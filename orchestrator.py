@@ -56,7 +56,7 @@ async def print_phase(state: AgentState) -> dict:
 
     json_dati = state["standardized_json_data"]
 
-    print("\n================== JSON STANDARDIZZATO GENERATO ==================")
+    print("\n================== Json standardizato generato ==================")
     print(json.dumps(json_dati, indent=4, ensure_ascii=False))
     print("==================================================================\n")
 
