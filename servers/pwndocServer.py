@@ -1,13 +1,42 @@
 import os
+import sys
+import json
+import logging
 import requests
+from pathlib import Path
 from fastmcp import FastMCP
 from reportlab.lib.pagesizes import letter
 from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.lib import colors
 
+# Directory di lavoro del progetto
+BASE_DIR = Path(__file__).parent.parent.resolve()
+FINDINGS_FILE = BASE_DIR / "scan_findings.json"
+
+# Logging su sys.stderr per non inquinare stdio MCP
+logging.basicConfig(
+    stream=sys.stderr,
+    level=logging.INFO,
+    format="[%(asctime)s] %(levelname)s - %(message)s"
+)
+logger = logging.getLogger("PwnDoc_Server")
+
 mcp = FastMCP("PwnDoc_Server")
 PWNDOC_API_URL = os.getenv("PWNDOC_URL", "http://localhost:8443/api")
+
+
+def load_findings_from_disk() -> dict:
+    """Carica i risultati dal file di log condiviso su disco se presente."""
+    if FINDINGS_FILE.exists():
+        try:
+            with open(FINDINGS_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                logger.info(f"Caricati findings di fallback da {FINDINGS_FILE}")
+                return data
+        except Exception as e:
+            logger.error(f"Errore nella lettura di {FINDINGS_FILE}: {e}")
+    return {}
 
 
 @mcp.tool()
@@ -16,23 +45,31 @@ def generate_report(
     target: str = "",
     target_url: str = ""
 ) -> dict:
-    """Generates a local PDF report and attempts sync with PwnDoc if reachable."""
+    """Genera un report PDF locale ed effettua il sync con PwnDoc se raggiungibile."""
 
-    # 1. Resolve argument inconsistencies (handles 'target' vs 'target_url')
-    target_host = target or target_url or "Unknown Target"
+    # 1. Normalizzazione Target
+    target_host = target or target_url or "http://127.0.0.1:3000"
     pdf_filename = "SecOps_Assessment_Report.pdf"
     pdf_generated = False
 
-    # 2. Normalize findings_summary into a valid dictionary
-    if findings_summary is None:
-        findings_summary = {}
-    elif isinstance(findings_summary, str):
-        try:
-            findings_summary = json.loads(findings_summary)
-        except json.JSONDecodeError:
-            findings_summary = {"raw_output": findings_summary}
+    # 2. Parsing e Normalizzazione Findings
+    parsed_findings = {}
 
-    # 3. Build local PDF using ReportLab
+    if isinstance(findings_summary, str):
+        try:
+            parsed_findings = json.loads(findings_summary)
+        except json.JSONDecodeError:
+            if findings_summary.strip():
+                parsed_findings = {"raw_summary": findings_summary}
+    elif isinstance(findings_summary, dict):
+        parsed_findings = findings_summary
+
+    # FALLBACK: Se l'LLM ha passato un dizionario vuoto ({}), leggi da disco
+    if not parsed_findings:
+        logger.warning("findings_summary vuoto da LLM. Attivazione fallback da disco...")
+        parsed_findings = load_findings_from_disk()
+
+    # 3. Costruzione Documento ReportLab
     try:
         doc = SimpleDocTemplate(
             pdf_filename,
@@ -48,7 +85,7 @@ def generate_report(
         title_style = ParagraphStyle(
             'ReportTitle',
             parent=styles['Heading1'],
-            fontSize=20,
+            fontSize=18,
             textColor=colors.HexColor("#1A365D"),
             spaceAfter=12
         )
@@ -56,50 +93,65 @@ def generate_report(
         cell_style = ParagraphStyle(
             'TableCell',
             parent=styles['Normal'],
+            fontSize=8,
+            leading=10
+        )
+
+        header_style = ParagraphStyle(
+            'TableHeader',
+            parent=styles['Normal'],
             fontSize=9,
-            leading=11
+            fontName='Helvetica-Bold',
+            textColor=colors.whitesmoke
         )
 
         story.append(Paragraph("Autonomous SecOps Assessment Report", title_style))
-        story.append(Paragraph(f"<b>Target:</b> {target_host}", styles['Normal']))
+        story.append(Paragraph(f"<b>Target URL:</b> {target_host}", styles['Normal']))
         story.append(Spacer(1, 12))
 
-        # Table data construction
-        table_data = [["Tool / Module", "Status / Findings Summary"]]
+        # Intestazione Tabella
+        table_data = [[
+            Paragraph("Tool / Module", header_style),
+            Paragraph("Status / Findings Summary", header_style)
+        ]]
 
-        if not findings_summary:
-            table_data.append(["N/A", "No tool findings reported."])
+        if not parsed_findings:
+            table_data.append([
+                Paragraph("<b>ALL TOOLS</b>", cell_style),
+                Paragraph("No tool findings were supplied by agent or found in scan_findings.json.", cell_style)
+            ])
         else:
-            for tool_name, result in findings_summary.items():
-                # Extract summary text safely depending on data type
+            for tool_name, result in parsed_findings.items():
+                # Formattazione estrazione contenuto
                 if isinstance(result, dict):
-                    summary_text = str(
+                    text_content = (
                         result.get("vulnerabilities") or
+                        result.get("output") or
                         result.get("findings") or
                         result.get("message") or
                         result.get("status") or
-                        "Completed"
+                        str(result)
                     )
-                elif isinstance(result, (list, str)):
-                    summary_text = str(result)
                 else:
-                    summary_text = "Completed"
+                    text_content = str(result)
 
-                # Truncate and wrap in Paragraph to prevent layout overflow
-                truncated_text = summary_text[:250] + ("..." if len(summary_text) > 250 else "")
+                # Pulizia e troncamento per evitare overflow grafico
+                text_content = str(text_content).replace("\n", "<br/>")
+                if len(text_content) > 500:
+                    text_content = text_content[:500] + "... [TRUNCATED]"
+
                 table_data.append([
                     Paragraph(f"<b>{str(tool_name).upper()}</b>", cell_style),
-                    Paragraph(truncated_text, cell_style)
+                    Paragraph(text_content, cell_style)
                 ])
 
         t = Table(table_data, colWidths=[120, 420])
         t.setStyle(TableStyle([
             ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor("#2B6CB0")),
-            ('TEXTCOLOR', (0, 0), (-1, 0), colors.whitesmoke),
             ('ALIGN', (0, 0), (-1, -1), 'LEFT'),
             ('VALIGN', (0, 0), (-1, -1), 'TOP'),
-            ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
-            ('BOTTOMPADDING', (0, 0), (-1, 0), 8),
+            ('BOTTOMPADDING', (0, 0), (-1, 0), 6),
+            ('TOPPADDING', (0, 0), (-1, -1), 6),
             ('BACKGROUND', (0, 1), (-1, -1), colors.HexColor("#F7FAFC")),
             ('GRID', (0, 0), (-1, -1), 0.5, colors.HexColor("#CBD5E0"))
         ]))
@@ -108,29 +160,26 @@ def generate_report(
         pdf_generated = True
 
     except Exception as e:
-        print(f"[-] Errore nella generazione del PDF locale: {e}")
+        logger.error(f"Errore durante la creazione del PDF: {e}")
 
-    # 4. Attempt PwnDoc synchronization
+    # 4. Controllo stato PwnDoc
     pwndoc_status = "offline"
     try:
-        response = requests.get(f"{PWNDOC_API_URL}/ping", timeout=2)
-        if response.status_code == 200:
+        res = requests.get(f"{PWNDOC_API_URL}/ping", timeout=2)
+        if res.status_code == 200:
             pwndoc_status = "synced_successfully"
     except Exception:
-        pass  # Maintain local fallback if PwnDoc is unreachable
+        pass
 
-    # 5. Output summary
-    print("\n" + "=" * 50)
-    print(f" [SUCCESS] PDF locale generato correttamente: {pdf_filename}")
-    print(f" [PWNDOC] Stato integrazione: {pwndoc_status}")
-    print("=" * 50 + "\n")
+    logger.info(f"PDF locale generato: {pdf_filename} (Findings usati: {len(parsed_findings)})")
 
     return {
         "status": "success",
         "local_pdf_generated": pdf_generated,
         "pdf_filename": pdf_filename,
+        "findings_count": len(parsed_findings),
         "pwndoc_status": pwndoc_status,
-        "message": f"Local PDF report created as {pdf_filename}. PwnDoc status: {pwndoc_status}."
+        "message": f"Report PDF creato ({len(parsed_findings)} voci registrate)."
     }
 
 
