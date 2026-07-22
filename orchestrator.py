@@ -15,6 +15,7 @@ os.environ["OLLAMA_MODELS"] = str(OLLAMA_MODELS_DIR)
 from langchain_mcp_adapters.client import MultiServerMCPClient
 from langchain_ollama import ChatOllama
 from langgraph.prebuilt import create_react_agent
+from langchain_core.messages import ToolMessage
 
 
 async def main():
@@ -35,7 +36,7 @@ async def main():
     )
 
     # -------------------------------------------------------------------------
-    # FIX A: Inizializzazione file di log condiviso su disco
+    # Inizializzazione file di log condiviso su disco
     # -------------------------------------------------------------------------
     findings_file = BASE_DIR / "scan_findings.json"
     findings_log = {}
@@ -63,7 +64,6 @@ async def main():
         "interactsh": "interactshServer.py",
     }
 
-    # Dynamically verify file existence to prevent TaskGroup sub-exception crashes
     server_configs = {}
     for name, script_name in all_servers.items():
         script_path = SERVERS_DIR / script_name
@@ -79,10 +79,7 @@ async def main():
                 file=sys.stderr,
             )
 
-    print(
-        "[*] Connecting to existing MCP tool servers...",
-        file=sys.stderr,
-    )
+    print("[*] Connecting to existing MCP tool servers...", file=sys.stderr)
 
     tools = []
     for name, config in server_configs.items():
@@ -114,19 +111,22 @@ async def main():
     )
 
     system_prompt = (
-        "You are an automated security testing agent.\n"
-        "STRICT INSTRUCTIONS:\n"
-        "1. Native Tool Execution ONLY: Do NOT output text JSON blocks or explanations. Call tools natively.\n"
-        "2. Error Resilience: If a tool fails or times out, ignore the error and invoke the next tool.\n"
-        "3. Complete Assessment: Run available discovery and scanning tools before calling 'generate_report'.\n"
-        "4. Final Step: Invoke 'generate_report' with 'target' and 'findings_summary'."
+        "You are an automated security testing agent operating under strict phase constraints.\n\n"
+        "PHASE 1 — SCANNING (MANDATORY FIRST STEP):\n"
+        "- You MUST call available active scanning tools (such as zap, nuclei, ffuf, nikto, sqlmap, etc.) against the target.\n"
+        "- Run scans step-by-step. If a tool fails, times out, or finishes, proceed to another available scanning tool.\n"
+        "- NEVER call 'generate_report' during Phase 1.\n\n"
+        "PHASE 2 — REPORTING (FINAL STEP ONLY):\n"
+        "- ONLY call 'generate_report' AFTER you have executed scanning tools in Phase 1.\n"
+        "- Pass the collected scan outputs as 'findings_summary'."
     )
 
     agent = create_react_agent(model, tools, prompt=system_prompt)
 
     query = (
-        f"Perform a full security scan on target: {args.target}.\n"
-        "Invoke scanning tools step-by-step. Finish by calling 'generate_report'."
+        f"Execute a full security scan on target: {args.target}.\n"
+        "1. Start by running active vulnerability scan tools against the target.\n"
+        "2. Once scan tools have executed, call 'generate_report' to create the final PDF report."
     )
 
     print(f"\n[AGENT PROMPT]: {query}\n", file=sys.stderr)
@@ -135,29 +135,34 @@ async def main():
     async for chunk in agent.astream(
         {"messages": [("user", query)]}, stream_mode="values"
     ):
-        latest_message = chunk["messages"][-1]
+        messages = chunk.get("messages", [])
 
         # -------------------------------------------------------------------------
-        #Intercettazione e salvataggio automatico dell'output dei tool
+        # FIX: Scansione completa della cronologia messaggi per salvare ogni ToolMessage
         # -------------------------------------------------------------------------
-        if getattr(latest_message, "type", "") == "tool":
-            tool_name = getattr(latest_message, "name", "unknown_tool")
-            content = getattr(latest_message, "content", "")
-            findings_log[tool_name] = content
+        for msg in messages:
+            if isinstance(msg, ToolMessage) or getattr(msg, "type", "") == "tool":
+                tool_name = getattr(msg, "name", "unknown_tool")
 
-            try:
-                with open(findings_file, "w", encoding="utf-8") as f:
-                    json.dump(findings_log, f, indent=2)
-            except Exception as e:
-                print(f"[!] Errore aggiornamento {findings_file}: {e}", file=sys.stderr)
+                # Ignora generate_report per non salvare il report come finding
+                if tool_name != "generate_report":
+                    findings_log[tool_name] = msg.content
 
-        if hasattr(latest_message, "tool_calls") and latest_message.tool_calls:
+        # Salva i findings aggiornati su disco
+        try:
+            with open(findings_file, "w", encoding="utf-8") as f:
+                json.dump(findings_log, f, indent=2)
+        except Exception as e:
+            print(f"[!] Errore aggiornamento {findings_file}: {e}", file=sys.stderr)
+
+        latest_message = messages[-1] if messages else None
+        if latest_message and hasattr(latest_message, "tool_calls") and latest_message.tool_calls:
             for tc in latest_message.tool_calls:
                 print(
                     f"[NATIVE TOOL CALL]: {tc['name']} -> {tc['args']}",
                     file=sys.stderr,
                 )
-        else:
+        elif latest_message:
             latest_message.pretty_print()
 
 
