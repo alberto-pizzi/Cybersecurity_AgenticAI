@@ -1,89 +1,72 @@
 import asyncio
-import json
 import sys
+import argparse
 from pathlib import Path
-from typing import TypedDict
-from langgraph.graph import StateGraph, START, END
-from fastmcp import Client
-from fastmcp.client.transports import StdioTransport
+from langchain_ollama import ChatOllama
+from langgraph.prebuilt import create_react_agent
+from langchain_mcp_adapters.client import MultiServerMCPClient
 
-# Risoluzione dinamica del percorso del server ZAP (gestisce sia zap_server.py che zapServer.py)
 BASE_DIR = Path(__file__).parent.resolve()
-ZAP_SERVER_PATH = BASE_DIR / "servers" / "zap_server.py"
-if not ZAP_SERVER_PATH.exists():
-    ZAP_SERVER_PATH = BASE_DIR / "servers" / "zapServer.py"
-
-
-# Definizione dello stato dell'agente
-class AgentState(TypedDict):
-    target: str
-    standardized_json_data: dict
-    final_output_status: str
-
-
-# NODO 1: Interazione con l'MCP Server di ZAP
-async def scan_phase(state: AgentState) -> dict:
-    print("\n--- [ORCHESTRATORE] Fase 1: Chiamata al server MCP ZAP via stdio ---")
-
-    if not ZAP_SERVER_PATH.exists():
-        raise FileNotFoundError(
-            f"ERRORE CRITICO: Impossibile trovare il file del server nella cartella '{BASE_DIR / 'servers'}'. "
-            "Assicurati che zap_server.py (o zapServer.py) sia presente!"
-        )
-
-    # Definizione esplicita del trasporto STDIO per FastMCP
-    transport = StdioTransport(
-        command=sys.executable,
-        args=[str(ZAP_SERVER_PATH)]
-    )
-
-    async with Client(transport) as client:
-        # Invocazione del tool registrato nel server ZAP
-        data_received = await client.call_tool("run_pentest_scan", {"target_url": state["target"]})
-
-        # Estrazione e parsing della risposta
-        if hasattr(data_received, "content") and isinstance(data_received.content, list):
-            data_received = json.loads(data_received.content[0].text)
-        elif isinstance(data_received, str):
-            data_received = json.loads(data_received)
-
-        return {"standardized_json_data": data_received}
-
-
-# NODO 2: Elaborazione e Output
-async def print_phase(state: AgentState) -> dict:
-    print("\n--- [ORCHESTRATORE] Fase 2: Elaborazione ed output dei risultati ---")
-
-    json_dati = state["standardized_json_data"]
-
-    print("\n================== Json standardizato generato ==================")
-    print(json.dumps(json_dati, indent=4, ensure_ascii=False))
-    print("==================================================================\n")
-
-    vulns = json_dati.get("vulnerabilities", [])
-    print(f"Riepilogo Finale: Rilevate {len(vulns)} segnalazioni su {json_dati.get('target', 'N/D')}.")
-
-    return {"final_output_status": "Flusso completato con successo!"}
-
-
-# --- ASSEMBLAGGIO GRAFO LANGGRAPH ---
-builder = StateGraph(AgentState)
-builder.add_node("attacca_target", scan_phase)
-builder.add_node("stampa_risultati", print_phase)
-
-builder.add_edge(START, "attacca_target")
-builder.add_edge("attacca_target", "stampa_risultati")
-builder.add_edge("stampa_risultati", END)
-
-orchestrator_agent = builder.compile()
+SERVERS_DIR = BASE_DIR / "servers"
 
 
 async def main():
-    # Usa host.docker.internal in modo che il container ZAP possa raggiungere Juice Shop sul tuo host
-    inputs = {"target": "http://host.docker.internal:3000"}
-    print("=== AVVIO AGENTE AUTOMATIZZATO SU PYCHARM ===")
-    risultato = await orchestrator_agent.ainvoke(inputs)
-    print(f"\nStato Uscita Grafo: {risultato['final_output_status']}")
+    parser = argparse.ArgumentParser(description="Fully Autonomous Local SecOps Agent with Ollama & MCP")
+    parser.add_argument("--target", type=str, default="http://127.0.0.1:3000", help="Target URL to assess")
+    args = parser.parse_args()
+
+    print(f"=== INITIALIZING AUTONOMOUS OLLAMA AGENT ON: {args.target} ===")
+
+    # 1. Configure all local MCP servers via stdio transport
+    server_configs = {
+        "zap": {"transport": "stdio", "command": sys.executable, "args": [str(SERVERS_DIR / "zapServer.py")]},
+        "nuclei": {"transport": "stdio", "command": sys.executable, "args": [str(SERVERS_DIR / "nucleiServer.py")]},
+        "sqlmap": {"transport": "stdio", "command": sys.executable, "args": [str(SERVERS_DIR / "sqlmapServer.py")]},
+        "ffuf": {"transport": "stdio", "command": sys.executable, "args": [str(SERVERS_DIR / "ffufServer.py")]},
+        "nikto": {"transport": "stdio", "command": sys.executable, "args": [str(SERVERS_DIR / "niktoServer.py")]},
+        "dalfox": {"transport": "stdio", "command": sys.executable, "args": [str(SERVERS_DIR / "dalfoxServer.py")]},
+        "arjun": {"transport": "stdio", "command": sys.executable, "args": [str(SERVERS_DIR / "arjunServer.py")]},
+        "commix": {"transport": "stdio", "command": sys.executable, "args": [str(SERVERS_DIR / "commixServer.py")]},
+        "idor": {"transport": "stdio", "command": sys.executable, "args": [str(SERVERS_DIR / "idorForgeServer.py")]},
+        "pwndoc": {"transport": "stdio", "command": sys.executable, "args": [str(SERVERS_DIR / "pwndocServer.py")]}
+    }
+
+    print("[*] Connecting to MCP tool servers and loading capabilities...")
+    async with MultiServerMCPClient(server_configs) as client:
+        # Automatically converts all MCP server tools into LangChain-compatible tools
+        tools = client.get_tools()
+
+        # 2. Initialize local model via Ollama
+        model = ChatOllama(
+            model="llama3.1",
+            temperature=0,
+            base_url="http://localhost:11434"
+        )
+
+        # 3. Create the autonomous ReAct agent loop
+        system_prompt = (
+            "You are an expert autonomous offensive security agent. "
+            "Your job is to analyze the target web application, decide which security tools to invoke, "
+            "evaluate vulnerabilities found, and finally trigger the pwndoc reporting tool to compile the assessment."
+        )
+
+        agent = create_react_agent(model, tools, prompt=system_prompt)
+
+        # 4. Run the autonomous assessment loop
+        query = (
+            f"Perform a comprehensive security assessment on target {args.target}. "
+            "Examine endpoints, execute relevant scans, gather vulnerabilities, "
+            "and finish by generating the final report using the available reporting tool."
+        )
+
+        print(f"\n[AGENT PROMPT]: {query}\n")
+        print("[*] Agent is now reasoning and executing tools autonomously...\n")
+
+        async for chunk in agent.astream({"messages": [("user", query)]}, stream_mode="values"):
+            latest_message = chunk["messages"][-1]
+            latest_message.pretty_print()
+
+    print("\n[+] Autonomous security assessment workflow completed successfully!")
 
 
 if __name__ == "__main__":
