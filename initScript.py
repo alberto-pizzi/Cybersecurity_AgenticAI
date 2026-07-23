@@ -15,777 +15,286 @@ import time
 import zipfile
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Iterable
+from typing import Any
 
 import requests
 
-from utils import ROOT_DIR, WORDLISTS_DIR, find_executable, setup_path
+from utils import ROOT_DIR, WORDLISTS_DIR, setup_path
 
-
-# -----------------------------------------------------------------------------
-# Project configuration
-# -----------------------------------------------------------------------------
-
-PYTHON_PACKAGES = [
-    # Keep the FastMCP major version expected by the current project.
-    "fastmcp==2.12.5",
-    "langgraph>=0.6,<2",
-    "requests>=2.32,<3",
-    "beautifulsoup4>=4.13,<5",
-    "python-owasp-zap-v2.4>=0.1.0",
-    "reportlab>=4.4,<5",
-    "PyJWT>=2.10,<3",
-    "arjun>=2.2,<3",
-]
-
-DEFAULT_TARGET = "http://127.0.0.1"
-DEFAULT_MODEL = "llama3.1:8b"
-
-# All locally managed scanners are stored inside the project/user profile.
+ROOT = Path(ROOT_DIR).resolve()
 LOCAL_ROOT = Path.home() / ".local"
 LOCAL_BIN = LOCAL_ROOT / "bin"
 LOCAL_OPT = LOCAL_ROOT / "opt"
-DOWNLOAD_DIR = LOCAL_ROOT / "downloads"
-RUNTIME_CONFIG_PATH = Path(ROOT_DIR) / ".secops_runtime.json"
+DOWNLOADS = LOCAL_ROOT / "downloads"
+RUNTIME_FILE = ROOT / ".secops_runtime.json"
+TARGET = "http://127.0.0.1"
+DEFAULT_MODEL = "llama3.1:8b"
+BUILD_ID = "secops-init-simplified-v2-20260723"
 
-# Tools that must exist after initialization.
-REQUIRED_SCANNERS = (
-    "nuclei",
-    "nikto",
-    "ffuf",
-    "dalfox",
-    "commix",
-    "sqlmap",
-    "arjun",
-    "interactsh-client",
+PYTHON_PACKAGES = (
+    "fastmcp==2.12.5", "langgraph>=0.6,<2", "requests>=2.32,<3",
+    "beautifulsoup4>=4.13,<5", "python-owasp-zap-v2.4>=0.1.0",
+    "reportlab>=4.4,<5", "PyJWT>=2.10,<3", "arjun>=2.2,<3",
 )
+SCANNERS = ("nuclei", "nikto", "ffuf", "dalfox", "commix", "sqlmap", "arjun", "interactsh-client")
+REPOSITORY_TOOLS = {
+    "sqlmap": ("https://github.com/sqlmapproject/sqlmap.git", "sqlmap.py"),
+    "commix": ("https://github.com/commixproject/commix.git", "commix.py"),
+}
+RELEASE_TOOLS = {
+    "nuclei": ("projectdiscovery/nuclei", "nuclei"),
+    "ffuf": ("ffuf/ffuf", "ffuf"),
+    "dalfox": ("hahwul/dalfox", "dalfox"),
+    "interactsh-client": ("projectdiscovery/interactsh", "interactsh-client"),
+}
 
 
-# -----------------------------------------------------------------------------
-# Generic process and PATH helpers
-# -----------------------------------------------------------------------------
-
-def run(
-    command: list[str],
-    *,
-    required: bool = True,
-    capture: bool = False,
-    timeout: int = 3600,
-    cwd: Path | None = None,
-) -> subprocess.CompletedProcess[str]:
-    """Run a command safely without shell interpolation."""
+def run(command: list[str], *, required: bool = True, capture: bool = False, show_output: bool = True, timeout: int = 3600, cwd: Path | None = None) -> subprocess.CompletedProcess[str]:
     print("[+] " + subprocess.list2cmdline(command))
     try:
-        completed = subprocess.run(
-            command,
-            cwd=str(cwd) if cwd else None,
-            text=True,
-            capture_output=capture,
-            timeout=timeout,
-            shell=False,
-            env=os.environ.copy(),
+        result = subprocess.run(
+            command, cwd=str(cwd) if cwd else None, env=os.environ.copy(), shell=False,
+            text=True, capture_output=capture, timeout=timeout,
         )
     except FileNotFoundError as exc:
         raise RuntimeError(f"Command not found: {command[0]}") from exc
     except subprocess.TimeoutExpired as exc:
-        raise RuntimeError(
-            f"Command timed out after {timeout} seconds: "
-            f"{subprocess.list2cmdline(command)}"
-        ) from exc
-
-    if capture:
-        if completed.stdout.strip():
-            print(completed.stdout.strip())
-        if completed.stderr.strip():
-            print(completed.stderr.strip(), file=sys.stderr)
-
-    if completed.returncode != 0 and required:
-        details = completed.stderr.strip() if capture else ""
-        raise RuntimeError(
-            f"Command failed with exit code {completed.returncode}: {command}\n{details}"
-        )
-    return completed
+        raise RuntimeError(f"Command timed out: {subprocess.list2cmdline(command)}") from exc
+    if capture and show_output:
+        if result.stdout.strip():
+            print(result.stdout.strip())
+        if result.stderr.strip():
+            print(result.stderr.strip(), file=sys.stderr)
+    if required and result.returncode:
+        raise RuntimeError(f"Command failed ({result.returncode}): {subprocess.list2cmdline(command)}\n{result.stderr if capture else ''}")
+    return result
 
 
-def add_path(path: Path) -> None:
-    """Add a directory to the current process PATH exactly once."""
-    if not path:
+def _add_path(path: Path) -> None:
+    if not path.is_dir():
         return
-    path = path.expanduser().resolve()
-    current_parts = os.environ.get("PATH", "").split(os.pathsep)
-    normalized = {os.path.normcase(os.path.abspath(part)) for part in current_parts if part}
-    if os.path.normcase(str(path)) not in normalized:
-        os.environ["PATH"] = str(path) + os.pathsep + os.environ.get("PATH", "")
+    resolved = str(path.resolve())
+    current = [part for part in os.environ.get("PATH", "").split(os.pathsep) if part]
+    if os.path.normcase(resolved) not in {os.path.normcase(os.path.abspath(part)) for part in current}:
+        os.environ["PATH"] = resolved + os.pathsep + os.environ.get("PATH", "")
 
 
-def configure_runtime_path() -> None:
-    """
-    Add every relevant Python/user binary directory to PATH.
-
-    This fixes the exact warning shown in the log where arjun.exe was installed
-    successfully but Windows could not find it afterwards.
-    """
-    LOCAL_BIN.mkdir(parents=True, exist_ok=True)
-    LOCAL_OPT.mkdir(parents=True, exist_ok=True)
-    DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
-
-    candidates: list[Path] = [LOCAL_BIN]
-
-    # Python's user Scripts directory, e.g. ...\Python313\Scripts on Windows.
-    user_scripts = sysconfig.get_path("scripts", scheme="nt_user" if os.name == "nt" else "posix_user")
-    if user_scripts:
-        candidates.append(Path(user_scripts))
-
-    # The active interpreter's Scripts/bin directory.
-    candidates.append(Path(sys.executable).resolve().parent)
-    if os.name == "nt":
-        candidates.append(Path(sys.executable).resolve().parent / "Scripts")
-    else:
-        candidates.append(Path(sys.executable).resolve().parent / "bin")
-
-    # pip --user sometimes resolves through site.USER_BASE.
+def configure_path() -> list[str]:
+    for directory in (LOCAL_BIN, LOCAL_OPT, DOWNLOADS):
+        directory.mkdir(parents=True, exist_ok=True)
+    candidates = [LOCAL_BIN]
+    try:
+        scripts = sysconfig.get_path("scripts", scheme="nt_user" if os.name == "nt" else "posix_user")
+        if scripts:
+            candidates.append(Path(scripts))
+    except (KeyError, ValueError):
+        pass
     try:
         import site
         candidates.append(Path(site.USER_BASE) / ("Scripts" if os.name == "nt" else "bin"))
     except Exception:
         pass
-
-    for candidate in candidates:
-        if candidate.exists():
-            add_path(candidate)
+    candidates.append(Path(sys.executable).resolve().parent)
+    added = []
+    for path in candidates:
+        if path.is_dir():
+            _add_path(path)
+            added.append(str(path.resolve()))
+    return list(dict.fromkeys(added))
 
 
 def command_path(name: str) -> str | None:
-    """Resolve a command using both utils.py and the updated process PATH."""
-    try:
-        found = find_executable(name)
-        if found:
-            return found
-    except Exception:
-        pass
-    return shutil.which(name)
-
-
-def runtime_tool_directories(
-    status: dict[str, str | None] | None = None,
-) -> list[str]:
-    """Return every binary directory shared with future orchestrator processes."""
-    status = status or scanner_status()
-    directories: list[Path] = [LOCAL_BIN]
-
-    try:
-        scripts = sysconfig.get_path(
-            "scripts",
-            scheme="nt_user" if os.name == "nt" else "posix_user",
-        )
-    except (KeyError, ValueError):
-        scripts = None
-    if scripts:
-        directories.append(Path(scripts))
-
-    for value in status.values():
-        if value:
-            directories.append(Path(value).expanduser().resolve().parent)
-
-    unique: list[str] = []
-    seen: set[str] = set()
-    for directory in directories:
-        expanded = directory.expanduser()
-        try:
-            resolved = expanded.resolve()
-        except OSError:
-            continue
-        key = os.path.normcase(str(resolved))
-        if key in seen or not resolved.is_dir():
-            continue
-        seen.add(key)
-        unique.append(str(resolved))
-    return unique
-
-
-def write_runtime_config(
-    status: dict[str, str | None] | None = None,
-) -> Path:
-    """
-    Persist scanner paths for the deterministic and agentic orchestrators.
-
-    PATH changes made by this process disappear after initScript.py exits, so
-    this file is the stable link between installation and later executions.
-    """
-    status = status or scanner_status()
-    payload = {
-        "schema_version": 1,
-        "generated_at": datetime.now(timezone.utc).isoformat(),
-        "project_root": str(Path(ROOT_DIR).resolve()),
-        "python_executable": str(Path(sys.executable).resolve()),
-        "tool_directories": runtime_tool_directories(status),
-        "executables": {
-            name: (str(Path(path).resolve()) if path else None)
-            for name, path in status.items()
-        },
-    }
-    RUNTIME_CONFIG_PATH.write_text(
-        json.dumps(payload, indent=2, ensure_ascii=False),
-        encoding="utf-8",
-    )
-    print(f"[+] Runtime scanner configuration written: {RUNTIME_CONFIG_PATH}")
-    return RUNTIME_CONFIG_PATH
-
-
-def run_project_preflight() -> None:
-    """Verify the orchestrator using exactly the runtime created by init."""
-    script = Path(ROOT_DIR) / "orchestratorDeterministic.py"
-    if not script.is_file():
-        raise RuntimeError(f"Missing orchestrator for preflight: {script}")
-    completed = run(
-        [
-            sys.executable,
-            str(script),
-            "--target",
-            DEFAULT_TARGET,
-            "--preflight-only",
-        ],
-        required=False,
-        capture=True,
-        timeout=300,
-        cwd=Path(ROOT_DIR),
-    )
-    if completed.returncode != 0:
-        raise RuntimeError(
-            "The orchestrator preflight failed after initialization. "
-            "Review the errors printed above."
-        )
-
-
-# -----------------------------------------------------------------------------
-# Python dependencies and launchers
-# -----------------------------------------------------------------------------
-
-def install_python_dependencies() -> None:
-    run([sys.executable, "-m", "pip", "install", "--upgrade", "pip"], timeout=1800)
-    run([sys.executable, "-m", "pip", "install", *PYTHON_PACKAGES], timeout=3600)
-    configure_runtime_path()
+    configure_path()
+    value = shutil.which(name)
+    return str(Path(value).resolve()) if value else None
 
 
 def write_launcher(name: str, command: list[str]) -> Path:
-    """Create a portable wrapper in ~/.local/bin."""
     LOCAL_BIN.mkdir(parents=True, exist_ok=True)
-
     if os.name == "nt":
-        launcher = LOCAL_BIN / f"{name}.bat"
-        launcher.write_text(
-            "@echo off\r\n" + subprocess.list2cmdline(command) + " %*\r\n",
-            encoding="utf-8",
-        )
+        path = LOCAL_BIN / f"{name}.bat"
+        path.write_text("@echo off\r\n" + subprocess.list2cmdline(command) + " %*\r\n", encoding="utf-8")
     else:
-        launcher = LOCAL_BIN / name
+        path = LOCAL_BIN / name
         quoted = " ".join(subprocess.list2cmdline([part]) for part in command)
-        launcher.write_text(
-            f"#!/usr/bin/env sh\nexec {quoted} \"$@\"\n",
-            encoding="utf-8",
-        )
-        launcher.chmod(
-            launcher.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH
-        )
-
-    print(f"[+] Launcher created: {launcher}")
-    configure_runtime_path()
-    return launcher
+        path.write_text(f"#!/usr/bin/env sh\nexec {quoted} \"$@\"\n", encoding="utf-8")
+        path.chmod(path.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+    configure_path()
+    print(f"[+] Launcher created: {path}")
+    return path
 
 
-def ensure_arjun_launcher() -> None:
-    """
-    Arjun is installed by pip. If its generated executable is not visible,
-    create a local launcher that invokes its module entry point.
-    """
-    if command_path("arjun"):
-        print(f"[+] arjun already available: {command_path('arjun')}")
-        return
-
-    probe = run(
-        [sys.executable, "-m", "arjun", "--help"],
-        required=False,
-        capture=True,
-        timeout=60,
-    )
-    if probe.returncode == 0:
-        write_launcher("arjun", [sys.executable, "-m", "arjun"])
-        return
-
-    raise RuntimeError(
-        "Arjun was installed by pip but neither arjun.exe nor python -m arjun works."
-    )
+def install_python_packages() -> None:
+    run([sys.executable, "-m", "pip", "install", "--upgrade", "pip"], timeout=1800)
+    run([sys.executable, "-m", "pip", "install", *PYTHON_PACKAGES], timeout=3600)
+    configure_path()
 
 
-# -----------------------------------------------------------------------------
-# Git repositories: SQLMap, Commix and Nikto
-# -----------------------------------------------------------------------------
-
-def require_git() -> str:
-    git = shutil.which("git")
-    if not git:
+def clone_or_update(url: str, destination: Path) -> None:
+    if not shutil.which("git"):
         raise RuntimeError("Git is required to install SQLMap, Commix and Nikto.")
-    return git
-
-
-def clone_or_update(repository: str, destination: Path) -> None:
-    require_git()
-    if (destination / ".git").exists():
-        update = run(
-            ["git", "-C", str(destination), "pull", "--ff-only"],
-            required=False,
-            capture=True,
-            timeout=600,
-        )
-        if update.returncode != 0:
-            print(f"[!] Could not update {destination.name}; keeping the existing copy.")
+    if (destination / ".git").is_dir():
+        if run(["git", "-C", str(destination), "pull", "--ff-only"], required=False, capture=True, timeout=600).returncode:
+            print(f"[!] Keeping the existing {destination.name} checkout.")
         return
-
-    if destination.exists():
-        shutil.rmtree(destination)
+    shutil.rmtree(destination, ignore_errors=True)
     destination.parent.mkdir(parents=True, exist_ok=True)
-    run(["git", "clone", "--depth", "1", repository, str(destination)], timeout=1200)
+    run(["git", "clone", "--depth", "1", url, str(destination)], timeout=1200)
 
 
-def install_sqlmap() -> None:
-    if command_path("sqlmap"):
-        print(f"[+] sqlmap already available: {command_path('sqlmap')}")
+def install_repository_tool(name: str, repository: str, script_name: str) -> None:
+    if command_path(name):
+        print(f"[+] {name} already available: {command_path(name)}")
         return
-    destination = LOCAL_OPT / "sqlmap"
-    clone_or_update("https://github.com/sqlmapproject/sqlmap.git", destination)
-    script = destination / "sqlmap.py"
-    if not script.exists():
-        raise RuntimeError("sqlmap.py was not found after cloning SQLMap.")
-    write_launcher("sqlmap", [sys.executable, str(script)])
-
-
-def install_commix() -> None:
-    if command_path("commix"):
-        print(f"[+] commix already available: {command_path('commix')}")
-        return
-    destination = LOCAL_OPT / "commix"
-    clone_or_update("https://github.com/commixproject/commix.git", destination)
-    script = destination / "commix.py"
-    if not script.exists():
-        raise RuntimeError("commix.py was not found after cloning Commix.")
-    write_launcher("commix", [sys.executable, str(script)])
+    destination = LOCAL_OPT / name
+    clone_or_update(repository, destination)
+    script = destination / script_name
+    if not script.is_file():
+        raise RuntimeError(f"Missing {script_name} after cloning {name}.")
+    write_launcher(name, [sys.executable, str(script)])
 
 
 def find_perl() -> str | None:
-    perl = shutil.which("perl")
-    if perl:
-        return perl
-
+    found = shutil.which("perl")
+    if found:
+        return found
     if os.name == "nt":
-        candidates = [
-            Path(r"C:\Strawberry\perl\bin\perl.exe"),
-            Path(r"C:\Program Files\Strawberry Perl\perl\bin\perl.exe"),
-        ]
-        for candidate in candidates:
-            if candidate.exists():
-                add_path(candidate.parent)
+        for candidate in (Path(r"C:\Strawberry\perl\bin\perl.exe"), Path(r"C:\Program Files\Strawberry Perl\perl\bin\perl.exe")):
+            if candidate.is_file():
+                _add_path(candidate.parent)
                 return str(candidate)
     return None
-
-
-def install_strawberry_perl_windows() -> str | None:
-    """Install Strawberry Perl with winget when Nikto needs it."""
-    perl = find_perl()
-    if perl or os.name != "nt":
-        return perl
-
-    winget = shutil.which("winget")
-    if not winget:
-        return None
-
-    print("[*] Perl not found. Installing Strawberry Perl with winget...")
-    run(
-        [
-            winget,
-            "install",
-            "--id",
-            "StrawberryPerl.StrawberryPerl",
-            "--exact",
-            "--silent",
-            "--accept-package-agreements",
-            "--accept-source-agreements",
-        ],
-        required=False,
-        timeout=1800,
-    )
-    return find_perl()
 
 
 def install_nikto() -> None:
     if command_path("nikto"):
         print(f"[+] nikto already available: {command_path('nikto')}")
         return
-
     destination = LOCAL_OPT / "nikto"
     clone_or_update("https://github.com/sullo/nikto.git", destination)
     script = destination / "program" / "nikto.pl"
-    if not script.exists():
-        raise RuntimeError("nikto.pl was not found after cloning Nikto.")
-
-    perl = find_perl() or install_strawberry_perl_windows()
-    if not perl:
-        raise RuntimeError(
-            "Nikto was downloaded, but Perl is missing. Install Strawberry Perl and rerun."
-        )
+    perl = find_perl()
+    if not perl and os.name == "nt" and shutil.which("winget"):
+        run(["winget", "install", "--id", "StrawberryPerl.StrawberryPerl", "--exact", "--silent", "--accept-package-agreements", "--accept-source-agreements"], required=False, timeout=1800)
+        perl = find_perl()
+    if not script.is_file() or not perl:
+        raise RuntimeError("Nikto requires program/nikto.pl and Perl (Strawberry Perl on Windows).")
     write_launcher("nikto", [perl, str(script)])
 
 
-# -----------------------------------------------------------------------------
-# GitHub release binaries: Nuclei, FFUF, Dalfox and Interactsh
-# -----------------------------------------------------------------------------
+def ensure_arjun() -> None:
+    if command_path("arjun"):
+        print(f"[+] arjun already available: {command_path('arjun')}")
+        return
+    if run([sys.executable, "-m", "arjun", "--help"], required=False, capture=True, timeout=60).returncode == 0:
+        write_launcher("arjun", [sys.executable, "-m", "arjun"])
+        return
+    raise RuntimeError("Arjun is installed but no executable/module entry point is available.")
 
-def github_latest_release(repository: str) -> dict:
-    response = requests.get(
-        f"https://api.github.com/repos/{repository}/releases/latest",
-        headers={"Accept": "application/vnd.github+json"},
-        timeout=60,
-    )
+
+def github_release(repository: str) -> dict[str, Any]:
+    response = requests.get(f"https://api.github.com/repos/{repository}/releases/latest", headers={"Accept": "application/vnd.github+json"}, timeout=60)
     response.raise_for_status()
-    payload = response.json()
-    if not isinstance(payload, dict):
-        raise RuntimeError(f"Invalid GitHub release response for {repository}.")
-    return payload
+    value = response.json()
+    if not isinstance(value, dict):
+        raise RuntimeError(f"Invalid GitHub response for {repository}.")
+    return value
 
 
-def architecture_tokens() -> tuple[str, ...]:
+def select_asset(release: dict[str, Any], hint: str) -> dict[str, Any]:
     machine = platform.machine().lower()
-    if machine in {"amd64", "x86_64", "x64"}:
-        return ("amd64", "x86_64", "64bit")
-    if machine in {"arm64", "aarch64"}:
-        return ("arm64", "aarch64")
-    raise RuntimeError(f"Unsupported CPU architecture: {machine}")
-
-
-def operating_system_tokens() -> tuple[str, ...]:
+    arch = ("amd64", "x86_64", "64bit") if machine in {"amd64", "x86_64", "x64"} else ("arm64", "aarch64")
     system = platform.system().lower()
-    if system == "windows":
-        return ("windows", "win")
-    if system == "linux":
-        return ("linux",)
-    if system == "darwin":
-        return ("macos", "darwin", "osx")
-    raise RuntimeError(f"Unsupported operating system: {system}")
-
-
-def select_release_asset(release: dict, tool_hint: str) -> dict:
-    assets = release.get("assets") or []
-    os_tokens = operating_system_tokens()
-    arch_tokens = architecture_tokens()
-
-    candidates: list[dict] = []
-    for asset in assets:
+    os_tokens = ("windows", "win") if system == "windows" else ("linux",) if system == "linux" else ("macos", "darwin", "osx")
+    assets = []
+    for asset in release.get("assets", []):
         name = str(asset.get("name", "")).lower()
-        is_archive = name.endswith((".zip", ".tar.gz", ".tgz"))
-        if not is_archive:
-            continue
-        if not any(token in name for token in os_tokens):
-            continue
-        if not any(token in name for token in arch_tokens):
-            continue
-        if tool_hint.lower() not in name:
-            continue
-        candidates.append(asset)
-
-    if not candidates:
-        available = [str(asset.get("name", "")) for asset in assets]
-        raise RuntimeError(
-            f"No compatible release asset found for {tool_hint}. Available: {available}"
-        )
-
-    # Prefer ZIP on Windows and tar.gz elsewhere.
-    if os.name == "nt":
-        candidates.sort(key=lambda item: not str(item.get("name", "")).lower().endswith(".zip"))
-    else:
-        candidates.sort(key=lambda item: str(item.get("name", "")).lower().endswith(".zip"))
-    return candidates[0]
+        if name.endswith((".zip", ".tar.gz", ".tgz")) and hint.lower() in name and any(token in name for token in arch) and any(token in name for token in os_tokens):
+            assets.append(asset)
+    if not assets:
+        raise RuntimeError(f"No compatible {hint} release asset found.")
+    assets.sort(key=lambda item: not str(item.get("name", "")).lower().endswith(".zip") if os.name == "nt" else str(item.get("name", "")).lower().endswith(".zip"))
+    return assets[0]
 
 
-def download_file(url: str, destination: Path) -> None:
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    with requests.get(url, stream=True, timeout=180) as response:
+def install_release_tool(name: str, repository: str, hint: str) -> None:
+    if command_path(name):
+        print(f"[+] {name} already available: {command_path(name)}")
+        return
+    asset = select_asset(github_release(repository), hint)
+    archive = DOWNLOADS / str(asset["name"])
+    extract_dir = DOWNLOADS / f"extract_{name}"
+    with requests.get(str(asset["browser_download_url"]), stream=True, timeout=180) as response:
         response.raise_for_status()
-        with destination.open("wb") as handle:
+        with archive.open("wb") as handle:
             for chunk in response.iter_content(1024 * 1024):
                 if chunk:
                     handle.write(chunk)
-
-
-def extract_archive(archive: Path, destination: Path) -> None:
-    if destination.exists():
-        shutil.rmtree(destination)
-    destination.mkdir(parents=True, exist_ok=True)
-
+    shutil.rmtree(extract_dir, ignore_errors=True)
+    extract_dir.mkdir(parents=True)
     if archive.name.lower().endswith(".zip"):
-        with zipfile.ZipFile(archive) as zipped:
-            zipped.extractall(destination)
-    elif archive.name.lower().endswith((".tar.gz", ".tgz")):
-        with tarfile.open(archive, "r:gz") as tar:
-            tar.extractall(destination)
+        with zipfile.ZipFile(archive) as source:
+            source.extractall(extract_dir)
     else:
-        raise RuntimeError(f"Unsupported archive format: {archive.name}")
-
-
-def install_release_binary(command_name: str, repository: str, asset_hint: str) -> None:
-    if command_path(command_name):
-        print(f"[+] {command_name} already available: {command_path(command_name)}")
-        return
-
-    print(f"[*] Installing {command_name} from {repository}...")
-    release = github_latest_release(repository)
-    asset = select_release_asset(release, asset_hint)
-    archive = DOWNLOAD_DIR / str(asset["name"])
-    extract_dir = DOWNLOAD_DIR / f"extract_{command_name}"
-
-    download_file(str(asset["browser_download_url"]), archive)
-    extract_archive(archive, extract_dir)
-
-    expected_names = {
-        command_name.lower(),
-        f"{command_name}.exe".lower(),
-    }
-    candidates = [
-        item
-        for item in extract_dir.rglob("*")
-        if item.is_file() and item.name.lower() in expected_names
-    ]
-    if not candidates:
-        raise RuntimeError(
-            f"Executable {command_name} was not found inside {archive.name}."
-        )
-
-    source = candidates[0]
-    destination_name = f"{command_name}.exe" if os.name == "nt" else command_name
-    destination = LOCAL_BIN / destination_name
-    shutil.copy2(source, destination)
+        with tarfile.open(archive, "r:gz") as source:
+            source.extractall(extract_dir)
+    expected = {name.lower(), f"{name}.exe".lower()}
+    executable = next((path for path in extract_dir.rglob("*") if path.is_file() and path.name.lower() in expected), None)
+    if not executable:
+        raise RuntimeError(f"Executable {name} was not found in {archive.name}.")
+    destination = LOCAL_BIN / (f"{name}.exe" if os.name == "nt" else name)
+    shutil.copy2(executable, destination)
     if os.name != "nt":
-        destination.chmod(
-            destination.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH
-        )
-
+        destination.chmod(destination.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
     shutil.rmtree(extract_dir, ignore_errors=True)
     archive.unlink(missing_ok=True)
-    configure_runtime_path()
-
-    if not command_path(command_name):
-        raise RuntimeError(f"{command_name} installation completed but it is still not resolvable.")
-    print(f"[+] Installed {command_name}: {destination}")
+    configure_path()
 
 
-def install_binary_scanners() -> None:
-    install_release_binary("nuclei", "projectdiscovery/nuclei", "nuclei")
-    install_release_binary("ffuf", "ffuf/ffuf", "ffuf")
-    install_release_binary("dalfox", "hahwul/dalfox", "dalfox")
-    install_release_binary(
-        "interactsh-client",
-        "projectdiscovery/interactsh",
-        "interactsh-client",
-    )
-
-
-def install_all_scanners() -> None:
+def install_scanners() -> None:
     print("\n=== Installing/verifying security scanners ===")
-    ensure_arjun_launcher()
-    install_sqlmap()
-    install_commix()
+    ensure_arjun()
+    for name, (repository, script) in REPOSITORY_TOOLS.items():
+        install_repository_tool(name, repository, script)
     install_nikto()
-    install_binary_scanners()
+    for name, (repository, hint) in RELEASE_TOOLS.items():
+        install_release_tool(name, repository, hint)
 
-
-# -----------------------------------------------------------------------------
-# Verification
-# -----------------------------------------------------------------------------
 
 def scanner_status() -> dict[str, str | None]:
-    configure_runtime_path()
-    return {name: command_path(name) for name in REQUIRED_SCANNERS}
+    return {name: command_path(name) for name in SCANNERS}
 
 
-def print_cli_status(*, fail_on_missing: bool = False) -> dict[str, str | None]:
+def verify_scanners(required: bool = True) -> dict[str, str | None]:
     status = scanner_status()
     print("\n=== Scanner executables ===")
     for name, path in status.items():
         print(f"{name:20} {'OK: ' + path if path else 'MISSING'}")
-
     missing = [name for name, path in status.items() if not path]
-    if missing and fail_on_missing:
-        raise RuntimeError(
-            "Installation incomplete. Missing scanners: " + ", ".join(missing)
-        )
+    if required and missing:
+        raise RuntimeError("Missing scanners: " + ", ".join(missing))
     return status
 
 
-# -----------------------------------------------------------------------------
-# Local laboratory and authentication
-# -----------------------------------------------------------------------------
-
-def docker_inspect_container(name: str) -> dict | None:
-    """Return Docker container inspection data, or None if the container does not exist."""
-    completed = subprocess.run(
-        ["docker", "inspect", name],
-        text=True,
-        capture_output=True,
-        shell=False,
-        timeout=60,
-    )
-    if completed.returncode != 0:
-        return None
-
-    try:
-        payload = json.loads(completed.stdout)
-    except json.JSONDecodeError:
-        return None
-
-    if not isinstance(payload, list) or not payload or not isinstance(payload[0], dict):
-        return None
-    return payload[0]
+def write_runtime_config(status: dict[str, str | None]) -> None:
+    directories = configure_path() + [str(Path(path).parent) for path in status.values() if path]
+    payload = {
+        "schema_version": 1,
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "project_root": str(ROOT),
+        "python_executable": str(Path(sys.executable).resolve()),
+        "tool_directories": list(dict.fromkeys(directories)),
+        "executables": status,
+    }
+    RUNTIME_FILE.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
+    print(f"[+] Runtime scanner configuration written: {RUNTIME_FILE}")
 
 
-def docker_network_exists(name: str) -> bool:
-    completed = subprocess.run(
-        ["docker", "network", "inspect", name],
-        text=True,
-        capture_output=True,
-        shell=False,
-        timeout=60,
-    )
-    return completed.returncode == 0
+def create_wordlist() -> None:
+    WORDLISTS_DIR.mkdir(parents=True, exist_ok=True)
+    words = "admin api assets backup config css docs images index.php js login.php logout.php robots.txt server-status setup.php uploads vulnerabilities".split()
+    (WORDLISTS_DIR / "common.txt").write_text("\n".join(words) + "\n", encoding="utf-8")
 
-
-def ensure_network(name: str) -> None:
-    """Reuse a valid Docker network, otherwise recreate it."""
-    if docker_network_exists(name):
-        print(f"[+] Docker network {name} already exists.")
-        return
-
-    print(f"[*] Docker network {name} is missing. Creating it...")
-    run(["docker", "network", "create", name], timeout=60)
-
-
-def container_matches(
-    inspection: dict,
-    *,
-    image: str,
-    network: str,
-    port_bindings: dict[str, str],
-) -> tuple[bool, list[str]]:
-    """Validate the image, Docker network and published host ports."""
-    problems: list[str] = []
-
-    configured_image = str(inspection.get("Config", {}).get("Image", ""))
-    if configured_image != image:
-        problems.append(
-            f"wrong image ({configured_image or 'missing'}, expected {image})"
-        )
-
-    networks = inspection.get("NetworkSettings", {}).get("Networks", {}) or {}
-    if network not in networks:
-        problems.append(f"not connected to network {network}")
-
-    configured_bindings = inspection.get("HostConfig", {}).get("PortBindings", {}) or {}
-    for container_port, expected_host_port in port_bindings.items():
-        entries = configured_bindings.get(container_port) or []
-        actual_ports = {
-            str(entry.get("HostPort", ""))
-            for entry in entries
-            if isinstance(entry, dict)
-        }
-        if expected_host_port not in actual_ports:
-            problems.append(
-                f"missing port mapping {expected_host_port}:{container_port.split('/')[0]}"
-            )
-
-    return not problems, problems
-
-
-def remove_container(name: str) -> None:
-    print(f"[*] Removing invalid container {name}...")
-    run(["docker", "rm", "-f", name], required=False, timeout=180)
-
-
-def ensure_container(
-    name: str,
-    create_command: list[str],
-    *,
-    image: str,
-    network: str,
-    port_bindings: dict[str, str],
-    readiness_url: str,
-    readiness_attempts: int = 60,
-) -> None:
-    """
-    Reuse a correctly configured and healthy container.
-
-    If the container is missing, incorrectly configured, cannot start, or does
-    not answer its readiness endpoint, remove it and recreate it from scratch.
-    """
-    inspection = docker_inspect_container(name)
-
-    if inspection is not None:
-        valid, problems = container_matches(
-            inspection,
-            image=image,
-            network=network,
-            port_bindings=port_bindings,
-        )
-
-        if valid:
-            running = bool(inspection.get("State", {}).get("Running"))
-            if running:
-                print(f"[+] Container {name} exists and is correctly configured.")
-            else:
-                print(f"[*] Container {name} is valid but stopped. Starting it...")
-                started = run(
-                    ["docker", "start", name],
-                    required=False,
-                    capture=True,
-                    timeout=180,
-                )
-                if started.returncode != 0:
-                    print(f"[!] Container {name} could not be started.")
-                    valid = False
-
-            if valid and wait_http(readiness_url, attempts=readiness_attempts):
-                print(f"[+] Container {name} is ready.")
-                return
-
-            if valid:
-                print(
-                    f"[!] Container {name} did not pass the readiness check "
-                    f"at {readiness_url}."
-                )
-        else:
-            print(f"[!] Container {name} is invalid: {', '.join(problems)}")
-
-        remove_container(name)
-    else:
-        print(f"[*] Container {name} does not exist.")
-
-    print(f"[*] Creating container {name} from scratch...")
-    created = run(create_command, required=False, capture=True, timeout=1200)
-    if created.returncode != 0:
-        raise RuntimeError(
-            f"Could not create container {name}. "
-            f"Check whether its host port is already in use."
-        )
-
-    if not wait_http(readiness_url, attempts=readiness_attempts):
-        run(
-            ["docker", "logs", "--tail", "100", name],
-            required=False,
-            capture=True,
-            timeout=60,
-        )
-        raise RuntimeError(
-            f"Container {name} was recreated but is not ready at {readiness_url}. "
-            f"Inspect the Docker logs shown above."
-        )
-
-    print(f"[+] Container {name} was recreated successfully and is ready.")
 
 def wait_http(url: str, attempts: int = 60) -> bool:
     for _ in range(attempts):
@@ -798,255 +307,143 @@ def wait_http(url: str, attempts: int = 60) -> bool:
     return False
 
 
-def create_wordlist() -> None:
-    WORDLISTS_DIR.mkdir(parents=True, exist_ok=True)
-    words = [
-        "admin", "api", "assets", "backup", "config", "css", "docs", "images",
-        "index.php", "js", "login.php", "logout.php", "robots.txt", "server-status",
-        "setup.php", "uploads", "vulnerabilities",
-    ]
-    (WORDLISTS_DIR / "common.txt").write_text(
-        "\n".join(words) + "\n",
-        encoding="utf-8",
-    )
+def inspect_container(name: str) -> dict[str, Any] | None:
+    result = run(["docker", "inspect", name], required=False, capture=True, show_output=False, timeout=60)
+    if result.returncode:
+        return None
+    try:
+        value = json.loads(result.stdout)
+        return value[0] if isinstance(value, list) and value else None
+    except json.JSONDecodeError:
+        return None
 
 
-def initialize_and_login_dvwa(target: str) -> str:
-    """Reset DVWA and return the authenticated Cookie header value."""
-    base = target.rstrip("/")
-    if not wait_http(f"{base}/login.php"):
-        raise RuntimeError("DVWA did not become reachable.")
+def container_valid(info: dict[str, Any], image: str, network: str, ports: dict[str, str]) -> bool:
+    if info.get("Config", {}).get("Image") != image or network not in (info.get("NetworkSettings", {}).get("Networks", {}) or {}):
+        return False
+    bindings = info.get("HostConfig", {}).get("PortBindings", {}) or {}
+    return all(host in {str(item.get("HostPort", "")) for item in bindings.get(container, [])} for container, host in ports.items())
 
+
+def ensure_network(name: str) -> None:
+    if run(["docker", "network", "inspect", name], required=False, capture=True, show_output=False, timeout=60).returncode:
+        run(["docker", "network", "create", name], timeout=60)
+
+
+def ensure_container(name: str, image: str, ports: dict[str, str], readiness_url: str, run_options: list[str] | None = None, command: list[str] | None = None, attempts: int = 90) -> None:
+    info = inspect_container(name)
+    if info and container_valid(info, image, "secops-net", ports):
+        if not info.get("State", {}).get("Running"):
+            run(["docker", "start", name], required=False, timeout=180)
+        if wait_http(readiness_url, attempts):
+            print(f"[+] Container {name} is ready.")
+            return
+    if info:
+        run(["docker", "rm", "-f", name], required=False, timeout=180)
+    port_args = [item for container, host in ports.items() for item in ("-p", f"{host}:{container.split('/')[0]}")]
+    run(["docker", "run", "-d", "--name", name, "--network", "secops-net", *port_args, *(run_options or []), image, *(command or [])], timeout=1200)
+    if not wait_http(readiness_url, attempts):
+        run(["docker", "logs", "--tail", "100", name], required=False, capture=True, timeout=60)
+        raise RuntimeError(f"Container {name} is not ready at {readiness_url}.")
+
+
+def login_dvwa() -> str:
+    if not wait_http(f"{TARGET}/login.php", 90):
+        raise RuntimeError("DVWA is not reachable.")
     session = requests.Session()
-    session.get(f"{base}/setup.php", timeout=15).raise_for_status()
-    setup_response = session.post(
-        f"{base}/setup.php",
-        data={"create_db": "Create / Reset Database"},
-        timeout=20,
-        allow_redirects=True,
-    )
-    setup_response.raise_for_status()
-
-    login_page = session.get(f"{base}/login.php", timeout=15)
-    login_page.raise_for_status()
-    token_match = re.search(
-        r'name=["\']user_token["\']\s+value=["\']([^"\']+)',
-        login_page.text,
-        re.IGNORECASE,
-    )
+    session.get(f"{TARGET}/setup.php", timeout=15).raise_for_status()
+    session.post(f"{TARGET}/setup.php", data={"create_db": "Create / Reset Database"}, timeout=20).raise_for_status()
+    page = session.get(f"{TARGET}/login.php", timeout=15)
+    token = re.search(r'name=["\']user_token["\'][^>]*value=["\']([^"\']+)', page.text, re.I)
     credentials = {"username": "admin", "password": "password", "Login": "Login"}
-    if token_match:
-        credentials["user_token"] = token_match.group(1)
-
-    login_response = session.post(
-        f"{base}/login.php",
-        data=credentials,
-        timeout=20,
-        allow_redirects=True,
-    )
-    if (
-        "login.php" in login_response.url.lower()
-        or "login :: damn vulnerable" in login_response.text.lower()
-    ):
+    if token:
+        credentials["user_token"] = token.group(1)
+    response = session.post(f"{TARGET}/login.php", data=credentials, timeout=20, allow_redirects=True)
+    if "login.php" in response.url.lower() or "login :: damn vulnerable" in response.text.lower():
         raise RuntimeError("Automatic DVWA login failed.")
-
     session.cookies.set("security", "low")
-    cookie = "; ".join(
-        f"{name}={value}" for name, value in session.cookies.get_dict().items()
-    )
+    cookie = "; ".join(f"{name}={value}" for name, value in session.cookies.get_dict().items())
     if "PHPSESSID=" not in cookie:
-        raise RuntimeError("DVWA login succeeded without a PHP session cookie.")
+        raise RuntimeError("DVWA did not issue PHPSESSID.")
     return cookie
 
 
-def setup_local_lab(model: str) -> str:
-    """Start DVWA, ZAP and Ollama, pull the model, and authenticate to DVWA."""
+def setup_lab(model: str) -> str:
     if not shutil.which("docker"):
         raise RuntimeError("Docker is required for --with-lab.")
-
     run(["docker", "info"], timeout=60)
     ensure_network("secops-net")
-
+    ensure_container("dvwa", "vulnerables/web-dvwa", {"80/tcp": "80"}, f"{TARGET}/login.php")
     ensure_container(
-        "dvwa",
-        [
-            "docker", "run", "-d", "--name", "dvwa",
-            "--network", "secops-net", "-p", "80:80",
-            "vulnerables/web-dvwa",
-        ],
-        image="vulnerables/web-dvwa",
-        network="secops-net",
-        port_bindings={"80/tcp": "80"},
-        readiness_url=f"{DEFAULT_TARGET}/login.php",
-        readiness_attempts=90,
+        "zap_mcp", "zaproxy/zap-stable", {"8080/tcp": "8080"},
+        "http://127.0.0.1:8080/JSON/core/view/version/",
+        command=["zap.sh", "-daemon", "-host", "0.0.0.0", "-port", "8080", "-config", "api.disablekey=true", "-config", "api.addrs.addr.name=.*", "-config", "api.addrs.addr.regex=true"], attempts=120,
     )
-    ensure_container(
-        "zap_mcp",
-        [
-            "docker", "run", "-d", "--name", "zap_mcp",
-            "--network", "secops-net", "-p", "8080:8080",
-            "zaproxy/zap-stable", "zap.sh", "-daemon",
-            "-host", "0.0.0.0", "-port", "8080",
-            "-config", "api.disablekey=true",
-            "-config", "api.addrs.addr.name=.*",
-            "-config", "api.addrs.addr.regex=true",
-        ],
-        image="zaproxy/zap-stable",
-        network="secops-net",
-        port_bindings={"8080/tcp": "8080"},
-        readiness_url="http://127.0.0.1:8080/JSON/core/view/version/",
-        readiness_attempts=120,
-    )
-    ensure_container(
-        "ollama_secops",
-        [
-            "docker", "run", "-d", "--name", "ollama_secops",
-            "--network", "secops-net", "-p", "11434:11434",
-            "-v", "ollama_secops:/root/.ollama", "ollama/ollama",
-        ],
-        image="ollama/ollama",
-        network="secops-net",
-        port_bindings={"11434/tcp": "11434"},
-        readiness_url="http://127.0.0.1:11434/api/tags",
-        readiness_attempts=120,
-    )
-
-    run(
-        ["docker", "exec", "ollama_secops", "ollama", "pull", model],
-        timeout=7200,
-    )
-    return initialize_and_login_dvwa(DEFAULT_TARGET)
+    ensure_container("ollama_secops", "ollama/ollama", {"11434/tcp": "11434"}, "http://127.0.0.1:11434/api/tags", run_options=["-v", "ollama_secops:/root/.ollama"], attempts=120)
+    run(["docker", "exec", "ollama_secops", "ollama", "pull", model], timeout=7200)
+    return login_dvwa()
 
 
-def print_cli_commands(cookie: str, model: str) -> None:
-    root = Path(ROOT_DIR)
-    init_command = [sys.executable, str(root / "initScript.py"), "--with-lab"]
-    preflight = [
-        sys.executable,
-        str(root / "orchestratorDeterministic.py"),
-        "--target",
-        DEFAULT_TARGET,
-        "--preflight-only",
-    ]
-    deterministic = [
-        sys.executable,
-        str(root / "orchestratorDeterministic.py"),
-        "--target",
-        DEFAULT_TARGET,
-        "--cookies",
-        cookie,
-    ]
-    agentic = [
-        sys.executable,
-        str(root / "orchestratorAgentic.py"),
-        "--target",
-        DEFAULT_TARGET,
-        "--cookies",
-        cookie,
-        "--model",
-        model,
-    ]
+def run_preflight() -> None:
+    script = ROOT / "orchestratorDeterministic.py"
+    result = run([sys.executable, str(script), "--target", TARGET, "--preflight-only"], required=False, capture=True, timeout=300, cwd=ROOT)
+    if result.returncode:
+        raise RuntimeError("The live orchestrator preflight failed.")
 
+
+def print_commands(cookie: str, model: str) -> None:
+    python = str(Path(sys.executable).resolve())
+    def show(script: str, *arguments: str) -> None:
+        print(subprocess.list2cmdline([python, str(ROOT / script), *arguments]))
     print("\n=== Commands to use from PowerShell ===")
-    print("\nInitialize/update tools and start the lab:")
-    print(subprocess.list2cmdline(init_command))
-    print("\nVerify scanner and MCP-server discovery:")
-    print(subprocess.list2cmdline(preflight))
-    print("\nDeterministic — anonymous + authenticated:")
-    print(subprocess.list2cmdline(deterministic))
-    print("\nDeterministic — authenticated only:")
-    print(subprocess.list2cmdline([*deterministic, "--auth-only"]))
-    print("\nAgentic — anonymous + authenticated:")
-    print(subprocess.list2cmdline(agentic))
-    print("\nAgentic — authenticated only:")
-    print(subprocess.list2cmdline([*agentic, "--auth-only"]))
-    print(f"\nRuntime configuration: {RUNTIME_CONFIG_PATH}")
+    show("initScript.py", "--with-lab")
+    show("orchestratorDeterministic.py", "--target", TARGET, "--preflight-only")
+    show("orchestratorDeterministic.py", "--target", TARGET, "--cookies", cookie)
+    show("orchestratorDeterministic.py", "--target", TARGET, "--cookies", cookie, "--auth-only")
+    show("orchestratorAgentic.py", "--target", TARGET, "--cookies", cookie, "--model", model)
+    show("orchestratorAgentic.py", "--target", TARGET, "--cookies", cookie, "--model", model, "--auth-only")
 
-
-# -----------------------------------------------------------------------------
-# Main program
-# -----------------------------------------------------------------------------
 
 def main() -> int:
-    parser = argparse.ArgumentParser(
-        description="Initialize the FastMCP SecOps project and local laboratory."
-    )
-    parser.add_argument(
-        "--with-lab",
-        action="store_true",
-        help="Start DVWA, ZAP and Ollama and create an authenticated DVWA session.",
-    )
-    parser.add_argument(
-        "--run",
-        choices=("none", "deterministic", "agentic"),
-        default="none",
-    )
+    print(f"=== SecOps initializer [{BUILD_ID}] ===")
+    parser = argparse.ArgumentParser(description="Initialize the FastMCP SecOps project and local lab.")
+    parser.add_argument("--with-lab", action="store_true")
+    parser.add_argument("--run", choices=("none", "deterministic", "agentic"), default="none")
     parser.add_argument("--model", default=DEFAULT_MODEL)
-    parser.add_argument(
-        "--skip-preflight",
-        action="store_true",
-        help="Skip the orchestrator preflight after installation.",
-    )
-    parser.add_argument(
-        "--skip-scanners",
-        action="store_true",
-        help="Install only Python dependencies; do not install external scanners.",
-    )
+    parser.add_argument("--skip-preflight", action="store_true")
+    parser.add_argument("--skip-scanners", action="store_true")
+    parser.add_argument("--version", action="version", version=BUILD_ID)
     args = parser.parse_args()
 
-    os.chdir(ROOT_DIR)
+    os.chdir(ROOT)
     setup_path()
-    configure_runtime_path()
+    configure_path()
     print("=== SecOps FastMCP initialization ===")
-
     try:
-        install_python_dependencies()
+        install_python_packages()
         create_wordlist()
-
         if not args.skip_scanners:
-            install_all_scanners()
-            scanner_paths = print_cli_status(fail_on_missing=True)
-        else:
-            scanner_paths = print_cli_status(fail_on_missing=False)
-
-        write_runtime_config(scanner_paths)
+            install_scanners()
+        status = verify_scanners(required=not args.skip_scanners)
+        write_runtime_config(status)
         if not args.skip_preflight:
-            run_project_preflight()
-
+            run_preflight()
         cookie = ""
         if args.with_lab:
-            cookie = setup_local_lab(args.model)
-            print("\n[+] DVWA login created successfully.")
-            print(f"[+] Cookie header: {cookie}")
-            print_cli_commands(cookie, args.model)
-
+            cookie = setup_lab(args.model)
+            print(f"\n[+] DVWA login created successfully.\n[+] Cookie header: {cookie}")
+            print_commands(cookie, args.model)
         if args.run != "none":
             if not cookie:
-                raise RuntimeError(
-                    "--run requires --with-lab so the login cookie can be created."
-                )
-
-            script = ROOT_DIR / (
-                "orchestratorAgentic.py"
-                if args.run == "agentic"
-                else "orchestratorDeterministic.py"
-            )
-            command = [
-                sys.executable,
-                str(script),
-                "--target", DEFAULT_TARGET,
-                "--cookies", cookie,
-            ]
+                raise RuntimeError("--run requires --with-lab.")
+            script = "orchestratorAgentic.py" if args.run == "agentic" else "orchestratorDeterministic.py"
+            command = [sys.executable, str(ROOT / script), "--target", TARGET, "--cookies", cookie]
             if args.run == "agentic":
-                command.extend(["--model", args.model])
-            return run(command, required=False, timeout=7200).returncode
-
+                command += ["--model", args.model]
+            return run(command, required=False, timeout=7200, cwd=ROOT).returncode
         return 0
     except Exception as exc:
-        print(
-            f"[-] Initialization failed: {type(exc).__name__}: {exc}",
-            file=sys.stderr,
-        )
+        print(f"[-] Initialization failed: {type(exc).__name__}: {exc}", file=sys.stderr)
         return 1
 
 

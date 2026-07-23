@@ -3,77 +3,37 @@ from __future__ import annotations
 import argparse
 import ast
 import asyncio
-import html as html_lib
+import html
 import importlib.util
 import json
 import os
 import re
 import shutil
+import subprocess
 import sys
 import sysconfig
 import time
 import traceback
-from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from html.parser import HTMLParser
 from pathlib import Path
-from typing import Any, Iterator, TypedDict
+from typing import Any, Iterator
 from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 
 import requests
 from fastmcp import Client
-from langgraph.graph import END, START, StateGraph
+from fastmcp.client.transports import StdioTransport
 
 from utils import ROOT_DIR, SERVERS_DIR, absolute_url, normalize_url, same_origin
 
-
-DEFAULT_MCP_TIMEOUT = float(os.getenv("SECOPS_MCP_TIMEOUT", "900"))
+ROOT = Path(ROOT_DIR).resolve()
+SERVERS = Path(SERVERS_DIR).resolve()
+RUNTIME_FILE = ROOT / ".secops_runtime.json"
+LOCAL_BIN = Path.home() / ".local" / "bin"
+MCP_CONNECT_TIMEOUT = float(os.getenv("SECOPS_MCP_CONNECT_TIMEOUT", "20"))
+MCP_TOOL_TIMEOUT = float(os.getenv("SECOPS_MCP_TIMEOUT", "900"))
 MAX_PARAMETER_ENDPOINTS = max(1, int(os.getenv("SECOPS_MAX_PARAMETER_ENDPOINTS", "5")))
-
-
-class LinkFormParser(HTMLParser):
-    """Small dependency-free HTML parser used for same-origin discovery."""
-
-    def __init__(self) -> None:
-        super().__init__()
-        self.links: list[str] = []
-        self.forms: list[dict[str, Any]] = []
-        self._current_form: dict[str, Any] | None = None
-
-    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
-        values = dict(attrs)
-        normalized_tag = tag.lower()
-        if normalized_tag == "a" and values.get("href"):
-            self.links.append(str(values["href"]))
-        elif normalized_tag == "form":
-            self._current_form = {
-                "action": values.get("action", ""),
-                "method": str(values.get("method", "get")).lower(),
-                "parameters": [],
-            }
-        elif normalized_tag in {"input", "textarea", "select", "button"} and self._current_form is not None:
-            name = values.get("name")
-            if name:
-                self._current_form["parameters"].append(str(name))
-
-    def handle_endtag(self, tag: str) -> None:
-        if tag.lower() == "form" and self._current_form is not None:
-            self.forms.append(self._current_form)
-            self._current_form = None
-
-
-class OrchestratorState(TypedDict):
-    target: str
-    profiles: list[dict[str, str]]
-    discovery_by_profile: dict[str, dict[str, Any]]
-    discovered_urls: list[str]
-    parameterized_urls: list[str]
-    jwt_tokens: list[str]
-    interactsh_injection_url: str
-    results: dict[str, dict[str, Any]]
-    diagnostics: list[dict[str, Any]]
-    report_status: dict[str, Any]
 
 
 @dataclass(frozen=True)
@@ -82,300 +42,329 @@ class ToolSpec:
     server: str
     tool: str
     executable: str = ""
+    module: str = ""
 
 
-TOOLS = [
-    ToolSpec("zap", "zapServer.py", "run_zap_scan"),
+BASE_TOOLS = (
+    ToolSpec("zap", "zapServer.py", "run_zap_scan", module="zapv2"),
     ToolSpec("nuclei", "nucleiServer.py", "run_nuclei_scan", "nuclei"),
     ToolSpec("nikto", "niktoServer.py", "run_nikto_scan", "nikto"),
     ToolSpec("ffuf", "ffufServer.py", "run_ffuf_fuzz", "ffuf"),
     ToolSpec("arjun", "arjunServer.py", "run_arjun_scan", "arjun"),
-]
-
-PARAMETER_TOOLS = [
+)
+PARAMETER_TOOLS = (
     ToolSpec("sqlmap", "sqlmapServer.py", "run_sqlmap_scan", "sqlmap"),
     ToolSpec("dalfox", "dalfoxServer.py", "run_dalfox_scan", "dalfox"),
     ToolSpec("commix", "commixServer.py", "run_commix_scan", "commix"),
     ToolSpec("idor", "idorForgeServer.py", "run_idor_check"),
-]
-
-OPTIONAL_TOOL_SPECS = [
-    ToolSpec("jwt", "jwtServer.py", "run_jwt_scan"),
+)
+OPTIONAL_TOOLS = (
+    ToolSpec("jwt", "jwtServer.py", "run_jwt_scan", module="jwt"),
     ToolSpec("interactsh", "interactshServer.py", "run_interactsh_client", "interactsh-client"),
-    ToolSpec("report", "pwndocServer.py", "generate_report"),
-]
-
-ALL_TOOL_SPECS = [*TOOLS, *PARAMETER_TOOLS, *OPTIONAL_TOOL_SPECS]
-SERVER_PYTHON_MODULES = {
-    "zapServer.py": "zapv2",
-    "jwtServer.py": "jwt",
-    "pwndocServer.py": "reportlab",
-}
-
-RUNTIME_CONFIG_PATH = Path(ROOT_DIR) / ".secops_runtime.json"
-LOCAL_TOOL_BIN = Path.home() / ".local" / "bin"
+    ToolSpec("report", "pwndocServer.py", "generate_report", module="reportlab"),
+)
+ALL_TOOLS = (*BASE_TOOLS, *PARAMETER_TOOLS, *OPTIONAL_TOOLS)
 
 
-def _add_path_directory(path: Path | str) -> None:
-    """Prepend an existing directory to PATH exactly once."""
-    candidate = Path(path).expanduser()
-    if not candidate.is_dir():
+# ---------------------------------------------------------------------------
+# Runtime, server and MCP handling
+# ---------------------------------------------------------------------------
+
+def _load_runtime() -> dict[str, Any]:
+    try:
+        value = json.loads(RUNTIME_FILE.read_text(encoding="utf-8"))
+        return value if isinstance(value, dict) else {}
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def _prepend_path(path: Path) -> None:
+    if not path.is_dir():
         return
-    resolved = str(candidate.resolve())
+    resolved = str(path.resolve())
     current = [part for part in os.environ.get("PATH", "").split(os.pathsep) if part]
-    normalized = {os.path.normcase(os.path.abspath(part)) for part in current}
-    if os.path.normcase(os.path.abspath(resolved)) not in normalized:
+    keys = {os.path.normcase(os.path.abspath(part)) for part in current}
+    if os.path.normcase(resolved) not in keys:
         os.environ["PATH"] = resolved + os.pathsep + os.environ.get("PATH", "")
 
 
-def _runtime_config() -> dict[str, Any]:
-    """Read executable locations persisted by initScript.py."""
-    try:
-        payload = json.loads(RUNTIME_CONFIG_PATH.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError, TypeError):
-        return {}
-    return payload if isinstance(payload, dict) else {}
-
-
 def configure_runtime_path() -> list[str]:
-    """
-    Rebuild the scanner PATH in each new Python process.
-
-    initScript.py stores release binaries and launchers under ~/.local/bin and
-    writes .secops_runtime.json. Python user Scripts directories are included
-    so Arjun remains discoverable after the initializer process exits.
-    """
-    candidates: list[Path] = []
-
-    configured = os.getenv("SECOPS_TOOL_BIN", "")
-    if configured:
-        candidates.extend(Path(item) for item in configured.split(os.pathsep) if item)
-
-    runtime = _runtime_config()
-    for item in runtime.get("tool_directories", []) or []:
-        if isinstance(item, str) and item.strip():
-            candidates.append(Path(item))
+    """Recreate the PATH written by initScript.py in every new process."""
+    runtime = _load_runtime()
+    candidates: list[Path] = [LOCAL_BIN]
+    candidates += [Path(value) for value in runtime.get("tool_directories", []) if isinstance(value, str)]
     executables = runtime.get("executables", {})
     if isinstance(executables, dict):
-        for value in executables.values():
-            if isinstance(value, str) and value.strip():
-                candidates.append(Path(value).expanduser().parent)
-
-    candidates.append(LOCAL_TOOL_BIN)
-
+        candidates += [Path(value).expanduser().parent for value in executables.values() if isinstance(value, str)]
     try:
-        scripts = sysconfig.get_path(
-            "scripts",
-            scheme="nt_user" if os.name == "nt" else "posix_user",
-        )
+        scripts = sysconfig.get_path("scripts", scheme="nt_user" if os.name == "nt" else "posix_user")
+        if scripts:
+            candidates.append(Path(scripts))
     except (KeyError, ValueError):
-        scripts = None
-    if scripts:
-        candidates.append(Path(scripts))
-
-    candidates.append(Path(sys.executable).resolve().parent)
-    candidates.append(
-        Path(sys.executable).resolve().parent / ("Scripts" if os.name == "nt" else "bin")
-    )
-
+        pass
     try:
         import site
         candidates.append(Path(site.USER_BASE) / ("Scripts" if os.name == "nt" else "bin"))
     except Exception:
         pass
 
-    if os.name == "nt":
-        version = f"Python{sys.version_info.major}{sys.version_info.minor}"
-        if os.getenv("APPDATA"):
-            candidates.append(Path(os.environ["APPDATA"]) / "Python" / version / "Scripts")
-        if os.getenv("LOCALAPPDATA"):
-            candidates.append(
-                Path(os.environ["LOCALAPPDATA"])
-                / "Programs"
-                / "Python"
-                / version
-                / "Scripts"
-            )
-
     added: list[str] = []
     seen: set[str] = set()
-    for candidate in candidates:
-        expanded = candidate.expanduser()
+    for path in candidates:
         try:
-            normalized = os.path.normcase(str(expanded.resolve()))
+            key = os.path.normcase(str(path.expanduser().resolve()))
         except OSError:
             continue
-        if normalized in seen:
+        if key in seen:
             continue
-        seen.add(normalized)
-        if expanded.is_dir():
-            _add_path_directory(expanded)
-            added.append(str(expanded.resolve()))
+        seen.add(key)
+        if path.expanduser().is_dir():
+            _prepend_path(path.expanduser())
+            added.append(str(path.expanduser().resolve()))
     return added
 
 
-def resolve_executable(command: str) -> str | None:
-    """Resolve a scanner command using the initializer's persisted locations."""
+def resolve_executable(name: str) -> str | None:
     configure_runtime_path()
-    resolved = shutil.which(command)
-    if resolved:
-        return str(Path(resolved).resolve())
-
-    runtime = _runtime_config()
-    executables = runtime.get("executables", {})
-    if isinstance(executables, dict):
-        configured = executables.get(command)
-        if isinstance(configured, str) and Path(configured).expanduser().is_file():
-            return str(Path(configured).expanduser().resolve())
-    return None
+    found = shutil.which(name)
+    if found:
+        return str(Path(found).resolve())
+    value = _load_runtime().get("executables", {}).get(name)
+    return str(Path(value).resolve()) if isinstance(value, str) and Path(value).is_file() else None
 
 
-def _server_candidates(server_file: str) -> list[Path]:
-    requested = Path(server_file).name
-    stem = Path(requested).stem
-    suffix = Path(requested).suffix or ".py"
-    exact = (Path(SERVERS_DIR) / requested).resolve()
-    candidates: list[Path] = [exact]
-
-    if Path(SERVERS_DIR).is_dir():
-        duplicate_pattern = re.compile(
-            rf"^{re.escape(stem)}\s*\(\d+\){re.escape(suffix)}$",
-            re.IGNORECASE,
-        )
-        for candidate in Path(SERVERS_DIR).iterdir():
-            if not candidate.is_file():
-                continue
-            if (
-                candidate.name.casefold() == requested.casefold()
-                or duplicate_pattern.fullmatch(candidate.name)
-            ):
-                resolved = candidate.resolve()
-                if resolved not in candidates:
-                    candidates.append(resolved)
-    return candidates
-
-
-def resolve_server_path(server_file: str, required_tool: str = "") -> Path:
-    """
-    Resolve a server by filename and MCP function contract.
-
-    An obsolete exact filename is not selected over a valid numbered copy.
-    Exact files are still preferred when they declare the required function.
-    """
-    candidates = _server_candidates(server_file)
-    existing = [candidate for candidate in candidates if candidate.is_file()]
-    if required_tool:
-        matching = [
-            candidate
-            for candidate in existing
-            if required_tool in _declared_function_names(candidate)
-        ]
-        if matching:
-            exact = candidates[0]
-            if exact in matching:
-                return exact
-            return max(matching, key=lambda path: path.stat().st_mtime)
-    if existing:
-        return existing[0]
-    return candidates[0]
-
-
-def _declared_function_names(path: Path) -> set[str]:
+def _declared_functions(path: Path) -> set[str]:
     try:
-        tree = ast.parse(path.read_text(encoding="utf-8", errors="replace"), filename=str(path))
+        tree = ast.parse(path.read_text(encoding="utf-8", errors="replace"))
     except (OSError, SyntaxError):
         return set()
-    return {node.name for node in ast.walk(tree) if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))}
+    return {
+        node.name
+        for node in ast.walk(tree)
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+    }
 
 
-def run_preflight_checks() -> list[dict[str, str]]:
-    """Verify shared PATH, server contracts, modules and external scanners."""
+def resolve_server_path(filename: str, required_tool: str = "") -> Path:
+    """Prefer a file that really declares the requested tool, including name(2).py copies."""
+    requested = Path(filename)
+    pattern = re.compile(
+        rf"^{re.escape(requested.stem)}\s*(?:\(\d+\))?{re.escape(requested.suffix or '.py')}$",
+        re.IGNORECASE,
+    )
+    candidates = [path.resolve() for path in SERVERS.iterdir() if path.is_file() and pattern.fullmatch(path.name)] if SERVERS.is_dir() else []
+    exact = (SERVERS / requested.name).resolve()
+    if exact.is_file() and exact not in candidates:
+        candidates.insert(0, exact)
+    if required_tool:
+        valid = [path for path in candidates if required_tool in _declared_functions(path)]
+        if exact in valid:
+            return exact
+        if valid:
+            return max(valid, key=lambda path: path.stat().st_mtime)
+    return exact if exact.is_file() else (max(candidates, key=lambda path: path.stat().st_mtime) if candidates else exact)
+
+
+def _server_python() -> str:
+    configured = _load_runtime().get("python_executable")
+    if isinstance(configured, str) and Path(configured).is_file():
+        return str(Path(configured).resolve())
+    return str(Path(sys.executable).resolve())
+
+
+def _server_env() -> dict[str, str]:
+    configure_runtime_path()
+    env = {str(key): str(value) for key, value in os.environ.items()}
+    paths = [part for part in env.get("PYTHONPATH", "").split(os.pathsep) if part]
+    if str(ROOT) not in paths:
+        paths.insert(0, str(ROOT))
+    env.update({
+        "PATH": os.environ.get("PATH", ""),
+        "PYTHONPATH": os.pathsep.join(paths),
+        "PYTHONUNBUFFERED": "1",
+        "PYTHONIOENCODING": "utf-8",
+        "SECOPS_PROJECT_ROOT": str(ROOT),
+    })
+    return env
+
+
+def _transport(server: Path) -> StdioTransport:
+    return StdioTransport(
+        command=_server_python(),
+        args=[str(server)],
+        env=_server_env(),
+        cwd=str(ROOT),
+        keep_alive=False,
+    )
+
+
+def _extract_response(response: Any) -> tuple[Any, bool, str]:
+    is_error = bool(getattr(response, "is_error", False) or getattr(response, "isError", False))
+    for name in ("data", "structured_content", "structuredContent"):
+        value = getattr(response, name, None)
+        if value is not None:
+            return value, is_error, name
+    content = getattr(response, "content", response)
+    if isinstance(content, list):
+        values = [getattr(item, "text", item.get("text") if isinstance(item, dict) else item) for item in content]
+        content = values[0] if len(values) == 1 else values
+    if isinstance(content, str):
+        try:
+            content = json.loads(content)
+        except json.JSONDecodeError:
+            pass
+    return content, is_error, "content"
+
+
+def diagnose_error(text: str) -> str:
+    lowered = text.lower()
+    rules = (
+        (("no such file", "not found", "winerror 2"), "missing_file_or_executable"),
+        (("no module named", "modulenotfounderror"), "missing_python_dependency"),
+        (("connection refused", "failed to establish"), "service_unreachable"),
+        (("timed out", "timeout"), "timeout"),
+        (("permission denied", "access is denied"), "permission_denied"),
+        (("tool not found", "method not found", "unknown tool"), "mcp_tool_name_mismatch"),
+        (("connection closed", "closedresourceerror", "end of file"), "mcp_server_crashed"),
+    )
+    return next((cause for needles, cause in rules if any(item in lowered for item in needles)), "scanner_or_mcp_error")
+
+
+def _normalize_result(data: Any, spec: ToolSpec, target: str, elapsed: float, is_error: bool, shape: str) -> dict[str, Any]:
+    if isinstance(data, dict):
+        result = dict(data)
+    else:
+        result = {
+            "tool": spec.name,
+            "status": "error" if is_error else "success",
+            "target": target,
+            "output": data if isinstance(data, str) else json.dumps(data, ensure_ascii=False, default=str),
+            "vulnerabilities": [],
+        }
+    result.setdefault("tool", spec.name)
+    result.setdefault("target", target)
+    result.setdefault("output", "")
+    result.setdefault("vulnerabilities", [])
+    status = "error" if is_error else str(result.get("status", "success")).lower()
+    result["status"] = status if status in {"success", "error", "skipped", "partial"} else "error"
+    result["_meta"] = {
+        "server": spec.server,
+        "resolved_server": str(resolve_server_path(spec.server, spec.tool)),
+        "duration_seconds": round(elapsed, 3),
+        "response_shape": shape,
+    }
+    if result["status"] == "error":
+        result.setdefault("diagnosis", diagnose_error(str(result.get("output", ""))))
+    return result
+
+
+def _startup_stderr(server: Path) -> str:
+    """Capture immediate import/startup failures without pretending to speak MCP."""
+    try:
+        process = subprocess.Popen(
+            [_server_python(), str(server)],
+            cwd=str(ROOT), env=_server_env(), stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            text=True, encoding="utf-8", errors="replace",
+        )
+        time.sleep(0.5)
+        if process.poll() is None:
+            process.terminate()
+        _, stderr = process.communicate(timeout=3)
+        return stderr[-6000:].strip()
+    except Exception as exc:
+        return f"Startup probe failed: {type(exc).__name__}: {exc}"
+
+
+async def call_mcp(server_file: str, tool_name: str, arguments: dict[str, Any], timeout_seconds: float = MCP_TOOL_TIMEOUT) -> dict[str, Any]:
+    spec = next((item for item in ALL_TOOLS if item.server == server_file and item.tool == tool_name), ToolSpec(tool_name, server_file, tool_name))
+    server = resolve_server_path(server_file, tool_name)
+    target = str(arguments.get("target_url", ""))
+    started = time.monotonic()
+    if not server.is_file():
+        return {"tool": spec.name, "status": "error", "target": target, "output": f"MCP server not found: {server}", "vulnerabilities": [], "diagnosis": "missing_mcp_server_file"}
+
+    async def invoke() -> tuple[Any, bool, str]:
+        async with Client(_transport(server)) as client:
+            return _extract_response(await client.call_tool(tool_name, arguments))
+
+    try:
+        data, is_error, shape = await asyncio.wait_for(invoke(), timeout=timeout_seconds + MCP_CONNECT_TIMEOUT)
+        result = _normalize_result(data, spec, target, time.monotonic() - started, is_error, shape)
+    except (KeyboardInterrupt, asyncio.CancelledError):
+        raise
+    except Exception as exc:
+        stderr = _startup_stderr(server)
+        message = f"MCP communication failed: {type(exc).__name__}: {exc}"
+        if stderr:
+            message += f" | server stderr: {stderr}"
+        result = {
+            "tool": spec.name, "status": "error", "target": target,
+            "output": message, "vulnerabilities": [],
+            "diagnosis": diagnose_error(message),
+            "traceback": traceback.format_exc(),
+            "_meta": {"server": str(server), "duration_seconds": round(time.monotonic() - started, 3)},
+        }
+    if result.get("status") == "error":
+        print(f"\n[SCANNER ERROR] {spec.name}: {target}\n  {result.get('output', '')}", file=sys.stderr)
+    return result
+
+
+async def _live_server_check(spec: ToolSpec) -> dict[str, str]:
+    server = resolve_server_path(spec.server, spec.tool)
+    try:
+        async def check() -> list[str]:
+            async with Client(_transport(server)) as client:
+                tools = await client.list_tools()
+                return [str(getattr(tool, "name", "")) for tool in tools]
+        names = await asyncio.wait_for(check(), timeout=MCP_CONNECT_TIMEOUT)
+        if spec.tool not in names:
+            return {"level": "error", "component": spec.name, "cause": "mcp_runtime_tool_missing", "detail": f"{server.name} exposed {names!r}"}
+        return {"level": "ok", "component": spec.name, "cause": "mcp_stdio_handshake_ok", "detail": f"{server.name}: {spec.tool}()"}
+    except Exception as exc:
+        stderr = _startup_stderr(server)
+        detail = f"{type(exc).__name__}: {exc}" + (f" | server stderr: {stderr}" if stderr else "")
+        return {"level": "error", "component": spec.name, "cause": "mcp_stdio_handshake_failed", "detail": detail}
+
+
+def run_preflight_checks(*, include_live: bool = True) -> list[dict[str, str]]:
     configure_runtime_path()
     checks: list[dict[str, str]] = []
     seen_executables: set[str] = set()
-
-    for spec in ALL_TOOL_SPECS:
-        path = resolve_server_path(spec.server, spec.tool)
-        if not path.is_file():
-            checks.append({
-                "level": "error",
-                "component": spec.name,
-                "cause": "missing_server",
-                "detail": str(path),
-            })
+    for spec in ALL_TOOLS:
+        server = resolve_server_path(spec.server, spec.tool)
+        if not server.is_file():
+            checks.append({"level": "error", "component": spec.name, "cause": "missing_server", "detail": str(server)})
             continue
-
-        checks.append({
-            "level": "ok",
-            "component": spec.name,
-            "cause": "server_found",
-            "detail": str(path),
-        })
-
-        names = _declared_function_names(path)
-        if spec.tool not in names:
+        checks.append({"level": "ok", "component": spec.name, "cause": "mcp_tool_found", "detail": f"{server.name}: {spec.tool}()"})
+        if spec.tool not in _declared_functions(server):
+            checks[-1] = {"level": "error", "component": spec.name, "cause": "mcp_tool_name_mismatch", "detail": f"{server.name} does not declare {spec.tool}()"}
+        if spec.module:
             checks.append({
-                "level": "error",
+                "level": "ok" if importlib.util.find_spec(spec.module) else "error",
                 "component": spec.name,
-                "cause": "mcp_tool_name_mismatch",
-                "detail": f"{path.name} does not declare {spec.tool}()",
+                "cause": "python_dependency_found" if importlib.util.find_spec(spec.module) else "missing_python_dependency",
+                "detail": spec.module,
             })
-        else:
-            checks.append({
-                "level": "ok",
-                "component": spec.name,
-                "cause": "mcp_tool_found",
-                "detail": f"{path.name}: {spec.tool}()",
-            })
-
-        module = SERVER_PYTHON_MODULES.get(spec.server)
-        if module:
-            if importlib.util.find_spec(module) is None:
-                checks.append({
-                    "level": "error",
-                    "component": spec.name,
-                    "cause": "missing_python_dependency",
-                    "detail": f"Python module not installed: {module}",
-                })
-            else:
-                checks.append({
-                    "level": "ok",
-                    "component": spec.name,
-                    "cause": "python_dependency_found",
-                    "detail": module,
-                })
-
         if spec.executable and spec.executable not in seen_executables:
             seen_executables.add(spec.executable)
-            resolved = resolve_executable(spec.executable)
-            if resolved is None:
-                checked = configure_runtime_path()
-                checks.append({
-                    "level": "error",
-                    "component": spec.name,
-                    "cause": "missing_executable",
-                    "detail": (
-                        f"Executable not found: {spec.executable}. "
-                        f"Runtime config: {RUNTIME_CONFIG_PATH}. "
-                        f"Directories checked: {checked}"
-                    ),
-                })
-            else:
-                checks.append({
-                    "level": "ok",
-                    "component": spec.name,
-                    "cause": "executable_found",
-                    "detail": resolved,
-                })
-
+            executable = resolve_executable(spec.executable)
+            checks.append({
+                "level": "ok" if executable else "error",
+                "component": spec.name,
+                "cause": "executable_found" if executable else "missing_executable",
+                "detail": executable or f"Not found: {spec.executable}; runtime={RUNTIME_FILE}",
+            })
+    if include_live and not any(item["level"] == "error" for item in checks):
+        checks.extend(asyncio.run(_run_live_checks()))
     if not any(item["level"] == "error" for item in checks):
-        checks.append({
-            "level": "ok",
-            "component": "mcp",
-            "cause": "preflight_passed",
-            "detail": "All server contracts, modules and scanner executables were found.",
-        })
+        checks.append({"level": "ok", "component": "mcp", "cause": "preflight_passed", "detail": "All contracts, executables and MCP STDIO handshakes passed."})
     return checks
+
+
+async def _run_live_checks() -> list[dict[str, str]]:
+    return [await _live_server_check(spec) for spec in ALL_TOOLS]
+
 
 def print_preflight_report(checks: list[dict[str, str]], *, show_ok: bool = False) -> int:
     errors = [item for item in checks if item["level"] == "error"]
@@ -384,900 +373,315 @@ def print_preflight_report(checks: list[dict[str, str]], *, show_ok: bool = Fals
         print("\n=== SecOps preflight ===")
         for item in visible:
             marker = "+" if item["level"] == "ok" else "-"
-            stream = sys.stdout if item["level"] == "ok" else sys.stderr
-            print(
-                f"[{marker}] {item['component']}: {item['cause']} — {item['detail']}",
-                file=stream,
-            )
+            print(f"[{marker}] {item['component']}: {item['cause']} — {item['detail']}", file=sys.stdout if marker == "+" else sys.stderr)
     return len(errors)
 
 
-def cookie_string(cookie_jar: requests.cookies.RequestsCookieJar) -> str:
-    return "; ".join(f"{cookie.name}={cookie.value}" for cookie in cookie_jar)
+# ---------------------------------------------------------------------------
+# Discovery and result helpers
+# ---------------------------------------------------------------------------
+
+class LinkFormParser(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__()
+        self.links: list[str] = []
+        self.forms: list[dict[str, Any]] = []
+        self.current: dict[str, Any] | None = None
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        values = dict(attrs)
+        tag = tag.lower()
+        if tag == "a" and values.get("href"):
+            self.links.append(str(values["href"]))
+        elif tag == "form":
+            self.current = {"action": values.get("action", ""), "method": str(values.get("method", "get")).lower(), "parameters": []}
+        elif tag in {"input", "textarea", "select", "button"} and self.current and values.get("name"):
+            self.current["parameters"].append(str(values["name"]))
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag.lower() == "form" and self.current:
+            self.forms.append(self.current)
+            self.current = None
 
 
-def _without_fragment(url: str) -> str:
-    parsed = urlparse(url)
-    return urlunparse(parsed._replace(fragment=""))
+def _clean_url(url: str) -> str:
+    return urlunparse(urlparse(url)._replace(fragment=""))
 
 
 def discover_target(target: str, cookies: str, max_pages: int = 25) -> dict[str, Any]:
-    """Crawl same-origin HTML pages and return URLs, parameters, JWTs and crawl errors."""
     session = requests.Session()
-    session.headers.update({
-        "User-Agent": "SecOpsAgent-University/1.1",
-        "Accept": "text/html,application/xhtml+xml,application/json;q=0.8,*/*;q=0.5",
-    })
+    session.headers.update({"User-Agent": "SecOpsAgent-University/1.2", "Accept": "text/html,*/*;q=0.5"})
     if cookies:
         session.headers["Cookie"] = cookies
-
-    queue = [_without_fragment(target)]
-    visited: set[str] = set()
-    parameterized: set[str] = set()
-    jwt_tokens: set[str] = set()
-    errors: list[dict[str, str]] = []
-
+    queue, visited = [_clean_url(target)], set()
+    parameterized, tokens, errors = set(), set(), []
     while queue and len(visited) < max_pages:
         url = queue.pop(0)
         if url in visited:
             continue
         visited.add(url)
-
         try:
             response = session.get(url, timeout=(5, 15), allow_redirects=True)
         except requests.RequestException as exc:
-            errors.append({
-                "url": url,
-                "type": type(exc).__name__,
-                "message": str(exc),
-            })
+            errors.append({"url": url, "type": type(exc).__name__, "message": str(exc)})
             continue
-
-        final_url = _without_fragment(response.url)
-        if not same_origin(target, final_url):
-            errors.append({
-                "url": url,
-                "type": "CrossOriginRedirect",
-                "message": f"Redirected outside target origin: {final_url}",
-            })
+        final = _clean_url(response.url)
+        if not same_origin(target, final):
+            errors.append({"url": url, "type": "CrossOriginRedirect", "message": final})
             continue
-
         if response.status_code >= 400:
-            errors.append({
-                "url": final_url,
-                "type": f"HTTP{response.status_code}",
-                "message": response.reason or "HTTP error",
-            })
-
-        content_type = response.headers.get("content-type", "").lower()
-        looks_like_html = "html" in content_type or response.text.lstrip().startswith(("<", "<!"))
-        if not looks_like_html:
+            errors.append({"url": final, "type": f"HTTP{response.status_code}", "message": response.reason})
+        if "html" not in response.headers.get("content-type", "").lower() and not response.text.lstrip().startswith("<"):
             continue
-
-        for token in re.findall(
-            r"eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]*",
-            response.text,
-        ):
-            jwt_tokens.add(token)
-
+        tokens.update(re.findall(r"eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]*", response.text))
         parser = LinkFormParser()
         try:
             parser.feed(response.text)
-            parser.close()
         except Exception as exc:
-            errors.append({
-                "url": final_url,
-                "type": type(exc).__name__,
-                "message": f"HTML parsing failed: {exc}",
-            })
+            errors.append({"url": final, "type": type(exc).__name__, "message": f"HTML parse: {exc}"})
             continue
-
-        for candidate in parser.links:
+        for href in parser.links:
             try:
-                absolute = _without_fragment(absolute_url(final_url, candidate))
-            except Exception as exc:
-                errors.append({
-                    "url": final_url,
-                    "type": type(exc).__name__,
-                    "message": f"Invalid discovered link {candidate!r}: {exc}",
-                })
+                candidate = _clean_url(absolute_url(final, href))
+            except Exception:
                 continue
-            if not same_origin(target, absolute):
-                continue
-            if urlparse(absolute).query:
-                parameterized.add(absolute)
-            if absolute not in visited and absolute not in queue:
-                queue.append(absolute)
-
+            if same_origin(target, candidate):
+                if urlparse(candidate).query:
+                    parameterized.add(candidate)
+                if candidate not in visited and candidate not in queue:
+                    queue.append(candidate)
         for form in parser.forms:
-            try:
-                action = _without_fragment(absolute_url(final_url, form["action"] or final_url))
-            except Exception as exc:
-                errors.append({
-                    "url": final_url,
-                    "type": type(exc).__name__,
-                    "message": f"Invalid form action: {exc}",
-                })
+            action = _clean_url(absolute_url(final, form["action"] or final))
+            if not same_origin(target, action) or form["method"] != "get":
                 continue
-            if not same_origin(target, action):
-                continue
-            parameters = list(dict.fromkeys(form["parameters"]))
-            if form["method"] == "get" and parameters:
-                parsed = urlparse(action)
-                existing = dict(parse_qsl(parsed.query, keep_blank_values=True))
-                for name in parameters:
-                    existing.setdefault(name, "1")
-                parameterized.add(urlunparse(parsed._replace(query=urlencode(existing))))
-
-    return {
-        "urls": sorted(visited),
-        "parameterized_urls": sorted(parameterized),
-        "jwt_tokens": sorted(jwt_tokens),
-        "errors": errors,
-    }
-
-
-def parameter_signature(url: str) -> tuple[str, str, str, tuple[str, ...]]:
-    parsed = urlparse(url)
-    names = tuple(sorted({name for name, _ in parse_qsl(parsed.query, keep_blank_values=True)}))
-    return parsed.scheme.lower(), parsed.netloc.lower(), parsed.path, names
+            values = dict(parse_qsl(urlparse(action).query, keep_blank_values=True))
+            for name in dict.fromkeys(form["parameters"]):
+                values.setdefault(name, "1")
+            if values:
+                parameterized.add(urlunparse(urlparse(action)._replace(query=urlencode(values))))
+    return {"urls": sorted(visited), "parameterized_urls": sorted(parameterized), "jwt_tokens": sorted(tokens), "errors": errors}
 
 
 def select_parameterized_urls(urls: list[str], limit: int = MAX_PARAMETER_ENDPOINTS) -> list[str]:
-    """Keep one representative per endpoint/parameter-name combination."""
-    selected: list[str] = []
-    seen: set[tuple[str, str, str, tuple[str, ...]]] = set()
+    selected, seen = [], set()
     for url in sorted(urls):
-        signature = parameter_signature(url)
+        parsed = urlparse(url)
+        signature = (parsed.scheme.lower(), parsed.netloc.lower(), parsed.path, tuple(sorted({name for name, _ in parse_qsl(parsed.query, keep_blank_values=True)})))
         if not signature[3] or signature in seen:
             continue
         seen.add(signature)
         selected.append(url)
-        if len(selected) >= limit:
+        if len(selected) == limit:
             break
     return selected
 
 
-def build_parameterized_urls(base_url: str, parameters: list[str], limit: int = 20) -> list[str]:
-    """Convert Arjun parameter names into concrete same-origin URLs for downstream tools."""
+def enrich_discovery_with_arjun(discovery: dict[str, Any], result: dict[str, Any], base_url: str) -> tuple[dict[str, Any], list[str]]:
+    parameters = {str(item).strip() for item in result.get("parameters", []) if str(item).strip()}
+    parameters.update(str(item.get("parameter", "")).strip() for item in result.get("vulnerabilities", []) if isinstance(item, dict))
     parsed = urlparse(base_url)
     existing = list(parse_qsl(parsed.query, keep_blank_values=True))
-    existing_names = {name for name, _ in existing}
-    generated: list[str] = []
-    seen: set[str] = set()
-    for raw_name in parameters:
-        name = str(raw_name).strip()
-        if not name or name in existing_names or not re.fullmatch(r"[A-Za-z0-9_.:-]{1,128}", name):
-            continue
-        query = urlencode([*existing, (name, "1")])
-        candidate = urlunparse(parsed._replace(query=query, fragment=""))
-        if candidate not in seen:
-            seen.add(candidate)
-            generated.append(candidate)
-        if len(generated) >= limit:
-            break
-    return generated
-
-
-def extract_arjun_parameters(result: dict[str, Any]) -> list[str]:
-    parameters = result.get("parameters") or []
-    collected = [str(value) for value in parameters if isinstance(value, (str, int, float))]
-    for finding in result.get("vulnerabilities") or []:
-        if isinstance(finding, dict) and finding.get("parameter"):
-            collected.append(str(finding["parameter"]))
-    return sorted(set(value.strip() for value in collected if value.strip()))
-
-
-def enrich_discovery_with_arjun(
-    discovery: dict[str, Any],
-    arjun_result: dict[str, Any],
-    base_url: str,
-) -> tuple[dict[str, Any], list[str]]:
-    """Merge successful Arjun discoveries into the profile-specific discovery surface."""
+    names = {name for name, _ in existing}
+    generated = [urlunparse(parsed._replace(query=urlencode([*existing, (name, "1")]), fragment="")) for name in sorted(parameters) if name and name not in names and re.fullmatch(r"[A-Za-z0-9_.:-]{1,128}", name)]
     updated = dict(discovery)
-    if str(arjun_result.get("status", "")).lower() != "success":
-        return updated, []
-    generated = build_parameterized_urls(base_url, extract_arjun_parameters(arjun_result))
-    if not generated:
-        return updated, []
     updated["parameterized_urls"] = sorted(set(updated.get("parameterized_urls", [])) | set(generated))
     return updated, generated
 
 
-def enrich_discovery_with_ffuf(
-    discovery: dict[str, Any],
-    ffuf_result: dict[str, Any],
-    target: str,
-) -> tuple[dict[str, Any], list[str]]:
-    """Add same-origin resources returned by FFUF to the discovery surface."""
+def enrich_discovery_with_ffuf(discovery: dict[str, Any], result: dict[str, Any], target: str) -> tuple[dict[str, Any], list[str]]:
+    urls = sorted({str(item.get("url", "")) for item in result.get("vulnerabilities", []) if isinstance(item, dict) and item.get("url") and same_origin(target, str(item["url"]))})
     updated = dict(discovery)
-    if str(ffuf_result.get("status", "")).lower() != "success":
-        return updated, []
-    discovered: list[str] = []
-    for finding in ffuf_result.get("vulnerabilities") or []:
-        if not isinstance(finding, dict):
-            continue
-        candidate = str(finding.get("url", "")).strip()
-        if candidate and same_origin(target, candidate):
-            candidate = _without_fragment(candidate)
-            discovered.append(candidate)
-    if not discovered:
-        return updated, []
-    updated["urls"] = sorted(set(updated.get("urls", [])) | set(discovered))
-    parameterized = {url for url in discovered if urlparse(url).query}
-    if parameterized:
-        updated["parameterized_urls"] = sorted(
-            set(updated.get("parameterized_urls", [])) | parameterized
-        )
-    return updated, sorted(set(discovered))
-
-
-def is_idor_candidate(url: str) -> bool:
-    """Match the current IDOR server contract: it mutates numeric query values only."""
-    return any(value.isdigit() for _, value in parse_qsl(urlparse(url).query, keep_blank_values=True))
+    updated["urls"] = sorted(set(updated.get("urls", [])) | set(urls))
+    updated["parameterized_urls"] = sorted(set(updated.get("parameterized_urls", [])) | {url for url in urls if urlparse(url).query})
+    return updated, urls
 
 
 def make_skipped_result(tool: str, target: str, reason: str) -> dict[str, Any]:
-    return {
-        "tool": tool,
-        "status": "skipped",
-        "target": target,
-        "output": reason,
-        "vulnerabilities": [],
-        "diagnosis": "not_applicable",
-    }
-
-
-def diagnose_error(message: str) -> str:
-    lowered = message.lower()
-    patterns = [
-        (("no such file", "not found", "winerror 2", "errno 2"), "missing_file_or_executable"),
-        (("modulenotfounderror", "no module named"), "missing_python_dependency"),
-        (("connection refused", "failed to establish a new connection"), "service_unreachable"),
-        (("timed out", "timeout", "timeouterror"), "timeout"),
-        (("permission denied", "access is denied", "winerror 5"), "permission_denied"),
-        (("unknown tool", "tool not found", "method not found"), "mcp_tool_name_mismatch"),
-        (("jsondecodeerror", "invalid json"), "invalid_json_response"),
-        (("api key", "unauthorized", "forbidden", "401", "403"), "authentication_or_api_key"),
-        (("cannot import name", "importerror"), "incompatible_python_dependency"),
-        (("closedresourceerror", "connection closed", "end of file"), "mcp_server_crashed"),
-    ]
-    for needles, cause in patterns:
-        if any(needle in lowered for needle in needles):
-            return cause
-    return "scanner_or_mcp_error"
-
-
-def _ensure_project_pythonpath() -> None:
-    configure_runtime_path()
-    root = str(Path(ROOT_DIR).resolve())
-    existing = os.environ.get("PYTHONPATH", "")
-    parts = [part for part in existing.split(os.pathsep) if part]
-    if root not in parts:
-        os.environ["PYTHONPATH"] = os.pathsep.join([root, *parts])
-
-
-def _json_safe(value: Any) -> Any:
-    try:
-        return json.loads(json.dumps(value, ensure_ascii=False, default=str))
-    except Exception:
-        return str(value)
-
-
-def _parse_text_payload(text: str) -> Any:
-    stripped = text.strip()
-    if not stripped:
-        return ""
-    try:
-        return json.loads(stripped)
-    except (json.JSONDecodeError, TypeError):
-        return stripped
-
-
-def _extract_mcp_response(response: Any) -> tuple[Any, bool, str]:
-    """Support FastMCP response shapes both before and after the `.data` API."""
-    is_error = bool(getattr(response, "is_error", False) or getattr(response, "isError", False))
-
-    for attribute in ("data", "structured_content", "structuredContent"):
-        if hasattr(response, attribute):
-            value = getattr(response, attribute)
-            if value is not None:
-                return value, is_error, attribute
-
-    content = getattr(response, "content", None)
-    if content is not None:
-        if isinstance(content, str):
-            return _parse_text_payload(content), is_error, "content"
-        if isinstance(content, list):
-            texts: list[str] = []
-            objects: list[Any] = []
-            for item in content:
-                if isinstance(item, dict):
-                    if "text" in item:
-                        texts.append(str(item["text"]))
-                    else:
-                        objects.append(item)
-                else:
-                    text = getattr(item, "text", None)
-                    if text is not None:
-                        texts.append(str(text))
-                    else:
-                        objects.append(item)
-            if len(texts) == 1 and not objects:
-                return _parse_text_payload(texts[0]), is_error, "content.text"
-            if texts or objects:
-                return [_parse_text_payload(text) for text in texts] + objects, is_error, "content[]"
-
-    if isinstance(response, dict):
-        return response, is_error, "mapping"
-    return str(response), is_error, "stringified_response"
-
-
-def _normalize_mcp_result(
-    data: Any,
-    *,
-    tool_name: str,
-    server_file: str,
-    target: str,
-    elapsed: float,
-    response_shape: str,
-    mcp_is_error: bool,
-) -> dict[str, Any]:
-    safe_data = _json_safe(data)
-    if isinstance(safe_data, dict):
-        result = dict(safe_data)
-    else:
-        result = {
-            "tool": tool_name,
-            "status": "error" if mcp_is_error else "success",
-            "target": target,
-            "output": safe_data if isinstance(safe_data, str) else json.dumps(safe_data, ensure_ascii=False),
-            "vulnerabilities": [],
-        }
-
-    result.setdefault("tool", tool_name)
-    result.setdefault("target", target)
-    result.setdefault("output", "")
-    result.setdefault("vulnerabilities", [])
-    status = str(result.get("status", "error" if mcp_is_error else "success")).lower()
-    if mcp_is_error:
-        status = "error"
-    if status not in {"success", "error", "skipped", "partial"}:
-        status = "error" if mcp_is_error else "success"
-    result["status"] = status
-    result["_meta"] = {
-        "server": server_file,
-        "requested_tool": tool_name,
-        "duration_seconds": round(elapsed, 3),
-        "response_shape": response_shape,
-        "mcp_is_error": mcp_is_error,
-    }
-    if status == "error":
-        diagnostic_text = "\n".join(
-            str(result.get(field, ""))
-            for field in ("output", "stderr", "stdout", "error", "message")
-            if result.get(field)
-        )
-        result.setdefault("diagnosis", diagnose_error(diagnostic_text))
-    return result
-
-
-async def call_mcp(
-    server_file: str,
-    tool_name: str,
-    arguments: dict[str, Any],
-    timeout_seconds: float = DEFAULT_MCP_TIMEOUT,
-) -> dict[str, Any]:
-    """Call one scanner over MCP and always return a structured, diagnosable result."""
-    configure_runtime_path()
-    server_path = resolve_server_path(server_file, tool_name)
-    target = str(arguments.get("target_url", ""))
-    started = time.monotonic()
-
-    if not server_path.is_file():
-        message = f"MCP server file does not exist: {server_path}"
-        return {
-            "tool": tool_name,
-            "status": "error",
-            "target": target,
-            "output": message,
-            "vulnerabilities": [],
-            "diagnosis": "missing_mcp_server_file",
-            "_meta": {"server": server_file, "requested_tool": tool_name, "duration_seconds": 0.0},
-        }
-
-    _ensure_project_pythonpath()
-
-    async def invoke() -> tuple[Any, bool, str]:
-        async with Client(str(server_path)) as client:
-            response = await client.call_tool(tool_name, arguments)
-            return _extract_mcp_response(response)
-
-    try:
-        data, mcp_is_error, response_shape = await asyncio.wait_for(
-            invoke(), timeout=max(1.0, float(timeout_seconds))
-        )
-        result = _normalize_mcp_result(
-            data,
-            tool_name=tool_name,
-            server_file=server_file,
-            target=target,
-            elapsed=time.monotonic() - started,
-            response_shape=response_shape,
-            mcp_is_error=mcp_is_error,
-        )
-        result.setdefault("_meta", {})["resolved_server"] = str(server_path)
-    except asyncio.TimeoutError:
-        message = f"MCP call exceeded {timeout_seconds:.0f} seconds."
-        result = {
-            "tool": tool_name,
-            "status": "error",
-            "target": target,
-            "output": message,
-            "vulnerabilities": [],
-            "diagnosis": "timeout",
-            "_meta": {
-                "server": server_file,
-                "requested_tool": tool_name,
-                "duration_seconds": round(time.monotonic() - started, 3),
-            },
-        }
-    except Exception as exc:
-        message = f"MCP communication failed: {type(exc).__name__}: {exc}"
-        result = {
-            "tool": tool_name,
-            "status": "error",
-            "target": target,
-            "output": message,
-            "vulnerabilities": [],
-            "diagnosis": diagnose_error(message),
-            "exception_type": type(exc).__name__,
-            "traceback": traceback.format_exc(),
-            "_meta": {
-                "server": server_file,
-                "requested_tool": tool_name,
-                "duration_seconds": round(time.monotonic() - started, 3),
-            },
-        }
-
-    if result.get("status") == "error":
-        print(
-            f"\n[SCANNER ERROR] server={server_file} tool={tool_name} target={target}\n"
-            f"  cause={result.get('diagnosis', 'unknown')}\n"
-            f"  detail={result.get('output', '')}",
-            file=sys.stderr,
-        )
-    return result
-
-
-def run_async(coroutine: Any) -> Any:
-    """Run a coroutine from sync LangGraph nodes, including hosts with a running loop."""
-    try:
-        asyncio.get_running_loop()
-    except RuntimeError:
-        return asyncio.run(coroutine)
-    with ThreadPoolExecutor(max_workers=1) as executor:
-        return executor.submit(asyncio.run, coroutine).result()
+    return {"tool": tool, "status": "skipped", "target": target, "output": reason, "vulnerabilities": [], "diagnosis": "not_applicable"}
 
 
 def log_result(profile: str, name: str, result: dict[str, Any], target: str = "") -> None:
     status = str(result.get("status", "error")).upper()
-    detail = str(result.get("output", "")).replace("\n", " ")[:180]
-    destination = target or str(result.get("target", ""))
-    print(f"    [{status:7}] {name}: {destination}")
-    if status in {"ERROR", "PARTIAL"} and detail:
-        print(f"              {detail}", file=sys.stderr)
+    print(f"    [{status:7}] {name}: {target or result.get('target', '')}")
+    if status in {"ERROR", "PARTIAL"}:
+        print(f"              {str(result.get('output', ''))[:300]}", file=sys.stderr)
 
 
 def aggregate_runs(tool: str, target: str, runs: list[dict[str, Any]]) -> dict[str, Any]:
     if not runs:
         return make_skipped_result(tool, target, "No applicable parameterized URL was discovered.")
-    statuses = [str(run.get("status", "error")).lower() for run in runs]
+    statuses = [str(run.get("status", "error")) for run in runs]
+    successful = sum(status == "success" for status in statuses)
     errors = sum(status == "error" for status in statuses)
-    skipped = sum(status == "skipped" for status in statuses)
-    successes = sum(status == "success" for status in statuses)
-    if errors:
-        status = "error" if successes == 0 else "partial"
-    elif successes:
-        status = "success"
-    else:
-        status = "skipped"
-    vulnerabilities = [
-        finding
-        for run in runs
-        for finding in (run.get("vulnerabilities") or [])
-        if isinstance(finding, dict)
-    ]
+    status = "skipped" if all(value == "skipped" for value in statuses) else "error" if errors == len(runs) else "partial" if errors else "success"
     return {
-        "tool": tool,
-        "status": status,
-        "target": target,
-        "output": (
-            f"Runs: {len(runs)}; successful: {successes}; errors: {errors}; "
-            f"skipped: {skipped}; findings: {len(vulnerabilities)}."
-        ),
-        "vulnerabilities": vulnerabilities,
+        "tool": tool, "status": status, "target": target,
+        "output": f"Runs: {len(runs)}, successful: {successful}, errors: {errors}.",
+        "vulnerabilities": [finding for run in runs for finding in run.get("vulnerabilities", [])],
         "runs": runs,
-        "diagnosis": "nested_scanner_errors" if errors else None,
     }
 
 
-def iter_leaf_results(results: dict[str, Any], path: tuple[str, ...] = ()) -> Iterator[tuple[tuple[str, ...], dict[str, Any]]]:
-    for key, value in results.items():
-        current = (*path, str(key))
-        if not isinstance(value, dict):
-            continue
+def iter_leaf_results(value: Any, path: tuple[str, ...] = ()) -> Iterator[tuple[tuple[str, ...], dict[str, Any]]]:
+    if isinstance(value, dict) and "status" in value:
         runs = value.get("runs")
         if isinstance(runs, list):
-            for index, run in enumerate(runs, start=1):
-                if isinstance(run, dict):
-                    yield (*current, str(index)), run
-            continue
-        if "status" in value:
-            yield current, value
+            for index, run in enumerate(runs):
+                yield from iter_leaf_results(run, (*path, f"run[{index}]"))
         else:
-            yield from iter_leaf_results(value, current)
+            yield path, value
+    elif isinstance(value, dict):
+        for key, nested in value.items():
+            yield from iter_leaf_results(nested, (*path, str(key)))
 
 
-def discovery_node(state: OrchestratorState) -> dict[str, Any]:
-    print("\n[*] Discovery anonima e autenticata...")
-    discovery_by_profile: dict[str, dict[str, Any]] = {}
-    urls: set[str] = set()
-    parameterized: set[str] = set()
-    tokens: set[str] = set()
-    diagnostics = list(state.get("diagnostics", []))
-
-    for profile in state["profiles"]:
-        name = profile["name"]
-        found = discover_target(state["target"], profile["cookies"])
-        discovery_by_profile[name] = found
-        urls.update(found["urls"])
-        parameterized.update(found["parameterized_urls"])
-        tokens.update(found["jwt_tokens"])
-        for error in found.get("errors", []):
-            diagnostics.append({"phase": "discovery", "profile": name, **error})
-        print(
-            f"    {name}: {len(found['urls'])} pagine, "
-            f"{len(found['parameterized_urls'])} URL parametrizzati, "
-            f"{len(found.get('errors', []))} errori HTTP/crawl"
-        )
-
-    return {
-        "discovery_by_profile": discovery_by_profile,
-        "discovered_urls": sorted(urls),
-        "parameterized_urls": sorted(parameterized),
-        "jwt_tokens": sorted(tokens),
-        "diagnostics": diagnostics,
-    }
-
-
-def base_scanners_node(state: OrchestratorState) -> dict[str, Any]:
-    all_results = {profile: dict(values) for profile, values in state["results"].items()}
-    discovery_by_profile = {
-        profile: dict(values) for profile, values in state["discovery_by_profile"].items()
-    }
-    all_parameterized = set(state.get("parameterized_urls", []))
-
-    for profile in state["profiles"]:
-        profile_name = profile["name"]
-        cookies = profile["cookies"]
-        profile_results = dict(all_results.get(profile_name, {}))
-        print(f"\n[*] Scanner generali - profilo: {profile_name}")
-        for spec in TOOLS:
-            result = run_async(call_mcp(
-                spec.server,
-                spec.tool,
-                {"target_url": state["target"], "cookies": cookies},
-            ))
-            profile_results[spec.name] = result
-            log_result(profile_name, spec.name, result, state["target"])
-
-            if spec.name == "ffuf":
-                current = discovery_by_profile.get(profile_name, {})
-                enriched, generated_resources = enrich_discovery_with_ffuf(
-                    current, result, state["target"]
-                )
-                discovery_by_profile[profile_name] = enriched
-                all_parameterized.update(
-                    url for url in generated_resources if urlparse(url).query
-                )
-                if generated_resources:
-                    print(f"    [INFO   ] ffuf aggiunge {len(generated_resources)} risorse al profilo {profile_name}")
-
-            if spec.name == "arjun":
-                current = discovery_by_profile.get(profile_name, {})
-                enriched, generated = enrich_discovery_with_arjun(current, result, state["target"])
-                discovery_by_profile[profile_name] = enriched
-                all_parameterized.update(generated)
-                if generated:
-                    print(f"    [INFO   ] arjun aggiunge {len(generated)} URL parametrizzati al profilo {profile_name}")
-
-        all_results[profile_name] = profile_results
-    return {
-        "results": all_results,
-        "discovery_by_profile": discovery_by_profile,
-        "parameterized_urls": sorted(all_parameterized),
-    }
-
-
-def parameter_scanners_node(state: OrchestratorState) -> dict[str, Any]:
-    """Run parameter tools only on URLs discovered in the same access profile."""
-    all_results = {profile: dict(values) for profile, values in state["results"].items()}
-
-    for profile in state["profiles"]:
-        profile_name = profile["name"]
-        cookies = profile["cookies"]
-        profile_results = dict(all_results.get(profile_name, {}))
-        discovered = state["discovery_by_profile"].get(profile_name, {})
-        test_urls = select_parameterized_urls(discovered.get("parameterized_urls", []))
-        print(f"\n[*] Scanner su parametri - profilo: {profile_name}")
-        print(f"    [INFO   ] endpoint unici selezionati: {len(test_urls)}")
-
-        grouped: dict[str, list[dict[str, Any]]] = {spec.name: [] for spec in PARAMETER_TOOLS}
-        for url in test_urls:
-            for spec in PARAMETER_TOOLS:
-                if spec.name == "idor" and not is_idor_candidate(url):
-                    skipped = make_skipped_result(
-                        "idor", url, "No numeric or identifier-like parameter was found."
-                    )
-                    grouped[spec.name].append(skipped)
-                    log_result(profile_name, spec.name, skipped, url)
-                    continue
-                result = run_async(call_mcp(
-                    spec.server,
-                    spec.tool,
-                    {"target_url": url, "cookies": cookies},
-                ))
-                grouped[spec.name].append(result)
-                log_result(profile_name, spec.name, result, url)
-
-        for key, runs in grouped.items():
-            profile_results[key] = aggregate_runs(key, state["target"], runs)
-        all_results[profile_name] = profile_results
-
-    return {"results": all_results}
-
-
-def optional_scanners_node(state: OrchestratorState) -> dict[str, Any]:
-    all_results = {profile: dict(values) for profile, values in state["results"].items()}
-    for profile in state["profiles"]:
-        profile_name = profile["name"]
-        profile_results = dict(all_results.get(profile_name, {}))
-        found = state["discovery_by_profile"].get(profile_name, {})
-        tokens = found.get("jwt_tokens", [])
-
-        if tokens:
-            jwt_result = run_async(call_mcp(
-                "jwtServer.py",
-                "run_jwt_scan",
-                {"jwt_token": tokens[0], "target_url": state["target"]},
-            ))
-        else:
-            jwt_result = make_skipped_result("jwt", state["target"], "No JWT was discovered for this profile.")
-        profile_results["jwt"] = jwt_result
-        log_result(profile_name, "jwt", jwt_result, state["target"])
-
-        injection_url = state.get("interactsh_injection_url", "").strip()
-        if injection_url:
-            interactsh_result = run_async(call_mcp(
-                "interactshServer.py",
-                "run_interactsh_client",
-                {
-                    "target_url": state["target"],
-                    "injection_url": injection_url,
-                    "cookies": profile["cookies"],
-                },
-            ))
-        else:
-            interactsh_result = make_skipped_result(
-                "interactsh",
-                state["target"],
-                "No target-specific OAST injection URL was supplied. Use --interactsh-injection-url.",
-            )
-        profile_results["interactsh"] = interactsh_result
-        log_result(profile_name, "interactsh", interactsh_result, state["target"])
-        all_results[profile_name] = profile_results
-
-    return {"results": all_results}
-
-
-def write_emergency_json_report(
-    target: str,
-    results: dict[str, Any],
-    diagnostics: list[dict[str, Any]],
-    reason: str,
-    output_name: str = "",
-) -> str | None:
+def write_emergency_json_report(target: str, results: dict[str, Any], diagnostics: list[dict[str, Any]], reason: str, output_name: str = "SecOps_Emergency") -> str | None:
     try:
-        reports_dir = Path(ROOT_DIR) / "reports"
-        reports_dir.mkdir(parents=True, exist_ok=True)
-        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        safe_name = re.sub(r"[^A-Za-z0-9_.-]+", "_", output_name).strip("._")
-        filename = f"{safe_name or 'SecOps_Emergency'}_{stamp}.json"
-        path = reports_dir / filename
-        payload = {
-            "generated_at": datetime.now(timezone.utc).isoformat(),
-            "target": target,
-            "report_mode": "orchestrator_emergency_json",
-            "reason": reason,
-            "diagnostics": diagnostics,
-            "results": _json_safe(results),
-        }
-        path.write_text(json.dumps(payload, indent=2, ensure_ascii=False, default=str), encoding="utf-8")
-        html_path = path.with_suffix(".html")
-        escaped = html_lib.escape(json.dumps(payload, indent=2, ensure_ascii=False, default=str))
-        html_path.write_text(
-            "<!doctype html><html><head><meta charset='utf-8'><title>SecOps emergency preview</title>"
-            "<style>body{font-family:Segoe UI,Arial,sans-serif;margin:2rem;max-width:1200px}"
-            "pre{white-space:pre-wrap;overflow-wrap:anywhere;background:#111923;color:#e7eef7;padding:1rem;border-radius:10px}</style>"
-            f"</head><body><h1>SecOps emergency preview</h1><p><b>Target:</b> {html_lib.escape(target)}</p>"
-            f"<p><b>Reason:</b> {html_lib.escape(reason)}</p><pre>{escaped}</pre></body></html>",
-            encoding="utf-8",
-        )
-        print(f"[+] Emergency JSON report generated: {path.resolve()}")
-        print(f"[+] Emergency HTML preview generated: {html_path.resolve()}")
+        directory = ROOT / "reports"
+        directory.mkdir(parents=True, exist_ok=True)
+        stem = re.sub(r"[^A-Za-z0-9_.-]+", "_", output_name).strip("._")
+        path = directory / f"{stem}_{datetime.now():%Y%m%d_%H%M%S}.json"
+        payload = {"generated_at": datetime.now(timezone.utc).isoformat(), "target": target, "reason": reason, "diagnostics": diagnostics, "results": results}
+        text = json.dumps(payload, indent=2, ensure_ascii=False, default=str)
+        path.write_text(text, encoding="utf-8")
+        path.with_suffix(".html").write_text(f"<!doctype html><meta charset='utf-8'><title>SecOps preview</title><style>body{{font-family:Segoe UI;margin:2rem}}pre{{white-space:pre-wrap;background:#111923;color:#e7eef7;padding:1rem}}</style><h1>SecOps emergency preview</h1><pre>{html.escape(text)}</pre>", encoding="utf-8")
         return str(path.resolve())
     except Exception as exc:
-        print(f"[REPORT FALLBACK ERROR] {type(exc).__name__}: {exc}", file=sys.stderr)
-        traceback.print_exc()
+        print(f"[REPORT FALLBACK ERROR] {exc}", file=sys.stderr)
         return None
 
 
-def report_node(state: OrchestratorState) -> dict[str, Any]:
+# ---------------------------------------------------------------------------
+# Deterministic pipeline
+# ---------------------------------------------------------------------------
+
+async def run_pipeline(target: str, profiles: list[dict[str, str]], injection_url: str) -> dict[str, Any]:
+    print("\n[*] Discovery anonima e autenticata...")
+    discovery: dict[str, dict[str, Any]] = {}
+    diagnostics: list[dict[str, Any]] = []
+    results = {profile["name"]: {} for profile in profiles}
+
+    for profile in profiles:
+        found = discover_target(target, profile["cookies"])
+        discovery[profile["name"]] = found
+        diagnostics.extend({"phase": "discovery", "profile": profile["name"], **item} for item in found["errors"])
+        print(f"    {profile['name']}: {len(found['urls'])} pagine, {len(found['parameterized_urls'])} URL parametrizzati, {len(found['errors'])} errori")
+
+    for profile in profiles:
+        name, cookies = profile["name"], profile["cookies"]
+        print(f"\n[*] Scanner generali - profilo: {name}")
+        for spec in BASE_TOOLS:
+            result = await call_mcp(spec.server, spec.tool, {"target_url": target, "cookies": cookies})
+            results[name][spec.name] = result
+            log_result(name, spec.name, result, target)
+            if spec.name == "ffuf" and result.get("status") == "success":
+                discovery[name], _ = enrich_discovery_with_ffuf(discovery[name], result, target)
+            if spec.name == "arjun" and result.get("status") == "success":
+                discovery[name], _ = enrich_discovery_with_arjun(discovery[name], result, target)
+
+    for profile in profiles:
+        name, cookies = profile["name"], profile["cookies"]
+        urls = select_parameterized_urls(discovery[name].get("parameterized_urls", []))
+        print(f"\n[*] Scanner su parametri - profilo: {name}\n    [INFO   ] endpoint unici selezionati: {len(urls)}")
+        grouped = {spec.name: [] for spec in PARAMETER_TOOLS}
+        for url in urls:
+            for spec in PARAMETER_TOOLS:
+                if spec.name == "idor" and not any(value.isdigit() for _, value in parse_qsl(urlparse(url).query, keep_blank_values=True)):
+                    result = make_skipped_result("idor", url, "No numeric query parameter was available.")
+                else:
+                    result = await call_mcp(spec.server, spec.tool, {"target_url": url, "cookies": cookies})
+                grouped[spec.name].append(result)
+                log_result(name, spec.name, result, url)
+        for spec in PARAMETER_TOOLS:
+            results[name][spec.name] = aggregate_runs(spec.name, target, grouped[spec.name])
+
+    for profile in profiles:
+        name = profile["name"]
+        token = (discovery[name].get("jwt_tokens") or [""])[0]
+        jwt_result = await call_mcp("jwtServer.py", "run_jwt_scan", {"jwt_token": token, "target_url": target}) if token else make_skipped_result("jwt", target, "No JWT was discovered.")
+        interactsh_result = await call_mcp("interactshServer.py", "run_interactsh_client", {"target_url": target, "injection_url": injection_url, "cookies": profile["cookies"]}) if injection_url else make_skipped_result("interactsh", target, "No OAST injection URL was supplied.")
+        results[name].update(jwt=jwt_result, interactsh=interactsh_result)
+        log_result(name, "jwt", jwt_result, target)
+        log_result(name, "interactsh", interactsh_result, target)
+
     print("\n[*] Generazione report...")
-    report = run_async(call_mcp(
-        "pwndocServer.py",
-        "generate_report",
-        {
-            "findings_summary": state["results"],
-            "target_url": state["target"],
-        },
-    ))
+    report = await call_mcp("pwndocServer.py", "generate_report", {"findings_summary": results, "target_url": target})
     if report.get("status") != "success" and not report.get("json_filename"):
-        fallback_path = write_emergency_json_report(
-            state["target"],
-            state["results"],
-            state.get("diagnostics", []),
-            str(report.get("output", "PwnDoc MCP report failed.")),
-        )
-        if fallback_path:
-            report["json_filename"] = fallback_path
-            preview_path = str(Path(fallback_path).with_suffix(".html"))
-            if Path(preview_path).is_file():
-                report["html_filename"] = preview_path
-            report["local_json_fallback"] = True
-    if report.get("status") == "error":
-        print(
-            f"[REPORT ERROR] cause={report.get('diagnosis', 'unknown')} "
-            f"detail={report.get('output', '')}",
-            file=sys.stderr,
-        )
-    return {"report_status": report}
+        fallback = write_emergency_json_report(target, results, diagnostics, str(report.get("output", "Report MCP failed.")))
+        if fallback:
+            report.update(json_filename=fallback, html_filename=str(Path(fallback).with_suffix(".html")), local_json_fallback=True)
+    return {"results": results, "discovery": discovery, "diagnostics": diagnostics, "report_status": report}
 
 
-def build_graph() -> Any:
-    graph = StateGraph(OrchestratorState)
-    graph.add_node("discovery", discovery_node)
-    graph.add_node("base_scanners", base_scanners_node)
-    graph.add_node("parameter_scanners", parameter_scanners_node)
-    graph.add_node("optional_scanners", optional_scanners_node)
-    graph.add_node("report", report_node)
-    graph.add_edge(START, "discovery")
-    graph.add_edge("discovery", "base_scanners")
-    graph.add_edge("base_scanners", "parameter_scanners")
-    graph.add_edge("parameter_scanners", "optional_scanners")
-    graph.add_edge("optional_scanners", "report")
-    graph.add_edge("report", END)
-    return graph.compile()
-
-
-def print_error_summary(results: dict[str, Any]) -> tuple[int, int, int]:
-    errors = 0
-    skips = 0
-    partial = 0
-    error_rows: list[tuple[str, str, str]] = []
+def summarize_results(results: dict[str, Any]) -> tuple[int, int, int]:
+    errors = skips = partial = 0
+    rows = []
     for path, result in iter_leaf_results(results):
-        status = str(result.get("status", "error")).lower()
+        status = str(result.get("status", "error"))
+        errors += status == "error"
+        skips += status == "skipped"
+        partial += status == "partial"
         if status == "error":
-            errors += 1
-            error_rows.append(("/".join(path), str(result.get("diagnosis", "unknown")), str(result.get("output", ""))))
-        elif status == "skipped":
-            skips += 1
-        elif status == "partial":
-            partial += 1
-    if error_rows:
+            rows.append(("/".join(path), result.get("diagnosis", "unknown"), str(result.get("output", ""))))
+    if rows:
         print("\n=== Scanner error details ===", file=sys.stderr)
-        for path, cause, output in error_rows:
-            print(f"[-] {path}: {cause} — {output[:500]}", file=sys.stderr)
+        for path, cause, detail in rows:
+            print(f"[-] {path}: {cause} — {detail[:500]}", file=sys.stderr)
     return errors, skips, partial
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Generic deterministic FastMCP web-security orchestrator.")
-    parser.add_argument("--target", required=True, help="Authorized HTTP/HTTPS target.")
-    parser.add_argument("--cookies", default="", help="Authenticated session cookies.")
-    parser.add_argument("--auth-only", action="store_true", help="Test only with supplied cookies.")
-    parser.add_argument("--authorized", action="store_true", help="Confirms explicit authorization for a remote target.")
-    parser.add_argument("--preflight-only", action="store_true", help="Validate MCP files, function names, Python modules and scanner executables, then exit.")
-    parser.add_argument("--ignore-preflight-errors", action="store_true", help="Continue despite preflight errors.")
-    parser.add_argument(
-        "--interactsh-injection-url",
-        default="",
-        help="Optional same-target URL/endpoint where an OAST payload can be inserted.",
-    )
+    parser = argparse.ArgumentParser(description="Deterministic FastMCP web-security orchestrator.")
+    parser.add_argument("--target", required=True)
+    parser.add_argument("--cookies", default="")
+    parser.add_argument("--auth-only", action="store_true")
+    parser.add_argument("--authorized", action="store_true")
+    parser.add_argument("--preflight-only", action="store_true")
+    parser.add_argument("--ignore-preflight-errors", action="store_true")
+    parser.add_argument("--interactsh-injection-url", default="")
     args = parser.parse_args()
 
-    configure_runtime_path()
-    preflight_checks = run_preflight_checks()
-    preflight_errors = print_preflight_report(preflight_checks, show_ok=args.preflight_only)
+    checks = run_preflight_checks(include_live=True)
+    preflight_errors = print_preflight_report(checks, show_ok=args.preflight_only)
     if args.preflight_only:
-        return 0 if preflight_errors == 0 else 3
+        return 0 if not preflight_errors else 3
     if preflight_errors and not args.ignore_preflight_errors:
-        print("[-] Preflight failed. Fix the listed components or use --ignore-preflight-errors.", file=sys.stderr)
         return 3
 
     target = normalize_url(args.target)
-    is_local = urlparse(target).hostname in {"127.0.0.1", "localhost", "dvwa"}
-    if not is_local and not args.authorized:
+    if urlparse(target).hostname not in {"127.0.0.1", "localhost", "dvwa"} and not args.authorized:
         parser.error("Remote targets require --authorized.")
-
     injection_url = args.interactsh_injection_url.strip()
     if injection_url and not same_origin(target, injection_url):
         parser.error("--interactsh-injection-url must have the same origin as --target.")
 
-    profiles: list[dict[str, str]] = []
-    if not args.auth_only:
-        profiles.append({"name": "anonymous", "cookies": ""})
+    profiles = [] if args.auth_only else [{"name": "anonymous", "cookies": ""}]
     if args.cookies:
         profiles.append({"name": "authenticated", "cookies": args.cookies})
     elif args.auth_only:
         parser.error("--auth-only requires --cookies.")
 
     print("=== FastMCP Deterministic Security Pipeline ===")
-    print(f"[*] Target: {target}")
-    print(f"[*] Profiles: {', '.join(profile['name'] for profile in profiles)}")
+    print(f"[*] Target: {target}\n[*] Profiles: {', '.join(profile['name'] for profile in profiles)}")
     started = time.time()
-
-    initial: OrchestratorState = {
-        "target": target,
-        "profiles": profiles,
-        "discovery_by_profile": {},
-        "discovered_urls": [],
-        "parameterized_urls": [],
-        "jwt_tokens": [],
-        "interactsh_injection_url": injection_url,
-        "results": {profile["name"]: {} for profile in profiles},
-        "diagnostics": [],
-        "report_status": {},
-    }
-
     try:
-        final = build_graph().invoke(initial)
+        final = asyncio.run(run_pipeline(target, profiles, injection_url))
+    except KeyboardInterrupt:
+        print("\n[!] Workflow interrupted by the operator.", file=sys.stderr)
+        return 130
     except Exception as exc:
-        detail = f"Workflow failed: {type(exc).__name__}: {exc}"
-        print(f"[-] {detail}", file=sys.stderr)
+        print(f"[-] Workflow failed: {type(exc).__name__}: {exc}", file=sys.stderr)
         traceback.print_exc()
-        emergency = write_emergency_json_report(target, initial["results"], initial["diagnostics"], detail)
-        print(f"[+] JSON: {emergency or 'not generated'}")
         return 1
 
-    report = final.get("report_status", {})
-    errors, skips, partial = print_error_summary(final.get("results", {}))
-
+    report = final["report_status"]
+    errors, skips, partial = summarize_results(final["results"])
     print(f"\n=== Completed in {time.time() - started:.2f} seconds ===")
     print(f"[+] PDF: {report.get('pdf_filename') or 'not generated'}")
     print(f"[+] HTML preview: {report.get('html_filename') or 'not generated'}")
     print(f"[+] JSON: {report.get('json_filename') or 'not generated'}")
-    print(f"[+] Scanner errors: {errors}")
-    print(f"[+] Scanner partial results: {partial}")
-    print(f"[+] Scanner skips: {skips}")
-    print(f"[+] Discovery diagnostics: {len(final.get('diagnostics', []))}")
-
-    if report.get("status") != "success":
-        return 1
-    if errors:
-        return 2
-    return 0
+    print(f"[+] Scanner errors: {errors}\n[+] Scanner partial results: {partial}\n[+] Scanner skips: {skips}")
+    return 1 if report.get("status") != "success" else 2 if errors else 0
 
 
 if __name__ == "__main__":
