@@ -13,6 +13,7 @@ import sysconfig
 import tarfile
 import time
 import zipfile
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterable
 
@@ -45,6 +46,7 @@ LOCAL_ROOT = Path.home() / ".local"
 LOCAL_BIN = LOCAL_ROOT / "bin"
 LOCAL_OPT = LOCAL_ROOT / "opt"
 DOWNLOAD_DIR = LOCAL_ROOT / "downloads"
+RUNTIME_CONFIG_PATH = Path(ROOT_DIR) / ".secops_runtime.json"
 
 # Tools that must exist after initialization.
 REQUIRED_SCANNERS = (
@@ -81,6 +83,7 @@ def run(
             capture_output=capture,
             timeout=timeout,
             shell=False,
+            env=os.environ.copy(),
         )
     except FileNotFoundError as exc:
         raise RuntimeError(f"Command not found: {command[0]}") from exc
@@ -161,6 +164,97 @@ def command_path(name: str) -> str | None:
     except Exception:
         pass
     return shutil.which(name)
+
+
+def runtime_tool_directories(
+    status: dict[str, str | None] | None = None,
+) -> list[str]:
+    """Return every binary directory shared with future orchestrator processes."""
+    status = status or scanner_status()
+    directories: list[Path] = [LOCAL_BIN]
+
+    try:
+        scripts = sysconfig.get_path(
+            "scripts",
+            scheme="nt_user" if os.name == "nt" else "posix_user",
+        )
+    except (KeyError, ValueError):
+        scripts = None
+    if scripts:
+        directories.append(Path(scripts))
+
+    for value in status.values():
+        if value:
+            directories.append(Path(value).expanduser().resolve().parent)
+
+    unique: list[str] = []
+    seen: set[str] = set()
+    for directory in directories:
+        expanded = directory.expanduser()
+        try:
+            resolved = expanded.resolve()
+        except OSError:
+            continue
+        key = os.path.normcase(str(resolved))
+        if key in seen or not resolved.is_dir():
+            continue
+        seen.add(key)
+        unique.append(str(resolved))
+    return unique
+
+
+def write_runtime_config(
+    status: dict[str, str | None] | None = None,
+) -> Path:
+    """
+    Persist scanner paths for the deterministic and agentic orchestrators.
+
+    PATH changes made by this process disappear after initScript.py exits, so
+    this file is the stable link between installation and later executions.
+    """
+    status = status or scanner_status()
+    payload = {
+        "schema_version": 1,
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "project_root": str(Path(ROOT_DIR).resolve()),
+        "python_executable": str(Path(sys.executable).resolve()),
+        "tool_directories": runtime_tool_directories(status),
+        "executables": {
+            name: (str(Path(path).resolve()) if path else None)
+            for name, path in status.items()
+        },
+    }
+    RUNTIME_CONFIG_PATH.write_text(
+        json.dumps(payload, indent=2, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    print(f"[+] Runtime scanner configuration written: {RUNTIME_CONFIG_PATH}")
+    return RUNTIME_CONFIG_PATH
+
+
+def run_project_preflight() -> None:
+    """Verify the orchestrator using exactly the runtime created by init."""
+    script = Path(ROOT_DIR) / "orchestratorDeterministic.py"
+    if not script.is_file():
+        raise RuntimeError(f"Missing orchestrator for preflight: {script}")
+    completed = run(
+        [
+            sys.executable,
+            str(script),
+            "--target",
+            DEFAULT_TARGET,
+            "--preflight-only",
+        ],
+        required=False,
+        capture=True,
+        timeout=300,
+        cwd=Path(ROOT_DIR),
+    )
+    if completed.returncode != 0:
+        raise RuntimeError(
+            "The orchestrator preflight failed after initialization. "
+            "Review the errors printed above."
+        )
 
 
 # -----------------------------------------------------------------------------
@@ -825,27 +919,48 @@ def setup_local_lab(model: str) -> str:
 
 
 def print_cli_commands(cookie: str, model: str) -> None:
+    root = Path(ROOT_DIR)
+    init_command = [sys.executable, str(root / "initScript.py"), "--with-lab"]
+    preflight = [
+        sys.executable,
+        str(root / "orchestratorDeterministic.py"),
+        "--target",
+        DEFAULT_TARGET,
+        "--preflight-only",
+    ]
     deterministic = [
         sys.executable,
-        str(ROOT_DIR / "orchestratorDeterministic.py"),
-        "--target", DEFAULT_TARGET,
-        "--cookies", cookie,
+        str(root / "orchestratorDeterministic.py"),
+        "--target",
+        DEFAULT_TARGET,
+        "--cookies",
+        cookie,
     ]
     agentic = [
         sys.executable,
-        str(ROOT_DIR / "orchestratorAgentic.py"),
-        "--target", DEFAULT_TARGET,
-        "--cookies", cookie,
-        "--model", model,
+        str(root / "orchestratorAgentic.py"),
+        "--target",
+        DEFAULT_TARGET,
+        "--cookies",
+        cookie,
+        "--model",
+        model,
     ]
 
-    print("\n=== Reusable authenticated commands ===")
-    print("\nDeterministic orchestrator:")
+    print("\n=== Commands to use from PowerShell ===")
+    print("\nInitialize/update tools and start the lab:")
+    print(subprocess.list2cmdline(init_command))
+    print("\nVerify scanner and MCP-server discovery:")
+    print(subprocess.list2cmdline(preflight))
+    print("\nDeterministic — anonymous + authenticated:")
     print(subprocess.list2cmdline(deterministic))
-    print("\nOllama/LangGraph agentic orchestrator:")
+    print("\nDeterministic — authenticated only:")
+    print(subprocess.list2cmdline([*deterministic, "--auth-only"]))
+    print("\nAgentic — anonymous + authenticated:")
     print(subprocess.list2cmdline(agentic))
-    print("\nBoth commands execute the anonymous profile by default.")
-    print("Add --auth-only to run only the authenticated profile.")
+    print("\nAgentic — authenticated only:")
+    print(subprocess.list2cmdline([*agentic, "--auth-only"]))
+    print(f"\nRuntime configuration: {RUNTIME_CONFIG_PATH}")
 
 
 # -----------------------------------------------------------------------------
@@ -868,6 +983,11 @@ def main() -> int:
     )
     parser.add_argument("--model", default=DEFAULT_MODEL)
     parser.add_argument(
+        "--skip-preflight",
+        action="store_true",
+        help="Skip the orchestrator preflight after installation.",
+    )
+    parser.add_argument(
         "--skip-scanners",
         action="store_true",
         help="Install only Python dependencies; do not install external scanners.",
@@ -885,9 +1005,13 @@ def main() -> int:
 
         if not args.skip_scanners:
             install_all_scanners()
-            print_cli_status(fail_on_missing=True)
+            scanner_paths = print_cli_status(fail_on_missing=True)
         else:
-            print_cli_status(fail_on_missing=False)
+            scanner_paths = print_cli_status(fail_on_missing=False)
+
+        write_runtime_config(scanner_paths)
+        if not args.skip_preflight:
+            run_project_preflight()
 
         cookie = ""
         if args.with_lab:

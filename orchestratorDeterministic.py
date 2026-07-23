@@ -10,6 +10,7 @@ import os
 import re
 import shutil
 import sys
+import sysconfig
 import time
 import traceback
 from concurrent.futures import ThreadPoolExecutor
@@ -111,32 +112,172 @@ SERVER_PYTHON_MODULES = {
     "pwndocServer.py": "reportlab",
 }
 
+RUNTIME_CONFIG_PATH = Path(ROOT_DIR) / ".secops_runtime.json"
+LOCAL_TOOL_BIN = Path.home() / ".local" / "bin"
 
-def resolve_server_path(server_file: str) -> Path:
-    """Resolve normal server names and uploaded duplicate names such as ``name(2).py``."""
+
+def _add_path_directory(path: Path | str) -> None:
+    """Prepend an existing directory to PATH exactly once."""
+    candidate = Path(path).expanduser()
+    if not candidate.is_dir():
+        return
+    resolved = str(candidate.resolve())
+    current = [part for part in os.environ.get("PATH", "").split(os.pathsep) if part]
+    normalized = {os.path.normcase(os.path.abspath(part)) for part in current}
+    if os.path.normcase(os.path.abspath(resolved)) not in normalized:
+        os.environ["PATH"] = resolved + os.pathsep + os.environ.get("PATH", "")
+
+
+def _runtime_config() -> dict[str, Any]:
+    """Read executable locations persisted by initScript.py."""
+    try:
+        payload = json.loads(RUNTIME_CONFIG_PATH.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError, TypeError):
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def configure_runtime_path() -> list[str]:
+    """
+    Rebuild the scanner PATH in each new Python process.
+
+    initScript.py stores release binaries and launchers under ~/.local/bin and
+    writes .secops_runtime.json. Python user Scripts directories are included
+    so Arjun remains discoverable after the initializer process exits.
+    """
+    candidates: list[Path] = []
+
+    configured = os.getenv("SECOPS_TOOL_BIN", "")
+    if configured:
+        candidates.extend(Path(item) for item in configured.split(os.pathsep) if item)
+
+    runtime = _runtime_config()
+    for item in runtime.get("tool_directories", []) or []:
+        if isinstance(item, str) and item.strip():
+            candidates.append(Path(item))
+    executables = runtime.get("executables", {})
+    if isinstance(executables, dict):
+        for value in executables.values():
+            if isinstance(value, str) and value.strip():
+                candidates.append(Path(value).expanduser().parent)
+
+    candidates.append(LOCAL_TOOL_BIN)
+
+    try:
+        scripts = sysconfig.get_path(
+            "scripts",
+            scheme="nt_user" if os.name == "nt" else "posix_user",
+        )
+    except (KeyError, ValueError):
+        scripts = None
+    if scripts:
+        candidates.append(Path(scripts))
+
+    candidates.append(Path(sys.executable).resolve().parent)
+    candidates.append(
+        Path(sys.executable).resolve().parent / ("Scripts" if os.name == "nt" else "bin")
+    )
+
+    try:
+        import site
+        candidates.append(Path(site.USER_BASE) / ("Scripts" if os.name == "nt" else "bin"))
+    except Exception:
+        pass
+
+    if os.name == "nt":
+        version = f"Python{sys.version_info.major}{sys.version_info.minor}"
+        if os.getenv("APPDATA"):
+            candidates.append(Path(os.environ["APPDATA"]) / "Python" / version / "Scripts")
+        if os.getenv("LOCALAPPDATA"):
+            candidates.append(
+                Path(os.environ["LOCALAPPDATA"])
+                / "Programs"
+                / "Python"
+                / version
+                / "Scripts"
+            )
+
+    added: list[str] = []
+    seen: set[str] = set()
+    for candidate in candidates:
+        expanded = candidate.expanduser()
+        try:
+            normalized = os.path.normcase(str(expanded.resolve()))
+        except OSError:
+            continue
+        if normalized in seen:
+            continue
+        seen.add(normalized)
+        if expanded.is_dir():
+            _add_path_directory(expanded)
+            added.append(str(expanded.resolve()))
+    return added
+
+
+def resolve_executable(command: str) -> str | None:
+    """Resolve a scanner command using the initializer's persisted locations."""
+    configure_runtime_path()
+    resolved = shutil.which(command)
+    if resolved:
+        return str(Path(resolved).resolve())
+
+    runtime = _runtime_config()
+    executables = runtime.get("executables", {})
+    if isinstance(executables, dict):
+        configured = executables.get(command)
+        if isinstance(configured, str) and Path(configured).expanduser().is_file():
+            return str(Path(configured).expanduser().resolve())
+    return None
+
+
+def _server_candidates(server_file: str) -> list[Path]:
     requested = Path(server_file).name
-    exact = (SERVERS_DIR / requested).resolve()
-    if exact.is_file():
-        return exact
-
     stem = Path(requested).stem
     suffix = Path(requested).suffix or ".py"
-    candidates = [
-        (SERVERS_DIR / f"{stem}(2){suffix}").resolve(),
-        (SERVERS_DIR / f"{stem} (2){suffix}").resolve(),
-    ]
-    for candidate in candidates:
-        if candidate.is_file():
-            return candidate
+    exact = (Path(SERVERS_DIR) / requested).resolve()
+    candidates: list[Path] = [exact]
 
     if Path(SERVERS_DIR).is_dir():
-        wanted = requested.casefold()
-        duplicate_prefix = f"{stem}(".casefold()
+        duplicate_pattern = re.compile(
+            rf"^{re.escape(stem)}\s*\(\d+\){re.escape(suffix)}$",
+            re.IGNORECASE,
+        )
         for candidate in Path(SERVERS_DIR).iterdir():
-            name = candidate.name.casefold()
-            if candidate.is_file() and (name == wanted or (name.startswith(duplicate_prefix) and name.endswith(suffix.casefold()))):
-                return candidate.resolve()
-    return exact
+            if not candidate.is_file():
+                continue
+            if (
+                candidate.name.casefold() == requested.casefold()
+                or duplicate_pattern.fullmatch(candidate.name)
+            ):
+                resolved = candidate.resolve()
+                if resolved not in candidates:
+                    candidates.append(resolved)
+    return candidates
+
+
+def resolve_server_path(server_file: str, required_tool: str = "") -> Path:
+    """
+    Resolve a server by filename and MCP function contract.
+
+    An obsolete exact filename is not selected over a valid numbered copy.
+    Exact files are still preferred when they declare the required function.
+    """
+    candidates = _server_candidates(server_file)
+    existing = [candidate for candidate in candidates if candidate.is_file()]
+    if required_tool:
+        matching = [
+            candidate
+            for candidate in existing
+            if required_tool in _declared_function_names(candidate)
+        ]
+        if matching:
+            exact = candidates[0]
+            if exact in matching:
+                return exact
+            return max(matching, key=lambda path: path.stat().st_mtime)
+    if existing:
+        return existing[0]
+    return candidates[0]
 
 
 def _declared_function_names(path: Path) -> set[str]:
@@ -148,14 +289,29 @@ def _declared_function_names(path: Path) -> set[str]:
 
 
 def run_preflight_checks() -> list[dict[str, str]]:
-    """Statically verify server files, MCP function names, modules and CLI executables."""
+    """Verify shared PATH, server contracts, modules and external scanners."""
+    configure_runtime_path()
     checks: list[dict[str, str]] = []
     seen_executables: set[str] = set()
+
     for spec in ALL_TOOL_SPECS:
-        path = resolve_server_path(spec.server)
+        path = resolve_server_path(spec.server, spec.tool)
         if not path.is_file():
-            checks.append({"level": "error", "component": spec.name, "cause": "missing_server", "detail": str(path)})
+            checks.append({
+                "level": "error",
+                "component": spec.name,
+                "cause": "missing_server",
+                "detail": str(path),
+            })
             continue
+
+        checks.append({
+            "level": "ok",
+            "component": spec.name,
+            "cause": "server_found",
+            "detail": str(path),
+        })
+
         names = _declared_function_names(path)
         if spec.tool not in names:
             checks.append({
@@ -164,23 +320,45 @@ def run_preflight_checks() -> list[dict[str, str]]:
                 "cause": "mcp_tool_name_mismatch",
                 "detail": f"{path.name} does not declare {spec.tool}()",
             })
-        module = SERVER_PYTHON_MODULES.get(spec.server)
-        if module and importlib.util.find_spec(module) is None:
+        else:
             checks.append({
-                "level": "error",
+                "level": "ok",
                 "component": spec.name,
-                "cause": "missing_python_dependency",
-                "detail": f"Python module not installed: {module}",
+                "cause": "mcp_tool_found",
+                "detail": f"{path.name}: {spec.tool}()",
             })
+
+        module = SERVER_PYTHON_MODULES.get(spec.server)
+        if module:
+            if importlib.util.find_spec(module) is None:
+                checks.append({
+                    "level": "error",
+                    "component": spec.name,
+                    "cause": "missing_python_dependency",
+                    "detail": f"Python module not installed: {module}",
+                })
+            else:
+                checks.append({
+                    "level": "ok",
+                    "component": spec.name,
+                    "cause": "python_dependency_found",
+                    "detail": module,
+                })
+
         if spec.executable and spec.executable not in seen_executables:
             seen_executables.add(spec.executable)
-            resolved = shutil.which(spec.executable)
+            resolved = resolve_executable(spec.executable)
             if resolved is None:
+                checked = configure_runtime_path()
                 checks.append({
                     "level": "error",
                     "component": spec.name,
                     "cause": "missing_executable",
-                    "detail": f"Executable not found in PATH: {spec.executable}",
+                    "detail": (
+                        f"Executable not found: {spec.executable}. "
+                        f"Runtime config: {RUNTIME_CONFIG_PATH}. "
+                        f"Directories checked: {checked}"
+                    ),
                 })
             else:
                 checks.append({
@@ -189,10 +367,15 @@ def run_preflight_checks() -> list[dict[str, str]]:
                     "cause": "executable_found",
                     "detail": resolved,
                 })
-    if not any(item["level"] == "error" for item in checks):
-        checks.append({"level": "ok", "component": "mcp", "cause": "preflight_passed", "detail": "All server contracts were found."})
-    return checks
 
+    if not any(item["level"] == "error" for item in checks):
+        checks.append({
+            "level": "ok",
+            "component": "mcp",
+            "cause": "preflight_passed",
+            "detail": "All server contracts, modules and scanner executables were found.",
+        })
+    return checks
 
 def print_preflight_report(checks: list[dict[str, str]], *, show_ok: bool = False) -> int:
     errors = [item for item in checks if item["level"] == "error"]
@@ -466,6 +649,7 @@ def diagnose_error(message: str) -> str:
 
 
 def _ensure_project_pythonpath() -> None:
+    configure_runtime_path()
     root = str(Path(ROOT_DIR).resolve())
     existing = os.environ.get("PYTHONPATH", "")
     parts = [part for part in existing.split(os.pathsep) if part]
@@ -585,7 +769,8 @@ async def call_mcp(
     timeout_seconds: float = DEFAULT_MCP_TIMEOUT,
 ) -> dict[str, Any]:
     """Call one scanner over MCP and always return a structured, diagnosable result."""
-    server_path = resolve_server_path(server_file)
+    configure_runtime_path()
+    server_path = resolve_server_path(server_file, tool_name)
     target = str(arguments.get("target_url", ""))
     started = time.monotonic()
 
@@ -1014,6 +1199,7 @@ def main() -> int:
     parser.add_argument("--auth-only", action="store_true", help="Test only with supplied cookies.")
     parser.add_argument("--authorized", action="store_true", help="Confirms explicit authorization for a remote target.")
     parser.add_argument("--preflight-only", action="store_true", help="Validate MCP files, function names, Python modules and scanner executables, then exit.")
+    parser.add_argument("--ignore-preflight-errors", action="store_true", help="Continue despite preflight errors.")
     parser.add_argument(
         "--interactsh-injection-url",
         default="",
@@ -1021,10 +1207,14 @@ def main() -> int:
     )
     args = parser.parse_args()
 
+    configure_runtime_path()
     preflight_checks = run_preflight_checks()
     preflight_errors = print_preflight_report(preflight_checks, show_ok=args.preflight_only)
     if args.preflight_only:
         return 0 if preflight_errors == 0 else 3
+    if preflight_errors and not args.ignore_preflight_errors:
+        print("[-] Preflight failed. Fix the listed components or use --ignore-preflight-errors.", file=sys.stderr)
+        return 3
 
     target = normalize_url(args.target)
     is_local = urlparse(target).hostname in {"127.0.0.1", "localhost", "dvwa"}

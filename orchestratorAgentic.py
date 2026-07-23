@@ -16,6 +16,7 @@ from langgraph.graph import END, START, StateGraph
 
 from orchestratorDeterministic import (
     call_mcp,
+    configure_runtime_path,
     diagnose_error,
     discover_target,
     enrich_discovery_with_arjun,
@@ -610,15 +611,20 @@ def main() -> int:
         help="Optional same-origin URL accepted by interactshServer.py; use a FUZZ placeholder when supported.",
     )
     parser.add_argument("--preflight-only", action="store_true")
+    parser.add_argument("--ignore-preflight-errors", action="store_true")
     parser.add_argument("--model", default="llama3.1:8b")
     parser.add_argument("--ollama-url", default="http://127.0.0.1:11434")
     parser.add_argument("--max-rounds", type=int, default=2, choices=(1, 2, 3))
     args = parser.parse_args()
 
+    configure_runtime_path()
     preflight_checks = run_preflight_checks()
     preflight_errors = print_preflight_report(preflight_checks, show_ok=args.preflight_only)
     if args.preflight_only:
         return 0 if preflight_errors == 0 else 3
+    if preflight_errors and not args.ignore_preflight_errors:
+        print("[-] Preflight failed. Fix the listed components or use --ignore-preflight-errors.", file=sys.stderr)
+        return 3
 
     target = normalize_url(args.target)
     if urlparse(target).hostname not in {"127.0.0.1", "localhost", "dvwa"} and not args.authorized:

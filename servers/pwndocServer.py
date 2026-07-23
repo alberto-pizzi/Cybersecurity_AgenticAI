@@ -109,6 +109,77 @@ def _update_failure(result: dict[str, Any], **extra: Any) -> dict[str, Any]:
     return result
 
 
+def _render_html_preview(report_payload: dict[str, Any]) -> str:
+    """Create a standalone browser preview with no external assets."""
+    summary = report_payload.get("summary", {})
+    counts = summary.get("counts", {})
+    errors = summary.get("errors", [])
+    findings = report_payload.get("findings", [])
+
+    def cells(values: list[Any]) -> str:
+        return "".join(f"<td>{html.escape(str(value or ''))}</td>" for value in values)
+
+    error_rows = "".join(
+        f"<tr>{cells([row.get('path'), row.get('status'), row.get('diagnosis'), row.get('target'), row.get('output')])}</tr>"
+        for row in errors
+    ) or '<tr><td colspan="5">No scanner errors or partial results.</td></tr>'
+
+    finding_rows = "".join(
+        f"<tr>{cells([
+            finding.get('profile'),
+            finding.get('tool'),
+            finding.get('alert', 'Finding'),
+            finding.get('risk', 'info'),
+            finding.get('url'),
+            finding.get('parameter'),
+            finding.get('description'),
+            finding.get('evidence'),
+        ])}</tr>"
+        for finding in findings
+    ) or '<tr><td colspan="8">No structured findings. Scanner failures are not treated as a clean result.</td></tr>'
+
+    raw_json = html.escape(json.dumps(report_payload.get("results", {}), indent=2, ensure_ascii=False, default=str))
+    target = html.escape(str(report_payload.get("target", "")))
+    generated = html.escape(str(report_payload.get("generated_at", "")))
+    return f"""<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>SecOps Assessment Preview</title>
+<style>
+:root {{ color-scheme: light dark; --bg:#f4f7fa; --card:#fff; --text:#17212b; --muted:#5f6b76; --line:#cbd5df; --accent:#24476b; --error:#8b2f2f; }}
+@media (prefers-color-scheme: dark) {{ :root {{ --bg:#10151b; --card:#18212b; --text:#ecf2f8; --muted:#aeb9c4; --line:#354353; --accent:#5c91c8; --error:#d87979; }} }}
+* {{ box-sizing:border-box; }} body {{ margin:0; font-family:Inter,Segoe UI,Arial,sans-serif; background:var(--bg); color:var(--text); }}
+main {{ max-width:1500px; margin:auto; padding:28px; }} h1,h2 {{ margin:0 0 14px; }} .meta {{ color:var(--muted); margin-bottom:20px; }}
+.grid {{ display:grid; grid-template-columns:repeat(auto-fit,minmax(150px,1fr)); gap:12px; margin:18px 0 26px; }}
+.card {{ background:var(--card); border:1px solid var(--line); border-radius:12px; padding:16px; box-shadow:0 3px 12px #0001; }}
+.value {{ font-size:1.8rem; font-weight:700; }} .label {{ color:var(--muted); }}
+.table-wrap {{ overflow:auto; background:var(--card); border:1px solid var(--line); border-radius:12px; margin-bottom:26px; }}
+table {{ width:100%; border-collapse:collapse; min-width:900px; }} th {{ position:sticky; top:0; background:var(--accent); color:white; text-align:left; }}
+th,td {{ padding:9px 10px; border-bottom:1px solid var(--line); vertical-align:top; white-space:pre-wrap; overflow-wrap:anywhere; }}
+tr:nth-child(even) td {{ background:#7f8c9810; }} .errors th {{ background:var(--error); }} details {{ margin-top:20px; }}
+pre {{ max-height:700px; overflow:auto; background:#0c1117; color:#d7e0ea; padding:16px; border-radius:10px; }}
+</style>
+</head>
+<body><main>
+<h1>SecOps Assessment Preview</h1>
+<div class="meta"><b>Target:</b> {target}<br><b>Generated:</b> {generated}</div>
+<div class="grid">
+<div class="card"><div class="value">{counts.get('success', 0)}</div><div class="label">Successful runs</div></div>
+<div class="card"><div class="value">{counts.get('error', 0)}</div><div class="label">Errors</div></div>
+<div class="card"><div class="value">{counts.get('partial', 0)}</div><div class="label">Partial</div></div>
+<div class="card"><div class="value">{counts.get('skipped', 0)}</div><div class="label">Skipped</div></div>
+<div class="card"><div class="value">{len(findings)}</div><div class="label">Unique findings</div></div>
+</div>
+<h2>Scanner errors and partial results</h2>
+<div class="table-wrap"><table class="errors"><thead><tr><th>Path</th><th>Status</th><th>Cause</th><th>Target</th><th>Details</th></tr></thead><tbody>{error_rows}</tbody></table></div>
+<h2>Security findings</h2>
+<div class="table-wrap"><table><thead><tr><th>Profile</th><th>Tool</th><th>Finding</th><th>Risk</th><th>URL</th><th>Parameter</th><th>Description</th><th>Evidence</th></tr></thead><tbody>{finding_rows}</tbody></table></div>
+<details><summary>Raw structured scanner results</summary><pre>{raw_json}</pre></details>
+</main></body></html>"""
+
+
 @mcp.tool()
 def generate_report(
     findings_summary: dict | str,
@@ -129,6 +200,7 @@ def generate_report(
     requested_name = _safe_name(output_name)
     base_name = requested_name or f"SecOps_Assessment_{stamp}"
     pdf_path = Path(REPORTS_DIR) / f"{base_name}.pdf"
+    html_path = Path(REPORTS_DIR) / f"{base_name}.html"
     json_path = Path(REPORTS_DIR) / f"{base_name}.json"
 
     findings = flatten_findings(results)
@@ -142,7 +214,7 @@ def generate_report(
         "results": results,
     }
 
-    # JSON is intentionally independent from PDF generation.
+    # JSON and HTML preview are intentionally independent from PDF generation.
     try:
         json_path.write_text(
             json.dumps(report_payload, indent=2, ensure_ascii=False, default=str),
@@ -150,6 +222,28 @@ def generate_report(
         )
     except Exception as exc:
         return failure("Report Generator", target_url, f"JSON report creation failed: {type(exc).__name__}: {exc}")
+
+    try:
+        html_path.write_text(_render_html_preview(report_payload), encoding="utf-8")
+        if not html_path.is_file() or html_path.stat().st_size == 0:
+            raise RuntimeError("HTML preview writer completed without creating a non-empty file.")
+    except Exception as exc:
+        result = failure(
+            "Report Generator",
+            target_url,
+            f"HTML preview creation failed: {type(exc).__name__}: {exc}",
+        )
+        return _update_failure(
+            result,
+            json_filename=str(json_path.resolve()),
+            html_filename=None,
+            pdf_filename=None,
+            local_json_generated=True,
+            local_html_generated=False,
+            local_pdf_generated=False,
+            findings_count=len(findings),
+            diagnosis="html_preview_generation_failed",
+        )
 
     try:
         document = SimpleDocTemplate(
@@ -279,8 +373,10 @@ def generate_report(
         return _update_failure(
             result,
             json_filename=str(json_path.resolve()),
+            html_filename=str(html_path.resolve()),
             pdf_filename=None,
             local_json_generated=True,
+            local_html_generated=True,
             local_pdf_generated=False,
             findings_count=len(findings),
             diagnosis="pdf_generation_failed",
@@ -302,10 +398,12 @@ def generate_report(
     return success(
         "Report Generator",
         target_url,
-        f"PDF and JSON reports generated. Unique findings: {len(findings)}",
+        f"PDF, HTML preview and JSON reports generated. Unique findings: {len(findings)}",
         pdf_filename=str(pdf_path.resolve()),
+        html_filename=str(html_path.resolve()),
         json_filename=str(json_path.resolve()),
         local_pdf_generated=True,
+        local_html_generated=True,
         local_json_generated=True,
         findings_count=len(findings),
         scanner_summary=result_summary["counts"],
