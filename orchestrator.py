@@ -19,8 +19,12 @@ from langchain_core.messages import ToolMessage
 
 
 async def main():
+    # Force child MCP processes to inherit user binary and script paths
+    bin_dir = str(Path.home() / ".local" / "bin")
+    scripts_dir = str(Path(sys.executable).parent / "Scripts")
+    os.environ["PATH"] = bin_dir + os.pathsep + scripts_dir + os.pathsep + os.environ.get("PATH", "")
     parser = argparse.ArgumentParser(
-        description="Fully Autonomous Local SecOps Agent with Ollama & MCP"
+        description="Autonomous Ollama SecOps Agent with MCP"
     )
     parser.add_argument(
         "--target",
@@ -35,18 +39,16 @@ async def main():
         file=sys.stderr,
     )
 
-    # -------------------------------------------------------------------------
-    # Inizializzazione file di log condiviso su disco
-    # -------------------------------------------------------------------------
     findings_file = BASE_DIR / "scan_findings.json"
     findings_log = {}
 
+    # Reset scan findings file
     try:
         with open(findings_file, "w", encoding="utf-8") as f:
             json.dump({}, f)
-        print(f"[*] Inizializzato log dei findings su {findings_file}", file=sys.stderr)
+        print(f"[*] Initialized findings log at {findings_file}", file=sys.stderr)
     except Exception as e:
-        print(f"[!] Errore creazione {findings_file}: {e}", file=sys.stderr)
+        print(f"[!] Error creating {findings_file}: {e}", file=sys.stderr)
 
     # Master list of server scripts
     all_servers = {
@@ -59,9 +61,9 @@ async def main():
         "arjun": "arjunServer.py",
         "commix": "commixServer.py",
         "idor": "idorForgeServer.py",
-        "pwndoc": "pwndocServer.py",
         "jwt": "jwtServer.py",
         "interactsh": "interactshServer.py",
+        "pwndoc": "pwndocServer.py",
     }
 
     server_configs = {}
@@ -74,96 +76,117 @@ async def main():
                 "args": [str(script_path)],
             }
         else:
-            print(
-                f"[!] Skipping '{name}': file not found at {script_path}",
-                file=sys.stderr,
-            )
+            print(f"[!] Skipping '{name}': file not found at {script_path}", file=sys.stderr)
 
-    print("[*] Connecting to existing MCP tool servers...", file=sys.stderr)
+    print("[*] Connecting to MCP tool servers...", file=sys.stderr)
 
-    tools = []
+    scan_tools = []
+    report_tool = None
+
+    # Load servers resiliently (one failure won't crash the rest)
     for name, config in server_configs.items():
-        print(f"[*] Loading MCP server '{name}'...", file=sys.stderr)
         try:
             single_client = MultiServerMCPClient({name: config})
             server_tools = await single_client.get_tools()
-            tools.extend(server_tools)
-            print(
-                f"    [+] '{name}' connected ({len(server_tools)} tools active).",
-                file=sys.stderr,
-            )
+            for tool in server_tools:
+                if tool.name == "generate_report":
+                    report_tool = tool
+                else:
+                    scan_tools.append(tool)
+            print(f"    [+] '{name}' loaded ({len(server_tools)} tools).", file=sys.stderr)
         except Exception as e:
             print(f"    [!] Server '{name}' failed to load: {e}", file=sys.stderr)
 
-    if not tools:
-        print("[-] Critical Error: No tools loaded. Exiting.", file=sys.stderr)
+    if not scan_tools:
+        print("[-] Critical Error: No scan tools loaded. Exiting.", file=sys.stderr)
         return
 
-    print(
-        f"\n[+] Total tools registered with LangGraph: {len(tools)}",
-        file=sys.stderr,
-    )
+    print(f"\n[+] Active scan tools passed to Ollama Agent: {len(scan_tools)}", file=sys.stderr)
 
     model = ChatOllama(
         model="llama3.1",
         temperature=0,
         base_url="http://localhost:11434",
-    )
+    ).bind_tools(scan_tools)
 
     system_prompt = (
-        "You are an automated security testing agent operating under strict phase constraints.\n\n"
-        "PHASE 1 — SCANNING (MANDATORY FIRST STEP):\n"
-        "- You MUST call available active scanning tools (such as zap, nuclei, ffuf, nikto, sqlmap, etc.) against the target.\n"
-        "- Run scans step-by-step. If a tool fails, times out, or finishes, proceed to another available scanning tool.\n"
-        "- NEVER call 'generate_report' during Phase 1.\n\n"
-        "PHASE 2 — REPORTING (FINAL STEP ONLY):\n"
-        "- ONLY call 'generate_report' AFTER you have executed scanning tools in Phase 1.\n"
-        "- Pass the collected scan outputs as 'findings_summary'."
+        "You are an automated security testing agent.\n"
+        "CRITICAL INSTRUCTIONS:\n"
+        "1. You MUST use the provided tool-calling mechanism to execute commands. "
+        "DO NOT write text descriptions, lists, or markdown JSON blocks of tool calls.\n"
+        "2. Execute the security scan tools step-by-step against the target URL.\n"
+        "3. Run tools systematically to assess vulnerabilities."
     )
 
-    agent = create_react_agent(model, tools, prompt=system_prompt)
+    # Note: Only scan_tools are given to Ollama, so it CANNOT call generate_report prematurely
+    agent = create_react_agent(model, scan_tools, prompt=system_prompt)
 
-    query = (
-        f"Execute a full security scan on target: {args.target}.\n"
-        "1. Start by running active vulnerability scan tools against the target.\n"
-        "2. Once scan tools have executed, call 'generate_report' to create the final PDF report."
-    )
+    query = f"Execute active security scan tools against target: {args.target}, run all possible tools without skipping"
 
-    print(f"\n[AGENT PROMPT]: {query}\n", file=sys.stderr)
-    print("[*] Agent executing...\n", file=sys.stderr)
+    print(f"\n[*] Ollama Agent executing scans...\n", file=sys.stderr)
 
+    # -------------------------------------------------------------------------
+    # STEP 1: Ollama Agent Execution Phase
+    # -------------------------------------------------------------------------
     async for chunk in agent.astream(
         {"messages": [("user", query)]}, stream_mode="values"
     ):
         messages = chunk.get("messages", [])
 
-        # -------------------------------------------------------------------------
-        # FIX: Scansione completa della cronologia messaggi per salvare ogni ToolMessage
-        # -------------------------------------------------------------------------
+        # Process message history to log tool execution results
         for msg in messages:
             if isinstance(msg, ToolMessage) or getattr(msg, "type", "") == "tool":
                 tool_name = getattr(msg, "name", "unknown_tool")
+                findings_log[tool_name] = msg.content
 
-                # Ignora generate_report per non salvare il report come finding
-                if tool_name != "generate_report":
-                    findings_log[tool_name] = msg.content
-
-        # Salva i findings aggiornati su disco
+        # Update JSON on disk
         try:
             with open(findings_file, "w", encoding="utf-8") as f:
                 json.dump(findings_log, f, indent=2)
         except Exception as e:
-            print(f"[!] Errore aggiornamento {findings_file}: {e}", file=sys.stderr)
+            print(f"[!] Error writing {findings_file}: {e}", file=sys.stderr)
 
+        # Print native tool calls or agent messages
         latest_message = messages[-1] if messages else None
         if latest_message and hasattr(latest_message, "tool_calls") and latest_message.tool_calls:
             for tc in latest_message.tool_calls:
-                print(
-                    f"[NATIVE TOOL CALL]: {tc['name']} -> {tc['args']}",
-                    file=sys.stderr,
-                )
+                print(f"[OLLAMA TOOL CALL]: {tc['name']} -> {tc['args']}", file=sys.stderr)
         elif latest_message:
             latest_message.pretty_print()
+
+    # -------------------------------------------------------------------------
+    # STEP 2: Display All Findings on CLI Terminal
+    # -------------------------------------------------------------------------
+    print("\n" + "=" * 60)
+    print("                 CLI SCAN FINDINGS SUMMARY")
+    print("=" * 60)
+
+    if not findings_log:
+        print("\n[!] No findings were recorded by Ollama.\n")
+    else:
+        for tool_name, output in findings_log.items():
+            print(f"\n--- [TOOL]: {tool_name} ---")
+            print(output)
+            print("-" * 40)
+
+    # -------------------------------------------------------------------------
+    # STEP 3: Automated Report Generation Phase (Programmatic)
+    # -------------------------------------------------------------------------
+    if report_tool:
+        print("\n" + "=" * 60)
+        print("             GENERATING REPORT WITH FINDINGS")
+        print("=" * 60)
+        try:
+            report_res = await report_tool.ainvoke({
+                "target": args.target,
+                "target_url": args.target,
+                "findings_summary": findings_log
+            })
+            print(f"\n[+] Report Generator Response:\n{report_res}")
+        except Exception as e:
+            print(f"\n[!] Error generating report: {e}")
+    else:
+        print("\n[!] 'generate_report' tool unavailable. Skipping PDF generation.")
 
 
 if __name__ == "__main__":

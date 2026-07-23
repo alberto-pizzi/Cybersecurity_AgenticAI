@@ -6,10 +6,10 @@ mcp = FastMCP("Nuclei_Server")
 
 @mcp.tool()
 def run_nuclei_scan(target_url: str) -> dict:
-    """Esegue scansioni di vulnerabilità con Nuclei."""
+    """Esegue scansioni di vulnerabilità mirate con Nuclei."""
     try:
-        cmd = ["nuclei", "-u", target_url, "-json", "-silent"]
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+        cmd = ["nuclei", "-u", target_url, "-severity", "low,medium,high,critical", "-json", "-silent"]
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
         vulnerabilities = []
         for line in result.stdout.splitlines():
             if line.strip():

@@ -5,8 +5,8 @@ mcp = FastMCP("IDOR_Forge_Server")
 
 
 @mcp.tool()
-def run_idor_check(target_url: str, test_id_param: str = "id", low_id: str = "1", high_id: str = "2") -> dict:
-    """Esegue test funzionale IDOR alterando i parametri ID di sessione per verificare accessi non autorizzati."""
+def run_idor_check(target_url: str, test_id_param: str = "id", low_id: str = "1", high_id: str = "3") -> dict:
+    """Esegue test IDOR approfonditi verificando variazioni di risposta e contenuti sensibili tra ID differenti[cite: 21]."""
     findings = []
     try:
         base_endpoint = target_url.rstrip("/")
@@ -15,9 +15,13 @@ def run_idor_check(target_url: str, test_id_param: str = "id", low_id: str = "1"
 
         if resp_low.status_code == 200 and resp_high.status_code == 200:
             if resp_low.text != resp_high.text:
+                sensitive_keywords = ["email", "password", "role", "admin", "token", "credit"]
+                leaks = [kw for kw in sensitive_keywords if kw in resp_low.text.lower() or kw in resp_high.text.lower()]
+
                 findings.append({
-                    "vulnerability": "Potential IDOR",
-                    "description": f"Different objects returned when switching parameter '{test_id_param}' from {low_id} to {high_id} without explicit authorization enforcement."
+                    "vulnerability": "Confirmed Potential IDOR / Unauthorized Object Access",
+                    "description": f"Different state/objects returned when switching parameter '{test_id_param}' from {low_id} to {high_id}.",
+                    "sensitive_keywords_detected": leaks
                 })
         return {"status": "success", "target": target_url, "findings": findings}
     except Exception as e:

@@ -16,7 +16,6 @@ def run_command(cmd: str):
     result = subprocess.run(cmd, shell=True)
     if result.returncode != 0:
         print(f"[-] Command failed with exit code {result.returncode}")
-        sys.exit(result.returncode)
 
 
 def get_bin_dir() -> Path:
@@ -31,15 +30,43 @@ def get_bin_dir() -> Path:
     return bin_dir
 
 
+def install_perl_windows(local_dir: Path):
+    """Downloads and extracts Strawberry Perl on Windows if missing."""
+    system = platform.system().lower()
+    if system != "windows":
+        return
+
+    print("[*] Checking Perl installation (required for Nikto on Windows)...")
+    if shutil.which("perl"):
+        print("[+] Perl is already installed and accessible in PATH.")
+        return
+
+    print("[*] Perl runtime missing. Downloading Strawberry Perl Portable...")
+    try:
+        perl_url = "https://strawberryperl.com/download/5.38.2.1/strawberry-perl-5.38.2.1-64bit-portable.zip"
+        perl_zip = local_dir / "perl.zip"
+        perl_dir = local_dir / "strawberry_perl"
+        perl_dir.mkdir(parents=True, exist_ok=True)
+
+        urllib.request.urlretrieve(perl_url, perl_zip)
+        with zipfile.ZipFile(perl_zip, 'r') as zip_ref:
+            zip_ref.extractall(perl_dir)
+        perl_zip.unlink(missing_ok=True)
+
+        # Add perl/bin to current session PATH
+        perl_bin = str(perl_dir / "perl" / "bin")
+        os.environ["PATH"] = perl_bin + os.pathsep + os.environ.get("PATH", "")
+        print(f"[+] Strawberry Perl portable configured at {perl_bin}")
+    except Exception as e:
+        print(f"[-] Automated Perl setup failed: {e}. Nikto might fail.")
+
+
 def install_nikto(bin_dir: Path):
     """Installs Nikto via git clone and generates a platform executable wrapper."""
     print("[*] Checking Nikto installation...")
     if shutil.which("nikto"):
         print("[+] Nikto is already installed and accessible in PATH.")
         return
-
-    if not shutil.which("perl"):
-        print("[!] Warning: 'perl' runtime not detected in PATH. Nikto requires Perl to execute.")
 
     opt_dir = Path.home() / ".local" / "opt"
     opt_dir.mkdir(parents=True, exist_ok=True)
@@ -62,28 +89,20 @@ def install_nikto(bin_dir: Path):
         with open(wrapper_file, "w") as f:
             f.write(f'#!/usr/bin/env bash\nexec perl "{program_file}" "$@"\n')
         os.chmod(wrapper_file, 0o755)
-        print(f"[+] Created executable wrapper for Nikto at {wrapper_file}")
 
 
 def install_nuclei(bin_dir: Path):
-    """Installs the latest Nuclei release binary for the current OS/Architecture."""
+    """Installs the Nuclei release binary for the current OS/Architecture."""
     print("[*] Checking Nuclei installation...")
     if shutil.which("nuclei"):
         print("[+] Nuclei is already installed and accessible in PATH.")
         return
 
-    print("[*] Downloading Nuclei binary...")
     system = platform.system().lower()
     arch = platform.machine().lower()
 
     arch_str = "amd64" if arch in ["x86_64", "amd64"] else "arm64"
-    if system == "windows":
-        os_str, ext = "windows", "zip"
-    elif system == "darwin":
-        os_str, ext = "macOS", "zip"
-    else:
-        os_str, ext = "linux", "tar.gz"
-
+    os_str, ext = ("windows", "zip") if system == "windows" else ("linux", "tar.gz")
     version = "3.3.0"
     url = f"https://github.com/projectdiscovery/nuclei/releases/download/v{version}/nuclei_{version}_{os_str}_{arch_str}.{ext}"
     archive_path = bin_dir / f"nuclei.{ext}"
@@ -99,70 +118,154 @@ def install_nuclei(bin_dir: Path):
 
         if archive_path.exists():
             archive_path.unlink()
-
-        nuclei_bin = bin_dir / ("nuclei.exe" if system == "windows" else "nuclei")
-        if nuclei_bin.exists() and system != "windows":
-            os.chmod(nuclei_bin, 0o755)
-
         print(f"[+] Nuclei successfully installed to {bin_dir}")
     except Exception as e:
         print(f"[-] Automatic Nuclei installation failed: {e}")
 
 
-def install_owasp_zap_cli(bin_dir: Path):
-    """Ensures OWASP ZAP standalone files or CLI launchers are configured."""
-    print("[*] Checking OWASP ZAP CLI accessibility...")
-    if shutil.which("zap.sh") or shutil.which("zap"):
-        print("[+] OWASP ZAP binary or launcher is already in PATH.")
+def install_ffuf(bin_dir: Path):
+    """Installs FFUF release binary."""
+    print("[*] Checking FFUF installation...")
+    if shutil.which("ffuf"):
+        print("[+] FFUF is already installed and accessible in PATH.")
         return
 
     system = platform.system().lower()
-    zap_ver = "2.15.0"
+    arch = platform.machine().lower()
+
+    arch_str = "amd64" if arch in ["x86_64", "amd64"] else "arm64"
+    os_str, ext = ("windows", "zip") if system == "windows" else ("linux", "tar.gz")
+    version = "2.1.0"
+    url = f"https://github.com/ffuf/ffuf/releases/download/v{version}/ffuf_{version}_{os_str}_{arch_str}.{ext}"
+    archive_path = bin_dir / f"ffuf.{ext}"
+
+    try:
+        urllib.request.urlretrieve(url, archive_path)
+        if ext == "zip":
+            with zipfile.ZipFile(archive_path, "r") as zip_ref:
+                zip_ref.extractall(bin_dir)
+        else:
+            with tarfile.open(archive_path, "r:gz") as tar_ref:
+                tar_ref.extractall(bin_dir)
+
+        if archive_path.exists():
+            archive_path.unlink()
+        print(f"[+] FFUF successfully installed to {bin_dir}")
+    except Exception as e:
+        print(f"[-] Automatic FFUF installation failed: {e}")
+
+
+def install_dalfox(bin_dir: Path):
+    """Installs DalFox release binary."""
+    print("[*] Checking DalFox installation...")
+    if shutil.which("dalfox"):
+        print("[+] DalFox is already installed and accessible in PATH.")
+        return
+
+    system = platform.system().lower()
+    arch = platform.machine().lower()
+
+    arch_str = "amd64" if arch in ["x86_64", "amd64"] else "arm64"
+    os_str, ext = ("windows", "zip") if system == "windows" else ("linux", "tar.gz")
+    version = "2.9.0"
+    url = f"https://github.com/hahwul/dalfox/releases/download/v{version}/dalfox_{version}_{os_str}_{arch_str}.{ext}"
+    archive_path = bin_dir / f"dalfox.{ext}"
+
+    try:
+        urllib.request.urlretrieve(url, archive_path)
+        if ext == "zip":
+            with zipfile.ZipFile(archive_path, "r") as zip_ref:
+                zip_ref.extractall(bin_dir)
+        else:
+            with tarfile.open(archive_path, "r:gz") as tar_ref:
+                tar_ref.extractall(bin_dir)
+
+        if archive_path.exists():
+            archive_path.unlink()
+        print(f"[+] DalFox successfully installed to {bin_dir}")
+    except Exception as e:
+        print(f"[-] Automatic DalFox installation failed: {e}")
+
+
+def install_commix(bin_dir: Path):
+    """Clones Commix and builds a launcher script."""
+    print("[*] Checking Commix installation...")
+    if shutil.which("commix") or shutil.which("commix.bat"):
+        print("[+] Commix is already installed and accessible in PATH.")
+        return
+
     opt_dir = Path.home() / ".local" / "opt"
     opt_dir.mkdir(parents=True, exist_ok=True)
-    zap_dir = opt_dir / f"ZAP_{zap_ver}"
-    wrapper_file = bin_dir / ("zap.bat" if system == "windows" else "zap")
+    commix_dir = opt_dir / "commix"
 
-    if not zap_dir.exists() and system == "linux":
-        print(f"[*] Downloading OWASP ZAP Standalone package v{zap_ver}...")
-        url = f"https://github.com/zaproxy/zaproxy/releases/download/v{zap_ver}/ZAP_{zap_ver}_Linux.tar.gz"
-        tar_path = bin_dir / "zap.tar.gz"
-        try:
-            urllib.request.urlretrieve(url, tar_path)
-            with tarfile.open(tar_path, "r:gz") as tar_ref:
-                tar_ref.extractall(opt_dir)
-            if tar_path.exists():
-                tar_path.unlink()
+    if not commix_dir.exists():
+        print("[*] Cloning Commix repository...")
+        run_command(f'git clone https://github.com/commixproject/commix.git "{commix_dir}"')
 
-            zap_script = zap_dir / "zap.sh"
-            if zap_script.exists():
-                os.chmod(zap_script, 0o755)
-                with open(wrapper_file, "w") as f:
-                    f.write(f'#!/usr/bin/env bash\nexec "{zap_script}" "$@"\n')
-                os.chmod(wrapper_file, 0o755)
-                print(f"[+] OWASP ZAP standalone installed to {wrapper_file}")
-        except Exception as e:
-            print(f"[-] Standalone OWASP ZAP download failed/skipped: {e}")
+    program_file = commix_dir / "commix.py"
+    system = platform.system().lower()
 
-    print("[*] Note: OWASP ZAP container service (`zap_mcp`) will also run on port 8080.")
+    if system == "windows":
+        bat_file = bin_dir / "commix.bat"
+        with open(bat_file, "w") as f:
+            f.write(f'@echo off\n"{sys.executable}" "{program_file}" %*\n')
+        print(f"[+] Created Windows batch launcher for Commix at {bat_file}")
+    else:
+        wrapper_file = bin_dir / "commix"
+        with open(wrapper_file, "w") as f:
+            f.write(f'#!/usr/bin/env bash\nexec "{sys.executable}" "{program_file}" "$@"\n')
+        os.chmod(wrapper_file, 0o755)
+
+
+def install_sqlmap(bin_dir: Path):
+    """Clones SQLMap and builds a launcher script."""
+    print("[*] Checking SQLMap installation...")
+    if shutil.which("sqlmap") or shutil.which("sqlmap.bat"):
+        print("[+] SQLMap is already installed and accessible in PATH.")
+        return
+
+    opt_dir = Path.home() / ".local" / "opt"
+    opt_dir.mkdir(parents=True, exist_ok=True)
+    sqlmap_dir = opt_dir / "sqlmap"
+
+    if not sqlmap_dir.exists():
+        print("[*] Cloning SQLMap repository...")
+        run_command(f'git clone https://github.com/sqlmapproject/sqlmap.git "{sqlmap_dir}"')
+
+    program_file = sqlmap_dir / "sqlmap.py"
+    system = platform.system().lower()
+
+    if system == "windows":
+        bat_file = bin_dir / "sqlmap.bat"
+        with open(bat_file, "w") as f:
+            f.write(f'@echo off\n"{sys.executable}" "{program_file}" %*\n')
+        print(f"[+] Created Windows batch launcher for SQLMap at {bat_file}")
+    else:
+        wrapper_file = bin_dir / "sqlmap"
+        with open(wrapper_file, "w") as f:
+            f.write(f'#!/usr/bin/env bash\nexec "{sys.executable}" "{program_file}" "$@"\n')
+        os.chmod(wrapper_file, 0o755)
 
 
 def ensure_cli_tools():
-    """Ensure required CLI binaries (Arjun, Nuclei, Nikto, OWASP ZAP) exist in PATH."""
+    """Ensure all required CLI tools are downloaded, installed, and wrapped in PATH."""
     print("\n[*] Installing and verifying security CLI tools...")
     bin_dir = get_bin_dir()
+    local_dir = Path.home() / ".local"
 
-    # 1. Install Arjun via pip
+    # Pip-based tools
     run_command(f"{sys.executable} -m pip install arjun")
 
-    # 2. Install Nuclei
+    # Install Windows Perl if required before Nikto
+    install_perl_windows(local_dir)
+
+    # Binary and script tools
     install_nuclei(bin_dir)
-
-    # 3. Install Nikto
     install_nikto(bin_dir)
-
-    # 4. Install OWASP ZAP CLI / Standalone
-    install_owasp_zap_cli(bin_dir)
+    install_ffuf(bin_dir)
+    install_dalfox(bin_dir)
+    install_commix(bin_dir)
+    install_sqlmap(bin_dir)
 
 
 def start_or_restart_container(name: str, run_cmd: str):
@@ -182,12 +285,12 @@ def main():
     # 1. Upgrade pip
     run_command(f"{sys.executable} -m pip install --upgrade pip")
 
-    # 2. Install Python dependencies (including ZAP API and Arjun)
+    # 2. Install Python dependencies
     run_command(
         f"{sys.executable} -m pip install fastmcp langgraph langchain-ollama langchain-mcp-adapters requests python-owasp-zap-v2.4 reportlab pillow arjun"
     )
 
-    # 3. Ensure CLI dependencies (Arjun, Nuclei, Nikto, ZAP)
+    # 3. Ensure CLI dependencies
     ensure_cli_tools()
 
     # 4. Create shared Docker network safely
@@ -195,55 +298,44 @@ def main():
     net_check = subprocess.run("docker network inspect secops-net", shell=True, capture_output=True)
     if net_check.returncode != 0:
         run_command("docker network create secops-net")
-    else:
-        print("[+] Network 'secops-net' already exists.")
 
-    # 5. Start MongoDB for PwnDoc
+    # 5-9. Containers setup
     start_or_restart_container(
         "mongodb",
         "docker run -d --name mongodb --network secops-net -e MONGO_DB=pwndoc mongo:4.2.15 --wiredTigerCacheSizeGB 1",
     )
-
-    # 6. Start PwnDoc Backend
     start_or_restart_container(
         "pwndoc-backend",
         "docker run -d --name pwndoc-backend --network secops-net -e DB_SERVER=mongodb -e DB_NAME=pwndoc ghcr.io/pwndoc/pwndoc-backend:latest",
     )
-
-    # 7. Start PwnDoc Frontend (Port 8443)
     start_or_restart_container(
         "pwndoc-frontend",
         "docker run -d --name pwndoc-frontend --network secops-net -p 8443:80 ghcr.io/pwndoc/pwndoc-frontend:latest",
     )
-
-    # 8. Start Ollama in Docker
     start_or_restart_container(
         "ollama",
         "docker run -d --name ollama --network secops-net -p 11434:11434 -v ollama_data:/root/.ollama ollama/ollama:latest",
     )
-
-    # 9. Start Vulnerable Target (Juice Shop)
     start_or_restart_container("juice-shop", "docker run -d -p 3000:3000 --name juice-shop bkimminich/juice-shop")
 
-    # 10. Start OWASP ZAP Container
+    # 10. OWASP ZAP Container
     start_or_restart_container(
         "zap_mcp",
         "docker run -d -p 8080:8080 -p 8090:8090 --name zap_mcp zaproxy/zap-stable zap.sh -daemon -host 0.0.0.0 -port 8080 -config api.disablekey=true -config api.addrs.addr.name=.* -config api.addrs.addr.regex=true",
     )
 
-    print("[*] Waiting 5 seconds for all services to stabilize...")
-    time.sleep(5)
+    print("[*] Waiting for ZAP service on port 8080 to respond...")
+    time.sleep(10)
 
-    # 11. Pull Llama 3.1 inside the Ollama container
+    # 11. Pull Llama 3.1 model inside Ollama container
     print("[*] Pulling local Llama 3.1 model inside the Ollama container...")
     run_command("docker exec ollama ollama pull llama3.1")
 
-    # 12. Verify running containers
     print("\n=== Active Containers (docker ps) ===")
     run_command("docker ps")
-    print("\n[+] Environment fully ready! Launching Autonomous Orchestrator...\n")
+    print("\n[+] Environment fully ready! Launching Orchestrator...\n")
 
-    # 13. Run orchestrator script
+    # 12. Run orchestrator script
     run_command(f"{sys.executable} orchestrator.py --target http://127.0.0.1:3000")
 
 
