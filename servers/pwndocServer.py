@@ -1,14 +1,15 @@
-import os
-import sys
+import html
 import json
 import logging
-import requests
+import os
+import sys
 from pathlib import Path
 from fastmcp import FastMCP
-from reportlab.lib.pagesizes import letter
-from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
-from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+import requests
 from reportlab.lib import colors
+from reportlab.lib.pagesizes import letter
+from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
+from reportlab.platypus import Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle
 
 # Directory di lavoro del progetto
 BASE_DIR = Path(__file__).parent.parent.resolve()
@@ -24,6 +25,16 @@ logger = logging.getLogger("PwnDoc_Server")
 
 mcp = FastMCP("PwnDoc_Server")
 PWNDOC_API_URL = os.getenv("PWNDOC_URL", "http://localhost:8443/api")
+
+# Mappatura per l'ordinamento per livello di gravità
+RISK_PRIORITY = {
+    "critical": 5,
+    "high": 4,
+    "medium": 3,
+    "low": 2,
+    "informational": 1,
+    "info": 1
+}
 
 
 def load_findings_from_disk() -> dict:
@@ -41,11 +52,11 @@ def load_findings_from_disk() -> dict:
 
 @mcp.tool()
 def generate_report(
-    findings_summary: dict | str = None,
-    target: str = "",
-    target_url: str = ""
+        findings_summary: dict | str = None,
+        target: str = "",
+        target_url: str = ""
 ) -> dict:
-    """Genera un report PDF locale ed effettua il sync con PwnDoc se raggiungibile."""
+    """Genera un report PDF locale con layout strutturato a celle separate e sincronizza con PwnDoc se disponibile."""
 
     # 1. Normalizzazione Target
     target_host = target or target_url or "http://127.0.0.1:3000"
@@ -54,7 +65,6 @@ def generate_report(
 
     # 2. Parsing e Normalizzazione Findings
     parsed_findings = {}
-
     if isinstance(findings_summary, str):
         try:
             parsed_findings = json.loads(findings_summary)
@@ -64,12 +74,11 @@ def generate_report(
     elif isinstance(findings_summary, dict):
         parsed_findings = findings_summary
 
-    # FALLBACK: Se l'LLM ha passato un dizionario vuoto ({}), leggi da disco
     if not parsed_findings:
-        logger.warning("findings_summary vuoto da LLM. Attivazione fallback da disco...")
+        logger.warning("findings_summary vuoto. Attivazione fallback da disco...")
         parsed_findings = load_findings_from_disk()
 
-    # 3. Costruzione Documento ReportLab
+    # 3. Costruzione Documento ReportLab con layout a colonne distinte
     try:
         doc = SimpleDocTemplate(
             pdf_filename,
@@ -85,8 +94,16 @@ def generate_report(
         title_style = ParagraphStyle(
             'ReportTitle',
             parent=styles['Heading1'],
-            fontSize=18,
+            fontSize=16,
             textColor=colors.HexColor("#1A365D"),
+            spaceAfter=6
+        )
+
+        subtitle_style = ParagraphStyle(
+            'ReportSubtitle',
+            parent=styles['Normal'],
+            fontSize=10,
+            textColor=colors.HexColor("#4A5568"),
             spaceAfter=12
         )
 
@@ -94,7 +111,7 @@ def generate_report(
             'TableCell',
             parent=styles['Normal'],
             fontSize=8,
-            leading=10
+            leading=11
         )
 
         header_style = ParagraphStyle(
@@ -106,54 +123,110 @@ def generate_report(
         )
 
         story.append(Paragraph("Autonomous SecOps Assessment Report", title_style))
-        story.append(Paragraph(f"<b>Target URL:</b> {target_host}", styles['Normal']))
-        story.append(Spacer(1, 12))
+        story.append(Paragraph(f"<b>Target URL:</b> {html.escape(target_host)}", subtitle_style))
+        story.append(Spacer(1, 6))
 
-        # Intestazione Tabella
+        # Intestazione Tabella con celle separate per Tool, Alert, Rischio e Dettagli/Descrizione
         table_data = [[
-            Paragraph("Tool / Module", header_style),
-            Paragraph("Status / Findings Summary", header_style)
+            Paragraph("Tool", header_style),
+            Paragraph("Alert / Vulnerabilità", header_style),
+            Paragraph("Rischio", header_style),
+            Paragraph("Descrizione e Dettagli", header_style)
         ]]
 
         if not parsed_findings:
             table_data.append([
-                Paragraph("<b>ALL TOOLS</b>", cell_style),
-                Paragraph("No tool findings were supplied by agent or found in scan_findings.json.", cell_style)
+                Paragraph("<b>ALL</b>", cell_style),
+                Paragraph("Nessun dato", cell_style),
+                Paragraph("N/A", cell_style),
+                Paragraph("Nessun dato di scansione disponibile nel report.", cell_style)
             ])
         else:
             for tool_name, result in parsed_findings.items():
-                # Formattazione estrazione contenuto
+                clean_tool_name = html.escape(str(tool_name)).upper()
+
                 if isinstance(result, dict):
-                    text_content = (
-                        result.get("vulnerabilities") or
-                        result.get("output") or
-                        result.get("findings") or
-                        result.get("message") or
-                        result.get("status") or
-                        str(result)
-                    )
+                    vulns = result.get("vulnerabilities")
+
+                    if isinstance(vulns, list) and vulns:
+                        # Ordinamento per livello di rischio decrescente
+                        sorted_vulns = sorted(
+                            vulns,
+                            key=lambda x: RISK_PRIORITY.get(str(x.get("risk", x.get("severity", ""))).lower(), 0),
+                            reverse=True
+                        )
+                        for v in sorted_vulns:
+                            alert = html.escape(str(v.get("alert", v.get("title", "Sconosciuto"))))
+                            risk = str(v.get("risk", v.get("severity", "Info"))).strip()
+                            url = html.escape(str(v.get("url", "N/A")))
+                            desc = html.escape(str(v.get("description", "Nessuna descrizione disponibile.")))
+                            sol = html.escape(str(v.get("solution", "")))
+
+                            if len(desc) > 250:
+                                desc = desc[:250] + "..."
+
+                            # Formattazione colore badge rischio
+                            risk_lower = risk.lower()
+                            if risk_lower in ["high", "critical"]:
+                                risk_html = f"<font color='#E53E3E'><b>{html.escape(risk)}</b></font>"
+                            elif risk_lower == "medium":
+                                risk_html = f"<font color='#DD6B20'><b>{html.escape(risk)}</b></font>"
+                            elif risk_lower == "low":
+                                risk_html = f"<font color='#3182CE'><b>{html.escape(risk)}</b></font>"
+                            else:
+                                risk_html = f"<font color='#718096'><b>{html.escape(risk)}</b></font>"
+
+                            details_text = f"<b>URL:</b> {url}<br/><b>Desc:</b> {desc}"
+                            if sol:
+                                details_text += f"<br/><b>Rimedio:</b> {sol}"
+
+                            table_data.append([
+                                Paragraph(clean_tool_name, cell_style),
+                                Paragraph(alert, cell_style),
+                                Paragraph(risk_html, cell_style),
+                                Paragraph(details_text, cell_style)
+                            ])
+                    else:
+                        # Gestione output testuali o dizionari senza lista vulnerabilità esplicita
+                        msg = (
+                            result.get("output") or
+                            result.get("findings") or
+                            result.get("message") or
+                            result.get("status") or
+                            str(result)
+                        )
+                        text_content = html.escape(str(msg)).replace("\n", "<br/>")
+                        if len(text_content) > 300:
+                            text_content = text_content[:300] + "..."
+
+                        table_data.append([
+                            Paragraph(clean_tool_name, cell_style),
+                            Paragraph("Output Generico", cell_style),
+                            Paragraph("Info", cell_style),
+                            Paragraph(text_content, cell_style)
+                        ])
                 else:
-                    text_content = str(result)
+                    text_content = html.escape(str(result)).replace("\n", "<br/>")
+                    if len(text_content) > 300:
+                        text_content = text_content[:300] + "..."
 
-                # Pulizia e troncamento per evitare overflow grafico
-                text_content = str(text_content).replace("\n", "<br/>")
-                if len(text_content) > 500:
-                    text_content = text_content[:500] + "... [TRUNCATED]"
+                    table_data.append([
+                        Paragraph(clean_tool_name, cell_style),
+                        Paragraph("Risultato", cell_style),
+                        Paragraph("Info", cell_style),
+                        Paragraph(text_content, cell_style)
+                    ])
 
-                table_data.append([
-                    Paragraph(f"<b>{str(tool_name).upper()}</b>", cell_style),
-                    Paragraph(text_content, cell_style)
-                ])
-
-        t = Table(table_data, colWidths=[120, 420])
+        # Dimensioni colonne ottimizzate per la pagina letter (Totale larghezza utile: 540 pt)
+        t = Table(table_data, colWidths=[80, 130, 60, 270])
         t.setStyle(TableStyle([
             ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor("#2B6CB0")),
             ('ALIGN', (0, 0), (-1, -1), 'LEFT'),
             ('VALIGN', (0, 0), (-1, -1), 'TOP'),
             ('BOTTOMPADDING', (0, 0), (-1, 0), 6),
             ('TOPPADDING', (0, 0), (-1, -1), 6),
-            ('BACKGROUND', (0, 1), (-1, -1), colors.HexColor("#F7FAFC")),
-            ('GRID', (0, 0), (-1, -1), 0.5, colors.HexColor("#CBD5E0"))
+            ('GRID', (0, 0), (-1, -1), 0.5, colors.HexColor("#CBD5E0")),
+            ('ROWBACKGROUNDS', (0, 1), (-1, -1), [colors.HexColor("#FFFFFF"), colors.HexColor("#F7FAFC")])
         ]))
         story.append(t)
         doc.build(story)
@@ -171,7 +244,7 @@ def generate_report(
     except Exception:
         pass
 
-    logger.info(f"PDF locale generato: {pdf_filename} (Findings usati: {len(parsed_findings)})")
+    logger.info(f"PDF locale generato: {pdf_filename} (Righe tabella: {len(table_data) - 1})")
 
     return {
         "status": "success",
@@ -179,7 +252,7 @@ def generate_report(
         "pdf_filename": pdf_filename,
         "findings_count": len(parsed_findings),
         "pwndoc_status": pwndoc_status,
-        "message": f"Report PDF creato ({len(parsed_findings)} voci registrate)."
+        "message": "Report PDF creato con layout a celle separate per massima chiarezza."
     }
 
 

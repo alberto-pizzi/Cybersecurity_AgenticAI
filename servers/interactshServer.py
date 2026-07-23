@@ -5,7 +5,7 @@ mcp = FastMCP("Interactsh_Server")
 
 @mcp.tool()
 def run_interactsh_client() -> dict:
-    """Esegue Interactsh per OAST out-of-band checks estesi con timeout incrementato[cite: 20]."""
+    """Esegue Interactsh per OAST out-of-band checks estesi con timeout."""
     try:
         cmd = ["interactsh-client", "-json", "-v", "-timeout", "30"]
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=35)

@@ -9,6 +9,7 @@ import time
 import urllib.request
 import zipfile
 from pathlib import Path
+import requests
 
 
 def run_command(cmd: str):
@@ -53,7 +54,6 @@ def install_perl_windows(local_dir: Path):
             zip_ref.extractall(perl_dir)
         perl_zip.unlink(missing_ok=True)
 
-        # Add perl/bin to current session PATH
         perl_bin = str(perl_dir / "perl" / "bin")
         os.environ["PATH"] = perl_bin + os.pathsep + os.environ.get("PATH", "")
         print(f"[+] Strawberry Perl portable configured at {perl_bin}")
@@ -279,6 +279,37 @@ def start_or_restart_container(name: str, run_cmd: str):
         run_command(run_cmd)
 
 
+def initialize_dvwa_database(target_url: str = "http://127.0.0.1"):
+    """Attende l'avvio di DVWA ed esegue l'inizializzazione del Database."""
+    print(f"[*] Attesa avvio servizio DVWA su {target_url}...")
+    session = requests.Session()
+
+    # Attesa che la porta 80 risponda
+    for attempt in range(15):
+        try:
+            res = session.get(f"{target_url}/login.php", timeout=3)
+            if res.status_code == 200:
+                print("[+] DVWA e raggiungibile! Inizializzazione Database...")
+                break
+        except Exception:
+            pass
+        time.sleep(2)
+
+    # Invio della richiesta HTTP POST per creare/resettare il database
+    try:
+        setup_resp = session.post(
+            f"{target_url}/setup.php",
+            data={"create_db": "Create / Reset Database"},
+            timeout=10
+        )
+        if setup_resp.status_code in [200, 302]:
+            print("[+] Database DVWA creato e inizializzato con successo!")
+        else:
+            print(f"[-] Avviso: Risposta inattesa dal setup di DVWA (Status code: {setup_resp.status_code})")
+    except Exception as e:
+        print(f"[-] Errore durante l'inizializzazione del Database DVWA: {e}")
+
+
 def main():
     print("=== Initializing All-in-One SecOps Autonomous MCP Environment ===")
 
@@ -316,12 +347,20 @@ def main():
         "ollama",
         "docker run -d --name ollama --network secops-net -p 11434:11434 -v ollama_data:/root/.ollama ollama/ollama:latest",
     )
-    start_or_restart_container("juice-shop", "docker run -d -p 3000:3000 --name juice-shop bkimminich/juice-shop")
+
+    # DVWA (Damn Vulnerable Web Application) sulla porta 80
+    start_or_restart_container(
+        "dvwa",
+        "docker run -d --name dvwa --network secops-net -p 80:80 vulnerables/web-dvwa"
+    )
+
+    # Inizializzazione automatica del Database di DVWA
+    initialize_dvwa_database("http://127.0.0.1")
 
     # 10. OWASP ZAP Container
     start_or_restart_container(
         "zap_mcp",
-        "docker run -d -p 8080:8080 -p 8090:8090 --name zap_mcp zaproxy/zap-stable zap.sh -daemon -host 0.0.0.0 -port 8080 -config api.disablekey=true -config api.addrs.addr.name=.* -config api.addrs.addr.regex=true",
+        "docker run -d --network secops-net -p 8080:8080 -p 8090:8090 --name zap_mcp zaproxy/zap-stable zap.sh -daemon -host 0.0.0.0 -port 8080 -config api.disablekey=true -config api.addrs.addr.name=.* -config api.addrs.addr.regex=true",
     )
 
     print("[*] Waiting for ZAP service on port 8080 to respond...")
@@ -333,11 +372,11 @@ def main():
 
     print("\n=== Active Containers (docker ps) ===")
     run_command("docker ps")
-    print("\n[+] Environment fully ready! Launching Orchestrator...\n")
+    print("\n[+] Environment fully ready! Launching LangGraph Orchestrator against DVWA...\n")
 
-    # 12. Run orchestrator script
-    run_command(f"{sys.executable} orchestrator.py --target http://127.0.0.1:3000")
-
+    # 12. Avvio dell'orchestratore LangGraph puntato a DVWA (http://127.0.0.1)
+    run_command(f"{sys.executable} orchestratorDeterministic.py --target http://127.0.0.1")
+    # run_command(f"{sys.executable} orchestrator.py --target http://127.0.0.1:3000")
 
 if __name__ == "__main__":
     main()
