@@ -1,57 +1,44 @@
-import subprocess
-import json
-import re
-import requests
+from __future__ import annotations
+
 from fastmcp import FastMCP
 
-mcp = FastMCP("Nuclei_Server")
+from utils import read_json_lines, run_process
 
-def get_dvwa_session() -> str:
-    session = requests.Session()
-    auth_url = "http://127.0.0.1"
-    try:
-        login_page = session.get(f"{auth_url}/login.php", timeout=5)
-        user_token = ""
-        match = re.search(r"name=['\"]user_token['\"]\s+value=['\"]([^'\"]+)['\"]", login_page.text)
-        if match:
-            user_token = match.group(1)
+mcp = FastMCP("Nuclei Scanner")
 
-        login_data = {"username": "admin", "password": "password", "Login": "Login"}
-        if user_token:
-            login_data["user_token"] = user_token
-
-        session.post(f"{auth_url}/login.php", data=login_data, timeout=5)
-        session.get(f"{auth_url}/security.php", timeout=5)
-        return session.cookies.get("PHPSESSID") or ""
-    except Exception:
-        return ""
 
 @mcp.tool()
-def run_nuclei_scan(target_url: str) -> dict:
-    """Esegue scansioni di vulnerabilità con Nuclei passando i cookie autenticati."""
-    phpsessid = get_dvwa_session()
-    cookie_header = f"Cookie: PHPSESSID={phpsessid}; security=low" if phpsessid else ""
+def run_nuclei_scan(target_url: str, cookies: str = "", timeout: int = 240) -> dict:
+    """Runs Nuclei and converts its JSONL output into the shared finding format."""
+    command = [
+        "nuclei", "-u", target_url,
+        "-severity", "info,low,medium,high,critical",
+        "-jsonl", "-silent",
+        "-disable-update-check",
+    ]
+    if cookies:
+        command.extend(["-H", f"Cookie: {cookies}"])
 
-    try:
-        cmd = ["nuclei", "-u", target_url, "-severity", "low,medium,high,critical", "-json", "-silent"]
-        if cookie_header:
-            cmd.extend(["-header", cookie_header])
+    result = run_process("Nuclei", command, target=target_url, timeout=timeout)
+    if result["status"] != "success":
+        return result
 
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=90)
-        vulnerabilities = []
-        for line in result.stdout.splitlines():
-            if line.strip():
-                try:
-                    data = json.loads(line)
-                    vulnerabilities.append({
-                        "title": data.get("info", {}).get("name"),
-                        "severity": data.get("info", {}).get("severity")
-                    })
-                except json.JSONDecodeError:
-                    continue
-        return {"status": "success", "target": target_url, "vulnerabilities": vulnerabilities}
-    except Exception as e:
-        return {"status": "error", "target": target_url, "message": str(e)}
+    findings = []
+    for item in read_json_lines(result.get("stdout", "")):
+        info = item.get("info") or {}
+        findings.append({
+            "alert": info.get("name", item.get("template-id", "Nuclei finding")),
+            "risk": str(info.get("severity", "info")).lower(),
+            "description": info.get("description", ""),
+            "solution": info.get("remediation", ""),
+            "url": item.get("matched-at", item.get("host", target_url)),
+            "template_id": item.get("template-id", ""),
+        })
+
+    result["vulnerabilities"] = findings
+    result["output"] = f"Nuclei completed. Findings: {len(findings)}"
+    return result
+
 
 if __name__ == "__main__":
     mcp.run(transport="stdio")

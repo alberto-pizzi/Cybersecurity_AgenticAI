@@ -1,20 +1,57 @@
-import subprocess
-from fastmcp import FastMCP
+from __future__ import annotations
 
-mcp = FastMCP("JWT_Tool_Server")
+from fastmcp import FastMCP
+import jwt
+
+from utils import failure, skipped, success
+
+mcp = FastMCP("JWT Analyzer")
+
 
 @mcp.tool()
-def run_jwt_scan(jwt_token: str) -> dict:
-    """Analizza in profondità token JWT con jwt_tool testando fuzzing avanzato e attacchi algoritmici."""
+def run_jwt_scan(jwt_token: str = "", target_url: str = "") -> dict:
+    """
+    Analyses a JWT supplied by the user or discovered by the orchestrator.
+
+    It never invents a sample token. No token means the tool is explicitly skipped.
+    """
+    if not jwt_token:
+        return skipped("JWT Analyzer", target_url, "No JWT was supplied or discovered.")
+
     try:
-        cmd = ["python3", "jwt_tool.py", jwt_token, "-M", "all", "-T", "-d", "common_secrets.txt"]
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=90)
-        return {
-            "status": "success" if result.returncode == 0 else "error",
-            "output": result.stdout[-2000:] if result.stdout else result.stderr
-        }
-    except Exception as e:
-        return {"status": "error", "message": str(e)}
+        header = jwt.get_unverified_header(jwt_token)
+        payload = jwt.decode(jwt_token, options={"verify_signature": False})
+    except Exception as exc:
+        return failure("JWT Analyzer", target_url, f"Invalid JWT: {exc}")
+
+    findings = []
+    algorithm = str(header.get("alg", "")).lower()
+    if algorithm == "none":
+        findings.append({
+            "alert": "JWT accepts no-signature algorithm",
+            "risk": "critical",
+            "description": "The token declares alg=none.",
+            "solution": "Reject unsigned tokens and enforce an explicit algorithm allow-list.",
+            "url": target_url,
+        })
+    if "exp" not in payload:
+        findings.append({
+            "alert": "JWT without expiration",
+            "risk": "medium",
+            "description": "The token has no exp claim.",
+            "solution": "Issue short-lived tokens with expiration and rotation.",
+            "url": target_url,
+        })
+
+    return success(
+        "JWT Analyzer",
+        target_url,
+        f"JWT decoded without signature verification. Findings: {len(findings)}",
+        vulnerabilities=findings,
+        header=header,
+        payload=payload,
+    )
+
 
 if __name__ == "__main__":
     mcp.run(transport="stdio")

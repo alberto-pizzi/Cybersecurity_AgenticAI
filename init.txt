@@ -1,4 +1,6 @@
-pip install fastmcp langgraph requests zapv2
-docker run -d -p 3000:3000 --name juice-shop bkimminich/juice-shop
-docker run -d -p 8080:8080 -p 8090:8090 --name zap_mcp zaproxy/zap-stable zap.sh -daemon -host 0.0.0.0 -port 8080 -config api.disablekey=true -config api.addrs.addr.name=.* -config api.addrs.addr.regex=true
-docker ps
+python initScript.py --with-lab   # inizializza tutto e da nella console token e cookie da usare per test con autenticazione su dvwa
+python orchestratorDeterministic.py --target http://127.0.0.1 --cookies "PHPSESSID=Quello ottenuto da comando sopra; security=low" tets deterministico autorizzato e non autorizzato
+oppure python orchestratorAgentic.py --target http://127.0.0.1 --cookies "PHPSESSID=Quello ottenuto da comando sopra; security=low" --model llama3.1:8b test con ia come sopra
+ad entrambi Add --auth-only to run only the authenticated profile.
+
+

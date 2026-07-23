@@ -1,51 +1,88 @@
-import requests
+from __future__ import annotations
+
 import re
+from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
+
+import requests
 from fastmcp import FastMCP
 
-mcp = FastMCP("IDOR_Forge_Server")
+from utils import failure, skipped, success
 
-def get_authenticated_session() -> requests.Session:
-    """Crea una sessione HTTP autenticata su DVWA."""
-    session = requests.Session()
-    auth_url = "http://127.0.0.1"
-    try:
-        login_page = session.get(f"{auth_url}/login.php", timeout=5)
-        user_token = ""
-        match = re.search(r"name=['\"]user_token['\"]\s+value=['\"]([^'\"]+)['\"]", login_page.text)
-        if match:
-            user_token = match.group(1)
-        login_data = {"username": "admin", "password": "password", "Login": "Login"}
-        if user_token:
-            login_data["user_token"] = user_token
-        session.post(f"{auth_url}/login.php", data=login_data, timeout=5)
-        session.cookies.set("security", "low")
-        return session
-    except Exception:
-        return session
+mcp = FastMCP("IDOR Differential Checker")
+
+
+def mutate_first_numeric_parameter(url: str) -> tuple[str, str] | None:
+    parsed = urlparse(url)
+    pairs = parse_qsl(parsed.query, keep_blank_values=True)
+    for index, (name, value) in enumerate(pairs):
+        if re.fullmatch(r"\d+", value):
+            changed = pairs.copy()
+            changed[index] = (name, str(int(value) + 1))
+            mutated = urlunparse(parsed._replace(query=urlencode(changed)))
+            return name, mutated
+    return None
+
 
 @mcp.tool()
-def run_idor_check(target_url: str, test_id_param: str = "id", low_id: str = "1", high_id: str = "3") -> dict:
-    """Esegue test IDOR approfonditi utilizzando una sessione HTTP autenticata."""
-    findings = []
+def run_idor_check(target_url: str, cookies: str = "", timeout: int = 20) -> dict:
+    """
+    Performs a small differential check on the first numeric query parameter.
+
+    This is a heuristic, not a proof: a reported candidate must be manually verified
+    with two accounts that have different permissions.
+    """
+    mutation = mutate_first_numeric_parameter(target_url)
+    if not mutation:
+        return skipped(
+            "IDOR Differential Checker",
+            target_url,
+            "No numeric query parameter was available for a differential check.",
+        )
+
+    parameter, mutated_url = mutation
+    session = requests.Session()
+    if cookies:
+        session.headers["Cookie"] = cookies
+
     try:
-        session = get_authenticated_session()
-        base_endpoint = target_url.rstrip("/")
-        resp_low = session.get(f"{base_endpoint}?{test_id_param}={low_id}", timeout=5)
-        resp_high = session.get(f"{base_endpoint}?{test_id_param}={high_id}", timeout=5)
+        original = session.get(target_url, timeout=timeout, allow_redirects=True)
+        mutated = session.get(mutated_url, timeout=timeout, allow_redirects=True)
+    except requests.RequestException as exc:
+        return failure("IDOR Differential Checker", target_url, str(exc))
 
-        if resp_low.status_code == 200 and resp_high.status_code == 200:
-            if resp_low.text != resp_high.text:
-                sensitive_keywords = ["email", "password", "role", "admin", "token", "credit"]
-                leaks = [kw for kw in sensitive_keywords if kw in resp_low.text.lower() or kw in resp_high.text.lower()]
+    similar_size = abs(len(original.content) - len(mutated.content)) <= max(
+        100, int(len(original.content) * 0.10)
+    )
+    candidate = (
+        original.status_code == mutated.status_code == 200
+        and similar_size
+        and original.url != mutated.url
+    )
 
-                findings.append({
-                    "vulnerability": "Confirmed Potential IDOR / Unauthorized Object Access",
-                    "description": f"Different state/objects returned when switching parameter '{test_id_param}' from {low_id} to {high_id}.",
-                    "sensitive_keywords_detected": leaks
-                })
-        return {"status": "success", "target": target_url, "findings": findings}
-    except Exception as e:
-        return {"status": "error", "target": target_url, "message": str(e)}
+    findings = []
+    if candidate:
+        findings.append({
+            "alert": "Potential IDOR candidate",
+            "risk": "medium",
+            "description": (
+                f"Changing parameter '{parameter}' produced another successful, "
+                "similarly sized response. Manual multi-user authorization testing is required."
+            ),
+            "solution": "Enforce object-level authorization on every server-side access.",
+            "url": mutated_url,
+            "parameter": parameter,
+            "evidence": f"Original bytes={len(original.content)}, changed bytes={len(mutated.content)}",
+        })
+
+    return success(
+        "IDOR Differential Checker",
+        target_url,
+        f"Differential request completed. Candidate: {candidate}",
+        vulnerabilities=findings,
+        mutated_url=mutated_url,
+        candidate=candidate,
+    )
+
 
 if __name__ == "__main__":
     mcp.run(transport="stdio")

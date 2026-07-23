@@ -1,50 +1,52 @@
-import subprocess
-import sys
+from __future__ import annotations
+
 import re
-import requests
-from pathlib import Path
+
 from fastmcp import FastMCP
 
-mcp = FastMCP("Commix_Server")
+from utils import run_process
 
-def get_dvwa_session() -> str:
-    session = requests.Session()
-    auth_url = "http://127.0.0.1"
-    try:
-        login_page = session.get(f"{auth_url}/login.php", timeout=5)
-        user_token = ""
-        match = re.search(r"name=['\"]user_token['\"]\s+value=['\"]([^'\"]+)['\"]", login_page.text)
-        if match:
-            user_token = match.group(1)
-        login_data = {"username": "admin", "password": "password", "Login": "Login"}
-        if user_token:
-            login_data["user_token"] = user_token
-        session.post(f"{auth_url}/login.php", data=login_data, timeout=5)
-        session.get(f"{auth_url}/security.php", timeout=5)
-        return session.cookies.get("PHPSESSID") or ""
-    except Exception:
-        return ""
+mcp = FastMCP("Commix Scanner")
+
 
 @mcp.tool()
-def run_commix_scan(target_url: str) -> dict:
-    """Esegue test command injection con Commix includendo i cookie di sessione."""
-    phpsessid = get_dvwa_session()
-    cookie_str = f"PHPSESSID={phpsessid}; security=low" if phpsessid else ""
+def run_commix_scan(target_url: str, cookies: str = "", timeout: int = 300) -> dict:
+    """Runs Commix non-interactively on a URL with testable parameters."""
+    command = ["commix", "--url", target_url, "--batch", "--level", "1"]
+    if cookies:
+        command.extend(["--cookie", cookies])
 
-    try:
-        commix_path = Path.home() / ".local" / "opt" / "commix" / "commix.py"
-        if commix_path.exists():
-            cmd = [sys.executable, str(commix_path), "--url", target_url, "--batch", "--level=1"]
-        else:
-            cmd = ["commix", "--url", target_url, "--batch"]
+    result = run_process(
+        "Commix",
+        command,
+        target=target_url,
+        timeout=timeout,
+        accepted_codes=(0, 1),
+    )
+    if result["status"] != "success":
+        return result
 
-        if cookie_str:
-            cmd.extend(["--cookie", cookie_str])
+    text = result.get("output", "")
+    found = bool(re.search(
+        r"(parameter.+is vulnerable|injectable parameter|command injection vulnerability)",
+        text,
+        re.IGNORECASE,
+    ))
+    findings = []
+    if found:
+        findings.append({
+            "alert": "OS command injection",
+            "risk": "critical",
+            "description": "Commix reported an injectable command parameter.",
+            "solution": "Avoid shell execution and enforce strict allow-list validation.",
+            "url": target_url,
+            "evidence": text[:2000],
+        })
 
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
-        return {"status": "success", "target": target_url, "output": result.stdout}
-    except Exception as e:
-        return {"status": "error", "target": target_url, "message": str(e)}
+    result["command_injection_found"] = found
+    result["vulnerabilities"] = findings
+    return result
+
 
 if __name__ == "__main__":
     mcp.run(transport="stdio")

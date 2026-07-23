@@ -1,71 +1,67 @@
-import subprocess
+from __future__ import annotations
+
 import json
-import os
-import re
-import requests
+import tempfile
 from pathlib import Path
+
 from fastmcp import FastMCP
 
-mcp = FastMCP("FFUF_Server")
+from utils import WORDLISTS_DIR, failure, run_process
 
-def get_dvwa_session() -> str:
-    session = requests.Session()
-    auth_url = "http://127.0.0.1"
-    try:
-        login_page = session.get(f"{auth_url}/login.php", timeout=5)
-        user_token = ""
-        match = re.search(r"name=['\"]user_token['\"]\s+value=['\"]([^'\"]+)['\"]", login_page.text)
-        if match:
-            user_token = match.group(1)
-        login_data = {"username": "admin", "password": "password", "Login": "Login"}
-        if user_token:
-            login_data["user_token"] = user_token
-        session.post(f"{auth_url}/login.php", data=login_data, timeout=5)
-        session.get(f"{auth_url}/security.php", timeout=5)
-        return session.cookies.get("PHPSESSID") or ""
-    except Exception:
-        return ""
+mcp = FastMCP("FFUF Scanner")
+
 
 @mcp.tool()
-def run_ffuf_fuzz(target_url: str) -> dict:
-    """Esegue directory e file fuzzing avanzato con FFUF passando i cookie autenticati."""
-    wordlist_path = Path("/usr/share/wordlists/dirb/common.txt")
+def run_ffuf_fuzz(
+    target_url: str,
+    cookies: str = "",
+    wordlist: str = "",
+    timeout: int = 180,
+) -> dict:
+    """Discovers web resources with FFUF using a cross-platform wordlist."""
+    wordlist_path = Path(wordlist) if wordlist else WORDLISTS_DIR / "common.txt"
     if not wordlist_path.exists():
-        wordlist_path = Path.home() / ".local" / "wordlists" / "common.txt"
+        return failure("FFUF", target_url, f"Wordlist not found: {wordlist_path}")
 
-    phpsessid = get_dvwa_session()
-    cookie_str = f"PHPSESSID={phpsessid}; security=low" if phpsessid else ""
-
-    try:
-        cmd = [
+    with tempfile.TemporaryDirectory(prefix="ffuf-") as temporary_directory:
+        output_file = Path(temporary_directory) / "ffuf.json"
+        command = [
             "ffuf",
-            "-u", f"{target_url}/FUZZ",
+            "-u", f"{target_url.rstrip('/')}/FUZZ",
             "-w", str(wordlist_path),
-            "-e", ".js,.html,.json,.bak,.php",
-            "-recursion",
-            "-recursion-depth", "2",
-            "-json",
-            "-s"
+            "-of", "json",
+            "-o", str(output_file),
+            "-ac",
+            "-t", "20",
+            "-timeout", "10",
+            "-noninteractive",
         ]
-        if cookie_str:
-            cmd.extend(["-b", cookie_str])
+        if cookies:
+            command.extend(["-b", cookies])
 
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=90)
-        discovered = []
-        for line in result.stdout.splitlines():
-            if line.strip():
-                try:
-                    data = json.loads(line)
-                    discovered.append({
-                        "url": data.get("url"),
-                        "status": data.get("status"),
-                        "length": data.get("length")
-                    })
-                except json.JSONDecodeError:
-                    continue
-        return {"status": "success", "target": target_url, "discovered_endpoints": discovered}
-    except Exception as e:
-        return {"status": "error", "target": target_url, "message": str(e)}
+        result = run_process("FFUF", command, target=target_url, timeout=timeout)
+        if result["status"] != "success":
+            return result
+
+        try:
+            parsed = json.loads(output_file.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            return failure("FFUF", target_url, f"Cannot parse FFUF JSON: {exc}")
+
+        findings = []
+        for item in parsed.get("results", []):
+            findings.append({
+                "alert": "Discovered web resource",
+                "risk": "info",
+                "description": f"HTTP {item.get('status')}, {item.get('length')} bytes.",
+                "url": item.get("url", ""),
+                "status_code": item.get("status"),
+            })
+
+        result["vulnerabilities"] = findings
+        result["output"] = f"FFUF completed. Resources: {len(findings)}"
+        return result
+
 
 if __name__ == "__main__":
     mcp.run(transport="stdio")

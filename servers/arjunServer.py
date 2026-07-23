@@ -1,45 +1,64 @@
-import subprocess
-import re
-import requests
+from __future__ import annotations
+
+import json
+import tempfile
+from pathlib import Path
+
 from fastmcp import FastMCP
 
-mcp = FastMCP("Arjun_Server")
+from utils import failure, run_process
+
+mcp = FastMCP("Arjun Scanner")
 
 
-def get_dvwa_session() -> str:
-    session = requests.Session()
-    auth_url = "http://127.0.0.1"
-    try:
-        login_page = session.get(f"{auth_url}/login.php", timeout=5)
-        user_token = ""
-        match = re.search(r"name=['\"]user_token['\"]\s+value=['\"]([^'\"]+)['\"]", login_page.text)
-        if match:
-            user_token = match.group(1)
-        login_data = {"username": "admin", "password": "password", "Login": "Login"}
-        if user_token:
-            login_data["user_token"] = user_token
-        session.post(f"{auth_url}/login.php", data=login_data, timeout=5)
-        session.get(f"{auth_url}/security.php", timeout=5)
-        return session.cookies.get("PHPSESSID") or ""
-    except Exception:
-        return ""
+def collect_parameters(value) -> list[str]:
+    """Recursively extracts parameter names from Arjun's JSON variants."""
+    found: list[str] = []
+    if isinstance(value, list):
+        found.extend(str(item) for item in value if isinstance(item, (str, int, float)))
+    elif isinstance(value, dict):
+        for nested in value.values():
+            found.extend(collect_parameters(nested))
+    return found
 
 
 @mcp.tool()
-def run_arjun_scan(target_url: str) -> dict:
-    """Trova parametri HTTP nascosti con Arjun passando i cookie autenticati."""
-    phpsessid = get_dvwa_session()
-    cookie_str = f"PHPSESSID={phpsessid}; security=low" if phpsessid else ""
+def run_arjun_scan(target_url: str, cookies: str = "", timeout: int = 180) -> dict:
+    """Discovers hidden GET parameters without assuming a specific application."""
+    with tempfile.TemporaryDirectory(prefix="arjun-") as temporary_directory:
+        output_file = Path(temporary_directory) / "arjun.json"
+        command = [
+            "arjun", "-u", target_url,
+            "-m", "GET",
+            "-oJ", str(output_file),
+            "-t", "10",
+            "--stable",
+        ]
+        if cookies:
+            command.extend(["--headers", f"Cookie: {cookies}"])
 
-    try:
-        cmd = ["arjun", "-u", target_url, "-m", "GET,POST", "--stable"]
-        if cookie_str:
-            cmd.extend(["--cookie", cookie_str])
+        result = run_process("Arjun", command, target=target_url, timeout=timeout)
+        if result["status"] != "success":
+            return result
 
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
-        return {"status": "success", "target": target_url, "output": result.stdout}
-    except Exception as e:
-        return {"status": "error", "target": target_url, "message": str(e)}
+        try:
+            parsed = json.loads(output_file.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            return failure("Arjun", target_url, f"Cannot parse Arjun JSON: {exc}")
+
+        parameters = sorted(set(collect_parameters(parsed)))
+        findings = [{
+            "alert": "Hidden HTTP parameter",
+            "risk": "info",
+            "description": f"Parameter discovered: {parameter}",
+            "url": target_url,
+            "parameter": parameter,
+        } for parameter in parameters]
+
+        result["parameters"] = parameters
+        result["vulnerabilities"] = findings
+        result["output"] = f"Arjun completed. Parameters: {len(parameters)}"
+        return result
 
 
 if __name__ == "__main__":
