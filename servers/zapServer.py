@@ -845,6 +845,11 @@ def _run_targeted_active_scans(
         if remaining < 15:
             break
         url = str(case.get("url") or "")
+        scan_url = _translate_url(
+            url,
+            target_url,
+            zap_target_url,
+        )
         method = str(case.get("method") or "GET").upper()
         data = str(case.get("data") or "")
         try:
@@ -1418,13 +1423,18 @@ def run_zap_scan(
         post_session = _validate_session(
             zap,
             target_url,
+            zap_target_url,
             zap_url,
             canonical_cookies,
             cookie_pairs,
             probe_url,
         ) if canonical_cookies else {"effective": True}
 
-        findings = _findings(zap, target_url)
+        findings = _findings(
+            zap,
+            zap_target_url,
+            target_url,
+        )
         try:
             site_tree_urls = list(
                 zap.core.urls(baseurl=zap_target_url) or []
