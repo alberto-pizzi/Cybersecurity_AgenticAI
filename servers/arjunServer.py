@@ -3,16 +3,16 @@ from __future__ import annotations
 import json
 import tempfile
 from pathlib import Path
+from typing import Any
 
 from fastmcp import FastMCP
 
-from utils import failure, run_process
+from utils import partial, run_process
 
 mcp = FastMCP("Arjun Scanner")
 
 
-def collect_parameters(value) -> list[str]:
-    """Recursively extracts parameter names from Arjun's JSON variants."""
+def collect_parameters(value: Any) -> list[str]:
     found: list[str] = []
     if isinstance(value, list):
         found.extend(str(item) for item in value if isinstance(item, (str, int, float)))
@@ -22,42 +22,68 @@ def collect_parameters(value) -> list[str]:
     return found
 
 
+def _load_parameters(path: Path) -> list[str]:
+    try:
+        parsed = json.loads(path.read_text(encoding="utf-8", errors="replace"))
+    except (OSError, json.JSONDecodeError):
+        return []
+    return sorted({item.strip() for item in collect_parameters(parsed) if item.strip()})
+
+
 @mcp.tool()
-def run_arjun_scan(target_url: str, cookies: str = "", timeout: int = 180) -> dict:
-    """Discovers hidden GET parameters without assuming a specific application."""
+def run_arjun_scan(target_url: str, cookies: str = "", timeout: int = 120) -> dict:
+    """Discover hidden GET parameters using a bounded, non-stable scan profile."""
     with tempfile.TemporaryDirectory(prefix="arjun-") as temporary_directory:
         output_file = Path(temporary_directory) / "arjun.json"
         command = [
             "arjun", "-u", target_url,
             "-m", "GET",
             "-oJ", str(output_file),
-            "-t", "10",
-            "--stable",
+            "-t", "5",
+            "-T", "8",
+            "-w", "small",
+            "-c", "250",
         ]
         if cookies:
             command.extend(["--headers", f"Cookie: {cookies}"])
 
         result = run_process("Arjun", command, target=target_url, timeout=timeout)
-        if result["status"] != "success":
-            return result
-
-        try:
-            parsed = json.loads(output_file.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError) as exc:
-            return failure("Arjun", target_url, f"Cannot parse Arjun JSON: {exc}")
-
-        parameters = sorted(set(collect_parameters(parsed)))
+        parameters = _load_parameters(output_file)
         findings = [{
-            "alert": "Hidden HTTP parameter",
+            "alert": "Hidden HTTP parameter discovered",
             "risk": "info",
-            "description": f"Parameter discovered: {parameter}",
+            "category": "discovery",
+            "description": f"Arjun identified the undocumented GET parameter '{parameter}'.",
+            "impact": "The parameter increases the application attack surface and should be reviewed by injection and authorization scanners.",
+            "solution": "Confirm whether the parameter is intended, validate it server-side, and remove unused parameters.",
             "url": target_url,
             "parameter": parameter,
+            "confidence": "medium",
+            "evidence": f"Parameter name returned by Arjun: {parameter}",
         } for parameter in parameters]
 
-        result["parameters"] = parameters
-        result["vulnerabilities"] = findings
-        result["output"] = f"Arjun completed. Parameters: {len(parameters)}"
+        if result.get("status") == "error" and result.get("diagnosis") == "timeout" and parameters:
+            return partial(
+                "Arjun",
+                target_url,
+                f"Arjun timed out after {timeout} seconds but returned {len(parameters)} parameter names.",
+                vulnerabilities=findings,
+                parameters=parameters,
+                diagnosis="timeout_with_partial_results",
+                timed_out=True,
+                duration_seconds=result.get("duration_seconds"),
+                command=result.get("command", []),
+            )
+        if result.get("status") != "success":
+            result.update(vulnerabilities=findings, parameters=parameters)
+            return result
+
+        result.update(
+            parameters=parameters,
+            vulnerabilities=findings,
+            output=f"Arjun completed. Hidden parameters: {len(parameters)}.",
+            scan_profile="small wordlist, 5 threads, 8-second request timeout",
+        )
         return result
 
 

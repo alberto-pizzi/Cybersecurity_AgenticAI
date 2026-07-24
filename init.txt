@@ -2,5 +2,5 @@ python initScript.py --with-lab   # inizializza tutto e da nella console token e
 python orchestratorDeterministic.py --target http://127.0.0.1 --cookies "PHPSESSID=Quello ottenuto da comando sopra; security=low" tets deterministico autorizzato e non autorizzato
 oppure python orchestratorAgentic.py --target http://127.0.0.1 --cookies "PHPSESSID=Quello ottenuto da comando sopra; security=low" --model llama3.1:8b test con ia come sopra
 ad entrambi Add --auth-only to run only the authenticated profile.
-
+powershell amministartore per scaricare perl per nikto winget uninstall --id StrawberryPerl.StrawberryPerl --exact
 

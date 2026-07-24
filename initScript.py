@@ -29,7 +29,7 @@ DOWNLOADS = LOCAL_ROOT / "downloads"
 RUNTIME_FILE = ROOT / ".secops_runtime.json"
 TARGET = "http://127.0.0.1"
 DEFAULT_MODEL = "llama3.1:8b"
-BUILD_ID = "secops-init-simplified-v2-20260723"
+BUILD_ID = "secops-init-resilient-v6-20260724"
 
 PYTHON_PACKAGES = (
     "fastmcp==2.12.5", "langgraph>=0.6,<2", "requests>=2.32,<3",
@@ -49,24 +49,50 @@ RELEASE_TOOLS = {
 }
 
 
-def run(command: list[str], *, required: bool = True, capture: bool = False, show_output: bool = True, timeout: int = 3600, cwd: Path | None = None) -> subprocess.CompletedProcess[str]:
+def run(
+    command: list[str],
+    *,
+    required: bool = True,
+    capture: bool = False,
+    show_output: bool = True,
+    timeout: int = 3600,
+    cwd: Path | None = None,
+    env_overrides: dict[str, str] | None = None,
+) -> subprocess.CompletedProcess[str]:
     print("[+] " + subprocess.list2cmdline(command))
     try:
+        child_env = os.environ.copy()
+        child_env.setdefault("PYTHONUTF8", "1")
+        child_env.setdefault("PYTHONIOENCODING", "utf-8")
+        if env_overrides:
+            child_env.update(env_overrides)
         result = subprocess.run(
-            command, cwd=str(cwd) if cwd else None, env=os.environ.copy(), shell=False,
-            text=True, capture_output=capture, timeout=timeout,
+            command,
+            cwd=str(cwd) if cwd else None,
+            env=child_env,
+            shell=False,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            capture_output=capture,
+            timeout=timeout,
         )
     except FileNotFoundError as exc:
         raise RuntimeError(f"Command not found: {command[0]}") from exc
     except subprocess.TimeoutExpired as exc:
         raise RuntimeError(f"Command timed out: {subprocess.list2cmdline(command)}") from exc
+    stdout = result.stdout or ""
+    stderr = result.stderr or ""
     if capture and show_output:
-        if result.stdout.strip():
-            print(result.stdout.strip())
-        if result.stderr.strip():
-            print(result.stderr.strip(), file=sys.stderr)
+        if stdout.strip():
+            print(stdout.strip())
+        if stderr.strip():
+            print(stderr.strip(), file=sys.stderr)
     if required and result.returncode:
-        raise RuntimeError(f"Command failed ({result.returncode}): {subprocess.list2cmdline(command)}\n{result.stderr if capture else ''}")
+        raise RuntimeError(
+            f"Command failed ({result.returncode}): {subprocess.list2cmdline(command)}\n"
+            f"{stderr if capture else ''}"
+        )
     return result
 
 
@@ -166,20 +192,140 @@ def find_perl() -> str | None:
     return None
 
 
+def _perl_module_available(perl: Path, module: str) -> tuple[bool, str]:
+    probe = run(
+        [str(perl), f"-M{module}", "-e", f"print ${module}::VERSION"],
+        required=False,
+        capture=True,
+        show_output=False,
+        timeout=60,
+    )
+    parts = [(probe.stdout or "").strip(), (probe.stderr or "").strip()]
+    detail = "\n".join(part for part in parts if part)
+    return probe.returncode == 0, detail
+
+
+def _install_perl_module(perl: Path, module: str) -> None:
+    """Install one missing Strawberry Perl module without requiring interactive CPAN input."""
+    environment = {
+        "PERL_MM_USE_DEFAULT": "1",
+        "PERL_AUTOINSTALL": "--defaultdeps",
+        "NONINTERACTIVE_TESTING": "1",
+    }
+    cpanm_candidates = (
+        perl.parent / "cpanm.bat",
+        perl.parent / "cpanm.exe",
+        perl.parent / "cpanm",
+        perl.parent.parent / "site" / "bin" / "cpanm.bat",
+        perl.parent.parent / "site" / "bin" / "cpanm.exe",
+    )
+    cpanm = next((path for path in cpanm_candidates if path.exists()), None)
+    if cpanm:
+        result = run([str(cpanm), "--notest", module], required=False, capture=True, timeout=1800, env_overrides=environment)
+    else:
+        result = run(
+            [str(perl), "-MCPAN", "-e", f"CPAN::Shell->install('{module}')"],
+            required=False,
+            capture=True,
+            timeout=1800,
+            env_overrides=environment,
+        )
+    healthy, detail = _perl_module_available(perl, module)
+    if result.returncode != 0 or not healthy:
+        raise RuntimeError(
+            f"Perl module {module} could not be installed. {detail or (result.stderr or result.stdout or '').strip()}\n"
+            "If Strawberry Perl is corrupted, uninstall it with: "
+            "winget uninstall --id StrawberryPerl.StrawberryPerl --exact"
+        )
+
+
+def _write_nikto_launcher(perl: Path, script: Path) -> Path:
+    """Use a small Python launcher so cmd.exe never reparses the Perl script path."""
+    LOCAL_BIN.mkdir(parents=True, exist_ok=True)
+    wrapper = LOCAL_OPT / "nikto_launcher.py"
+    wrapper.write_text(
+        "import subprocess, sys\n"
+        f"raise SystemExit(subprocess.call([{str(perl)!r}, {str(script)!r}, *sys.argv[1:]]))\n",
+        encoding="utf-8",
+    )
+    if os.name == "nt":
+        launcher = LOCAL_BIN / "nikto.bat"
+        launcher.write_text(
+            "@echo off\r\n"
+            f'"{Path(sys.executable).resolve()}" "{wrapper}" %*\r\n'
+            "exit /b %ERRORLEVEL%\r\n",
+            encoding="utf-8",
+        )
+    else:
+        launcher = LOCAL_BIN / "nikto"
+        launcher.write_text(f'#!/usr/bin/env sh\nexec "{Path(sys.executable).resolve()}" "{wrapper}" "$@"\n', encoding="utf-8")
+        launcher.chmod(launcher.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+    configure_path()
+    return launcher
+
+
+def _nikto_health(perl: Path, script: Path, launcher: Path | None = None) -> tuple[bool, str]:
+    fatal = re.compile(
+        r"(?:can't open perl script|cannot open perl script|invalid argument|required module not found|"
+        r"not recognized|non .? riconosciuto|no such file|modulenotfounderror|traceback|^error:)",
+        re.IGNORECASE | re.MULTILINE,
+    )
+    commands = [[str(perl), str(script), "-Version"]]
+    if launcher:
+        commands.append([str(launcher), "-Version"])
+    details: list[str] = []
+    for command in commands:
+        result = run(command, required=False, capture=True, show_output=False, timeout=60)
+        parts = [(result.stdout or "").strip(), (result.stderr or "").strip()]
+        combined = "\n".join(part for part in parts if part)
+        details.append(combined or f"exit={result.returncode}")
+        if result.returncode != 0 or fatal.search(combined):
+            return False, details[-1]
+    return True, details[-1]
+
+
 def install_nikto() -> None:
-    if command_path("nikto"):
-        print(f"[+] nikto already available: {command_path('nikto')}")
-        return
+    """Install/repair Nikto, Strawberry Perl dependencies, and a quoting-safe launcher."""
     destination = LOCAL_OPT / "nikto"
-    clone_or_update("https://github.com/sullo/nikto.git", destination)
     script = destination / "program" / "nikto.pl"
-    perl = find_perl()
-    if not perl and os.name == "nt" and shutil.which("winget"):
-        run(["winget", "install", "--id", "StrawberryPerl.StrawberryPerl", "--exact", "--silent", "--accept-package-agreements", "--accept-source-agreements"], required=False, timeout=1800)
-        perl = find_perl()
-    if not script.is_file() or not perl:
-        raise RuntimeError("Nikto requires program/nikto.pl and Perl (Strawberry Perl on Windows).")
-    write_launcher("nikto", [perl, str(script)])
+    if not script.is_file():
+        clone_or_update("https://github.com/sullo/nikto.git", destination)
+
+    perl_value = find_perl()
+    if not perl_value and os.name == "nt" and shutil.which("winget"):
+        run(
+            ["winget", "install", "--id", "StrawberryPerl.StrawberryPerl", "--exact", "--silent",
+             "--accept-package-agreements", "--accept-source-agreements"],
+            required=False,
+            timeout=1800,
+        )
+        configure_path()
+        perl_value = find_perl()
+
+    if not script.is_file() or not perl_value:
+        raise RuntimeError(
+            "Nikto requires program/nikto.pl and Strawberry Perl. "
+            "To remove a corrupted installation run: "
+            "winget uninstall --id StrawberryPerl.StrawberryPerl --exact"
+        )
+
+    perl = Path(perl_value).resolve()
+    for module in ("XML::Writer",):
+        available, _ = _perl_module_available(perl, module)
+        if not available:
+            print(f"[*] Installing missing Perl module: {module}")
+            _install_perl_module(perl, module)
+
+    launcher = _write_nikto_launcher(perl, script.resolve())
+    healthy, detail = _nikto_health(perl, script.resolve(), launcher)
+    if not healthy:
+        raise RuntimeError(
+            f"Nikto runtime verification failed: {detail}\n"
+            "Reinstall Strawberry Perl with:\n"
+            "  winget uninstall --id StrawberryPerl.StrawberryPerl --exact\n"
+            "  winget install --id StrawberryPerl.StrawberryPerl --exact"
+        )
+    print(f"[+] Nikto runtime and launcher verified: {launcher}")
 
 
 def ensure_arjun() -> None:
@@ -267,24 +413,36 @@ def scanner_status() -> dict[str, str | None]:
 
 def verify_scanners(required: bool = True) -> dict[str, str | None]:
     status = scanner_status()
+    if status.get("nikto"):
+        perl_value = find_perl()
+        script = LOCAL_OPT / "nikto" / "program" / "nikto.pl"
+        healthy = False
+        detail = "Perl or nikto.pl is missing."
+        if perl_value and script.is_file():
+            healthy, detail = _nikto_health(Path(perl_value).resolve(), script.resolve(), Path(status["nikto"]))
+        if not healthy:
+            status["nikto"] = None
+            print(f"[!] Nikto is unusable: {detail}", file=sys.stderr)
     print("\n=== Scanner executables ===")
     for name, path in status.items():
-        print(f"{name:20} {'OK: ' + path if path else 'MISSING'}")
+        print(f"{name:20} {'OK: ' + path if path else 'MISSING/UNUSABLE'}")
     missing = [name for name, path in status.items() if not path]
     if required and missing:
-        raise RuntimeError("Missing scanners: " + ", ".join(missing))
+        raise RuntimeError("Missing or unusable scanners: " + ", ".join(missing))
     return status
 
 
 def write_runtime_config(status: dict[str, str | None]) -> None:
     directories = configure_path() + [str(Path(path).parent) for path in status.values() if path]
     payload = {
-        "schema_version": 1,
+        "schema_version": 2,
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "project_root": str(ROOT),
         "python_executable": str(Path(sys.executable).resolve()),
         "tool_directories": list(dict.fromkeys(directories)),
         "executables": status,
+        "nikto_perl": str(Path(find_perl()).resolve()) if find_perl() else "",
+        "nikto_script": str((LOCAL_OPT / "nikto" / "program" / "nikto.pl").resolve()),
     }
     RUNTIME_FILE.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
     print(f"[+] Runtime scanner configuration written: {RUNTIME_FILE}")
@@ -292,7 +450,7 @@ def write_runtime_config(status: dict[str, str | None]) -> None:
 
 def create_wordlist() -> None:
     WORDLISTS_DIR.mkdir(parents=True, exist_ok=True)
-    words = "admin api assets backup config css docs images index.php js login.php logout.php robots.txt server-status setup.php uploads vulnerabilities".split()
+    words = "admin api assets backup config debug docs images index.php js login.php logout.php robots.txt server-status setup.php uploads vulnerabilities .env .git".split()
     (WORDLISTS_DIR / "common.txt").write_text("\n".join(words) + "\n", encoding="utf-8")
 
 
@@ -368,6 +526,19 @@ def login_dvwa() -> str:
     return cookie
 
 
+
+def update_runtime_auth(cookie: str) -> None:
+    try:
+        payload = json.loads(RUNTIME_FILE.read_text(encoding="utf-8")) if RUNTIME_FILE.exists() else {}
+    except (OSError, json.JSONDecodeError):
+        payload = {}
+    payload.update({
+        "last_auth_target": TARGET,
+        "last_auth_cookie": cookie,
+        "last_auth_generated_at": datetime.now(timezone.utc).isoformat(),
+    })
+    RUNTIME_FILE.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
+
 def setup_lab(model: str) -> str:
     if not shutil.which("docker"):
         raise RuntimeError("Docker is required for --with-lab.")
@@ -431,6 +602,7 @@ def main() -> int:
         cookie = ""
         if args.with_lab:
             cookie = setup_lab(args.model)
+            update_runtime_auth(cookie)
             print(f"\n[+] DVWA login created successfully.\n[+] Cookie header: {cookie}")
             print_commands(cookie, args.model)
         if args.run != "none":

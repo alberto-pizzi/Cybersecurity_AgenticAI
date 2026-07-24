@@ -4,6 +4,7 @@ import html
 import json
 import os
 import re
+from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterator
@@ -20,164 +21,345 @@ from utils import REPORTS_DIR, failure, success
 mcp = FastMCP("SecOps Report Server")
 
 RISK_ORDER = {"critical": 5, "high": 4, "medium": 3, "low": 2, "info": 1}
+TOOL_PURPOSES = {
+    "zap": "Broad authenticated/anonymous crawling and active web vulnerability scanning.",
+    "nuclei": "Template-based checks for known exposures, CVEs and misconfigurations.",
+    "nikto": "Web-server hardening, dangerous files and outdated component checks.",
+    "ffuf": "Hidden path and resource discovery used to expand the crawl surface.",
+    "arjun": "Hidden HTTP parameter discovery for downstream injection testing.",
+    "sqlmap": "SQL injection confirmation on parameterized URLs.",
+    "dalfox": "Cross-site scripting confirmation on parameterized URLs.",
+    "commix": "Operating-system command injection testing.",
+    "idor": "Heuristic object-level authorization differential checks.",
+    "jwt": "JWT structural and claim analysis when a token is available.",
+    "interactsh": "Explicit out-of-band callback testing when an insertion point is supplied.",
+}
 
 
 def _safe_name(value: str) -> str:
-    sanitized = re.sub(r"[^A-Za-z0-9_.-]+", "_", value.strip()).strip("._")
-    return sanitized[:120]
+    return re.sub(r"[^A-Za-z0-9_.-]+", "_", value.strip()).strip("._")[:120]
 
 
-def _iter_result_nodes(value: Any, path: tuple[str, ...] = ()) -> Iterator[tuple[tuple[str, ...], dict[str, Any]]]:
+def _as_dict(value: dict | str | None) -> dict[str, Any]:
+    if value is None:
+        return {}
     if isinstance(value, dict):
+        return value
+    parsed = json.loads(value)
+    if not isinstance(parsed, dict):
+        raise ValueError("Expected a JSON object.")
+    return parsed
+
+
+def _iter_leaf_results(value: Any, path: tuple[str, ...] = ()) -> Iterator[tuple[tuple[str, ...], dict[str, Any]]]:
+    if isinstance(value, dict) and "status" in value:
         runs = value.get("runs")
-        if isinstance(runs, list):
+        if isinstance(runs, list) and runs:
             for index, run in enumerate(runs, start=1):
                 if isinstance(run, dict):
-                    yield (*path, str(index)), run
-            return
-        if "status" in value or "vulnerabilities" in value:
+                    yield (*path, f"run[{index}]"), run
+        else:
             yield path, value
-            return
+        return
+    if isinstance(value, dict):
         for key, child in value.items():
-            yield from _iter_result_nodes(child, (*path, str(key)))
-    elif isinstance(value, list):
-        for index, child in enumerate(value, start=1):
-            yield from _iter_result_nodes(child, (*path, str(index)))
+            yield from _iter_leaf_results(child, (*path, str(key)))
 
 
-def _finding_fingerprint(finding: dict[str, Any]) -> tuple[str, ...]:
-    return tuple(str(finding.get(key, "")) for key in (
-        "profile", "tool", "alert", "risk", "url", "parameter", "evidence", "description"
-    ))
+def _category(finding: dict[str, Any]) -> str:
+    explicit = str(finding.get("category", "")).lower()
+    if explicit in {"vulnerability", "candidate", "discovery", "observation"}:
+        return explicit
+    return "observation" if str(finding.get("risk", "info")).lower() == "info" else "vulnerability"
+
+
+def _default_impact(risk: str) -> str:
+    return {
+        "critical": "Successful exploitation may result in full compromise of application data or the underlying host.",
+        "high": "Successful exploitation may expose sensitive data or enable significant unauthorized actions.",
+        "medium": "The issue may enable limited unauthorized access, security-control bypass, or useful attacker reconnaissance.",
+        "low": "The issue weakens security posture or exposes information useful for further attacks.",
+        "info": "This observation expands the known attack surface but is not proof of a vulnerability by itself.",
+    }.get(risk, "Review the finding in its application context.")
 
 
 def flatten_findings(results: dict[str, Any]) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     seen: set[tuple[str, ...]] = set()
-    for path, tool_result in _iter_result_nodes(results):
-        findings = tool_result.get("vulnerabilities") or []
-        if not isinstance(findings, list):
-            continue
-        profile_name = path[0] if path else str(tool_result.get("profile", ""))
-        tool_name = path[1] if len(path) > 1 else str(tool_result.get("tool", "unknown"))
-        for finding in findings:
-            if not isinstance(finding, dict):
+    for path, result in _iter_leaf_results(results):
+        profile = path[0] if path else str(result.get("profile", "unknown"))
+        tool_key = (path[1].split(":", 1)[0] if len(path) > 1 else str(result.get("tool", "unknown")))
+        for raw in result.get("vulnerabilities") or []:
+            if not isinstance(raw, dict):
                 continue
+            risk = str(raw.get("risk", "info")).lower()
             row = {
-                "profile": profile_name,
-                "tool": tool_name,
-                **finding,
+                "profile": profile,
+                "tool": tool_key,
+                **raw,
+                "risk": risk,
+                "category": _category(raw),
+                "impact": raw.get("impact") or _default_impact(risk),
+                "solution": raw.get("solution") or "Review and remediate the affected component according to vendor and secure-development guidance.",
+                "confidence": raw.get("confidence") or ("high" if risk in {"critical", "high"} else "medium"),
             }
-            fingerprint = _finding_fingerprint(row)
-            if fingerprint in seen:
+            fingerprint = tuple(str(row.get(key, "")) for key in ("profile", "tool", "alert", "risk", "url", "parameter", "evidence"))
+            if fingerprint not in seen:
+                seen.add(fingerprint)
+                rows.append(row)
+    return sorted(rows, key=lambda row: (RISK_ORDER.get(row["risk"], 0), row.get("alert", "")), reverse=True)
+
+
+def _effective_status(result: dict[str, Any]) -> tuple[str, str]:
+    status = str(result.get("status", "unknown")).lower()
+    combined = "\n".join(str(result.get(key, "")) for key in ("output", "stdout", "stderr"))
+    if status == "success" and re.search(
+        r"(?:not recognized as an internal or external command|non .? riconosciuto come comando interno o esterno|can't open perl script|modulenotfounderror|traceback \(most recent call last\))",
+        combined, re.I,
+    ):
+        return "error", "The scanner result claimed success, but its process output contains a launcher or dependency failure."
+    return status, ""
+
+
+def _duration(result: dict[str, Any]) -> float:
+    if isinstance(result.get("runs"), list):
+        return sum(_duration(run) for run in result["runs"] if isinstance(run, dict))
+    meta = result.get("_meta") if isinstance(result.get("_meta"), dict) else {}
+    value = result.get("duration_seconds", meta.get("duration_seconds", 0))
+    try:
+        return float(value or 0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _tool_result(tools: dict[str, Any], tool: str) -> dict[str, Any] | None:
+    exact = tools.get(tool)
+    if isinstance(exact, dict):
+        return exact
+    matches = [value for key, value in tools.items() if key == tool or key.startswith(f"{tool}:") if isinstance(value, dict)]
+    if not matches:
+        return None
+    statuses = [str(item.get("status", "unknown")) for item in matches]
+    successes = sum(status == "success" for status in statuses)
+    errors = sum(status == "error" for status in statuses)
+    partials = sum(status == "partial" for status in statuses)
+    if errors == len(matches):
+        status = "error"
+    elif errors or partials:
+        status = "partial"
+    elif successes:
+        status = "success"
+    else:
+        status = "skipped"
+    findings = [finding for item in matches for finding in (item.get("vulnerabilities") or []) if isinstance(finding, dict)]
+    return {
+        "tool": tool, "status": status, "target": matches[0].get("target", ""),
+        "output": f"Agentic runs: {len(matches)}; successful={successes}; errors={errors}; partial={partials}.",
+        "vulnerabilities": findings, "runs": matches,
+    }
+
+
+def build_coverage(results: dict[str, Any], context: dict[str, Any]) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    expected = context.get("expected_tools") if isinstance(context.get("expected_tools"), list) else list(TOOL_PURPOSES)
+    profiles = context.get("profiles") if isinstance(context.get("profiles"), list) else list(results)
+    profile_names = [item.get("name", item) if isinstance(item, dict) else item for item in profiles]
+    for profile in profile_names:
+        tools = results.get(profile, {}) if isinstance(results.get(profile), dict) else {}
+        for tool in expected:
+            result = _tool_result(tools, tool)
+            if not isinstance(result, dict):
+                rows.append({
+                    "profile": profile, "tool": tool, "status": "not_run", "targets": 0,
+                    "findings": 0, "duration_seconds": 0.0,
+                    "purpose": TOOL_PURPOSES.get(tool, "Security assessment tool."),
+                    "details": "The orchestrator did not create a result for this tool.",
+                })
                 continue
-            seen.add(fingerprint)
-            rows.append(row)
-    return sorted(
-        rows,
-        key=lambda row: RISK_ORDER.get(str(row.get("risk", "info")).lower(), 0),
-        reverse=True,
+            runs = result.get("runs") if isinstance(result.get("runs"), list) else []
+            targets = len(runs) if runs else (1 if result.get("status") != "skipped" else 0)
+            effective_status, contradiction = _effective_status(result)
+            rows.append({
+                "profile": profile,
+                "tool": tool,
+                "status": effective_status,
+                "targets": targets,
+                "findings": len(result.get("vulnerabilities") or []),
+                "duration_seconds": round(_duration(result), 2),
+                "purpose": TOOL_PURPOSES.get(tool, "Security assessment tool."),
+                "details": (contradiction + " " + str(result.get("output", ""))).strip(),
+            })
+    return rows
+
+
+def summarize(results: dict[str, Any], findings: list[dict[str, Any]], coverage: list[dict[str, Any]], context: dict[str, Any]) -> dict[str, Any]:
+    status_counts = Counter(row["status"] for row in coverage)
+    risk_counts = Counter(row["risk"] for row in findings if row["category"] in {"vulnerability", "candidate"})
+    category_counts = Counter(row["category"] for row in findings)
+    limitations = []
+    for path, result in _iter_leaf_results(results):
+        effective_status, contradiction = _effective_status(result)
+        if effective_status in {"error", "partial"}:
+            limitations.append({
+                "path": "/".join(path), "status": effective_status,
+                "diagnosis": result.get("diagnosis", "inconsistent_success" if contradiction else "unknown"),
+                "details": (contradiction + " " + str(result.get("output", ""))).strip(),
+            })
+    for profile, discovery in (context.get("discovery") or {}).items():
+        if isinstance(discovery, dict) and discovery.get("authentication_effective") is False:
+            limitations.append({
+                "path": f"{profile}/authentication", "status": "warning", "diagnosis": "authentication_ineffective",
+                "details": discovery.get("authentication_note", "The supplied session appeared to reach a login page."),
+            })
+    return {
+        "status_counts": dict(status_counts),
+        "risk_counts": {risk: risk_counts.get(risk, 0) for risk in RISK_ORDER},
+        "category_counts": dict(category_counts),
+        "limitations": limitations,
+        "coverage_complete": not any(row["status"] in {"error", "partial", "not_run"} for row in coverage),
+    }
+
+
+def _executive_text(summary: dict[str, Any], findings: list[dict[str, Any]]) -> str:
+    risks = summary["risk_counts"]
+    confirmed = sum(1 for item in findings if item["category"] == "vulnerability")
+    candidates = sum(1 for item in findings if item["category"] == "candidate")
+    observations = sum(1 for item in findings if item["category"] in {"discovery", "observation"})
+    return (
+        f"The assessment recorded {confirmed} security findings, {candidates} candidates requiring manual verification, "
+        f"and {observations} discovery or hardening observations. Severity distribution: "
+        f"{risks.get('critical', 0)} critical, {risks.get('high', 0)} high, {risks.get('medium', 0)} medium, "
+        f"{risks.get('low', 0)} low. {len(summary['limitations'])} execution limitations or warnings were recorded; "
+        "a failed or skipped scanner is never interpreted as proof that the target is clean."
     )
 
 
-def summarize_results(results: dict[str, Any]) -> dict[str, Any]:
-    counts = {"success": 0, "error": 0, "skipped": 0, "partial": 0, "unknown": 0}
-    errors: list[dict[str, Any]] = []
-    for path, result in _iter_result_nodes(results):
-        status = str(result.get("status", "unknown")).lower()
-        if status not in counts:
-            status = "unknown"
-        counts[status] += 1
-        if status in {"error", "partial"}:
-            errors.append({
-                "path": "/".join(path),
-                "tool": result.get("tool", path[-1] if path else "unknown"),
-                "target": result.get("target", ""),
-                "status": status,
-                "diagnosis": result.get("diagnosis", "unknown"),
-                "output": str(result.get("output", "")),
-            })
-    return {"counts": counts, "errors": errors}
+def _esc(value: Any) -> str:
+    return html.escape(str(value or ""))
 
 
-def _paragraph_text(value: Any) -> str:
+def _render_html(payload: dict[str, Any]) -> str:
+    summary, coverage, findings = payload["summary"], payload["coverage"], payload["findings"]
+    security = [item for item in findings if item["category"] in {"vulnerability", "candidate"}]
+    observations = [item for item in findings if item["category"] in {"discovery", "observation"}]
+
+    coverage_rows = "".join(
+        "<tr>" + "".join(f"<td>{_esc(value)}</td>" for value in (
+            row["profile"], row["tool"], row["status"], row["targets"], row["findings"], row["duration_seconds"], row["purpose"], row["details"]
+        )) + "</tr>" for row in coverage
+    )
+    limitation_rows = "".join(
+        "<tr>" + "".join(f"<td>{_esc(value)}</td>" for value in (row["path"], row["status"], row["diagnosis"], row["details"])) + "</tr>"
+        for row in summary["limitations"]
+    ) or '<tr><td colspan="4">No execution limitations were recorded.</td></tr>'
+    discovery_rows = []
+    for profile, discovered in (payload.get("assessment_context", {}).get("discovery", {}) or {}).items():
+        if not isinstance(discovered, dict):
+            continue
+        cases = discovered.get("request_cases", []) or []
+        get_cases = sum(str(case.get("method", "GET")).upper() == "GET" for case in cases if isinstance(case, dict))
+        post_cases = sum(str(case.get("method", "GET")).upper() == "POST" for case in cases if isinstance(case, dict))
+        discovery_rows.append("<tr>" + "".join(f"<td>{_esc(value)}</td>" for value in (
+            profile, len(discovered.get("html_urls", []) or []), get_cases, post_cases,
+            discovered.get("authentication_effective"), discovered.get("authentication_note", ""),
+            len(discovered.get("errors", []) or []),
+        )) + "</tr>")
+    discovery_rows_html = "".join(discovery_rows) or '<tr><td colspan="7">No discovery context was supplied.</td></tr>'
+
+    def finding_cards(items: list[dict[str, Any]]) -> str:
+        if not items:
+            return '<div class="empty">None recorded.</div>'
+        cards = []
+        for index, item in enumerate(items, start=1):
+            refs = item.get("references") or item.get("reference") or []
+            if isinstance(refs, str):
+                refs = [refs]
+            cards.append(f"""
+<article class="finding risk-{_esc(item['risk'])}">
+<h3>{index}. {_esc(item.get('alert', 'Finding'))}</h3>
+<div class="badges"><span>{_esc(item['risk']).upper()}</span><span>{_esc(item['category'])}</span><span>confidence: {_esc(item.get('confidence'))}</span></div>
+<dl>
+<dt>Profile / tool</dt><dd>{_esc(item.get('profile'))} / {_esc(item.get('tool'))}</dd>
+<dt>Affected URL</dt><dd>{_esc(item.get('url'))}</dd>
+<dt>Method</dt><dd>{_esc(item.get('method')) or 'GET / not specified'}</dd>
+<dt>Parameter</dt><dd>{_esc(item.get('parameter')) or '-'}</dd>
+<dt>Description</dt><dd>{_esc(item.get('description'))}</dd>
+<dt>Potential impact</dt><dd>{_esc(item.get('impact'))}</dd>
+<dt>Evidence</dt><dd><pre>{_esc(item.get('evidence')) or 'No scanner evidence was supplied.'}</pre></dd>
+<dt>Recommendation</dt><dd>{_esc(item.get('solution'))}</dd>
+<dt>References</dt><dd>{'<br>'.join(_esc(ref) for ref in refs) or '-'}</dd>
+</dl></article>""")
+        return "".join(cards)
+
+    raw = _esc(json.dumps(payload.get("results", {}), indent=2, ensure_ascii=False, default=str))
+    risks = summary["risk_counts"]
+    return f"""<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>SecOps Assessment</title><style>
+:root{{--bg:#f3f6f9;--card:#fff;--text:#17212b;--muted:#607080;--line:#ccd5df;--accent:#24476b;--bad:#8b2f2f}}
+@media(prefers-color-scheme:dark){{:root{{--bg:#10161d;--card:#18212b;--text:#edf3f8;--muted:#aeb9c4;--line:#354353;--accent:#5c91c8;--bad:#d87979}}}}
+*{{box-sizing:border-box}}body{{margin:0;background:var(--bg);color:var(--text);font-family:Segoe UI,Arial,sans-serif}}main{{max-width:1450px;margin:auto;padding:28px}}
+h1,h2,h3{{margin-top:0}}.meta,.muted{{color:var(--muted)}}.grid{{display:grid;grid-template-columns:repeat(auto-fit,minmax(145px,1fr));gap:12px;margin:18px 0 28px}}
+.card,.finding,.empty{{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:16px;margin-bottom:16px}}.value{{font-size:1.8rem;font-weight:700}}
+.table-wrap{{overflow:auto;background:var(--card);border:1px solid var(--line);border-radius:12px;margin-bottom:26px}}table{{width:100%;border-collapse:collapse;min-width:1050px}}th{{background:var(--accent);color:#fff;text-align:left}}th,td{{padding:9px;border-bottom:1px solid var(--line);vertical-align:top;white-space:pre-wrap}}
+.badges span{{display:inline-block;padding:3px 8px;margin:0 6px 8px 0;border-radius:999px;background:#68798a22;font-size:.85rem}}dl{{display:grid;grid-template-columns:150px 1fr;gap:8px 14px}}dt{{font-weight:700}}dd{{margin:0}}pre{{white-space:pre-wrap;overflow-wrap:anywhere;background:#0d141b;color:#dce7f0;padding:12px;border-radius:8px;max-height:420px;overflow:auto}}
+.risk-critical,.risk-high{{border-left:6px solid #b22}}.risk-medium{{border-left:6px solid #d98200}}.risk-low{{border-left:6px solid #d0ad00}}.risk-info{{border-left:6px solid #4b86b4}}details{{margin-top:20px}}
+</style></head><body><main>
+<h1>SecOps Assessment Report</h1><div class="meta"><b>Target:</b> {_esc(payload['target'])}<br><b>Generated:</b> {_esc(payload['generated_at'])}</div>
+<h2>Executive summary</h2><div class="card">{_esc(payload['executive_summary'])}</div>
+<div class="grid">{''.join(f'<div class="card"><div class="value">{risks.get(risk,0)}</div><div class="muted">{risk.title()}</div></div>' for risk in ('critical','high','medium','low'))}<div class="card"><div class="value">{len(summary['limitations'])}</div><div class="muted">Limitations</div></div></div>
+<h2>Discovery and authentication coverage</h2><div class="table-wrap"><table><thead><tr><th>Profile</th><th>HTML pages</th><th>GET cases</th><th>POST cases</th><th>Authentication effective</th><th>Explanation</th><th>Crawl errors</th></tr></thead><tbody>{discovery_rows_html}</tbody></table></div>
+<h2>Tool coverage</h2><div class="table-wrap"><table><thead><tr><th>Profile</th><th>Tool</th><th>Status</th><th>Targets</th><th>Findings</th><th>Seconds</th><th>Purpose</th><th>Details</th></tr></thead><tbody>{coverage_rows}</tbody></table></div>
+<h2>Execution limitations</h2><div class="table-wrap"><table><thead><tr><th>Path</th><th>Status</th><th>Cause</th><th>Explanation</th></tr></thead><tbody>{limitation_rows}</tbody></table></div>
+<h2>Security findings and candidates</h2>{finding_cards(security)}
+<h2>Discovery and hardening observations</h2>{finding_cards(observations)}
+<details><summary>Raw structured scanner results</summary><pre>{raw}</pre></details>
+</main></body></html>"""
+
+
+def _p(value: Any) -> str:
     return html.escape(str(value or "")).replace("\n", "<br/>")
 
 
-def _update_failure(result: dict[str, Any], **extra: Any) -> dict[str, Any]:
-    result.update(extra)
-    return result
-
-
-def _render_html_preview(report_payload: dict[str, Any]) -> str:
-    """Create a standalone browser preview with no external assets."""
-    summary = report_payload.get("summary", {})
-    counts = summary.get("counts", {})
-    errors = summary.get("errors", [])
-    findings = report_payload.get("findings", [])
-
-    def cells(values: list[Any]) -> str:
-        return "".join(f"<td>{html.escape(str(value or ''))}</td>" for value in values)
-
-    error_rows = "".join(
-        f"<tr>{cells([row.get('path'), row.get('status'), row.get('diagnosis'), row.get('target'), row.get('output')])}</tr>"
-        for row in errors
-    ) or '<tr><td colspan="5">No scanner errors or partial results.</td></tr>'
-
-    finding_rows = "".join(
-        f"<tr>{cells([
-            finding.get('profile'),
-            finding.get('tool'),
-            finding.get('alert', 'Finding'),
-            finding.get('risk', 'info'),
-            finding.get('url'),
-            finding.get('parameter'),
-            finding.get('description'),
-            finding.get('evidence'),
-        ])}</tr>"
-        for finding in findings
-    ) or '<tr><td colspan="8">No structured findings. Scanner failures are not treated as a clean result.</td></tr>'
-
-    raw_json = html.escape(json.dumps(report_payload.get("results", {}), indent=2, ensure_ascii=False, default=str))
-    target = html.escape(str(report_payload.get("target", "")))
-    generated = html.escape(str(report_payload.get("generated_at", "")))
-    return f"""<!doctype html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>SecOps Assessment Preview</title>
-<style>
-:root {{ color-scheme: light dark; --bg:#f4f7fa; --card:#fff; --text:#17212b; --muted:#5f6b76; --line:#cbd5df; --accent:#24476b; --error:#8b2f2f; }}
-@media (prefers-color-scheme: dark) {{ :root {{ --bg:#10151b; --card:#18212b; --text:#ecf2f8; --muted:#aeb9c4; --line:#354353; --accent:#5c91c8; --error:#d87979; }} }}
-* {{ box-sizing:border-box; }} body {{ margin:0; font-family:Inter,Segoe UI,Arial,sans-serif; background:var(--bg); color:var(--text); }}
-main {{ max-width:1500px; margin:auto; padding:28px; }} h1,h2 {{ margin:0 0 14px; }} .meta {{ color:var(--muted); margin-bottom:20px; }}
-.grid {{ display:grid; grid-template-columns:repeat(auto-fit,minmax(150px,1fr)); gap:12px; margin:18px 0 26px; }}
-.card {{ background:var(--card); border:1px solid var(--line); border-radius:12px; padding:16px; box-shadow:0 3px 12px #0001; }}
-.value {{ font-size:1.8rem; font-weight:700; }} .label {{ color:var(--muted); }}
-.table-wrap {{ overflow:auto; background:var(--card); border:1px solid var(--line); border-radius:12px; margin-bottom:26px; }}
-table {{ width:100%; border-collapse:collapse; min-width:900px; }} th {{ position:sticky; top:0; background:var(--accent); color:white; text-align:left; }}
-th,td {{ padding:9px 10px; border-bottom:1px solid var(--line); vertical-align:top; white-space:pre-wrap; overflow-wrap:anywhere; }}
-tr:nth-child(even) td {{ background:#7f8c9810; }} .errors th {{ background:var(--error); }} details {{ margin-top:20px; }}
-pre {{ max-height:700px; overflow:auto; background:#0c1117; color:#d7e0ea; padding:16px; border-radius:10px; }}
-</style>
-</head>
-<body><main>
-<h1>SecOps Assessment Preview</h1>
-<div class="meta"><b>Target:</b> {target}<br><b>Generated:</b> {generated}</div>
-<div class="grid">
-<div class="card"><div class="value">{counts.get('success', 0)}</div><div class="label">Successful runs</div></div>
-<div class="card"><div class="value">{counts.get('error', 0)}</div><div class="label">Errors</div></div>
-<div class="card"><div class="value">{counts.get('partial', 0)}</div><div class="label">Partial</div></div>
-<div class="card"><div class="value">{counts.get('skipped', 0)}</div><div class="label">Skipped</div></div>
-<div class="card"><div class="value">{len(findings)}</div><div class="label">Unique findings</div></div>
-</div>
-<h2>Scanner errors and partial results</h2>
-<div class="table-wrap"><table class="errors"><thead><tr><th>Path</th><th>Status</th><th>Cause</th><th>Target</th><th>Details</th></tr></thead><tbody>{error_rows}</tbody></table></div>
-<h2>Security findings</h2>
-<div class="table-wrap"><table><thead><tr><th>Profile</th><th>Tool</th><th>Finding</th><th>Risk</th><th>URL</th><th>Parameter</th><th>Description</th><th>Evidence</th></tr></thead><tbody>{finding_rows}</tbody></table></div>
-<details><summary>Raw structured scanner results</summary><pre>{raw_json}</pre></details>
-</main></body></html>"""
+def _build_pdf(path: Path, payload: dict[str, Any]) -> None:
+    styles = getSampleStyleSheet()
+    body = ParagraphStyle("BodySmall", parent=styles["BodyText"], fontSize=8, leading=10, spaceAfter=5)
+    small = ParagraphStyle("Tiny", parent=body, fontSize=7, leading=8)
+    header = ParagraphStyle("Header", parent=small, fontName="Helvetica-Bold", textColor=colors.white)
+    heading = ParagraphStyle("FindingHeading", parent=styles["Heading3"], spaceBefore=8, spaceAfter=5)
+    doc = SimpleDocTemplate(str(path), pagesize=landscape(A4), leftMargin=28, rightMargin=28, topMargin=26, bottomMargin=26)
+    story: list[Any] = [
+        Paragraph("SecOps Assessment Report", styles["Title"]),
+        Paragraph(f"<b>Target:</b> {_p(payload['target'])}", body),
+        Paragraph(f"<b>Generated:</b> {_p(payload['generated_at'])}", body),
+        Spacer(1, 8), Paragraph("Executive summary", styles["Heading2"]),
+        Paragraph(_p(payload["executive_summary"]), body), Spacer(1, 8),
+        Paragraph("Tool coverage", styles["Heading2"]),
+    ]
+    coverage_data = [[Paragraph(value, header) for value in ("Profile", "Tool", "Status", "Targets", "Findings", "Seconds", "Details")]]
+    for row in payload["coverage"]:
+        coverage_data.append([
+            Paragraph(_p(row["profile"]), small), Paragraph(_p(row["tool"]), small), Paragraph(_p(row["status"]), small),
+            Paragraph(str(row["targets"]), small), Paragraph(str(row["findings"]), small), Paragraph(str(row["duration_seconds"]), small), Paragraph(_p(row["details"]), small),
+        ])
+    table = Table(coverage_data, colWidths=[65, 60, 55, 42, 45, 45, 430], repeatRows=1)
+    table.setStyle(TableStyle([("BACKGROUND", (0,0), (-1,0), colors.HexColor("#24476B")), ("GRID", (0,0), (-1,-1), .35, colors.HexColor("#B8C2CC")), ("VALIGN", (0,0), (-1,-1), "TOP"), ("ROWBACKGROUNDS", (0,1), (-1,-1), [colors.white, colors.HexColor("#F4F7FA")])]))
+    story.extend([table, PageBreak(), Paragraph("Detailed findings", styles["Heading2"])])
+    for index, item in enumerate(payload["findings"], start=1):
+        story.extend([
+            Paragraph(f"{index}. {_p(item.get('alert', 'Finding'))} [{_p(item.get('risk', 'info')).upper()}]", heading),
+            Paragraph(f"<b>Category:</b> {_p(item.get('category'))} &nbsp; <b>Confidence:</b> {_p(item.get('confidence'))}", body),
+            Paragraph(f"<b>Profile / tool:</b> {_p(item.get('profile'))} / {_p(item.get('tool'))}", body),
+            Paragraph(f"<b>URL:</b> {_p(item.get('url'))}", body),
+            Paragraph(f"<b>Method:</b> {_p(item.get('method')) or 'GET / not specified'}", body),
+            Paragraph(f"<b>Parameter:</b> {_p(item.get('parameter')) or '-'}", body),
+            Paragraph(f"<b>Description:</b> {_p(item.get('description'))}", body),
+            Paragraph(f"<b>Impact:</b> {_p(item.get('impact'))}", body),
+            Paragraph(f"<b>Evidence:</b> {_p(item.get('evidence')) or 'No scanner evidence was supplied.'}", small),
+            Paragraph(f"<b>Recommendation:</b> {_p(item.get('solution'))}", body), Spacer(1, 7),
+        ])
+    if not payload["findings"]:
+        story.append(Paragraph("No structured findings were produced. Review coverage and limitations; incomplete scanners are not considered clean results.", body))
+    doc.build(story)
 
 
 @mcp.tool()
@@ -185,229 +367,61 @@ def generate_report(
     findings_summary: dict | str,
     target_url: str,
     output_name: str = "",
+    assessment_context: dict | str | None = None,
 ) -> dict:
-    """Generate local JSON and PDF reports from structured scanner results."""
+    """Generate detailed JSON, HTML and PDF reports with coverage and limitations."""
     try:
-        results = json.loads(findings_summary) if isinstance(findings_summary, str) else findings_summary
-    except json.JSONDecodeError as exc:
-        return failure("Report Generator", target_url, f"Invalid findings JSON: {exc}")
-
-    if not isinstance(results, dict):
-        return failure("Report Generator", target_url, "findings_summary must be a dictionary.")
+        results = _as_dict(findings_summary)
+        context = _as_dict(assessment_context)
+    except (json.JSONDecodeError, ValueError) as exc:
+        return failure("Report Generator", target_url, f"Invalid report input: {exc}", diagnosis="invalid_report_input")
 
     REPORTS_DIR.mkdir(parents=True, exist_ok=True)
-    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    requested_name = _safe_name(output_name)
-    base_name = requested_name or f"SecOps_Assessment_{stamp}"
-    pdf_path = Path(REPORTS_DIR) / f"{base_name}.pdf"
-    html_path = Path(REPORTS_DIR) / f"{base_name}.html"
-    json_path = Path(REPORTS_DIR) / f"{base_name}.json"
-
+    base = _safe_name(output_name) or f"SecOps_Assessment_{datetime.now():%Y%m%d_%H%M%S}"
+    json_path, html_path, pdf_path = (Path(REPORTS_DIR) / f"{base}.{suffix}" for suffix in ("json", "html", "pdf"))
     findings = flatten_findings(results)
-    result_summary = summarize_results(results)
-    report_payload = {
-        "generated_at": datetime.now(timezone.utc).isoformat(),
-        "target": target_url,
-        "summary": result_summary,
-        "findings_count": len(findings),
-        "findings": findings,
-        "results": results,
+    coverage = build_coverage(results, context)
+    summary = summarize(results, findings, coverage, context)
+    payload = {
+        "generated_at": datetime.now(timezone.utc).isoformat(), "target": target_url,
+        "executive_summary": _executive_text(summary, findings),
+        "summary": summary, "coverage": coverage,
+        "security_findings_count": sum(item["category"] == "vulnerability" for item in findings),
+        "candidate_findings_count": sum(item["category"] == "candidate" for item in findings),
+        "observations_count": sum(item["category"] in {"discovery", "observation"} for item in findings),
+        "findings_count": len(findings), "findings": findings,
+        "assessment_context": context, "results": results,
     }
 
-    # JSON and HTML preview are intentionally independent from PDF generation.
     try:
-        json_path.write_text(
-            json.dumps(report_payload, indent=2, ensure_ascii=False, default=str),
-            encoding="utf-8",
-        )
+        json_path.write_text(json.dumps(payload, indent=2, ensure_ascii=False, default=str), encoding="utf-8")
+        html_path.write_text(_render_html(payload), encoding="utf-8")
     except Exception as exc:
-        return failure("Report Generator", target_url, f"JSON report creation failed: {type(exc).__name__}: {exc}")
+        return failure("Report Generator", target_url, f"JSON/HTML report creation failed: {type(exc).__name__}: {exc}", diagnosis="report_serialization_failed")
 
     try:
-        html_path.write_text(_render_html_preview(report_payload), encoding="utf-8")
-        if not html_path.is_file() or html_path.stat().st_size == 0:
-            raise RuntimeError("HTML preview writer completed without creating a non-empty file.")
+        _build_pdf(pdf_path, payload)
     except Exception as exc:
-        result = failure(
-            "Report Generator",
-            target_url,
-            f"HTML preview creation failed: {type(exc).__name__}: {exc}",
-        )
-        return _update_failure(
-            result,
-            json_filename=str(json_path.resolve()),
-            html_filename=None,
-            pdf_filename=None,
-            local_json_generated=True,
-            local_html_generated=False,
-            local_pdf_generated=False,
-            findings_count=len(findings),
-            diagnosis="html_preview_generation_failed",
-        )
-
-    try:
-        document = SimpleDocTemplate(
-            str(pdf_path),
-            pagesize=landscape(A4),
-            leftMargin=28,
-            rightMargin=28,
-            topMargin=28,
-            bottomMargin=28,
-            title="SecOps Assessment Report",
-            author="SecOps Agent",
-        )
-        styles = getSampleStyleSheet()
-        cell = ParagraphStyle("SecOpsCell", parent=styles["BodyText"], fontSize=7, leading=9)
-        header = ParagraphStyle(
-            "SecOpsHeader",
-            parent=cell,
-            fontName="Helvetica-Bold",
-            textColor=colors.white,
-        )
-        small = ParagraphStyle("SecOpsSmall", parent=styles["BodyText"], fontSize=8, leading=10)
-
-        counts = result_summary["counts"]
-        story = [
-            Paragraph("SecOps Assessment Report", styles["Title"]),
-            Paragraph(f"<b>Target:</b> {_paragraph_text(target_url)}", styles["BodyText"]),
-            Paragraph(
-                "<b>Scanner executions:</b> "
-                f"success {counts['success']} · error {counts['error']} · "
-                f"partial {counts['partial']} · skipped {counts['skipped']}",
-                styles["BodyText"],
-            ),
-            Paragraph(f"<b>Unique findings:</b> {len(findings)}", styles["BodyText"]),
-            Spacer(1, 12),
-        ]
-
-        if result_summary["errors"]:
-            story.append(Paragraph("Scanner Errors and Partial Results", styles["Heading2"]))
-            error_data = [[
-                Paragraph("Path", header),
-                Paragraph("Status", header),
-                Paragraph("Cause", header),
-                Paragraph("Target", header),
-                Paragraph("Details", header),
-            ]]
-            for row in result_summary["errors"]:
-                error_data.append([
-                    Paragraph(_paragraph_text(row["path"]), cell),
-                    Paragraph(_paragraph_text(row["status"]), cell),
-                    Paragraph(_paragraph_text(row["diagnosis"]), cell),
-                    Paragraph(_paragraph_text(row["target"]), cell),
-                    Paragraph(_paragraph_text(row["output"]), cell),
-                ])
-            error_table = Table(error_data, colWidths=[120, 50, 105, 180, 315], repeatRows=1)
-            error_table.setStyle(TableStyle([
-                ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#7A2E2E")),
-                ("GRID", (0, 0), (-1, -1), 0.4, colors.HexColor("#B8C2CC")),
-                ("VALIGN", (0, 0), (-1, -1), "TOP"),
-                ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, colors.HexColor("#FFF6F6")]),
-                ("LEFTPADDING", (0, 0), (-1, -1), 4),
-                ("RIGHTPADDING", (0, 0), (-1, -1), 4),
-                ("TOPPADDING", (0, 0), (-1, -1), 4),
-                ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
-            ]))
-            story.extend([error_table, PageBreak()])
-
-        story.append(Paragraph("Security Findings", styles["Heading2"]))
-        table_data = [[
-            Paragraph("Profile", header),
-            Paragraph("Tool", header),
-            Paragraph("Finding", header),
-            Paragraph("Risk", header),
-            Paragraph("URL", header),
-            Paragraph("Description / evidence", header),
-        ]]
-
-        if not findings:
-            table_data.append([
-                Paragraph("-", cell),
-                Paragraph("-", cell),
-                Paragraph("No structured findings", cell),
-                Paragraph("Info", cell),
-                Paragraph(_paragraph_text(target_url), cell),
-                Paragraph(
-                    "Review scanner statuses and errors above. A failed scanner is not treated as evidence that the target is clean.",
-                    small,
-                ),
-            ])
-        else:
-            for finding in findings:
-                description = _paragraph_text(finding.get("description", ""))
-                evidence = _paragraph_text(finding.get("evidence", ""))
-                detail = description
-                if evidence:
-                    detail += f"<br/><b>Evidence:</b> {evidence}"
-                table_data.append([
-                    Paragraph(_paragraph_text(finding.get("profile", "")), cell),
-                    Paragraph(_paragraph_text(finding.get("tool", "")), cell),
-                    Paragraph(_paragraph_text(finding.get("alert", "Finding")), cell),
-                    Paragraph(_paragraph_text(finding.get("risk", "info")), cell),
-                    Paragraph(_paragraph_text(finding.get("url", target_url)), cell),
-                    Paragraph(detail, cell),
-                ])
-
-        table = Table(table_data, colWidths=[65, 80, 125, 45, 180, 275], repeatRows=1)
-        table.setStyle(TableStyle([
-            ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#24476B")),
-            ("GRID", (0, 0), (-1, -1), 0.4, colors.HexColor("#B8C2CC")),
-            ("VALIGN", (0, 0), (-1, -1), "TOP"),
-            ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, colors.HexColor("#F4F7FA")]),
-            ("LEFTPADDING", (0, 0), (-1, -1), 4),
-            ("RIGHTPADDING", (0, 0), (-1, -1), 4),
-            ("TOPPADDING", (0, 0), (-1, -1), 4),
-            ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
-        ]))
-        story.append(table)
-        document.build(story)
-
-        if not pdf_path.is_file() or pdf_path.stat().st_size == 0:
-            raise RuntimeError("ReportLab completed without creating a non-empty PDF.")
-    except Exception as exc:
-        result = failure(
-            "Report Generator",
-            target_url,
-            f"PDF report creation failed: {type(exc).__name__}: {exc}",
-        )
-        return _update_failure(
-            result,
-            json_filename=str(json_path.resolve()),
-            html_filename=str(html_path.resolve()),
-            pdf_filename=None,
-            local_json_generated=True,
-            local_html_generated=True,
-            local_pdf_generated=False,
-            findings_count=len(findings),
-            diagnosis="pdf_generation_failed",
-        )
+        result = failure("Report Generator", target_url, f"PDF report creation failed: {type(exc).__name__}: {exc}", diagnosis="pdf_generation_failed")
+        result.update(json_filename=str(json_path.resolve()), html_filename=str(html_path.resolve()), pdf_filename=None, findings_count=len(findings))
+        return result
 
     pwndoc_url = os.getenv("PWNDOC_URL", "").rstrip("/")
     pwndoc_status = "not_configured"
     if pwndoc_url:
-        verify_tls = os.getenv("PWNDOC_VERIFY_TLS", "true").lower() not in {"0", "false", "no"}
         try:
-            response = requests.get(pwndoc_url, timeout=(3, 5), verify=verify_tls)
-            if response.status_code < 500:
-                pwndoc_status = "reachable"
-            else:
-                pwndoc_status = f"unhealthy_http_{response.status_code}"
-        except requests.RequestException as exc:
-            pwndoc_status = f"offline:{type(exc).__name__}"
+            response = requests.get(pwndoc_url, timeout=4, verify=os.getenv("PWNDOC_VERIFY_TLS", "true").lower() not in {"0", "false", "no"})
+            pwndoc_status = "reachable" if response.status_code < 500 else "unhealthy"
+        except requests.RequestException:
+            pwndoc_status = "offline"
 
     return success(
-        "Report Generator",
-        target_url,
-        f"PDF, HTML preview and JSON reports generated. Unique findings: {len(findings)}",
-        pdf_filename=str(pdf_path.resolve()),
-        html_filename=str(html_path.resolve()),
-        json_filename=str(json_path.resolve()),
-        local_pdf_generated=True,
-        local_html_generated=True,
-        local_json_generated=True,
-        findings_count=len(findings),
-        scanner_summary=result_summary["counts"],
-        pwndoc_status=pwndoc_status,
+        "Report Generator", target_url,
+        f"Detailed PDF, HTML and JSON reports generated. Security findings: {payload['security_findings_count']}; observations: {payload['observations_count']}.",
+        pdf_filename=str(pdf_path.resolve()), html_filename=str(html_path.resolve()), json_filename=str(json_path.resolve()),
+        local_pdf_generated=True, local_html_generated=True, local_json_generated=True,
+        findings_count=len(findings), security_findings_count=payload["security_findings_count"],
+        observations_count=payload["observations_count"], pwndoc_status=pwndoc_status,
     )
 
 
