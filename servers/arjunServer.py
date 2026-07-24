@@ -1,91 +1,91 @@
 from __future__ import annotations
 
+import argparse
 import json
+import os
 import tempfile
 from pathlib import Path
 from typing import Any
 
 from fastmcp import FastMCP
 
-from utils import partial, run_process
+from utils import failure, partial, run_process, success
 
 mcp = FastMCP("Arjun Scanner")
 
+PRIORITY_PARAMETERS = (
+    "id","uid","user","user_id","account","role","admin","action","query","search","q",
+    "cmd","command","exec","shell","ip","host","file","filename","path","page","include",
+    "template","url","uri","redirect","next","return","callback","webhook","xml","data",
+    "token","key","debug","format","download","upload","name","email","message","sort","order",
+)
+HIGH_RISK_NAMES = {"cmd","command","exec","shell","file","filename","path","include","template","url","uri","redirect","callback","webhook","role","admin","user_id","id","xml"}
+
 
 def collect_parameters(value: Any) -> list[str]:
-    found: list[str] = []
-    if isinstance(value, list):
-        found.extend(str(item) for item in value if isinstance(item, (str, int, float)))
-    elif isinstance(value, dict):
-        for nested in value.values():
-            found.extend(collect_parameters(nested))
+    found=[]
+    if isinstance(value,list): found.extend(str(item) for item in value if isinstance(item,(str,int,float)))
+    elif isinstance(value,dict):
+        for nested in value.values(): found.extend(collect_parameters(nested))
     return found
 
 
-def _load_parameters(path: Path) -> list[str]:
-    try:
-        parsed = json.loads(path.read_text(encoding="utf-8", errors="replace"))
-    except (OSError, json.JSONDecodeError):
-        return []
+def _load(path: Path) -> list[str]:
+    try: parsed=json.loads(path.read_text(encoding="utf-8",errors="replace"))
+    except (OSError,json.JSONDecodeError): return []
     return sorted({item.strip() for item in collect_parameters(parsed) if item.strip()})
 
 
+def _run(target_url: str, cookies: str, output: Path, wordlist: str, budget: int, name: str) -> tuple[dict[str,Any],list[str]]:
+    command=["arjun","-u",target_url,"-m","GET","-oJ",str(output),"-t","5","-T","6","-w",wordlist,"-c","100"]
+    if cookies: command.extend(["--headers",f"Cookie: {cookies}"])
+    result=run_process("Arjun",command,target=target_url,timeout=budget)
+    parameters=_load(output)
+    if result.get("diagnosis")=="timeout": result.update(status="partial",diagnosis="time_limit_reached",timed_out=True,output=f"Arjun phase '{name}' reached its {budget}-second budget. Parameters preserved: {len(parameters)}.")
+    result.update(phase=name,phase_parameters=len(parameters),phase_timeout_seconds=budget)
+    return result,parameters
+
+
+def _finding(target_url: str, parameter: str) -> dict[str,Any]:
+    high=parameter.lower() in HIGH_RISK_NAMES
+    return {"alert":"High-value hidden HTTP parameter discovered" if high else "Hidden HTTP parameter discovered","risk":"low" if high else "info","category":"candidate" if high else "discovery","description":f"Arjun identified the undocumented GET parameter '{parameter}'.","impact":"This parameter name is commonly associated with injection, file access, redirection, or authorization decisions and should receive priority testing." if high else "The parameter expands the application attack surface for downstream testing.","solution":"Confirm the parameter is intended, validate it server-side, enforce authorization where applicable, and remove unused inputs.","url":target_url,"parameter":parameter,"confidence":"low" if high else "medium","priority":"high" if high else "normal","evidence":f"Parameter name returned by Arjun: {parameter}"}
+
+
 @mcp.tool()
-def run_arjun_scan(target_url: str, cookies: str = "", timeout: int = 120) -> dict:
-    """Discover hidden GET parameters using a bounded, non-stable scan profile."""
-    with tempfile.TemporaryDirectory(prefix="arjun-") as temporary_directory:
-        output_file = Path(temporary_directory) / "arjun.json"
-        command = [
-            "arjun", "-u", target_url,
-            "-m", "GET",
-            "-oJ", str(output_file),
-            "-t", "5",
-            "-T", "8",
-            "-w", "small",
-            "-c", "250",
-        ]
-        if cookies:
-            command.extend(["--headers", f"Cookie: {cookies}"])
+def run_arjun_scan(target_url: str,cookies: str="",timeout: int=120) -> dict:
+    """Probe high-risk parameter names first, then use Arjun's compact general list."""
+    timeout=max(45,min(int(timeout),240)); priority_budget=min(40,max(20,timeout//3)); general_budget=max(20,timeout-priority_budget)
+    with tempfile.TemporaryDirectory(prefix="arjun-priority-") as td:
+        temp=Path(td); priority=temp/"priority.txt"; priority.write_text("\n".join(PRIORITY_PARAMETERS)+"\n",encoding="utf-8")
+        phases=[]; parameters=[]
+        for name,wordlist,budget in (("high_risk_parameter_names",str(priority),priority_budget),("compact_general_parameters","small",general_budget)):
+            phase,found=_run(target_url,cookies,temp/f"{name}.json",wordlist,budget,name); phases.append(phase); parameters.extend(found)
+        parameters=sorted(set(parameters),key=lambda value:(value.lower() not in HIGH_RISK_NAMES,value.lower()))
+        findings=[_finding(target_url,p) for p in parameters]
+        hard=[p for p in phases if p.get("status")=="error"]; limited=[p for p in phases if p.get("status")=="partial"]
+        common={"vulnerabilities":findings,"parameters":parameters,"authenticated":bool(cookies),"hard_failure":bool(hard),"phases":[{"name":p.get("phase"),"status":p.get("status"),"parameters":p.get("phase_parameters",0),"timeout_seconds":p.get("phase_timeout_seconds")} for p in phases],"scan_profile":"high-risk names first, then compact general discovery"}
+        if len(hard)==len(phases) and not parameters: return failure("Arjun",target_url,"Both Arjun phases failed before returning parameters.") | common
+        if hard or limited: return partial("Arjun",target_url,f"Arjun completed with incomplete coverage. Hidden parameters preserved: {len(parameters)}.",diagnosis="time_limit_reached" if limited and not hard else "partial_scan",timed_out=bool(limited),**common)
+        return success("Arjun",target_url,f"Arjun completed. Hidden parameters: {len(parameters)}.",**common)
 
-        result = run_process("Arjun", command, target=target_url, timeout=timeout)
-        parameters = _load_parameters(output_file)
-        findings = [{
-            "alert": "Hidden HTTP parameter discovered",
-            "risk": "info",
-            "category": "discovery",
-            "description": f"Arjun identified the undocumented GET parameter '{parameter}'.",
-            "impact": "The parameter increases the application attack surface and should be reviewed by injection and authorization scanners.",
-            "solution": "Confirm whether the parameter is intended, validate it server-side, and remove unused parameters.",
-            "url": target_url,
-            "parameter": parameter,
-            "confidence": "medium",
-            "evidence": f"Parameter name returned by Arjun: {parameter}",
-        } for parameter in parameters]
 
-        if result.get("status") == "error" and result.get("diagnosis") == "timeout" and parameters:
-            return partial(
-                "Arjun",
-                target_url,
-                f"Arjun timed out after {timeout} seconds but returned {len(parameters)} parameter names.",
-                vulnerabilities=findings,
-                parameters=parameters,
-                diagnosis="timeout_with_partial_results",
-                timed_out=True,
-                duration_seconds=result.get("duration_seconds"),
-                command=result.get("command", []),
-            )
-        if result.get("status") != "success":
-            result.update(vulnerabilities=findings, parameters=parameters)
-            return result
-
-        result.update(
-            parameters=parameters,
-            vulnerabilities=findings,
-            output=f"Arjun completed. Hidden parameters: {len(parameters)}.",
-            scan_profile="small wordlist, 5 threads, 8-second request timeout",
-        )
-        return result
+def _once() -> int:
+    try:
+        arguments = json.loads(os.sys.stdin.read() or "{}")
+        if not isinstance(arguments, dict):
+            raise ValueError("Expected a JSON object on stdin.")
+        result = run_arjun_scan(**arguments)
+    except Exception as exc:
+        from utils import failure
+        result = failure("Arjun", "", f"One-shot Arjun execution failed: {type(exc).__name__}: {exc}")
+    print(json.dumps(result, ensure_ascii=False, default=str))
+    return 0
 
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser(add_help=False)
+    parser.add_argument("--once", action="store_true")
+    args, _ = parser.parse_known_args()
+    if args.once:
+        raise SystemExit(_once())
     mcp.run(transport="stdio")

@@ -11,7 +11,7 @@ from urllib.parse import quote
 import requests
 from fastmcp import FastMCP
 
-from utils import failure, skipped, success
+from utils import failure, partial, skipped, success
 
 mcp = FastMCP("Interactsh OAST Client")
 
@@ -93,7 +93,7 @@ def run_interactsh_client(
                 time.sleep(0.25)
 
             if not payload:
-                return failure("Interactsh", target_url, "Timed out waiting for an Interactsh payload.")
+                return partial("Interactsh", target_url, "Interactsh reached its payload-generation time budget.", diagnosis="time_limit_reached", timed_out=True, vulnerabilities=[])
 
             injected_url = injection_url.replace("FUZZ", quote(payload, safe=""))
             headers = {"User-Agent": "SecOpsAgent-University/1.1"}
@@ -102,6 +102,8 @@ def run_interactsh_client(
             try:
                 response = requests.get(injected_url, headers=headers, timeout=(5, 20), allow_redirects=True)
                 injection_status = response.status_code
+            except requests.Timeout as exc:
+                return partial("Interactsh", target_url, f"Injection request reached its time budget: {exc}", diagnosis="time_limit_reached", timed_out=True, vulnerabilities=[])
             except requests.RequestException as exc:
                 return failure("Interactsh", target_url, f"Injection request failed: {exc}")
 

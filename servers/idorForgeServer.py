@@ -8,7 +8,7 @@ from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 import requests
 from fastmcp import FastMCP
 
-from utils import failure, skipped, success
+from utils import failure, partial, skipped, success
 
 mcp = FastMCP("IDOR Differential Checker")
 
@@ -42,6 +42,8 @@ def run_idor_check(target_url: str, cookies: str = "", timeout: int = 20) -> dic
     try:
         original = session.get(target_url, timeout=timeout, allow_redirects=True)
         mutated = session.get(mutated_url, timeout=timeout, allow_redirects=True)
+    except requests.Timeout as exc:
+        return partial("IDOR Differential Checker", target_url, f"IDOR differential check reached its request time budget: {exc}", diagnosis="time_limit_reached", timed_out=True, vulnerabilities=[])
     except requests.RequestException as exc:
         return failure("IDOR Differential Checker", target_url, str(exc), diagnosis="request_failed")
 

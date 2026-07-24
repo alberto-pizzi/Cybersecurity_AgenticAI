@@ -37,6 +37,25 @@ MCP_TOOL_TIMEOUT = float(os.getenv("SECOPS_MCP_TIMEOUT", "900"))
 MAX_PARAMETER_ENDPOINTS = max(1, int(os.getenv("SECOPS_MAX_PARAMETER_ENDPOINTS", "5")))
 MAX_ARJUN_ENDPOINTS = max(1, int(os.getenv("SECOPS_MAX_ARJUN_ENDPOINTS", "2")))
 MAX_CRAWL_PAGES = max(10, int(os.getenv("SECOPS_MAX_CRAWL_PAGES", "50")))
+SCANNER_PROGRESS_INTERVAL = max(10, int(os.getenv("SECOPS_PROGRESS_INTERVAL", "30")))
+BROAD_SCANNER_TIMEOUTS = {
+    "zap": 300,
+    "nuclei": 180,
+    "nikto": 180,
+    "ffuf": 120,
+}
+PARAMETER_TOOL_TIMEOUTS = {
+    "sqlmap": 180,
+    "dalfox": 120,
+    "commix": 150,
+    "idor": 20,
+}
+TIME_LIMIT_DIAGNOSES = {
+    "timeout", "time_limit_reached", "timeout_with_partial_results",
+    "timeout_with_confirmed_finding", "bounded_partial_scan",
+}
+ONE_SHOT_FALLBACK_TOOLS = {"nuclei", "nikto", "arjun", "sqlmap", "dalfox", "commix", "ffuf"}
+AUTO_INDEX_PARAMETERS = {"c", "n", "m", "s", "d", "o"}
 
 
 @dataclass(frozen=True)
@@ -234,6 +253,53 @@ def diagnose_error(text: str) -> str:
     return next((cause for needles, cause in rules if any(item in lowered for item in needles)), "scanner_or_mcp_error")
 
 
+def _finding_counts(result: dict[str, Any]) -> tuple[int, int, int]:
+    findings = [item for item in (result.get("vulnerabilities") or []) if isinstance(item, dict)]
+    security = 0
+    for item in findings:
+        category = str(item.get("category", "")).lower()
+        risk = str(item.get("risk", "info")).lower()
+        if category in {"vulnerability", "candidate"} or (not category and risk not in {"", "info"}):
+            security += 1
+    return len(findings), security, len(findings) - security
+
+
+def _is_time_limited(result: dict[str, Any]) -> bool:
+    diagnosis = str(result.get("diagnosis", "")).lower()
+    text = " ".join(str(result.get(key, "")) for key in ("output", "stderr", "stdout")).lower()
+    return bool(
+        result.get("timed_out")
+        or diagnosis in TIME_LIMIT_DIAGNOSES
+        or "timeout" in diagnosis
+        or "timed out" in text
+        or "time limit" in text
+        or "time budget" in text
+    )
+
+
+def _normalize_time_limit(result: dict[str, Any], tool: str, target: str) -> dict[str, Any]:
+    """A configured scan budget is an incomplete result, not an execution error."""
+    if result.get("hard_failure") or not _is_time_limited(result):
+        return result
+    total, security, observations = _finding_counts(result)
+    previous = str(result.get("diagnosis", ""))
+    result["status"] = "partial"
+    result["timed_out"] = True
+    result["time_limit_reached"] = True
+    result["diagnosis"] = "time_limit_reached"
+    if previous and previous != "time_limit_reached":
+        result["original_diagnosis"] = previous
+    result.setdefault("tool", tool)
+    result.setdefault("target", target)
+    result.setdefault("vulnerabilities", [])
+    result["output"] = (
+        f"Configured scan time budget reached. Findings preserved: {total} "
+        f"(security/candidates: {security}, observations/discovery: {observations}). "
+        "Coverage is incomplete, but the scanner did not fail."
+    )
+    return result
+
+
 def _normalize_result(data: Any, spec: ToolSpec, target: str, elapsed: float, is_error: bool, shape: str) -> dict[str, Any]:
     if isinstance(data, dict):
         result = dict(data)
@@ -259,7 +325,7 @@ def _normalize_result(data: Any, spec: ToolSpec, target: str, elapsed: float, is
     }
     if result["status"] == "error":
         result.setdefault("diagnosis", diagnose_error(str(result.get("output", ""))))
-    return result
+    return _normalize_time_limit(result, spec.name, target)
 
 
 def _startup_stderr(server: Path) -> str:
@@ -288,8 +354,15 @@ def _transport_failure(exc: BaseException) -> bool:
     ))
 
 
-def _call_nuclei_once(server: Path, arguments: dict[str, Any], timeout_seconds: float) -> dict[str, Any]:
-    """Fallback used only when the long-running MCP STDIO channel closes unexpectedly."""
+def _call_server_once(
+    server: Path,
+    tool_name: str,
+    arguments: dict[str, Any],
+    timeout_seconds: float,
+    tool: str,
+) -> dict[str, Any]:
+    """Run a scanner server in an isolated one-shot process after an MCP pipe crash."""
+    process_limit = max(45, int(timeout_seconds) + 30)
     try:
         completed = subprocess.run(
             [_server_python(), str(server), "--once"],
@@ -300,22 +373,33 @@ def _call_nuclei_once(server: Path, arguments: dict[str, Any], timeout_seconds: 
             text=True,
             encoding="utf-8",
             errors="replace",
-            timeout=max(60, int(timeout_seconds) + 30),
+            timeout=process_limit,
             shell=False,
         )
     except subprocess.TimeoutExpired as exc:
         return {
-            "tool": "nuclei", "status": "error", "target": str(arguments.get("target_url", "")),
-            "output": f"Nuclei one-shot fallback timed out after {int(timeout_seconds) + 30} seconds.",
-            "vulnerabilities": [], "diagnosis": "timeout",
+            "tool": tool,
+            "status": "partial",
+            "target": str(arguments.get("target_url", "")),
+            "output": (
+                f"{tool} isolated fallback reached its configured process budget. "
+                "No execution failure is implied; coverage is incomplete."
+            ),
+            "vulnerabilities": [],
+            "diagnosis": "time_limit_reached",
+            "timed_out": True,
+            "time_limit_reached": True,
             "stdout": exc.stdout.decode("utf-8", "replace") if isinstance(exc.stdout, bytes) else (exc.stdout or ""),
             "stderr": exc.stderr.decode("utf-8", "replace") if isinstance(exc.stderr, bytes) else (exc.stderr or ""),
         }
     except OSError as exc:
         return {
-            "tool": "nuclei", "status": "error", "target": str(arguments.get("target_url", "")),
-            "output": f"Cannot start Nuclei one-shot fallback: {exc}",
-            "vulnerabilities": [], "diagnosis": "process_start_failed",
+            "tool": tool,
+            "status": "error",
+            "target": str(arguments.get("target_url", "")),
+            "output": f"Cannot start {tool} isolated fallback: {exc}",
+            "vulnerabilities": [],
+            "diagnosis": "process_start_failed",
         }
 
     stdout = (completed.stdout or "").strip()
@@ -324,18 +408,29 @@ def _call_nuclei_once(server: Path, arguments: dict[str, Any], timeout_seconds: 
         value = json.loads(stdout)
     except json.JSONDecodeError:
         value = {
-            "tool": "nuclei", "status": "error", "target": str(arguments.get("target_url", "")),
-            "output": f"Nuclei fallback returned invalid JSON. stderr: {stderr[-2000:]}",
-            "vulnerabilities": [], "diagnosis": "invalid_json_response",
-            "stdout": stdout[-4000:], "stderr": stderr[-4000:],
+            "tool": tool,
+            "status": "error",
+            "target": str(arguments.get("target_url", "")),
+            "output": (
+                f"{tool} isolated fallback returned invalid JSON. "
+                f"Exit code={completed.returncode}; stderr={stderr[-2000:]}"
+            ),
+            "vulnerabilities": [],
+            "diagnosis": "invalid_json_response",
+            "stdout": stdout[-4000:],
+            "stderr": stderr[-4000:],
         }
     if not isinstance(value, dict):
         value = {
-            "tool": "nuclei", "status": "error", "target": str(arguments.get("target_url", "")),
-            "output": "Nuclei fallback returned a non-object JSON value.",
-            "vulnerabilities": [], "diagnosis": "invalid_json_response",
+            "tool": tool,
+            "status": "error",
+            "target": str(arguments.get("target_url", "")),
+            "output": f"{tool} isolated fallback returned a non-object JSON value.",
+            "vulnerabilities": [],
+            "diagnosis": "invalid_json_response",
         }
     value.setdefault("_meta", {})["transport_fallback"] = "one_shot_subprocess"
+    value.setdefault("_meta", {})["fallback_exit_code"] = completed.returncode
     if stderr:
         value.setdefault("_meta", {})["fallback_stderr"] = stderr[-2000:]
     return value
@@ -367,18 +462,42 @@ async def call_mcp(server_file: str, tool_name: str, arguments: dict[str, Any], 
     except (KeyboardInterrupt, asyncio.CancelledError):
         raise
     except Exception as exc:
-        if spec.name == "nuclei" and _transport_failure(exc):
-            print("    [WARNING] Nuclei MCP channel closed; retrying through the one-shot server fallback.", file=sys.stderr)
-            result = await asyncio.to_thread(
-                _call_nuclei_once,
-                server,
-                effective_arguments,
-                min(float(effective_arguments.get("timeout", 300)), timeout_seconds),
+        exception_text = f"{type(exc).__name__}: {exc}"
+        exception_diagnosis = diagnose_error(exception_text)
+        if exception_diagnosis == "timeout":
+            result = {
+                "tool": spec.name,
+                "status": "partial",
+                "target": target,
+                "output": (
+                    f"{spec.name} reached the orchestrator/MCP time budget. "
+                    "Coverage is incomplete; this is not classified as a scanner error."
+                ),
+                "vulnerabilities": [],
+                "diagnosis": "time_limit_reached",
+                "timed_out": True,
+                "time_limit_reached": True,
+                "traceback": traceback.format_exc(),
+                "_meta": {"server": str(server), "duration_seconds": round(time.monotonic() - started, 3)},
+            }
+        elif spec.name in ONE_SHOT_FALLBACK_TOOLS and _transport_failure(exc):
+            print(
+                f"    [WARNING] {spec.name} MCP channel closed; retrying in an isolated one-shot process.",
+                file=sys.stderr,
             )
-            result.setdefault("_meta", {})["mcp_failure"] = f"{type(exc).__name__}: {exc}"
+            internal_limit = float(effective_arguments.get("timeout", timeout_seconds))
+            result = await asyncio.to_thread(
+                _call_server_once,
+                server,
+                spec.tool,
+                effective_arguments,
+                min(internal_limit, timeout_seconds),
+                spec.name,
+            )
+            result.setdefault("_meta", {})["mcp_failure"] = exception_text
         else:
             stderr = _startup_stderr(server)
-            message = f"MCP communication failed: {type(exc).__name__}: {exc}"
+            message = f"MCP communication failed: {exception_text}"
             if stderr:
                 message += f" | server stderr: {stderr}"
             result = {
@@ -392,9 +511,34 @@ async def call_mcp(server_file: str, tool_name: str, arguments: dict[str, Any], 
         if temporary_output:
             temporary_output.unlink(missing_ok=True)
 
+    result = _normalize_time_limit(result, spec.name, target)
     if result.get("status") == "error":
         print(f"\n[SCANNER ERROR] {spec.name}: {target}\n  {result.get('output', '')}", file=sys.stderr)
     return result
+
+
+async def call_mcp_with_progress(
+    spec: ToolSpec,
+    arguments: dict[str, Any],
+    *,
+    timeout_seconds: float = MCP_TOOL_TIMEOUT,
+) -> dict[str, Any]:
+    """Run one MCP scanner while showing which tool is active."""
+    target = str(arguments.get("target_url", ""))
+    scanner_limit = arguments.get("timeout")
+    limit_text = f", scanner limit {scanner_limit}s" if scanner_limit else ""
+    print(f"    [RUNNING ] {spec.name}: {target}{limit_text}", flush=True)
+
+    started = time.monotonic()
+    task = asyncio.create_task(
+        call_mcp(spec.server, spec.tool, arguments, timeout_seconds=timeout_seconds)
+    )
+    while True:
+        done, _ = await asyncio.wait({task}, timeout=SCANNER_PROGRESS_INTERVAL)
+        if task in done:
+            return await task
+        elapsed = int(time.monotonic() - started)
+        print(f"    [WAITING ] {spec.name}: still running after {elapsed}s", flush=True)
 
 
 async def _live_server_check(spec: ToolSpec) -> dict[str, str]:
@@ -738,23 +882,82 @@ def merge_discovery(left: dict[str, Any], right: dict[str, Any]) -> dict[str, An
     return merged
 
 
+def _risk_terms(value: str) -> int:
+    text = value.lower()
+    tokens = set(re.findall(r"[a-z0-9]+", text))
+    weights = {
+        "cmd": 12, "command": 12, "exec": 12, "shell": 12,
+        "sql": 11, "query": 8, "search": 7,
+        "file": 10, "path": 10, "include": 10, "template": 9, "upload": 8,
+        "url": 9, "uri": 8, "redirect": 8, "callback": 8, "webhook": 8,
+        "admin": 8, "role": 8, "user": 6, "uid": 7, "id": 5,
+        "token": 7, "debug": 7, "api": 5, "xml": 7, "deserialize": 10,
+        "xss": 10, "sqli": 11, "ssrf": 11, "lfi": 11, "rfi": 11,
+    }
+    return sum(
+        weight for term, weight in weights.items()
+        if (term in tokens if len(term) <= 3 else term in text)
+    )
+
+
+def _is_login_case(case: dict[str, Any]) -> bool:
+    path = urlparse(str(case.get("url", ""))).path.lower()
+    parameters = {str(value).lower() for value in case.get("parameters", [])}
+    return (
+        path.endswith("/login")
+        or path.endswith("/login.php")
+        or bool({"username", "password"} <= parameters)
+    )
+
+
+def _is_auto_index_case(case: dict[str, Any]) -> bool:
+    """Identify Apache-style directory sorting links such as ?C=D;O=A."""
+    parsed = urlparse(str(case.get("url", "")))
+    names = {name.lower() for name, _ in parse_qsl(parsed.query.replace(";", "&"), keep_blank_values=True)}
+    parameters = {str(value).lower() for value in case.get("parameters", [])}
+    names |= parameters
+    path = parsed.path.lower()
+    return bool(names) and names <= AUTO_INDEX_PARAMETERS and (
+        path.endswith("/") or "/config/" in path or "/docs/" in path
+    )
+
+
+def _tool_case_skip_reason(tool: str, case: dict[str, Any]) -> str:
+    if _is_auto_index_case(case):
+        return "Apache directory-index sorting parameters are navigation controls, not application inputs."
+    if tool in {"dalfox", "commix"} and _is_login_case(case):
+        return f"{tool} is not prioritized against the generic login form; SQLMap remains available for SQL-injection checks."
+    return ""
+
+
 def select_arjun_candidates(discovery: dict[str, Any], target: str, limit: int = MAX_ARJUN_ENDPOINTS) -> list[str]:
-    candidates = [*discovery.get("form_urls", []), *discovery.get("html_urls", [])]
-    selected: list[str] = []
+    """Prefer high-impact input handlers and avoid configuration/login utility pages."""
+    form_urls = set(discovery.get("form_urls", []))
+    candidates = set(form_urls) | set(discovery.get("html_urls", []))
+    ranked: list[tuple[int, str]] = []
+    excluded = ("login", "logout", "setup", "security.php", "/config/", "/docs/")
+    low_value = ("brute", "captcha", "csrf")
     for url in candidates:
         path = urlparse(url).path.lower()
-        if any(name in path for name in ("login", "logout", "setup")):
+        if any(name in path for name in excluded):
             continue
         clean = _clean_url(url)
-        if clean not in selected:
-            selected.append(clean)
-        if len(selected) >= limit:
-            break
-    return selected
-
+        score = _risk_terms(path)
+        if url in form_urls:
+            score += 12
+        if urlparse(url).query:
+            score += 8
+        if "/vulnerabilities/" in path:
+            score += 12
+        if any(term in path for term in low_value):
+            score -= 10
+        if score <= 0:
+            continue
+        ranked.append((score, clean))
+    return [url for _, url in sorted(set(ranked), key=lambda item: (-item[0], item[1]))[:limit]]
 
 def select_request_cases(discovery: dict[str, Any], limit: int = MAX_PARAMETER_ENDPOINTS) -> list[dict[str, Any]]:
-    """Select distinct, non-destructive GET/POST form cases for injection tools."""
+    """Select non-destructive cases, ranking likely injection/authorization inputs first."""
     cases = list(discovery.get("request_cases", []))
     known_urls = {str(case.get("url", "")) for case in cases}
     for url in discovery.get("parameterized_urls", []):
@@ -764,7 +967,8 @@ def select_request_cases(discovery: dict[str, Any], limit: int = MAX_PARAMETER_E
                 "parameters": [name for name, _ in parse_qsl(urlparse(url).query, keep_blank_values=True)],
                 "source_url": url,
             })
-    selected: list[dict[str, Any]] = []
+
+    ranked: list[tuple[int, dict[str, Any]]] = []
     seen: set[tuple[str, str, tuple[str, ...]]] = set()
     for case in cases:
         url = str(case.get("url", ""))
@@ -772,16 +976,21 @@ def select_request_cases(discovery: dict[str, Any], limit: int = MAX_PARAMETER_E
         path = urlparse(url).path.lower()
         if not url or method not in {"GET", "POST"} or any(part in path for part in ("logout", "setup")):
             continue
+        if _is_auto_index_case(case):
+            continue
         parameters = tuple(sorted(str(value) for value in case.get("parameters", []) if value))
         key = (method, urlparse(url)._replace(query="").geturl(), parameters)
         if not parameters or key in seen:
             continue
         seen.add(key)
-        selected.append({**case, "method": method, "parameters": list(parameters)})
-        if len(selected) >= limit:
-            break
-    return selected
-
+        score = _risk_terms(path + " " + " ".join(parameters))
+        score += 7 if method == "POST" else 3
+        if _is_login_case(case):
+            score -= 20
+        score += min(8, len(parameters) * 2)
+        ranked.append((score, {**case, "method": method, "parameters": list(parameters), "priority_score": score}))
+    ranked.sort(key=lambda item: (-item[0], str(item[1].get("url", ""))))
+    return [case for _, case in ranked[:limit]]
 
 def enrich_discovery_with_arjun(discovery: dict[str, Any], result: dict[str, Any], base_url: str) -> tuple[dict[str, Any], list[str]]:
     parameters = {str(item).strip() for item in result.get("parameters", []) if str(item).strip()}
@@ -814,42 +1023,66 @@ def make_skipped_result(tool: str, target: str, reason: str) -> dict[str, Any]:
 
 
 def log_result(profile: str, name: str, result: dict[str, Any], target: str = "") -> None:
-    status = str(result.get("status", "error")).upper()
-    print(f"    [{status:7}] {name}: {target or result.get('target', '')}")
-    if status in {"ERROR", "PARTIAL"}:
-        print(f"              {str(result.get('output', ''))[:300]}", file=sys.stderr)
-
+    raw_status = str(result.get("status", "error")).lower()
+    limited = raw_status == "partial" and _is_time_limited(result)
+    label = "LIMITED" if limited else raw_status.upper()
+    total, security, observations = _finding_counts(result)
+    print(
+        f"    [{label:7}] {name}: {target or result.get('target', '')} — "
+        f"findings={total} (security/candidates={security}, observations={observations})"
+    )
+    detail = str(result.get("output", ""))[:400]
+    if raw_status == "error":
+        print(f"              {detail}", file=sys.stderr)
+    elif raw_status == "partial":
+        print(f"              {detail}")
 
 def aggregate_runs(tool: str, target: str, runs: list[dict[str, Any]]) -> dict[str, Any]:
     if not runs:
         return make_skipped_result(tool, target, "No applicable endpoint was discovered for this tool.")
-    statuses = [str(run.get("status", "error")).lower() for run in runs]
+    normalized = [_normalize_time_limit(dict(run), tool, str(run.get("target", target))) for run in runs]
+    statuses = [str(run.get("status", "error")).lower() for run in normalized]
     successful = sum(status == "success" for status in statuses)
     errors = sum(status == "error" for status in statuses)
     partials = sum(status == "partial" for status in statuses)
+    limited = sum(status == "partial" and _is_time_limited(run) for status, run in zip(statuses, normalized))
     skipped_count = sum(status == "skipped" for status in statuses)
     if all(status == "skipped" for status in statuses):
         status = "skipped"
-    elif errors == len(runs):
+    elif errors == len(normalized):
         status = "error"
     elif errors or partials:
         status = "partial"
     else:
         status = "success"
-    vulnerabilities = [
-        finding for run in runs for finding in (run.get("vulnerabilities") or [])
-        if isinstance(finding, dict)
-    ]
-    return {
+    vulnerabilities: list[dict[str, Any]] = []
+    seen_findings: set[tuple[str, ...]] = set()
+    for run in normalized:
+        for finding in run.get("vulnerabilities") or []:
+            if not isinstance(finding, dict):
+                continue
+            fingerprint = tuple(str(finding.get(key, "")) for key in (
+                "alert", "risk", "category", "url", "parameter", "evidence"
+            ))
+            if fingerprint not in seen_findings:
+                seen_findings.add(fingerprint)
+                vulnerabilities.append(finding)
+    result = {
         "tool": tool, "status": status, "target": target,
         "output": (
-            f"Runs: {len(runs)}; successful: {successful}; partial: {partials}; "
-            f"errors: {errors}; skipped: {skipped_count}; findings: {len(vulnerabilities)}."
+            f"Runs: {len(normalized)}; successful: {successful}; time-limited: {limited}; "
+            f"other partial: {max(0, partials-limited)}; errors: {errors}; skipped: {skipped_count}; "
+            f"findings: {len(vulnerabilities)}."
         ),
-        "vulnerabilities": vulnerabilities, "runs": runs,
-        "diagnosis": "nested_scanner_errors" if errors else ("nested_partial_results" if partials else None),
+        "vulnerabilities": vulnerabilities, "runs": normalized,
+        "diagnosis": (
+            "nested_scanner_errors" if errors else
+            "time_limit_reached" if limited else
+            "nested_partial_results" if partials else None
+        ),
+        "timed_out": bool(limited),
     }
-
+    return result
 
 def iter_leaf_results(value: Any, path: tuple[str, ...] = ()) -> Iterator[tuple[tuple[str, ...], dict[str, Any]]]:
     if isinstance(value, dict) and "status" in value:
@@ -914,7 +1147,15 @@ async def run_pipeline(target: str, profiles: list[dict[str, str]], injection_ur
         name, cookies = profile["name"], profile["cookies"]
         print(f"\n[*] Scanner generali - profilo: {name}")
         for spec in BASE_TOOLS:
-            result = await call_mcp(spec.server, spec.tool, {"target_url": target, "cookies": cookies})
+            scanner_timeout = BROAD_SCANNER_TIMEOUTS.get(spec.name, 180)
+            result = await call_mcp_with_progress(
+                spec,
+                {
+                    "target_url": target,
+                    "cookies": cookies,
+                    "timeout": scanner_timeout,
+                },
+            )
             results[name][spec.name] = result
             log_result(name, spec.name, result, target)
             if spec.name == "ffuf" and result.get("status") in {"success", "partial"}:
@@ -933,7 +1174,10 @@ async def run_pipeline(target: str, profiles: list[dict[str, str]], injection_ur
         if candidates:
             print(f"    [INFO   ] Arjun endpoints selected: {len(candidates)}")
             for endpoint in candidates:
-                result = await call_mcp(ARJUN_TOOL.server, ARJUN_TOOL.tool, {"target_url": endpoint, "cookies": cookies})
+                result = await call_mcp_with_progress(
+                    ARJUN_TOOL,
+                    {"target_url": endpoint, "cookies": cookies, "timeout": 120},
+                )
                 arjun_runs.append(result)
                 log_result(name, "arjun", result, endpoint)
                 if result.get("status") in {"success", "partial"}:
@@ -948,18 +1192,28 @@ async def run_pipeline(target: str, profiles: list[dict[str, str]], injection_ur
     async def run_parameter_tool(spec: ToolSpec, case: dict[str, Any], cookies: str) -> dict[str, Any]:
         url = str(case.get("url", ""))
         method = str(case.get("method", "GET")).upper()
+        skip_reason = _tool_case_skip_reason(spec.name, case)
+        if skip_reason:
+            return make_skipped_result(spec.name, url, skip_reason)
         if spec.name == "idor":
             if method != "GET":
                 return make_skipped_result("idor", url, "IDOR differential checks currently require a numeric GET parameter.")
             if not any(value.isdigit() for _, value in parse_qsl(urlparse(url).query, keep_blank_values=True)):
                 return make_skipped_result("idor", url, "No numeric query parameter was available.")
+        scanner_timeout = PARAMETER_TOOL_TIMEOUTS.get(spec.name, 120)
         arguments = {
             "target_url": url, "cookies": cookies,
             "method": method, "data": str(case.get("data", "")),
             "parameters": list(case.get("parameters", [])),
+            "timeout": scanner_timeout,
         }
         async with semaphore:
-            return await call_mcp(spec.server, spec.tool, arguments)
+            return await call_mcp(
+                spec.server,
+                spec.tool,
+                arguments,
+                timeout_seconds=scanner_timeout + 35,
+            )
 
     for profile in profiles:
         name, cookies = profile["name"], profile["cookies"]
@@ -1091,7 +1345,7 @@ def main() -> int:
     print(f"[+] PDF: {report.get('pdf_filename') or 'not generated'}")
     print(f"[+] HTML preview: {report.get('html_filename') or 'not generated'}")
     print(f"[+] JSON: {report.get('json_filename') or 'not generated'}")
-    print(f"[+] Scanner errors: {errors}\n[+] Scanner partial results: {partial}\n[+] Scanner skips: {skips}")
+    print(f"[+] Scanner run errors: {errors}\n[+] Time-limited/partial scanner runs: {partial}\n[+] Scanner run skips: {skips}")
     return 1 if report.get("status") != "success" else 2 if errors else 0
 
 

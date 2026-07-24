@@ -29,7 +29,7 @@ DOWNLOADS = LOCAL_ROOT / "downloads"
 RUNTIME_FILE = ROOT / ".secops_runtime.json"
 TARGET = "http://127.0.0.1"
 DEFAULT_MODEL = "llama3.1:8b"
-BUILD_ID = "secops-init-resilient-v6-20260724"
+BUILD_ID = "secops-init-resilient-v7-20260724"
 
 PYTHON_PACKAGES = (
     "fastmcp==2.12.5", "langgraph>=0.6,<2", "requests>=2.32,<3",
@@ -205,9 +205,60 @@ def _perl_module_available(perl: Path, module: str) -> tuple[bool, str]:
     return probe.returncode == 0, detail
 
 
+def _strawberry_root(perl: Path) -> Path:
+    """Return the Strawberry Perl installation root from .../perl/bin/perl.exe."""
+    resolved = perl.resolve()
+    if resolved.parent.name.lower() == "bin" and resolved.parent.parent.name.lower() == "perl":
+        return resolved.parent.parent.parent
+    return resolved.parent.parent
+
+
+def _configure_perl_toolchain(perl: Path) -> tuple[Path | None, str]:
+    """Expose Strawberry Perl's compiler/make directory and resolve its configured make tool."""
+    root = _strawberry_root(perl)
+    tool_dirs = (perl.parent, root / "c" / "bin", root / "perl" / "site" / "bin")
+    for directory in tool_dirs:
+        if directory.is_dir():
+            _add_path(directory)
+
+    probe = run(
+        [str(perl), "-MConfig", "-e", "print $Config{make}"],
+        required=False,
+        capture=True,
+        show_output=False,
+        timeout=30,
+    )
+    configured_name = (probe.stdout or "").strip() or "gmake"
+    names = list(dict.fromkeys((configured_name, "gmake", "dmake", "make")))
+    candidates = [root / "c" / "bin" / name for name in names]
+    if os.name == "nt":
+        candidates += [root / "c" / "bin" / f"{name}.exe" for name in names if not name.lower().endswith(".exe")]
+
+    make = next((path.resolve() for path in candidates if path.is_file()), None)
+    if make is None:
+        found = next((shutil.which(name) for name in names if shutil.which(name)), None)
+        make = Path(found).resolve() if found else None
+    if make is not None:
+        _add_path(make.parent)
+    detail = f"configured make={configured_name}; resolved={make or 'missing'}; root={root}"
+    return make, detail
+
+
 def _install_perl_module(perl: Path, module: str) -> None:
-    """Install one missing Strawberry Perl module without requiring interactive CPAN input."""
+    """Install a Strawberry Perl module with the bundled make tool and a CPAN fallback."""
+    make, toolchain_detail = _configure_perl_toolchain(perl)
+    if make is None:
+        raise RuntimeError(
+            "Strawberry Perl is missing its bundled make/compiler toolchain. "
+            f"{toolchain_detail}\n"
+            "Reinstall it with:\n"
+            "  winget uninstall --id StrawberryPerl.StrawberryPerl --exact\n"
+            "  winget install --id StrawberryPerl.StrawberryPerl --exact"
+        )
+
     environment = {
+        "PATH": os.environ.get("PATH", ""),
+        "MAKE": str(make),
         "PERL_MM_USE_DEFAULT": "1",
         "PERL_AUTOINSTALL": "--defaultdeps",
         "NONINTERACTIVE_TESTING": "1",
@@ -219,23 +270,40 @@ def _install_perl_module(perl: Path, module: str) -> None:
         perl.parent.parent / "site" / "bin" / "cpanm.bat",
         perl.parent.parent / "site" / "bin" / "cpanm.exe",
     )
+    attempts: list[str] = []
     cpanm = next((path for path in cpanm_candidates if path.exists()), None)
     if cpanm:
-        result = run([str(cpanm), "--notest", module], required=False, capture=True, timeout=1800, env_overrides=environment)
-    else:
         result = run(
-            [str(perl), "-MCPAN", "-e", f"CPAN::Shell->install('{module}')"],
+            [str(cpanm), "--notest", module],
             required=False,
             capture=True,
             timeout=1800,
             env_overrides=environment,
         )
+        attempts.append("\n".join(filter(None, ((result.stdout or "").strip(), (result.stderr or "").strip())))[:4000])
+        healthy, _ = _perl_module_available(perl, module)
+        if healthy:
+            return
+
+    cpan_candidates = (perl.parent / "cpan.bat", perl.parent / "cpan.exe", perl.parent / "cpan")
+    cpan = next((path for path in cpan_candidates if path.exists()), None)
+    command = [str(cpan), "-T", module] if cpan else [str(perl), "-MCPAN", "-e", f"CPAN::Shell->install('{module}')"]
+    result = run(
+        command,
+        required=False,
+        capture=True,
+        timeout=1800,
+        env_overrides=environment,
+    )
+    attempts.append("\n".join(filter(None, ((result.stdout or "").strip(), (result.stderr or "").strip())))[:4000])
     healthy, detail = _perl_module_available(perl, module)
-    if result.returncode != 0 or not healthy:
+    if not healthy:
+        diagnostics = "\n--- installer attempt ---\n".join(value for value in attempts if value)
         raise RuntimeError(
-            f"Perl module {module} could not be installed. {detail or (result.stderr or result.stdout or '').strip()}\n"
-            "If Strawberry Perl is corrupted, uninstall it with: "
-            "winget uninstall --id StrawberryPerl.StrawberryPerl --exact"
+            f"Perl module {module} could not be installed. {toolchain_detail}. {detail}\n{diagnostics}\n"
+            "To reinstall Strawberry Perl:\n"
+            "  winget uninstall --id StrawberryPerl.StrawberryPerl --exact\n"
+            "  winget install --id StrawberryPerl.StrawberryPerl --exact"
         )
 
 
@@ -310,6 +378,16 @@ def install_nikto() -> None:
         )
 
     perl = Path(perl_value).resolve()
+    make, toolchain_detail = _configure_perl_toolchain(perl)
+    if make is None:
+        raise RuntimeError(
+            "Strawberry Perl was found, but its bundled make/compiler toolchain is missing. "
+            f"{toolchain_detail}\n"
+            "Reinstall it with:\n"
+            "  winget uninstall --id StrawberryPerl.StrawberryPerl --exact\n"
+            "  winget install --id StrawberryPerl.StrawberryPerl --exact"
+        )
+    print(f"[+] Strawberry Perl build tool: {make}")
     for module in ("XML::Writer",):
         available, _ = _perl_module_available(perl, module)
         if not available:

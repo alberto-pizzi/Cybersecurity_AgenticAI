@@ -1,13 +1,35 @@
 from __future__ import annotations
 
+import argparse
+import json
+import os
 import re
+import sys
+from pathlib import Path
 from typing import Any
 
 from fastmcp import FastMCP
 
-from utils import partial, run_process
+from utils import ROOT_DIR, failure, partial, run_process, success
 
 mcp = FastMCP("Commix Scanner")
+
+
+def _find_commix_script() -> Path | None:
+    candidates = [
+        Path.home() / ".local" / "opt" / "commix" / "commix.py",
+        Path(ROOT_DIR) / "tools" / "commix" / "commix.py",
+    ]
+    launcher = Path.home() / ".local" / "bin" / "commix.bat"
+    if launcher.is_file():
+        text = launcher.read_text(encoding="utf-8", errors="replace")
+        match = re.search(r'"([^"\r\n]*commix\.py)"|([A-Za-z]:\\[^\r\n]*?commix\.py)', text, re.I)
+        if match:
+            candidates.insert(0, Path(match.group(1) or match.group(2)))
+    for path in candidates:
+        if path.is_file():
+            return path.resolve()
+    return None
 
 
 def _findings(text: str, target_url: str, method: str) -> list[dict[str, Any]]:
@@ -28,6 +50,15 @@ def _findings(text: str, target_url: str, method: str) -> list[dict[str, Any]]:
     }]
 
 
+def _trim(result: dict[str, Any], limit: int = 10000) -> dict[str, Any]:
+    for key in ("stdout", "stderr"):
+        value = str(result.get(key, ""))
+        if len(value) > limit:
+            result[key] = value[-limit:]
+            result[f"{key}_truncated"] = True
+    return result
+
+
 @mcp.tool()
 def run_commix_scan(
     target_url: str,
@@ -35,11 +66,27 @@ def run_commix_scan(
     method: str = "GET",
     data: str = "",
     parameters: list[str] | None = None,
-    timeout: int = 240,
+    timeout: int = 150,
 ) -> dict:
-    """Run Commix non-interactively against a discovered GET or POST request case."""
+    """Run Commix directly through Python and preserve bounded results."""
     method = method.upper()
-    command = ["commix", "--url", target_url, "--batch", "--level", "1"]
+    timeout = max(45, min(int(timeout), 600))
+    parameters = [str(value) for value in (parameters or []) if str(value)]
+    script = _find_commix_script()
+    if script is None:
+        return failure(
+            "Commix", target_url,
+            "commix.py was not found under ~/.local/opt/commix. Run initScript.py again.",
+            diagnosis="missing_commix_script",
+        )
+
+    command = [
+        sys.executable, str(script),
+        "--url", target_url,
+        "--batch", "--level", "1",
+        "--timeout", "5", "--retries", "0",
+        "--time-limit", str(max(30, timeout - 15)),
+    ]
     if data:
         command.extend(["--data", data])
     if parameters:
@@ -47,27 +94,71 @@ def run_commix_scan(
     if cookies:
         command.extend(["--cookie", cookies])
 
-    result = run_process("Commix", command, target=target_url, timeout=timeout, accepted_codes=(0, 1))
-    text = "\n".join((result.get("stdout", ""), result.get("stderr", ""), result.get("output", "")))
+    result = run_process(
+        "Commix",
+        command,
+        target=target_url,
+        timeout=timeout,
+        accepted_codes=(0, 1),
+        cwd=script.parent,
+    )
+    text = "\n".join(str(result.get(key, "")) for key in ("stdout", "stderr", "output"))
     findings = _findings(text, target_url, method)
     common = {
         "vulnerabilities": findings,
         "request_method": method,
         "request_data_present": bool(data),
-        "tested_parameters": parameters or [],
+        "tested_parameters": parameters,
+        "authenticated": bool(cookies),
+        "execution_mode": "direct_python",
+        "commix_script": str(script),
     }
-    if result.get("status") == "error" and result.get("diagnosis") == "timeout" and findings:
+
+    if result.get("diagnosis") == "timeout":
         return partial(
             "Commix", target_url,
-            "Commix timed out after reporting command-injection evidence; remaining tests may be incomplete.",
-            diagnosis="timeout_with_confirmed_finding", **common,
+            f"Commix reached its configured time budget. Findings preserved: {len(findings)}.",
+            diagnosis="time_limit_reached",
+            timed_out=True,
+            time_limit_reached=True,
+            duration_seconds=result.get("duration_seconds"),
+            stdout=str(result.get("stdout", ""))[-10000:],
+            stderr=str(result.get("stderr", ""))[-10000:],
+            command=result.get("command", []),
+            **common,
         )
     if result.get("status") != "success":
         result.update(common)
-        return result
-    result.update(**common, command_injection_found=bool(findings), output=f"Commix completed for {method}. Confirmed command-injection findings: {len(findings)}.")
-    return result
+        return _trim(result)
+
+    return success(
+        "Commix", target_url,
+        f"Commix completed for {method}. Confirmed command-injection findings: {len(findings)}.",
+        command_injection_found=bool(findings),
+        duration_seconds=result.get("duration_seconds"),
+        command=result.get("command", []),
+        stdout=str(result.get("stdout", ""))[-10000:],
+        stderr=str(result.get("stderr", ""))[-10000:],
+        **common,
+    )
+
+
+def _once() -> int:
+    try:
+        arguments = json.loads(os.sys.stdin.read() or "{}")
+        if not isinstance(arguments, dict):
+            raise ValueError("Expected a JSON object on stdin.")
+        result = run_commix_scan(**arguments)
+    except Exception as exc:
+        result = failure("Commix", "", f"One-shot Commix execution failed: {type(exc).__name__}: {exc}")
+    print(json.dumps(result, ensure_ascii=False, default=str))
+    return 0
 
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser(add_help=False)
+    parser.add_argument("--once", action="store_true")
+    args, _ = parser.parse_known_args()
+    if args.once:
+        raise SystemExit(_once())
     mcp.run(transport="stdio")

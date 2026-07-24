@@ -112,7 +112,10 @@ def flatten_findings(results: dict[str, Any]) -> list[dict[str, Any]]:
 
 def _effective_status(result: dict[str, Any]) -> tuple[str, str]:
     status = str(result.get("status", "unknown")).lower()
+    diagnosis = str(result.get("diagnosis", "")).lower()
     combined = "\n".join(str(result.get(key, "")) for key in ("output", "stdout", "stderr"))
+    if result.get("timed_out") or result.get("time_limit_reached") or "timeout" in diagnosis or "time limit" in combined.lower():
+        return "time_limit", "The configured scan budget was reached; findings were preserved and coverage is incomplete."
     if status == "success" and re.search(
         r"(?:not recognized as an internal or external command|non .? riconosciuto come comando interno o esterno|can't open perl script|modulenotfounderror|traceback \(most recent call last\))",
         combined, re.I,
@@ -139,22 +142,36 @@ def _tool_result(tools: dict[str, Any], tool: str) -> dict[str, Any] | None:
     matches = [value for key, value in tools.items() if key == tool or key.startswith(f"{tool}:") if isinstance(value, dict)]
     if not matches:
         return None
-    statuses = [str(item.get("status", "unknown")) for item in matches]
+    statuses = [_effective_status(item)[0] for item in matches]
     successes = sum(status == "success" for status in statuses)
     errors = sum(status == "error" for status in statuses)
     partials = sum(status == "partial" for status in statuses)
+    limited = sum(status == "time_limit" for status in statuses)
     if errors == len(matches):
         status = "error"
     elif errors or partials:
         status = "partial"
+    elif limited:
+        status = "time_limit"
     elif successes:
         status = "success"
     else:
         status = "skipped"
-    findings = [finding for item in matches for finding in (item.get("vulnerabilities") or []) if isinstance(finding, dict)]
+    findings: list[dict[str, Any]] = []
+    seen_findings: set[tuple[str, ...]] = set()
+    for item in matches:
+        for finding in item.get("vulnerabilities") or []:
+            if not isinstance(finding, dict):
+                continue
+            fingerprint = tuple(str(finding.get(key, "")) for key in (
+                "alert", "risk", "category", "url", "parameter", "evidence"
+            ))
+            if fingerprint not in seen_findings:
+                seen_findings.add(fingerprint)
+                findings.append(finding)
     return {
         "tool": tool, "status": status, "target": matches[0].get("target", ""),
-        "output": f"Agentic runs: {len(matches)}; successful={successes}; errors={errors}; partial={partials}.",
+        "output": f"Agentic runs: {len(matches)}; successful={successes}; time-limited={limited}; errors={errors}; other partial={partials}.",
         "vulnerabilities": findings, "runs": matches,
     }
 
@@ -199,7 +216,7 @@ def summarize(results: dict[str, Any], findings: list[dict[str, Any]], coverage:
     limitations = []
     for path, result in _iter_leaf_results(results):
         effective_status, contradiction = _effective_status(result)
-        if effective_status in {"error", "partial"}:
+        if effective_status in {"error", "partial", "time_limit"}:
             limitations.append({
                 "path": "/".join(path), "status": effective_status,
                 "diagnosis": result.get("diagnosis", "inconsistent_success" if contradiction else "unknown"),
@@ -216,7 +233,7 @@ def summarize(results: dict[str, Any], findings: list[dict[str, Any]], coverage:
         "risk_counts": {risk: risk_counts.get(risk, 0) for risk in RISK_ORDER},
         "category_counts": dict(category_counts),
         "limitations": limitations,
-        "coverage_complete": not any(row["status"] in {"error", "partial", "not_run"} for row in coverage),
+        "coverage_complete": not any(row["status"] in {"error", "partial", "time_limit", "not_run"} for row in coverage),
     }
 
 
@@ -230,7 +247,7 @@ def _executive_text(summary: dict[str, Any], findings: list[dict[str, Any]]) -> 
         f"and {observations} discovery or hardening observations. Severity distribution: "
         f"{risks.get('critical', 0)} critical, {risks.get('high', 0)} high, {risks.get('medium', 0)} medium, "
         f"{risks.get('low', 0)} low. {len(summary['limitations'])} execution limitations or warnings were recorded; "
-        "a failed or skipped scanner is never interpreted as proof that the target is clean."
+        "a failed, skipped, or time-limited scanner is never interpreted as proof that the target is clean."
     )
 
 

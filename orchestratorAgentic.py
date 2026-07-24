@@ -15,6 +15,9 @@ import requests
 from langgraph.graph import END, START, StateGraph
 
 from orchestratorDeterministic import (
+    BROAD_SCANNER_TIMEOUTS,
+    PARAMETER_TOOL_TIMEOUTS,
+    _tool_case_skip_reason,
     call_mcp,
     diagnose_error,
     discover_target,
@@ -116,7 +119,7 @@ def ollama_plan(state: AgentState) -> dict[str, Any]:
                     "Plan an explicitly authorized web-security assessment. Use only the supplied registry, "
                     "same-profile discovered URLs, GET/POST request cases and JWTs. Use parameter tools only on discovered request cases, "
                     "IDOR only on numeric values, and Interactsh only when configured. Avoid duplicates. "
-                    "A scanner error never means the target is clean. Return only schema-valid JSON."
+                    "A scanner error never means the target is clean. A configured time limit is a partial result, not an error. Prioritize high-impact checks and risk-ranked request cases. Return only schema-valid JSON."
                 )},
                 {"role": "user", "content": json.dumps(prompt, ensure_ascii=False)},
             ],
@@ -220,6 +223,8 @@ def validate_plan(state: AgentState, proposed: Any) -> list[dict[str, Any]]:
             if not matching:
                 continue
             selected = matching[0]
+            if _tool_case_skip_reason(tool, selected):
+                continue
             method = str(selected.get("method", "GET")).upper()
             data = str(selected.get("data", ""))
             parameters = [str(value) for value in selected.get("parameters", [])]
@@ -285,6 +290,12 @@ async def execute_action(action: dict[str, Any], cookies: dict[str, str]) -> tup
         arguments = {"target_url": action["target_url"], "injection_url": action["injection_url"], "cookies": cookies.get(action["profile"], "")}
     else:
         arguments = {"target_url": action["target_url"], "cookies": cookies.get(action["profile"], "")}
+        if action["tool"] in BROAD_SCANNER_TIMEOUTS:
+            arguments["timeout"] = BROAD_SCANNER_TIMEOUTS[action["tool"]]
+        elif action["tool"] == "arjun":
+            arguments["timeout"] = 120
+        elif action["tool"] in PARAMETER_TOOL_TIMEOUTS:
+            arguments["timeout"] = PARAMETER_TOOL_TIMEOUTS[action["tool"]]
         if action["tool"] in {"sqlmap", "dalfox", "commix"}:
             arguments.update({
                 "method": action.get("method", "GET"),
@@ -292,7 +303,13 @@ async def execute_action(action: dict[str, Any], cookies: dict[str, str]) -> tup
                 "parameters": action.get("parameters", []),
             })
     try:
-        return action, await call_mcp(server, function, arguments)
+        scanner_limit = float(arguments.get("timeout", 180))
+        return action, await call_mcp(
+            server,
+            function,
+            arguments,
+            timeout_seconds=scanner_limit + 35,
+        )
     except Exception as exc:
         message = f"Agent executor failed: {type(exc).__name__}: {exc}"
         return action, {"tool": action["tool"], "status": "error", "target": action["target_url"], "output": message, "vulnerabilities": [], "diagnosis": diagnose_error(message), "traceback": traceback.format_exc()}
@@ -447,7 +464,7 @@ def main() -> int:
     print(f"[+] PDF: {report.get('pdf_filename') or 'not generated'}")
     print(f"[+] HTML preview: {report.get('html_filename') or 'not generated'}")
     print(f"[+] JSON: {report.get('json_filename') or 'not generated'}")
-    print(f"[+] Scanner errors: {errors}\n[+] Scanner partial results: {partial}\n[+] Scanner skips: {skips}")
+    print(f"[+] Scanner run errors: {errors}\n[+] Time-limited/partial scanner runs: {partial}\n[+] Scanner run skips: {skips}")
     return 1 if report.get("status") != "success" else 2 if errors else 0
 
 
