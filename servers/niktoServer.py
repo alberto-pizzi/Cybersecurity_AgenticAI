@@ -20,6 +20,15 @@ from utils import ROOT_DIR, failure, success
 mcp = FastMCP("Nikto Scanner")
 
 RUNTIME_FILE = Path(ROOT_DIR) / ".secops_runtime.json"
+CONNECTION_FAILURE_MARKERS = (
+    "unable to connect",
+    "connection refused",
+    "cannot connect",
+    "could not connect",
+    "no route to host",
+    "connection timed out",
+)
+
 FATAL_MARKERS = (
     "can't open perl script",
     "cannot open perl script",
@@ -160,6 +169,41 @@ def _risk_from_message(message: str) -> str:
     return "info"
 
 
+def _message_guidance(message: str) -> tuple[str, str]:
+    text = message.lower()
+    if "directory indexing" in text or "directory listing" in text:
+        return (
+            "Directory listing can reveal file names, backups, source artifacts, and other resources that were not intended to be enumerated.",
+            "Disable directory indexes for the affected location and explicitly publish only required files.",
+        )
+    if "default credential" in text or "default password" in text:
+        return (
+            "Default credentials can permit unauthorized access when the affected interface is reachable.",
+            "Remove or rotate default accounts and passwords, restrict the interface, and verify authentication controls.",
+        )
+    if any(token in text for token in ("backup", "configuration file", "config file", "source code", "password file", "sensitive file")):
+        return (
+            "The reported resource may expose configuration, source, backup, or credential-bearing content if the response is valid.",
+            "Manually verify the response, remove the exposed artifact from the web root, restrict access, and rotate any disclosed secrets.",
+        )
+    if "outdated" in text or "vulnerable" in text:
+        return (
+            "The reported component version may be affected by publicly documented vulnerabilities. Nikto's version inference requires manual confirmation.",
+            "Confirm the installed version and patch or upgrade it according to the vendor advisory referenced by Nikto.",
+        )
+    if "header is not present" in text or "missing" in text and "header" in text:
+        return (
+            "The response is missing the security header named in the Nikto message, reducing the corresponding browser-side protection.",
+            "Configure the named response header with an application-appropriate value and verify it on all relevant responses.",
+        )
+    if "allowed methods" in text or "http method" in text or "options method" in text:
+        return (
+            "The server advertises HTTP methods that may expand the attack surface if they are not required and correctly authorized.",
+            "Disable unnecessary methods and enforce authentication and authorization for every enabled method.",
+        )
+    return ("", "")
+
+
 def _parse_csv(output_file: Path, target_url: str) -> list[dict[str, Any]]:
     findings: list[dict[str, Any]] = []
     if not output_file.is_file():
@@ -180,32 +224,45 @@ def _parse_csv(output_file: Path, target_url: str) -> list[dict[str, Any]]:
             message = row[6].strip()
             if not message:
                 continue
+            if any(marker in message.lower() for marker in CONNECTION_FAILURE_MARKERS):
+                continue
 
             finding_url = (
                 uri if uri.startswith(("http://", "https://"))
                 else urljoin(target_url.rstrip("/") + "/", uri.lstrip("/"))
             )
             risk = _risk_from_message(message)
+            impact, solution = _message_guidance(message)
+            title = message.split(".", 1)[0].strip()[:140] or "Nikto web-server finding"
             findings.append({
-                "alert": "Nikto web-server finding",
+                "alert": title,
                 "risk": risk,
                 "category": "observation" if risk == "info" else "candidate",
+                "verification_status": "automated-candidate" if risk != "info" else "hardening-observation",
                 "confidence": "medium",
-                "description": message,
-                "impact": (
-                    "The identified server behaviour or exposed resource may increase "
-                    "the attack surface. Nikto results should be manually verified."
-                ),
-                "solution": (
-                    "Verify the affected resource, remove unnecessary exposed content, "
-                    "update vulnerable components, and harden the reported configuration."
-                ),
+                "description": f"Nikto reported: {message}",
+                "impact": impact,
+                "solution": solution,
                 "url": finding_url or target_url,
                 "method": method,
                 "reference": reference,
+                "references": [reference] if reference else [],
+                "technical_details": f"Nikto CSV message; method={method or 'not specified'}; reference={reference or 'not supplied'}.",
                 "evidence": message,
             })
     return findings
+
+
+def _connection_runtime_error(log_text: str, csv_path: Path) -> str:
+    combined = log_text
+    try:
+        combined += "\n" + csv_path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        pass
+    for line in combined.splitlines():
+        if any(marker in line.lower() for marker in CONNECTION_FAILURE_MARKERS):
+            return line.strip()
+    return ""
 
 
 def _fatal_runtime_error(log_text: str) -> str:
@@ -315,6 +372,7 @@ def run_nikto_scan(
         findings = _parse_csv(output_file, target_url)
         duration = round(time.monotonic() - started, 3)
         fatal = _fatal_runtime_error(log_text)
+        connection_failure = _connection_runtime_error(log_text, output_file)
 
         common = {
             "vulnerabilities": findings,
@@ -327,6 +385,18 @@ def run_nikto_scan(
             "perl_executable": str(perl),
             "scanner_log": log_text[-6000:],
         }
+
+        if connection_failure and not findings:
+            result = failure(
+                "Nikto",
+                target_url,
+                f"Nikto could not complete the target connection: {connection_failure}",
+                return_code=return_code,
+                stdout=log_text,
+                diagnosis="nikto_target_unreachable",
+            )
+            result.update(common)
+            return result
 
         if fatal:
             result = failure(

@@ -30,8 +30,21 @@ def _looks_like_login(response: requests.Response) -> bool:
 
 
 @mcp.tool()
-def run_idor_check(target_url: str, cookies: str = "", timeout: int = 20) -> dict:
-    """Perform a cautious differential check; identical generic responses are not flagged."""
+def run_idor_check(
+    target_url: str,
+    cookies: str = "",
+    timeout: int = 20,
+    method: str = "GET",
+    data: str = "",
+    parameters: list[str] | None = None,
+) -> dict:
+    """Perform a cautious GET differential check; extra MCP metadata is accepted safely."""
+    if str(method).upper() != "GET":
+        return skipped(
+            "IDOR Differential Checker",
+            target_url,
+            "The current differential checker supports numeric GET object references only.",
+        )
     mutation = mutate_first_numeric_parameter(target_url)
     if not mutation:
         return skipped("IDOR Differential Checker", target_url, "No numeric query parameter was available for a differential check.")
@@ -60,10 +73,14 @@ def run_idor_check(target_url: str, cookies: str = "", timeout: int = 20) -> dic
             "alert": "Potential IDOR candidate",
             "risk": "medium",
             "category": "candidate",
-            "description": f"Changing numeric parameter '{parameter}' returned a different but structurally similar successful response.",
+            "verification_status": "differential-candidate-needs-two-account-validation",
+            "description": f"Changing numeric parameter '{parameter}' returned HTTP 200 with different content that remained structurally similar to the original response. This is a differential candidate, not proof that another user's object was accessed.",
             "impact": "If the changed object belongs to another user and no authorization check is enforced, unauthorized data access or modification may be possible.",
             "solution": "Enforce object-level authorization on every request and manually verify with two accounts that have different permissions.",
             "url": mutated_url,
+            "original_url": target_url,
+            "mutated_url": mutated_url,
+            "method": "GET",
             "parameter": parameter,
             "confidence": "low",
             "evidence": (

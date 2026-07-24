@@ -15,6 +15,7 @@ import sysconfig
 import time
 import traceback
 import uuid
+import warnings
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from html.parser import HTMLParser
@@ -22,11 +23,13 @@ from pathlib import Path
 from typing import Any, Iterator
 from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 
+warnings.filterwarnings("ignore", message=r"authlib\.jose module is deprecated.*")
+
 import requests
 from fastmcp import Client
 from fastmcp.client.transports import StdioTransport
 
-from utils import ROOT_DIR, SERVERS_DIR, absolute_url, normalize_url, same_origin
+from utils import canonical_cookie_header, cookie_names, ROOT_DIR, SERVERS_DIR, absolute_url, normalize_url, same_origin
 
 ROOT = Path(ROOT_DIR).resolve()
 SERVERS = Path(SERVERS_DIR).resolve()
@@ -35,20 +38,26 @@ LOCAL_BIN = Path.home() / ".local" / "bin"
 MCP_CONNECT_TIMEOUT = float(os.getenv("SECOPS_MCP_CONNECT_TIMEOUT", "20"))
 MCP_TOOL_TIMEOUT = float(os.getenv("SECOPS_MCP_TIMEOUT", "900"))
 MAX_PARAMETER_ENDPOINTS = max(1, int(os.getenv("SECOPS_MAX_PARAMETER_ENDPOINTS", "5")))
-MAX_ARJUN_ENDPOINTS = max(1, int(os.getenv("SECOPS_MAX_ARJUN_ENDPOINTS", "2")))
+MAX_ARJUN_ENDPOINTS = max(1, int(os.getenv("SECOPS_MAX_ARJUN_ENDPOINTS", "1")))
 MAX_CRAWL_PAGES = max(10, int(os.getenv("SECOPS_MAX_CRAWL_PAGES", "50")))
 SCANNER_PROGRESS_INTERVAL = max(10, int(os.getenv("SECOPS_PROGRESS_INTERVAL", "30")))
 BROAD_SCANNER_TIMEOUTS = {
-    "zap": 300,
+    "zap": 360,
     "nuclei": 180,
     "nikto": 180,
     "ffuf": 120,
 }
 PARAMETER_TOOL_TIMEOUTS = {
-    "sqlmap": 180,
-    "dalfox": 120,
-    "commix": 150,
-    "idor": 20,
+    "sqlmap": 240,
+    "dalfox": 150,
+    "commix": 180,
+    "idor": 25,
+}
+PARAMETER_TOOL_CASE_LIMITS = {
+    "sqlmap": 2,
+    "dalfox": 2,
+    "commix": 1,
+    "idor": 2,
 }
 TIME_LIMIT_DIAGNOSES = {
     "timeout", "time_limit_reached", "timeout_with_partial_results",
@@ -69,10 +78,12 @@ class ToolSpec:
 
 
 BASE_TOOLS = (
+    # FFUF runs first so its high-value paths can be re-crawled and supplied to
+    # ZAP before the active scan.
+    ToolSpec("ffuf", "ffufServer.py", "run_ffuf_fuzz", "ffuf"),
     ToolSpec("zap", "zapServer.py", "run_zap_scan", module="zapv2"),
     ToolSpec("nuclei", "nucleiServer.py", "run_nuclei_scan", "nuclei"),
     ToolSpec("nikto", "niktoServer.py", "run_nikto_scan", "nikto"),
-    ToolSpec("ffuf", "ffufServer.py", "run_ffuf_fuzz", "ffuf"),
 )
 ARJUN_TOOL = ToolSpec("arjun", "arjunServer.py", "run_arjun_scan", "arjun")
 PARAMETER_TOOLS = (
@@ -169,23 +180,13 @@ def _declared_functions(path: Path) -> set[str]:
 
 
 def resolve_server_path(filename: str, required_tool: str = "") -> Path:
-    """Prefer a file that really declares the requested tool, including name(2).py copies."""
-    requested = Path(filename)
-    pattern = re.compile(
-        rf"^{re.escape(requested.stem)}\s*(?:\(\d+\))?{re.escape(requested.suffix or '.py')}$",
-        re.IGNORECASE,
-    )
-    candidates = [path.resolve() for path in SERVERS.iterdir() if path.is_file() and pattern.fullmatch(path.name)] if SERVERS.is_dir() else []
-    exact = (SERVERS / requested.name).resolve()
-    if exact.is_file() and exact not in candidates:
-        candidates.insert(0, exact)
-    if required_tool:
-        valid = [path for path in candidates if required_tool in _declared_functions(path)]
-        if exact in valid:
-            return exact
-        if valid:
-            return max(valid, key=lambda path: path.stat().st_mtime)
-    return exact if exact.is_file() else (max(candidates, key=lambda path: path.stat().st_mtime) if candidates else exact)
+    """
+    Resolve only the canonical MCP server filename.
+
+    Numbered browser copies such as nucleiServer(12).py are never executed.
+    This prevents stale files from silently overriding the replacement.
+    """
+    return (SERVERS / Path(filename).name).resolve()
 
 
 def _server_python() -> str:
@@ -593,9 +594,40 @@ def _nikto_runtime_check(executable: str) -> tuple[bool, str]:
     return True, combined[-1000:]
 
 
+def _numbered_duplicate_servers() -> list[Path]:
+    if not SERVERS.is_dir():
+        return []
+    pattern = re.compile(r".+\(\d+\)\.py$", re.IGNORECASE)
+    return sorted(
+        (
+            path.resolve()
+            for path in SERVERS.iterdir()
+            if path.is_file() and pattern.fullmatch(path.name)
+        ),
+        key=lambda path: path.name.lower(),
+    )
+
+
 def run_preflight_checks(*, include_live: bool = True) -> list[dict[str, str]]:
     configure_runtime_path()
     checks: list[dict[str, str]] = []
+
+    numbered_duplicates = _numbered_duplicate_servers()
+    checks.append({
+        "level": "warning" if numbered_duplicates else "ok",
+        "component": "project",
+        "cause": (
+            "numbered_server_copies_found"
+            if numbered_duplicates
+            else "canonical_server_filenames"
+        ),
+        "detail": (
+            "Move or delete numbered MCP copies: "
+            + ", ".join(path.name for path in numbered_duplicates)
+            if numbered_duplicates
+            else "Only canonical MCP server filenames will be executed."
+        ),
+    })
     seen_executables: set[str] = set()
     for spec in ALL_TOOLS:
         server = resolve_server_path(spec.server, spec.tool)
@@ -910,24 +942,150 @@ def _is_login_case(case: dict[str, Any]) -> bool:
     )
 
 
+def _is_auto_index_url(url: str) -> bool:
+    """Identify Apache/nginx directory-list sorting links such as ?C=D;O=A."""
+    parsed = urlparse(str(url))
+    names = {
+        name.lower()
+        for name, _ in parse_qsl(parsed.query.replace(";", "&"), keep_blank_values=True)
+    }
+    return bool(names) and names <= AUTO_INDEX_PARAMETERS and parsed.path.endswith("/")
+
+
 def _is_auto_index_case(case: dict[str, Any]) -> bool:
-    """Identify Apache-style directory sorting links such as ?C=D;O=A."""
-    parsed = urlparse(str(case.get("url", "")))
-    names = {name.lower() for name, _ in parse_qsl(parsed.query.replace(";", "&"), keep_blank_values=True)}
-    parameters = {str(value).lower() for value in case.get("parameters", [])}
-    names |= parameters
-    path = parsed.path.lower()
-    return bool(names) and names <= AUTO_INDEX_PARAMETERS and (
-        path.endswith("/") or "/config/" in path or "/docs/" in path
+    names = {str(value).lower() for value in case.get("parameters", [])}
+    return _is_auto_index_url(str(case.get("url", ""))) or (
+        bool(names)
+        and names <= AUTO_INDEX_PARAMETERS
+        and urlparse(str(case.get("url", ""))).path.endswith("/")
     )
+
+
+SQL_HINTS = {
+    "id", "uid", "user", "user_id", "username", "email", "account",
+    "query", "search", "q", "category", "product", "item", "order",
+}
+XSS_HINTS = {
+    "name", "message", "comment", "search", "query", "q", "input",
+    "text", "title", "url", "redirect", "callback",
+}
+COMMAND_HINTS = {
+    "cmd", "command", "exec", "shell", "ip", "host", "hostname",
+    "ping", "target", "domain",
+}
+IDOR_HINTS = {
+    "id", "uid", "user_id", "account_id", "object_id", "item_id",
+    "order_id", "document_id", "file_id", "profile_id",
+}
+
+
+def _case_parameters(case: dict[str, Any]) -> set[str]:
+    parameters = {str(value).lower() for value in case.get("parameters", []) if str(value)}
+    parsed = urlparse(str(case.get("url", "")))
+    parameters.update(name.lower() for name, _ in parse_qsl(parsed.query, keep_blank_values=True))
+    return parameters
+
+
+def _tool_case_priority(tool: str, case: dict[str, Any]) -> int:
+    """Score request cases for the scanner that is actually suited to them."""
+    if _is_auto_index_case(case):
+        return -1000
+
+    url = str(case.get("url", ""))
+    parsed = urlparse(url)
+    path = parsed.path.lower()
+    method = str(case.get("method", "GET")).upper()
+    parameters = _case_parameters(case)
+    text = " ".join((path, " ".join(sorted(parameters))))
+    score = _risk_terms(text)
+
+    if tool == "sqlmap":
+        score += 45 if any(token in path for token in ("sqli", "/sql", "database")) else 0
+        score += 9 * len(parameters & SQL_HINTS)
+        score += 12 if _is_login_case(case) else 0
+        if any(token in path for token in ("xss", "/exec", "/csp")) and not (parameters & SQL_HINTS):
+            score -= 35
+        return score
+
+    if tool == "dalfox":
+        score += 45 if "xss" in path else 0
+        score += 10 * len(parameters & XSS_HINTS)
+        if any(token in path for token in ("sqli", "/exec", "/csp")) and not (parameters & XSS_HINTS):
+            score -= 35
+        if _is_login_case(case):
+            score -= 30
+        return score
+
+    if tool == "commix":
+        score += 55 if any(token in path for token in ("/exec", "command", "cmd")) else 0
+        score += 13 * len(parameters & COMMAND_HINTS)
+        if any(token in path for token in ("sqli", "xss", "/csp")) and not (parameters & COMMAND_HINTS):
+            score -= 45
+        if _is_login_case(case):
+            score -= 40
+        return score
+
+    if tool == "idor":
+        if method != "GET":
+            return -1000
+        numeric_pairs = [
+            (name.lower(), value)
+            for name, value in parse_qsl(parsed.query, keep_blank_values=True)
+            if value.isdigit()
+        ]
+        if not numeric_pairs:
+            return -1000
+        score = 12
+        score += 28 * sum(name in IDOR_HINTS for name, _ in numeric_pairs)
+        score += 25 if any(token in path for token in ("idor", "object", "profile", "account", "user")) else 0
+        # SQLi demo endpoints also use id=1, but they are not useful IDOR targets.
+        if any(token in path for token in ("sqli", "xss", "/exec", "/csp")):
+            score -= 60
+        return score
+
+    return score
 
 
 def _tool_case_skip_reason(tool: str, case: dict[str, Any]) -> str:
     if _is_auto_index_case(case):
-        return "Apache directory-index sorting parameters are navigation controls, not application inputs."
+        return "Directory-index sorting parameters are navigation controls, not application inputs."
     if tool in {"dalfox", "commix"} and _is_login_case(case):
-        return f"{tool} is not prioritized against the generic login form; SQLMap remains available for SQL-injection checks."
+        return f"{tool} is not suited to the generic login form; SQLMap remains available for SQL-injection checks."
+    if _tool_case_priority(tool, case) <= 0:
+        return f"The request was not selected because its path and parameters do not match {tool}'s vulnerability class."
     return ""
+
+
+def select_tool_request_cases(
+    discovery: dict[str, Any],
+    tool: str,
+    limit: int | None = None,
+) -> list[dict[str, Any]]:
+    """Choose the highest-value request cases separately for each scanner."""
+    effective_limit = limit or PARAMETER_TOOL_CASE_LIMITS.get(tool, MAX_PARAMETER_ENDPOINTS)
+    ranked: list[tuple[int, int, dict[str, Any]]] = []
+    for index, case in enumerate(discovery.get("request_cases", [])):
+        if not isinstance(case, dict):
+            continue
+        score = _tool_case_priority(tool, case)
+        if score > 0:
+            ranked.append((score, -index, case))
+
+    selected: list[dict[str, Any]] = []
+    seen: set[tuple[str, str, tuple[str, ...]]] = set()
+    for _, _, case in sorted(ranked, key=lambda item: (-item[0], -item[1])):
+        key = (
+            str(case.get("method", "GET")).upper(),
+            str(case.get("url", "")),
+            tuple(sorted(str(value) for value in case.get("parameters", []))),
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        selected.append(case)
+        if len(selected) >= effective_limit:
+            break
+    return selected
 
 
 def select_arjun_candidates(discovery: dict[str, Any], target: str, limit: int = MAX_ARJUN_ENDPOINTS) -> list[str]:
@@ -967,7 +1125,7 @@ def select_arjun_candidates(discovery: dict[str, Any], target: str, limit: int =
     for url in candidates:
         parsed = urlparse(url)
         path = parsed.path.lower()
-        if "logout" in path:
+        if "logout" in path or _is_auto_index_url(url):
             continue
 
         related_cases = case_by_url.get(url, [])
@@ -1084,6 +1242,70 @@ def enrich_discovery_with_ffuf(discovery: dict[str, Any], result: dict[str, Any]
 
 def make_skipped_result(tool: str, target: str, reason: str) -> dict[str, Any]:
     return {"tool": tool, "status": "skipped", "target": target, "output": reason, "vulnerabilities": [], "diagnosis": "not_applicable"}
+
+
+def log_zap_session_diagnostics(result: dict[str, Any]) -> None:
+    diagnostics = (
+        result.get("session_diagnostics")
+        if isinstance(result.get("session_diagnostics"), dict)
+        else {}
+    )
+    before = (
+        diagnostics.get("before_scan")
+        if isinstance(diagnostics.get("before_scan"), dict)
+        else diagnostics
+    )
+    after = (
+        diagnostics.get("after_scan")
+        if isinstance(diagnostics.get("after_scan"), dict)
+        else {}
+    )
+    if not before:
+        return
+
+    print(
+        "    [ZAP AUTH] "
+        f"ZAP={result.get('zap_version', before.get('zap_version', 'unknown'))}; "
+        f"Python API={result.get('python_zap_api_version', before.get('python_zap_api_version', 'unknown'))}"
+    )
+    print(
+        "    [ZAP AUTH] "
+        f"probe={before.get('probe_url', '')}; "
+        f"cookie names={', '.join(before.get('cookie_names', [])) or 'none'}"
+    )
+    print(
+        "    [ZAP AUTH] "
+        f"direct authenticated={before.get('direct', {}).get('login_detected') is False}; "
+        f"proxy matches direct={before.get('proxy_matches_direct')}; "
+        f"history cookie exact={before.get('history_cookie_exact')}"
+    )
+    history = before.get("history") if isinstance(before.get("history"), dict) else {}
+    if history.get("duplicate_cookie_names"):
+        print(
+            "    [ZAP AUTH WARNING] duplicate Cookie names: "
+            + ", ".join(history["duplicate_cookie_names"])
+        )
+    if before.get("root_cause"):
+        print(f"    [ZAP AUTH ROOT CAUSE] {before['root_cause']}")
+    if after:
+        print(
+            "    [ZAP AUTH] "
+            f"session valid after scan={after.get('effective')}; "
+            f"proxy matches direct={after.get('proxy_matches_direct')}; "
+            f"history cookie exact={after.get('history_cookie_exact')}"
+        )
+        if after.get("root_cause"):
+            print(f"    [ZAP AUTH ROOT CAUSE] {after['root_cause']}")
+    if "targeted_active_scans_started" in result:
+        print(
+            "    [ZAP COVERAGE] "
+            f"seeded URLs={result.get('seeded_urls', 0)}; "
+            f"seeded requests={result.get('seeded_request_cases', 0)}; "
+            f"targeted active={result.get('targeted_active_scans_completed', 0)}/"
+            f"{result.get('targeted_active_scans_started', 0)}; "
+            f"site-tree URLs={result.get('zap_sites_tree_urls', 0)}"
+        )
+
 
 
 def log_result(profile: str, name: str, result: dict[str, Any], target: str = "") -> None:
@@ -1210,18 +1432,32 @@ async def run_pipeline(target: str, profiles: list[dict[str, str]], injection_ur
     for profile in profiles:
         name, cookies = profile["name"], profile["cookies"]
         print(f"\n[*] Scanner generali - profilo: {name}")
-        for spec in BASE_TOOLS:
+        broad_order = ("ffuf", "zap", "nuclei", "nikto")
+        broad_specs = {
+            spec.name: spec
+            for spec in BASE_TOOLS
+        }
+        for scanner_name in broad_order:
+            spec = broad_specs[scanner_name]
             scanner_timeout = BROAD_SCANNER_TIMEOUTS.get(spec.name, 180)
-            result = await call_mcp_with_progress(
-                spec,
-                {
-                    "target_url": target,
-                    "cookies": cookies,
-                    "timeout": scanner_timeout,
-                },
-            )
+            arguments: dict[str, Any] = {
+                "target_url": target,
+                "cookies": cookies,
+                "timeout": scanner_timeout,
+            }
+            if spec.name == "zap":
+                # ZAP's own spider previously started only from the root URL. Pass
+                # the already authenticated discovery surface so ZAP can import
+                # forms, POST requests and parameterized endpoints before active scan.
+                arguments.update({
+                    "seed_urls": discovery[name].get("html_urls", []),
+                    "request_cases": discovery[name].get("request_cases", []),
+                })
+            result = await call_mcp_with_progress(spec, arguments)
             results[name][spec.name] = result
             log_result(name, spec.name, result, target)
+            if spec.name == "zap":
+                log_zap_session_diagnostics(result)
             if spec.name == "ffuf" and result.get("status") in {"success", "partial"}:
                 discovery[name], discovered_urls = enrich_discovery_with_ffuf(discovery[name], result, target)
                 if discovered_urls:
@@ -1250,7 +1486,8 @@ async def run_pipeline(target: str, profiles: list[dict[str, str]], injection_ur
             "arjun", target, "No suitable HTML/form endpoint was available for hidden-parameter discovery."
         )
 
-    # Parameter tools are independent and run with bounded concurrency to reduce total duration.
+    # Parameter tools are selected independently by vulnerability class.
+    parameter_selection_summary: dict[str, dict[str, list[dict[str, Any]]]] = {}
     semaphore = asyncio.Semaphore(2)
 
     async def run_parameter_tool(spec: ToolSpec, case: dict[str, Any], cookies: str) -> dict[str, Any]:
@@ -1259,18 +1496,25 @@ async def run_pipeline(target: str, profiles: list[dict[str, str]], injection_ur
         skip_reason = _tool_case_skip_reason(spec.name, case)
         if skip_reason:
             return make_skipped_result(spec.name, url, skip_reason)
-        if spec.name == "idor":
-            if method != "GET":
-                return make_skipped_result("idor", url, "IDOR differential checks currently require a numeric GET parameter.")
-            if not any(value.isdigit() for _, value in parse_qsl(urlparse(url).query, keep_blank_values=True)):
-                return make_skipped_result("idor", url, "No numeric query parameter was available.")
+
         scanner_timeout = PARAMETER_TOOL_TIMEOUTS.get(spec.name, 120)
-        arguments = {
-            "target_url": url, "cookies": cookies,
-            "method": method, "data": str(case.get("data", "")),
-            "parameters": list(case.get("parameters", [])),
-            "timeout": scanner_timeout,
-        }
+        if spec.name == "idor":
+            # IDOR's MCP contract accepts only the request URL, cookies and timeout.
+            arguments: dict[str, Any] = {
+                "target_url": url,
+                "cookies": cookies,
+                "timeout": scanner_timeout,
+            }
+        else:
+            arguments = {
+                "target_url": url,
+                "cookies": cookies,
+                "method": method,
+                "data": str(case.get("data", "")),
+                "parameters": list(case.get("parameters", [])),
+                "timeout": scanner_timeout,
+            }
+
         async with semaphore:
             return await call_mcp(
                 spec.server,
@@ -1281,22 +1525,49 @@ async def run_pipeline(target: str, profiles: list[dict[str, str]], injection_ur
 
     for profile in profiles:
         name, cookies = profile["name"], profile["cookies"]
-        cases = select_request_cases(discovery[name])
-        get_count = sum(str(case.get("method", "GET")).upper() == "GET" for case in cases)
-        post_count = len(cases) - get_count
-        print(f"\n[*] Scanner su parametri - profilo: {name}\n    [INFO   ] casi selezionati: {len(cases)} (GET={get_count}, POST={post_count})")
+        print(f"\n[*] Scanner su parametri - profilo: {name}")
+        parameter_selection_summary[name] = {}
         grouped = {spec.name: [] for spec in PARAMETER_TOOLS}
         tasks: list[tuple[ToolSpec, dict[str, Any], asyncio.Task[dict[str, Any]]]] = []
-        for case in cases:
-            for spec in PARAMETER_TOOLS:
-                tasks.append((spec, case, asyncio.create_task(run_parameter_tool(spec, case, cookies))))
+
+        for spec in PARAMETER_TOOLS:
+            cases = select_tool_request_cases(discovery[name], spec.name)
+            get_count = sum(str(case.get("method", "GET")).upper() == "GET" for case in cases)
+            post_count = len(cases) - get_count
+            parameter_selection_summary[name][spec.name] = [
+                {
+                    "method": str(case.get("method", "GET")).upper(),
+                    "url": str(case.get("url", "")),
+                    "parameters": list(case.get("parameters", [])),
+                }
+                for case in cases
+            ]
+            print(
+                f"    [INFO   ] {spec.name}: casi selezionati={len(cases)} "
+                f"(GET={get_count}, POST={post_count})"
+            )
+            for case in cases:
+                tasks.append(
+                    (spec, case, asyncio.create_task(run_parameter_tool(spec, case, cookies)))
+                )
+
         for spec, case, task in tasks:
             result = await task
             grouped[spec.name].append(result)
             label = f"{case.get('method', 'GET')} {case.get('url', '')}"
             log_result(name, spec.name, result, label)
+
         for spec in PARAMETER_TOOLS:
-            results[name][spec.name] = aggregate_runs(spec.name, target, grouped[spec.name])
+            runs = grouped[spec.name]
+            results[name][spec.name] = (
+                aggregate_runs(spec.name, target, runs)
+                if runs
+                else make_skipped_result(
+                    spec.name,
+                    target,
+                    f"No discovered request matched {spec.name}'s vulnerability class.",
+                )
+            )
 
     for profile in profiles:
         name = profile["name"]
@@ -1328,6 +1599,9 @@ async def run_pipeline(target: str, profiles: list[dict[str, str]], injection_ur
             "POST": sum(str(case.get("method", "GET")).upper() == "POST" for case in found.get("request_cases", [])),
         } for name, found in discovery.items()},
         "arjun_endpoint_limit": MAX_ARJUN_ENDPOINTS,
+        "parameter_selection": parameter_selection_summary,
+        "parameter_tool_timeouts": PARAMETER_TOOL_TIMEOUTS,
+        "broad_scanner_timeouts": BROAD_SCANNER_TIMEOUTS,
     }
     print("\n[*] Generazione report...")
     report = await call_mcp("pwndocServer.py", "generate_report", {
@@ -1386,7 +1660,15 @@ def main() -> int:
 
     profiles = [] if args.auth_only else [{"name": "anonymous", "cookies": ""}]
     if args.cookies:
-        profiles.append({"name": "authenticated", "cookies": args.cookies})
+        try:
+            normalized_cookie = canonical_cookie_header(args.cookies)
+        except ValueError as exc:
+            parser.error(f"Invalid --cookies value: {exc}")
+        print(
+            "[*] Authenticated cookie names: "
+            + ", ".join(cookie_names(normalized_cookie))
+        )
+        profiles.append({"name": "authenticated", "cookies": normalized_cookie})
     elif args.auth_only:
         parser.error("--auth-only requires --cookies.")
 

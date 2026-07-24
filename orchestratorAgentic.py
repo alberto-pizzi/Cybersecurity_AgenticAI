@@ -6,10 +6,13 @@ import json
 import sys
 import time
 import traceback
+import warnings
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Literal, TypedDict
 from urllib.parse import parse_qsl, urlparse
+
+warnings.filterwarnings("ignore", message=r"authlib\.jose module is deprecated.*")
 
 import requests
 from langgraph.graph import END, START, StateGraph
@@ -30,9 +33,10 @@ from orchestratorDeterministic import (
     print_preflight_report,
     run_preflight_checks,
     select_request_cases,
+    select_tool_request_cases,
     write_emergency_json_report,
 )
-from utils import normalize_url, same_origin
+from utils import canonical_cookie_header, cookie_names, normalize_url, same_origin
 
 
 class AgentState(TypedDict):
@@ -169,18 +173,18 @@ def fallback_plan(state: AgentState) -> list[dict[str, Any]]:
     actions: list[dict[str, Any]] = []
     for profile in state["profiles"]:
         name = profile["name"]
-        for tool in ("zap", "nuclei", "nikto", "ffuf"):
+        for tool in ("ffuf", "zap", "nuclei", "nikto"):
             actions.append({"profile": name, "tool": tool, "target_url": state["target"], "jwt_token": "", "injection_url": "", "reason": "Mandatory baseline coverage."})
         for endpoint in select_arjun_candidates(state["discovery"].get(name, {}), state["target"]):
             actions.append({"profile": name, "tool": "arjun", "target_url": endpoint, "jwt_token": "", "injection_url": "", "reason": "Hidden-parameter discovery on a crawled HTML/form endpoint."})
-        for case in select_request_cases(state["discovery"].get(name, {}), 3):
-            for tool in ("sqlmap", "dalfox", "commix", "idor"):
+        for tool in ("sqlmap", "dalfox", "commix", "idor"):
+            for case in select_tool_request_cases(state["discovery"].get(name, {}), tool):
                 actions.append({
                     "profile": name, "tool": tool, "target_url": case["url"],
                     "method": case.get("method", "GET"), "data": case.get("data", ""),
                     "parameters": case.get("parameters", []),
                     "jwt_token": "", "injection_url": "",
-                    "reason": "Discovered GET/POST request case.",
+                    "reason": f"Risk-ranked request case suited to {tool}.",
                 })
         tokens = state["discovery"].get(name, {}).get("jwt_tokens", [])
         if tokens:
@@ -216,7 +220,7 @@ def validate_plan(state: AgentState, proposed: Any) -> list[dict[str, Any]]:
             if target_url not in allowed:
                 continue
         elif scope in {"parameterized", "numeric"}:
-            cases = select_request_cases(found, limit=20)
+            cases = select_tool_request_cases(found, tool, limit=20)
             matching = [case for case in cases if str(case.get("url", "")) == target_url]
             if method:
                 matching = [case for case in matching if str(case.get("method", "GET")).upper() == method]
@@ -282,7 +286,7 @@ def planner_node(state: AgentState) -> dict[str, Any]:
     return {"plan": plan, "round": round_number, "notes": notes, "finished": finished}
 
 
-async def execute_action(action: dict[str, Any], cookies: dict[str, str]) -> tuple[dict[str, Any], dict[str, Any]]:
+async def execute_action(action: dict[str, Any], cookies: dict[str, str], discovery: dict[str, dict[str, Any]]) -> tuple[dict[str, Any], dict[str, Any]]:
     server, function = REGISTRY[action["tool"]][:2]
     if action["tool"] == "jwt":
         arguments = {"jwt_token": action["jwt_token"], "target_url": action["target_url"]}
@@ -292,6 +296,12 @@ async def execute_action(action: dict[str, Any], cookies: dict[str, str]) -> tup
         arguments = {"target_url": action["target_url"], "cookies": cookies.get(action["profile"], "")}
         if action["tool"] in BROAD_SCANNER_TIMEOUTS:
             arguments["timeout"] = BROAD_SCANNER_TIMEOUTS[action["tool"]]
+            if action["tool"] == "zap":
+                profile_discovery = discovery.get(action["profile"], {})
+                arguments.update({
+                    "seed_urls": profile_discovery.get("html_urls", []),
+                    "request_cases": profile_discovery.get("request_cases", []),
+                })
         elif action["tool"] == "arjun":
             arguments["timeout"] = 120
         elif action["tool"] in PARAMETER_TOOL_TIMEOUTS:
@@ -315,14 +325,14 @@ async def execute_action(action: dict[str, Any], cookies: dict[str, str]) -> tup
         return action, {"tool": action["tool"], "status": "error", "target": action["target_url"], "output": message, "vulnerabilities": [], "diagnosis": diagnose_error(message), "traceback": traceback.format_exc()}
 
 
-async def execute_plan(plan: list[dict[str, Any]], cookies: dict[str, str]) -> list[tuple[dict[str, Any], dict[str, Any]]]:
+async def execute_plan(plan: list[dict[str, Any]], cookies: dict[str, str], discovery: dict[str, dict[str, Any]]) -> list[tuple[dict[str, Any], dict[str, Any]]]:
     semaphore, zap_lock = asyncio.Semaphore(3), asyncio.Lock()
     async def limited(action: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
         async with semaphore:
             if action["tool"] == "zap":
                 async with zap_lock:
-                    return await execute_action(action, cookies)
-            return await execute_action(action, cookies)
+                    return await execute_action(action, cookies, discovery)
+            return await execute_action(action, cookies, discovery)
     return await asyncio.gather(*(limited(action) for action in plan))
 
 
@@ -330,7 +340,7 @@ def executor_node(state: AgentState) -> dict[str, Any]:
     if not state["plan"]:
         return {}
     cookies = {profile["name"]: profile["cookies"] for profile in state["profiles"]}
-    executed = asyncio.run(execute_plan(state["plan"], cookies))
+    executed = asyncio.run(execute_plan(state["plan"], cookies, state["discovery"]))
     results = {profile: dict(values) for profile, values in state["results"].items()}
     discovery = {profile: dict(values) for profile, values in state["discovery"].items()}
     completed, new_attack_surface = list(state["completed"]), 0
@@ -438,7 +448,15 @@ def main() -> int:
         parser.error("--interactsh-injection-url must have the same origin as --target.")
     profiles = [] if args.auth_only else [{"name": "anonymous", "cookies": ""}]
     if args.cookies:
-        profiles.append({"name": "authenticated", "cookies": args.cookies})
+        try:
+            normalized_cookie = canonical_cookie_header(args.cookies)
+        except ValueError as exc:
+            parser.error(f"Invalid --cookies value: {exc}")
+        print(
+            "[*] Authenticated cookie names: "
+            + ", ".join(cookie_names(normalized_cookie))
+        )
+        profiles.append({"name": "authenticated", "cookies": normalized_cookie})
     elif args.auth_only:
         parser.error("--auth-only requires --cookies.")
 

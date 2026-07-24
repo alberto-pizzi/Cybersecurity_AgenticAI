@@ -39,45 +39,81 @@ def _extract_findings(text: str, target_url: str, method: str) -> list[dict[str,
         re.IGNORECASE,
     ):
         return []
+
+    dbms_match = re.search(r"back-end DBMS:\s*(.+)", text, re.I)
+    dbms = dbms_match.group(1).strip() if dbms_match else ""
     blocks = re.split(r"(?=Parameter:\s*)", text, flags=re.I)
     findings: list[dict[str, Any]] = []
     for block in blocks:
-        if not re.search(r"Parameter:\s*", block, re.I):
+        parameter_match = re.search(r"Parameter:\s*([^\s(]+)(?:\s*\(([^)]+)\))?", block, re.I)
+        if not parameter_match:
             continue
-        parameter = re.search(r"Parameter:\s*([^\s(]+)", block, re.I)
-        evidence = []
-        for label, pattern in (
-            ("Type", r"Type:\s*(.+)"),
-            ("Title", r"Title:\s*(.+)"),
-            ("Payload", r"Payload:\s*(.+)"),
-        ):
-            match = re.search(pattern, block, re.I)
-            if match:
-                evidence.append(f"{label}: {match.group(1).strip()}")
+        parameter = parameter_match.group(1).strip()
+        place = (parameter_match.group(2) or method).strip().upper()
+        types = [value.strip() for value in re.findall(r"^\s*Type:\s*(.+)$", block, re.I | re.M)]
+        titles = [value.strip() for value in re.findall(r"^\s*Title:\s*(.+)$", block, re.I | re.M)]
+        payloads = [value.strip() for value in re.findall(r"^\s*Payload:\s*(.+)$", block, re.I | re.M)]
+        if not (types or titles or payloads or re.search(r"vulnerable|injectable", block, re.I)):
+            continue
+        technique_text = "; ".join(dict.fromkeys([*types, *titles])) or "SQLMap-confirmed injection technique"
+        evidence_lines = [
+            f"Parameter: {parameter} ({place})",
+            *(f"Type: {value}" for value in types),
+            *(f"Title: {value}" for value in titles),
+            *(f"Payload: {value}" for value in payloads),
+            f"Back-end DBMS: {dbms}" if dbms else "",
+        ]
         findings.append({
-            "alert": "SQL injection",
+            "alert": f"SQL injection in parameter '{parameter}'",
             "risk": "high",
             "category": "vulnerability",
-            "description": f"SQLMap confirmed SQL injection through an HTTP {method} parameter.",
-            "impact": "An attacker may read or modify database data and, depending on database privileges, potentially compromise the server.",
-            "solution": "Use parameterized queries, strict server-side validation, least-privileged database accounts, and generic error handling.",
+            "verification_status": "scanner-confirmed-injection",
+            "description": (
+                f"SQLMap confirmed SQL injection in the {place} parameter '{parameter}' "
+                f"on {method} {target_url}. Confirmed technique information: {technique_text}."
+            ),
+            "impact": (
+                "A successful attacker can alter the database query executed by the application. "
+                "The achievable impact depends on database privileges and the confirmed technique, and may include "
+                "reading or modifying application data, bypassing authentication, or performing database-level actions."
+            ),
+            "solution": (
+                f"Replace dynamic SQL construction for parameter '{parameter}' with parameterized queries, "
+                "validate the expected data type server-side, use a least-privileged database account, and add "
+                "a regression test using the confirmed request path."
+            ),
             "url": target_url,
-            "parameter": parameter.group(1) if parameter else "",
+            "parameter": parameter,
+            "parameter_location": place,
             "method": method,
             "confidence": "high",
-            "evidence": "\n".join(evidence) or block[-2500:],
+            "dbms": dbms,
+            "injection_types": types,
+            "injection_titles": titles,
+            "payloads": payloads,
+            "technical_details": f"Parameter={parameter}; location={place}; DBMS={dbms or 'not identified'}; techniques={technique_text}.",
+            "reproduction": "Replay the affected request using one of the SQLMap-confirmed payloads recorded in the evidence and compare the database-dependent response behaviour.",
+            "evidence": "\n".join(line for line in evidence_lines if line),
         })
-    return findings or [{
-        "alert": "SQL injection",
+
+    if findings:
+        return findings
+    return [{
+        "alert": "SQL injection reported by SQLMap",
         "risk": "high",
         "category": "vulnerability",
-        "description": f"SQLMap confirmed SQL injection through an HTTP {method} parameter.",
-        "impact": "An attacker may access or modify database data.",
-        "solution": "Use parameterized queries and strict validation.",
+        "verification_status": "scanner-confirmed-injection-parser-limited",
+        "description": (
+            "SQLMap reported an injectable parameter, but the structured parser could not extract the parameter block. "
+            "The exact scanner output is retained as evidence and must be reviewed before remediation."
+        ),
+        "impact": "SQL injection can alter the application's database query; the exact impact must be determined from the retained SQLMap output.",
+        "solution": "Identify the affected parameter in the retained SQLMap output, replace dynamic SQL with parameterized queries, and retest the exact request.",
         "url": target_url,
         "method": method,
         "confidence": "high",
-        "evidence": text[-2500:],
+        "technical_details": f"SQLMap positive marker detected; DBMS={dbms or 'not identified'}; parameter parser did not find a complete block.",
+        "evidence": text[-5000:],
     }]
 
 
@@ -116,7 +152,7 @@ def run_sqlmap_scan(
         "--batch", "--random-agent",
         "--level=2", "--risk=1", "--technique=BEU", "--time-sec=2",
         "--timeout=5", "--retries=0", "--threads=4",
-        "--answers=follow=N", "--flush-session",
+        "--answers=follow=N", "--drop-set-cookie",
     ]
     if method != "GET":
         command.append(f"--method={method}")

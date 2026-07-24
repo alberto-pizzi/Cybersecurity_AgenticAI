@@ -28,6 +28,56 @@ _FATAL_STARTUP_PATTERNS = (
 )
 
 
+
+_COOKIE_NAME_RE = re.compile(r"^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$")
+
+
+def parse_cookie_header(value: str) -> list[tuple[str, str]]:
+    """
+    Parse a Cookie header without silently accepting duplicate names.
+
+    Cookie values are treated as opaque strings. Control characters and
+    duplicate cookie names are rejected because they can produce ambiguous
+    behaviour across Requests, ZAP, SQLMap, Commix and the target application.
+    """
+    text = str(value or "").strip()
+    if not text:
+        return []
+    if "\r" in text or "\n" in text:
+        raise ValueError("Cookie header contains a prohibited control character.")
+
+    pairs: list[tuple[str, str]] = []
+    seen: set[str] = set()
+    for part in text.split(";"):
+        part = part.strip()
+        if not part:
+            continue
+        if "=" not in part:
+            raise ValueError(f"Invalid cookie pair without '=': {part!r}")
+        name, cookie_value = part.split("=", 1)
+        name = name.strip()
+        cookie_value = cookie_value.strip()
+        if not name or not _COOKIE_NAME_RE.fullmatch(name):
+            raise ValueError(f"Invalid cookie name: {name!r}")
+        lowered = name.lower()
+        if lowered in seen:
+            raise ValueError(f"Duplicate cookie name: {name}")
+        seen.add(lowered)
+        pairs.append((name, cookie_value))
+    return pairs
+
+
+def canonical_cookie_header(value: str) -> str:
+    return "; ".join(f"{name}={cookie_value}" for name, cookie_value in parse_cookie_header(value))
+
+
+def cookie_names(value: str) -> list[str]:
+    return [name for name, _ in parse_cookie_header(value)]
+
+
+def redact_cookie_header(value: str) -> str:
+    return "; ".join(f"{name}=<redacted>" for name, _ in parse_cookie_header(value))
+
 def setup_path() -> None:
     """Add the project-managed executable directory to PATH once."""
     LOCAL_BIN.mkdir(parents=True, exist_ok=True)

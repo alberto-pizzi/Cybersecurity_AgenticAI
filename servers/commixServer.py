@@ -35,18 +35,45 @@ def _find_commix_script() -> Path | None:
 def _findings(text: str, target_url: str, method: str) -> list[dict[str, Any]]:
     if not re.search(r"(parameter.+is vulnerable|injectable parameter|command injection vulnerability)", text, re.I):
         return []
-    evidence = [line.strip() for line in text.splitlines() if re.search(r"vulnerable|injectable|payload", line, re.I)]
+    parameter_match = re.search(
+        r"(?:parameter|parameter\s*['\"])(?:\s*[:=]\s*)?['\"]?([A-Za-z0-9_.-]+)['\"]?.{0,80}?(?:vulnerable|injectable)",
+        text,
+        re.I,
+    )
+    if not parameter_match:
+        parameter_match = re.search(r"(?:GET|POST) parameter ['\"]([^'\"]+)['\"]", text, re.I)
+    parameter = parameter_match.group(1) if parameter_match else ""
+    payloads = [value.strip() for value in re.findall(r"(?:payload|Payload)\s*[:=]\s*(.+)", text)]
+    technique_lines = [
+        line.strip() for line in text.splitlines()
+        if re.search(r"technique|vulnerable|injectable|payload", line, re.I)
+    ]
     return [{
-        "alert": "OS command injection",
+        "alert": (f"OS command injection in parameter '{parameter}'" if parameter else "OS command injection"),
         "risk": "critical",
         "category": "vulnerability",
-        "description": f"Commix reported that an HTTP {method} parameter can inject operating-system commands.",
-        "impact": "A successful attacker may execute commands with the web application's operating-system privileges and compromise the host.",
-        "solution": "Avoid shell execution, use safe APIs, enforce strict allow-list validation, and run the service with minimal privileges.",
+        "verification_status": "scanner-confirmed-command-injection",
+        "description": (
+            f"Commix reported that the HTTP {method} parameter '{parameter}' is command-injectable."
+            if parameter else
+            f"Commix reported a command-injectable HTTP {method} parameter; the parameter name was not extracted by the parser."
+        ),
+        "impact": (
+            "The affected input can reach an operating-system command execution path. An attacker may execute commands "
+            "with the web application's operating-system privileges, access files and secrets available to that account, "
+            "or use the host as a pivot, subject to platform and process restrictions."
+        ),
+        "solution": (
+            "Remove shell-command construction from untrusted input. Use a safe library API for the required operation, "
+            "apply strict allow-list validation, avoid invoking a shell, and run the service with minimal privileges."
+        ),
         "url": target_url,
         "method": method,
+        "parameter": parameter,
+        "payloads": payloads[:10],
         "confidence": "high",
-        "evidence": "\n".join(evidence[:30]) or text[-2500:],
+        "technical_details": f"Commix positive marker; parameter={parameter or 'not extracted'}; method={method}.",
+        "evidence": "\n".join(technique_lines[:40]) or text[-5000:],
     }]
 
 
@@ -84,7 +111,7 @@ def run_commix_scan(
         sys.executable, str(script),
         "--url", target_url,
         "--batch", "--level", "1",
-        "--timeout", "5", "--retries", "0",
+        "--timeout", "5", "--retries", "0", "--drop-set-cookie",
         "--time-limit", str(max(30, timeout - 15)),
     ]
     if data:

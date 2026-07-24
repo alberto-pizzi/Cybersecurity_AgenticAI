@@ -45,38 +45,290 @@ def _run_phase(target_url: str, cookies: str, wordlist: Path, output: Path, budg
     return result, rows
 
 
-def _verify(url: str, cookies: str) -> tuple[str, str, str, str]:
-    path = urlparse(url).path.lower()
+def _verify(url: str, cookies: str) -> dict[str, Any]:
+    """
+    Verify a sensitive-looking FFUF path before classifying it.
+
+    Redirects to login pages, 401/403 responses, and failed verification are not
+    reported as exposed medium-severity resources.
+    """
+    original_path = urlparse(url).path.lower()
     headers = {"Cookie": cookies} if cookies else {}
     try:
-        response = requests.get(url, headers=headers, timeout=(3,6), allow_redirects=True)
-        sample = response.text[:12000]
-    except requests.RequestException:
-        return "candidate", "medium", "Potentially sensitive resource exposed", "The resource should be manually verified."
+        response = requests.get(
+            url,
+            headers=headers,
+            timeout=(3, 7),
+            allow_redirects=True,
+        )
+    except requests.RequestException as exc:
+        return {
+            "category": "observation",
+            "risk": "info",
+            "alert": "Sensitive-looking path could not be verified",
+            "verification_status": "verification-request-failed",
+            "description": "FFUF discovered a sensitive-looking path, but the follow-up verification request failed.",
+            "impact": "",
+            "solution": "",
+            "confidence": "low",
+            "final_url": "",
+            "final_status": 0,
+            "evidence": f"Verification request failed: {type(exc).__name__}: {exc}",
+        }
+
+    final_url = str(response.url)
+    final_path = urlparse(final_url).path.lower()
+    sample = response.text[:20000]
     lower = sample.lower()
-    if path.endswith("/.git/head") and sample.lstrip().startswith("ref:"):
-        return "vulnerability", "high", "Exposed Git repository metadata", "The Git HEAD reference was retrieved and may permit repository reconstruction."
-    if path.endswith("/.env") and any(token in lower for token in ("password=", "secret=", "api_key=", "db_host=", "db_password=")):
-        return "vulnerability", "high", "Environment secrets file exposed", "The response resembles an environment file containing secret-bearing keys."
-    if "phpinfo" in path and "php version" in lower:
-        return "vulnerability", "medium", "PHP diagnostic page exposed", "A PHP information page discloses detailed runtime and server configuration."
-    if path.endswith("server-status") and "apache server status" in lower:
-        return "vulnerability", "medium", "Apache server-status exposed", "The Apache status page discloses operational details and active requests."
-    return "candidate", "medium", "Potentially sensitive resource exposed", "The resource returned a reachable response but requires manual content validation."
+    evidence = (
+        f"Original URL: {url}\nFinal URL: {final_url}\n"
+        f"Final HTTP status: {response.status_code}\n"
+        f"Response bytes sampled: {len(sample.encode('utf-8', errors='replace'))}"
+    )
+
+    login_page = (
+        final_path.endswith("/login")
+        or final_path.endswith("/login.php")
+        or ('type="password"' in lower and "login" in lower)
+        or ("type='password'" in lower and "login" in lower)
+    )
+    if login_page and final_url.rstrip("/") != url.rstrip("/"):
+        return {
+            "category": "observation",
+            "risk": "info",
+            "alert": "Sensitive-looking path redirected to authentication",
+            "verification_status": "access-controlled-or-session-redirect",
+            "description": "The discovered path redirected to a login page during verification; exposure was not confirmed.",
+            "impact": "",
+            "solution": "",
+            "confidence": "high",
+            "final_url": final_url,
+            "final_status": response.status_code,
+            "evidence": evidence,
+        }
+
+    if response.status_code in {401, 403}:
+        return {
+            "category": "observation",
+            "risk": "info",
+            "alert": "Sensitive-looking path is access controlled",
+            "verification_status": "access-control-observed",
+            "description": f"The verification request returned HTTP {response.status_code}; public exposure was not demonstrated.",
+            "impact": "",
+            "solution": "",
+            "confidence": "high",
+            "final_url": final_url,
+            "final_status": response.status_code,
+            "evidence": evidence,
+        }
+
+    if response.status_code >= 400:
+        return {
+            "category": "discovery",
+            "risk": "info",
+            "alert": "FFUF path not confirmed by verification",
+            "verification_status": "verification-negative",
+            "description": f"The follow-up request returned HTTP {response.status_code}; the initial FFUF match was not treated as an exposure.",
+            "impact": "",
+            "solution": "",
+            "confidence": "high",
+            "final_url": final_url,
+            "final_status": response.status_code,
+            "evidence": evidence,
+        }
+
+    if original_path.endswith("/.git/head") and sample.lstrip().startswith("ref:"):
+        return {
+            "category": "vulnerability",
+            "risk": "high",
+            "alert": "Exposed Git repository metadata",
+            "verification_status": "content-verified",
+            "description": "The .git/HEAD reference was retrieved from the web server.",
+            "impact": "Accessible Git metadata can permit reconstruction of repository contents, including source code and historical secrets.",
+            "solution": "Remove the .git directory from the web root, block access to repository metadata, and rotate any exposed credentials.",
+            "confidence": "high",
+            "final_url": final_url,
+            "final_status": response.status_code,
+            "evidence": evidence + "\nResponse prefix: " + sample[:300],
+        }
+
+    if original_path.endswith("/.env") and any(
+        token in lower
+        for token in ("password=", "secret=", "api_key=", "db_host=", "db_password=")
+    ):
+        return {
+            "category": "vulnerability",
+            "risk": "high",
+            "alert": "Environment secrets file exposed",
+            "verification_status": "content-verified",
+            "description": "The response resembles an environment file and contains secret-bearing configuration keys.",
+            "impact": "Exposed application secrets may permit database access, API abuse, session forgery, or compromise of dependent services.",
+            "solution": "Remove the file from the web root, block dotfile access, rotate every exposed secret, and review access logs.",
+            "confidence": "high",
+            "final_url": final_url,
+            "final_status": response.status_code,
+            "evidence": evidence + "\nSecret-bearing key names were detected; values are not copied into the report.",
+        }
+
+    if "phpinfo" in original_path and "php version" in lower:
+        return {
+            "category": "vulnerability",
+            "risk": "medium",
+            "alert": "PHP diagnostic page exposed",
+            "verification_status": "content-verified",
+            "description": "A PHP information page was retrieved and disclosed runtime and server configuration details.",
+            "impact": "The page can disclose versions, filesystem paths, loaded modules, environment values, and security-relevant configuration.",
+            "solution": "Remove or restrict the diagnostic page and review the disclosed values for secrets or unsafe configuration.",
+            "confidence": "high",
+            "final_url": final_url,
+            "final_status": response.status_code,
+            "evidence": evidence + "\nPHP information markers were present in the response.",
+        }
+
+    if original_path.endswith("server-status") and "apache server status" in lower:
+        return {
+            "category": "vulnerability",
+            "risk": "medium",
+            "alert": "Apache server-status exposed",
+            "verification_status": "content-verified",
+            "description": "The Apache server-status page was retrieved.",
+            "impact": "The page can reveal active requests, client addresses, worker state, hostnames, and operational details useful to an attacker.",
+            "solution": "Restrict server-status to trusted administrative networks or disable it when it is not required.",
+            "confidence": "high",
+            "final_url": final_url,
+            "final_status": response.status_code,
+            "evidence": evidence + "\nApache server-status markers were present.",
+        }
+
+    if "<title>index of" in lower or "<h1>index of" in lower:
+        return {
+            "category": "candidate",
+            "risk": "low",
+            "alert": "Directory listing reachable",
+            "verification_status": "content-verified-directory-index",
+            "description": "The response contains a directory index for a sensitive-looking path.",
+            "impact": "Directory indexes can reveal file names, backups, source artifacts, and resources that were not intended to be enumerated.",
+            "solution": "Disable directory indexing and publish only the files required by the application.",
+            "confidence": "high",
+            "final_url": final_url,
+            "final_status": response.status_code,
+            "evidence": evidence + "\nDirectory-index title or heading was detected.",
+        }
+
+    if any(token in original_path for token in ("setup", "install")) and (
+        "<form" in lower
+        and any(token in lower for token in ("setup", "install", "create database", "reset database"))
+    ):
+        return {
+            "category": "candidate",
+            "risk": "medium",
+            "alert": "Setup or installation interface reachable",
+            "verification_status": "content-verified-requires-manual-validation",
+            "description": "A setup or installation interface was reachable and contained an actionable form.",
+            "impact": "If the interface permits unauthenticated reconfiguration, database reset, or installation actions, application availability or integrity may be affected.",
+            "solution": "Disable the interface after deployment or restrict it to authorized administrators and trusted networks.",
+            "confidence": "medium",
+            "final_url": final_url,
+            "final_status": response.status_code,
+            "evidence": evidence + "\nSetup/installation form markers were detected.",
+        }
+
+    return {
+        "category": "discovery",
+        "risk": "info",
+        "alert": "Sensitive-looking path reachable without verified sensitive content",
+        "verification_status": "reachable-content-not-sensitive",
+        "description": "The path was reachable, but the verification response did not match a supported sensitive-content signature.",
+        "impact": "",
+        "solution": "",
+        "confidence": "medium",
+        "final_url": final_url,
+        "final_status": response.status_code,
+        "evidence": evidence,
+    }
 
 
 def _finding(item: dict[str, Any], cookies: str, verify: bool) -> dict[str, Any]:
-    url = str(item.get("url", "")); status = int(item.get("status") or 0)
-    name = Path(urlparse(url).path.rstrip("/")).name.lower(); full_path = urlparse(url).path.lower()
-    sensitive = name in SENSITIVE_NAMES or any(token in full_path for token in ("/.git/", ".env", "backup", "dump.sql", "database.sql", "phpinfo", "server-status", "actuator/env"))
-    if sensitive and status in {200,301,302,307,401,403}:
-        category, risk, alert, impact = _verify(url, cookies) if verify and status == 200 else ("candidate","medium","Potentially sensitive resource exposed","The path may expose administrative, diagnostic, configuration, or backup content.")
-        solution = "Remove deployment artifacts and secrets, restrict administrative/diagnostic paths, and verify authorization controls."
-    else:
-        category, risk, alert = "discovery", "info", "Discovered web resource"
-        impact = "The resource expands the known attack surface for subsequent crawling and testing."
-        solution = "Confirm the resource is intended to be reachable and include it in application security testing."
-    return {"alert":alert,"risk":risk,"category":category,"description":f"FFUF received HTTP {status} ({item.get('length',0)} bytes, {item.get('words',0)} words, {item.get('lines',0)} lines).","impact":impact,"solution":solution,"url":url,"status_code":status,"content_length":item.get("length"),"words":item.get("words"),"lines":item.get("lines"),"redirect_location":item.get("redirectlocation", ""),"confidence":"high" if category=="vulnerability" else "medium","evidence":f"HTTP {status}; length={item.get('length')}; words={item.get('words')}; lines={item.get('lines')}"}
+    url = str(item.get("url", ""))
+    status = int(item.get("status") or 0)
+    parsed = urlparse(url)
+    name = Path(parsed.path.rstrip("/")).name.lower()
+    full_path = parsed.path.lower()
+    sensitive = (
+        name in SENSITIVE_NAMES
+        or any(
+            token in full_path
+            for token in (
+                "/.git/", ".env", "backup", "dump.sql", "database.sql",
+                "phpinfo", "server-status", "actuator/env", "setup", "install",
+            )
+        )
+    )
+
+    base_evidence = (
+        f"FFUF HTTP {status}; length={item.get('length')}; "
+        f"words={item.get('words')}; lines={item.get('lines')}; "
+        f"redirect={item.get('redirectlocation', '') or 'not supplied'}"
+    )
+
+    if sensitive and verify:
+        verified = _verify(url, cookies)
+        return {
+            "alert": verified["alert"],
+            "risk": verified["risk"],
+            "category": verified["category"],
+            "verification_status": verified["verification_status"],
+            "description": verified["description"],
+            "impact": verified["impact"],
+            "solution": verified["solution"],
+            "url": url,
+            "final_url": verified.get("final_url", ""),
+            "status_code": status,
+            "verification_status_code": verified.get("final_status", 0),
+            "content_length": item.get("length"),
+            "words": item.get("words"),
+            "lines": item.get("lines"),
+            "redirect_location": item.get("redirectlocation", ""),
+            "confidence": verified["confidence"],
+            "evidence": base_evidence + "\n" + verified["evidence"],
+        }
+
+    if sensitive:
+        return {
+            "alert": "Sensitive-looking resource discovered",
+            "risk": "info",
+            "category": "discovery",
+            "verification_status": "not-content-verified",
+            "description": "FFUF discovered a sensitive-looking path, but it was outside the bounded content-verification subset.",
+            "impact": "",
+            "solution": "",
+            "url": url,
+            "status_code": status,
+            "content_length": item.get("length"),
+            "words": item.get("words"),
+            "lines": item.get("lines"),
+            "redirect_location": item.get("redirectlocation", ""),
+            "confidence": "low",
+            "evidence": base_evidence,
+        }
+
+    return {
+        "alert": "Discovered web resource",
+        "risk": "info",
+        "category": "discovery",
+        "verification_status": "discovery-only",
+        "description": f"FFUF received HTTP {status} for this resource.",
+        "impact": "",
+        "solution": "",
+        "url": url,
+        "status_code": status,
+        "content_length": item.get("length"),
+        "words": item.get("words"),
+        "lines": item.get("lines"),
+        "redirect_location": item.get("redirectlocation", ""),
+        "confidence": "high",
+        "evidence": base_evidence,
+    }
 
 
 @mcp.tool()

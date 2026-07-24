@@ -48,7 +48,22 @@ def _run(target_url: str, cookies: str, output: Path, wordlist: str, budget: int
 
 def _finding(target_url: str, parameter: str) -> dict[str,Any]:
     high=parameter.lower() in HIGH_RISK_NAMES
-    return {"alert":"High-value hidden HTTP parameter discovered" if high else "Hidden HTTP parameter discovered","risk":"low" if high else "info","category":"candidate" if high else "discovery","description":f"Arjun identified the undocumented GET parameter '{parameter}'.","impact":"This parameter name is commonly associated with injection, file access, redirection, or authorization decisions and should receive priority testing." if high else "The parameter expands the application attack surface for downstream testing.","solution":"Confirm the parameter is intended, validate it server-side, enforce authorization where applicable, and remove unused inputs.","url":target_url,"parameter":parameter,"confidence":"low" if high else "medium","priority":"high" if high else "normal","evidence":f"Parameter name returned by Arjun: {parameter}"}
+    return {
+        "alert": "High-priority hidden HTTP parameter discovered" if high else "Hidden HTTP parameter discovered",
+        "risk": "info",
+        "category": "discovery",
+        "verification_status": "parameter-name-discovery-only",
+        "description": f"Arjun observed that the endpoint accepts or reacts to the undocumented GET parameter '{parameter}'.",
+        "impact": "No vulnerability is inferred from the parameter name alone. The result expands the attack surface and identifies an input that should be tested by the appropriate injection or authorization scanner.",
+        "solution": "Confirm whether the parameter is intended, document it, apply server-side validation and authorization where relevant, and remove unused inputs.",
+        "url": target_url,
+        "method": "GET",
+        "parameter": parameter,
+        "confidence": "medium",
+        "priority": "high" if high else "normal",
+        "technical_details": f"Arjun parameter discovery result; parameter={parameter}; priority={'high' if high else 'normal'}.",
+        "evidence": f"Parameter name returned by Arjun: {parameter}",
+    }
 
 
 @mcp.tool()

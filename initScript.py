@@ -19,7 +19,7 @@ from typing import Any
 
 import requests
 
-from utils import ROOT_DIR, WORDLISTS_DIR, setup_path
+from utils import canonical_cookie_header, cookie_names, ROOT_DIR, WORDLISTS_DIR, setup_path
 
 ROOT = Path(ROOT_DIR).resolve()
 LOCAL_ROOT = Path.home() / ".local"
@@ -29,11 +29,11 @@ DOWNLOADS = LOCAL_ROOT / "downloads"
 RUNTIME_FILE = ROOT / ".secops_runtime.json"
 TARGET = "http://127.0.0.1"
 DEFAULT_MODEL = "llama3.1:8b"
-BUILD_ID = "secops-init-resilient-v7-20260724"
+BUILD_ID = "secops-init-resilient-v15-20260724"
 
 PYTHON_PACKAGES = (
     "fastmcp==2.12.5", "langgraph>=0.6,<2", "requests>=2.32,<3",
-    "beautifulsoup4>=4.13,<5", "python-owasp-zap-v2.4>=0.1.0",
+    "beautifulsoup4>=4.13,<5", "zaproxy>=0.5,<0.6",
     "reportlab>=4.4,<5", "PyJWT>=2.10,<3", "arjun>=2.2,<3",
 )
 SCANNERS = ("nuclei", "nikto", "ffuf", "dalfox", "commix", "sqlmap", "arjun", "interactsh-client")
@@ -152,7 +152,14 @@ def write_launcher(name: str, command: list[str]) -> Path:
 
 def install_python_packages() -> None:
     run([sys.executable, "-m", "pip", "install", "--upgrade", "pip"], timeout=1800)
-    run([sys.executable, "-m", "pip", "install", *PYTHON_PACKAGES], timeout=3600)
+    run(
+        [sys.executable, "-m", "pip", "uninstall", "-y", "python-owasp-zap-v2.4"],
+        required=False,
+        capture=True,
+        show_output=False,
+        timeout=600,
+    )
+    run([sys.executable, "-m", "pip", "install", "--upgrade", *PYTHON_PACKAGES], timeout=3600)
     configure_path()
 
 
@@ -597,10 +604,32 @@ def login_dvwa() -> str:
     response = session.post(f"{TARGET}/login.php", data=credentials, timeout=20, allow_redirects=True)
     if "login.php" in response.url.lower() or "login :: damn vulnerable" in response.text.lower():
         raise RuntimeError("Automatic DVWA login failed.")
-    session.cookies.set("security", "low")
-    cookie = "; ".join(f"{name}={value}" for name, value in session.cookies.get_dict().items())
-    if "PHPSESSID=" not in cookie:
+    session.cookies.set("security", "low", path="/")
+    cookie = canonical_cookie_header(
+        "; ".join(
+            f"{name}={value}"
+            for name, value in session.cookies.get_dict().items()
+        )
+    )
+    names = {name.lower() for name in cookie_names(cookie)}
+    if "phpsessid" not in names:
         raise RuntimeError("DVWA did not issue PHPSESSID.")
+    if "security" not in names:
+        raise RuntimeError("DVWA security cookie was not created.")
+
+    verification = requests.get(
+        f"{TARGET}/security.php",
+        headers={"Cookie": cookie},
+        timeout=15,
+        allow_redirects=True,
+    )
+    body = verification.text.lower()
+    if (
+        "login.php" in verification.url.lower()
+        or "type=\"password\"" in body
+        or "login :: damn vulnerable" in body
+    ):
+        raise RuntimeError("DVWA cookie verification failed: the session is not authenticated.")
     return cookie
 
 
@@ -623,11 +652,29 @@ def setup_lab(model: str) -> str:
     run(["docker", "info"], timeout=60)
     ensure_network("secops-net")
     ensure_container("dvwa", "vulnerables/web-dvwa", {"80/tcp": "80"}, f"{TARGET}/login.php")
+    # The ZAP image tag is mutable. Pull and recreate the container so the
+    # daemon and the current zaproxy Python API are not silently out of sync.
+    run(["docker", "pull", "zaproxy/zap-stable"], timeout=1800)
+    run(["docker", "rm", "-f", "zap_mcp"], required=False, timeout=180)
     ensure_container(
         "zap_mcp", "zaproxy/zap-stable", {"8080/tcp": "8080"},
         "http://127.0.0.1:8080/JSON/core/view/version/",
-        command=["zap.sh", "-daemon", "-host", "0.0.0.0", "-port", "8080", "-config", "api.disablekey=true", "-config", "api.addrs.addr.name=.*", "-config", "api.addrs.addr.regex=true"], attempts=120,
+        command=[
+            "zap.sh", "-daemon", "-host", "0.0.0.0", "-port", "8080",
+            "-config", "api.disablekey=true",
+            "-config", "api.addrs.addr.name=.*",
+            "-config", "api.addrs.addr.regex=true",
+        ],
+        attempts=120,
     )
+    try:
+        version = requests.get(
+            "http://127.0.0.1:8080/JSON/core/view/version/",
+            timeout=15,
+        ).json().get("version", "")
+        print(f"[+] ZAP daemon version: {version or 'unknown'}")
+    except Exception as exc:
+        print(f"[!] Could not read ZAP version: {type(exc).__name__}: {exc}")
     ensure_container("ollama_secops", "ollama/ollama", {"11434/tcp": "11434"}, "http://127.0.0.1:11434/api/tags", run_options=["-v", "ollama_secops:/root/.ollama"], attempts=120)
     run(["docker", "exec", "ollama_secops", "ollama", "pull", model], timeout=7200)
     return login_dvwa()

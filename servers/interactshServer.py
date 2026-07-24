@@ -125,13 +125,31 @@ def run_interactsh_client(
 
             findings = []
             if events:
+                protocols = sorted({str(event.get("protocol") or event.get("type") or "unknown") for event in events if isinstance(event, dict)})
                 findings.append({
                     "alert": "Out-of-band interaction confirmed",
                     "risk": "high",
-                    "description": "The supplied injection point generated an Interactsh callback.",
-                    "solution": "Validate outbound destinations and remove unsafe server-side fetch or execution paths.",
+                    "category": "vulnerability",
+                    "verification_status": "callback-confirmed",
+                    "confidence": "high",
+                    "description": (
+                        "The supplied injection point caused the target-side processing path to generate "
+                        f"an out-of-band callback. Observed interaction protocols: {', '.join(protocols)}."
+                    ),
+                    "impact": (
+                        "The callback proves that attacker-controlled input can cause an external interaction. "
+                        "Depending on the tested insertion point and protocol, this may represent SSRF, blind "
+                        "command injection, XML external entity processing, or another server-side interaction primitive."
+                    ),
+                    "solution": (
+                        "Trace the exact code path that consumed the payload, restrict outbound network access, "
+                        "use allow-lists for remote destinations, disable unsafe parsers or shell execution, and "
+                        "add a regression test for the confirmed insertion point."
+                    ),
                     "url": injected_url,
-                    "evidence": events[:10],
+                    "method": "GET",
+                    "technical_details": f"Interactsh payload={payload}; callbacks={len(events)}; protocols={protocols}.",
+                    "evidence": json.dumps(events[:10], indent=2, ensure_ascii=False, default=str),
                 })
 
             return success(

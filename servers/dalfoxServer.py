@@ -16,25 +16,40 @@ mcp = FastMCP("Dalfox Scanner")
 
 
 def _text_findings(text: str, target_url: str, method: str) -> list[dict[str, Any]]:
-    evidence_lines = [
-        line.strip()
-        for line in text.splitlines()
-        if re.search(r"\[V\]|\[POC\]|verified", line, re.I)
-    ]
-    if not evidence_lines:
-        return []
-    return [{
-        "alert": "Cross-site scripting",
-        "risk": "high",
-        "category": "vulnerability",
-        "description": f"Dalfox returned a verified or reproducible XSS vector in an HTTP {method} parameter.",
-        "impact": "A successful payload can execute JavaScript in a victim's browser, enabling session theft, unauthorized actions, or content manipulation.",
-        "solution": "Apply contextual output encoding, strict input validation, safe DOM APIs, and an effective Content Security Policy.",
-        "url": target_url,
-        "method": method,
-        "confidence": "high",
-        "evidence": "\n".join(evidence_lines[:20]),
-    }]
+    verified = [line.strip() for line in text.splitlines() if re.search(r"\[V\]|verified", line, re.I)]
+    candidates = [line.strip() for line in text.splitlines() if re.search(r"\[POC\]|\[R\]|reflected", line, re.I)]
+    findings: list[dict[str, Any]] = []
+    if verified:
+        findings.append({
+            "alert": "Verified cross-site scripting",
+            "risk": "high",
+            "category": "vulnerability",
+            "verification_status": "dalfox-verified-vector",
+            "description": f"Dalfox reported a verified executable XSS vector in an HTTP {method} input.",
+            "impact": "The verified vector can execute attacker-controlled JavaScript in a victim browser within the affected origin.",
+            "solution": "Apply context-aware output encoding at the affected sink, validate the input server-side, use safe DOM APIs, and add an effective Content Security Policy as defence in depth.",
+            "url": target_url,
+            "method": method,
+            "confidence": "high",
+            "technical_details": "Dalfox text output contained a verified-vector marker.",
+            "evidence": "\n".join(verified[:30]),
+        })
+    if candidates and not verified:
+        findings.append({
+            "alert": "Potential cross-site scripting reflection",
+            "risk": "medium",
+            "category": "candidate",
+            "verification_status": "reflection-or-poc-needs-validation",
+            "description": f"Dalfox reported a reflection or proof-of-concept candidate in an HTTP {method} input, but did not mark it as a verified executable vector.",
+            "impact": "No browser execution was confirmed. Manual validation is required to determine whether the reflection reaches an executable HTML, attribute, JavaScript, or URL context.",
+            "solution": "Review the reflected context, apply context-aware encoding, validate the input, and retest with a browser-based proof of execution.",
+            "url": target_url,
+            "method": method,
+            "confidence": "medium",
+            "technical_details": "Dalfox text output contained a POC/reflection marker without a verified-vector marker.",
+            "evidence": "\n".join(candidates[:30]),
+        })
+    return findings
 
 
 def _json_findings(path: Path, target_url: str, method: str) -> list[dict[str, Any]]:
@@ -51,13 +66,14 @@ def _json_findings(path: Path, target_url: str, method: str) -> list[dict[str, A
             "alert": str(item.get("type_description") or "Cross-site scripting"),
             "risk": severity,
             "category": category,
+            "verification_status": "dalfox-verified-vector" if finding_type == "V" else "reflection-or-ast-candidate",
             "description": (
                 "Dalfox verified an executable XSS vector."
                 if finding_type == "V"
                 else "Dalfox identified an XSS reflection or AST candidate requiring confirmation."
             ),
             "impact": "Successful XSS can execute attacker-controlled JavaScript in a victim browser session.",
-            "solution": "Use context-aware output encoding, strict server-side validation, safe DOM APIs, and Content Security Policy.",
+            "solution": "Apply context-aware output encoding at the affected sink, validate the input server-side, use safe DOM APIs, and deploy Content Security Policy as defence in depth.",
             "url": str(item.get("data") or target_url),
             "method": str(item.get("method") or method),
             "parameter": str(item.get("param") or ""),
