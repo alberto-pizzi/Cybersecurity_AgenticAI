@@ -931,30 +931,94 @@ def _tool_case_skip_reason(tool: str, case: dict[str, Any]) -> str:
 
 
 def select_arjun_candidates(discovery: dict[str, Any], target: str, limit: int = MAX_ARJUN_ENDPOINTS) -> list[str]:
-    """Prefer high-impact input handlers and avoid configuration/login utility pages."""
-    form_urls = set(discovery.get("form_urls", []))
-    candidates = set(form_urls) | set(discovery.get("html_urls", []))
+    """
+    Rank Arjun targets by likely security value without blanket-excluding useful pages.
+
+    - logout endpoints are excluded because probing them can destroy the session;
+    - security/login/setup pages remain eligible when they expose forms, existing
+      parameters, or discovered request cases;
+    - /config/ and /docs/ are skipped only when they are plain directory indexes;
+    - high-impact vulnerability handlers are tested before generic utility pages.
+    """
+    form_urls = {normalize_url(str(url)) for url in discovery.get("form_urls", [])}
+    request_cases = [
+        case for case in discovery.get("request_cases", [])
+        if isinstance(case, dict)
+    ]
+    case_by_url: dict[str, list[dict[str, Any]]] = {}
+    for case in request_cases:
+        case_url = normalize_url(str(case.get("url", "")))
+        if case_url:
+            case_by_url.setdefault(case_url, []).append(case)
+
+    candidates = {
+        normalize_url(str(url))
+        for url in (*discovery.get("html_urls", []), *discovery.get("form_urls", []))
+        if str(url)
+    }
     ranked: list[tuple[int, str]] = []
-    excluded = ("login", "logout", "setup", "security.php", "/config/", "/docs/")
     low_value = ("brute", "captcha", "csrf")
+    preferred = (
+        "/vulnerabilities/exec", "/vulnerabilities/sqli", "/vulnerabilities/fi",
+        "/vulnerabilities/xss", "/vulnerabilities/upload", "/vulnerabilities/api",
+        "/vulnerabilities/idor", "/vulnerabilities/ssrf",
+    )
+
     for url in candidates:
-        path = urlparse(url).path.lower()
-        if any(name in path for name in excluded):
+        parsed = urlparse(url)
+        path = parsed.path.lower()
+        if "logout" in path:
             continue
-        clean = _clean_url(url)
+
+        related_cases = case_by_url.get(url, [])
+        has_form = url in form_urls
+        has_existing_parameters = bool(parsed.query) or any(
+            case.get("parameters") for case in related_cases
+        )
+
+        # Directory indexes such as /config/?C=D;O=A are navigation pages, not
+        # useful hidden-parameter targets. A real form/API under those paths is
+        # still retained.
+        directory_utility = "/config/" in path or "/docs/" in path
+        if directory_utility and not has_form and not has_existing_parameters:
+            continue
+
         score = _risk_terms(path)
-        if url in form_urls:
+        if has_form:
+            score += 14
+        if has_existing_parameters:
+            score += 10
+        if any(token in path for token in preferred):
+            score += 22
+        elif "/vulnerabilities/" in path:
             score += 12
-        if urlparse(url).query:
-            score += 8
-        if "/vulnerabilities/" in path:
-            score += 12
+
+        # These pages can contain meaningful parameters, but normally have less
+        # value than direct vulnerability handlers.
+        if path.endswith("/security.php"):
+            score += 5 if has_form or has_existing_parameters else -3
+        if path.endswith("/login.php") or path.endswith("/login"):
+            score += 2 if has_form or has_existing_parameters else -7
+        if "setup" in path:
+            score += 1 if has_form or has_existing_parameters else -9
+        if directory_utility:
+            score -= 5
         if any(term in path for term in low_value):
-            score -= 10
-        if score <= 0:
-            continue
-        ranked.append((score, clean))
-    return [url for _, url in sorted(set(ranked), key=lambda item: (-item[0], item[1]))[:limit]]
+            score -= 8
+
+        # Keep actual input handlers even when their path name has no risk term.
+        if score <= 0 and (has_form or has_existing_parameters):
+            score = 1
+        if score > 0:
+            ranked.append((score, _clean_url(url)))
+
+    # De-duplicate while preserving the highest score for each clean URL.
+    best: dict[str, int] = {}
+    for score, url in ranked:
+        best[url] = max(score, best.get(url, score))
+    return [
+        url for url, _ in sorted(best.items(), key=lambda item: (-item[1], item[0]))[:limit]
+    ]
 
 def select_request_cases(discovery: dict[str, Any], limit: int = MAX_PARAMETER_ENDPOINTS) -> list[dict[str, Any]]:
     """Select non-destructive cases, ranking likely injection/authorization inputs first."""
