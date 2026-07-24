@@ -14,8 +14,10 @@ import tarfile
 import time
 import zipfile
 from datetime import datetime, timezone
+from html.parser import HTMLParser
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
 import requests
 
@@ -29,7 +31,7 @@ DOWNLOADS = LOCAL_ROOT / "downloads"
 RUNTIME_FILE = ROOT / ".secops_runtime.json"
 TARGET = "http://127.0.0.1"
 DEFAULT_MODEL = "llama3.1:8b"
-BUILD_ID = "secops-init-resilient-v17-20260724"
+BUILD_ID = "secops-init-resilient-v17.4-20260724"
 
 PYTHON_PACKAGES = (
     "fastmcp==2.12.5", "langgraph>=0.6,<2", "requests>=2.32,<3",
@@ -590,47 +592,384 @@ def ensure_container(name: str, image: str, ports: dict[str, str], readiness_url
         raise RuntimeError(f"Container {name} is not ready at {readiness_url}.")
 
 
-def login_dvwa() -> str:
-    if not wait_http(f"{TARGET}/login.php", 90):
-        raise RuntimeError("DVWA is not reachable.")
-    session = requests.Session()
-    session.get(f"{TARGET}/setup.php", timeout=15).raise_for_status()
-    session.post(f"{TARGET}/setup.php", data={"create_db": "Create / Reset Database"}, timeout=20).raise_for_status()
-    page = session.get(f"{TARGET}/login.php", timeout=15)
-    token = re.search(r'name=["\']user_token["\'][^>]*value=["\']([^"\']+)', page.text, re.I)
-    credentials = {"username": "admin", "password": "password", "Login": "Login"}
-    if token:
-        credentials["user_token"] = token.group(1)
-    response = session.post(f"{TARGET}/login.php", data=credentials, timeout=20, allow_redirects=True)
-    if "login.php" in response.url.lower() or "login :: damn vulnerable" in response.text.lower():
-        raise RuntimeError("Automatic DVWA login failed.")
-    session.cookies.set("security", "low", path="/")
-    cookie = canonical_cookie_header(
-        "; ".join(
-            f"{name}={value}"
-            for name, value in session.cookies.get_dict().items()
+class _HiddenInputParser(HTMLParser):
+    """Collect input values without depending on HTML attribute ordering."""
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.values: dict[str, str] = {}
+
+    def handle_starttag(
+        self,
+        tag: str,
+        attrs: list[tuple[str, str | None]],
+    ) -> None:
+        if tag.lower() != "input":
+            return
+        attributes = {
+            str(name).lower(): "" if value is None else str(value)
+            for name, value in attrs
+        }
+        name = attributes.get("name", "")
+        if name:
+            self.values[name] = attributes.get("value", "")
+
+
+def _hidden_input(html_text: str, name: str) -> str:
+    parser = _HiddenInputParser()
+    try:
+        parser.feed(str(html_text or ""))
+    except Exception:
+        return ""
+    return str(parser.values.get(name, "")).strip()
+
+
+def _dvwa_login_page(response: requests.Response) -> bool:
+    text = response.text[:100_000].lower()
+    path = urlparse(str(response.url)).path.lower()
+    return (
+        path.endswith("/login")
+        or path.endswith("/login.php")
+        or "login :: damn vulnerable web application" in text
+        or (
+            ("name=\"username\"" in text or "name='username'" in text)
+            and ("name=\"password\"" in text or "name='password'" in text)
         )
     )
-    names = {name.lower() for name in cookie_names(cookie)}
-    if "phpsessid" not in names:
-        raise RuntimeError("DVWA did not issue PHPSESSID.")
-    if "security" not in names:
-        raise RuntimeError("DVWA security cookie was not created.")
 
-    verification = requests.get(
-        f"{TARGET}/security.php",
-        headers={"Cookie": cookie},
+
+def _dvwa_setup_page(response: requests.Response) -> bool:
+    path = urlparse(str(response.url)).path.lower()
+    text = response.text[:100_000].lower()
+    return (
+        path.endswith("/setup.php")
+        or "create / reset database" in text
+        or "setup check" in text
+    )
+
+
+def _dvwa_response_summary(
+    response: requests.Response,
+) -> dict[str, Any]:
+    text = response.text[:100_000]
+    lowered = text.lower()
+    title_match = re.search(
+        r"<title[^>]*>\s*(.*?)\s*</title>",
+        text,
+        re.I | re.S,
+    )
+    error_markers = (
+        "database error",
+        "could not connect",
+        "access denied",
+        "connection refused",
+        "unknown database",
+        "fatal error",
+        "warning:",
+        "failed",
+    )
+    return {
+        "status": int(response.status_code),
+        "final_url": str(response.url),
+        "login_page": _dvwa_login_page(response),
+        "setup_page": _dvwa_setup_page(response),
+        "title": (
+            re.sub(r"\s+", " ", title_match.group(1)).strip()
+            if title_match
+            else ""
+        ),
+        "body_bytes": len(response.content),
+        "error_markers": [
+            marker for marker in error_markers if marker in lowered
+        ],
+    }
+
+
+def _dvwa_cookie_value(
+    session: requests.Session,
+    cookie_name: str,
+) -> str:
+    selected = ""
+    for cookie in session.cookies:
+        if str(cookie.name).lower() == cookie_name.lower():
+            selected = str(cookie.value)
+    return selected
+
+
+def _remove_named_cookies(
+    session: requests.Session,
+    cookie_name: str,
+) -> None:
+    removals: list[tuple[str, str, str]] = []
+    for cookie in session.cookies:
+        if str(cookie.name).lower() == cookie_name.lower():
+            removals.append(
+                (
+                    str(cookie.domain or ""),
+                    str(cookie.path or "/"),
+                    str(cookie.name),
+                )
+            )
+    for domain, path, name in removals:
+        try:
+            session.cookies.clear(
+                domain=domain,
+                path=path,
+                name=name,
+            )
+        except (KeyError, ValueError):
+            pass
+
+
+def _attempt_dvwa_login(
+    session: requests.Session,
+    username: str,
+    password: str,
+) -> tuple[bool, dict[str, Any]]:
+    page = session.get(
+        f"{TARGET}/login.php",
         timeout=15,
         allow_redirects=True,
+        headers={"Cache-Control": "no-cache"},
     )
-    body = verification.text.lower()
-    if (
-        "login.php" in verification.url.lower()
-        or "type=\"password\"" in body
-        or "login :: damn vulnerable" in body
-    ):
-        raise RuntimeError("DVWA cookie verification failed: the session is not authenticated.")
-    return cookie
+    page.raise_for_status()
+    token = _hidden_input(page.text, "user_token")
+    credentials = {
+        "username": username,
+        "password": password,
+        "Login": "Login",
+    }
+    if token:
+        credentials["user_token"] = token
+
+    response = session.post(
+        f"{TARGET}/login.php",
+        data=credentials,
+        timeout=20,
+        allow_redirects=True,
+        headers={
+            "Referer": f"{TARGET}/login.php",
+            "Cache-Control": "no-cache",
+        },
+    )
+    response.raise_for_status()
+    final_path = urlparse(str(response.url)).path.lower()
+    successful = (
+        not _dvwa_login_page(response)
+        and not _dvwa_setup_page(response)
+        and final_path not in {"/login.php", "/setup.php"}
+    )
+    return successful, {
+        "login_page": _dvwa_response_summary(page),
+        "login_response": _dvwa_response_summary(response),
+        "login_token_present": bool(token),
+        "cookie_names": sorted(
+            {str(cookie.name) for cookie in session.cookies},
+            key=str.lower,
+        ),
+    }
+
+
+def _reset_dvwa_database(
+    session: requests.Session,
+) -> dict[str, Any]:
+    setup_page = session.get(
+        f"{TARGET}/setup.php",
+        timeout=20,
+        allow_redirects=True,
+        headers={"Cache-Control": "no-cache"},
+    )
+    setup_page.raise_for_status()
+    token = _hidden_input(setup_page.text, "user_token")
+    payload = {
+        "create_db": "Create / Reset Database",
+    }
+    if token:
+        payload["user_token"] = token
+
+    setup_response = session.post(
+        f"{TARGET}/setup.php",
+        data=payload,
+        timeout=45,
+        allow_redirects=True,
+        headers={
+            "Referer": f"{TARGET}/setup.php",
+            "Cache-Control": "no-cache",
+        },
+    )
+    setup_response.raise_for_status()
+    summary = {
+        "setup_page": _dvwa_response_summary(setup_page),
+        "setup_response": _dvwa_response_summary(setup_response),
+        "setup_token_present": bool(token),
+    }
+
+    for _ in range(20):
+        try:
+            probe = session.get(
+                f"{TARGET}/login.php",
+                timeout=8,
+                allow_redirects=True,
+                headers={"Cache-Control": "no-cache"},
+            )
+            if probe.status_code < 500:
+                summary["post_setup_probe"] = _dvwa_response_summary(
+                    probe
+                )
+                break
+        except requests.RequestException:
+            pass
+        time.sleep(0.5)
+
+    return summary
+
+
+def _finalize_dvwa_cookie(
+    session: requests.Session,
+) -> tuple[str, dict[str, Any]]:
+    php_session = _dvwa_cookie_value(session, "PHPSESSID")
+    if not php_session:
+        raise RuntimeError("DVWA did not issue PHPSESSID after login.")
+
+    _remove_named_cookies(session, "security")
+    session.cookies.set(
+        "security",
+        "low",
+        domain=urlparse(TARGET).hostname,
+        path="/",
+    )
+
+    verification = session.get(
+        f"{TARGET}/security.php",
+        timeout=15,
+        allow_redirects=True,
+        headers={"Cache-Control": "no-cache"},
+    )
+    verification.raise_for_status()
+    summary = _dvwa_response_summary(verification)
+    if _dvwa_login_page(verification) or _dvwa_setup_page(verification):
+        raise RuntimeError(
+            "DVWA cookie verification failed after login: "
+            + json.dumps(summary, ensure_ascii=False)
+        )
+
+    cookie = canonical_cookie_header(
+        f"PHPSESSID={php_session}; security=low"
+    )
+    return cookie, summary
+
+
+def login_dvwa() -> str:
+    """
+    Try the existing database first, reset only when needed, then verify the
+    exact scanner Cookie header.
+    """
+    if not wait_http(f"{TARGET}/login.php", 90):
+        raise RuntimeError("DVWA is not reachable.")
+
+    session = requests.Session()
+    session.headers.update({
+        "User-Agent": "SecOpsAgent-DVWA-Initializer/4.0",
+        "Accept": "text/html,application/xhtml+xml,*/*;q=0.8",
+    })
+    diagnostics: dict[str, Any] = {
+        "target": TARGET,
+        "attempts": [],
+    }
+
+    try:
+        success_now, first_attempt = _attempt_dvwa_login(
+            session,
+            "admin",
+            "password",
+        )
+        diagnostics["attempts"].append({
+            "phase": "existing_database",
+            **first_attempt,
+        })
+        if success_now:
+            cookie, verification = _finalize_dvwa_cookie(session)
+            diagnostics["verification"] = verification
+            print(
+                "[+] DVWA automatic login succeeded using the existing database."
+            )
+            return cookie
+    except requests.RequestException as exc:
+        diagnostics["attempts"].append({
+            "phase": "existing_database",
+            "request_error": f"{type(exc).__name__}: {exc}",
+        })
+
+    session.cookies.clear()
+
+    try:
+        diagnostics["database_reset"] = _reset_dvwa_database(
+            session
+        )
+    except requests.RequestException as exc:
+        diagnostics["database_reset"] = {
+            "request_error": f"{type(exc).__name__}: {exc}",
+        }
+        raise RuntimeError(
+            "DVWA database setup request failed. Diagnostics: "
+            + json.dumps(diagnostics, ensure_ascii=False)
+        ) from exc
+
+    for attempt_number in range(1, 6):
+        try:
+            success_now, attempt = _attempt_dvwa_login(
+                session,
+                "admin",
+                "password",
+            )
+            diagnostics["attempts"].append({
+                "phase": "after_database_reset",
+                "attempt": attempt_number,
+                **attempt,
+            })
+            if success_now:
+                cookie, verification = _finalize_dvwa_cookie(
+                    session
+                )
+                diagnostics["verification"] = verification
+                print(
+                    "[+] DVWA database initialized and automatic login succeeded."
+                )
+                return cookie
+        except requests.RequestException as exc:
+            diagnostics["attempts"].append({
+                "phase": "after_database_reset",
+                "attempt": attempt_number,
+                "request_error": f"{type(exc).__name__}: {exc}",
+            })
+        time.sleep(attempt_number)
+
+    try:
+        logs = run(
+            ["docker", "logs", "--tail", "80", "dvwa"],
+            required=False,
+            capture=True,
+            show_output=False,
+            timeout=30,
+        )
+        diagnostics["docker_log_tail"] = "\n".join(
+            value
+            for value in (
+                (logs.stdout or "").strip(),
+                (logs.stderr or "").strip(),
+            )
+            if value
+        )[-6000:]
+    except Exception as exc:
+        diagnostics["docker_log_error"] = (
+            f"{type(exc).__name__}: {exc}"
+        )
+
+    raise RuntimeError(
+        "Automatic DVWA login failed after an existing-database attempt "
+        "and five post-reset retries. Redacted diagnostics: "
+        + json.dumps(diagnostics, ensure_ascii=False)
+    )
 
 
 
