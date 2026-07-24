@@ -6,12 +6,15 @@ import json
 import os
 import re
 import shutil
+import socket
 import subprocess
 import tempfile
 import time
 from pathlib import Path
 from typing import Any
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlparse, urlunparse
+
+import requests
 
 from fastmcp import FastMCP
 
@@ -276,8 +279,7 @@ def _fatal_runtime_error(log_text: str) -> str:
     return ""
 
 
-@mcp.tool()
-def run_nikto_scan(
+def _run_native_nikto_scan(
     target_url: str,
     cookies: str = "",
     timeout: int = 180,
@@ -453,6 +455,331 @@ def run_nikto_scan(
             f"Nikto completed through direct Perl execution. Findings: {len(findings)}.",
             **common,
         )
+
+
+NIKTO_DOCKER_IMAGE = "ghcr.io/sullo/nikto:latest"
+
+
+def _target_host_port(target_url: str) -> tuple[str, int]:
+    parsed = urlparse(target_url)
+    port = parsed.port or (443 if parsed.scheme == "https" else 80)
+    return parsed.hostname or "", port
+
+
+def _python_connectivity_probe(target_url: str) -> dict[str, Any]:
+    host, port = _target_host_port(target_url)
+    result: dict[str, Any] = {
+        "host": host,
+        "port": port,
+        "tcp_connected": False,
+        "http_reachable": False,
+    }
+    try:
+        with socket.create_connection((host, port), timeout=5):
+            result["tcp_connected"] = True
+    except OSError as exc:
+        result["tcp_error"] = f"{type(exc).__name__}: {exc}"
+        return result
+    try:
+        response = requests.get(
+            target_url,
+            timeout=(4, 10),
+            allow_redirects=True,
+        )
+        result.update({
+            "http_reachable": response.status_code < 500,
+            "http_status": response.status_code,
+            "final_url": str(response.url),
+        })
+    except requests.RequestException as exc:
+        result["http_error"] = f"{type(exc).__name__}: {exc}"
+    return result
+
+
+def _perl_connectivity_probe(perl: Path, target_url: str) -> dict[str, Any]:
+    host, port = _target_host_port(target_url)
+    code = (
+        "use IO::Socket::INET;"
+        f"my $s=IO::Socket::INET->new(PeerAddr=>q{{{host}}},"
+        f"PeerPort=>{port},Proto=>q{{tcp}},Timeout=>5);"
+        "if($s){print q{connected};close($s);exit 0;}"
+        "print(($@||$!||q{unknown socket error}));exit 2;"
+    )
+    try:
+        completed = subprocess.run(
+            [str(perl), "-e", code],
+            cwd=str(perl.parent),
+            env=_process_environment(perl),
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=15,
+            shell=False,
+        )
+    except Exception as exc:
+        return {
+            "connected": False,
+            "error": f"{type(exc).__name__}: {exc}",
+        }
+    return {
+        "connected": completed.returncode == 0,
+        "return_code": completed.returncode,
+        "stdout": (completed.stdout or "").strip(),
+        "stderr": (completed.stderr or "").strip(),
+    }
+
+
+def _docker_command_available() -> bool:
+    return bool(shutil.which("docker"))
+
+
+def _docker_lab_available() -> bool:
+    if not _docker_command_available():
+        return False
+    completed = subprocess.run(
+        ["docker", "inspect", "dvwa"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        check=False,
+        timeout=20,
+    )
+    return completed.returncode == 0
+
+
+def _docker_target(target_url: str) -> tuple[str, list[str], str]:
+    parsed = urlparse(target_url)
+    hostname = (parsed.hostname or "").lower()
+    docker_args: list[str] = []
+    mode = "same_target"
+
+    if hostname in {"127.0.0.1", "localhost", "::1"}:
+        if _docker_lab_available():
+            docker_args.extend(["--network", "secops-net"])
+            netloc = "dvwa"
+            if parsed.port and parsed.port not in {80, 443}:
+                netloc = f"dvwa:{parsed.port}"
+            mode = "secops_network_dvwa"
+        else:
+            netloc = "host.docker.internal"
+            if parsed.port:
+                netloc += f":{parsed.port}"
+            docker_args.extend([
+                "--add-host",
+                "host.docker.internal:host-gateway",
+            ])
+            mode = "docker_desktop_host_gateway"
+        target = urlunparse(
+            parsed._replace(netloc=netloc)
+        )
+        return target, docker_args, mode
+
+    return target_url, docker_args, mode
+
+
+def _run_docker_nikto(
+    target_url: str,
+    cookies: str,
+    timeout: int,
+    connectivity: dict[str, Any],
+) -> dict[str, Any]:
+    if not _docker_command_available():
+        return failure(
+            "Nikto",
+            target_url,
+            "Native Nikto could not connect and Docker is unavailable for the fallback.",
+            diagnosis="nikto_native_and_docker_unavailable",
+            connectivity_diagnostics=connectivity,
+        )
+
+    docker_target, network_args, mapping_mode = _docker_target(target_url)
+    started = time.monotonic()
+    with tempfile.TemporaryDirectory(prefix="nikto-docker-") as temporary_directory:
+        temp = Path(temporary_directory).resolve()
+        output_file = temp / "nikto.csv"
+        mount = f"{temp}:/tmp/secops-output"
+        nikto_limit = max(30, timeout - 25)
+        command = [
+            "docker", "run", "--rm",
+            *network_args,
+            "-v", mount,
+            NIKTO_DOCKER_IMAGE,
+            "-h", docker_target,
+            "-nointeractive",
+            "-nolookup",
+            "-nocookies",
+            "-timeout", "5",
+            "-maxtime", f"{nikto_limit}s",
+            "-Format", "csv",
+            "-output", "/tmp/secops-output/nikto.csv",
+        ]
+        if cookies:
+            command.extend(["-header", f"Cookie: {cookies}"])
+
+        try:
+            completed = subprocess.run(
+                command,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=timeout,
+                shell=False,
+            )
+            timed_out = False
+        except subprocess.TimeoutExpired as exc:
+            completed = None
+            timed_out = True
+            stdout = (
+                exc.stdout.decode("utf-8", "replace")
+                if isinstance(exc.stdout, bytes)
+                else (exc.stdout or "")
+            )
+            stderr = (
+                exc.stderr.decode("utf-8", "replace")
+                if isinstance(exc.stderr, bytes)
+                else (exc.stderr or "")
+            )
+        else:
+            stdout = completed.stdout or ""
+            stderr = completed.stderr or ""
+
+        log_text = "\n".join(part for part in (stdout, stderr) if part)
+        findings = _parse_csv(output_file, target_url)
+        duration = round(time.monotonic() - started, 3)
+        connection_failure = _connection_runtime_error(log_text, output_file)
+        common = {
+            "vulnerabilities": findings,
+            "duration_seconds": duration,
+            "authenticated": bool(cookies),
+            "execution_mode": "official_docker_image",
+            "docker_image": NIKTO_DOCKER_IMAGE,
+            "docker_target": docker_target,
+            "docker_target_mapping": mapping_mode,
+            "connectivity_diagnostics": connectivity,
+            "scanner_log": log_text[-8000:],
+            "command": command,
+        }
+
+        if timed_out:
+            return partial(
+                "Nikto",
+                target_url,
+                f"Containerized Nikto reached its configured budget. Findings preserved: {len(findings)}.",
+                diagnosis="time_limit_reached",
+                timed_out=True,
+                time_limit_reached=True,
+                **common,
+            )
+
+        if connection_failure and not findings:
+            result = failure(
+                "Nikto",
+                target_url,
+                f"Containerized Nikto could not reach its translated target: {connection_failure}",
+                return_code=completed.returncode if completed else None,
+                stdout=log_text,
+                diagnosis="nikto_docker_target_unreachable",
+            )
+            result.update(common)
+            return result
+
+        if completed and completed.returncode not in (0, 1):
+            result = failure(
+                "Nikto",
+                target_url,
+                f"Containerized Nikto exited with code {completed.returncode}.",
+                return_code=completed.returncode,
+                stdout=stdout,
+                stderr=stderr,
+                diagnosis="nikto_docker_exit",
+            )
+            result.update(common)
+            return result
+
+        return success(
+            "Nikto",
+            target_url,
+            f"Containerized Nikto completed. Findings: {len(findings)}.",
+            **common,
+        )
+
+
+@mcp.tool()
+def run_nikto_scan(
+    target_url: str,
+    cookies: str = "",
+    timeout: int = 180,
+) -> dict:
+    """
+    Prefer the native Perl runtime when its socket layer works. On Windows
+    loopback targets, automatically use the official Nikto Docker image when
+    Python can reach the server but Strawberry Perl/LibWhisker cannot.
+    """
+    timeout = max(60, min(int(timeout), 600))
+    perl = _find_perl()
+    connectivity = {
+        "python": _python_connectivity_probe(target_url),
+        "perl": {},
+    }
+
+    if not connectivity["python"].get("tcp_connected"):
+        return failure(
+            "Nikto",
+            target_url,
+            "The target TCP port is not reachable from Python; Nikto was not started.",
+            diagnosis="target_tcp_unreachable",
+            connectivity_diagnostics=connectivity,
+        )
+
+    if perl is not None:
+        connectivity["perl"] = _perl_connectivity_probe(perl, target_url)
+
+    host, _ = _target_host_port(target_url)
+    loopback = host.lower() in {"127.0.0.1", "localhost", "::1"}
+
+    # This is the exact failure observed on Windows: the target is reachable by
+    # Python/curl, but Strawberry Perl cannot create the TCP socket.
+    if (
+        os.name == "nt"
+        and loopback
+        and not connectivity["perl"].get("connected")
+        and _docker_command_available()
+    ):
+        return _run_docker_nikto(
+            target_url,
+            cookies,
+            timeout,
+            connectivity,
+        )
+
+    native = _run_native_nikto_scan(
+        target_url,
+        cookies,
+        timeout,
+    )
+    native["connectivity_diagnostics"] = connectivity
+
+    if (
+        native.get("diagnosis") == "nikto_target_unreachable"
+        and connectivity["python"].get("tcp_connected")
+        and _docker_command_available()
+    ):
+        docker = _run_docker_nikto(
+            target_url,
+            cookies,
+            timeout,
+            connectivity,
+        )
+        docker.setdefault("native_failure", {
+            "status": native.get("status"),
+            "diagnosis": native.get("diagnosis"),
+            "output": native.get("output"),
+        })
+        return docker
+
+    return native
+
 
 
 def _once() -> int:

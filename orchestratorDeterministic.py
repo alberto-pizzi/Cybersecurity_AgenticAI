@@ -733,6 +733,57 @@ def _crawlable_url(url: str) -> bool:
     ))
 
 
+DESTRUCTIVE_CRAWL_TOKENS = (
+    "logout",
+    "signout",
+    "logoff",
+    "setup",
+    "install",
+    "reset",
+    "create_db",
+    "create-database",
+    "createdb",
+    "drop_db",
+    "drop-database",
+)
+
+
+def _destructive_crawl_url(url: str) -> bool:
+    parsed = urlparse(str(url or ""))
+    text = f"{parsed.path}?{parsed.query}".lower()
+    return any(token in text for token in DESTRUCTIVE_CRAWL_TOKENS)
+
+
+def _stable_auth_probe_url(target: str, discovered_urls: list[str]) -> str:
+    candidates = [
+        value
+        for value in discovered_urls
+        if same_origin(target, value)
+        and not _destructive_crawl_url(value)
+        and not _looks_like_login_path(value)
+    ]
+    candidates.append(_clean_url(target))
+
+    def score(value: str) -> int:
+        path = urlparse(value).path.lower()
+        if path.endswith("/security.php"):
+            return 500
+        if path.endswith("/index.php"):
+            return 400
+        if path in {"", "/"}:
+            return 300
+        if "/vulnerabilities/" in path:
+            return 100
+        return 200
+
+    return max(dict.fromkeys(candidates), key=score)
+
+
+def _looks_like_login_path(url: str) -> bool:
+    path = urlparse(str(url or "")).path.lower()
+    return path.endswith("/login") or path.endswith("/login.php")
+
+
 def _looks_like_login(response: requests.Response) -> bool:
     text = response.text[:100_000].lower()
     path = urlparse(response.url).path.lower()
@@ -807,7 +858,15 @@ def discover_target(
         session.headers["Cookie"] = cookies
 
     initial = [_clean_url(target), *[_clean_url(value) for value in (seeds or [])]]
-    queue = list(dict.fromkeys(value for value in initial if same_origin(target, value) and _crawlable_url(value)))
+    destructive_skipped: set[str] = set()
+    queue: list[str] = []
+    for value in dict.fromkeys(initial):
+        if not same_origin(target, value) or not _crawlable_url(value):
+            continue
+        if _destructive_crawl_url(value):
+            destructive_skipped.add(value)
+            continue
+        queue.append(value)
     visited: set[str] = set()
     html_urls: set[str] = set()
     form_urls: set[str] = set()
@@ -820,6 +879,9 @@ def discover_target(
     while queue and len(visited) < max_pages:
         requested = queue.pop(0)
         if requested in visited:
+            continue
+        if _destructive_crawl_url(requested):
+            destructive_skipped.add(requested)
             continue
         visited.add(requested)
         try:
@@ -859,6 +921,9 @@ def discover_target(
                 continue
             if not same_origin(target, candidate) or not _crawlable_url(candidate):
                 continue
+            if _destructive_crawl_url(candidate):
+                destructive_skipped.add(candidate)
+                continue
             if urlparse(candidate).query:
                 parameterized.add(candidate)
             if candidate not in visited and candidate not in queue:
@@ -871,6 +936,9 @@ def discover_target(
                 continue
             if not same_origin(target, action):
                 continue
+            if _destructive_crawl_url(action):
+                destructive_skipped.add(action)
+                continue
             fields = [field for field in form.get("fields", []) if isinstance(field, dict)]
             if fields:
                 form_urls.add(final)
@@ -882,12 +950,39 @@ def discover_target(
 
     auth_effective: bool | None = None
     auth_note = "Anonymous profile."
+    auth_probe: dict[str, Any] = {}
     if cookies:
-        auth_effective = not initial_login_detected
+        probe_url = _stable_auth_probe_url(target, sorted(html_urls))
+        try:
+            probe_response = session.get(
+                probe_url,
+                timeout=(5, 15),
+                allow_redirects=True,
+                headers={"Cache-Control": "no-cache"},
+            )
+            final_login_detected = _looks_like_login(probe_response)
+            auth_effective = (
+                not initial_login_detected
+                and not final_login_detected
+                and probe_response.status_code < 400
+            )
+            auth_probe = {
+                "url": probe_url,
+                "status": probe_response.status_code,
+                "final_url": str(probe_response.url),
+                "login_detected": final_login_detected,
+            }
+        except requests.RequestException as exc:
+            auth_effective = False
+            auth_probe = {
+                "url": probe_url,
+                "error": f"{type(exc).__name__}: {exc}",
+            }
+
         auth_note = (
-            "The supplied cookie reached a non-login landing page."
+            "The supplied cookie remained authenticated after safe discovery."
             if auth_effective else
-            "The supplied cookie was redirected to or rendered a login page; authenticated coverage is probably ineffective or expired."
+            "The supplied cookie was not authenticated after discovery; authenticated coverage is ineffective or expired."
         )
     return {
         "urls": sorted(visited),
@@ -899,6 +994,8 @@ def discover_target(
         "errors": errors,
         "authentication_effective": auth_effective,
         "authentication_note": auth_note,
+        "authentication_probe": auth_probe,
+        "destructive_urls_skipped": sorted(destructive_skipped),
     }
 
 
@@ -908,6 +1005,12 @@ def merge_discovery(left: dict[str, Any], right: dict[str, Any]) -> dict[str, An
         merged[key] = sorted(set(left.get(key, [])) | set(right.get(key, [])))
     merged["request_cases"] = _dedupe_request_cases([*left.get("request_cases", []), *right.get("request_cases", [])])
     merged["errors"] = [*left.get("errors", []), *right.get("errors", [])]
+    merged["destructive_urls_skipped"] = sorted(
+        set(left.get("destructive_urls_skipped", []))
+        | set(right.get("destructive_urls_skipped", []))
+    )
+    if right.get("authentication_probe"):
+        merged["authentication_probe"] = right.get("authentication_probe")
     if right.get("authentication_effective") is not None:
         merged["authentication_effective"] = right.get("authentication_effective")
         merged["authentication_note"] = right.get("authentication_note")
@@ -1156,7 +1259,10 @@ def select_arjun_candidates(discovery: dict[str, Any], target: str, limit: int =
         if path.endswith("/security.php"):
             score += 5 if has_form or has_existing_parameters else -3
         if path.endswith("/login.php") or path.endswith("/login"):
-            score += 2 if has_form or has_existing_parameters else -7
+            # Login forms are already covered by discovery and SQLMap. Hidden
+            # parameter mining here consumed the full Arjun budget with very
+            # little security value.
+            score -= 100
         if "setup" in path:
             score += 1 if has_form or has_existing_parameters else -9
         if directory_utility:
@@ -1261,6 +1367,18 @@ def log_zap_session_diagnostics(result: dict[str, Any]) -> None:
         else {}
     )
     if not before:
+        return
+
+    if before.get("anonymous_profile"):
+        if "targeted_active_scans_started" in result:
+            print(
+                "    [ZAP COVERAGE] "
+                f"seeded URLs={result.get('seeded_urls', 0)}; "
+                f"seeded requests={result.get('seeded_request_cases', 0)}; "
+                f"targeted active={result.get('targeted_active_scans_completed', 0)}/"
+                f"{result.get('targeted_active_scans_started', 0)}; "
+                f"site-tree URLs={result.get('zap_sites_tree_urls', 0)}"
+            )
         return
 
     print(
@@ -1399,6 +1517,38 @@ def write_emergency_json_report(target: str, results: dict[str, Any], diagnostic
         return None
 
 
+def select_session_probe_url(discovery: dict[str, Any], target: str) -> str:
+    """Choose a stable non-destructive page for session checks."""
+    candidates = [
+        str(value)
+        for value in discovery.get("html_urls", [])
+        if isinstance(value, str)
+        and same_origin(target, value)
+        and not _is_auto_index_url(value)
+    ]
+    candidates.append(target)
+
+    def score(url: str) -> int:
+        path = urlparse(url).path.lower()
+        if any(token in path for token in ("logout", "setup", "install", "reset")):
+            return -1000
+        if path.endswith("/security.php"):
+            return 500
+        if path.endswith("/index.php"):
+            return 400
+        if path == "/" or not path:
+            return 350
+        if path.endswith("/login.php") or path.endswith("/login"):
+            return -500
+        if "/vulnerabilities/" in path:
+            return 100
+        return 200
+
+    valid = [value for value in dict.fromkeys(candidates) if score(value) > 0]
+    return max(valid, key=score) if valid else target
+
+
+
 # ---------------------------------------------------------------------------
 # Deterministic pipeline
 # ---------------------------------------------------------------------------
@@ -1429,22 +1579,73 @@ async def run_pipeline(target: str, profiles: list[dict[str, str]], injection_ur
             print(f"    [WARNING] {name}: {found.get('authentication_note')}", file=sys.stderr)
 
     # Broad scanners. Arjun is intentionally delayed until crawling and FFUF have produced useful endpoints.
+    profile_session_state: dict[str, bool] = {
+        profile["name"]: discovery[profile["name"]].get("authentication_effective") is not False
+        for profile in profiles
+    }
     for profile in profiles:
         name, cookies = profile["name"], profile["cookies"]
         print(f"\n[*] Scanner generali - profilo: {name}")
-        broad_order = ("ffuf", "zap", "nuclei", "nikto")
+        # Authenticated ZAP runs before authenticated FFUF. Earlier releases
+        # allowed FFUF to request logout.php with the live PHPSESSID, which
+        # invalidated the session before ZAP's precheck.
+        broad_order = (
+            ("zap", "ffuf", "nuclei", "nikto")
+            if cookies
+            else ("ffuf", "zap", "nuclei", "nikto")
+        )
         broad_specs = {
             spec.name: spec
             for spec in BASE_TOOLS
         }
+
+        # Reuse anonymous FFUF discoveries as authenticated ZAP seeds without
+        # sending the authenticated cookie through the dangerous FFUF list.
+        if cookies and "anonymous" in results:
+            anonymous_ffuf = results.get("anonymous", {}).get("ffuf", {})
+            if isinstance(anonymous_ffuf, dict):
+                _, anonymous_urls = enrich_discovery_with_ffuf(
+                    discovery[name], anonymous_ffuf, target
+                )
+                if anonymous_urls:
+                    authenticated_recrawl = discover_target(
+                        target, cookies, seeds=anonymous_urls
+                    )
+                    discovery[name] = merge_discovery(
+                        discovery[name], authenticated_recrawl
+                    )
+                    diagnostics.extend(
+                        {
+                            "phase": "anonymous_ffuf_authenticated_recrawl",
+                            "profile": name,
+                            **item,
+                        }
+                        for item in authenticated_recrawl["errors"]
+                    )
+
+        profile_session_valid = discovery[name].get("authentication_effective") is not False
+        session_probe_url = select_session_probe_url(discovery[name], target)
+
         for scanner_name in broad_order:
             spec = broad_specs[scanner_name]
             scanner_timeout = BROAD_SCANNER_TIMEOUTS.get(spec.name, 180)
+            if cookies and not profile_session_valid:
+                result = make_skipped_result(
+                    spec.name,
+                    target,
+                    "Authenticated session is no longer valid; this run was skipped to avoid reporting anonymous coverage as authenticated.",
+                )
+                results[name][spec.name] = result
+                log_result(name, spec.name, result, target)
+                continue
+
             arguments: dict[str, Any] = {
                 "target_url": target,
                 "cookies": cookies,
                 "timeout": scanner_timeout,
             }
+            if spec.name == "ffuf":
+                arguments["session_probe_url"] = session_probe_url
             if spec.name == "zap":
                 # ZAP's own spider previously started only from the root URL. Pass
                 # the already authenticated discovery surface so ZAP can import
@@ -1468,6 +1669,15 @@ async def run_pipeline(target: str, profiles: list[dict[str, str]], injection_ur
                         f"    [INFO   ] FFUF re-crawl: {len(discovery[name]['html_urls'])} HTML pages, "
                         f"{len(discovery[name]['request_cases'])} GET/POST cases"
                     )
+                    if cookies and recrawl.get("authentication_effective") is False:
+                        profile_session_valid = False
+                        print(
+                            "    [AUTH SESSION ROOT CAUSE] The authenticated session became invalid after FFUF. "
+                            "Remaining authenticated scanners will be skipped.",
+                            file=sys.stderr,
+                        )
+                if cookies and result.get("diagnosis") == "authentication_lost_during_ffuf":
+                    profile_session_valid = False
 
         candidates = select_arjun_candidates(discovery[name], target)
         arjun_runs: list[dict[str, Any]] = []
@@ -1482,6 +1692,7 @@ async def run_pipeline(target: str, profiles: list[dict[str, str]], injection_ur
                 log_result(name, "arjun", result, endpoint)
                 if result.get("status") in {"success", "partial"}:
                     discovery[name], _ = enrich_discovery_with_arjun(discovery[name], result, endpoint)
+        profile_session_state[name] = profile_session_valid
         results[name]["arjun"] = aggregate_runs("arjun", target, arjun_runs) if arjun_runs else make_skipped_result(
             "arjun", target, "No suitable HTML/form endpoint was available for hidden-parameter discovery."
         )
@@ -1527,6 +1738,15 @@ async def run_pipeline(target: str, profiles: list[dict[str, str]], injection_ur
         name, cookies = profile["name"], profile["cookies"]
         print(f"\n[*] Scanner su parametri - profilo: {name}")
         parameter_selection_summary[name] = {}
+        if cookies and not profile_session_state.get(name, True):
+            for spec in PARAMETER_TOOLS:
+                results[name][spec.name] = make_skipped_result(
+                    spec.name,
+                    target,
+                    "Authenticated session became invalid before parameter testing.",
+                )
+                log_result(name, spec.name, results[name][spec.name], target)
+            continue
         grouped = {spec.name: [] for spec in PARAMETER_TOOLS}
         tasks: list[tuple[ToolSpec, dict[str, Any], asyncio.Task[dict[str, Any]]]] = []
 

@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import re
+import shutil
+import subprocess
 import time
 from difflib import SequenceMatcher
 from typing import Any
-from urllib.parse import parse_qsl, urlparse
+from urllib.parse import parse_qsl, urlparse, urlunparse
 
 import requests
 from fastmcp import FastMCP
@@ -56,6 +59,126 @@ def risk_name(value: Any) -> str:
         "3": "high",
         "4": "critical",
     }.get(str(value), str(value or "info").lower())
+
+
+def _docker_networks(container: str) -> set[str]:
+    if not shutil.which("docker"):
+        return set()
+    try:
+        completed = subprocess.run(
+            [
+                "docker", "inspect",
+                "--format", "{{json .NetworkSettings.Networks}}",
+                container,
+            ],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=15,
+            check=False,
+        )
+        if completed.returncode:
+            return set()
+        value = json.loads((completed.stdout or "{}").strip() or "{}")
+        return set(value) if isinstance(value, dict) else set()
+    except (OSError, subprocess.SubprocessError, json.JSONDecodeError):
+        return set()
+
+
+def _zap_reachable_target(target_url: str) -> tuple[str, dict[str, Any]]:
+    """
+    Convert a Windows-host loopback URL into a hostname reachable from the ZAP
+    Docker container. The project initializer places zap_mcp and dvwa on
+    secops-net, where the DVWA service name is `dvwa`.
+    """
+    parsed = urlparse(target_url)
+    hostname = (parsed.hostname or "").lower()
+    details: dict[str, Any] = {
+        "external_target": target_url,
+        "translated": False,
+        "mode": "unchanged",
+    }
+    if hostname not in {"127.0.0.1", "localhost", "::1"}:
+        details["zap_target"] = target_url
+        return target_url, details
+
+    zap_networks = _docker_networks("zap_mcp")
+    dvwa_networks = _docker_networks("dvwa")
+    shared = sorted(zap_networks & dvwa_networks)
+    if shared:
+        internal_port = 443 if parsed.scheme == "https" else 80
+        netloc = "dvwa" if internal_port in {80, 443} else f"dvwa:{internal_port}"
+        translated = urlunparse(parsed._replace(netloc=netloc))
+        details.update({
+            "translated": True,
+            "mode": "shared_docker_network",
+            "shared_networks": shared,
+            "zap_target": translated,
+            "container_alias": "dvwa",
+        })
+        return translated, details
+
+    # Docker Desktop normally provides this hostname even without an explicit
+    # shared user-defined network.
+    port = parsed.port
+    netloc = "host.docker.internal"
+    if port:
+        netloc += f":{port}"
+    translated = urlunparse(parsed._replace(netloc=netloc))
+    details.update({
+        "translated": True,
+        "mode": "docker_desktop_host_gateway",
+        "zap_target": translated,
+        "container_alias": "host.docker.internal",
+        "shared_networks": shared,
+    })
+    return translated, details
+
+
+def _translate_url(
+    value: str,
+    external_base: str,
+    zap_base: str,
+) -> str:
+    parsed = urlparse(str(value or ""))
+    external = urlparse(external_base)
+    internal = urlparse(zap_base)
+    if (
+        parsed.scheme.lower() == external.scheme.lower()
+        and parsed.hostname == external.hostname
+        and parsed.port == external.port
+    ):
+        return urlunparse(
+            parsed._replace(
+                scheme=internal.scheme,
+                netloc=internal.netloc,
+            )
+        )
+    return value
+
+
+def _externalize_url(
+    value: str,
+    zap_base: str,
+    external_base: str,
+) -> str:
+    parsed = urlparse(str(value or ""))
+    internal = urlparse(zap_base)
+    external = urlparse(external_base)
+    if (
+        parsed.scheme.lower() == internal.scheme.lower()
+        and parsed.hostname == internal.hostname
+        and parsed.port == internal.port
+    ):
+        return urlunparse(
+            parsed._replace(
+                scheme=external.scheme,
+                netloc=external.netloc,
+            )
+        )
+    return value
+
 
 
 def _valid_http_url(value: str) -> bool:
@@ -202,12 +325,16 @@ def _probe_score(url: str) -> int:
     if not _safe_path(url) or path.endswith("/login.php") or path.endswith("/login"):
         return -1000
     score = 0
+    # Stable session/account pages are better authentication probes than
+    # vulnerability demonstrations whose dynamic content can change.
+    if path.endswith("/security.php"):
+        score += 400
+    if path.endswith("/index.php"):
+        score += 300
+    if path == "/":
+        score += 250
     if "/vulnerabilities/" in path:
         score += 100
-    if path.endswith("/security.php"):
-        score += 90
-    if path.endswith("/index.php") or path == "/":
-        score += 30
     if any(word in path for word in HIGH_VALUE_PATH_WORDS):
         score += 35
     if urlparse(url).query:
@@ -435,15 +562,25 @@ def _configure_context(
 def _validate_session(
     zap: ZAPv2,
     target_url: str,
+    zap_target_url: str,
     zap_url: str,
     cookie_header: str,
     cookie_pairs: list[tuple[str, str]],
     probe_url: str,
 ) -> dict[str, Any]:
     try:
+        zap_probe_url = _translate_url(
+            probe_url,
+            target_url,
+            zap_target_url,
+        )
         anonymous = _request(probe_url, "")
         direct = _request(probe_url, cookie_header)
-        proxied = _request(probe_url, cookie_header, zap_url=zap_url)
+        proxied = _request(
+            zap_probe_url,
+            cookie_header,
+            zap_url=zap_url,
+        )
     except requests.RequestException as exc:
         return {
             "effective": False,
@@ -460,7 +597,7 @@ def _validate_session(
     proxy_text = proxied.text[:100_000]
     similarity = SequenceMatcher(None, direct_text, proxy_text).ratio()
 
-    history = _history_cookie_diagnostics(zap, probe_url, cookie_pairs)
+    history = _history_cookie_diagnostics(zap, zap_probe_url, cookie_pairs)
     names_lower = {name.lower() for name, _ in cookie_pairs}
     dvwa_detected = any(
         summary.get("dvwa_detected")
@@ -472,20 +609,24 @@ def _validate_session(
         else True
     )
 
-    direct_effective = (
-        direct.status_code < 400
-        and not direct_summary["login_detected"]
-        and _same_origin(target_url, direct.url)
-    )
-    proxy_effective = (
-        proxied.status_code < 400
-        and not proxy_summary["login_detected"]
-        and _same_origin(target_url, proxied.url)
-    )
+    # Calculate the anonymous/authenticated difference before it is used by
+    # direct_effective. v17 evaluated direct_effective first, causing an
+    # UnboundLocalError during every authenticated ZAP precheck.
     distinguished_from_anonymous = (
         anonymous_summary["login_detected"]
         or anonymous_summary["final_url"] != direct_summary["final_url"]
         or anonymous_summary["sha256"] != direct_summary["sha256"]
+    )
+    direct_effective = (
+        direct.status_code < 400
+        and not direct_summary["login_detected"]
+        and _same_origin(target_url, direct.url)
+        and distinguished_from_anonymous
+    )
+    proxy_effective = (
+        proxied.status_code < 400
+        and not proxy_summary["login_detected"]
+        and urlparse(proxied.url).path == urlparse(direct.url).path
     )
     proxy_matches_direct = (
         direct.status_code == proxied.status_code
@@ -515,6 +656,8 @@ def _validate_session(
     )
 
     reasons: list[str] = []
+    if not distinguished_from_anonymous:
+        reasons.append("the selected page does not distinguish authenticated and anonymous responses")
     if not direct_effective:
         reasons.append("the supplied cookie is not authenticated when used directly")
     if not proxy_effective:
@@ -532,6 +675,7 @@ def _validate_session(
         "effective": effective,
         "root_cause": "; ".join(reasons) if reasons else "",
         "probe_url": probe_url,
+        "zap_probe_url": zap_probe_url,
         "cookie_names": sorted(name for name, _ in cookie_pairs),
         "cookie_pair_count": len(cookie_pairs),
         "dvwa_detected": dvwa_detected,
@@ -550,6 +694,7 @@ def _validate_session(
 def _seed_zap_history(
     zap_url: str,
     target_url: str,
+    zap_target_url: str,
     cookie_header: str,
     seed_urls: list[str],
     request_cases: list[dict[str, Any]],
@@ -574,7 +719,11 @@ def _seed_zap_history(
         if time.monotonic() >= deadline:
             break
         try:
-            _request(url, cookie_header, zap_url=zap_url)
+            _request(
+                _translate_url(url, target_url, zap_target_url),
+                cookie_header,
+                zap_url=zap_url,
+            )
             seeded_urls += 1
         except requests.RequestException as exc:
             errors.append({
@@ -600,7 +749,7 @@ def _seed_zap_history(
             continue
         try:
             _request(
-                url,
+                _translate_url(url, target_url, zap_target_url),
                 cookie_header,
                 zap_url=zap_url,
                 method=method,
@@ -685,6 +834,8 @@ def _targeted_cases(
 def _run_targeted_active_scans(
     zap: ZAPv2,
     cases: list[dict[str, Any]],
+    target_url: str,
+    zap_target_url: str,
     context_id: str,
     deadline: float,
 ) -> list[dict[str, Any]]:
@@ -699,7 +850,7 @@ def _run_targeted_active_scans(
         try:
             scan_id = _scan_id(
                 zap.ascan.scan(
-                    url=url,
+                    url=scan_url,
                     recurse=False,
                     method=method,
                     postdata=data if method == "POST" else None,
@@ -721,6 +872,7 @@ def _run_targeted_active_scans(
                     pass
             results.append({
                 "url": url,
+                "scan_url": scan_url,
                 "method": method,
                 "scan_id": scan_id,
                 "completed": completed,
@@ -730,6 +882,7 @@ def _run_targeted_active_scans(
         except Exception as exc:
             results.append({
                 "url": url,
+                "scan_url": scan_url,
                 "method": method,
                 "completed": False,
                 "progress": 0,
@@ -767,8 +920,8 @@ def _message_details(zap: ZAPv2, alert: dict[str, Any]) -> dict[str, str]:
     }
 
 
-def _findings(zap: ZAPv2, target_url: str) -> list[dict[str, Any]]:
-    alerts = zap.core.alerts(baseurl=target_url)
+def _findings(zap: ZAPv2, zap_target_url: str, target_url: str) -> list[dict[str, Any]]:
+    alerts = zap.core.alerts(baseurl=zap_target_url)
     if not isinstance(alerts, list):
         return []
 
@@ -779,7 +932,12 @@ def _findings(zap: ZAPv2, target_url: str) -> list[dict[str, Any]]:
             continue
         risk = risk_name(alert.get("riskcode"))
         plugin_id = str(alert.get("pluginId") or alert.get("pluginid") or "")
-        url = str(alert.get("url") or target_url)
+        scanner_url = str(alert.get("url") or zap_target_url)
+        url = _externalize_url(
+            scanner_url,
+            zap_target_url,
+            target_url,
+        )
         parameter = str(alert.get("param") or "")
         attack = str(alert.get("attack") or "")
         evidence_value = str(alert.get("evidence") or "")
@@ -836,6 +994,7 @@ def _findings(zap: ZAPv2, target_url: str) -> list[dict[str, Any]]:
             "other_information": str(alert.get("other") or "").strip(),
             "solution": str(alert.get("solution") or "").strip(),
             "url": url,
+            "scanner_url": scanner_url,
             "method": str(alert.get("method") or ""),
             "parameter": parameter,
             "attack": attack,
@@ -928,6 +1087,10 @@ def run_zap_scan(
             diagnosis="invalid_cookie_header",
         )
 
+    zap_target_url, target_mapping = _zap_reachable_target(
+        target_url
+    )
+
     started = time.monotonic()
     deadline = started + timeout
     zap: ZAPv2 | None = None
@@ -977,7 +1140,7 @@ def run_zap_scan(
                     "reason": f"{type(exc).__name__}: {exc}",
                 }
 
-        context = _configure_context(zap, target_url)
+        context = _configure_context(zap, zap_target_url)
         context_name = str(context.get("context_name") or "")
         context_id = str(context.get("context_id") or "")
 
@@ -1004,18 +1167,23 @@ def run_zap_scan(
         # First proxied request creates the ZAP HTTP Sessions site entry.
         if canonical_cookies:
             _request(
-                probe_url,
+                _translate_url(
+                    probe_url,
+                    target_url,
+                    zap_target_url,
+                ),
                 canonical_cookies,
                 zap_url=zap_url,
             )
         http_sessions = _configure_http_sessions(
             zap,
-            target_url,
+            zap_target_url,
             cookie_pairs,
         )
         pre_session = _validate_session(
             zap,
             target_url,
+            zap_target_url,
             zap_url,
             canonical_cookies,
             cookie_pairs,
@@ -1061,6 +1229,8 @@ def run_zap_scan(
                 duration_seconds=round(time.monotonic() - started, 3),
                 zap_version=zap_version,
                 python_zap_api_version=python_api_version,
+                zap_target_url=zap_target_url,
+                target_mapping=target_mapping,
             )
 
         if diagnostic_only:
@@ -1081,6 +1251,8 @@ def run_zap_scan(
                 zap_version=zap_version,
                 python_zap_api_version=python_api_version,
                 diagnostic_only=True,
+                zap_target_url=zap_target_url,
+                target_mapping=target_mapping,
             )
 
         phase = "authenticated_surface_seeding"
@@ -1091,6 +1263,7 @@ def run_zap_scan(
         seed_summary = _seed_zap_history(
             zap_url,
             target_url,
+            zap_target_url,
             canonical_cookies,
             list(seed_urls or []),
             [
@@ -1100,7 +1273,7 @@ def run_zap_scan(
             ],
             seed_deadline,
         )
-        zap.urlopen(target_url)
+        zap.urlopen(zap_target_url)
         _wait_passive(
             zap,
             min(deadline, time.monotonic() + 12),
@@ -1110,7 +1283,7 @@ def run_zap_scan(
         try:
             spider_scan_id = _scan_id(
                 zap.spider.scan(
-                    url=target_url,
+                    url=zap_target_url,
                     recurse=True,
                     contextname=context_name or None,
                     subtreeonly=False,
@@ -1119,7 +1292,7 @@ def run_zap_scan(
             )
         except Exception:
             spider_scan_id = _scan_id(
-                zap.spider.scan(target_url),
+                zap.spider.scan(zap_target_url),
                 "spider",
             )
         spider_completed, spider_progress = _wait_scan(
@@ -1139,6 +1312,7 @@ def run_zap_scan(
         mid_session = _validate_session(
             zap,
             target_url,
+            zap_target_url,
             zap_url,
             canonical_cookies,
             cookie_pairs,
@@ -1146,7 +1320,7 @@ def run_zap_scan(
         ) if canonical_cookies else {"effective": True}
 
         if canonical_cookies and not mid_session.get("effective"):
-            findings = _findings(zap, target_url)
+            findings = _findings(zap, zap_target_url, target_url)
             return partial(
                 "OWASP ZAP",
                 target_url,
@@ -1190,6 +1364,8 @@ def run_zap_scan(
         targeted_results = _run_targeted_active_scans(
             zap,
             targeted,
+            target_url,
+            zap_target_url,
             context_id,
             targeted_deadline,
         )
@@ -1202,7 +1378,7 @@ def run_zap_scan(
             try:
                 broad_scan_id = _scan_id(
                     zap.ascan.scan(
-                        url=target_url,
+                        url=zap_target_url,
                         recurse=True,
                         inscopeonly=True if not context_id else None,
                         contextid=context_id or None,
@@ -1251,7 +1427,7 @@ def run_zap_scan(
         findings = _findings(zap, target_url)
         try:
             site_tree_urls = list(
-                zap.core.urls(baseurl=target_url) or []
+                zap.core.urls(baseurl=zap_target_url) or []
             )
         except Exception:
             site_tree_urls = []
@@ -1282,6 +1458,8 @@ def run_zap_scan(
             "vulnerabilities": findings,
             "zap_version": zap_version,
             "python_zap_api_version": python_api_version,
+            "zap_target_url": zap_target_url,
+            "target_mapping": target_mapping,
             "duration_seconds": round(
                 time.monotonic() - started,
                 3,

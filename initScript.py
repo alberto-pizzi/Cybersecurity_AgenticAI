@@ -29,7 +29,7 @@ DOWNLOADS = LOCAL_ROOT / "downloads"
 RUNTIME_FILE = ROOT / ".secops_runtime.json"
 TARGET = "http://127.0.0.1"
 DEFAULT_MODEL = "llama3.1:8b"
-BUILD_ID = "secops-init-resilient-v15-20260724"
+BUILD_ID = "secops-init-resilient-v17-20260724"
 
 PYTHON_PACKAGES = (
     "fastmcp==2.12.5", "langgraph>=0.6,<2", "requests>=2.32,<3",
@@ -535,7 +535,7 @@ def write_runtime_config(status: dict[str, str | None]) -> None:
 
 def create_wordlist() -> None:
     WORDLISTS_DIR.mkdir(parents=True, exist_ok=True)
-    words = "admin api assets backup config debug docs images index.php js login.php logout.php robots.txt server-status setup.php uploads vulnerabilities .env .git".split()
+    words = "admin api assets backup config debug docs images index.php js login.php robots.txt server-status uploads vulnerabilities .env .git".split()
     (WORDLISTS_DIR / "common.txt").write_text("\n".join(words) + "\n", encoding="utf-8")
 
 
@@ -655,6 +655,7 @@ def setup_lab(model: str) -> str:
     # The ZAP image tag is mutable. Pull and recreate the container so the
     # daemon and the current zaproxy Python API are not silently out of sync.
     run(["docker", "pull", "zaproxy/zap-stable"], timeout=1800)
+    run(["docker", "pull", "ghcr.io/sullo/nikto:latest"], timeout=1800)
     run(["docker", "rm", "-f", "zap_mcp"], required=False, timeout=180)
     ensure_container(
         "zap_mcp", "zaproxy/zap-stable", {"8080/tcp": "8080"},

@@ -21,6 +21,18 @@ async def main_async(target: str, cookies: str) -> int:
         f"requests={len(discovery.get('request_cases', []))}; "
         f"authentication_effective={discovery.get('authentication_effective')}"
     )
+    print(
+        f"[*] Safe discovery skipped destructive URLs: "
+        f"{len(discovery.get('destructive_urls_skipped', []))}"
+    )
+    if discovery.get("authentication_probe"):
+        print(
+            "[*] Discovery final auth probe: "
+            + json.dumps(
+                discovery["authentication_probe"],
+                ensure_ascii=False,
+            )
+        )
     spec = ToolSpec(
         "zap",
         "zapServer.py",

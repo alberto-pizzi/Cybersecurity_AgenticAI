@@ -25,6 +25,63 @@ PRIORITY_PATHS = (
 )
 SENSITIVE_NAMES = {".env", ".git", "backup", "config", "debug", "server-status", "setup.php", "phpinfo.php", "admin", "administrator"}
 
+# These paths can mutate or invalidate an authenticated application session.
+# They remain discoverable anonymously but are removed from authenticated FFUF
+# wordlists before the scanner starts.
+DESTRUCTIVE_AUTH_PATH_TOKENS = {
+    "logout", "signout", "logoff", "setup", "install", "reset",
+    "create_db", "create-database", "createdb", "drop_db", "drop-database",
+}
+
+
+def _destructive_authenticated_word(value: str) -> bool:
+    normalized = str(value or "").strip().lower().strip("/")
+    if not normalized:
+        return False
+    tokens = {
+        token
+        for token in re.split(r"[^a-z0-9_-]+", normalized)
+        if token
+    }
+    return bool(tokens & DESTRUCTIVE_AUTH_PATH_TOKENS)
+
+
+def _looks_like_login_response(response: requests.Response) -> bool:
+    text = response.text[:50_000].lower()
+    path = urlparse(response.url).path.lower()
+    return (
+        path.endswith("/login")
+        or path.endswith("/login.php")
+        or ("type=\"password\"" in text and "login" in text)
+        or ("type='password'" in text and "login" in text)
+        or "login :: damn vulnerable web application" in text
+    )
+
+
+def _session_probe(url: str, cookies: str) -> dict[str, Any]:
+    if not url or not cookies:
+        return {"performed": False, "authenticated": None}
+    try:
+        response = requests.get(
+            url,
+            headers={"Cookie": cookies, "Cache-Control": "no-cache"},
+            timeout=(4, 12),
+            allow_redirects=True,
+        )
+    except requests.RequestException as exc:
+        return {
+            "performed": True,
+            "authenticated": False,
+            "error": f"{type(exc).__name__}: {exc}",
+        }
+    return {
+        "performed": True,
+        "authenticated": response.status_code < 400 and not _looks_like_login_response(response),
+        "status": response.status_code,
+        "final_url": str(response.url),
+        "login_detected": _looks_like_login_response(response),
+    }
+
 
 def _read_json(path: Path) -> list[dict[str, Any]]:
     try:
@@ -332,7 +389,7 @@ def _finding(item: dict[str, Any], cookies: str, verify: bool) -> dict[str, Any]
 
 
 @mcp.tool()
-def run_ffuf_fuzz(target_url: str, cookies: str="", wordlist: str="", timeout: int=120) -> dict:
+def run_ffuf_fuzz(target_url: str, cookies: str="", wordlist: str="", timeout: int=120, session_probe_url: str="") -> dict:
     """Check high-value paths first, then use the compact project wordlist with the remaining budget."""
     timeout = max(45, min(int(timeout), 300))
     general = Path(wordlist) if wordlist else WORDLISTS_DIR/"common.txt"
@@ -340,10 +397,35 @@ def run_ffuf_fuzz(target_url: str, cookies: str="", wordlist: str="", timeout: i
     priority_budget = min(40, max(20, timeout//3)); general_budget = max(20, timeout-priority_budget)
     with tempfile.TemporaryDirectory(prefix="ffuf-priority-") as td:
         temp=Path(td); priority=temp/"priority.txt"; filtered=temp/"general.txt"
-        priority.write_text("\n".join(PRIORITY_PATHS)+"\n", encoding="utf-8")
-        priority_set={value.lower() for value in PRIORITY_PATHS}
-        lines=[line.strip() for line in general.read_text(encoding="utf-8",errors="replace").splitlines() if line.strip() and not line.lstrip().startswith("#") and line.strip().lower() not in priority_set]
+        authenticated = bool(cookies)
+        priority_values = [
+            value
+            for value in PRIORITY_PATHS
+            if not (authenticated and _destructive_authenticated_word(value))
+        ]
+        priority.write_text("\n".join(priority_values)+"\n", encoding="utf-8")
+        priority_set={value.lower() for value in priority_values}
+        lines=[
+            line.strip()
+            for line in general.read_text(encoding="utf-8",errors="replace").splitlines()
+            if line.strip()
+            and not line.lstrip().startswith("#")
+            and line.strip().lower() not in priority_set
+            and not (authenticated and _destructive_authenticated_word(line))
+        ]
         filtered.write_text("\n".join(lines)+"\n", encoding="utf-8")
+        session_before = _session_probe(session_probe_url, cookies)
+        if authenticated and session_before.get("performed") and not session_before.get("authenticated"):
+            return partial(
+                "FFUF", target_url,
+                "Authenticated FFUF was not started because the supplied session was already invalid.",
+                diagnosis="authentication_precheck_failed",
+                timed_out=False,
+                vulnerabilities=[],
+                authenticated=True,
+                session_before=session_before,
+                destructive_paths_excluded=sorted(DESTRUCTIVE_AUTH_PATH_TOKENS),
+            )
         phases=[]; rows=[]
         for name,wl,budget in (("high_value_paths",priority,priority_budget),("compact_general_discovery",filtered,general_budget)):
             output=temp/f"{name}.json"; phase,found=_run_phase(target_url,cookies,wl,output,budget,name); phases.append(phase); rows.extend(found)
@@ -352,7 +434,33 @@ def run_ffuf_fuzz(target_url: str, cookies: str="", wordlist: str="", timeout: i
         ordered=list(unique.values())
         findings=[_finding(item,cookies,index<12) for index,item in enumerate(ordered)]
         hard=[p for p in phases if p.get("status")=="error"]; limited=[p for p in phases if p.get("status")=="partial"]
-        common={"vulnerabilities":findings,"discovered_urls":[f["url"] for f in findings if f.get("url")],"authenticated":bool(cookies),"hard_failure":bool(hard),"phases":[{"name":p.get("phase"),"status":p.get("status"),"findings":p.get("phase_findings",0),"timeout_seconds":p.get("phase_timeout_seconds")} for p in phases]}
+        session_after = _session_probe(session_probe_url, cookies)
+        common={
+            "vulnerabilities":findings,
+            "discovered_urls":[f["url"] for f in findings if f.get("url")],
+            "authenticated":bool(cookies),
+            "hard_failure":bool(hard),
+            "phases":[
+                {
+                    "name":p.get("phase"),
+                    "status":p.get("status"),
+                    "findings":p.get("phase_findings",0),
+                    "timeout_seconds":p.get("phase_timeout_seconds"),
+                }
+                for p in phases
+            ],
+            "session_before":session_before,
+            "session_after":session_after,
+            "destructive_paths_excluded":sorted(DESTRUCTIVE_AUTH_PATH_TOKENS) if authenticated else [],
+        }
+        if authenticated and session_after.get("performed") and not session_after.get("authenticated"):
+            return partial(
+                "FFUF", target_url,
+                f"FFUF preserved {len(findings)} findings, but the authenticated session became invalid during the scan.",
+                diagnosis="authentication_lost_during_ffuf",
+                timed_out=False,
+                **common,
+            )
         if len(hard)==len(phases) and not findings: return failure("FFUF",target_url,"Both FFUF phases failed before producing parseable results.") | common
         if hard or limited: return partial("FFUF",target_url,f"FFUF completed with incomplete coverage. Resources preserved: {len(findings)}.",diagnosis="time_limit_reached" if limited and not hard else "partial_scan",timed_out=bool(limited),**common)
         return success("FFUF",target_url,f"FFUF completed. Resources: {len(findings)}.",**common)

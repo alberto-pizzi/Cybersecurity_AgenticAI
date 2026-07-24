@@ -1,0 +1,17 @@
+admin
+api
+assets
+backup
+config
+debug
+docs
+images
+index.php
+js
+login.php
+robots.txt
+server-status
+uploads
+vulnerabilities
+.env
+.git
