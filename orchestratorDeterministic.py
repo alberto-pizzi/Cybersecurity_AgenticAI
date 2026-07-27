@@ -55,14 +55,14 @@ SCAN_MODES = {
         "arjun_limit": 1,
     },
     "balanced": {
-        "broad": {"zap": 240, "nuclei": 150, "nikto": 90, "ffuf": 75},
+        "broad": {"zap": 360, "nuclei": 300, "nikto": 90, "ffuf": 75},
         "parameter": {"sqlmap": 120, "dalfox": 90, "commix": 75, "traversal": 45, "idor": 20},
         "limits": {"sqlmap": 3, "dalfox": 3, "commix": 1, "traversal": 2, "idor": 2},
         "arjun": 75,
         "arjun_limit": 2,
     },
     "deep": {
-        "broad": {"zap": 480, "nuclei": 300, "nikto": 180, "ffuf": 120},
+        "broad": {"zap": 900, "nuclei": 600, "nikto": 180, "ffuf": 120},
         "parameter": {"sqlmap": 240, "dalfox": 180, "commix": 150, "traversal": 90, "idor": 45},
         "limits": {"sqlmap": 5, "dalfox": 4, "commix": 2, "traversal": 3, "idor": 3},
         "arjun": 90,
@@ -197,12 +197,15 @@ def tool_action_limit(tool: str) -> int:
 
 
 def broad_tool_order(authenticated: bool) -> tuple[str, ...]:
-    """Keep host-scanner order identical in deterministic and agentic runs."""
-    return (
-        ("zap", "ffuf", "nuclei", "nikto")
-        if authenticated
-        else ("ffuf", "zap", "nuclei", "nikto")
-    )
+    """Run discovery before active scanning for every profile.
+
+    Authenticated FFUF is cookie-isolated during fuzzing, blocks destructive
+    redirects during verification, and checks that the supplied session remains
+    usable. Running it first lets both
+    orchestrators re-crawl newly discovered resources and seed ZAP with the
+    richer request surface instead of scanning only the initial crawl.
+    """
+    return ("ffuf", "zap", "nuclei", "nikto")
 
 
 def tool_execution_rank(tool: str, authenticated: bool) -> int:
@@ -944,19 +947,31 @@ def _crawlable_url(url: str) -> bool:
 
 DESTRUCTIVE_CRAWL_TOKENS = (
     "logout",
+    "log-out",
     "signout",
+    "sign-out",
     "logoff",
+    "disconnect",
+    "end-session",
+    "destroy-session",
+    "session-destroy",
     "setup",
     "install",
+    "reinstall",
+    "uninstall",
     "reset",
     "create_db",
     "create-database",
     "createdb",
     "drop_db",
     "drop-database",
+    "truncate",
+    "purge",
+    "wipe",
 )
 STATE_CHANGING_QUERY_KEYS = {
     "create_db", "reset", "action", "delete", "remove", "logout",
+    "signout", "logoff", "disconnect", "destroy", "install", "setup",
     "password_new", "password_conf", "new_password", "confirm_password",
 }
 
@@ -972,7 +987,54 @@ def _destructive_crawl_url(url: str) -> bool:
         lowered_value = value.lower()
         if lowered_name in STATE_CHANGING_QUERY_KEYS:
             return True
+        if any(token in lowered_value for token in DESTRUCTIVE_CRAWL_TOKENS):
+            return True
     return False
+
+
+def _safe_crawl_get(
+    session: requests.Session,
+    requested: str,
+    target: str,
+    *,
+    timeout: tuple[int, int] = (5, 15),
+    max_redirects: int = 5,
+) -> tuple[requests.Response | None, str, str]:
+    """Follow redirects without ever requesting logout/reset/install endpoints.
+
+    Requests' normal ``allow_redirects=True`` follows a redirect before callers
+    can inspect it. For authenticated discovery that can destroy the exact
+    session later needed by ZAP. This helper inspects every Location first and
+    stops before a destructive or cross-origin hop.
+    """
+    current = _clean_url(requested)
+    seen: set[str] = set()
+    response: requests.Response | None = None
+    for _ in range(max(0, int(max_redirects)) + 1):
+        if _destructive_crawl_url(current):
+            return response, current, f"destructive_url_blocked:{current}"
+        response = session.get(current, timeout=timeout, allow_redirects=False)
+        if response.status_code not in {301, 302, 303, 307, 308}:
+            return response, current, ""
+        location = str(response.headers.get("Location") or "").strip()
+        if not location:
+            return response, current, ""
+        try:
+            candidate = _normalize_redundant_base_path_link(
+                target,
+                _clean_url(absolute_url(current, location)),
+            )
+        except Exception:
+            return response, current, "invalid_redirect_location"
+        if not same_origin(target, candidate):
+            return response, current, f"cross_origin_redirect_blocked:{candidate}"
+        if _destructive_crawl_url(candidate):
+            return response, current, f"destructive_redirect_blocked:{candidate}"
+        if candidate in seen:
+            return response, current, f"redirect_loop:{candidate}"
+        seen.add(current)
+        current = candidate
+    return response, current, "redirect_limit_reached"
 
 
 def _clean_probe_url(url: str) -> str:
@@ -1182,12 +1244,24 @@ def discover_target(
             continue
         visited.add(requested)
         try:
-            response = session.get(requested, timeout=(5, 15), allow_redirects=True)
+            response, final, redirect_issue = _safe_crawl_get(
+                session, requested, target, timeout=(5, 15), max_redirects=5
+            )
         except requests.RequestException as exc:
             errors.append({"url": requested, "type": type(exc).__name__, "message": str(exc)})
             continue
-
-        final = _clean_url(response.url)
+        if response is None:
+            errors.append({"url": requested, "type": "UnsafeURLBlocked", "message": redirect_issue or final})
+            continue
+        final = _clean_url(final)
+        if redirect_issue:
+            errors.append({
+                "url": requested,
+                "type": "SafeRedirectGuard",
+                "message": redirect_issue,
+            })
+            if redirect_issue.startswith(("destructive_", "cross_origin_")):
+                continue
         if not same_origin(target, final):
             errors.append({"url": requested, "type": "CrossOriginRedirect", "message": final})
             continue
@@ -1251,22 +1325,33 @@ def discover_target(
     if cookies:
         probe_url = _stable_auth_probe_url(target, sorted(html_urls))
         try:
-            probe_response = session.get(
-                probe_url,
-                timeout=(5, 15),
-                allow_redirects=True,
-                headers={"Cache-Control": "no-cache"},
+            original_headers = dict(session.headers)
+            session.headers["Cache-Control"] = "no-cache"
+            probe_response, probe_final, probe_redirect_issue = _safe_crawl_get(
+                session, probe_url, target, timeout=(5, 15), max_redirects=5
             )
+            session.headers.clear()
+            session.headers.update(original_headers)
+            if probe_response is None:
+                raise requests.RequestException(
+                    probe_redirect_issue or f"Session probe was blocked: {probe_final}"
+                )
+            probe_response.url = probe_final
             final_login_detected = _looks_like_login(probe_response)
-            anonymous_response = requests.get(
-                probe_url,
-                timeout=(5, 15),
-                allow_redirects=True,
-                headers={
-                    "User-Agent": "SecOps-Discovery-Anonymous-Comparison/1.0",
-                    "Cache-Control": "no-cache",
-                },
+
+            anonymous_session = requests.Session()
+            anonymous_session.headers.update({
+                "User-Agent": "SecOps-Discovery-Anonymous-Comparison/1.0",
+                "Cache-Control": "no-cache",
+            })
+            anonymous_response, anonymous_final, anonymous_redirect_issue = _safe_crawl_get(
+                anonymous_session, probe_url, target, timeout=(5, 15), max_redirects=5
             )
+            if anonymous_response is None:
+                raise requests.RequestException(
+                    anonymous_redirect_issue or f"Anonymous probe was blocked: {anonymous_final}"
+                )
+            anonymous_response.url = anonymous_final
             anonymous_login_detected = _looks_like_login(anonymous_response)
             authenticated_good = (
                 not initial_login_detected
@@ -1299,6 +1384,8 @@ def discover_target(
                 "anonymous_status": anonymous_response.status_code,
                 "anonymous_final_url": str(anonymous_response.url),
                 "anonymous_login_detected": anonymous_login_detected,
+                "authenticated_redirect_guard": probe_redirect_issue,
+                "anonymous_redirect_guard": anonymous_redirect_issue,
                 "authenticated_distinguished_from_anonymous": (
                     True if clear_anonymous_difference else None
                 ),
@@ -1447,6 +1534,11 @@ def _tool_case_priority(tool: str, case: dict[str, Any]) -> int:
         score += 45 if any(token in path for token in ("sql", "query", "database", "search")) else 0
         score += 9 * len(parameters & SQL_HINTS)
         score += 12 if _is_login_case(case) else 0
+        # Authentication brute-force handlers commonly expose username/password
+        # controls but are not SQL-query endpoints. They consumed a complete
+        # SQLMap slot in the observed run and then failed the auth precheck.
+        if "brute" in path and not any(token in path for token in ("sql", "query", "database")):
+            score -= 90
         if any(token in path for token in ("xss", "/exec", "/csp")) and not (parameters & SQL_HINTS):
             score -= 35
         return score
@@ -1503,6 +1595,8 @@ def _tool_case_skip_reason(tool: str, case: dict[str, Any]) -> str:
         return "Directory-index sorting parameters are navigation controls, not application inputs."
     if tool in {"dalfox", "commix"} and _is_login_case(case):
         return f"{tool} is not suited to the generic login form; SQLMap remains available for SQL-injection checks."
+    if tool == "sqlmap" and "brute" in urlparse(str(case.get("url", ""))).path.lower():
+        return "The brute-force handler is an authentication workflow, not a SQL-query request class."
     if _tool_case_priority(tool, case) <= 0:
         return f"The request was not selected because its path and parameters do not match {tool}'s vulnerability class."
     return ""
@@ -1842,10 +1936,33 @@ def enrich_discovery_with_arjun(discovery: dict[str, Any], result: dict[str, Any
 
 
 def enrich_discovery_with_ffuf(discovery: dict[str, Any], result: dict[str, Any], target: str) -> tuple[dict[str, Any], list[str]]:
-    urls = sorted({str(item.get("url", "")) for item in result.get("vulnerabilities", []) if isinstance(item, dict) and item.get("url") and same_origin(target, str(item["url"]))})
+    """Merge only same-origin, non-destructive FFUF discoveries.
+
+    FFUF results may contain redirects or aliases. Re-crawling them with the
+    authenticated cookie is allowed only after the same state-change predicate
+    used by the normal crawler approves both the original and verified URL.
+    """
+    safe_urls: set[str] = set()
+    blocked: set[str] = set(discovery.get("destructive_urls_skipped", []))
+    for item in result.get("vulnerabilities", []):
+        if not isinstance(item, dict):
+            continue
+        for field in ("url", "final_url"):
+            value = str(item.get(field) or "").strip()
+            if not value or not same_origin(target, value):
+                continue
+            if _destructive_crawl_url(value):
+                blocked.add(value)
+                continue
+            safe_urls.add(_clean_url(value))
+    urls = sorted(safe_urls)
     updated = dict(discovery)
     updated["urls"] = sorted(set(updated.get("urls", [])) | set(urls))
-    updated["parameterized_urls"] = sorted(set(updated.get("parameterized_urls", [])) | {url for url in urls if urlparse(url).query})
+    updated["parameterized_urls"] = sorted(
+        set(updated.get("parameterized_urls", []))
+        | {url for url in urls if urlparse(url).query}
+    )
+    updated["destructive_urls_skipped"] = sorted(blocked)
     return updated, urls
 
 
@@ -1891,9 +2008,14 @@ def log_zap_session_diagnostics(result: dict[str, Any]) -> None:
             f"seeded requests={result.get('seeded_request_cases', 0)}; "
             f"targeted active={result.get('targeted_active_scans_completed', 0)}/"
             f"{result.get('targeted_active_scans_started', 0)}; "
-            f"active rules={result.get('active_rules_attempted', 0)}/"
+            f"configured rules={result.get('active_rules_attempted', 0)}/"
             f"{result.get('active_rules_planned', 0)} "
             f"({result.get('active_rule_coverage_percent', 0)}%); "
+            f"completed-rule coverage={result.get('active_rules_completed', 0)}/"
+            f"{result.get('active_rules_planned', 0)} "
+            f"({result.get('active_rule_effective_coverage_percent', 0)}%); "
+            f"critical cases={result.get('critical_targeted_scans_completed', 0)}/"
+            f"{result.get('critical_targeted_scans_started', 0)}; "
             f"proxy confirmed={result.get('proxy_assisted_confirmed', 0)}; "
             f"native security alerts={stats.get('security', 0)}; "
             f"site-tree URLs={result.get('zap_sites_tree_urls', 0)}"
@@ -2020,6 +2142,49 @@ def log_result(profile: str, name: str, result: dict[str, Any], target: str = ""
         print(f"              {detail}", file=sys.stderr)
     elif raw_status == "partial":
         print(f"              {detail}")
+
+    if name == "ffuf":
+        isolated = bool(result.get("cookie_isolated_discovery"))
+        credentialed = bool(result.get("credentialed_fuzz_requests_sent"))
+        blocked = len(result.get("blocked_destructive_rows") or [])
+        if isolated:
+            print(
+                "    [FFUF SESSION] path fuzzing cookie-isolated=True; "
+                f"credentialed fuzz requests={credentialed}; "
+                f"destructive rows blocked={blocked}"
+            )
+        session_after = result.get("session_after") if isinstance(result.get("session_after"), dict) else {}
+        if session_after.get("performed"):
+            print(
+                "    [FFUF SESSION] post-scan authenticated="
+                f"{session_after.get('authenticated')}; "
+                f"conclusive={session_after.get('conclusive')}"
+            )
+
+    if name == "nuclei":
+        inventory = result.get("template_inventory") if isinstance(result.get("template_inventory"), dict) else {}
+        print(
+            "    [NUCLEI TEMPLATES] total="
+            f"{inventory.get('count', 0)}; dast={inventory.get('dast_count', 0)}; "
+            f"directory={inventory.get('directory', '') or 'not-resolved'}"
+        )
+        phases = result.get("phases") if isinstance(result.get("phases"), list) else []
+        for phase in phases:
+            if not isinstance(phase, dict):
+                continue
+            print(
+                "    [NUCLEI PHASE] "
+                f"{phase.get('name', 'unknown')}: status={phase.get('status', 'unknown')}; "
+                f"findings={phase.get('findings', 0)}; budget={phase.get('timeout_seconds', 0)}s; "
+                f"input={phase.get('input_mode') or 'list'}; "
+                f"aggression={phase.get('fuzz_aggression') or 'n/a'}"
+            )
+        if not total:
+            print(
+                "    [NUCLEI RESULT] No template matcher completed with positive evidence. "
+                "This does not mean the target is clean; inspect phase status, DAST input count, "
+                "template inventory and time-limit diagnostics above."
+            )
 
 def aggregate_runs(tool: str, target: str, runs: list[dict[str, Any]]) -> dict[str, Any]:
     if not runs:
@@ -2149,8 +2314,9 @@ async def run_pipeline(target: str, profiles: list[dict[str, str]], injection_ur
     for profile in profiles:
         name, cookies = profile["name"], profile["cookies"]
         print(f"\n[*] Scanner generali - profilo: {name}")
-        # Authenticated ZAP runs before authenticated FFUF so a broad resource
-        # discovery pass cannot invalidate or alter the session first.
+        # FFUF is session-guarded and filters destructive paths. Its discoveries
+        # are merged immediately, so ZAP and Nuclei receive the richest safe
+        # authenticated surface available in the same run.
         broad_order = broad_tool_order(bool(cookies))
         broad_specs = {
             spec.name: spec
@@ -2360,9 +2526,8 @@ async def run_pipeline(target: str, profiles: list[dict[str, str]], injection_ur
                     url,
                     "The authenticated session could not be restored before this scanner.",
                 ) | {"session_state_refresh": state_refresh}
-            result = await call_mcp(
-                spec.server,
-                spec.tool,
+            result = await call_mcp_with_progress(
+                spec,
                 arguments,
                 timeout_seconds=scanner_timeout + 35,
             )
@@ -2461,9 +2626,11 @@ async def run_pipeline(target: str, profiles: list[dict[str, str]], injection_ur
         oast_selection_summary[name] = oast_cases
         interactsh_runs: list[dict[str, Any]] = []
         for oast_case in oast_cases:
-            result = await call_mcp(
-                "interactshServer.py",
-                "run_interactsh_client",
+            interactsh_spec = next(
+                item for item in OPTIONAL_TOOLS if item.name == "interactsh"
+            )
+            result = await call_mcp_with_progress(
+                interactsh_spec,
                 {
                     "target_url": target,
                     "injection_url": oast_case["injection_url"],

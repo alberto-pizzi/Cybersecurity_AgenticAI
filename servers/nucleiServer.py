@@ -5,6 +5,7 @@ import json
 import os
 import re
 import tempfile
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qsl, urlparse
@@ -127,15 +128,22 @@ def _command(
     compatibility: bool = False,
     automatic_scan: bool = False,
     dast: bool = False,
+    input_mode: str = "",
+    fuzz_aggression: str = "medium",
+    fuzz_param_frequency: int = 25,
     concurrency: int = 20,
     rate_limit: int = 80,
     request_timeout: int = 5,
     retries: int = 1,
     template_dir: str = "",
 ) -> list[str]:
+    input_args = (
+        ["-l", str(target_list), *(["-im", input_mode] if input_mode else [])]
+        if target_list else ["-u", target_url]
+    )
     command = [
         "nuclei",
-        *(["-l", str(target_list)] if target_list else ["-u", target_url]),
+        *input_args,
         "-severity", severities,
         "-jsonl", "-silent", "-nc",
         "-o", str(output_file),
@@ -153,6 +161,11 @@ def _command(
         command.append("-as")
     if dast:
         command.append("-dast")
+        if not compatibility:
+            command.extend([
+                "-fuzz-param-frequency", str(max(10, int(fuzz_param_frequency))),
+                "-fa", fuzz_aggression if fuzz_aggression in {"low", "medium", "high"} else "medium",
+            ])
     if not compatibility:
         excluded = DAST_EXCLUDED_TAGS if dast else EXCLUDED_TAGS
         command.extend(["-pt", "http", "-etags", excluded, "-fhr"])
@@ -259,9 +272,31 @@ def _filesystem_template_inventory() -> dict[str, Any]:
             for path in directory.rglob("*")
             if path.is_file() and path.suffix.lower() in {".yaml", ".yml"}
         )
-        inventories.append({"directory": str(directory), "count": count})
-    best = max(inventories, key=lambda item: item["count"], default={"directory": "", "count": 0})
-    return {"count": int(best["count"]), "directory": str(best["directory"]), "candidates": inventories}
+        dast_directory = directory / "dast"
+        dast_count = (
+            sum(
+                1
+                for path in dast_directory.rglob("*")
+                if path.is_file() and path.suffix.lower() in {".yaml", ".yml"}
+            )
+            if dast_directory.is_dir() else 0
+        )
+        inventories.append({
+            "directory": str(directory),
+            "count": count,
+            "dast_directory": str(dast_directory) if dast_directory.is_dir() else "",
+            "dast_count": dast_count,
+        })
+    best = max(inventories, key=lambda item: item["count"], default={
+        "directory": "", "count": 0, "dast_directory": "", "dast_count": 0
+    })
+    return {
+        "count": int(best["count"]),
+        "directory": str(best["directory"]),
+        "dast_directory": str(best.get("dast_directory", "")),
+        "dast_count": int(best.get("dast_count", 0)),
+        "candidates": inventories,
+    }
 
 
 def _template_inventory() -> dict[str, Any]:
@@ -287,6 +322,8 @@ def _template_inventory() -> dict[str, Any]:
         "cli_count": cli_count,
         "filesystem_count": int(filesystem.get("count", 0)),
         "directory": str(filesystem.get("directory", "")),
+        "dast_directory": str(filesystem.get("dast_directory", "")),
+        "dast_count": int(filesystem.get("dast_count", 0)),
         "filesystem_candidates": filesystem.get("candidates", []),
         "sufficient": count >= MIN_EXPECTED_TEMPLATE_COUNT,
         "minimum_expected": MIN_EXPECTED_TEMPLATE_COUNT,
@@ -328,6 +365,9 @@ def _run_phase(
     target_list: Path | None = None,
     automatic_scan: bool = False,
     dast: bool = False,
+    input_mode: str = "",
+    fuzz_aggression: str = "medium",
+    fuzz_param_frequency: int = 25,
     concurrency: int = 20,
     rate_limit: int = 80,
     request_timeout: int = 5,
@@ -347,6 +387,9 @@ def _run_phase(
                 compatibility=compatibility,
                 automatic_scan=automatic_scan if not compatibility else False,
                 dast=dast,
+                input_mode=input_mode,
+                fuzz_aggression=fuzz_aggression,
+                fuzz_param_frequency=fuzz_param_frequency,
                 concurrency=concurrency,
                 rate_limit=rate_limit,
                 request_timeout=request_timeout,
@@ -387,6 +430,9 @@ def _run_phase(
         phase_tags=tags,
         automatic_scan=automatic_scan,
         dast=dast,
+        input_mode=input_mode,
+        fuzz_aggression=fuzz_aggression if dast else "",
+        fuzz_param_frequency=fuzz_param_frequency if dast else 0,
     )
     return result, items
 
@@ -433,10 +479,10 @@ def _phase_definitions(
         weights = [1.0]
     elif scan_profile == "balanced":
         phases = ([dast_phase] if has_dast_targets else []) + [high_phase, exposure_phase, automatic_phase]
-        weights = [0.36, 0.29, 0.21, 0.14] if has_dast_targets else [0.46, 0.34, 0.20]
+        weights = [0.45, 0.25, 0.18, 0.12] if has_dast_targets else [0.46, 0.34, 0.20]
     else:
         phases = ([dast_phase] if has_dast_targets else []) + [high_phase, exposure_phase, automatic_phase, broad_phase]
-        weights = [0.32, 0.24, 0.17, 0.12, 0.15] if has_dast_targets else [0.31, 0.24, 0.18, 0.27]
+        weights = [0.44, 0.20, 0.14, 0.08, 0.14] if has_dast_targets else [0.31, 0.24, 0.18, 0.27]
 
     # Do not create more processes than the total budget can meaningfully start.
     # This keeps manually requested low timeouts bounded instead of silently
@@ -484,6 +530,114 @@ def _same_origin_url(base_url: str, candidate: str) -> bool:
     ) == (
         other.scheme.lower(), other.hostname or "", other.port or (443 if other.scheme == "https" else 80)
     )
+
+
+
+def _dast_request_cases(
+    target_url: str,
+    request_cases: list[dict[str, Any]] | None,
+    limit: int = 30,
+) -> list[dict[str, Any]]:
+    """Select safe same-origin GET and POST request contracts for Nuclei DAST."""
+    selected: list[dict[str, Any]] = []
+    seen: set[tuple[str, str, str]] = set()
+    for case in request_cases or []:
+        if not isinstance(case, dict):
+            continue
+        method = str(case.get("method") or "GET").upper()
+        candidate = str(case.get("url") or case.get("target_url") or "").strip()
+        data = str(case.get("data") or "")
+        if method not in {"GET", "POST"}:
+            continue
+        if not candidate.startswith(("http://", "https://")) or not _same_origin_url(target_url, candidate):
+            continue
+        parsed = urlparse(candidate)
+        path_lower = parsed.path.lower()
+        if any(word in path_lower for word in _STATE_CHANGING_PATH_WORDS):
+            continue
+        query_names = {name.lower() for name, _ in parse_qsl(parsed.query, keep_blank_values=True)}
+        body_names = {
+            name.lower() for name, _ in parse_qsl(data, keep_blank_values=True)
+        } if method == "POST" else set()
+        names = {
+            str(value).lower()
+            for value in case.get("parameters", [])
+            if str(value)
+        } | query_names | body_names
+        if not names or names & _STATE_CHANGING_KEYS:
+            continue
+        key = (method, candidate, data)
+        if key in seen:
+            continue
+        seen.add(key)
+        selected.append({
+            "url": candidate,
+            "method": method,
+            "data": data,
+            "parameters": sorted(names),
+        })
+        if len(selected) >= max(1, min(int(limit), 60)):
+            break
+    return selected
+
+
+def _write_proxify_jsonl(
+    path: Path,
+    cases: list[dict[str, Any]],
+    cookies: str,
+) -> int:
+    """Write complete request records using Nuclei's supported Proxify JSONL shape."""
+    records: list[str] = []
+    for case in cases:
+        url = str(case.get("url") or "")
+        method = str(case.get("method") or "GET").upper()
+        data = str(case.get("data") or "")
+        parsed = urlparse(url)
+        request_target = parsed.path or "/"
+        if parsed.query:
+            request_target += "?" + parsed.query
+        header_lines = [
+            f"{method} {request_target} HTTP/1.1",
+            f"Host: {parsed.netloc}",
+            "User-Agent: SecOps-Nuclei-DAST/3.0",
+            "Accept: */*",
+        ]
+        header_object: dict[str, Any] = {
+            "scheme": parsed.scheme,
+            "method": method,
+            "path": request_target,
+            "host": parsed.netloc,
+            "user_agent": "SecOps-Nuclei-DAST/3.0",
+            "accept": "*/*",
+        }
+        if cookies:
+            header_lines.append(f"Cookie: {cookies}")
+            header_object["cookie"] = cookies
+        if method == "POST":
+            header_lines.extend([
+                "Content-Type: application/x-www-form-urlencoded",
+                f"Content-Length: {len(data.encode('utf-8'))}",
+            ])
+            header_object["content_type"] = "application/x-www-form-urlencoded"
+            header_object["content_length"] = len(data.encode("utf-8"))
+        raw = "\r\n".join(header_lines) + "\r\n\r\n" + (data if method == "POST" else "")
+        record = {
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "url": url,
+            "request": {
+                "header": header_object,
+                "body": data if method == "POST" else "",
+                "raw": raw,
+            },
+            "response": {
+                "header": {"status_code": 0},
+                "body": "",
+                "raw": "",
+            },
+        }
+        records.append(json.dumps(record, ensure_ascii=False, default=str))
+    path.write_text("\n".join(records) + ("\n" if records else ""), encoding="utf-8")
+    return len(records)
 
 
 def _dast_target_urls(
@@ -536,6 +690,7 @@ def _run_nuclei_core(
         refresh_result = _attempt_template_refresh()
         inventory = _template_inventory()
     template_dir = str(inventory.get("directory") or "")
+    dast_template_dir = str(inventory.get("dast_directory") or "")
     if inventory.get("count", 0) <= 0:
         result = failure(
             "Nuclei",
@@ -584,40 +739,105 @@ def _run_nuclei_core(
     target_list = work_dir / f"{prefix}-targets.txt"
     target_list.write_text("\n".join(focused_targets) + "\n", encoding="utf-8")
 
-    dast_targets = _dast_target_urls(target_url, request_cases, limit=20 if scan_profile == "deep" else 10)
+    dast_cases = _dast_request_cases(
+        target_url,
+        request_cases,
+        limit=30 if scan_profile == "deep" else 16 if scan_profile == "balanced" else 8,
+    )
+    dast_targets = _dast_target_urls(
+        target_url,
+        request_cases,
+        limit=24 if scan_profile == "deep" else 12,
+    )
     dast_target_list = work_dir / f"{prefix}-dast-targets.txt"
     if dast_targets:
         dast_target_list.write_text("\n".join(dast_targets) + "\n", encoding="utf-8")
+    dast_request_log = work_dir / f"{prefix}-dast-requests.jsonl"
+    dast_request_count = _write_proxify_jsonl(dast_request_log, dast_cases, cookies) if dast_cases else 0
 
-    definitions = _phase_definitions(scan_profile, timeout, bool(dast_targets))
+    definitions = _phase_definitions(scan_profile, timeout, bool(dast_cases or dast_targets))
     phase_paths = [work_dir / f"{prefix}-{index + 1}.jsonl" for index in range(len(definitions))]
     for phase_path in phase_paths:
         phase_path.unlink(missing_ok=True)
 
     if scan_profile == "deep":
         concurrency, rate_limit, request_timeout, retries = 30, 120, 6, 1
+        fuzz_aggression, fuzz_frequency = "high", 30
     elif scan_profile == "balanced":
         concurrency, rate_limit, request_timeout, retries = 24, 100, 5, 1
+        fuzz_aggression, fuzz_frequency = "medium", 25
     else:
         concurrency, rate_limit, request_timeout, retries = 16, 60, 3, 0
+        fuzz_aggression, fuzz_frequency = "low", 15
 
     phases: list[dict[str, Any]] = []
     all_items: list[dict[str, Any]] = []
     try:
         for phase_path, definition in zip(phase_paths, definitions):
-            phase_target_list = dast_target_list if definition.get("dast") else target_list
+            is_dast = bool(definition.get("dast"))
+            phase_target_list = (
+                dast_request_log
+                if is_dast and dast_request_count
+                else dast_target_list
+                if is_dast
+                else target_list
+            )
+            input_mode = "jsonl" if is_dast and dast_request_count else ""
+            phase_template_dir = (
+                dast_template_dir
+                if is_dast and dast_template_dir
+                else template_dir
+            )
             phase, items = _run_phase(
                 target_url,
                 cookies,
                 phase_path,
                 target_list=phase_target_list,
+                input_mode=input_mode,
+                fuzz_aggression=fuzz_aggression,
+                fuzz_param_frequency=fuzz_frequency,
                 concurrency=concurrency,
                 rate_limit=rate_limit,
                 request_timeout=request_timeout,
                 retries=retries,
-                template_dir=template_dir,
+                template_dir=phase_template_dir,
                 **definition,
             )
+
+            # Older or vendor-modified Nuclei builds may reject Proxify JSONL
+            # inputs. Preserve DAST coverage by retrying the safe GET URL list.
+            phase_text = "\n".join((
+                str(phase.get("stdout", "")),
+                str(phase.get("stderr", "")),
+                str(phase.get("output", "")),
+            )).lower()
+            if (
+                is_dast
+                and input_mode == "jsonl"
+                and phase.get("status") == "error"
+                and dast_targets
+                and any(token in phase_text for token in ("jsonl", "input-mode", "input mode", "could not parse", "invalid input"))
+            ):
+                phase_path.unlink(missing_ok=True)
+                fallback_phase, fallback_items = _run_phase(
+                    target_url,
+                    cookies,
+                    phase_path,
+                    target_list=dast_target_list,
+                    input_mode="",
+                    fuzz_aggression=fuzz_aggression,
+                    fuzz_param_frequency=fuzz_frequency,
+                    concurrency=concurrency,
+                    rate_limit=rate_limit,
+                    request_timeout=request_timeout,
+                    retries=retries,
+                    template_dir=phase_template_dir,
+                    **definition,
+                )
+                fallback_phase["request_log_fallback"] = True
+                fallback_phase["request_log_error_excerpt"] = phase_text[-1600:]
+                phase, items = fallback_phase, fallback_items
+
             phases.append(phase)
             all_items.extend(items)
 
@@ -642,6 +862,10 @@ def _run_nuclei_core(
                 "tags": phase.get("phase_tags", ""),
                 "automatic_scan": phase.get("automatic_scan", False),
                 "dast": phase.get("dast", False),
+                "input_mode": phase.get("input_mode", ""),
+                "fuzz_aggression": phase.get("fuzz_aggression", ""),
+                "fuzz_param_frequency": phase.get("fuzz_param_frequency", 0),
+                "request_log_fallback": phase.get("request_log_fallback", False),
                 "stderr_excerpt": str(phase.get("stderr", ""))[-1200:],
             }
             for phase in phases
@@ -653,12 +877,24 @@ def _run_nuclei_core(
             "scan_profile": scan_profile,
             "scan_scope": (
                 f"Official template inventory={inventory.get('count')}; profile={scan_profile}; "
-                f"static_targets={len(focused_targets)}; dast_targets={len(dast_targets)}; "
+                f"static_targets={len(focused_targets)}; dast_request_cases={len(dast_cases)}; "
+                f"dast_get_targets={len(dast_targets)}; dast_templates={inventory.get('dast_count', 0)}; "
                 f"phases={','.join(item['name'] for item in definitions)}; "
                 f"regular_excluded_tags={EXCLUDED_TAGS}; dast_excluded_tags={DAST_EXCLUDED_TAGS}."
             ),
             "focused_targets": focused_targets,
             "dast_targets": dast_targets,
+            "dast_request_cases": [
+                {
+                    "url": item.get("url", ""),
+                    "method": item.get("method", "GET"),
+                    "parameters": item.get("parameters", []),
+                }
+                for item in dast_cases
+            ],
+            "dast_request_count": dast_request_count,
+            "dast_input_mode": "jsonl" if dast_request_count else "list",
+            "dast_template_directory": dast_template_dir,
             "template_inventory": inventory,
             "template_refresh": refresh_result,
             "hard_failure": bool(hard_failures),
@@ -701,6 +937,7 @@ def _run_nuclei_core(
             phase_path.unlink(missing_ok=True)
         target_list.unlink(missing_ok=True)
         dast_target_list.unlink(missing_ok=True)
+        dast_request_log.unlink(missing_ok=True)
         if temporary is not None:
             temporary.cleanup()
 

@@ -8,7 +8,7 @@ import tempfile
 import time
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import unquote, urljoin, urlparse
 
 import requests
 from fastmcp import FastMCP
@@ -31,21 +31,29 @@ SENSITIVE_NAMES = {".env", ".git", "backup", "config", "debug", "server-status",
 # They remain discoverable anonymously but are removed from authenticated FFUF
 # wordlists before the scanner starts.
 DESTRUCTIVE_AUTH_PATH_TOKENS = {
-    "logout", "signout", "logoff", "setup", "install", "reset",
+    "logout", "log-out", "signout", "sign-out", "logoff", "disconnect",
+    "end-session", "destroy-session", "session-destroy",
+    "setup", "install", "reinstall", "uninstall", "reset",
     "create_db", "create-database", "createdb", "drop_db", "drop-database",
+    "truncate", "purge", "wipe",
 }
 
 
 def _destructive_authenticated_word(value: str) -> bool:
-    normalized = str(value or "").strip().lower().strip("/")
-    if not normalized:
+    """Reject destructive path/query aliases before an authenticated request."""
+    raw = unquote(str(value or "")).strip().lower()
+    if not raw:
         return False
+    parsed = urlparse(raw if "://" in raw else f"http://secops.local/{raw.lstrip('/')}")
+    comparable = f"{parsed.path}?{parsed.query}"
     tokens = {
         token
-        for token in re.split(r"[^a-z0-9_-]+", normalized)
+        for token in re.split(r"[^a-z0-9_-]+", comparable)
         if token
     }
-    return bool(tokens & DESTRUCTIVE_AUTH_PATH_TOKENS)
+    if tokens & DESTRUCTIVE_AUTH_PATH_TOKENS:
+        return True
+    return any(marker in comparable for marker in DESTRUCTIVE_AUTH_PATH_TOKENS)
 
 
 def _looks_like_login_response(response: requests.Response) -> bool:
@@ -65,12 +73,26 @@ def _session_probe(url: str, cookies: str, attempts: int = 3) -> dict[str, Any]:
     errors: list[str] = []
     for attempt in range(max(1, attempts)):
         try:
-            response = requests.get(
-                url,
-                headers={"Cookie": cookies, "Cache-Control": "no-cache"},
-                timeout=(4, 14),
-                allow_redirects=True,
+            response, final_url, redirect_guard = _safe_verification_get(
+                url, cookies, max_redirects=4
             )
+            if response is None:
+                raise requests.RequestException(
+                    redirect_guard or f"session probe blocked at {final_url}"
+                )
+            response.url = final_url
+            if redirect_guard.startswith(("destructive_", "cross_origin_")):
+                return {
+                    "performed": True,
+                    "authenticated": None,
+                    "conclusive": False,
+                    "transient_error": False,
+                    "status": response.status_code,
+                    "final_url": final_url,
+                    "login_detected": False,
+                    "redirect_guard": redirect_guard,
+                    "attempt_errors": errors,
+                }
             login = _looks_like_login_response(response)
             return {
                 "performed": True,
@@ -80,6 +102,7 @@ def _session_probe(url: str, cookies: str, attempts: int = 3) -> dict[str, Any]:
                 "status": response.status_code,
                 "final_url": str(response.url),
                 "login_detected": login,
+                "redirect_guard": redirect_guard,
                 "attempt_errors": errors,
             }
         except (requests.Timeout, requests.ConnectionError) as exc:
@@ -117,6 +140,60 @@ def _run_phase(target_url: str, cookies: str, wordlist: Path, output: Path, budg
     return result, rows
 
 
+
+def _safe_verification_get(
+    url: str,
+    cookies: str,
+    *,
+    max_redirects: int = 4,
+) -> tuple[requests.Response | None, str, str]:
+    """Follow only same-origin, non-destructive redirects.
+
+    This prevents a benign-looking FFUF result from redirecting the supplied
+    authenticated session through logout/setup/reset handlers.
+    """
+    origin = urlparse(url)
+    origin_key = (
+        origin.scheme.lower(),
+        origin.hostname or "",
+        origin.port or (443 if origin.scheme.lower() == "https" else 80),
+    )
+    current = url
+    headers = {"Cookie": cookies} if cookies else {}
+    response: requests.Response | None = None
+    seen: set[str] = set()
+    for _ in range(max(0, int(max_redirects)) + 1):
+        if cookies and _destructive_authenticated_word(current):
+            return response, current, f"destructive_url_blocked:{current}"
+        response = requests.get(
+            current,
+            headers=headers,
+            timeout=(3, 7),
+            allow_redirects=False,
+        )
+        if response.status_code not in {301, 302, 303, 307, 308}:
+            return response, current, ""
+        location = str(response.headers.get("Location") or "").strip()
+        if not location:
+            return response, current, ""
+        candidate = urljoin(current, location)
+        parsed = urlparse(candidate)
+        candidate_key = (
+            parsed.scheme.lower(),
+            parsed.hostname or "",
+            parsed.port or (443 if parsed.scheme.lower() == "https" else 80),
+        )
+        if candidate_key != origin_key:
+            return response, current, f"cross_origin_redirect_blocked:{candidate}"
+        if cookies and _destructive_authenticated_word(candidate):
+            return response, current, f"destructive_redirect_blocked:{candidate}"
+        if candidate in seen:
+            return response, current, f"redirect_loop:{candidate}"
+        seen.add(current)
+        current = candidate
+    return response, current, "redirect_limit_reached"
+
+
 def _verify(url: str, cookies: str) -> dict[str, Any]:
     """
     Verify a sensitive-looking FFUF path before classifying it.
@@ -125,14 +202,13 @@ def _verify(url: str, cookies: str) -> dict[str, Any]:
     reported as exposed medium-severity resources.
     """
     original_path = urlparse(url).path.lower()
-    headers = {"Cookie": cookies} if cookies else {}
     try:
-        response = requests.get(
-            url,
-            headers=headers,
-            timeout=(3, 7),
-            allow_redirects=True,
+        response, safe_final_url, redirect_guard = _safe_verification_get(
+            url, cookies, max_redirects=4
         )
+        if response is None:
+            raise requests.RequestException(redirect_guard or "verification request blocked")
+        response.url = safe_final_url
     except requests.RequestException as exc:
         return {
             "category": "observation",
@@ -155,8 +231,24 @@ def _verify(url: str, cookies: str) -> dict[str, Any]:
     evidence = (
         f"Original URL: {url}\nFinal URL: {final_url}\n"
         f"Final HTTP status: {response.status_code}\n"
-        f"Response bytes sampled: {len(sample.encode('utf-8', errors='replace'))}"
+        f"Response bytes sampled: {len(sample.encode('utf-8', errors='replace'))}\n"
+        f"Redirect guard: {redirect_guard or 'not-triggered'}"
     )
+
+    if redirect_guard.startswith(("destructive_", "cross_origin_")):
+        return {
+            "category": "observation",
+            "risk": "info",
+            "alert": "FFUF redirect blocked by session-safety guard",
+            "verification_status": "unsafe-redirect-not-followed",
+            "description": "The discovered path redirected to a destructive or cross-origin destination. The redirect was not followed with the authenticated cookie.",
+            "impact": "",
+            "solution": "",
+            "confidence": "high",
+            "final_url": final_url,
+            "final_status": response.status_code,
+            "evidence": evidence,
+        }
 
     login_page = (
         final_path.endswith("/login")
@@ -441,19 +533,45 @@ def run_ffuf_fuzz(target_url: str, cookies: str="", wordlist: str="", timeout: i
                 session_before=session_before,
                 destructive_paths_excluded=sorted(DESTRUCTIVE_AUTH_PATH_TOKENS),
             )
+        # Path fuzzing is deliberately cookie-isolated for authenticated
+        # profiles. This makes it impossible for a guessed logout alias to
+        # invalidate the live session required by ZAP. Safe results are then
+        # verified and re-crawled with the cookie by guarded code.
+        fuzz_cookies = ""
         phases=[]; rows=[]
         for name,wl,budget in (("high_value_paths",priority,priority_budget),("compact_general_discovery",filtered,general_budget)):
-            output=temp/f"{name}.json"; phase,found=_run_phase(target_url,cookies,wl,output,budget,name); phases.append(phase); rows.extend(found)
+            output=temp/f"{name}.json"
+            phase,found=_run_phase(target_url,fuzz_cookies,wl,output,budget,name)
+            phases.append(phase)
+            rows.extend(found)
         unique={}
-        for item in rows: unique[(str(item.get("url","")),int(item.get("status") or 0))]=item
+        blocked_rows: list[str] = []
+        for item in rows:
+            item_url = str(item.get("url",""))
+            redirect = str(item.get("redirectlocation",""))
+            if authenticated and (
+                _destructive_authenticated_word(item_url)
+                or (redirect and _destructive_authenticated_word(redirect))
+            ):
+                blocked_rows.append(item_url or redirect)
+                continue
+            unique[(item_url,int(item.get("status") or 0))]=item
         ordered=list(unique.values())
-        findings=[_finding(item,cookies,index<12) for index,item in enumerate(ordered)]
+        findings=[_finding(item,cookies,index<20) for index,item in enumerate(ordered)]
         hard=[p for p in phases if p.get("status")=="error"]; limited=[p for p in phases if p.get("status")=="partial"]
         session_after = _session_probe(session_probe_url, cookies)
         common={
             "vulnerabilities":findings,
-            "discovered_urls":[f["url"] for f in findings if f.get("url")],
+            "discovered_urls":[
+                f["url"] for f in findings
+                if f.get("url")
+                and not (authenticated and _destructive_authenticated_word(str(f["url"])))
+            ],
             "authenticated":bool(cookies),
+            "credentialed_fuzz_requests_sent":False,
+            "cookie_isolated_discovery":bool(cookies),
+            "authenticated_verification_used":bool(cookies),
+            "blocked_destructive_rows":sorted(set(blocked_rows)),
             "hard_failure":bool(hard),
             "phases":[
                 {

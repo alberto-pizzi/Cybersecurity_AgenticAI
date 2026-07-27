@@ -33,12 +33,11 @@ mcp = FastMCP("OWASP ZAP Scanner")
 
 COOKIE_RULE_NAME = "secops-session-cookie-v15"
 DESTRUCTIVE_PATH_WORDS = (
-    "logout",
-    "setup",
-    "install",
-    "reset",
-    "create_db",
-    "create-database",
+    "logout", "log-out", "signout", "sign-out", "logoff", "disconnect",
+    "end-session", "destroy-session", "session-destroy",
+    "setup", "install", "reinstall", "uninstall", "reset",
+    "create_db", "create-database", "drop_db", "drop-database",
+    "truncate", "purge", "wipe",
 )
 STATE_CHANGING_QUERY_KEYS = {
     "create_db", "reset", "action", "delete", "remove", "logout",
@@ -576,7 +575,9 @@ def _configure_context(
     context_name = f"secops-scope-{int(time.time())}"
     context_id = ""
     excluded_regex = (
-        rf"^{re.escape(origin)}/.*(?:logout|setup|install|reset|create[_-]?db)"
+        rf"^{re.escape(origin)}/.*(?:logout|log[_-]?out|sign[_-]?out|logoff|disconnect|"
+        rf"end[_-]?session|destroy[_-]?session|setup|re?install|uninstall|reset|"
+        rf"create[_-]?db|drop[_-]?db|truncate|purge|wipe)"
         rf"(?:[^A-Za-z0-9].*)?$"
     )
     blocked_query_keys = set(STATE_CHANGING_QUERY_KEYS)
@@ -975,6 +976,93 @@ def _targeted_cases(
         if len(selected) >= max(1, limit):
             break
     return selected
+
+
+
+def _request_case_class(case: dict[str, Any]) -> str:
+    """Classify a request contract so critical ZAP rules are not run blindly."""
+    url = str(case.get("url") or "")
+    parsed = urlparse(url)
+    path = parsed.path.lower()
+    method = str(case.get("method") or "GET").upper()
+    parameters = {
+        str(value).lower()
+        for value in case.get("parameters", [])
+        if str(value)
+    }
+    parameters.update(name.lower() for name, _ in parse_qsl(parsed.query, keep_blank_values=True))
+    if method == "POST":
+        parameters.update(
+            name.lower()
+            for name, _ in parse_qsl(str(case.get("data") or ""), keep_blank_values=True)
+        )
+
+    if "sqli" in path or parameters & {"id", "uid", "user_id", "query", "search"}:
+        return "sqli"
+    if "xss_s" in path or ("xss" in path and method == "POST"):
+        return "xss_stored"
+    if "xss_r" in path or "xss" in path:
+        return "xss_reflected"
+    if "/exec" in path or "command" in path or parameters & {"cmd", "command", "exec", "shell", "ip", "host"}:
+        return "command"
+    if "/fi" in path or "travers" in path or parameters & {"file", "filename", "path", "page", "include", "template"}:
+        return "traversal"
+    if parameters & {"url", "uri", "callback", "webhook", "redirect", "host", "domain"}:
+        return "ssrf"
+    if parameters & {"xml", "doctype", "entity"}:
+        return "xxe"
+    return "other"
+
+
+def _scanner_rule_tags(scanner_id: str, scanner_name: str) -> set[str]:
+    """Map an installed ZAP active rule to the request classes it can test."""
+    lowered = scanner_name.lower()
+    tags: set[str] = set()
+    if "sql injection" in lowered or scanner_id in {"40018", "40019", "40020", "40021", "40022", "40027"}:
+        tags.add("sqli")
+    if "cross site scripting" in lowered or "cross-site scripting" in lowered or "xss" in lowered or scanner_id in {"40012", "40014"}:
+        tags.update({"xss_reflected", "xss_stored"})
+    if any(value in lowered for value in ("command injection", "remote os command", "code injection", "shell injection")) or scanner_id == "90020":
+        tags.add("command")
+    if any(value in lowered for value in ("path traversal", "file inclusion", "local file inclusion", "remote file inclusion")) or scanner_id in {"6", "7"}:
+        tags.add("traversal")
+    if "server side request forgery" in lowered or "server-side request forgery" in lowered or "ssrf" in lowered:
+        tags.add("ssrf")
+    if "external entity" in lowered or "xxe" in lowered or "xml injection" in lowered:
+        tags.add("xxe")
+    if "template injection" in lowered or "ssti" in lowered:
+        tags.add("ssti")
+    if "deserial" in lowered:
+        tags.add("deserialization")
+    return tags
+
+
+def _critical_scanners_for_case(
+    case: dict[str, Any],
+    scanner_ids: list[str],
+    scanner_names: list[str],
+) -> list[str]:
+    case_class = _request_case_class(case)
+    names = {
+        scanner_id: scanner_names[index] if index < len(scanner_names) else scanner_id
+        for index, scanner_id in enumerate(scanner_ids)
+    }
+    matched = [
+        scanner_id
+        for scanner_id in scanner_ids
+        if case_class in _scanner_rule_tags(scanner_id, names.get(scanner_id, scanner_id))
+    ]
+    if matched:
+        return matched
+    # Compatibility floor for older ZAP builds whose inventory omits names.
+    fallback = {
+        "sqli": {"40018", "40019", "40020", "40021", "40022", "40027"},
+        "xss_reflected": {"40012"},
+        "xss_stored": {"40014", "40012"},
+        "command": {"90020"},
+        "traversal": {"6", "7"},
+    }.get(case_class, set())
+    return [value for value in scanner_ids if value in fallback]
 
 def _stop_active_scans(zap: ZAPv2, scan_ids: list[str]) -> dict[str, Any]:
     stopped: list[str] = []
@@ -1418,26 +1506,34 @@ def _run_proxy_assisted_verification(
                 candidates = [value for value in parameters if value.lower() in {"mtxmessage", "message", "comment", "content"}]
                 if candidates:
                     parameter = candidates[0]
-                    payload = '<svg id="SECOPS_ZAP_STORED_26" onload="void(0)"></svg>'
+                    # Keep the payload below common guestbook/message length
+                    # limits. The previous long unique-ID payload was truncated
+                    # by DVWA and therefore could never be confirmed exactly.
+                    payload = '<svg id=sx onload=void(0)></svg>'
                     baseline = send(external_url, request_method="GET", data="")
                     probe_data = _mutate_form_parameter(base_data, parameter, payload)
                     post_response = send(data=probe_data)
                     verify_response = send(external_url, request_method="GET", data="")
+                    content_type = verify_response.headers.get("Content-Type", "").lower()
                     confirmed = (
                         payload not in baseline.text
+                        and "html" in content_type
                         and (payload in post_response.text or payload in verify_response.text)
                     )
-                    record["tests"].append({"type": "xss_stored", "confirmed": confirmed})
+                    record["tests"].append({
+                        "type": "xss_stored", "confirmed": confirmed,
+                        "payload_length": len(payload),
+                    })
                     if confirmed:
                         findings.append(_proxy_verification_finding(
                             alert=f"Stored cross-site scripting in parameter '{parameter}'",
                             risk="high", url=external_url, scanner_url=scanner_url,
                             method="POST", parameter=parameter,
                             verification_status="zap-proxy-stored-persistence-confirmed",
-                            description="An executable SVG event-handler payload submitted through a POST form persisted and was returned unescaped through ZAP.",
+                            description="A compact SVG event-handler payload submitted through a POST form persisted and was returned unescaped through ZAP.",
                             evidence=(
                                 f"POST HTTP {post_response.status_code}; follow-up HTTP {verify_response.status_code}; "
-                                f"payload absent from baseline=True; persisted unescaped=True."
+                                f"payload length={len(payload)}; payload absent from baseline=True; persisted unescaped=True."
                             ),
                             payloads=[payload], cwe_id="79", owasp_category="A03:2021 Injection",
                             solution="Encode stored data at every HTML sink, validate input and deploy a restrictive Content Security Policy.",
@@ -1448,23 +1544,36 @@ def _run_proxy_assisted_verification(
                 candidates = [value for value in parameters if value.lower() in {"ip", "host", "cmd", "command", "exec", "shell"}]
                 if candidates:
                     parameter = candidates[0]
-                    marker = "SECOPS_ZAP_CMD_26"
+                    marker = "S3C0PSZAP"
                     original = original_value(parameter, "127.0.0.1")
-                    payload = f"{original};printf {marker}"
                     baseline = send()
-                    probe_data = _mutate_form_parameter(base_data, parameter, payload)
-                    response = send(data=probe_data)
-                    confirmed = marker in response.text and marker not in baseline.text
-                    record["tests"].append({"type": "command_injection", "confirmed": confirmed})
+                    payloads = [
+                        f"{original};echo {marker}",
+                        f"{original}&&echo {marker}",
+                        f"{original} & echo {marker}",
+                    ]
+                    response = baseline
+                    confirmed_payload = ""
+                    for payload in payloads:
+                        probe_data = _mutate_form_parameter(base_data, parameter, payload)
+                        response = send(data=probe_data)
+                        if marker in response.text and marker not in baseline.text:
+                            confirmed_payload = payload
+                            break
+                    confirmed = bool(confirmed_payload)
+                    record["tests"].append({
+                        "type": "command_injection", "confirmed": confirmed,
+                        "payloads_attempted": len(payloads if not confirmed else payloads[:payloads.index(confirmed_payload) + 1]),
+                    })
                     if confirmed:
                         findings.append(_proxy_verification_finding(
                             alert=f"OS command injection in parameter '{parameter}'",
                             risk="critical", url=external_url, scanner_url=scanner_url,
                             method="POST", parameter=parameter,
                             verification_status="zap-proxy-unique-command-marker-confirmed",
-                            description="A benign printf command appended to the selected POST parameter produced a unique server-side response marker through ZAP.",
+                            description="A bounded benign echo command appended to the selected POST parameter produced a unique server-side response marker through ZAP.",
                             evidence=f"HTTP {response.status_code}; unique marker={marker}; marker absent from baseline=True.",
-                            payloads=[payload], cwe_id="78", owasp_category="A03:2021 Injection",
+                            payloads=[confirmed_payload], cwe_id="78", owasp_category="A03:2021 Injection",
                             solution="Avoid shell construction, use safe process APIs with fixed arguments, validate input and run with least privilege.",
                             impact="An attacker may execute operating-system commands with the web-server process privileges.",
                         ))
@@ -1515,7 +1624,7 @@ def _run_targeted_active_scans(
             break
         # Divide the actual remaining budget among the remaining cases. The old
         # fixed 18-second window did not allow several active rules to complete.
-        case_budget = max(25.0, min(90.0, remaining / cases_left))
+        case_budget = max(35.0, min(120.0, remaining / cases_left))
         url = str(case.get("url") or "")
         scan_url = _translate_url(url, target_url, zap_target_url)
         method = str(case.get("method") or "GET").upper()
@@ -1627,6 +1736,33 @@ def _run_recursive_active_scan(
         }
 
 
+
+def _critical_case_subset(
+    cases: list[dict[str, Any]],
+    scan_mode: str,
+) -> list[dict[str, Any]]:
+    """Keep diverse critical coverage without spending the whole budget on duplicates."""
+    per_class_limit = 2 if scan_mode == "full" else 1
+    grouped: dict[str, list[dict[str, Any]]] = {}
+    for case in cases:
+        class_name = _request_case_class(case)
+        if class_name == "other":
+            continue
+        grouped.setdefault(class_name, []).append(case)
+    selected: list[dict[str, Any]] = []
+    preferred_order = (
+        "sqli", "command", "xss_reflected", "xss_stored",
+        "traversal", "ssrf", "xxe", "ssti", "deserialization",
+    )
+    for class_name in preferred_order:
+        selected.extend(grouped.get(class_name, [])[:per_class_limit])
+    for class_name, values in grouped.items():
+        if class_name in preferred_order:
+            continue
+        selected.extend(values[:per_class_limit])
+    return selected[:12 if scan_mode == "full" else 8]
+
+
 def _run_prioritized_native_plan(
     zap: ZAPv2,
     cases: list[dict[str, Any]],
@@ -1637,7 +1773,14 @@ def _run_prioritized_native_plan(
     scan_mode: str,
     active_policy: dict[str, Any],
 ) -> dict[str, Any]:
-    """Run critical checks first, then high and remaining installed rules."""
+    """Run relevant critical rules first, then broader installed-rule tiers.
+
+    The previous implementation enabled every critical rule for every request.
+    In the observed deep run, all seven critical request scans stopped at 39-56%
+    while less important tiers completed. Critical rules are now matched to the
+    request class (SQLi, XSS, command injection, traversal, SSRF/XXE), preserving
+    budget for the checks that can actually apply to that endpoint.
+    """
     batches = [item for item in active_policy.get("batches", []) if isinstance(item, dict)]
     targeted_results: list[dict[str, Any]] = []
     recursive_results: list[dict[str, Any]] = []
@@ -1649,57 +1792,135 @@ def _run_prioritized_native_plan(
         for value in batch.get("scanner_ids", [])
         if str(value)
     }
-    weights = {"critical": 0.50, "high": 0.30, "remaining": 0.20}
+    # Deep mode should favor vulnerability-confirming rules. High/remaining
+    # inventories still run, but only after the critical request contracts.
+    weights = {"critical": 0.75, "high": 0.17, "remaining": 0.08}
 
     for index, batch in enumerate(batches):
         if deadline - time.monotonic() < 20:
             break
         tier = str(batch.get("tier") or f"tier-{index + 1}")
         scanner_ids = [str(value) for value in batch.get("scanner_ids", []) if str(value)]
+        scanner_names = [str(value) for value in batch.get("scanner_names", [])]
         if not scanner_ids:
             continue
         remaining_batches = batches[index:]
-        denominator = sum(weights.get(str(item.get("tier")), 0.20) for item in remaining_batches) or 1.0
+        denominator = sum(weights.get(str(item.get("tier")), 0.10) for item in remaining_batches) or 1.0
         available = max(0.0, deadline - time.monotonic())
-        tier_budget = max(28.0, available * weights.get(tier, 0.20) / denominator)
+        tier_budget = max(28.0, available * weights.get(tier, 0.10) / denominator)
         tier_deadline = min(deadline, time.monotonic() + tier_budget)
-        configure_errors = _apply_active_scanner_batch(
-            zap, scanner_ids, strength=str(batch.get("strength") or "MEDIUM")
-        )
-        attempted_ids.update(scanner_ids)
+        configure_errors: list[str] = []
+        tier_targeted: list[dict[str, Any]] = []
+        recursive: dict[str, Any] | None = None
 
-        # Critical rules are aimed at every selected high-value request. Later
-        # tiers are also applied to a smaller representative set and then to a
-        # recursive site pass, avoiding the old all-rules/all-URLs explosion.
         if tier == "critical":
-            selected_cases = cases
-        elif tier == "high":
-            selected_cases = cases[: min(6, len(cases))]
+            selected_cases = _critical_case_subset(cases, scan_mode)
+            matched_ids: set[str] = set()
+            for case_index, case in enumerate(selected_cases):
+                remaining = tier_deadline - time.monotonic()
+                cases_left = max(1, len(selected_cases) - case_index)
+                if remaining < 22:
+                    break
+                relevant_ids = _critical_scanners_for_case(case, scanner_ids, scanner_names)
+                if not relevant_ids:
+                    continue
+                matched_ids.update(relevant_ids)
+                configure_errors.extend(
+                    _apply_active_scanner_batch(
+                        zap,
+                        relevant_ids,
+                        strength=str(batch.get("strength") or "HIGH"),
+                    )
+                )
+                attempted_ids.update(relevant_ids)
+                # One endpoint receives only its relevant scanner family, so a
+                # 30-70 second window can complete where 22 mixed rules could not.
+                case_budget = max(45.0, min(120.0, remaining / cases_left))
+                tier_targeted.extend(
+                    _run_targeted_active_scans(
+                        zap,
+                        [case],
+                        target_url,
+                        zap_target_url,
+                        context_id,
+                        min(tier_deadline, time.monotonic() + case_budget),
+                        tier=tier,
+                        scanner_ids=relevant_ids,
+                    )
+                )
+
+            # Rules that could not be classified from the installed inventory
+            # are still attempted once on the highest-value request when budget
+            # remains, rather than being silently counted as covered.
+            unmatched = [value for value in scanner_ids if value not in matched_ids]
+            if unmatched and selected_cases and tier_deadline - time.monotonic() >= 24:
+                configure_errors.extend(
+                    _apply_active_scanner_batch(
+                        zap,
+                        unmatched,
+                        strength=str(batch.get("strength") or "HIGH"),
+                    )
+                )
+                attempted_ids.update(unmatched)
+                tier_targeted.extend(
+                    _run_targeted_active_scans(
+                        zap,
+                        [selected_cases[0]],
+                        target_url,
+                        zap_target_url,
+                        context_id,
+                        min(tier_deadline, time.monotonic() + 50.0),
+                        tier="critical-generic",
+                        scanner_ids=unmatched,
+                    )
+                )
         else:
-            selected_cases = cases[: min(3, len(cases))]
-
-        targeted_deadline = tier_deadline
-        if batch.get("recursive") and tier_deadline - time.monotonic() > 35:
-            targeted_deadline = time.monotonic() + max(20.0, (tier_deadline - time.monotonic()) * 0.45)
-        tier_targeted = _run_targeted_active_scans(
-            zap, selected_cases, target_url, zap_target_url, context_id,
-            min(tier_deadline, targeted_deadline), tier=tier, scanner_ids=scanner_ids,
-        ) if selected_cases else []
-        targeted_results.extend(tier_targeted)
-
-        recursive = None
-        if batch.get("recursive") and tier_deadline - time.monotonic() >= 18:
-            recursive = _run_recursive_active_scan(
-                zap, zap_target_url, context_id, tier_deadline,
-                tier=tier, scanner_ids=scanner_ids,
+            selected_cases = (
+                cases[: min(4, len(cases))]
+                if tier == "high"
+                else cases[: min(2, len(cases))]
             )
-            recursive_results.append(recursive)
+            configure_errors.extend(
+                _apply_active_scanner_batch(
+                    zap,
+                    scanner_ids,
+                    strength=str(batch.get("strength") or "MEDIUM"),
+                )
+            )
+            attempted_ids.update(scanner_ids)
+            targeted_deadline = tier_deadline
+            if batch.get("recursive") and tier_deadline - time.monotonic() > 35:
+                targeted_deadline = time.monotonic() + max(
+                    20.0, (tier_deadline - time.monotonic()) * 0.40
+                )
+            tier_targeted = _run_targeted_active_scans(
+                zap,
+                selected_cases,
+                target_url,
+                zap_target_url,
+                context_id,
+                min(tier_deadline, targeted_deadline),
+                tier=tier,
+                scanner_ids=scanner_ids,
+            ) if selected_cases else []
 
+            if batch.get("recursive") and tier_deadline - time.monotonic() >= 18:
+                recursive = _run_recursive_active_scan(
+                    zap,
+                    zap_target_url,
+                    context_id,
+                    tier_deadline,
+                    tier=tier,
+                    scanner_ids=scanner_ids,
+                )
+                recursive_results.append(recursive)
+
+        targeted_results.extend(tier_targeted)
         phase_results.append({
             "tier": tier,
             "scanner_count": len(scanner_ids),
             "scanner_ids": scanner_ids,
-            "scanner_names": list(batch.get("scanner_names", [])),
+            "scanner_names": scanner_names,
             "strength": batch.get("strength"),
             "configure_errors": configure_errors,
             "targeted_started": len(tier_targeted),
@@ -1708,8 +1929,21 @@ def _run_prioritized_native_plan(
             "budget_seconds": round(tier_budget, 2),
         })
 
+    completed_ids: set[str] = set()
+    for item in targeted_results:
+        if isinstance(item, dict) and item.get("completed"):
+            completed_ids.update(str(value) for value in item.get("scanner_ids", []) if str(value))
+    for item in recursive_results:
+        if isinstance(item, dict) and item.get("completed"):
+            completed_ids.update(str(value) for value in item.get("scanner_ids", []) if str(value))
+
     unattempted = sorted(all_planned - attempted_ids)
     coverage_percent = round((100.0 * len(attempted_ids) / len(all_planned)), 2) if all_planned else 100.0
+    effective_percent = round((100.0 * len(completed_ids) / len(all_planned)), 2) if all_planned else 100.0
+    critical_results = [
+        item for item in targeted_results
+        if str(item.get("priority_tier", "")).startswith("critical")
+    ]
     return {
         "targeted_results": targeted_results,
         "recursive_results": recursive_results,
@@ -1718,9 +1952,14 @@ def _run_prioritized_native_plan(
         "planned_rule_count": len(all_planned),
         "attempted_rule_ids": sorted(attempted_ids),
         "attempted_rule_count": len(attempted_ids),
+        "completed_rule_ids": sorted(completed_ids),
+        "completed_rule_count": len(completed_ids),
         "unattempted_rule_ids": unattempted,
         "rule_coverage_percent": coverage_percent,
-        "coverage_complete": not unattempted,
+        "effective_rule_coverage_percent": effective_percent,
+        "critical_targeted_started": len(critical_results),
+        "critical_targeted_completed": sum(bool(item.get("completed")) for item in critical_results),
+        "coverage_complete": not unattempted and len(completed_ids) == len(all_planned),
         "priority_order": [str(item.get("tier")) for item in batches],
         "scan_mode": scan_mode,
     }
@@ -2279,8 +2518,8 @@ def run_zap_scan(
                 min(
                     deadline - 35,
                     time.monotonic() + (
-                        85 if scan_mode == "full"
-                        else 60 if scan_mode == "prioritized"
+                        120 if scan_mode == "full"
+                        else 75 if scan_mode == "prioritized"
                         else 45
                     ),
                 ),
@@ -2293,11 +2532,11 @@ def run_zap_scan(
         # passes. This preserves early findings without pretending that an
         # unfinished full inventory was complete.
         native_budget = (
-            max(75, timeout - 120) if scan_mode == "full"
-            else max(90, timeout - 90) if scan_mode == "prioritized"
+            max(180, timeout - 150) if scan_mode == "full"
+            else max(120, timeout - 105) if scan_mode == "prioritized"
             else 75
         )
-        native_deadline = min(deadline - 25, time.monotonic() + native_budget)
+        native_deadline = min(deadline - 35, time.monotonic() + native_budget)
         native_plan = _run_prioritized_native_plan(
             zap, targeted, target_url, zap_target_url, context_id,
             native_deadline, scan_mode, active_policy,
@@ -2306,8 +2545,13 @@ def run_zap_scan(
             "planned_rule_ids": active_policy.get("planned_rule_ids", []),
             "planned_rule_count": active_policy.get("planned_rule_count", 0),
             "attempted_rule_ids": [], "attempted_rule_count": 0,
+            "completed_rule_ids": [], "completed_rule_count": 0,
             "unattempted_rule_ids": active_policy.get("planned_rule_ids", []),
-            "rule_coverage_percent": 0.0, "coverage_complete": False,
+            "rule_coverage_percent": 0.0,
+            "effective_rule_coverage_percent": 0.0,
+            "critical_targeted_started": 0,
+            "critical_targeted_completed": 0,
+            "coverage_complete": False,
             "priority_order": [], "scan_mode": scan_mode,
         }
         targeted_results = list(native_plan.get("targeted_results", []))
@@ -2330,6 +2574,7 @@ def run_zap_scan(
             "priority_phases": native_plan.get("phases", []),
             "recursive_runs": recursive_results,
             "rule_coverage_percent": native_plan.get("rule_coverage_percent", 0.0),
+            "effective_rule_coverage_percent": native_plan.get("effective_rule_coverage_percent", 0.0),
             "coverage_complete": native_plan.get("coverage_complete", False),
         })
 
@@ -2497,7 +2742,11 @@ def run_zap_scan(
             "prioritized_native_plan": native_plan,
             "active_rules_planned": native_plan.get("planned_rule_count", active_policy.get("planned_rule_count", 0)),
             "active_rules_attempted": native_plan.get("attempted_rule_count", 0),
+            "active_rules_completed": native_plan.get("completed_rule_count", 0),
             "active_rule_coverage_percent": native_plan.get("rule_coverage_percent", 0.0),
+            "active_rule_effective_coverage_percent": native_plan.get("effective_rule_coverage_percent", 0.0),
+            "critical_targeted_scans_started": native_plan.get("critical_targeted_started", 0),
+            "critical_targeted_scans_completed": native_plan.get("critical_targeted_completed", 0),
             "active_rules_unattempted": native_plan.get("unattempted_rule_ids", []),
             "proxy_assisted_verification": proxy_verification_diagnostics,
             "proxy_assisted_confirmed": len(proxy_verification_findings),
@@ -2554,22 +2803,28 @@ def run_zap_scan(
             )
 
         if incomplete:
+            budget_exhausted = time.monotonic() >= deadline - 1.0
+            diagnosis = "time_limit_reached" if budget_exhausted else "active_coverage_incomplete"
             return partial(
                 "OWASP ZAP",
                 target_url,
                 (
-                    f"ZAP reached the bounded scan budget with findings preserved: "
-                    f"{len(findings)}. Seeded URLs={common['seeded_urls']}; "
+                    f"ZAP preserved {len(findings)} findings with incomplete bounded active coverage. "
+                    f"Seeded URLs={common['seeded_urls']}; "
                     f"request cases={common['seeded_request_cases']}; "
                     f"targeted scans={targeted_completed}/{targeted_started}; "
-                    f"active rules={common['active_rules_attempted']}/{common['active_rules_planned']} "
+                    f"configured rules={common['active_rules_attempted']}/{common['active_rules_planned']} "
                     f"({common['active_rule_coverage_percent']}%); "
+                    f"rules with at least one completed scan={common['active_rules_completed']} "
+                    f"({common['active_rule_effective_coverage_percent']}%); "
+                    f"critical cases={common['critical_targeted_scans_completed']}/"
+                    f"{common['critical_targeted_scans_started']}; "
                     f"site-tree URLs={common['zap_sites_tree_urls']}."
                 ),
-                diagnosis="time_limit_reached",
-                timed_out=True,
-                time_limit_reached=True,
-                time_limit_phase=phase,
+                diagnosis=diagnosis,
+                timed_out=budget_exhausted,
+                time_limit_reached=budget_exhausted,
+                time_limit_phase=phase if budget_exhausted else "",
                 **common,
             )
 
@@ -2582,8 +2837,12 @@ def run_zap_scan(
                 f"seeded URLs={common['seeded_urls']}; "
                 f"request cases={common['seeded_request_cases']}; "
                 f"targeted scans={targeted_completed}/{targeted_started}; "
-                f"active rules={common['active_rules_attempted']}/{common['active_rules_planned']} "
+                f"configured rules={common['active_rules_attempted']}/{common['active_rules_planned']} "
                 f"({common['active_rule_coverage_percent']}%); "
+                f"rules with completed scans={common['active_rules_completed']} "
+                f"({common['active_rule_effective_coverage_percent']}%); "
+                f"critical cases={common['critical_targeted_scans_completed']}/"
+                f"{common['critical_targeted_scans_started']}; "
                 f"site-tree URLs={common['zap_sites_tree_urls']}."
             ),
             timed_out=False,

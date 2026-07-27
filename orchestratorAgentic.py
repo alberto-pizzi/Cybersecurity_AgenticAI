@@ -81,7 +81,19 @@ BROAD_COVERAGE_TOOLS = ("ffuf", "zap", "nuclei", "nikto")
 DISCOVERY_COVERAGE_TOOLS = ("arjun",)
 PARAMETER_COVERAGE_TOOLS = ("sqlmap", "dalfox", "commix", "traversal", "idor")
 OPTIONAL_COVERAGE_TOOLS = ("jwt", "interactsh")
-ROUND_ACTION_BUDGETS = {"fast": 8, "balanced": 12, "deep": 16}
+ROUND_ACTION_BUDGETS = {"fast": 12, "balanced": 20, "deep": 30}
+
+COVERAGE_REPAIR_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "reasoning_summary": {"type": "string"},
+        "selected_candidate_ids": {
+            "type": "array",
+            "items": {"type": "string"},
+        },
+    },
+    "required": ["reasoning_summary", "selected_candidate_ids"],
+}
 
 PLAN_SCHEMA = {
     "type": "object",
@@ -372,7 +384,7 @@ def ollama_plan(state: AgentState) -> dict[str, Any]:
         name: {"scope": values[2], "description": values[3]}
         for name, values in REGISTRY.items()
     }
-    eligible = validate_plan(state, adaptive_fallback_plan(state))
+    eligible = validate_plan(state, discovery_candidate_actions(state))
     remaining_by_profile: dict[str, list[dict[str, Any]]] = {}
     for action in eligible:
         remaining_by_profile.setdefault(action["profile"], []).append({
@@ -381,6 +393,7 @@ def ollama_plan(state: AgentState) -> dict[str, Any]:
             "method": action.get("method", "GET"),
             "parameters": action.get("parameters", []),
         })
+    coverage_contract = _coverage_contract(state, eligible)
     prompt = {
         "target": state["target"],
         "round": state["round"] + 1,
@@ -392,18 +405,21 @@ def ollama_plan(state: AgentState) -> dict[str, Any]:
         "previous_results": compact_results(state["results"]),
         "already_completed": state["completed"],
         "remaining_eligible_actions": remaining_by_profile,
+        "minimum_coverage_contract": coverage_contract,
         "configured_oast_url": state["injection_url"],
     }
     system_message = (
         "Plan an explicitly authorized web-security assessment. Use only the supplied registry and "
-        "discovered request contracts. Broad scanners are complementary: FFUF discovers resources, "
-        "ZAP imports traffic and performs passive/active analysis, Nuclei checks templates and DAST, "
+        "discovered request contracts. Broad scanners are complementary: FFUF must discover resources "
+        "before ZAP imports the enriched traffic and performs passive/active analysis; Nuclei checks templates and DAST, "
         "and Nikto checks server exposure; do not replace one with another. In the first round include "
         "all missing eligible broad scanners and Arjun discovery actions before expensive parameter "
         "checks. In later rounds cover remaining eligible SQLMap, Dalfox, Commix, traversal, IDOR, JWT, "
-        "and Interactsh actions. Use parameter tools only on an exactly matching discovered request, "
-        "IDOR only on numeric object references, and Interactsh only on compatible inputs. Avoid "
-        "duplicates and do not repeat completed actions. Do not set finish=true while "
+        "and Interactsh actions. The minimum_coverage_contract requires at least one AI-selected "
+        "action for every still-applicable profile/tool class; do not omit a group merely because "
+        "another scanner overlaps it. Use parameter tools only on an exactly matching discovered "
+        "request, IDOR only on numeric object references, and Interactsh only on compatible inputs. "
+        "Avoid duplicates and do not repeat completed actions. Do not set finish=true while "
         "remaining_eligible_actions is non-empty. Return up to round_action_budget actions and only "
         "schema-valid JSON with a concise reasoning_summary."
     )
@@ -412,6 +428,14 @@ def ollama_plan(state: AgentState) -> dict[str, Any]:
     max_predict = AI_PLANNER_MAX_PREDICT.get(
         deterministic_core.CURRENT_SCAN_MODE, 1000
     )
+    if state["round"] >= 1:
+        # Later rounds normally select only a handful of newly discovered
+        # requests. A 720-second/1400-token retry added twelve minutes to the
+        # observed run before a useful continuation plan was produced. Cap only
+        # continuation planning; the generic coverage contract and repair pass
+        # remain active, while scanner execution budgets are unchanged.
+        total_timeout = min(total_timeout, 300)
+        max_predict = min(max_predict, 600)
     common_options = {
         "temperature": 0,
         "num_predict": max_predict,
@@ -499,14 +523,18 @@ def discovery_node(state: AgentState) -> dict[str, Any]:
     return {"discovery": discovery, "diagnostics": diagnostics}
 
 
-def adaptive_fallback_plan(state: AgentState) -> list[dict[str, Any]]:
-    """Build a discovery-driven fallback only when AI planning is unavailable."""
+def discovery_candidate_actions(state: AgentState) -> list[dict[str, Any]]:
+    """Build a target-independent action catalogue from live discovery.
+
+    The same catalogue is shown to Ollama and can serve as an explicitly
+    labelled fallback only when AI planning is unavailable.
+    """
     actions: list[dict[str, Any]] = []
     has_auth = any(bool(profile.get("cookies")) for profile in state["profiles"])
     for profile in state["profiles"]:
         name = profile["name"]
         authenticated = bool(profile.get("cookies"))
-        broad = ["ffuf", "zap", "nuclei", "nikto"] if not authenticated else ["zap", "ffuf", "nuclei", "nikto"]
+        broad = list(deterministic_core.broad_tool_order(authenticated))
         for tool in broad:
             actions.append({"profile": name, "tool": tool, "target_url": state["target"], "jwt_token": "", "injection_url": "", "reason": "Session-aware baseline coverage."})
         for case in select_arjun_request_cases(
@@ -618,6 +646,12 @@ def validate_plan(state: AgentState, proposed: Any) -> list[dict[str, Any]]:
             selected = matching[0]
             if _tool_case_skip_reason(tool, selected):
                 continue
+            if tool == "sqlmap" and profile_has_cookie and deterministic_core._is_login_case(selected):
+                # An authenticated profile is expected to stay inside the
+                # application. Testing the public login form with that session
+                # repeatedly produced login redirects and wasted a deep-mode
+                # action without adding authenticated coverage.
+                continue
             method = str(selected.get("method", "GET")).upper()
             data = str(selected.get("data", ""))
             parameters = [str(value) for value in selected.get("parameters", [])]
@@ -676,43 +710,91 @@ def _coverage_phase(tool: str) -> int:
     return 9
 
 
-def _augment_plan_for_coverage(
-    state: AgentState,
-    ai_plan: list[dict[str, Any]],
-) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-    """Keep AI choice, while guaranteeing generic scanner-class coverage.
+def _coverage_group_key(action: dict[str, Any]) -> tuple[str, str]:
+    return str(action.get("profile", "")), str(action.get("tool", "")).lower()
 
-    This is target-independent: applicability comes exclusively from the shared
-    deterministic selectors and the actually discovered request contracts.
+
+def _eligible_action_catalog(state: AgentState) -> list[dict[str, Any]]:
+    """Return target-independent actions allowed by discovery and tool schemas.
+
+    This catalogue is not an execution plan.  It contains only actions derived
+    from the shared deterministic selectors and the request contracts actually
+    discovered for each profile.  The LLM must still choose the actions that
+    become part of an agentic round.
     """
-    eligible = validate_plan(state, adaptive_fallback_plan(state))
-    round_number = state["round"] + 1
-    budget = ROUND_ACTION_BUDGETS.get(deterministic_core.CURRENT_SCAN_MODE, 12)
+    return validate_plan(state, discovery_candidate_actions(state))
 
-    if round_number == 1:
-        coverage_first = [
-            action for action in eligible
-            if action["tool"] in BROAD_COVERAGE_TOOLS + DISCOVERY_COVERAGE_TOOLS
-        ]
-        ordered = [*coverage_first, *ai_plan, *eligible]
-    else:
-        ordered = [*ai_plan, *eligible]
 
-    ordered.sort(key=lambda action: (
-        0 if round_number > 1 and action_id(action) in {action_id(item) for item in ai_plan} else 1,
-        _coverage_phase(action["tool"]),
+def _coverage_contract(
+    state: AgentState,
+    eligible: list[dict[str, Any]] | None = None,
+) -> list[dict[str, Any]]:
+    """Build a generic minimum-coverage contract for the current AI round.
+
+    One action is requested for every still-applicable profile/tool class. This
+    does not contain DVWA routes, product names, or a fixed pentest plan: the
+    applicability and candidate endpoints are computed from live discovery.
+    """
+    catalog = eligible if eligible is not None else _eligible_action_catalog(state)
+    grouped: dict[tuple[str, str], list[dict[str, Any]]] = {}
+    for action in catalog:
+        grouped.setdefault(_coverage_group_key(action), []).append(action)
+
+    groups: list[dict[str, Any]] = []
+    for (profile, tool), candidates in grouped.items():
+        groups.append({
+            "profile": profile,
+            "tool": tool,
+            "phase": _coverage_phase(tool),
+            "required": 1,
+            "candidate_count": len(candidates),
+        })
+    groups.sort(key=lambda item: (
+        int(item["phase"]),
         deterministic_core.tool_execution_rank(
-            action["tool"],
+            str(item["tool"]),
             any(
-                profile.get("name") == action["profile"] and bool(profile.get("cookies"))
+                profile.get("name") == item["profile"] and bool(profile.get("cookies"))
                 for profile in state["profiles"]
             ),
         ),
+        str(item["profile"]),
+        str(item["tool"]),
     ))
+    return groups
 
+
+def _coverage_gaps(
+    state: AgentState,
+    plan: list[dict[str, Any]],
+    eligible: list[dict[str, Any]] | None = None,
+) -> list[dict[str, Any]]:
+    catalog = eligible if eligible is not None else _eligible_action_catalog(state)
+    by_group: dict[tuple[str, str], list[dict[str, Any]]] = {}
+    for action in catalog:
+        by_group.setdefault(_coverage_group_key(action), []).append(action)
+    planned_groups = {_coverage_group_key(action) for action in plan}
+    gaps: list[dict[str, Any]] = []
+    for requirement in _coverage_contract(state, catalog):
+        key = (str(requirement["profile"]), str(requirement["tool"]))
+        if key in planned_groups:
+            continue
+        gaps.append({
+            **requirement,
+            "candidates": by_group.get(key, []),
+        })
+    return gaps
+
+
+def _merge_ai_actions(
+    current: list[dict[str, Any]],
+    additions: list[dict[str, Any]],
+    *,
+    budget: int,
+) -> list[dict[str, Any]]:
     merged: list[dict[str, Any]] = []
     seen: set[str] = set()
-    for action in ordered:
+    for action in [*current, *additions]:
         identifier = action_id(action)
         if identifier in seen:
             continue
@@ -720,12 +802,157 @@ def _augment_plan_for_coverage(
         merged.append(action)
         if len(merged) >= budget:
             break
-    augmented = [action for action in merged if action_id(action) not in {action_id(item) for item in ai_plan}]
-    return merged, augmented
+    return merged
+
+
+def ollama_coverage_repair(
+    state: AgentState,
+    current_plan: list[dict[str, Any]],
+    gaps: list[dict[str, Any]],
+    *,
+    attempt: int,
+) -> tuple[list[dict[str, Any]], str]:
+    """Ask Ollama to choose exact candidate IDs for missing tool classes.
+
+    The orchestrator never silently inserts an endpoint.  Candidate actions are
+    generated from discovery, but Ollama explicitly selects the IDs to add.
+    """
+    candidate_map: dict[str, dict[str, Any]] = {}
+    missing_groups: list[dict[str, Any]] = []
+    serial = 1
+    for gap in gaps:
+        candidate_rows: list[dict[str, Any]] = []
+        for action in list(gap.get("candidates") or [])[:6]:
+            candidate_id = f"C{serial:03d}"
+            serial += 1
+            candidate_map[candidate_id] = action
+            candidate_rows.append({
+                "candidate_id": candidate_id,
+                "profile": action["profile"],
+                "tool": action["tool"],
+                "target_url": action["target_url"],
+                "method": action.get("method", "GET"),
+                "parameters": action.get("parameters", []),
+                "reason": action.get("reason", ""),
+            })
+        missing_groups.append({
+            "profile": gap["profile"],
+            "tool": gap["tool"],
+            "required": 1,
+            "candidates": candidate_rows,
+        })
+
+    remaining_slots = max(
+        0,
+        ROUND_ACTION_BUDGETS.get(deterministic_core.CURRENT_SCAN_MODE, 20)
+        - len(current_plan),
+    )
+    if not candidate_map or remaining_slots <= 0:
+        return [], "No repair slots or candidates were available."
+
+    prompt = {
+        "target": state["target"],
+        "round": state["round"] + 1,
+        "repair_attempt": attempt,
+        "remaining_action_slots": remaining_slots,
+        "current_plan": [
+            {
+                "profile": action["profile"],
+                "tool": action["tool"],
+                "target_url": action["target_url"],
+                "method": action.get("method", "GET"),
+            }
+            for action in current_plan
+        ],
+        "missing_coverage_groups": missing_groups,
+    }
+    system_message = (
+        "Repair an authorized web-security plan. Select candidate IDs only from the supplied "
+        "missing_coverage_groups. Choose at least one valid candidate for every group while "
+        "respecting remaining_action_slots. These groups are generic scanner classes derived "
+        "from the live discovered surface; none may be silently skipped. Prefer the highest-value "
+        "candidate when several exist. Return only schema-valid JSON."
+    )
+    base = state["ollama_url"].rstrip("/")
+    context = json.dumps(prompt, ensure_ascii=False, separators=(",", ":"))
+    options = {
+        "temperature": 0,
+        "num_predict": min(500, AI_PLANNER_MAX_PREDICT.get(
+            deterministic_core.CURRENT_SCAN_MODE, 1000
+        )),
+        "num_ctx": 8192,
+        "top_p": 0.9,
+    }
+    total_timeout = min(max(120, int(state.get("ai_timeout") or 480) // 3), 240)
+    attempts = [
+        (
+            "chat",
+            f"{base}/api/chat",
+            {
+                "model": state["model"],
+                "format": COVERAGE_REPAIR_SCHEMA,
+                "messages": [
+                    {"role": "system", "content": system_message},
+                    {"role": "user", "content": context},
+                ],
+                "options": options,
+                "keep_alive": "30m",
+            },
+            max(75, int(total_timeout * 0.65)),
+        ),
+        (
+            "generate",
+            f"{base}/api/generate",
+            {
+                "model": state["model"],
+                "format": COVERAGE_REPAIR_SCHEMA,
+                "prompt": system_message + "\n\nRepair context:\n" + context,
+                "options": options,
+                "keep_alive": "30m",
+            },
+            max(60, int(total_timeout * 0.35)),
+        ),
+    ]
+    errors: list[str] = []
+    for kind, url, payload, timeout in attempts:
+        try:
+            content = _ollama_stream_content(
+                url,
+                payload,
+                response_kind=kind,
+                total_timeout=timeout,
+            )
+            value = json.loads(content)
+            if not isinstance(value, dict):
+                raise ValueError("Coverage repair was not a JSON object.")
+            selected_ids = value.get("selected_candidate_ids", [])
+            if not isinstance(selected_ids, list):
+                raise ValueError("selected_candidate_ids was not a list.")
+            selected: list[dict[str, Any]] = []
+            seen: set[str] = set()
+            for raw_id in selected_ids:
+                candidate_id = str(raw_id)
+                action = candidate_map.get(candidate_id)
+                if action is None or candidate_id in seen:
+                    continue
+                seen.add(candidate_id)
+                chosen = dict(action)
+                chosen["reason"] = (
+                    f"AI coverage repair selected {candidate_id}: "
+                    f"{chosen.get('reason', 'applicable discovered request')}"
+                )[:500]
+                selected.append(chosen)
+                if len(selected) >= remaining_slots:
+                    break
+            summary = str(value.get("reasoning_summary", ""))[:700]
+            return selected, summary
+        except Exception as exc:
+            errors.append(f"{kind}: {type(exc).__name__}: {exc}")
+    raise RuntimeError("; ".join(errors))
 
 
 def _remaining_coverage_actions(state: AgentState) -> list[dict[str, Any]]:
-    return validate_plan(state, adaptive_fallback_plan(state))
+    return validate_plan(state, discovery_candidate_actions(state))
 
 
 def _has_tool_result(profile_results: dict[str, Any], tool: str) -> bool:
@@ -794,47 +1021,128 @@ def _materialize_missing_coverage(state: AgentState) -> dict[str, dict[str, Any]
 def planner_node(state: AgentState) -> dict[str, Any]:
     round_number = state["round"] + 1
     notes = list(state["notes"])
+    eligible = _eligible_action_catalog(state)
+    budget = ROUND_ACTION_BUDGETS.get(deterministic_core.CURRENT_SCAN_MODE, 20)
+    planner_source = "ai"
+    repair_summaries: list[str] = []
+
     try:
         decision = ollama_plan(state)
         proposed = decision.get("actions", [])
         ai_plan = validate_plan(state, proposed)
-        plan, augmented = _augment_plan_for_coverage(state, ai_plan)
+        plan = _merge_ai_actions([], ai_plan, budget=budget)
         summary = str(decision.get("reasoning_summary", ""))[:1000]
-        if augmented:
-            summary += (
-                f" Coverage guardrail added {len(augmented)} applicable action(s) "
-                "that the model omitted."
+
+        # A weak local model may return a syntactically valid but under-covered
+        # plan.  Repair is still agentic: Ollama receives discovery-derived
+        # candidate IDs and explicitly chooses which endpoints to add.  The
+        # orchestrator never inserts a candidate merely because it is eligible.
+        for repair_attempt in range(1, 3):
+            gaps = _coverage_gaps(state, plan, eligible)
+            if not gaps or len(plan) >= budget:
+                break
+            try:
+                additions, repair_summary = ollama_coverage_repair(
+                    state,
+                    plan,
+                    gaps,
+                    attempt=repair_attempt,
+                )
+            except Exception as repair_exc:
+                repair_summaries.append(
+                    f"attempt {repair_attempt} failed: "
+                    f"{type(repair_exc).__name__}: {repair_exc}"
+                )
+                break
+            validated_additions = validate_plan(state, additions)
+            before = len(plan)
+            plan = _merge_ai_actions(plan, validated_additions, budget=budget)
+            repair_summaries.append(
+                f"attempt {repair_attempt}: added {len(plan) - before}; {repair_summary}"
             )
-        finished = bool(decision.get("finish", False)) and not plan
-        endpoint = str(LAST_OLLAMA_PLAN_DIAGNOSTICS.get("endpoint", "unknown"))
-        context_bytes = int(LAST_OLLAMA_PLAN_DIAGNOSTICS.get("context_bytes", 0) or 0)
-        notes.append(
-            f"Round {round_number} [ai/{endpoint}; context={context_bytes}B]: {summary}"
+            if len(plan) == before:
+                break
+
+        gaps = _coverage_gaps(state, plan, eligible)
+        if repair_summaries:
+            planner_source = "ai-repaired"
+            summary += " Coverage repair: " + " | ".join(repair_summaries)
+        if gaps:
+            missing = ", ".join(
+                f"{gap['profile']}/{gap['tool']}" for gap in gaps[:20]
+            )
+            warning = (
+                f"AI plan remains below the generic coverage contract for "
+                f"{len(gaps)} group(s): {missing}. Remaining candidates will be "
+                "presented again in the next round."
+            )
+            notes.append(warning)
+            print(f"\n[!] {warning}", file=sys.stderr, flush=True)
+            if state.get("require_ai") and not plan:
+                raise RuntimeError(warning)
+
+        if not plan and eligible:
+            raise RuntimeError(
+                "Ollama returned no executable action despite applicable discovered candidates."
+            )
+        finished = (
+            bool(decision.get("finish", False))
+            and not plan
+            and not eligible
         )
-        planner_source = "ai"
+        endpoint = str(LAST_OLLAMA_PLAN_DIAGNOSTICS.get("endpoint", "unknown"))
+        context_bytes = int(
+            LAST_OLLAMA_PLAN_DIAGNOSTICS.get("context_bytes", 0) or 0
+        )
+        notes.append(
+            f"Round {round_number} [{planner_source}/{endpoint}; "
+            f"context={context_bytes}B]: {summary}"
+        )
         print(
             f"\n[*] Ollama plan round {round_number} via {endpoint} "
-            f"(context={context_bytes} bytes): {summary}"
+            f"(context={context_bytes} bytes): {summary}",
+            flush=True,
         )
     except Exception as exc:
         if state.get("require_ai"):
             raise RuntimeError(
-                f"Strict agentic mode requires a successful Ollama plan: "
-                f"{type(exc).__name__}: {exc}"
+                f"Strict agentic mode requires a successful Ollama plan and "
+                f"coverage repair: {type(exc).__name__}: {exc}"
             ) from exc
-        fallback_plan = validate_plan(state, adaptive_fallback_plan(state))
-        plan, _ = _augment_plan_for_coverage(state, fallback_plan)
-        finished = False
-        message = f"AI planning failed after streamed chat/generate retries; discovery-driven fallback used: {type(exc).__name__}: {exc}"
+
+        # The fallback is used only when the AI call itself cannot produce a
+        # usable plan.  It is generic and discovery-driven, but it is clearly
+        # labelled so a fallback run is never confused with a model decision.
+        ordered_fallback = sorted(
+            eligible,
+            key=lambda action: (
+                _coverage_phase(action["tool"]),
+                deterministic_core.tool_execution_rank(
+                    action["tool"],
+                    any(
+                        profile.get("name") == action["profile"]
+                        and bool(profile.get("cookies"))
+                        for profile in state["profiles"]
+                    ),
+                ),
+            ),
+        )
+        plan = ordered_fallback[:budget]
+        finished = not plan
+        message = (
+            "AI planning/repair failed after streamed retries; the explicitly "
+            "labelled discovery-driven fallback was used: "
+            f"{type(exc).__name__}: {exc}"
+        )
         notes.append(message)
         planner_source = "fallback"
-        print(f"\n[!] {message}", file=sys.stderr)
-    if not plan and round_number == 1:
-        fallback_plan = validate_plan(state, adaptive_fallback_plan(state))
-        plan, _ = _augment_plan_for_coverage(state, fallback_plan)
-        planner_source = "fallback"
-    if not plan:
+        print(f"\n[!] {message}", file=sys.stderr, flush=True)
+
+    if not plan and not eligible:
         finished = True
+    elif not plan:
+        finished = False
+
     print(f"[*] Validated actions: {len(plan)}", flush=True)
     for action in plan:
         print(
@@ -842,7 +1150,13 @@ def planner_node(state: AgentState) -> dict[str, Any]:
             f"{action['target_url']} — {action['reason']}",
             flush=True,
         )
-    return {"plan": plan, "round": round_number, "notes": notes, "finished": finished, "planner_source": planner_source}
+    return {
+        "plan": plan,
+        "round": round_number,
+        "notes": notes,
+        "finished": finished,
+        "planner_source": planner_source,
+    }
 
 
 async def execute_action(action: dict[str, Any], cookies: dict[str, str], discovery: dict[str, dict[str, Any]]) -> tuple[dict[str, Any], dict[str, Any]]:
@@ -1038,35 +1352,108 @@ async def execute_plan(plan: list[dict[str, Any]], cookies: dict[str, str], disc
     return executed
 
 
-def executor_node(state: AgentState) -> dict[str, Any]:
-    if not state["plan"]:
-        return {}
-    cookies = {profile["name"]: profile["cookies"] for profile in state["profiles"]}
-    executed = asyncio.run(execute_plan(state["plan"], cookies, state["discovery"]))
-    results = {profile: dict(values) for profile, values in state["results"].items()}
-    discovery = {profile: dict(values) for profile, values in state["discovery"].items()}
-    completed, new_attack_surface = list(state["completed"]), 0
-    profile_cookies = {profile["name"]: profile["cookies"] for profile in state["profiles"]}
+def _record_execution_batch(
+    executed: list[tuple[dict[str, Any], dict[str, Any]]],
+    *,
+    state: AgentState,
+    results: dict[str, dict[str, Any]],
+    discovery: dict[str, dict[str, Any]],
+    completed: list[str],
+    profile_cookies: dict[str, str],
+) -> int:
+    """Persist one execution stage and immediately merge new attack surface."""
+    new_attack_surface = 0
     for action, result in executed:
         profile, tool = action["profile"], action["tool"]
         profile_results = results.setdefault(profile, {})
         number = 1 + sum(key.startswith(f"{tool}:") for key in profile_results)
-        profile_results[f"{tool}:{number}"] = {**result, "planner_reason": action["reason"], "planner_round": state["round"]}
+        profile_results[f"{tool}:{number}"] = {
+            **result,
+            "planner_reason": action["reason"],
+            "planner_round": state["round"],
+        }
         completed.append(action_id(action))
         log_result(profile, tool, result, action["target_url"])
         if tool == "zap":
             log_zap_session_diagnostics(result)
         if tool == "ffuf" and result.get("status") in {"success", "partial"}:
             before = len(discovery.get(profile, {}).get("request_cases", []))
-            enriched, urls = enrich_discovery_with_ffuf(discovery.get(profile, {}), result, state["target"])
+            enriched, urls = enrich_discovery_with_ffuf(
+                discovery.get(profile, {}), result, state["target"]
+            )
             if urls:
-                recrawl = discover_target(state["target"], profile_cookies.get(profile, ""), seeds=urls)
+                recrawl = discover_target(
+                    state["target"], profile_cookies.get(profile, ""), seeds=urls
+                )
                 enriched = merge_discovery(enriched, recrawl)
+                print(
+                    f"    [DISCOVERY] {profile}: FFUF re-crawl expanded the surface to "
+                    f"{len(enriched.get('html_urls', []))} HTML pages and "
+                    f"{len(enriched.get('request_cases', []))} request cases.",
+                    flush=True,
+                )
             discovery[profile] = enriched
-            new_attack_surface += max(0, len(enriched.get("request_cases", [])) - before)
+            new_attack_surface += max(
+                0, len(enriched.get("request_cases", [])) - before
+            )
         if tool == "arjun" and result.get("status") in {"success", "partial"}:
-            discovery[profile], generated = enrich_discovery_with_arjun(discovery.get(profile, {}), result, action["target_url"])
+            discovery[profile], generated = enrich_discovery_with_arjun(
+                discovery.get(profile, {}), result, action["target_url"]
+            )
             new_attack_surface += len(generated)
+    return new_attack_surface
+
+
+def executor_node(state: AgentState) -> dict[str, Any]:
+    if not state["plan"]:
+        return {}
+    cookies = {profile["name"]: profile["cookies"] for profile in state["profiles"]}
+    results = {profile: dict(values) for profile, values in state["results"].items()}
+    discovery = {profile: dict(values) for profile, values in state["discovery"].items()}
+    completed = list(state["completed"])
+    profile_cookies = {profile["name"]: profile["cookies"] for profile in state["profiles"]}
+    new_attack_surface = 0
+
+    # Discovery must be consumed before active scanners. The previous agentic
+    # executor ran FFUF and ZAP in the same batch, then merged FFUF only after
+    # ZAP had already finished. This stage boundary makes ZAP and Nuclei receive
+    # the newly discovered URLs/forms in the same round.
+    discovery_stage = [action for action in state["plan"] if action["tool"] == "ffuf"]
+    remaining_stage = [action for action in state["plan"] if action["tool"] != "ffuf"]
+
+    if discovery_stage:
+        print("\n[*] Discovery enrichment stage: FFUF runs before ZAP/Nuclei.", flush=True)
+        ffuf_executed = asyncio.run(execute_plan(discovery_stage, cookies, discovery))
+        new_attack_surface += _record_execution_batch(
+            ffuf_executed,
+            state=state,
+            results=results,
+            discovery=discovery,
+            completed=completed,
+            profile_cookies=profile_cookies,
+        )
+
+        # ZAP and Nuclei already present in the AI plan consume the enriched
+        # discovery object below. Newly applicable parameter actions are not
+        # inserted automatically: they are returned to Ollama as candidates in
+        # the next planning round, preserving genuinely agent-selected scope.
+        print(
+            "[*] FFUF enrichment is available to planned ZAP/Nuclei actions; "
+            "new parameter candidates will be offered to Ollama next round.",
+            flush=True,
+        )
+
+    if remaining_stage:
+        executed = asyncio.run(execute_plan(remaining_stage, cookies, discovery))
+        new_attack_surface += _record_execution_batch(
+            executed,
+            state=state,
+            results=results,
+            discovery=discovery,
+            completed=completed,
+            profile_cookies=profile_cookies,
+        )
+
     next_state = dict(state)
     next_state.update(results=results, discovery=discovery, completed=completed)
     remaining = _remaining_coverage_actions(next_state)
@@ -1078,15 +1465,13 @@ def executor_node(state: AgentState) -> dict[str, Any]:
         f"Round {state['round']} execution: new request contracts={new_attack_surface}; "
         f"remaining eligible actions={len(remaining)}."
     )
-    update: dict[str, Any] = {
+    return {
         "results": results,
         "discovery": discovery,
         "completed": completed,
         "notes": notes,
         "finished": not can_continue,
     }
-    return update
-
 
 def route_after_execution(state: AgentState) -> Literal["planner", "report"]:
     return "report" if state["finished"] or state["round"] >= state["max_rounds"] or not state["plan"] else "planner"
@@ -1113,7 +1498,7 @@ def report_node(state: AgentState) -> dict[str, Any]:
         "python_executable": sys.executable,
         "mcp_server_python": deterministic_core._server_python(),
         "remaining_eligible_actions_at_report": len(remaining),
-        "execution_policy": "AI-selected actions are validated against the shared deterministic tool catalogue and discovered same-profile request contracts. A target-independent coverage guardrail adds omitted applicable scanner classes, preserves phase ordering, and continues planning while eligible actions remain and round budget is available.",
+        "execution_policy": "AI-selected actions are validated against the shared deterministic tool catalogue and discovered same-profile request contracts. A target-independent minimum-coverage contract is repaired by asking Ollama to choose explicit discovery-derived candidate IDs; successful AI plans are never silently supplemented with hard-coded endpoints. FFUF is credential-isolated, runs before ZAP/Nuclei, and newly discovered parameter candidates are returned to the AI in later rounds.",
     }
     report = asyncio.run(call_mcp("pwndocServer.py", "generate_report", {
         "findings_summary": report_results, "target_url": state["target"],
@@ -1260,7 +1645,6 @@ def main() -> int:
             "requested_model": args.model,
             "error": f"{type(exc).__name__}: {exc}",
         }
-
         print(
             "[!] Ollama readiness check failed; deterministic fallback remains "
             f"available: {ollama_diagnostics['error']}",
