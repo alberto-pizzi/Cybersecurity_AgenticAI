@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import ast
 import asyncio
+import functools
 import html
 import importlib.util
 import json
@@ -305,11 +306,46 @@ def resolve_server_path(filename: str, required_tool: str = "") -> Path:
     return (SERVERS / Path(filename).name).resolve()
 
 
+def _python_has_project_deps(python: str) -> bool:
+    """Check that `python` can actually import this project's server dependencies."""
+    try:
+        probe = subprocess.run(
+            [python, "-c", "import requests, fastmcp, jwt"],
+            capture_output=True,
+            timeout=30,
+        )
+        return probe.returncode == 0
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+
+
+@functools.lru_cache(maxsize=1)
 def _server_python() -> str:
+    """Pick the Python interpreter used to launch every MCP server subprocess.
+
+    The interpreter currently running this process is always correct when
+    orchestratorDeterministic.py is launched by initScript.py (it *is* the
+    venv's python), and unlike a path cached in .secops_runtime.json it can
+    never go stale. Prefer it, and only fall back to the runtime-config
+    value — after actually verifying it works — for the case where this
+    script is invoked directly with some other interpreter.
+    """
+    # NOTE: deliberately not calling .resolve() here — .venv/bin/python is
+    # normally a symlink to the base interpreter used to create the venv,
+    # and resolving it follows the symlink to that base interpreter, which
+    # has no knowledge of the venv (and therefore none of its packages).
+    # sys.executable is already an absolute path.
+    current = sys.executable
     configured = _load_runtime().get("python_executable")
-    if isinstance(configured, str) and Path(configured).is_file():
-        return str(Path(configured).resolve())
-    return str(Path(sys.executable).resolve())
+    if not (isinstance(configured, str) and Path(configured).is_file()):
+        return current
+    if configured == current:
+        return current
+    if _python_has_project_deps(current):
+        return current
+    if _python_has_project_deps(configured):
+        return configured
+    return current
 
 
 def _server_env() -> dict[str, str]:
