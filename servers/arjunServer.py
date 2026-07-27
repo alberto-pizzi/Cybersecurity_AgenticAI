@@ -14,10 +14,10 @@ from utils import failure, partial, run_process, success
 mcp = FastMCP("Arjun Scanner")
 
 PRIORITY_PARAMETERS = (
-    "id","uid","user","user_id","account","role","admin","action","query","search","q",
-    "cmd","command","exec","shell","ip","host","file","filename","path","page","include",
-    "template","url","uri","redirect","next","return","callback","webhook","xml","data",
-    "token","key","debug","format","download","upload","name","email","message","sort","order",
+    "id", "uid", "user_id", "account", "role", "admin", "action",
+    "cmd", "command", "exec", "shell", "ip", "host", "file", "path",
+    "page", "include", "template", "url", "redirect", "callback",
+    "webhook", "xml", "debug", "download", "upload", "message",
 )
 HIGH_RISK_NAMES = {"cmd","command","exec","shell","file","filename","path","include","template","url","uri","redirect","callback","webhook","role","admin","user_id","id","xml"}
 
@@ -36,8 +36,15 @@ def _load(path: Path) -> list[str]:
     return sorted({item.strip() for item in collect_parameters(parsed) if item.strip()})
 
 
-def _run(target_url: str, cookies: str, output: Path, wordlist: str, budget: int, name: str) -> tuple[dict[str,Any],list[str]]:
-    command=["arjun","-u",target_url,"-m","GET","-oJ",str(output),"-t","5","-T","6","-w",wordlist,"-c","100"]
+def _run(target_url: str, cookies: str, output: Path, wordlist: str, budget: int, name: str, method: str = "GET", data: str = "") -> tuple[dict[str,Any],list[str]]:
+    method = method.upper()
+    command=[
+        "arjun", "-u", target_url, "-m", method,
+        "-oJ", str(output), "-q", "-t", "2", "-T", "4",
+        "-w", wordlist, "-c", "15", "--rate-limit", "20",
+    ]
+    if data and method in {"POST", "JSON", "XML"}:
+        command.extend(["--include", data])
     if cookies: command.extend(["--headers",f"Cookie: {cookies}"])
     result=run_process("Arjun",command,target=target_url,timeout=budget)
     parameters=_load(output)
@@ -46,18 +53,18 @@ def _run(target_url: str, cookies: str, output: Path, wordlist: str, budget: int
     return result,parameters
 
 
-def _finding(target_url: str, parameter: str) -> dict[str,Any]:
+def _finding(target_url: str, parameter: str, method: str = "GET") -> dict[str,Any]:
     high=parameter.lower() in HIGH_RISK_NAMES
     return {
         "alert": "High-priority hidden HTTP parameter discovered" if high else "Hidden HTTP parameter discovered",
         "risk": "info",
         "category": "discovery",
         "verification_status": "parameter-name-discovery-only",
-        "description": f"Arjun observed that the endpoint accepts or reacts to the undocumented GET parameter '{parameter}'.",
+        "description": f"Arjun observed that the endpoint accepts or reacts to the undocumented {method} parameter '{parameter}'.",
         "impact": "No vulnerability is inferred from the parameter name alone. The result expands the attack surface and identifies an input that should be tested by the appropriate injection or authorization scanner.",
         "solution": "Confirm whether the parameter is intended, document it, apply server-side validation and authorization where relevant, and remove unused inputs.",
         "url": target_url,
-        "method": "GET",
+        "method": method,
         "parameter": parameter,
         "confidence": "medium",
         "priority": "high" if high else "normal",
@@ -67,21 +74,63 @@ def _finding(target_url: str, parameter: str) -> dict[str,Any]:
 
 
 @mcp.tool()
-def run_arjun_scan(target_url: str,cookies: str="",timeout: int=120) -> dict:
-    """Probe high-risk parameter names first, then use Arjun's compact general list."""
-    timeout=max(45,min(int(timeout),240)); priority_budget=min(40,max(20,timeout//3)); general_budget=max(20,timeout-priority_budget)
+def run_arjun_scan(
+    target_url: str,
+    cookies: str = "",
+    method: str = "GET",
+    data: str = "",
+    known_parameters: list[str] | None = None,
+    timeout: int = 60,
+) -> dict:
+    """Discover hidden GET or POST parameters using the actual request method."""
+    method = str(method or "GET").upper()
+    if method not in {"GET", "POST", "JSON", "XML"}:
+        return failure("Arjun", target_url, "method must be GET, POST, JSON, or XML.")
+    timeout=max(20,min(int(timeout),60))
+    known = sorted({str(value) for value in (known_parameters or []) if str(value)})
     with tempfile.TemporaryDirectory(prefix="arjun-priority-") as td:
-        temp=Path(td); priority=temp/"priority.txt"; priority.write_text("\n".join(PRIORITY_PARAMETERS)+"\n",encoding="utf-8")
-        phases=[]; parameters=[]
-        for name,wordlist,budget in (("high_risk_parameter_names",str(priority),priority_budget),("compact_general_parameters","small",general_budget)):
-            phase,found=_run(target_url,cookies,temp/f"{name}.json",wordlist,budget,name); phases.append(phase); parameters.extend(found)
-        parameters=sorted(set(parameters),key=lambda value:(value.lower() not in HIGH_RISK_NAMES,value.lower()))
-        findings=[_finding(target_url,p) for p in parameters]
-        hard=[p for p in phases if p.get("status")=="error"]; limited=[p for p in phases if p.get("status")=="partial"]
-        common={"vulnerabilities":findings,"parameters":parameters,"authenticated":bool(cookies),"hard_failure":bool(hard),"phases":[{"name":p.get("phase"),"status":p.get("status"),"parameters":p.get("phase_parameters",0),"timeout_seconds":p.get("phase_timeout_seconds")} for p in phases],"scan_profile":"high-risk names first, then compact general discovery"}
-        if len(hard)==len(phases) and not parameters: return failure("Arjun",target_url,"Both Arjun phases failed before returning parameters.") | common
-        if hard or limited: return partial("Arjun",target_url,f"Arjun completed with incomplete coverage. Hidden parameters preserved: {len(parameters)}.",diagnosis="time_limit_reached" if limited and not hard else "partial_scan",timed_out=bool(limited),**common)
-        return success("Arjun",target_url,f"Arjun completed. Hidden parameters: {len(parameters)}.",**common)
+        temp=Path(td)
+        priority=temp/"priority.txt"
+        priority.write_text("\n".join(PRIORITY_PARAMETERS)+"\n",encoding="utf-8")
+        phase, found = _run(
+            target_url, cookies, temp/"high_risk_parameter_names.json",
+            str(priority), timeout, "high_risk_parameter_names", method, data,
+        )
+        parameters=sorted(
+            set(found) - set(known),
+            key=lambda value:(value.lower() not in HIGH_RISK_NAMES,value.lower()),
+        )
+        findings=[_finding(target_url,p,method) for p in parameters]
+        common={
+            "vulnerabilities":findings,
+            "parameters":parameters,
+            "known_parameters":known,
+            "authenticated":bool(cookies),
+            "hard_failure":phase.get("status")=="error",
+            "phases":[{
+                "name":phase.get("phase"),"status":phase.get("status"),
+                "parameters":phase.get("phase_parameters",0),
+                "timeout_seconds":phase.get("phase_timeout_seconds"),
+            }],
+            "scan_profile":f"bounded high-risk hidden-parameter names; method={method}",
+            "request_method":method,
+            "persistent_data_present":bool(data),
+        }
+        if phase.get("status")=="error" and not parameters:
+            result=failure("Arjun",target_url,"Arjun failed before returning parameters.")
+            result.update(common)
+            return result
+        if phase.get("status")=="partial":
+            return partial(
+                "Arjun",target_url,
+                f"Arjun ended with incomplete coverage. Hidden parameters preserved: {len(parameters)}.",
+                diagnosis="time_limit_reached",timed_out=True,**common,
+            )
+        return success(
+            "Arjun",target_url,
+            f"Arjun completed for {method}. New hidden parameters: {len(parameters)}.",
+            **common,
+        )
 
 
 def _once() -> int:

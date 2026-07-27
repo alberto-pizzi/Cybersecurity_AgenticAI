@@ -3,9 +3,11 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import tempfile
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
 from fastmcp import FastMCP
 
@@ -13,9 +15,21 @@ from utils import failure, partial, read_json_lines, run_process, success
 
 mcp = FastMCP("Nuclei Scanner")
 
-EXCLUDED_TAGS = "dos,fuzz,tech,osint,creds-stuffing,token-spray"
-HIGH_IMPACT_TAGS = "rce,sqli,auth-bypass,lfi,rfi,ssrf,xxe,deserialization,default-login"
-EXPOSURE_TAGS = "misconfig,exposure,default-login"
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+
+# The official template repository contains some deliberately aggressive checks.
+# They remain excluded from automatic pipeline scans; the full safe HTTP pack is
+# still available in deep mode.
+EXCLUDED_TAGS = "dos,fuzz,creds-stuffing,token-spray"
+HIGH_IMPACT_TAGS = (
+    "rce,sqli,xss,auth-bypass,lfi,rfi,ssrf,xxe,deserialization,"
+    "cmdi,code-injection,ssti,path-traversal,default-login,cve"
+)
+EXPOSURE_TAGS = (
+    "misconfig,exposure,default-login,panel,backup,config,debug,api,"
+    "swagger,graphql,token,secret,files,open-redirect,takeover"
+)
+MIN_EXPECTED_TEMPLATE_COUNT = 1000
 
 
 def _as_list(value: Any) -> list[Any]:
@@ -45,12 +59,8 @@ def _finding(item: dict[str, Any], target_url: str) -> dict[str, Any]:
     ]
     evidence = "\n\n".join(part for part in evidence_parts if part)
 
-    description = str(info.get("description") or "").strip()
-
     cve_ids = [str(value) for value in _as_list(classification.get("cve-id") or classification.get("cve_id")) if str(value)]
     cwe_ids = [str(value) for value in _as_list(classification.get("cwe-id") or classification.get("cwe_id")) if str(value)]
-    cvss_score = classification.get("cvss-score") or classification.get("cvss_score") or ""
-    cvss_metrics = classification.get("cvss-metrics") or classification.get("cvss_metrics") or ""
 
     return {
         "alert": str(info.get("name") or template_id or "Nuclei template match"),
@@ -58,9 +68,7 @@ def _finding(item: dict[str, Any], target_url: str) -> dict[str, Any]:
         "category": "observation" if severity == "info" else "vulnerability",
         "verification_status": "automated-template-match",
         "confidence": "high",
-        "description": description,
-        # These fields remain empty when the template does not provide them. The
-        # report explicitly records missing scanner metadata instead of inventing it.
+        "description": str(info.get("description") or "").strip(),
         "impact": str(info.get("impact") or "").strip(),
         "solution": str(info.get("remediation") or "").strip(),
         "url": matched_at,
@@ -73,8 +81,8 @@ def _finding(item: dict[str, Any], target_url: str) -> dict[str, Any]:
         "references": references,
         "cve_ids": cve_ids,
         "cwe_ids": cwe_ids,
-        "cvss_score": cvss_score,
-        "cvss_metrics": cvss_metrics,
+        "cvss_score": classification.get("cvss-score") or classification.get("cvss_score") or "",
+        "cvss_metrics": classification.get("cvss-metrics") or classification.get("cvss_metrics") or "",
         "classification": classification,
         "extracted_results": extracted,
         "technical_details": (
@@ -110,28 +118,194 @@ def _command(
     target_url: str,
     cookies: str,
     output_file: Path,
+    target_list: Path | None = None,
     *,
     severities: str,
-    tags: str,
+    tags: str = "",
     compatibility: bool = False,
+    automatic_scan: bool = False,
+    concurrency: int = 20,
+    rate_limit: int = 80,
+    request_timeout: int = 5,
+    retries: int = 1,
+    template_dir: str = "",
 ) -> list[str]:
     command = [
-        "nuclei", "-u", target_url,
+        "nuclei",
+        *(["-l", str(target_list)] if target_list else ["-u", target_url]),
         "-severity", severities,
-        "-tags", tags,
         "-jsonl", "-silent", "-nc",
         "-o", str(output_file),
         "-disable-update-check",
-        "-timeout", "4",
-        "-retries", "0",
-        "-c", "12",
-        "-rl", "60",
+        "-timeout", str(max(2, request_timeout)),
+        "-retries", str(max(0, retries)),
+        "-c", str(max(1, concurrency)),
+        "-rl", str(max(1, rate_limit)),
     ]
+    if template_dir:
+        command.extend(["-t", template_dir])
+    if tags:
+        command.extend(["-tags", tags])
+    if automatic_scan:
+        command.append("-as")
     if not compatibility:
-        command.extend(["-pt", "http", "-etags", EXCLUDED_TAGS])
+        command.extend(["-pt", "http", "-etags", EXCLUDED_TAGS, "-fhr"])
     if cookies:
         command.extend(["-H", f"Cookie: {cookies}"])
     return command
+
+
+def _runtime_template_directories() -> list[Path]:
+    configured_runtime = os.environ.get("SECOPS_RUNTIME_CONFIG", "").strip()
+    runtime_path = (
+        Path(configured_runtime).expanduser()
+        if configured_runtime
+        else PROJECT_ROOT / ".secops_runtime.json"
+    )
+    try:
+        payload = json.loads(runtime_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return []
+    state = payload.get("nuclei_templates", {})
+    if not isinstance(state, dict):
+        return []
+    values: list[str] = []
+    for key in ("directory", "template_directory", "path"):
+        value = str(state.get(key) or "").strip()
+        if value:
+            values.append(value)
+    for value in state.get("directories", []) if isinstance(state.get("directories"), list) else []:
+        if str(value).strip():
+            values.append(str(value))
+    for item in state.get("filesystem_candidates", []) if isinstance(state.get("filesystem_candidates"), list) else []:
+        if isinstance(item, dict) and str(item.get("directory") or "").strip():
+            values.append(str(item["directory"]))
+    executable = str((payload.get("executables") or {}).get("nuclei") or "").strip()
+    if executable:
+        parent = Path(executable).expanduser().parent
+        values.extend((str(parent / "nuclei-templates"), str(parent.parent / "nuclei-templates")))
+    return [Path(value).expanduser().resolve() for value in values]
+
+
+def _config_template_directories() -> list[Path]:
+    home = Path.home()
+    appdata = os.environ.get("APPDATA", "").strip()
+    localappdata = os.environ.get("LOCALAPPDATA", "").strip()
+    config_files = [
+        home / ".config" / "nuclei" / "config.yaml",
+        home / ".config" / "nuclei" / "config.yml",
+        Path(appdata) / "nuclei" / "config.yaml" if appdata else None,
+        Path(localappdata) / "nuclei" / "config.yaml" if localappdata else None,
+    ]
+    values: list[Path] = []
+    pattern = re.compile(
+        r"^\s*(?:templates-directory|templates_directory|templates-dir)\s*:\s*[\"']?(.+?)[\"']?\s*$",
+        re.IGNORECASE | re.MULTILINE,
+    )
+    for config in config_files:
+        if config is None or not config.is_file():
+            continue
+        try:
+            content = config.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        for match in pattern.finditer(content):
+            raw = os.path.expandvars(match.group(1).strip())
+            candidate = Path(raw).expanduser()
+            if not candidate.is_absolute():
+                candidate = config.parent / candidate
+            values.append(candidate.resolve())
+    return values
+
+
+def _template_directories() -> list[Path]:
+    home = Path.home()
+    configured = os.environ.get("NUCLEI_TEMPLATES_DIR", "").strip()
+    appdata = os.environ.get("APPDATA", "").strip()
+    localappdata = os.environ.get("LOCALAPPDATA", "").strip()
+    programdata = os.environ.get("PROGRAMDATA", "").strip()
+    candidates = [
+        Path(configured).expanduser() if configured else None,
+        *_runtime_template_directories(),
+        *_config_template_directories(),
+        PROJECT_ROOT / "tools" / "nuclei-templates",
+        home / "nuclei-templates",
+        home / ".local" / "nuclei-templates",
+        home / ".config" / "nuclei" / "templates",
+        home / "AppData" / "Roaming" / "nuclei" / "templates",
+        Path(appdata) / "nuclei-templates" if appdata else None,
+        Path(appdata) / "nuclei" / "templates" if appdata else None,
+        Path(localappdata) / "nuclei-templates" if localappdata else None,
+        Path(localappdata) / "nuclei" / "templates" if localappdata else None,
+        Path(programdata) / "nuclei-templates" if programdata else None,
+    ]
+    return list(dict.fromkeys(path.resolve() for path in candidates if path is not None))
+
+
+def _filesystem_template_inventory() -> dict[str, Any]:
+    inventories: list[dict[str, Any]] = []
+    for directory in _template_directories():
+        if not directory.is_dir():
+            continue
+        count = sum(
+            1
+            for path in directory.rglob("*")
+            if path.is_file() and path.suffix.lower() in {".yaml", ".yml"}
+        )
+        inventories.append({"directory": str(directory), "count": count})
+    best = max(inventories, key=lambda item: item["count"], default={"directory": "", "count": 0})
+    return {"count": int(best["count"]), "directory": str(best["directory"]), "candidates": inventories}
+
+
+def _template_inventory() -> dict[str, Any]:
+    # The CLI listing can stall on Windows even when the official repository is
+    # present. Filesystem inventory is therefore authoritative fallback and the
+    # selected directory is passed explicitly to every scan phase.
+    filesystem = _filesystem_template_inventory()
+    result = run_process(
+        "Nuclei template inventory",
+        ["nuclei", "-tl", "-silent", "-nc", "-disable-update-check"],
+        target="templates",
+        timeout=45,
+    )
+    lines = {
+        line.strip()
+        for line in str(result.get("stdout", "")).splitlines()
+        if line.strip() and not line.lstrip().startswith("[")
+    }
+    cli_count = len(lines)
+    count = max(cli_count, int(filesystem.get("count", 0)))
+    return {
+        "count": count,
+        "cli_count": cli_count,
+        "filesystem_count": int(filesystem.get("count", 0)),
+        "directory": str(filesystem.get("directory", "")),
+        "filesystem_candidates": filesystem.get("candidates", []),
+        "sufficient": count >= MIN_EXPECTED_TEMPLATE_COUNT,
+        "minimum_expected": MIN_EXPECTED_TEMPLATE_COUNT,
+        "status": result.get("status"),
+        "diagnosis": result.get("diagnosis", ""),
+        "stderr_excerpt": str(result.get("stderr", ""))[-1200:],
+    }
+
+
+def _attempt_template_refresh() -> dict[str, Any]:
+    """Ask the installed Nuclei engine to restore its official template pack."""
+    result = run_process(
+        "Nuclei template refresh",
+        ["nuclei", "-update-templates"],
+        target="templates",
+        timeout=360,
+    )
+    combined = "\n".join((str(result.get("stdout", "")), str(result.get("stderr", ""))))
+    if result.get("status") == "error" and "unknown flag" in combined.lower():
+        result = run_process(
+            "Nuclei template refresh",
+            ["nuclei", "-ut"],
+            target="templates",
+            timeout=360,
+        )
+    return result
 
 
 def _run_phase(
@@ -143,10 +317,30 @@ def _run_phase(
     severities: str,
     tags: str,
     timeout: int,
+    target_list: Path | None = None,
+    automatic_scan: bool = False,
+    concurrency: int = 20,
+    rate_limit: int = 80,
+    request_timeout: int = 5,
+    retries: int = 1,
+    template_dir: str = "",
 ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     result = run_process(
         "Nuclei",
-        _command(target_url, cookies, path, severities=severities, tags=tags),
+        _command(
+            target_url,
+            cookies,
+            path,
+            target_list,
+            severities=severities,
+            tags=tags,
+            automatic_scan=automatic_scan,
+            concurrency=concurrency,
+            rate_limit=rate_limit,
+            request_timeout=request_timeout,
+            retries=retries,
+            template_dir=template_dir,
+        ),
         target=target_url,
         timeout=timeout,
     )
@@ -159,9 +353,16 @@ def _run_phase(
                 target_url,
                 cookies,
                 path,
+                target_list,
                 severities=severities,
-                tags=tags,
+                tags=tags or (f"{HIGH_IMPACT_TAGS},{EXPOSURE_TAGS}" if automatic_scan else ""),
                 compatibility=True,
+                automatic_scan=False,
+                concurrency=concurrency,
+                rate_limit=rate_limit,
+                request_timeout=request_timeout,
+                retries=retries,
+                template_dir=template_dir,
             ),
             target=target_url,
             timeout=timeout,
@@ -181,8 +382,79 @@ def _run_phase(
         phase=name,
         phase_timeout_seconds=timeout,
         phase_findings=len(items),
+        phase_tags=tags,
+        automatic_scan=automatic_scan,
     )
     return result, items
+
+
+def _phase_definitions(scan_profile: str, total_timeout: int) -> list[dict[str, Any]]:
+    usable = max(30, total_timeout - 12)
+    if scan_profile == "fast":
+        return [{
+            "name": "critical_high_value",
+            "severities": "medium,high,critical",
+            "tags": HIGH_IMPACT_TAGS,
+            "timeout": usable,
+        }]
+    if scan_profile == "balanced":
+        budgets = [max(40, int(usable * 0.48)), max(35, int(usable * 0.32))]
+        third = max(25, usable - sum(budgets))
+        return [
+            {
+                "name": "critical_high_value",
+                "severities": "medium,high,critical",
+                "tags": HIGH_IMPACT_TAGS,
+                "timeout": budgets[0],
+            },
+            {
+                "name": "exposures_and_misconfigurations",
+                "severities": "info,low,medium,high,critical",
+                "tags": EXPOSURE_TAGS,
+                "timeout": budgets[1],
+            },
+            {
+                "name": "technology_automatic_scan",
+                "severities": "low,medium,high,critical",
+                "tags": "",
+                "automatic_scan": True,
+                "timeout": third,
+            },
+        ]
+
+    budgets = [
+        max(55, int(usable * 0.30)),
+        max(45, int(usable * 0.22)),
+        max(35, int(usable * 0.16)),
+    ]
+    fourth = max(45, usable - sum(budgets))
+    return [
+        {
+            "name": "critical_high_value",
+            "severities": "medium,high,critical",
+            "tags": HIGH_IMPACT_TAGS,
+            "timeout": budgets[0],
+        },
+        {
+            "name": "exposures_and_misconfigurations",
+            "severities": "info,low,medium,high,critical",
+            "tags": EXPOSURE_TAGS,
+            "timeout": budgets[1],
+        },
+        {
+            "name": "technology_automatic_scan",
+            "severities": "low,medium,high,critical",
+            "tags": "",
+            "automatic_scan": True,
+            "timeout": budgets[2],
+        },
+        {
+            "name": "broad_safe_http_templates",
+            "severities": "low,medium,high,critical",
+            "tags": "",
+            "timeout": fourth,
+        },
+    ]
 
 
 def _run_nuclei_core(
@@ -190,13 +462,33 @@ def _run_nuclei_core(
     cookies: str = "",
     timeout: int = 180,
     output_file: str = "",
+    seed_urls: list[str] | None = None,
+    max_targets: int = 4,
+    scan_profile: str = "balanced",
 ) -> dict[str, Any]:
-    """Run high-impact templates first, then exposure and misconfiguration checks."""
-    timeout = max(90, min(int(timeout), 300))
-    first_budget = max(55, int(timeout * 0.58))
-    second_budget = max(35, timeout - first_budget)
-    temporary: tempfile.TemporaryDirectory[str] | None = None
+    """Run the official template pack in prioritized phases and preserve partial results."""
+    scan_profile = str(scan_profile or "balanced").lower()
+    if scan_profile not in {"fast", "balanced", "deep"}:
+        return failure("Nuclei", target_url, "scan_profile must be fast, balanced, or deep.")
+    timeout = max(35, min(int(timeout), 600))
+    inventory = _template_inventory()
+    refresh_result: dict[str, Any] = {}
+    if inventory.get("count", 0) <= 0:
+        refresh_result = _attempt_template_refresh()
+        inventory = _template_inventory()
+    template_dir = str(inventory.get("directory") or "")
+    if inventory.get("count", 0) <= 0:
+        result = failure(
+            "Nuclei",
+            target_url,
+            "No Nuclei templates were detected after checking runtime metadata, standard Windows/Linux directories, Nuclei configuration files, and one bounded official update attempt. Run initScript.py with network access to restore the official template pack.",
+            diagnosis="nuclei_templates_missing",
+        )
+        result["template_inventory"] = inventory
+        result["template_refresh"] = refresh_result
+        return result
 
+    temporary: tempfile.TemporaryDirectory[str] | None = None
     if output_file:
         combined_path = Path(output_file).expanduser().resolve()
         combined_path.parent.mkdir(parents=True, exist_ok=True)
@@ -208,32 +500,58 @@ def _run_nuclei_core(
         prefix = "nuclei"
         combined_path = work_dir / "combined.jsonl"
 
-    phase_paths = [
-        work_dir / f"{prefix}-high-impact.jsonl",
-        work_dir / f"{prefix}-exposure.jsonl",
+    def target_score(value: str) -> int:
+        parsed = urlparse(value)
+        path = parsed.path.lower()
+        score = 0
+        if any(token in path for token in ("setup", "admin", "config", "api", "swagger", "login", "phpinfo")):
+            score += 100
+        if any(token in path for token in ("upload", "debug", "backup", "download", "search", "query", "callback", "webhook")):
+            score += 65
+        if parsed.query:
+            score += 20
+        return score
+
+    max_targets = max(1, min(int(max_targets), 20))
+    seed_candidates = [
+        value for value in (seed_urls or [])
+        if isinstance(value, str)
+        and value.startswith(("http://", "https://"))
+        and value != target_url
     ]
-    for path in phase_paths:
-        path.unlink(missing_ok=True)
+    ranked_seeds = sorted(dict.fromkeys(seed_candidates), key=target_score, reverse=True)
+    focused_targets = [target_url, *ranked_seeds[: max(0, max_targets - 1)]]
+    target_list = work_dir / f"{prefix}-targets.txt"
+    target_list.write_text("\n".join(focused_targets) + "\n", encoding="utf-8")
+
+    definitions = _phase_definitions(scan_profile, timeout)
+    phase_paths = [work_dir / f"{prefix}-{index + 1}.jsonl" for index in range(len(definitions))]
+    for phase_path in phase_paths:
+        phase_path.unlink(missing_ok=True)
+
+    if scan_profile == "deep":
+        concurrency, rate_limit, request_timeout, retries = 30, 120, 6, 1
+    elif scan_profile == "balanced":
+        concurrency, rate_limit, request_timeout, retries = 24, 100, 5, 1
+    else:
+        concurrency, rate_limit, request_timeout, retries = 16, 60, 3, 0
 
     phases: list[dict[str, Any]] = []
     all_items: list[dict[str, Any]] = []
     try:
-        definitions = [
-            dict(
-                name="high_impact",
-                severities="medium,high,critical",
-                tags=HIGH_IMPACT_TAGS,
-                timeout=first_budget,
-            ),
-            dict(
-                name="exposure_misconfiguration",
-                severities="low,medium,high,critical",
-                tags=EXPOSURE_TAGS,
-                timeout=second_budget,
-            ),
-        ]
-        for path, kwargs in zip(phase_paths, definitions):
-            phase, items = _run_phase(target_url, cookies, path, **kwargs)
+        for phase_path, definition in zip(phase_paths, definitions):
+            phase, items = _run_phase(
+                target_url,
+                cookies,
+                phase_path,
+                target_list=target_list,
+                concurrency=concurrency,
+                rate_limit=rate_limit,
+                request_timeout=request_timeout,
+                retries=retries,
+                template_dir=template_dir,
+                **definition,
+            )
             phases.append(phase)
             all_items.extend(items)
 
@@ -246,10 +564,7 @@ def _run_nuclei_core(
 
         findings = [_finding(item, target_url) for item in all_items]
         hard_failures = [phase for phase in phases if phase.get("status") == "error"]
-        limited = [
-            phase for phase in phases
-            if phase.get("status") == "partial" and phase.get("timed_out")
-        ]
+        limited = [phase for phase in phases if phase.get("status") == "partial" and phase.get("timed_out")]
         summary = [
             {
                 "name": phase.get("phase"),
@@ -258,6 +573,8 @@ def _run_nuclei_core(
                 "duration_seconds": phase.get("duration_seconds"),
                 "findings": phase.get("phase_findings", 0),
                 "timeout_seconds": phase.get("phase_timeout_seconds"),
+                "tags": phase.get("phase_tags", ""),
+                "automatic_scan": phase.get("automatic_scan", False),
                 "stderr_excerpt": str(phase.get("stderr", ""))[-1200:],
             }
             for phase in phases
@@ -266,10 +583,15 @@ def _run_nuclei_core(
             "vulnerabilities": findings,
             "authenticated": bool(cookies),
             "phases": summary,
+            "scan_profile": scan_profile,
             "scan_scope": (
-                f"High-impact tags first ({HIGH_IMPACT_TAGS}), then {EXPOSURE_TAGS}; "
-                f"excluded {EXCLUDED_TAGS}."
+                f"Official template inventory={inventory.get('count')}; profile={scan_profile}; "
+                f"targets={len(focused_targets)}; phases={','.join(item['name'] for item in definitions)}; "
+                f"excluded tags={EXCLUDED_TAGS}."
             ),
+            "focused_targets": focused_targets,
+            "template_inventory": inventory,
+            "template_refresh": refresh_result,
             "hard_failure": bool(hard_failures),
             "output_file": str(combined_path) if output_file else "",
         }
@@ -278,7 +600,7 @@ def _run_nuclei_core(
             result = failure(
                 "Nuclei",
                 target_url,
-                "Both focused Nuclei phases failed before producing parseable findings.",
+                "Every prioritized Nuclei phase failed before producing parseable findings.",
                 stdout="\n".join(str(phase.get("stdout", "")) for phase in phases),
                 stderr="\n".join(str(phase.get("stderr", "")) for phase in phases),
                 diagnosis="nuclei_phases_failed",
@@ -287,17 +609,11 @@ def _run_nuclei_core(
             return result
 
         if hard_failures or limited:
-            # timed_out is supplied exactly once. This fixes the FastMCP ToolError
-            # caused by duplicate keyword arguments in the previous version.
             return partial(
                 "Nuclei",
                 target_url,
-                f"Focused Nuclei scan ended with incomplete coverage. Findings preserved: {len(findings)}.",
-                diagnosis=(
-                    "time_limit_reached"
-                    if limited and not hard_failures
-                    else "partial_scan"
-                ),
+                f"Prioritized {scan_profile} Nuclei scan ended with incomplete coverage. Findings preserved: {len(findings)}.",
+                diagnosis="time_limit_reached" if limited and not hard_failures else "partial_scan",
                 timed_out=bool(limited),
                 time_limit_reached=bool(limited),
                 **common,
@@ -306,14 +622,15 @@ def _run_nuclei_core(
         return success(
             "Nuclei",
             target_url,
-            f"Focused Nuclei scan completed. Findings: {len(findings)}.",
+            f"Prioritized {scan_profile} Nuclei scan completed. Findings: {len(findings)}.",
             timed_out=False,
             time_limit_reached=False,
             **common,
         )
     finally:
-        for path in phase_paths:
-            path.unlink(missing_ok=True)
+        for phase_path in phase_paths:
+            phase_path.unlink(missing_ok=True)
+        target_list.unlink(missing_ok=True)
         if temporary is not None:
             temporary.cleanup()
 
@@ -324,8 +641,19 @@ def run_nuclei_scan(
     cookies: str = "",
     timeout: int = 180,
     output_file: str = "",
+    seed_urls: list[str] | None = None,
+    max_targets: int = 4,
+    scan_profile: str = "balanced",
 ) -> dict:
-    return _run_nuclei_core(target_url, cookies, timeout, output_file)
+    return _run_nuclei_core(
+        target_url,
+        cookies,
+        timeout,
+        output_file,
+        seed_urls,
+        max_targets,
+        scan_profile,
+    )
 
 
 def _once() -> int:

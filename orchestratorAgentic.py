@@ -17,23 +17,32 @@ warnings.filterwarnings("ignore", message=r"authlib\.jose module is deprecated.*
 import requests
 from langgraph.graph import END, START, StateGraph
 
+import orchestratorDeterministic as deterministic_core
+
 from orchestratorDeterministic import (
     BROAD_SCANNER_TIMEOUTS,
+    CURRENT_SCAN_MODE,
+    ARJUN_TIMEOUT,
+    configure_scan_mode,
     PARAMETER_TOOL_TIMEOUTS,
     _tool_case_skip_reason,
     call_mcp,
+    call_mcp_with_progress,
     diagnose_error,
     discover_target,
     enrich_discovery_with_arjun,
     enrich_discovery_with_ffuf,
     merge_discovery,
-    select_arjun_candidates,
+    select_arjun_request_cases,
     iter_leaf_results,
     log_result,
+    log_zap_session_diagnostics,
     print_preflight_report,
+    print_security_finding_summary,
     run_preflight_checks,
     select_request_cases,
     select_tool_request_cases,
+    select_oast_request_cases,
     write_emergency_json_report,
 )
 from utils import canonical_cookie_header, cookie_names, normalize_url, same_origin
@@ -55,21 +64,16 @@ class AgentState(TypedDict):
     finished: bool
     diagnostics: list[dict[str, Any]]
     report_status: dict[str, Any]
+    require_ai: bool
+    planner_source: str
+    ai_timeout: int
 
 
-REGISTRY = {
-    "zap": ("zapServer.py", "run_zap_scan", "base", "Broad spider and active scan."),
-    "nuclei": ("nucleiServer.py", "run_nuclei_scan", "base", "Known exposures and misconfigurations."),
-    "nikto": ("niktoServer.py", "run_nikto_scan", "base", "Web-server checks."),
-    "ffuf": ("ffufServer.py", "run_ffuf_fuzz", "base", "Hidden resource discovery."),
-    "arjun": ("arjunServer.py", "run_arjun_scan", "url", "Hidden GET parameter discovery."),
-    "sqlmap": ("sqlmapServer.py", "run_sqlmap_scan", "parameterized", "SQL injection testing."),
-    "dalfox": ("dalfoxServer.py", "run_dalfox_scan", "parameterized", "XSS testing."),
-    "commix": ("commixServer.py", "run_commix_scan", "parameterized", "Command injection testing."),
-    "idor": ("idorForgeServer.py", "run_idor_check", "numeric", "Numeric IDOR differential check."),
-    "jwt": ("jwtServer.py", "run_jwt_scan", "jwt", "JWT analysis."),
-    "interactsh": ("interactshServer.py", "run_interactsh_client", "oast", "Explicit OAST test."),
-}
+REGISTRY = deterministic_core.agentic_registry()
+
+AI_PLANNER_TIMEOUTS = {"fast": 300, "balanced": 480, "deep": 720}
+AI_PLANNER_MAX_PREDICT = {"fast": 700, "balanced": 1000, "deep": 1400}
+LAST_OLLAMA_PLAN_DIAGNOSTICS: dict[str, Any] = {}
 
 PLAN_SCHEMA = {
     "type": "object",
@@ -97,46 +101,347 @@ PLAN_SCHEMA = {
 }
 
 
+
+def _ollama_error(response: requests.Response) -> str:
+    try:
+        payload = response.json()
+    except ValueError:
+        return (response.text or response.reason or "unknown Ollama error").strip()
+    if isinstance(payload, dict):
+        return str(payload.get("error") or payload.get("message") or payload).strip()
+    return str(payload)
+
+
+def _ollama_installed_models(ollama_url: str) -> list[str]:
+    response = requests.get(
+        f"{ollama_url.rstrip('/')}/api/tags", timeout=(5, 30)
+    )
+    response.raise_for_status()
+    payload = response.json()
+    values: list[str] = []
+    for item in payload.get("models", []) if isinstance(payload, dict) else []:
+        if not isinstance(item, dict):
+            continue
+        value = str(item.get("name") or item.get("model") or "").strip()
+        if value:
+            values.append(value)
+    return list(dict.fromkeys(values))
+
+
+def _model_matches(requested: str, installed: str) -> bool:
+    left, right = requested.lower(), installed.lower()
+    if left == right:
+        return True
+    if ":" not in left and right.split(":", 1)[0] == left:
+        return True
+    return False
+
+
+def ensure_ollama_model(
+    ollama_url: str,
+    requested_model: str,
+    *,
+    allow_pull: bool = True,
+) -> tuple[str, dict[str, Any]]:
+    """Verify Ollama and ensure a usable model exists before planning."""
+    base = ollama_url.rstrip("/")
+    diagnostics: dict[str, Any] = {
+        "ollama_url": base,
+        "requested_model": requested_model,
+        "model_pull_attempted": False,
+        "fallback_model_used": False,
+    }
+    version = requests.get(f"{base}/api/version", timeout=(5, 20))
+    version.raise_for_status()
+    try:
+        diagnostics["ollama_version"] = version.json().get("version", "unknown")
+    except ValueError:
+        diagnostics["ollama_version"] = "unknown"
+
+    installed = _ollama_installed_models(base)
+    diagnostics["installed_models_before"] = installed
+    matched = next(
+        (name for name in installed if _model_matches(requested_model, name)),
+        "",
+    )
+    if matched:
+        diagnostics.update(model_ready=True, selected_model=matched)
+        return matched, diagnostics
+
+    pull_error = ""
+    if allow_pull:
+        diagnostics["model_pull_attempted"] = True
+        try:
+            response = requests.post(
+                f"{base}/api/pull",
+                json={"model": requested_model, "stream": False},
+                timeout=(10, 7200),
+            )
+            if response.status_code >= 400:
+                raise RuntimeError(
+                    f"HTTP {response.status_code}: {_ollama_error(response)}"
+                )
+            installed = _ollama_installed_models(base)
+            diagnostics["installed_models_after_pull"] = installed
+            matched = next(
+                (name for name in installed if _model_matches(requested_model, name)),
+                "",
+            )
+            if matched:
+                diagnostics.update(model_ready=True, selected_model=matched)
+                return matched, diagnostics
+            pull_error = (
+                "Ollama pull completed but the requested model was not listed "
+                "by /api/tags."
+            )
+        except Exception as exc:
+            pull_error = f"{type(exc).__name__}: {exc}"
+    diagnostics["model_pull_error"] = pull_error
+
+    if installed:
+        selected = installed[0]
+        diagnostics.update(
+            model_ready=True,
+            selected_model=selected,
+            fallback_model_used=True,
+            fallback_reason=(
+                pull_error
+                or "Requested model is absent and automatic pulling was disabled."
+            ),
+        )
+        return selected, diagnostics
+
+    diagnostics.update(model_ready=False, selected_model="")
+    raise RuntimeError(
+        "Ollama is reachable but no usable local model exists. "
+        + (pull_error or f"Requested model '{requested_model}' is not installed.")
+    )
+
+
+def _parse_ollama_plan_content(content: str) -> dict[str, Any]:
+    value = json.loads(str(content or ""))
+    if not isinstance(value, dict) or not isinstance(value.get("actions", []), list):
+        raise ValueError("Ollama returned an invalid plan object.")
+    return value
+
+
+def compact_discovery_for_planner(discovery: dict[str, dict[str, Any]]) -> dict[str, Any]:
+    """Keep the LLM context bounded without removing actionable requests.
+
+    The previous implementation serialized complete discovery objects. On a
+    local 7B/8B model this could contain large response excerpts and exhaust the
+    240-second HTTP read timeout before a single plan was returned.
+    """
+    compact: dict[str, Any] = {}
+    for profile, found in discovery.items():
+        ranked_cases = select_request_cases(found, limit=36)
+        request_cases = []
+        for case in ranked_cases:
+            request_cases.append({
+                "url": str(case.get("url", "")),
+                "method": str(case.get("method", "GET")).upper(),
+                "data": str(case.get("data", ""))[:900],
+                "parameters": [str(value) for value in case.get("parameters", [])][:20],
+                "priority_score": int(case.get("priority_score", 0) or 0),
+            })
+        compact[profile] = {
+            "authenticated": found.get("authentication_effective"),
+            "html_url_count": len(found.get("html_urls", [])),
+            "request_case_count": len(found.get("request_cases", [])),
+            "high_value_html_urls": [str(value) for value in found.get("html_urls", [])[:45]],
+            "request_cases": request_cases,
+            "jwt_tokens": [str(value)[:1800] for value in found.get("jwt_tokens", [])[:4]],
+            "crawl_errors": [
+                {
+                    "url": str(item.get("url", "")),
+                    "error": str(item.get("error", item.get("message", "")))[:300],
+                }
+                for item in found.get("errors", [])[:8]
+                if isinstance(item, dict)
+            ],
+        }
+    return compact
+
+
+def _ollama_stream_content(
+    url: str,
+    payload: dict[str, Any],
+    *,
+    response_kind: str,
+    total_timeout: int,
+) -> str:
+    """Read a streamed Ollama response so token progress prevents false timeout.
+
+    The non-stream JSON branch is retained for older Ollama-compatible servers
+    and for the project's controlled regression fixtures.
+    """
+    started = time.monotonic()
+    chunks: list[str] = []
+    read_timeout = max(90, int(total_timeout) + 30)
+    response = requests.post(
+        url,
+        json={**payload, "stream": True},
+        stream=True,
+        timeout=(10, read_timeout),
+    )
+    try:
+        if response.status_code >= 400:
+            raise RuntimeError(f"HTTP {response.status_code}: {_ollama_error(response)}")
+        if not hasattr(response, "iter_lines"):
+            value = response.json()
+            if response_kind == "chat":
+                content = str((value.get("message") or {}).get("content") or "")
+            else:
+                content = str(value.get("response") or "")
+            if not content:
+                raise ValueError("Ollama completed without returning plan content.")
+            return content
+        for raw in response.iter_lines(decode_unicode=True):
+            if time.monotonic() - started > total_timeout:
+                raise TimeoutError(
+                    f"Ollama planning exceeded the {total_timeout}-second budget."
+                )
+            if not raw:
+                continue
+            try:
+                event = json.loads(raw)
+            except json.JSONDecodeError as exc:
+                raise ValueError(f"Ollama returned a non-JSON stream event: {raw[:200]}") from exc
+            if event.get("error"):
+                raise RuntimeError(str(event.get("error")))
+            if response_kind == "chat":
+                piece = str((event.get("message") or {}).get("content") or "")
+            else:
+                piece = str(event.get("response") or "")
+            if piece:
+                chunks.append(piece)
+            if event.get("done") is True:
+                break
+    finally:
+        close = getattr(response, "close", None)
+        if callable(close):
+            close()
+    content = "".join(chunks).strip()
+    if not content:
+        raise ValueError("Ollama completed without returning plan content.")
+    return content
+
+
+def warm_ollama_model(
+    ollama_url: str,
+    model: str,
+    *,
+    timeout: int,
+) -> dict[str, Any]:
+    """Load model weights before discovery so planning starts from a warm model."""
+    started = time.monotonic()
+    content = _ollama_stream_content(
+        f"{ollama_url.rstrip('/')}/api/generate",
+        {
+            "model": model,
+            "prompt": "Reply with READY and nothing else.",
+            "options": {"temperature": 0, "num_predict": 4, "num_ctx": 2048},
+            "keep_alive": "30m",
+        },
+        response_kind="generate",
+        total_timeout=max(90, min(int(timeout), 600)),
+    )
+    return {
+        "ready": True,
+        "response": content[:80],
+        "seconds": round(time.monotonic() - started, 2),
+    }
+
+
 def action_id(action: dict[str, Any]) -> str:
     return "|".join(str(action.get(key, "")) for key in ("profile", "tool", "target_url", "method", "data", "jwt_token", "injection_url"))
 
 
 def ollama_plan(state: AgentState) -> dict[str, Any]:
-    registry = {name: {"scope": values[2], "description": values[3]} for name, values in REGISTRY.items()}
+    registry = {
+        name: {"scope": values[2], "description": values[3]}
+        for name, values in REGISTRY.items()
+    }
     prompt = {
         "target": state["target"],
         "round": state["round"] + 1,
         "maximum_rounds": state["max_rounds"],
         "profiles": [profile["name"] for profile in state["profiles"]],
         "registry": registry,
-        "discovery": state["discovery"],
+        "discovery": compact_discovery_for_planner(state["discovery"]),
         "previous_results": compact_results(state["results"]),
         "already_completed": state["completed"],
         "configured_oast_url": state["injection_url"],
     }
-    response = requests.post(
-        f"{state['ollama_url'].rstrip('/')}/api/chat",
-        json={
-            "model": state["model"], "stream": False, "format": PLAN_SCHEMA,
-            "messages": [
-                {"role": "system", "content": (
-                    "Plan an explicitly authorized web-security assessment. Use only the supplied registry, "
-                    "same-profile discovered URLs, GET/POST request cases and JWTs. Use parameter tools only on discovered request cases, "
-                    "IDOR only on numeric values, and Interactsh only when configured. Avoid duplicates. "
-                    "A scanner error never means the target is clean. A configured time limit is a partial result, not an error. Prioritize high-impact checks and risk-ranked request cases. Return only schema-valid JSON."
-                )},
-                {"role": "user", "content": json.dumps(prompt, ensure_ascii=False)},
-            ],
-            "options": {"temperature": 0},
-        },
-        timeout=(5, 180),
+    system_message = (
+        "Plan an explicitly authorized web-security assessment. Use only the "
+        "supplied registry and discovered request cases. Use parameter tools "
+        "only on a matching discovered request, IDOR only on numeric object "
+        "references, and Interactsh only on compatible inputs. Avoid duplicates "
+        "and do not repeat completed actions. Prioritize high-impact checks. "
+        "Return only schema-valid JSON with a concise reasoning_summary."
     )
-    response.raise_for_status()
-    content = response.json().get("message", {}).get("content", "")
-    value = json.loads(content)
-    if not isinstance(value, dict) or not isinstance(value.get("actions", []), list):
-        raise ValueError("Ollama returned an invalid plan.")
-    return value
+    base = state["ollama_url"].rstrip("/")
+    total_timeout = max(120, int(state.get("ai_timeout") or 480))
+    max_predict = AI_PLANNER_MAX_PREDICT.get(
+        deterministic_core.CURRENT_SCAN_MODE, 1000
+    )
+    common_options = {
+        "temperature": 0,
+        "num_predict": max_predict,
+        "num_ctx": 8192,
+        "top_p": 0.9,
+    }
+    context = json.dumps(prompt, ensure_ascii=False, separators=(",", ":"))
+    attempts = [
+        (
+            "chat",
+            f"{base}/api/chat",
+            {
+                "model": state["model"],
+                "format": PLAN_SCHEMA,
+                "messages": [
+                    {"role": "system", "content": system_message},
+                    {"role": "user", "content": context},
+                ],
+                "options": common_options,
+                "keep_alive": "30m",
+            },
+            max(90, int(total_timeout * 0.62)),
+        ),
+        (
+            "generate",
+            f"{base}/api/generate",
+            {
+                "model": state["model"],
+                "format": PLAN_SCHEMA,
+                "prompt": system_message + "\n\nAssessment context:\n" + context,
+                "options": common_options,
+                "keep_alive": "30m",
+            },
+            max(90, int(total_timeout * 0.38)),
+        ),
+    ]
+    errors: list[str] = []
+    for kind, url, payload, budget in attempts:
+        try:
+            content = _ollama_stream_content(
+                url,
+                payload,
+                response_kind=kind,
+                total_timeout=budget,
+            )
+            plan = _parse_ollama_plan_content(content)
+            LAST_OLLAMA_PLAN_DIAGNOSTICS.clear()
+            LAST_OLLAMA_PLAN_DIAGNOSTICS.update({
+                "endpoint": kind,
+                "context_bytes": len(context.encode("utf-8")),
+                "attempt_errors": list(errors),
+            })
+            return plan
+        except Exception as exc:
+            errors.append(f"{kind}: {type(exc).__name__}: {exc}")
+    raise RuntimeError("; ".join(errors))
 
 
 def compact_results(results: dict[str, dict[str, Any]]) -> dict[str, Any]:
@@ -168,29 +473,55 @@ def discovery_node(state: AgentState) -> dict[str, Any]:
     return {"discovery": discovery, "diagnostics": diagnostics}
 
 
-def fallback_plan(state: AgentState) -> list[dict[str, Any]]:
-    """Guarantee baseline coverage while keeping parameter tools discovery-driven."""
+def adaptive_fallback_plan(state: AgentState) -> list[dict[str, Any]]:
+    """Build a discovery-driven fallback only when AI planning is unavailable."""
     actions: list[dict[str, Any]] = []
+    has_auth = any(bool(profile.get("cookies")) for profile in state["profiles"])
     for profile in state["profiles"]:
         name = profile["name"]
-        for tool in ("ffuf", "zap", "nuclei", "nikto"):
-            actions.append({"profile": name, "tool": tool, "target_url": state["target"], "jwt_token": "", "injection_url": "", "reason": "Mandatory baseline coverage."})
-        for endpoint in select_arjun_candidates(state["discovery"].get(name, {}), state["target"]):
-            actions.append({"profile": name, "tool": "arjun", "target_url": endpoint, "jwt_token": "", "injection_url": "", "reason": "Hidden-parameter discovery on a crawled HTML/form endpoint."})
-        for tool in ("sqlmap", "dalfox", "commix", "idor"):
-            for case in select_tool_request_cases(state["discovery"].get(name, {}), tool):
-                actions.append({
-                    "profile": name, "tool": tool, "target_url": case["url"],
-                    "method": case.get("method", "GET"), "data": case.get("data", ""),
-                    "parameters": case.get("parameters", []),
-                    "jwt_token": "", "injection_url": "",
-                    "reason": f"Risk-ranked request case suited to {tool}.",
-                })
+        authenticated = bool(profile.get("cookies"))
+        broad = ["ffuf", "zap", "nuclei", "nikto"] if not authenticated else ["zap", "ffuf", "nuclei", "nikto"]
+        for tool in broad:
+            actions.append({"profile": name, "tool": tool, "target_url": state["target"], "jwt_token": "", "injection_url": "", "reason": "Session-aware baseline coverage."})
+        for case in select_arjun_request_cases(
+            state["discovery"].get(name, {}), state["target"],
+            limit=deterministic_core.ARJUN_ENDPOINT_LIMIT,
+        ):
+            actions.append({
+                "profile": name,
+                "tool": "arjun",
+                "target_url": case["url"],
+                "method": case.get("method", "GET"),
+                "data": case.get("data", ""),
+                "parameters": case.get("parameters", []),
+                "jwt_token": "",
+                "injection_url": "",
+                "reason": "Hidden-parameter discovery using the real request method and body.",
+            })
+        if authenticated or not has_auth:
+            for tool in ("sqlmap", "dalfox", "commix", "traversal", "idor"):
+                for case in select_tool_request_cases(
+                    state["discovery"].get(name, {}), tool,
+                    limit=deterministic_core.PARAMETER_TOOL_CASE_LIMITS.get(tool, 1),
+                ):
+                    actions.append({"profile": name, "tool": tool, "target_url": case["url"], "method": case.get("method", "GET"), "data": case.get("data", ""), "parameters": case.get("parameters", []), "jwt_token": "", "injection_url": "", "reason": f"Highest-value discovered request for {tool}."})
         tokens = state["discovery"].get(name, {}).get("jwt_tokens", [])
         if tokens:
             actions.append({"profile": name, "tool": "jwt", "target_url": state["target"], "jwt_token": tokens[0], "injection_url": "", "reason": "Discovered JWT."})
         if state["injection_url"]:
-            actions.append({"profile": name, "tool": "interactsh", "target_url": state["target"], "jwt_token": "", "injection_url": state["injection_url"], "reason": "Configured OAST URL."})
+            actions.append({"profile": name, "tool": "interactsh", "target_url": state["target"], "method": "GET", "data": "", "parameters": ["explicit"], "jwt_token": "", "injection_url": state["injection_url"], "reason": "Configured OAST URL."})
+        else:
+            for case in select_oast_request_cases(
+                state["discovery"].get(name, {}), state["target"],
+                limit=deterministic_core.tool_action_limit("interactsh"),
+            ):
+                actions.append({
+                    "profile": name, "tool": "interactsh", "target_url": state["target"],
+                    "method": case.get("method", "GET"), "data": case.get("data", ""),
+                    "parameters": case.get("parameters", []), "jwt_token": "",
+                    "injection_url": case.get("injection_url", ""),
+                    "reason": f"Automatically selected OAST-capable parameter: {case.get('parameter', 'unknown')}.",
+                })
     return actions
 
 
@@ -199,12 +530,34 @@ def validate_plan(state: AgentState, proposed: Any) -> list[dict[str, Any]]:
         return []
     profiles = {profile["name"] for profile in state["profiles"]}
     completed, valid = set(state["completed"]), []
+    per_tool: dict[tuple[str, str], int] = {}
     for raw in proposed[:30]:
         if not isinstance(raw, dict):
             continue
         profile, tool = str(raw.get("profile", "")), str(raw.get("tool", "")).lower()
         if profile not in profiles or tool not in REGISTRY:
             continue
+        has_authenticated_profile = any(
+            bool(item.get("cookies")) for item in state["profiles"]
+        )
+        profile_has_cookie = next(
+            (
+                bool(item.get("cookies"))
+                for item in state["profiles"]
+                if item.get("name") == profile
+            ),
+            False,
+        )
+        if deterministic_core.CURRENT_SCAN_MODE != "deep":
+            # Match the deterministic orchestrator: do not duplicate slow host
+            # scanners and active parameter exploitation anonymously when an
+            # authenticated profile is available.
+            if (
+                profile == "anonymous"
+                and has_authenticated_profile
+                and tool in {"nikto", "sqlmap", "dalfox", "commix", "traversal", "idor"}
+            ):
+                continue
         found = state["discovery"].get(profile, {})
         target_url = str(raw.get("target_url", "")).strip()
         token = str(raw.get("jwt_token", "")).strip()
@@ -216,9 +569,19 @@ def validate_plan(state: AgentState, proposed: Any) -> list[dict[str, Any]]:
         if scope == "base":
             target_url = state["target"]
         elif scope == "url":
-            allowed = set(select_arjun_candidates(found, state["target"], limit=10))
-            if target_url not in allowed:
+            cases = select_arjun_request_cases(found, state["target"], limit=10)
+            matching = [case for case in cases if str(case.get("url", "")) == target_url]
+            if method:
+                matching = [
+                    case for case in matching
+                    if str(case.get("method", "GET")).upper() == method
+                ]
+            if not matching:
                 continue
+            selected = matching[0]
+            method = str(selected.get("method", "GET")).upper()
+            data = str(selected.get("data", ""))
+            parameters = [str(value) for value in selected.get("parameters", [])]
         elif scope in {"parameterized", "numeric"}:
             cases = select_tool_request_cases(found, tool, limit=20)
             matching = [case for case in cases if str(case.get("url", "")) == target_url]
@@ -242,9 +605,22 @@ def validate_plan(state: AgentState, proposed: Any) -> list[dict[str, Any]]:
                 continue
             target_url = state["target"]
         elif scope == "oast":
-            if not state["injection_url"]:
-                continue
-            target_url, injection = state["target"], state["injection_url"]
+            target_url = state["target"]
+            if state["injection_url"]:
+                injection = state["injection_url"]
+                method = "GET"
+                data = ""
+                parameters = ["explicit"]
+            else:
+                candidates = select_oast_request_cases(found, state["target"], limit=5)
+                matching = [item for item in candidates if not injection or item.get("injection_url") == injection]
+                if not matching:
+                    continue
+                selected = matching[0]
+                injection = str(selected.get("injection_url", ""))
+                method = str(selected.get("method", "GET")).upper()
+                data = str(selected.get("data", ""))
+                parameters = [str(value) for value in selected.get("parameters", [])]
         action = {
             "profile": profile, "tool": tool, "target_url": target_url,
             "method": method or "GET", "data": data, "parameters": parameters,
@@ -252,8 +628,13 @@ def validate_plan(state: AgentState, proposed: Any) -> list[dict[str, Any]]:
             "reason": str(raw.get("reason", ""))[:500] or "No planner reason supplied.",
         }
         identifier = action_id(action)
+        key = (profile, tool)
+        limit = deterministic_core.tool_action_limit(tool)
+        if per_tool.get(key, 0) >= limit:
+            continue
         if identifier not in completed and all(action_id(item) != identifier for item in valid):
             valid.append(action)
+            per_tool[key] = per_tool.get(key, 0) + 1
     return valid
 
 
@@ -263,27 +644,40 @@ def planner_node(state: AgentState) -> dict[str, Any]:
     try:
         decision = ollama_plan(state)
         proposed = decision.get("actions", [])
-        if round_number == 1:
-            proposed = [*fallback_plan(state), *proposed]
         plan = validate_plan(state, proposed)
         summary = str(decision.get("reasoning_summary", ""))[:1000]
         finished = bool(decision.get("finish", False))
-        notes.append(f"Round {round_number}: {summary}")
-        print(f"\n[*] Ollama plan round {round_number}: {summary}")
+        endpoint = str(LAST_OLLAMA_PLAN_DIAGNOSTICS.get("endpoint", "unknown"))
+        context_bytes = int(LAST_OLLAMA_PLAN_DIAGNOSTICS.get("context_bytes", 0) or 0)
+        notes.append(
+            f"Round {round_number} [ai/{endpoint}; context={context_bytes}B]: {summary}"
+        )
+        planner_source = "ai"
+        print(
+            f"\n[*] Ollama plan round {round_number} via {endpoint} "
+            f"(context={context_bytes} bytes): {summary}"
+        )
     except Exception as exc:
-        plan = validate_plan(state, fallback_plan(state))
+        if state.get("require_ai"):
+            raise RuntimeError(
+                f"Strict agentic mode requires a successful Ollama plan: "
+                f"{type(exc).__name__}: {exc}"
+            ) from exc
+        plan = validate_plan(state, adaptive_fallback_plan(state))
         finished = False
-        message = f"Ollama unavailable; deterministic fallback used: {type(exc).__name__}: {exc}"
+        message = f"AI planning failed after streamed chat/generate retries; discovery-driven fallback used: {type(exc).__name__}: {exc}"
         notes.append(message)
+        planner_source = "fallback"
         print(f"\n[!] {message}", file=sys.stderr)
     if not plan and round_number == 1:
-        plan = validate_plan(state, fallback_plan(state))
+        plan = validate_plan(state, adaptive_fallback_plan(state))
+        planner_source = "fallback"
     if not plan:
         finished = True
     print(f"[*] Validated actions: {len(plan)}")
     for action in plan:
         print(f"    {action['profile']:13} {action['tool']:10} {action['target_url']} — {action['reason']}")
-    return {"plan": plan, "round": round_number, "notes": notes, "finished": finished}
+    return {"plan": plan, "round": round_number, "notes": notes, "finished": finished, "planner_source": planner_source}
 
 
 async def execute_action(action: dict[str, Any], cookies: dict[str, str], discovery: dict[str, dict[str, Any]]) -> tuple[dict[str, Any], dict[str, Any]]:
@@ -291,49 +685,123 @@ async def execute_action(action: dict[str, Any], cookies: dict[str, str], discov
     if action["tool"] == "jwt":
         arguments = {"jwt_token": action["jwt_token"], "target_url": action["target_url"]}
     elif action["tool"] == "interactsh":
-        arguments = {"target_url": action["target_url"], "injection_url": action["injection_url"], "cookies": cookies.get(action["profile"], "")}
+        arguments = {
+            "target_url": action["target_url"],
+            "injection_url": action["injection_url"],
+            "cookies": cookies.get(action["profile"], ""),
+            "method": action.get("method", "GET"),
+            "data": action.get("data", ""),
+            "parameter": (action.get("parameters") or [""])[0],
+            "timeout": 120 if deterministic_core.CURRENT_SCAN_MODE == "deep" else 75,
+        }
     else:
         arguments = {"target_url": action["target_url"], "cookies": cookies.get(action["profile"], "")}
         if action["tool"] in BROAD_SCANNER_TIMEOUTS:
             arguments["timeout"] = BROAD_SCANNER_TIMEOUTS[action["tool"]]
+            profile_discovery = discovery.get(action["profile"], {})
             if action["tool"] == "zap":
-                profile_discovery = discovery.get(action["profile"], {})
+                authenticated = bool(cookies.get(action["profile"], ""))
                 arguments.update({
                     "seed_urls": profile_discovery.get("html_urls", []),
                     "request_cases": profile_discovery.get("request_cases", []),
+                    # Active checks are bounded to authenticated, high-value
+                    # discovered GET/POST contracts. Anonymous runs remain passive.
+                    "scan_mode": (
+                        "full" if authenticated and deterministic_core.CURRENT_SCAN_MODE == "deep"
+                        else "prioritized" if authenticated and deterministic_core.CURRENT_SCAN_MODE == "balanced"
+                        else "passive"
+                    ),
+                    "max_observations": 100 if deterministic_core.CURRENT_SCAN_MODE == "deep" else 50,
                 })
+            elif action["tool"] == "nuclei":
+                arguments["seed_urls"] = profile_discovery.get("html_urls", [])
+                arguments["scan_profile"] = deterministic_core.CURRENT_SCAN_MODE
+                arguments["max_targets"] = (
+                    8 if deterministic_core.CURRENT_SCAN_MODE == "deep"
+                    else 4 if deterministic_core.CURRENT_SCAN_MODE == "balanced"
+                    else 1
+                )
         elif action["tool"] == "arjun":
-            arguments["timeout"] = 120
+            arguments.update({
+                "timeout": deterministic_core.ARJUN_TIMEOUT,
+                "method": action.get("method", "GET"),
+                "data": action.get("data", ""),
+                "known_parameters": action.get("parameters", []),
+            })
         elif action["tool"] in PARAMETER_TOOL_TIMEOUTS:
             arguments["timeout"] = PARAMETER_TOOL_TIMEOUTS[action["tool"]]
-        if action["tool"] in {"sqlmap", "dalfox", "commix"}:
+        if action["tool"] in {"sqlmap", "dalfox", "commix", "traversal"}:
             arguments.update({
                 "method": action.get("method", "GET"),
                 "data": action.get("data", ""),
                 "parameters": action.get("parameters", []),
             })
+            if action["tool"] == "dalfox":
+                arguments["allow_state_changes"] = urlparse(action["target_url"]).hostname in {"127.0.0.1", "localhost", "::1"}
+
+    state_refresh: dict[str, Any] | None = None
+    if (
+        cookies.get(action["profile"], "")
+        and action["tool"] in {"sqlmap", "dalfox", "commix", "traversal", "idor", "interactsh", "arjun"}
+    ):
+        parsed_target = urlparse(action["target_url"])
+        refresh_target = f"{parsed_target.scheme}://{parsed_target.netloc}"
+        profile_discovery = discovery.get(action["profile"], {})
+        probe_url = deterministic_core.select_session_probe_url(
+            profile_discovery, refresh_target
+        )
+        state_refresh = deterministic_core.refresh_authenticated_session_state(
+            refresh_target, cookies[action["profile"]], probe_url
+        )
+        if state_refresh.get("usable") is False:
+            return action, {
+                "tool": action["tool"],
+                "status": "partial",
+                "target": action["target_url"],
+                "output": "The authenticated session could not be re-established before the scanner.",
+                "vulnerabilities": [],
+                "diagnosis": "authentication_precheck_failed",
+                "state_refresh": state_refresh,
+            }
     try:
         scanner_limit = float(arguments.get("timeout", 180))
-        return action, await call_mcp(
+        result = await call_mcp(
             server,
             function,
             arguments,
             timeout_seconds=scanner_limit + 35,
         )
+        if state_refresh is not None:
+            result["state_refresh"] = state_refresh
+        return action, result
     except Exception as exc:
         message = f"Agent executor failed: {type(exc).__name__}: {exc}"
-        return action, {"tool": action["tool"], "status": "error", "target": action["target_url"], "output": message, "vulnerabilities": [], "diagnosis": diagnose_error(message), "traceback": traceback.format_exc()}
+        result = {"tool": action["tool"], "status": "error", "target": action["target_url"], "output": message, "vulnerabilities": [], "diagnosis": diagnose_error(message), "traceback": traceback.format_exc()}
+        if state_refresh is not None:
+            result["state_refresh"] = state_refresh
+        return action, result
 
 
 async def execute_plan(plan: list[dict[str, Any]], cookies: dict[str, str], discovery: dict[str, dict[str, Any]]) -> list[tuple[dict[str, Any], dict[str, Any]]]:
-    semaphore, zap_lock = asyncio.Semaphore(3), asyncio.Lock()
-    async def limited(action: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
-        async with semaphore:
-            if action["tool"] == "zap":
-                async with zap_lock:
-                    return await execute_action(action, cookies, discovery)
-            return await execute_action(action, cookies, discovery)
-    return await asyncio.gather(*(limited(action) for action in plan))
+    """Execute the AI-selected actions with the shared safe phase ordering."""
+    profile_order = {name: index for index, name in enumerate(cookies)}
+    ordered = sorted(
+        plan,
+        key=lambda action: (
+            profile_order.get(action["profile"], 999),
+            deterministic_core.tool_execution_rank(
+                action["tool"], bool(cookies.get(action["profile"], ""))
+            ),
+        ),
+    )
+    executed: list[tuple[dict[str, Any], dict[str, Any]]] = []
+    for action in ordered:
+        try:
+            executed.append(await execute_action(action, cookies, discovery))
+        except Exception as exc:
+            message = f"Agent executor isolated failure: {type(exc).__name__}: {exc}"
+            executed.append((action, {"tool": action["tool"], "status": "error", "target": action["target_url"], "output": message, "vulnerabilities": [], "diagnosis": diagnose_error(message)}))
+    return executed
 
 
 def executor_node(state: AgentState) -> dict[str, Any]:
@@ -352,6 +820,8 @@ def executor_node(state: AgentState) -> dict[str, Any]:
         profile_results[f"{tool}:{number}"] = {**result, "planner_reason": action["reason"], "planner_round": state["round"]}
         completed.append(action_id(action))
         log_result(profile, tool, result, action["target_url"])
+        if tool == "zap":
+            log_zap_session_diagnostics(result)
         if tool == "ffuf" and result.get("status") in {"success", "partial"}:
             before = len(discovery.get(profile, {}).get("request_cases", []))
             enriched, urls = enrich_discovery_with_ffuf(discovery.get(profile, {}), result, state["target"])
@@ -363,9 +833,14 @@ def executor_node(state: AgentState) -> dict[str, Any]:
         if tool == "arjun" and result.get("status") in {"success", "partial"}:
             discovery[profile], generated = enrich_discovery_with_arjun(discovery.get(profile, {}), result, action["target_url"])
             new_attack_surface += len(generated)
-    update: dict[str, Any] = {"results": results, "discovery": discovery, "completed": completed}
-    if new_attack_surface and state["round"] < state["max_rounds"]:
-        update["finished"] = False
+    update: dict[str, Any] = {
+        "results": results,
+        "discovery": discovery,
+        "completed": completed,
+        "finished": not (
+            new_attack_surface > 0 and state["round"] < state["max_rounds"]
+        ),
+    }
     return update
 
 
@@ -383,6 +858,12 @@ def report_node(state: AgentState) -> dict[str, Any]:
         "diagnostics": state["diagnostics"],
         "planner_notes": state["notes"],
         "planner_rounds": state["round"],
+        "ollama_model": state["model"],
+        "ollama_url": state["ollama_url"],
+        "strict_ai_required": state.get("require_ai", False),
+        "planner_source": state.get("planner_source", "unknown"),
+        "scan_mode": deterministic_core.CURRENT_SCAN_MODE,
+        "execution_policy": "AI-selected actions are validated against the shared deterministic tool catalogue and discovered same-profile request contracts, then executed sequentially by phase. A discovery-driven fallback is used only when planning is unavailable or empty.",
     }
     report = asyncio.run(call_mcp("pwndocServer.py", "generate_report", {
         "findings_summary": state["results"], "target_url": state["target"],
@@ -430,8 +911,24 @@ def main() -> int:
     parser.add_argument("--interactsh-injection-url", default="")
     parser.add_argument("--model", default="llama3.1:8b")
     parser.add_argument("--ollama-url", default="http://127.0.0.1:11434")
-    parser.add_argument("--max-rounds", type=int, default=2, choices=(1, 2, 3))
+    parser.add_argument(
+        "--no-model-pull", action="store_true",
+        help="Do not automatically pull a missing requested Ollama model."
+    )
+    parser.add_argument(
+        "--require-ai", action="store_true",
+        help="Fail instead of using deterministic fallback when Ollama planning fails."
+    )
+    parser.add_argument("--max-rounds", type=int, default=1, choices=(1, 2, 3))
+    parser.add_argument(
+        "--ai-timeout", type=int, default=0,
+        help="Total planning budget per AI round; 0 selects a mode-specific default."
+    )
+    parser.add_argument("--mode", choices=("fast", "balanced", "deep"), default="balanced")
     args = parser.parse_args()
+    configure_scan_mode(args.mode)
+    globals()["CURRENT_SCAN_MODE"] = deterministic_core.CURRENT_SCAN_MODE
+    globals()["ARJUN_TIMEOUT"] = deterministic_core.ARJUN_TIMEOUT
 
     checks = run_preflight_checks(include_live=True)
     errors = print_preflight_report(checks, show_ok=args.preflight_only)
@@ -441,7 +938,7 @@ def main() -> int:
         return 3
 
     target = normalize_url(args.target)
-    if urlparse(target).hostname not in {"127.0.0.1", "localhost", "dvwa"} and not args.authorized:
+    if urlparse(target).hostname not in {"127.0.0.1", "localhost", "::1"} and not args.authorized:
         parser.error("Remote targets require --authorized.")
     injection = args.interactsh_injection_url.strip()
     if injection and not same_origin(target, injection):
@@ -460,11 +957,77 @@ def main() -> int:
     elif args.auth_only:
         parser.error("--auth-only requires --cookies.")
 
+    try:
+        selected_model, ollama_diagnostics = ensure_ollama_model(
+            args.ollama_url,
+            args.model,
+            allow_pull=not args.no_model_pull,
+        )
+        print(
+            f"[*] Ollama ready: version={ollama_diagnostics.get('ollama_version', 'unknown')}; "
+            f"model={selected_model}; requested={args.model}"
+        )
+        if ollama_diagnostics.get("fallback_model_used"):
+            print(
+                "[!] Requested model was unavailable; using installed fallback "
+                f"{selected_model}: {ollama_diagnostics.get('fallback_reason', '')}",
+                file=sys.stderr,
+            )
+        planner_timeout = args.ai_timeout or AI_PLANNER_TIMEOUTS[args.mode]
+        try:
+            warmup = warm_ollama_model(
+                args.ollama_url,
+                selected_model,
+                timeout=planner_timeout,
+            )
+            ollama_diagnostics["warmup"] = warmup
+            print(
+                f"[*] Ollama model warm: {warmup.get('seconds')}s; "
+                f"planner budget={planner_timeout}s per round"
+            )
+        except Exception as warm_exc:
+            ollama_diagnostics["warmup_error"] = (
+                f"{type(warm_exc).__name__}: {warm_exc}"
+            )
+            print(
+                "[!] Ollama warm-up was inconclusive; the streamed planner will "
+                f"still retry both endpoints: {ollama_diagnostics['warmup_error']}",
+                file=sys.stderr,
+            )
+    except Exception as exc:
+        if args.require_ai:
+            print(
+                f"[-] Strict agentic mode could not prepare Ollama: "
+                f"{type(exc).__name__}: {exc}",
+                file=sys.stderr,
+            )
+            return 4
+        selected_model = args.model
+        ollama_diagnostics = {
+            "model_ready": False,
+            "requested_model": args.model,
+            "error": f"{type(exc).__name__}: {exc}",
+        }
+        print(
+            "[!] Ollama readiness check failed; deterministic fallback remains "
+            f"available: {ollama_diagnostics['error']}",
+            file=sys.stderr,
+        )
+        planner_timeout = args.ai_timeout or AI_PLANNER_TIMEOUTS[args.mode]
+
     initial: AgentState = {
         "target": target, "profiles": profiles, "discovery": {}, "plan": [], "completed": [],
         "results": {profile["name"]: {} for profile in profiles}, "round": 0,
-        "max_rounds": args.max_rounds, "ollama_url": args.ollama_url, "model": args.model,
-        "injection_url": injection, "notes": [], "finished": False, "diagnostics": [], "report_status": {},
+        "max_rounds": args.max_rounds, "ollama_url": args.ollama_url, "model": selected_model,
+        "injection_url": injection,
+        "notes": [
+            "Ollama readiness: "
+            + json.dumps(ollama_diagnostics, ensure_ascii=False, default=str)
+        ],
+        "finished": False, "diagnostics": [], "report_status": {},
+        "require_ai": args.require_ai,
+        "planner_source": "pending",
+        "ai_timeout": planner_timeout,
     }
     started = time.time()
     try:
@@ -482,8 +1045,9 @@ def main() -> int:
     print(f"[+] PDF: {report.get('pdf_filename') or 'not generated'}")
     print(f"[+] HTML preview: {report.get('html_filename') or 'not generated'}")
     print(f"[+] JSON: {report.get('json_filename') or 'not generated'}")
+    print_security_finding_summary(final.get("results", {}))
     print(f"[+] Scanner run errors: {errors}\n[+] Time-limited/partial scanner runs: {partial}\n[+] Scanner run skips: {skips}")
-    return 1 if report.get("status") != "success" else 2 if errors else 0
+    return 1 if report.get("status") != "success" else 0
 
 
 if __name__ == "__main__":

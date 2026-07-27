@@ -8,7 +8,9 @@ import subprocess
 import time
 from pathlib import Path
 from typing import Any, Iterable
-from urllib.parse import urljoin, urlparse
+from urllib.parse import urljoin, urlparse, urlunparse
+
+import requests
 
 ROOT_DIR = Path(__file__).resolve().parent
 SERVERS_DIR = ROOT_DIR / "servers"
@@ -78,6 +80,196 @@ def cookie_names(value: str) -> list[str]:
 def redact_cookie_header(value: str) -> str:
     return "; ".join(f"{name}=<redacted>" for name, _ in parse_cookie_header(value))
 
+
+def response_looks_like_login(response: Any) -> bool:
+    """Conservative login-page detector shared by authenticated scanners."""
+    try:
+        final_url = str(response.url).lower()
+        text = str(response.text)[:100_000].lower()
+    except Exception:
+        return False
+    path = urlparse(final_url).path.rstrip("/")
+    password_field = "type=\"password\"" in text or "type='password'" in text
+    auth_words = any(term in text for term in ("login", "log in", "sign in", "signin", "authenticate"))
+    return (
+        path.endswith(("/login", "/login.php", "/signin", "/sign-in", "/auth"))
+        or (password_field and auth_words)
+    )
+
+
+def load_runtime_config() -> dict[str, Any]:
+    """Load initializer-generated runtime metadata without assuming a target product."""
+    path = ROOT_DIR / ".secops_runtime.json"
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+        return value if isinstance(value, dict) else {}
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def origin_key(url: str) -> str:
+    parsed = urlparse(str(url or ""))
+    if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+        return ""
+    default_port = 443 if parsed.scheme == "https" else 80
+    port = parsed.port or default_port
+    return f"{parsed.scheme.lower()}://{parsed.hostname.lower()}:{port}"
+
+
+def target_runtime_profile(target: str) -> dict[str, Any]:
+    """Return optional metadata bound to the exact initialized target URL."""
+    profiles = load_runtime_config().get("target_profiles", {})
+    if not isinstance(profiles, dict):
+        return {}
+    value = profiles.get(origin_key(target), {})
+    if not isinstance(value, dict):
+        return {}
+    configured_target = str(value.get("target_url") or "").strip()
+    if configured_target:
+        configured = urlparse(configured_target)
+        requested = urlparse(str(target or ""))
+        configured_path = (configured.path or "/").rstrip("/") or "/"
+        requested_path = (requested.path or "/").rstrip("/") or "/"
+        if origin_key(configured_target) != origin_key(target) or configured_path != requested_path:
+            return {}
+    return value
+
+
+def runtime_container_route(target: str, scanner_container: str = "") -> dict[str, Any]:
+    """Resolve an optional Docker-network route for a configured local target."""
+    profile = target_runtime_profile(target)
+    route = profile.get("container_route", {})
+    if not isinstance(route, dict):
+        return {}
+    allowed = str(route.get("scanner_container") or "")
+    if allowed and scanner_container and allowed != scanner_container:
+        return {}
+    return route
+
+
+def apply_runtime_target_preparation(target: str, cookies: str) -> dict[str, Any]:
+    """Apply initializer-declared, exact-origin preparation requests.
+
+    The orchestrators contain no application-specific actions. A local lab may
+    declare safe preparation requests in `.secops_runtime.json`; arbitrary
+    targets receive no special requests.
+    """
+    profile = target_runtime_profile(target)
+    requests_spec = profile.get("pre_scan_requests", [])
+    if not cookies or not isinstance(requests_spec, list) or not requests_spec:
+        return {"performed": False, "configured": bool(requests_spec), "usable": True}
+    session = requests.Session()
+    session.headers.update({
+        "Cookie": cookies,
+        "Cache-Control": "no-cache",
+        "User-Agent": "SecOps-Target-Preparation/1.0",
+    })
+    outcomes: list[dict[str, Any]] = []
+    usable = True
+    for item in requests_spec[:8]:
+        if not isinstance(item, dict):
+            continue
+        method = str(item.get("method") or "GET").upper()
+        path = str(item.get("path") or "").strip()
+        if method not in {"GET", "POST"} or not path:
+            continue
+        url = urljoin(target.rstrip("/") + "/", path.lstrip("/"))
+        if origin_key(url) != origin_key(target):
+            usable = False
+            outcomes.append({"url": url, "error": "cross-origin preparation request rejected"})
+            continue
+        try:
+            response = session.request(
+                method, url, data=str(item.get("data") or "") if method == "POST" else None,
+                timeout=(4, 15), allow_redirects=True,
+            )
+            accepted = item.get("accepted_statuses", [200, 204, 302])
+            accepted_set = {int(value) for value in accepted if str(value).isdigit()}
+            ok = response.status_code in accepted_set if accepted_set else response.status_code < 400
+            usable = usable and ok
+            outcomes.append({
+                "method": method, "url": url, "status": response.status_code,
+                "final_url": str(response.url), "accepted": ok,
+            })
+        except requests.RequestException as exc:
+            usable = False
+            outcomes.append({"method": method, "url": url, "error": f"{type(exc).__name__}: {exc}"})
+    return {"performed": bool(outcomes), "configured": True, "usable": usable, "requests": outcomes}
+
+
+def request_with_retries(
+    method: str,
+    url: str,
+    *,
+    attempts: int = 3,
+    backoff_seconds: float = 0.65,
+    **kwargs: Any,
+) -> tuple[requests.Response | None, list[str]]:
+    """Issue a bounded HTTP request and distinguish transient transport failure.
+
+    The caller decides whether a missing response is fatal. This helper never
+    converts a timeout into an authentication failure.
+    """
+    errors: list[str] = []
+    for attempt in range(max(1, int(attempts))):
+        try:
+            return requests.request(method=method, url=url, **kwargs), errors
+        except (requests.Timeout, requests.ConnectionError) as exc:
+            errors.append(f"{type(exc).__name__}: {exc}")
+            if attempt + 1 < attempts:
+                time.sleep(backoff_seconds * (attempt + 1))
+        except requests.RequestException as exc:
+            errors.append(f"{type(exc).__name__}: {exc}")
+            break
+    return None, errors
+
+
+def scanner_session_probe(
+    url: str,
+    cookies: str,
+    method: str = "GET",
+    data: str = "",
+    timeout: int = 12,
+    attempts: int = 3,
+) -> dict[str, Any]:
+    """Verify authentication without treating service saturation as logout.
+
+    ``authenticated`` is True/False only when the response is conclusive. It is
+    None when all attempts failed at the transport layer.
+    """
+    if not cookies:
+        return {"performed": False, "authenticated": None, "conclusive": True}
+    response, errors = request_with_retries(
+        str(method or "GET").upper(),
+        url,
+        attempts=attempts,
+        data=data if str(method).upper() != "GET" else None,
+        headers={"Cookie": cookies, "Cache-Control": "no-cache"},
+        timeout=(4, max(6, int(timeout))),
+        allow_redirects=True,
+    )
+    if response is None:
+        return {
+            "performed": True,
+            "authenticated": None,
+            "conclusive": False,
+            "transient_error": True,
+            "errors": errors,
+            "error": errors[-1] if errors else "request failed",
+        }
+    login = response_looks_like_login(response)
+    authenticated = response.status_code < 400 and not login
+    return {
+        "performed": True,
+        "authenticated": authenticated,
+        "conclusive": True,
+        "transient_error": False,
+        "status": int(response.status_code),
+        "final_url": str(response.url),
+        "login_detected": login,
+        "bytes": len(response.content),
+        "attempt_errors": errors,
+    }
 def setup_path() -> None:
     """Add the project-managed executable directory to PATH once."""
     LOCAL_BIN.mkdir(parents=True, exist_ok=True)

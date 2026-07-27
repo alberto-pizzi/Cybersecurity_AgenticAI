@@ -1,12 +1,14 @@
 from __future__ import annotations
 
+import argparse
+import sys
 import json
 import shutil
 import subprocess
 import tempfile
 import time
 from pathlib import Path
-from urllib.parse import quote
+from urllib.parse import quote, quote_plus
 
 import requests
 from fastmcp import FastMCP
@@ -39,17 +41,23 @@ def run_interactsh_client(
     target_url: str = "",
     injection_url: str = "",
     cookies: str = "",
+    method: str = "GET",
+    data: str = "",
+    parameter: str = "",
     timeout: int = 90,
 ) -> dict:
-    """Run one explicit OAST check using an injection URL containing ``FUZZ``."""
+    """Run a bounded GET or POST OAST check using a literal ``FUZZ`` placeholder."""
+    method = str(method or "GET").upper()
+    if method not in {"GET", "POST"}:
+        return skipped("Interactsh", target_url, f"Unsupported OAST HTTP method: {method}.")
     if not injection_url:
         return skipped("Interactsh", target_url, "No OAST injection URL was supplied.")
-    if "FUZZ" not in injection_url:
-        return skipped("Interactsh", target_url, "The injection URL must contain the literal FUZZ placeholder.")
+    if "FUZZ" not in injection_url and "FUZZ" not in str(data or ""):
+        return skipped("Interactsh", target_url, "The OAST URL or request body must contain the literal FUZZ placeholder.")
 
     executable = shutil.which("interactsh-client")
     if not executable:
-        return failure("Interactsh", target_url, "interactsh-client was not found in PATH.")
+        return failure("Interactsh", target_url, "interactsh-client was not found in PATH.", diagnosis="missing_interactsh_client")
 
     timeout = max(20, min(int(timeout), 300))
     with tempfile.TemporaryDirectory(prefix="interactsh-") as temp_dir:
@@ -57,23 +65,12 @@ def run_interactsh_client(
         payload_file = temp / "payload.txt"
         event_file = temp / "events.jsonl"
         command = [
-            executable,
-            "-n", "1",
-            "-pi", "1",
-            "-json",
-            "-v",
-            "-duc",
-            "-ps",
-            "-psf", str(payload_file),
-            "-o", str(event_file),
+            executable, "-n", "1", "-pi", "1", "-json", "-v", "-duc",
+            "-ps", "-psf", str(payload_file), "-o", str(event_file),
         ]
         process = subprocess.Popen(
-            command,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
+            command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+            encoding="utf-8", errors="replace",
         )
         started = time.monotonic()
         try:
@@ -86,26 +83,44 @@ def run_interactsh_client(
                 if process.poll() is not None:
                     stdout, stderr = process.communicate(timeout=2)
                     return failure(
-                        "Interactsh",
-                        target_url,
+                        "Interactsh", target_url,
                         f"interactsh-client exited before producing a payload. {stderr or stdout}".strip(),
+                        diagnosis="interactsh_payload_generation_failed",
                     )
                 time.sleep(0.25)
 
             if not payload:
-                return partial("Interactsh", target_url, "Interactsh reached its payload-generation time budget.", diagnosis="time_limit_reached", timed_out=True, vulnerabilities=[])
+                return partial(
+                    "Interactsh", target_url,
+                    "Interactsh reached its payload-generation time budget.",
+                    diagnosis="time_limit_reached", timed_out=True, vulnerabilities=[],
+                )
 
             injected_url = injection_url.replace("FUZZ", quote(payload, safe=""))
-            headers = {"User-Agent": "SecOpsAgent-University/1.1"}
+            injected_data = str(data or "").replace("FUZZ", quote_plus(payload))
+            headers = {"User-Agent": "SecOpsAgent-University/2.0"}
             if cookies:
                 headers["Cookie"] = cookies
+            if method == "POST":
+                headers["Content-Type"] = "application/x-www-form-urlencoded"
             try:
-                response = requests.get(injected_url, headers=headers, timeout=(5, 20), allow_redirects=True)
+                response = requests.request(
+                    method=method, url=injected_url,
+                    data=injected_data if method == "POST" else None,
+                    headers=headers, timeout=(5, 20), allow_redirects=True,
+                )
                 injection_status = response.status_code
             except requests.Timeout as exc:
-                return partial("Interactsh", target_url, f"Injection request reached its time budget: {exc}", diagnosis="time_limit_reached", timed_out=True, vulnerabilities=[])
+                return partial(
+                    "Interactsh", target_url,
+                    f"OAST injection request reached its time budget: {exc}",
+                    diagnosis="time_limit_reached", timed_out=True, vulnerabilities=[],
+                )
             except requests.RequestException as exc:
-                return failure("Interactsh", target_url, f"Injection request failed: {exc}")
+                return failure(
+                    "Interactsh", target_url, f"OAST injection request failed: {exc}",
+                    diagnosis="injection_request_failed",
+                )
 
             events: list[dict] = []
             deadline = started + timeout
@@ -117,9 +132,7 @@ def run_interactsh_client(
                         continue
                     if isinstance(item, dict) and item not in events:
                         events.append(item)
-                if events:
-                    break
-                if process.poll() is not None:
+                if events or process.poll() is not None:
                     break
                 time.sleep(1)
 
@@ -133,37 +146,56 @@ def run_interactsh_client(
                     "verification_status": "callback-confirmed",
                     "confidence": "high",
                     "description": (
-                        "The supplied injection point caused the target-side processing path to generate "
-                        f"an out-of-band callback. Observed interaction protocols: {', '.join(protocols)}."
+                        "The selected input caused the target-side processing path to generate "
+                        f"an out-of-band callback. Observed protocols: {', '.join(protocols)}."
                     ),
                     "impact": (
-                        "The callback proves that attacker-controlled input can cause an external interaction. "
-                        "Depending on the tested insertion point and protocol, this may represent SSRF, blind "
-                        "command injection, XML external entity processing, or another server-side interaction primitive."
+                        "The callback confirms a server-side external interaction primitive. Depending on the "
+                        "insertion point, this can represent SSRF, blind command injection, XXE, or a related issue."
                     ),
                     "solution": (
-                        "Trace the exact code path that consumed the payload, restrict outbound network access, "
-                        "use allow-lists for remote destinations, disable unsafe parsers or shell execution, and "
-                        "add a regression test for the confirmed insertion point."
+                        "Trace the consuming code path, restrict outbound access, allow-list destinations, "
+                        "disable unsafe parsers or shell execution, and add a regression test."
                     ),
                     "url": injected_url,
-                    "method": "GET",
-                    "technical_details": f"Interactsh payload={payload}; callbacks={len(events)}; protocols={protocols}.",
+                    "method": method,
+                    "parameter": parameter,
+                    "technical_details": f"Interactsh callbacks={len(events)}; protocols={protocols}; parameter={parameter or 'not specified'}." ,
                     "evidence": json.dumps(events[:10], indent=2, ensure_ascii=False, default=str),
                 })
 
             return success(
-                "Interactsh",
-                target_url,
-                f"OAST request completed. HTTP {injection_status}; callbacks: {len(events)}.",
-                vulnerabilities=findings,
-                payload=payload,
-                injected_url=injected_url,
-                interactions=events[:50],
+                "Interactsh", target_url,
+                f"OAST {method} request completed. HTTP {injection_status}; callbacks: {len(events)}.",
+                vulnerabilities=findings, payload=payload, injected_url=injected_url,
+                injected_data=injected_data if method == "POST" else "",
+                method=method, parameter=parameter, interactions=events[:50],
+                applicable=True, callback_confirmed=bool(events),
             )
         finally:
             _stop(process)
 
 
+def _once() -> int:
+    try:
+        arguments = json.loads(sys.stdin.read() or "{}")
+        if not isinstance(arguments, dict):
+            raise ValueError("Expected a JSON object on stdin.")
+        result = run_interactsh_client(**arguments)
+    except Exception as exc:
+        result = failure(
+            "Interactsh",
+            "",
+            f"One-shot Interactsh execution failed: {type(exc).__name__}: {exc}",
+        )
+    print(json.dumps(result, ensure_ascii=False, default=str))
+    return 0
+
+
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser(add_help=False)
+    parser.add_argument("--once", action="store_true")
+    args, _ = parser.parse_known_args()
+    if args.once:
+        raise SystemExit(_once())
     mcp.run(transport="stdio")

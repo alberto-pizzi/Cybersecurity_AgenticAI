@@ -18,7 +18,7 @@ import requests
 
 from fastmcp import FastMCP
 
-from utils import ROOT_DIR, failure, success
+from utils import ROOT_DIR, failure, partial, runtime_container_route, success
 
 mcp = FastMCP("Nikto Scanner")
 
@@ -256,6 +256,64 @@ def _parse_csv(output_file: Path, target_url: str) -> list[dict[str, Any]]:
     return findings
 
 
+
+def _parse_text_findings(log_text: str, target_url: str) -> list[dict[str, Any]]:
+    """Parse Nikto's normal console finding lines when report-file output is unavailable."""
+    findings: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    ignored = (
+        "target ip:", "target hostname:", "target port:", "start time:",
+        "end time:", "host(s) tested", "requests:", "server:", "ssl info:",
+    )
+    for raw in str(log_text or "").splitlines():
+        line = raw.strip()
+        if not line.startswith("+"):
+            continue
+        message = line.lstrip("+ ").strip()
+        lower = message.lower()
+        if not message or any(lower.startswith(prefix) for prefix in ignored):
+            continue
+        if lower in {"requires a value", "+ requires a value"} or lower.endswith(" requires a value"):
+            continue
+        if any(marker in lower for marker in (
+            "host(s) tested", "item(s) reported", "requests:",
+            "error(s)", "items checked", "end time:",
+        )):
+            continue
+        if any(marker in lower for marker in CONNECTION_FAILURE_MARKERS):
+            continue
+        if message in seen:
+            continue
+        seen.add(message)
+        uri_match = re.match(r"(/[^: ]*)\s*:\s*(.*)", message)
+        uri = uri_match.group(1) if uri_match else ""
+        description = uri_match.group(2) if uri_match else message
+        risk = _risk_from_message(description)
+        impact, solution = _message_guidance(description)
+        findings.append({
+            "alert": description.split(".", 1)[0][:140] or "Nikto finding",
+            "risk": risk,
+            "category": "observation" if risk == "info" else "candidate",
+            "verification_status": "automated-candidate" if risk != "info" else "hardening-observation",
+            "confidence": "medium",
+            "description": f"Nikto reported: {description}",
+            "impact": impact,
+            "solution": solution,
+            "url": urljoin(target_url.rstrip("/") + "/", uri.lstrip("/")) if uri else target_url,
+            "method": "GET",
+            "technical_details": "Parsed from Nikto console output.",
+            "evidence": message,
+        })
+    return findings
+
+
+def _nikto_scan_completed(log_text: str) -> bool:
+    lower = str(log_text or "").lower()
+    return any(marker in lower for marker in (
+        "host(s) tested", "end time:", "requests:", "items checked",
+        "item(s) reported", "scan terminated", "scan completed",
+    ))
+
 def _connection_runtime_error(log_text: str, csv_path: Path) -> str:
     combined = log_text
     try:
@@ -324,7 +382,7 @@ def _run_native_nikto_scan(
             "-output", str(output_file),
         ]
         if cookies:
-            command.extend(["-header", f"Cookie: {cookies}"])
+            command.extend(["-Add-header", f"Cookie: {cookies}"])
 
         creation_flags = 0
         if os.name == "nt":
@@ -372,6 +430,8 @@ def _run_native_nikto_scan(
             log_text = ""
 
         findings = _parse_csv(output_file, target_url)
+        if not findings:
+            findings = _parse_text_findings(log_text, target_url)
         duration = round(time.monotonic() - started, 3)
         fatal = _fatal_runtime_error(log_text)
         connection_failure = _connection_runtime_error(log_text, output_file)
@@ -534,17 +594,13 @@ def _docker_command_available() -> bool:
     return bool(shutil.which("docker"))
 
 
-def _docker_lab_available() -> bool:
-    if not _docker_command_available():
-        return False
-    completed = subprocess.run(
-        ["docker", "inspect", "dvwa"],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        check=False,
-        timeout=20,
+def _configured_target_container(target_url: str) -> tuple[str, str, str]:
+    route = runtime_container_route(target_url)
+    return (
+        str(route.get("target_container") or ""),
+        str(route.get("alias") or ""),
+        str(route.get("network") or ""),
     )
-    return completed.returncode == 0
 
 
 def _docker_target(target_url: str) -> tuple[str, list[str], str]:
@@ -554,25 +610,26 @@ def _docker_target(target_url: str) -> tuple[str, list[str], str]:
     mode = "same_target"
 
     if hostname in {"127.0.0.1", "localhost", "::1"}:
-        if _docker_lab_available():
-            docker_args.extend(["--network", "secops-net"])
-            netloc = "dvwa"
-            if parsed.port and parsed.port not in {80, 443}:
-                netloc = f"dvwa:{parsed.port}"
-            mode = "secops_network_dvwa"
-        else:
-            netloc = "host.docker.internal"
-            if parsed.port:
-                netloc += f":{parsed.port}"
-            docker_args.extend([
-                "--add-host",
-                "host.docker.internal:host-gateway",
-            ])
-            mode = "docker_desktop_host_gateway"
-        target = urlunparse(
-            parsed._replace(netloc=netloc)
-        )
-        return target, docker_args, mode
+        container, alias, network = _configured_target_container(target_url)
+        if container and alias and network:
+            completed = subprocess.run(
+                ["docker", "inspect", container],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                check=False, timeout=20,
+            )
+            if completed.returncode == 0:
+                docker_args.extend(["--network", network])
+                internal_port = int(runtime_container_route(target_url).get("internal_port") or (443 if parsed.scheme == "https" else 80))
+                netloc = alias if internal_port in {80, 443} else f"{alias}:{internal_port}"
+                mode = "configured_docker_route"
+                return urlunparse(parsed._replace(netloc=netloc)), docker_args, mode
+
+        netloc = "host.docker.internal"
+        if parsed.port:
+            netloc += f":{parsed.port}"
+        docker_args.extend(["--add-host", "host.docker.internal:host-gateway"])
+        mode = "docker_desktop_host_gateway"
+        return urlunparse(parsed._replace(netloc=netloc)), docker_args, mode
 
     return target_url, docker_args, mode
 
@@ -597,24 +654,25 @@ def _run_docker_nikto(
     with tempfile.TemporaryDirectory(prefix="nikto-docker-") as temporary_directory:
         temp = Path(temporary_directory).resolve()
         output_file = temp / "nikto.csv"
-        mount = f"{temp}:/tmp/secops-output"
-        nikto_limit = max(30, timeout - 25)
+        nikto_limit = max(25, timeout - 15)
+        container_output = "/tmp/secops/nikto.csv"
         command = [
             "docker", "run", "--rm",
             *network_args,
-            "-v", mount,
+            "-v", f"{temp}:/tmp/secops",
             NIKTO_DOCKER_IMAGE,
             "-h", docker_target,
             "-nointeractive",
+            "-ask", "no",
             "-nolookup",
             "-nocookies",
-            "-timeout", "5",
+            "-timeout", "4",
             "-maxtime", f"{nikto_limit}s",
             "-Format", "csv",
-            "-output", "/tmp/secops-output/nikto.csv",
+            "-output", container_output,
         ]
         if cookies:
-            command.extend(["-header", f"Cookie: {cookies}"])
+            command.extend(["-Add-header", f"Cookie: {cookies}"])
 
         try:
             completed = subprocess.run(
@@ -646,6 +704,8 @@ def _run_docker_nikto(
 
         log_text = "\n".join(part for part in (stdout, stderr) if part)
         findings = _parse_csv(output_file, target_url)
+        if not findings:
+            findings = _parse_text_findings(log_text, target_url)
         duration = round(time.monotonic() - started, 3)
         connection_failure = _connection_runtime_error(log_text, output_file)
         common = {
@@ -659,6 +719,8 @@ def _run_docker_nikto(
             "connectivity_diagnostics": connectivity,
             "scanner_log": log_text[-8000:],
             "command": command,
+            "docker_output_file": container_output,
+            "host_output_file_created": output_file.is_file(),
         }
 
         if timed_out:
@@ -682,6 +744,66 @@ def _run_docker_nikto(
                 diagnosis="nikto_docker_target_unreachable",
             )
             result.update(common)
+            return result
+
+        compatibility_retry: dict[str, Any] = {}
+        if not findings and not _nikto_scan_completed(log_text):
+            # Some Docker Desktop bind mounts do not receive Nikto's structured
+            # file even though the scanner starts correctly. Retry once without
+            # output redirection so the normal Nikto text stream can be parsed.
+            elapsed = max(1, int(time.monotonic() - started))
+            retry_budget = max(20, min(75, timeout - elapsed - 5))
+            retry_command = [
+                "docker", "run", "--rm", *network_args,
+                NIKTO_DOCKER_IMAGE,
+                "-h", docker_target,
+                "-nointeractive", "-ask", "no", "-nolookup", "-nocookies",
+                "-timeout", "4", "-maxtime", f"{retry_budget}s",
+            ]
+            if cookies:
+                retry_command.extend(["-Add-header", f"Cookie: {cookies}"])
+            try:
+                retry = subprocess.run(
+                    retry_command, capture_output=True, text=True,
+                    encoding="utf-8", errors="replace", timeout=retry_budget + 8,
+                    shell=False,
+                )
+                retry_text = "\n".join(part for part in (retry.stdout, retry.stderr) if part)
+                retry_findings = _parse_text_findings(retry_text, target_url)
+                if retry_findings:
+                    findings.extend(retry_findings)
+                compatibility_retry = {
+                    "performed": True,
+                    "return_code": retry.returncode,
+                    "scan_completed": _nikto_scan_completed(retry_text),
+                    "findings": len(retry_findings),
+                    "log": retry_text[-8000:],
+                    "command": retry_command,
+                }
+                common["vulnerabilities"] = findings
+                common["compatibility_retry"] = compatibility_retry
+                common["scanner_log"] = "\n".join(part for part in (log_text, retry_text) if part)[-12000:]
+                if retry.returncode in (0, 1) and (retry_findings or _nikto_scan_completed(retry_text)):
+                    return success(
+                        "Nikto", target_url,
+                        f"Containerized Nikto completed through the text-output compatibility path. Findings: {len(findings)}.",
+                        **common,
+                    )
+            except subprocess.TimeoutExpired as exc:
+                compatibility_retry = {
+                    "performed": True,
+                    "timed_out": True,
+                    "error": f"TimeoutExpired: {exc}",
+                    "command": retry_command,
+                }
+                common["compatibility_retry"] = compatibility_retry
+            result = partial(
+                "Nikto", target_url,
+                "Nikto's structured file and compatibility text stream did not provide a verifiable completion summary.",
+                diagnosis="nikto_output_unverified",
+                timed_out=False,
+                **common,
+            )
             return result
 
         if completed and completed.returncode not in (0, 1):

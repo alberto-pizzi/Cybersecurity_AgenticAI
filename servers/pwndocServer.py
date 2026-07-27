@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import argparse
+import sys
 import html
 import json
 import os
@@ -8,6 +10,7 @@ from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterator
+from urllib.parse import urlparse
 
 import requests
 from fastmcp import FastMCP
@@ -22,20 +25,21 @@ mcp = FastMCP("SecOps Report Server")
 
 RISK_ORDER = {"critical": 5, "high": 4, "medium": 3, "low": 2, "info": 1}
 TOOL_PURPOSES = {
-    "zap": "Authenticated/anonymous traffic import, spidering, passive analysis and active web scanning.",
+    "zap": "Traffic import, session handling, spider/site-tree population, passive analysis, and bounded high-value active checks when enabled.",
     "nuclei": "Focused template checks for high-impact vulnerabilities, exposures and misconfigurations.",
     "nikto": "Web-server hardening, exposed resource and outdated component checks.",
     "ffuf": "High-value path and resource discovery with content verification for selected sensitive paths.",
-    "arjun": "Hidden HTTP parameter discovery for downstream targeted testing.",
+    "arjun": "Hidden GET/POST parameter discovery using the discovered request contract.",
     "sqlmap": "SQL injection confirmation on discovered GET and POST requests.",
     "dalfox": "XSS reflection, AST and verified-vector testing.",
     "commix": "Operating-system command injection confirmation.",
+    "traversal": "Bounded path traversal and local-file-inclusion verification on file-like parameters.",
     "idor": "Differential numeric object-reference checks requiring manual two-account validation.",
     "jwt": "JWT structural analysis; it does not prove server acceptance of modified tokens.",
     "interactsh": "Explicit out-of-band callback confirmation for a supplied insertion point.",
 }
 SECRET_PATTERNS = (
-    (re.compile(r"(?i)(PHPSESSID=)[^;\s]+"), r"\1<redacted>"),
+    (re.compile(r"(?i)((?:session(?:_?id)?|sid|jsessionid|connect\.sid|asp\.net_sessionid)=)[^;\s]+"), r"\1<redacted>"),
     (re.compile(r"(?i)(Cookie:\s*)[^\r\n]+"), r"\1<redacted>"),
     (re.compile(r"(?i)(Authorization:\s*Bearer\s+)[A-Za-z0-9._~-]+"), r"\1<redacted>"),
     (re.compile(r"eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]*"), "<redacted-jwt>"),
@@ -146,8 +150,17 @@ def _normalize_finding(raw: dict[str, Any], profile: str, tool: str) -> dict[str
     impact = _redact_text(raw.get("impact") or "").strip()
     solution = _redact_text(raw.get("solution") or "").strip()
     evidence = _redact_text(raw.get("evidence") or "").strip()
+    if category in {"observation", "discovery"} and len(evidence) > 1200:
+        evidence = evidence[:1200] + "\n[Evidence truncated in human-readable report.]"
     technical = _redact_text(raw.get("technical_details") or raw.get("other_information") or "").strip()
     reproduction = _redact_text(raw.get("reproduction") or "").strip()
+    attack_preconditions = _redact_text(raw.get("attack_preconditions") or raw.get("preconditions") or "").strip()
+    owasp_category = _redact_text(raw.get("owasp_category") or "").strip()
+    payload = _redact_text(raw.get("payload") or "").strip()
+    payloads = raw.get("payloads") or []
+    if not isinstance(payloads, list):
+        payloads = [payloads]
+    payloads = [_redact_text(value) for value in payloads if str(value)]
 
     data_quality_notes: list[str] = []
     if not description:
@@ -168,7 +181,8 @@ def _normalize_finding(raw: dict[str, Any], profile: str, tool: str) -> dict[str
             "alert", "risk", "category", "verification_status", "confidence",
             "description", "impact", "solution", "url", "method", "parameter",
             "evidence", "technical_details", "other_information", "reproduction",
-            "references", "reference",
+            "references", "reference", "attack_preconditions", "preconditions",
+            "owasp_category", "payload", "payloads",
         }
         and value not in (None, "", [], {})
     }
@@ -189,6 +203,10 @@ def _normalize_finding(raw: dict[str, Any], profile: str, tool: str) -> dict[str
         "impact": impact,
         "solution": solution,
         "reproduction": reproduction,
+        "attack_preconditions": attack_preconditions,
+        "owasp_category": owasp_category,
+        "payload": payload,
+        "payloads": payloads,
         "references": _references(raw),
         "identifiers": _identifier_lines(raw),
         "data_quality_notes": data_quality_notes,
@@ -211,10 +229,28 @@ def flatten_findings(results: dict[str, Any]) -> list[dict[str, Any]]:
             if not isinstance(raw, dict):
                 continue
             row = _normalize_finding(raw, profile, tool)
-            fingerprint = tuple(str(row.get(key) or "") for key in (
-                "tool", "alert", "risk", "category", "url", "method",
-                "parameter", "evidence", "verification_status",
-            ))
+            if row.get("category") in {"vulnerability", "candidate"}:
+                parsed_url = urlparse(str(row.get("url") or ""))
+                normalized_path = parsed_url.path.rstrip("/").lower() or "/"
+                normalized_alert = re.sub(
+                    r"\s+in parameter ['\"][^'\"]+['\"]$",
+                    "",
+                    str(row.get("alert") or "").lower(),
+                )
+                fingerprint = (
+                    normalized_alert,
+                    str(row.get("risk") or ""),
+                    str(row.get("category") or ""),
+                    normalized_path,
+                    str(row.get("method") or "").upper(),
+                    str(row.get("parameter") or "").lower(),
+                )
+            else:
+                fingerprint_keys = (
+                    "tool", "alert", "risk", "category", "url", "method",
+                    "parameter", "verification_status",
+                )
+                fingerprint = tuple(str(row.get(key) or "") for key in fingerprint_keys)
             existing = merged.get(fingerprint)
             if existing is None:
                 row["profiles"] = [profile]
@@ -223,7 +259,15 @@ def flatten_findings(results: dict[str, Any]) -> list[dict[str, Any]]:
                 profiles = existing.setdefault("profiles", [])
                 if profile not in profiles:
                     profiles.append(profile)
+                tools = existing.setdefault("tools", [existing.get("tool", "unknown")])
+                if tool not in tools:
+                    tools.append(tool)
+                affected_urls = existing.setdefault("affected_urls", [existing.get("url", "")])
+                if row.get("url") and row.get("url") not in affected_urls:
+                    affected_urls.append(row.get("url"))
+                existing["tool"] = ", ".join(sorted(set(str(value) for value in tools if value)))
                 existing["profile"] = ", ".join(profiles)
+                existing["occurrence_count"] = int(existing.get("occurrence_count", 1)) + 1
 
     rows = list(merged.values())
     for row in rows:
@@ -250,10 +294,53 @@ def _finding_groups(findings: list[dict[str, Any]]) -> dict[str, list[dict[str, 
     }
 
 
+def _truncate_human_value(value: Any, *, string_limit: int = 1400, list_limit: int = 25) -> Any:
+    """Bound HTML-only structured detail while preserving complete JSON data."""
+    if isinstance(value, dict):
+        return {
+            str(key): _truncate_human_value(child, string_limit=string_limit, list_limit=list_limit)
+            for key, child in list(value.items())[:list_limit]
+        }
+    if isinstance(value, list):
+        return [
+            _truncate_human_value(child, string_limit=string_limit, list_limit=list_limit)
+            for child in value[:list_limit]
+        ]
+    if isinstance(value, tuple):
+        return [
+            _truncate_human_value(child, string_limit=string_limit, list_limit=list_limit)
+            for child in list(value)[:list_limit]
+        ]
+    if isinstance(value, str) and len(value) > string_limit:
+        return value[:string_limit] + "\n[Structured field truncated in human-readable report.]"
+    return value
+
+
+def _human_readable_findings(findings: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], dict[str, int]]:
+    """Keep all vulnerabilities/candidates while bounding repetitive low-value detail."""
+    limits = {"observation": 35, "discovery": 25}
+    kept: list[dict[str, Any]] = []
+    omitted = {"observation": 0, "discovery": 0}
+    counters = {"observation": 0, "discovery": 0}
+    for item in findings:
+        category = str(item.get("category") or "")
+        if category in limits:
+            if counters[category] >= limits[category]:
+                omitted[category] += 1
+                continue
+            counters[category] += 1
+        human_item = dict(item)
+        human_item["scanner_fields"] = _truncate_human_value(
+            item.get("scanner_fields") or {}
+        )
+        kept.append(human_item)
+    return kept, omitted
+
+
 FINDING_SECTION_META = {
     "vulnerability": (
         "Confirmed vulnerabilities",
-        "Scanner evidence met the tool-specific confirmation rule. Reproduce and validate impact before production remediation.",
+        "The scanner supplied a bounded payload and response evidence satisfying the tool-specific confirmation rule. Each entry includes preconditions, technical reasoning, impact, remediation and reproduction details when available.",
     ),
     "candidate": (
         "Candidates requiring manual validation",
@@ -346,6 +433,9 @@ def build_coverage(results: dict[str, Any], context: dict[str, Any]) -> list[dic
                     "status": "not_run",
                     "targets": 0,
                     "findings": 0,
+                    "confirmed": 0,
+                    "candidates": 0,
+                    "observations": 0,
                     "duration_seconds": 0.0,
                     "purpose": TOOL_PURPOSES.get(str(tool), "Security assessment tool."),
                     "details": "No result object was produced for this tool.",
@@ -354,12 +444,17 @@ def build_coverage(results: dict[str, Any], context: dict[str, Any]) -> list[dic
             status, status_note = _effective_status(result)
             runs = result.get("runs") if isinstance(result.get("runs"), list) else [result]
             details = _redact_text(result.get("output") or status_note)
+            raw_findings = [item for item in (result.get("vulnerabilities") or []) if isinstance(item, dict)]
+            category_counts = Counter(_category(item) for item in raw_findings)
             rows.append({
                 "profile": profile,
                 "tool": tool,
                 "status": status,
                 "targets": len(runs),
-                "findings": len([item for item in (result.get("vulnerabilities") or []) if isinstance(item, dict)]),
+                "findings": len(raw_findings),
+                "confirmed": category_counts.get("vulnerability", 0),
+                "candidates": category_counts.get("candidate", 0),
+                "observations": category_counts.get("observation", 0) + category_counts.get("discovery", 0),
                 "duration_seconds": round(_duration(result), 2),
                 "purpose": TOOL_PURPOSES.get(str(tool), "Security assessment tool."),
                 "details": details[:1000],
@@ -398,7 +493,7 @@ def _executive_text(summary: dict[str, Any], findings: list[dict[str, Any]]) -> 
     return (
         f"The automated assessment produced {confirmed} scanner-confirmed findings, {candidates} candidates requiring manual validation, "
         f"and {observations} discovery or hardening observations. {limits} execution limitation(s) were recorded. "
-        "The report preserves scanner evidence and metadata; it does not invent missing impact, remediation, CVSS, or exploitability claims."
+        "The report preserves scanner evidence and metadata; it does not invent unsupported exploitability claims. Confirmed findings include the exact tested parameter, bounded payload, response evidence, impact, remediation and reproduction steps when supplied by the scanner. Repetitive informational details may be summarized in PDF/HTML while the complete normalized set remains in JSON."
     )
 
 
@@ -420,6 +515,16 @@ def _field(label: str, value: Any, *, pre: bool = False) -> str:
 def _render_html(payload: dict[str, Any]) -> str:
     summary = payload["summary"]
     risks = summary["risk_counts"]
+    omitted = payload["summary"].get("omitted_human_readable_detail", {})
+    detail_cap_note = (
+        '<p class="section-note">'
+        f"Human-readable detail cap: {omitted.get('observation', 0)} repetitive observations "
+        f"and {omitted.get('discovery', 0)} discovery entries were omitted from detailed pages. "
+        "Aggregate counts remain in the executive summary and the complete normalized set remains in JSON."
+        "</p>"
+        if any(omitted.values())
+        else ""
+    )
     groups = _finding_groups(payload["findings"])
 
     coverage_rows = "".join(
@@ -427,12 +532,13 @@ def _render_html(payload: dict[str, Any]) -> str:
         f"<td>{_esc(row['profile'])}</td>"
         f"<td><b>{_esc(row['tool'])}</b><br><small>{_esc(row.get('purpose', ''))}</small></td>"
         f"<td>{_esc(row['status'])}</td>"
-        f"<td>{row['targets']}</td><td>{row['findings']}</td>"
+        f"<td>{row['targets']}</td><td>{row.get('confirmed',0)}</td>"
+        f"<td>{row.get('candidates',0)}</td><td>{row.get('observations',0)}</td>"
         f"<td>{row['duration_seconds']}</td>"
         f"<td>{_esc(row['details'])}</td>"
         "</tr>"
         for row in payload["coverage"]
-    ) or '<tr><td colspan="7">No execution data.</td></tr>'
+    ) or '<tr><td colspan="9">No execution data.</td></tr>'
 
     limitation_rows = "".join(
         f"<tr><td>{_esc(row['path'])}</td><td>{_esc(row['status'])}</td><td>{_esc(row['cause'])}</td><td>{_esc(row['explanation'])}</td></tr>"
@@ -461,11 +567,14 @@ def _render_html(payload: dict[str, Any]) -> str:
 {_field('HTTP method', item.get('method'))}
 {_field('Parameter', item.get('parameter'))}
 {_field('Description', item.get('description'))}
-{_field('Technical details', item.get('technical_details'))}
+{_field('Why the evidence confirms or suggests the issue', item.get('technical_details'))}
+{_field('Attack preconditions', item.get('attack_preconditions'))}
+{_field('Payload / test input', item.get('payload') or '; '.join(item.get('payloads') or []), pre=True)}
 {_field('Evidence', item.get('evidence'), pre=True)}
-{_field('Impact', item.get('impact'))}
-{_field('Remediation', item.get('solution'))}
-{_field('Reproduction / validation', item.get('reproduction'))}
+{_field('Security impact', item.get('impact'))}
+{_field('Recommended remediation', item.get('solution'))}
+{_field('Reproduction / validation steps', item.get('reproduction'), pre=True)}
+{_field('OWASP classification', item.get('owasp_category'))}
 </dl>
 {('<h4>Identifiers</h4>' + _render_list(item.get('identifiers') or [])) if item.get('identifiers') else ''}
 {('<h4>References</h4>' + _render_list(item.get('references') or [])) if item.get('references') else ''}
@@ -488,6 +597,29 @@ def _render_html(payload: dict[str, Any]) -> str:
             f'<section><h2>{_esc(title)} <span class="count">{len(items)}</span></h2>'
             f'<p class="section-note">{_esc(explanation)}</p>{cards or empty}</section>'
         )
+
+    glance_items = [
+        item for item in payload["findings"]
+        if item.get("category") in {"vulnerability", "candidate"}
+    ]
+    glance_rows = "".join(
+        "<tr>"
+        f"<td>{index}</td><td>{_esc(item.get('risk','info')).upper()}</td>"
+        f"<td><b>{_esc(item.get('alert','Unnamed finding'))}</b></td>"
+        f"<td>{_esc(item.get('tool',''))}</td>"
+        f"<td>{_esc(item.get('url',''))}<br><small>parameter: {_esc(item.get('parameter') or '-')}</small></td>"
+        "</tr>"
+        for index, item in enumerate(glance_items[:12], 1)
+    )
+    glance_html = (
+        "<h2>Security findings at a glance</h2>"
+        "<p class='section-note'>Confirmed vulnerabilities and candidates are named here before execution details.</p>"
+        "<table><thead><tr><th>#</th><th>Severity</th><th>Finding</th><th>Tool</th><th>Affected endpoint</th></tr></thead>"
+        f"<tbody>{glance_rows}</tbody></table>"
+        + (f"<p>Only the first 12 of {len(glance_items)} security findings are shown here; all details follow below.</p>" if len(glance_items) > 12 else "")
+        if glance_items else
+        "<h2>Security findings at a glance</h2><p>No confirmed vulnerabilities or validation candidates were recorded.</p>"
+    )
 
     context_json = json.dumps(
         _redact_value(payload.get("assessment_context") or {}),
@@ -518,14 +650,16 @@ details{{margin-top:14px}}.section-note{{background:#eaf1f7;border-left:4px soli
 <h1>SecOps Penetration-Test Report</h1>
 <div class="meta"><b>Target:</b> {_esc(payload['target'])}<br><b>Generated:</b> {_esc(payload['generated_at'])}<br><b>Evidence policy:</b> scanner-grounded; missing statements are not fabricated.</div>
 <h2>Executive summary</h2><div class="card">{_esc(payload['executive_summary'])}</div>
+{glance_html}
 <div class="grid">{''.join(f'<div class="card"><div class="value">{risks.get(risk,0)}</div><div>{risk.title()}</div></div>' for risk in ('critical','high','medium','low'))}<div class="card"><div class="value">{len(summary['limitations'])}</div><div>Limitations</div></div></div>
 
+{detail_cap_note}
 <h2>Scope and assessment context</h2>
 <details><summary>Profiles, discovery counts and configured limits</summary><pre>{_esc(context_json)}</pre></details>
 
 <h2>Assessment execution</h2>
 <p class="section-note">This section records tools, targets, duration and execution status. It is deliberately separate from security findings.</p>
-<table><thead><tr><th>Profile</th><th>Tool and purpose</th><th>Status</th><th>Targets</th><th>Findings</th><th>Seconds</th><th>Execution details</th></tr></thead><tbody>{coverage_rows}</tbody></table>
+<table><thead><tr><th>Profile</th><th>Tool and purpose</th><th>Status</th><th>Targets</th><th>Confirmed</th><th>Candidates</th><th>Info/discovery</th><th>Seconds</th><th>Execution details</th></tr></thead><tbody>{coverage_rows}</tbody></table>
 
 <h2>Execution limitations and incomplete coverage</h2>
 <table><thead><tr><th>Run</th><th>Status</th><th>Cause</th><th>Explanation</th></tr></thead><tbody>{limitation_rows}</tbody></table>
@@ -593,6 +727,55 @@ def _build_pdf(path: Path, payload: dict[str, Any]) -> None:
         Spacer(1, 8),
     ]
 
+    glance_items = [
+        item for item in payload["findings"]
+        if item.get("category") in {"vulnerability", "candidate"}
+    ]
+    story.append(Paragraph("Security findings at a glance", styles["Heading2"]))
+    story.append(Paragraph(
+        "Confirmed vulnerabilities and candidates are named here before tool execution details.",
+        section_note,
+    ))
+    if glance_items:
+        glance_data = [[
+            Paragraph(value, header)
+            for value in ("#", "Severity", "Finding", "Tool", "Endpoint / parameter")
+        ]]
+        for index, item in enumerate(glance_items[:10], 1):
+            glance_data.append([
+                Paragraph(str(index), small),
+                Paragraph(_p(str(item.get("risk") or "info").upper()), small),
+                Paragraph(_p(item.get("alert") or "Unnamed finding"), small),
+                Paragraph(_p(item.get("tool") or ""), small),
+                Paragraph(
+                    f"{_p(item.get('url') or '-')}<br/><b>parameter:</b> {_p(item.get('parameter') or '-')}",
+                    small,
+                ),
+            ])
+        glance_table = Table(
+            glance_data,
+            colWidths=[22, 48, 180, 62, 223],
+            repeatRows=1,
+            hAlign="LEFT",
+        )
+        glance_table.setStyle(TableStyle([
+            ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#7A2738")),
+            ("GRID", (0, 0), (-1, -1), .35, colors.HexColor("#B8C2CC")),
+            ("VALIGN", (0, 0), (-1, -1), "TOP"),
+            ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, colors.HexColor("#FAF4F5")]),
+            ("LEFTPADDING", (0, 0), (-1, -1), 4),
+            ("RIGHTPADDING", (0, 0), (-1, -1), 4),
+        ]))
+        story.append(glance_table)
+        if len(glance_items) > 10:
+            story.append(Paragraph(
+                f"Only the first 10 of {len(glance_items)} security findings are shown in this summary; full details follow below.",
+                small,
+            ))
+    else:
+        story.append(Paragraph("No confirmed vulnerabilities or validation candidates were recorded.", body))
+    story.append(Spacer(1, 8))
+
     context = payload.get("assessment_context") if isinstance(payload.get("assessment_context"), dict) else {}
     profiles = context.get("profiles") if isinstance(context.get("profiles"), list) else []
     discovery = context.get("discovery") if isinstance(context.get("discovery"), dict) else {}
@@ -638,7 +821,7 @@ def _build_pdf(path: Path, payload: dict[str, Any]) -> None:
     # Compact execution table: long tool messages are moved into execution notes.
     coverage_data = [[
         Paragraph(value, header)
-        for value in ("Profile", "Tool", "Status", "Targets", "Findings", "Seconds")
+        for value in ("Profile", "Tool", "Status", "Targets", "Confirmed", "Candidates", "Info", "Seconds")
     ]]
     for row in payload["coverage"]:
         coverage_data.append([
@@ -646,12 +829,14 @@ def _build_pdf(path: Path, payload: dict[str, Any]) -> None:
             Paragraph(_p(row["tool"]), small),
             Paragraph(_p(row["status"]), small),
             Paragraph(str(row["targets"]), small),
-            Paragraph(str(row["findings"]), small),
+            Paragraph(str(row.get("confirmed", 0)), small),
+            Paragraph(str(row.get("candidates", 0)), small),
+            Paragraph(str(row.get("observations", 0)), small),
             Paragraph(str(row["duration_seconds"]), small),
         ])
     table = Table(
         coverage_data,
-        colWidths=[82, 70, 68, 54, 54, 58],
+        colWidths=[70, 58, 58, 44, 52, 52, 42, 50],
         repeatRows=1,
         hAlign="LEFT",
     )
@@ -759,17 +944,25 @@ def _build_pdf(path: Path, payload: dict[str, Any]) -> None:
                 core.append(Paragraph(f"<b>Description:</b> {_p(item['description'])}", body))
             story.append(KeepTogether(core))
             for label, key, style in (
-                ("Technical details", "technical_details", body),
+                ("Why the evidence confirms or suggests the issue", "technical_details", body),
+                ("Attack preconditions", "attack_preconditions", body),
+                ("Payload / test input", "payload", small),
                 ("Evidence", "evidence", small),
-                ("Impact", "impact", body),
-                ("Remediation", "solution", body),
-                ("Reproduction / validation", "reproduction", body),
+                ("Security impact", "impact", body),
+                ("Recommended remediation", "solution", body),
+                ("Reproduction / validation steps", "reproduction", body),
+                ("OWASP classification", "owasp_category", body),
             ):
                 if item.get(key):
                     story.append(Paragraph(
                         f"<b>{label}:</b> {_p(item[key])}",
                         style,
                     ))
+            if not item.get("payload") and item.get("payloads"):
+                story.append(Paragraph(
+                    f"<b>Payloads / test inputs:</b> {_p('; '.join(item['payloads']))}",
+                    small,
+                ))
             if item.get("identifiers"):
                 story.append(Paragraph(
                     f"<b>Identifiers:</b> {_p('; '.join(item['identifiers']))}",
@@ -813,9 +1006,11 @@ def generate_report(
     json_path = Path(REPORTS_DIR) / f"{base}.json"
     html_path = Path(REPORTS_DIR) / f"{base}.html"
     pdf_path = Path(REPORTS_DIR) / f"{base}.pdf"
-    findings = flatten_findings(results)
+    all_findings = flatten_findings(results)
+    findings, omitted_detail = _human_readable_findings(all_findings)
     coverage = build_coverage(results, context)
-    summary = summarize(results, findings, coverage, context)
+    summary = summarize(results, all_findings, coverage, context)
+    summary["omitted_human_readable_detail"] = omitted_detail
     payload = {
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "target": target_url,
@@ -828,6 +1023,7 @@ def generate_report(
         "observations_count": sum(item["category"] in {"discovery", "observation"} for item in findings),
         "findings_count": len(findings),
         "findings": findings,
+        "all_findings": all_findings,
         "findings_by_category": _finding_groups(findings),
         "assessment_context": _redact_value(context),
         "results": _redact_value(results),
@@ -877,5 +1073,26 @@ def generate_report(
     )
 
 
+def _once() -> int:
+    try:
+        arguments = json.loads(sys.stdin.read() or "{}")
+        if not isinstance(arguments, dict):
+            raise ValueError("Expected a JSON object on stdin.")
+        result = generate_report(**arguments)
+    except Exception as exc:
+        result = failure(
+            "Report Generator",
+            "",
+            f"One-shot Report Generator execution failed: {type(exc).__name__}: {exc}",
+        )
+    print(json.dumps(result, ensure_ascii=False, default=str))
+    return 0
+
+
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser(add_help=False)
+    parser.add_argument("--once", action="store_true")
+    args, _ = parser.parse_known_args()
+    if args.once:
+        raise SystemExit(_once())
     mcp.run(transport="stdio")

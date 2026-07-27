@@ -3,7 +3,9 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import tempfile
+import time
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
@@ -54,34 +56,47 @@ def _looks_like_login_response(response: requests.Response) -> bool:
         or path.endswith("/login.php")
         or ("type=\"password\"" in text and "login" in text)
         or ("type='password'" in text and "login" in text)
-        or "login :: damn vulnerable web application" in text
     )
 
 
-def _session_probe(url: str, cookies: str) -> dict[str, Any]:
+def _session_probe(url: str, cookies: str, attempts: int = 3) -> dict[str, Any]:
     if not url or not cookies:
-        return {"performed": False, "authenticated": None}
-    try:
-        response = requests.get(
-            url,
-            headers={"Cookie": cookies, "Cache-Control": "no-cache"},
-            timeout=(4, 12),
-            allow_redirects=True,
-        )
-    except requests.RequestException as exc:
-        return {
-            "performed": True,
-            "authenticated": False,
-            "error": f"{type(exc).__name__}: {exc}",
-        }
+        return {"performed": False, "authenticated": None, "conclusive": True}
+    errors: list[str] = []
+    for attempt in range(max(1, attempts)):
+        try:
+            response = requests.get(
+                url,
+                headers={"Cookie": cookies, "Cache-Control": "no-cache"},
+                timeout=(4, 14),
+                allow_redirects=True,
+            )
+            login = _looks_like_login_response(response)
+            return {
+                "performed": True,
+                "authenticated": response.status_code < 400 and not login,
+                "conclusive": True,
+                "transient_error": False,
+                "status": response.status_code,
+                "final_url": str(response.url),
+                "login_detected": login,
+                "attempt_errors": errors,
+            }
+        except (requests.Timeout, requests.ConnectionError) as exc:
+            errors.append(f"{type(exc).__name__}: {exc}")
+            if attempt + 1 < attempts:
+                time.sleep(0.8 * (attempt + 1))
+        except requests.RequestException as exc:
+            errors.append(f"{type(exc).__name__}: {exc}")
+            break
     return {
         "performed": True,
-        "authenticated": response.status_code < 400 and not _looks_like_login_response(response),
-        "status": response.status_code,
-        "final_url": str(response.url),
-        "login_detected": _looks_like_login_response(response),
+        "authenticated": None,
+        "conclusive": False,
+        "transient_error": True,
+        "errors": errors,
+        "error": errors[-1] if errors else "request failed",
     }
-
 
 def _read_json(path: Path) -> list[dict[str, Any]]:
     try:
@@ -92,7 +107,7 @@ def _read_json(path: Path) -> list[dict[str, Any]]:
 
 
 def _run_phase(target_url: str, cookies: str, wordlist: Path, output: Path, budget: int, name: str) -> tuple[dict[str, Any], list[dict[str, Any]]]:
-    command = ["ffuf", "-u", f"{target_url.rstrip('/')}/FUZZ", "-w", str(wordlist), "-of", "json", "-o", str(output), "-ac", "-t", "20", "-timeout", "7", "-maxtime", str(max(10,budget)), "-noninteractive"]
+    command = ["ffuf", "-u", f"{target_url.rstrip('/')}/FUZZ", "-w", str(wordlist), "-of", "json", "-o", str(output), "-ac", "-t", "30", "-timeout", "4", "-maxtime", str(max(10,budget)), "-noninteractive"]
     if cookies: command.extend(["-b", cookies])
     result = run_process("FFUF", command, target=target_url, timeout=max(20,budget+15))
     rows = _read_json(output)
@@ -391,10 +406,10 @@ def _finding(item: dict[str, Any], cookies: str, verify: bool) -> dict[str, Any]
 @mcp.tool()
 def run_ffuf_fuzz(target_url: str, cookies: str="", wordlist: str="", timeout: int=120, session_probe_url: str="") -> dict:
     """Check high-value paths first, then use the compact project wordlist with the remaining budget."""
-    timeout = max(45, min(int(timeout), 300))
+    timeout = max(30, min(int(timeout), 180))
     general = Path(wordlist) if wordlist else WORDLISTS_DIR/"common.txt"
     if not general.exists(): return failure("FFUF", target_url, f"Wordlist not found: {general}", diagnosis="missing_wordlist")
-    priority_budget = min(40, max(20, timeout//3)); general_budget = max(20, timeout-priority_budget)
+    priority_budget = min(20, max(10, timeout//3)); general_budget = max(15, timeout-priority_budget)
     with tempfile.TemporaryDirectory(prefix="ffuf-priority-") as td:
         temp=Path(td); priority=temp/"priority.txt"; filtered=temp/"general.txt"
         authenticated = bool(cookies)
@@ -415,7 +430,7 @@ def run_ffuf_fuzz(target_url: str, cookies: str="", wordlist: str="", timeout: i
         ]
         filtered.write_text("\n".join(lines)+"\n", encoding="utf-8")
         session_before = _session_probe(session_probe_url, cookies)
-        if authenticated and session_before.get("performed") and not session_before.get("authenticated"):
+        if authenticated and session_before.get("performed") and session_before.get("conclusive") and session_before.get("authenticated") is False:
             return partial(
                 "FFUF", target_url,
                 "Authenticated FFUF was not started because the supplied session was already invalid.",
@@ -452,8 +467,12 @@ def run_ffuf_fuzz(target_url: str, cookies: str="", wordlist: str="", timeout: i
             "session_before":session_before,
             "session_after":session_after,
             "destructive_paths_excluded":sorted(DESTRUCTIVE_AUTH_PATH_TOKENS) if authenticated else [],
+            "session_probe_inconclusive": bool(
+                session_before.get("conclusive") is False
+                or session_after.get("conclusive") is False
+            ),
         }
-        if authenticated and session_after.get("performed") and not session_after.get("authenticated"):
+        if authenticated and session_after.get("performed") and session_after.get("conclusive") and session_after.get("authenticated") is False:
             return partial(
                 "FFUF", target_url,
                 f"FFUF preserved {len(findings)} findings, but the authenticated session became invalid during the scan.",

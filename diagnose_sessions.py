@@ -25,6 +25,14 @@ async def main_async(target: str, cookies: str) -> int:
         f"[*] Safe discovery skipped destructive URLs: "
         f"{len(discovery.get('destructive_urls_skipped', []))}"
     )
+    if discovery.get("target_preparation"):
+        print(
+            "[*] Target preparation: "
+            + json.dumps(
+                discovery["target_preparation"],
+                ensure_ascii=False,
+            )
+        )
     if discovery.get("authentication_probe"):
         print(
             "[*] Discovery final auth probe: "

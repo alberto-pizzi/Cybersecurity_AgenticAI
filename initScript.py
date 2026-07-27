@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import importlib.metadata
 import os
 import platform
 import re
@@ -20,6 +21,7 @@ from typing import Any
 from urllib.parse import urlparse
 
 import requests
+from packaging.requirements import Requirement
 
 from utils import canonical_cookie_header, cookie_names, ROOT_DIR, WORDLISTS_DIR, setup_path
 
@@ -29,9 +31,16 @@ LOCAL_BIN = LOCAL_ROOT / "bin"
 LOCAL_OPT = LOCAL_ROOT / "opt"
 DOWNLOADS = LOCAL_ROOT / "downloads"
 RUNTIME_FILE = ROOT / ".secops_runtime.json"
+COMMAND_REFERENCE_FILE = ROOT / "init.txt"
 TARGET = "http://127.0.0.1"
+LOCAL_LAB_CONTAINER = "dvwa"
+LOCAL_LAB_IMAGE = "vulnerables/web-dvwa"
+LOCAL_LAB_NETWORK = "secops-net"
 DEFAULT_MODEL = "llama3.1:8b"
-BUILD_ID = "secops-init-resilient-v17.4-20260724"
+NUCLEI_TEMPLATE_MINIMUM = 1000
+NUCLEI_TEMPLATE_UPDATE_TIMEOUT = 600
+_NUCLEI_TEMPLATE_STATE: dict[str, Any] = {}
+BUILD_ID = "secops-init-resilient-v29-generic-parity-v29.3.1-ai-nuclei-installer-fix-20260727"
 
 PYTHON_PACKAGES = (
     "fastmcp==2.12.5", "langgraph>=0.6,<2", "requests>=2.32,<3",
@@ -152,16 +161,50 @@ def write_launcher(name: str, command: list[str]) -> Path:
     return path
 
 
+def _missing_python_packages() -> list[str]:
+    """Return only missing or version-incompatible requirements.
+
+    This avoids contacting PyPI on every initializer run. It is especially
+    important for offline/local-lab runs where all dependencies are already
+    installed but DNS is temporarily unavailable.
+    """
+    missing: list[str] = []
+    for raw in PYTHON_PACKAGES:
+        requirement = Requirement(raw)
+        try:
+            installed = importlib.metadata.version(requirement.name)
+        except importlib.metadata.PackageNotFoundError:
+            missing.append(raw)
+            continue
+        if requirement.specifier and installed not in requirement.specifier:
+            missing.append(raw)
+    return missing
+
+
 def install_python_packages() -> None:
-    run([sys.executable, "-m", "pip", "install", "--upgrade", "pip"], timeout=1800)
-    run(
-        [sys.executable, "-m", "pip", "uninstall", "-y", "python-owasp-zap-v2.4"],
-        required=False,
-        capture=True,
-        show_output=False,
-        timeout=600,
-    )
-    run([sys.executable, "-m", "pip", "install", "--upgrade", *PYTHON_PACKAGES], timeout=3600)
+    # Remove the obsolete ZAP client only when it is actually installed.
+    try:
+        importlib.metadata.version("python-owasp-zap-v2.4")
+    except importlib.metadata.PackageNotFoundError:
+        pass
+    else:
+        run(
+            [sys.executable, "-m", "pip", "uninstall", "-y", "python-owasp-zap-v2.4"],
+            required=False,
+            capture=True,
+            show_output=False,
+            timeout=600,
+        )
+
+    missing = _missing_python_packages()
+    if missing:
+        print("[*] Installing missing/incompatible Python packages: " + ", ".join(missing))
+        run(
+            [sys.executable, "-m", "pip", "install", *missing],
+            timeout=3600,
+        )
+    else:
+        print("[+] Python dependencies already satisfy the pinned requirements; PyPI access skipped.")
     configure_path()
 
 
@@ -361,40 +404,102 @@ def _nikto_health(perl: Path, script: Path, launcher: Path | None = None) -> tup
     return True, details[-1]
 
 
+NIKTO_DOCKER_IMAGE = "ghcr.io/sullo/nikto:latest"
+
+
+def _docker_image_ready(image: str) -> bool:
+    if not shutil.which("docker"):
+        return False
+    result = run(
+        ["docker", "image", "inspect", image],
+        required=False,
+        capture=True,
+        show_output=False,
+        timeout=60,
+    )
+    return result.returncode == 0
+
+
+def _ensure_nikto_docker_image() -> bool:
+    if _docker_image_ready(NIKTO_DOCKER_IMAGE):
+        print(f"[+] Nikto Docker fallback already available: {NIKTO_DOCKER_IMAGE}")
+        return True
+    if not shutil.which("docker"):
+        return False
+    result = run(
+        ["docker", "pull", NIKTO_DOCKER_IMAGE],
+        required=False,
+        capture=True,
+        timeout=1800,
+    )
+    if result.returncode == 0 and _docker_image_ready(NIKTO_DOCKER_IMAGE):
+        print(f"[+] Nikto Docker fallback installed: {NIKTO_DOCKER_IMAGE}")
+        return True
+    print("[!] Nikto Docker image could not be pulled. Native Perl will be checked as a secondary option.")
+    return False
+
+
+def _write_nikto_docker_launcher() -> Path:
+    """Create a CLI-compatible marker/launcher while MCP uses its richer Docker path."""
+    LOCAL_BIN.mkdir(parents=True, exist_ok=True)
+    if os.name == "nt":
+        launcher = LOCAL_BIN / "nikto.bat"
+        launcher.write_text(
+            "@echo off\\r\\n"
+            f'docker run --rm "{NIKTO_DOCKER_IMAGE}" %*\\r\\n'
+            "exit /b %ERRORLEVEL%\\r\\n",
+            encoding="utf-8",
+        )
+    else:
+        launcher = LOCAL_BIN / "nikto"
+        launcher.write_text(
+            "#!/usr/bin/env sh\\n"
+            f'exec docker run --rm "{NIKTO_DOCKER_IMAGE}" "$@"\\n',
+            encoding="utf-8",
+        )
+        launcher.chmod(
+            launcher.stat().st_mode
+            | stat.S_IXUSR
+            | stat.S_IXGRP
+            | stat.S_IXOTH
+        )
+    configure_path()
+    print(f"[+] Nikto Docker launcher created: {launcher}")
+    return launcher
+
+
 def install_nikto() -> None:
-    """Install/repair Nikto, Strawberry Perl dependencies, and a quoting-safe launcher."""
+    """Prefer the official Docker Nikto image; keep native Perl optional.
+
+    The MCP Nikto server already supports Docker and should not force users to
+    uninstall/reinstall Strawberry Perl. Native Perl remains a secondary
+    fallback for systems without Docker.
+    """
+    if _ensure_nikto_docker_image():
+        _write_nikto_docker_launcher()
+        return
+
     destination = LOCAL_OPT / "nikto"
     script = destination / "program" / "nikto.pl"
     if not script.is_file():
         clone_or_update("https://github.com/sullo/nikto.git", destination)
 
     perl_value = find_perl()
-    if not perl_value and os.name == "nt" and shutil.which("winget"):
-        run(
-            ["winget", "install", "--id", "StrawberryPerl.StrawberryPerl", "--exact", "--silent",
-             "--accept-package-agreements", "--accept-source-agreements"],
-            required=False,
-            timeout=1800,
-        )
-        configure_path()
-        perl_value = find_perl()
-
     if not script.is_file() or not perl_value:
         raise RuntimeError(
-            "Nikto requires program/nikto.pl and Strawberry Perl. "
-            "To remove a corrupted installation run: "
-            "winget uninstall --id StrawberryPerl.StrawberryPerl --exact"
+            "Nikto is unavailable: the official Docker image is not ready and "
+            "the optional native Perl runtime is missing. Restore network/Docker "
+            "access and rerun the initializer. Do not uninstall working runtimes."
         )
 
     perl = Path(perl_value).resolve()
     make, toolchain_detail = _configure_perl_toolchain(perl)
     if make is None:
         raise RuntimeError(
-            "Strawberry Perl was found, but its bundled make/compiler toolchain is missing. "
-            f"{toolchain_detail}\n"
-            "Reinstall it with:\n"
-            "  winget uninstall --id StrawberryPerl.StrawberryPerl --exact\n"
-            "  winget install --id StrawberryPerl.StrawberryPerl --exact"
+            "The optional native Strawberry Perl toolchain is incomplete and "
+            "the Docker fallback is unavailable. "
+            f"{toolchain_detail}. Restore Docker/network access or repair Perl manually; "
+            "the initializer will not uninstall it."
         )
     print(f"[+] Strawberry Perl build tool: {make}")
     for module in ("XML::Writer",):
@@ -407,10 +512,8 @@ def install_nikto() -> None:
     healthy, detail = _nikto_health(perl, script.resolve(), launcher)
     if not healthy:
         raise RuntimeError(
-            f"Nikto runtime verification failed: {detail}\n"
-            "Reinstall Strawberry Perl with:\n"
-            "  winget uninstall --id StrawberryPerl.StrawberryPerl --exact\n"
-            "  winget install --id StrawberryPerl.StrawberryPerl --exact"
+            f"Optional native Nikto runtime verification failed: {detail}. "
+            "The initializer will not uninstall Perl."
         )
     print(f"[+] Nikto runtime and launcher verified: {launcher}")
 
@@ -484,6 +587,222 @@ def install_release_tool(name: str, repository: str, hint: str) -> None:
     configure_path()
 
 
+def _nuclei_template_directories() -> list[Path]:
+    home = Path.home()
+    appdata = os.environ.get("APPDATA", "").strip()
+    localappdata = os.environ.get("LOCALAPPDATA", "").strip()
+    programdata = os.environ.get("PROGRAMDATA", "").strip()
+    candidates = [
+        Path(os.environ["NUCLEI_TEMPLATES_DIR"]).expanduser()
+        if os.environ.get("NUCLEI_TEMPLATES_DIR") else None,
+        ROOT / "tools" / "nuclei-templates",
+        home / "nuclei-templates",
+        home / ".local" / "nuclei-templates",
+        home / ".config" / "nuclei" / "templates",
+        home / "AppData" / "Roaming" / "nuclei" / "templates",
+        Path(appdata) / "nuclei-templates" if appdata else None,
+        Path(appdata) / "nuclei" / "templates" if appdata else None,
+        Path(localappdata) / "nuclei-templates" if localappdata else None,
+        Path(localappdata) / "nuclei" / "templates" if localappdata else None,
+        Path(programdata) / "nuclei-templates" if programdata else None,
+    ]
+    return list(dict.fromkeys(path.resolve() for path in candidates if path is not None))
+
+
+def _filesystem_nuclei_template_inventory() -> list[dict[str, Any]]:
+    inventories: list[dict[str, Any]] = []
+    for directory in _nuclei_template_directories():
+        if not directory.is_dir():
+            continue
+        count = sum(
+            1
+            for path in directory.rglob("*")
+            if path.is_file() and path.suffix.lower() in {".yaml", ".yml"}
+        )
+        inventories.append({"directory": str(directory), "count": count})
+    inventories.sort(key=lambda item: int(item["count"]), reverse=True)
+    return inventories
+
+
+def _filesystem_nuclei_template_count() -> tuple[int, list[str]]:
+    inventory = _filesystem_nuclei_template_inventory()
+    return (
+        max((int(item["count"]) for item in inventory), default=0),
+        [str(item["directory"]) for item in inventory],
+    )
+
+
+def _best_nuclei_template_directory() -> str:
+    inventory = _filesystem_nuclei_template_inventory()
+    return str(inventory[0]["directory"]) if inventory and int(inventory[0]["count"]) > 0 else ""
+
+
+def _nuclei_listed_template_count(executable: str) -> tuple[int, str]:
+    probe = run(
+        [executable, "-tl", "-silent", "-nc", "-disable-update-check"],
+        required=False,
+        capture=True,
+        show_output=False,
+        timeout=240,
+    )
+    lines = {
+        line.strip()
+        for line in (probe.stdout or "").splitlines()
+        if line.strip() and not line.lstrip().startswith("[")
+    }
+    detail = "\n".join(part for part in ((probe.stdout or "")[-1000:], (probe.stderr or "")[-1000:]) if part)
+    return len(lines), detail
+
+
+def _install_official_nuclei_template_fallback() -> bool:
+    """Merge the official template repository when the Nuclei updater is unavailable."""
+    archive = DOWNLOADS / "nuclei-templates-main.zip"
+    extract_dir = DOWNLOADS / "extract_nuclei_templates"
+    destination = Path.home() / "nuclei-templates"
+    url = "https://github.com/projectdiscovery/nuclei-templates/archive/refs/heads/main.zip"
+    try:
+        DOWNLOADS.mkdir(parents=True, exist_ok=True)
+        with requests.get(url, stream=True, timeout=180) as response:
+            response.raise_for_status()
+            with archive.open("wb") as handle:
+                for chunk in response.iter_content(1024 * 1024):
+                    if chunk:
+                        handle.write(chunk)
+        shutil.rmtree(extract_dir, ignore_errors=True)
+        extract_dir.mkdir(parents=True, exist_ok=True)
+        with zipfile.ZipFile(archive) as source:
+            source.extractall(extract_dir)
+        extracted = next(
+            (item for item in extract_dir.iterdir() if item.is_dir() and item.name.startswith("nuclei-templates")),
+            None,
+        )
+        if extracted is None:
+            raise RuntimeError("The official Nuclei template archive had no repository directory.")
+        destination.mkdir(parents=True, exist_ok=True)
+        shutil.copytree(extracted, destination, dirs_exist_ok=True)
+        print(f"[+] Official Nuclei template repository merged into: {destination}")
+        return True
+    except Exception as exc:
+        print(f"[!] Official Nuclei template fallback could not be downloaded: {type(exc).__name__}: {exc}", file=sys.stderr)
+        return False
+    finally:
+        shutil.rmtree(extract_dir, ignore_errors=True)
+        archive.unlink(missing_ok=True)
+
+
+def ensure_nuclei_engine_current() -> dict[str, Any]:
+    """Ask the official Nuclei binary to self-update before refreshing templates."""
+    executable = command_path("nuclei")
+    if not executable:
+        raise RuntimeError("Nuclei executable is unavailable.")
+    before = run(
+        [executable, "-version"],
+        required=False,
+        capture=True,
+        show_output=False,
+        timeout=60,
+    )
+    update = run(
+        [executable, "-update"],
+        required=False,
+        capture=True,
+        timeout=NUCLEI_TEMPLATE_UPDATE_TIMEOUT,
+    )
+    after = run(
+        [executable, "-version"],
+        required=False,
+        capture=True,
+        show_output=False,
+        timeout=60,
+    )
+    state = {
+        "update_returncode": update.returncode,
+        "version_before": "\n".join(filter(None, ((before.stdout or "").strip(), (before.stderr or "").strip())))[-1000:],
+        "version_after": "\n".join(filter(None, ((after.stdout or "").strip(), (after.stderr or "").strip())))[-1000:],
+        "update_output_excerpt": "\n".join(filter(None, ((update.stdout or "").strip(), (update.stderr or "").strip())))[-1600:],
+    }
+    if update.returncode == 0:
+        print("[+] Nuclei engine update check completed.")
+    else:
+        print("[!] Nuclei self-update did not complete; the existing executable will be retained.", file=sys.stderr)
+    return state
+
+
+def ensure_nuclei_templates() -> dict[str, Any]:
+    """Install/update the complete official community template pack and report its size."""
+    global _NUCLEI_TEMPLATE_STATE
+    executable = command_path("nuclei")
+    if not executable:
+        raise RuntimeError("Nuclei executable is unavailable; templates cannot be installed.")
+
+    listed_before, _ = _nuclei_listed_template_count(executable)
+    filesystem_before, directories_before = _filesystem_nuclei_template_count()
+    before = max(listed_before, filesystem_before)
+    print(f"[*] Nuclei templates before update: {before}")
+
+    update = run(
+        [executable, "-update-templates"],
+        required=False,
+        capture=True,
+        timeout=NUCLEI_TEMPLATE_UPDATE_TIMEOUT,
+    )
+    combined = "\n".join((update.stdout or "", update.stderr or ""))
+    if update.returncode != 0 and "unknown flag" in combined.lower():
+        update = run(
+            [executable, "-ut"],
+            required=False,
+            capture=True,
+            timeout=NUCLEI_TEMPLATE_UPDATE_TIMEOUT,
+        )
+        combined = "\n".join((update.stdout or "", update.stderr or ""))
+
+    listed_after, listed_detail = _nuclei_listed_template_count(executable)
+    filesystem_after, directories_after = _filesystem_nuclei_template_count()
+    after = max(listed_after, filesystem_after)
+    fallback_used = False
+
+    if after < NUCLEI_TEMPLATE_MINIMUM:
+        print(
+            f"[!] Only {after} Nuclei templates were detected; attempting the complete official repository fallback.",
+            file=sys.stderr,
+        )
+        fallback_used = _install_official_nuclei_template_fallback()
+        listed_after, listed_detail = _nuclei_listed_template_count(executable)
+        filesystem_after, directories_after = _filesystem_nuclei_template_count()
+        after = max(listed_after, filesystem_after)
+
+    if after <= 0:
+        raise RuntimeError(
+            "No Nuclei templates are available. Restore network access and rerun initScript.py so "
+            "the official projectdiscovery/nuclei-templates repository can be installed."
+        )
+
+    sufficient = after >= NUCLEI_TEMPLATE_MINIMUM
+    if sufficient:
+        print(f"[+] Nuclei template inventory ready: {after} templates (complete official pack threshold satisfied).")
+    else:
+        print(
+            f"[!] Nuclei has {after} templates. Scans can continue, but the expected full-pack threshold "
+            f"of {NUCLEI_TEMPLATE_MINIMUM} was not reached.",
+            file=sys.stderr,
+        )
+
+    _NUCLEI_TEMPLATE_STATE = {
+        "count": after,
+        "count_before_update": before,
+        "minimum_expected": NUCLEI_TEMPLATE_MINIMUM,
+        "sufficient": sufficient,
+        "update_returncode": update.returncode,
+        "update_output_excerpt": combined[-2000:],
+        "fallback_used": fallback_used,
+        "directory": _best_nuclei_template_directory(),
+        "directories": directories_after or directories_before,
+        "filesystem_candidates": _filesystem_nuclei_template_inventory(),
+        "list_probe_excerpt": listed_detail[-1000:],
+    }
+    return dict(_NUCLEI_TEMPLATE_STATE)
+
+
 def install_scanners() -> None:
     print("\n=== Installing/verifying security scanners ===")
     ensure_arjun()
@@ -492,6 +811,10 @@ def install_scanners() -> None:
     install_nikto()
     for name, (repository, hint) in RELEASE_TOOLS.items():
         install_release_tool(name, repository, hint)
+    nuclei_engine = ensure_nuclei_engine_current()
+    nuclei_templates = ensure_nuclei_templates()
+    nuclei_templates["engine"] = nuclei_engine
+    _NUCLEI_TEMPLATE_STATE.update(nuclei_templates)
 
 
 def scanner_status() -> dict[str, str | None]:
@@ -500,16 +823,27 @@ def scanner_status() -> dict[str, str | None]:
 
 def verify_scanners(required: bool = True) -> dict[str, str | None]:
     status = scanner_status()
-    if status.get("nikto"):
+    if _docker_image_ready(NIKTO_DOCKER_IMAGE):
+        if not status.get("nikto"):
+            status["nikto"] = str(_write_nikto_docker_launcher())
+        print(f"[+] Nikto verified through official Docker fallback: {NIKTO_DOCKER_IMAGE}")
+    elif status.get("nikto"):
         perl_value = find_perl()
         script = LOCAL_OPT / "nikto" / "program" / "nikto.pl"
         healthy = False
         detail = "Perl or nikto.pl is missing."
         if perl_value and script.is_file():
-            healthy, detail = _nikto_health(Path(perl_value).resolve(), script.resolve(), Path(status["nikto"]))
+            healthy, detail = _nikto_health(
+                Path(perl_value).resolve(),
+                script.resolve(),
+                Path(status["nikto"]),
+            )
         if not healthy:
             status["nikto"] = None
-            print(f"[!] Nikto is unusable: {detail}", file=sys.stderr)
+            print(
+                f"[!] Nikto native runtime is unusable and Docker fallback is absent: {detail}",
+                file=sys.stderr,
+            )
     print("\n=== Scanner executables ===")
     for name, path in status.items():
         print(f"{name:20} {'OK: ' + path if path else 'MISSING/UNUSABLE'}")
@@ -530,6 +864,26 @@ def write_runtime_config(status: dict[str, str | None]) -> None:
         "executables": status,
         "nikto_perl": str(Path(find_perl()).resolve()) if find_perl() else "",
         "nikto_script": str((LOCAL_OPT / "nikto" / "program" / "nikto.pl").resolve()),
+        "nikto_image": NIKTO_DOCKER_IMAGE,
+        "nikto_execution_mode": (
+            "docker_official_image"
+            if _docker_image_ready(NIKTO_DOCKER_IMAGE)
+            else "native_perl"
+        ),
+        "nuclei_templates": (
+            dict(_NUCLEI_TEMPLATE_STATE)
+            if _NUCLEI_TEMPLATE_STATE
+            else {
+                "count": max(
+                    _nuclei_listed_template_count(status.get("nuclei") or "nuclei")[0],
+                    _filesystem_nuclei_template_count()[0],
+                ),
+                "directory": _best_nuclei_template_directory(),
+                "directories": _filesystem_nuclei_template_count()[1],
+                "filesystem_candidates": _filesystem_nuclei_template_inventory(),
+                "minimum_expected": NUCLEI_TEMPLATE_MINIMUM,
+            }
+        ),
     }
     RUNTIME_FILE.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
     print(f"[+] Runtime scanner configuration written: {RUNTIME_FILE}")
@@ -624,13 +978,12 @@ def _hidden_input(html_text: str, name: str) -> str:
     return str(parser.values.get(name, "")).strip()
 
 
-def _dvwa_login_page(response: requests.Response) -> bool:
+def _local_lab_login_page(response: requests.Response) -> bool:
     text = response.text[:100_000].lower()
     path = urlparse(str(response.url)).path.lower()
     return (
         path.endswith("/login")
         or path.endswith("/login.php")
-        or "login :: damn vulnerable web application" in text
         or (
             ("name=\"username\"" in text or "name='username'" in text)
             and ("name=\"password\"" in text or "name='password'" in text)
@@ -638,7 +991,7 @@ def _dvwa_login_page(response: requests.Response) -> bool:
     )
 
 
-def _dvwa_setup_page(response: requests.Response) -> bool:
+def _local_lab_setup_page(response: requests.Response) -> bool:
     path = urlparse(str(response.url)).path.lower()
     text = response.text[:100_000].lower()
     return (
@@ -648,7 +1001,7 @@ def _dvwa_setup_page(response: requests.Response) -> bool:
     )
 
 
-def _dvwa_response_summary(
+def _local_lab_response_summary(
     response: requests.Response,
 ) -> dict[str, Any]:
     text = response.text[:100_000]
@@ -671,8 +1024,8 @@ def _dvwa_response_summary(
     return {
         "status": int(response.status_code),
         "final_url": str(response.url),
-        "login_page": _dvwa_login_page(response),
-        "setup_page": _dvwa_setup_page(response),
+        "login_page": _local_lab_login_page(response),
+        "setup_page": _local_lab_setup_page(response),
         "title": (
             re.sub(r"\s+", " ", title_match.group(1)).strip()
             if title_match
@@ -685,7 +1038,7 @@ def _dvwa_response_summary(
     }
 
 
-def _dvwa_cookie_value(
+def _local_lab_cookie_value(
     session: requests.Session,
     cookie_name: str,
 ) -> str:
@@ -721,7 +1074,7 @@ def _remove_named_cookies(
             pass
 
 
-def _attempt_dvwa_login(
+def _attempt_local_lab_login(
     session: requests.Session,
     username: str,
     password: str,
@@ -755,13 +1108,13 @@ def _attempt_dvwa_login(
     response.raise_for_status()
     final_path = urlparse(str(response.url)).path.lower()
     successful = (
-        not _dvwa_login_page(response)
-        and not _dvwa_setup_page(response)
+        not _local_lab_login_page(response)
+        and not _local_lab_setup_page(response)
         and final_path not in {"/login.php", "/setup.php"}
     )
     return successful, {
-        "login_page": _dvwa_response_summary(page),
-        "login_response": _dvwa_response_summary(response),
+        "login_page": _local_lab_response_summary(page),
+        "login_response": _local_lab_response_summary(response),
         "login_token_present": bool(token),
         "cookie_names": sorted(
             {str(cookie.name) for cookie in session.cookies},
@@ -770,7 +1123,7 @@ def _attempt_dvwa_login(
     }
 
 
-def _reset_dvwa_database(
+def _reset_local_lab_database(
     session: requests.Session,
 ) -> dict[str, Any]:
     setup_page = session.get(
@@ -799,8 +1152,8 @@ def _reset_dvwa_database(
     )
     setup_response.raise_for_status()
     summary = {
-        "setup_page": _dvwa_response_summary(setup_page),
-        "setup_response": _dvwa_response_summary(setup_response),
+        "setup_page": _local_lab_response_summary(setup_page),
+        "setup_response": _local_lab_response_summary(setup_response),
         "setup_token_present": bool(token),
     }
 
@@ -813,7 +1166,7 @@ def _reset_dvwa_database(
                 headers={"Cache-Control": "no-cache"},
             )
             if probe.status_code < 500:
-                summary["post_setup_probe"] = _dvwa_response_summary(
+                summary["post_setup_probe"] = _local_lab_response_summary(
                     probe
                 )
                 break
@@ -824,12 +1177,78 @@ def _reset_dvwa_database(
     return summary
 
 
-def _finalize_dvwa_cookie(
+
+def _configure_local_lab_profile(
+    session: requests.Session,
+) -> dict[str, Any]:
+    """Apply the bundled training lab profile required for repeatable scans."""
+    actions: list[dict[str, Any]] = []
+
+    # The bundled lab exposes an optional request filter. Disable it so bounded
+    # scanner payloads reach the intentionally vulnerable training handlers.
+    for action_url in (
+        f"{TARGET}/security.php?phpids=off",
+    ):
+        response = session.get(
+            action_url,
+            timeout=15,
+            allow_redirects=True,
+            headers={
+                "Referer": f"{TARGET}/security.php",
+                "Cache-Control": "no-cache",
+            },
+        )
+        response.raise_for_status()
+        actions.append(_local_lab_response_summary(response))
+
+    verification = session.get(
+        f"{TARGET}/security.php",
+        timeout=15,
+        allow_redirects=True,
+        headers={"Cache-Control": "no-cache"},
+    )
+    verification.raise_for_status()
+    lowered = verification.text[:100_000].lower()
+    summary = _local_lab_response_summary(verification)
+    plain_text = re.sub(r"<[^>]+>", " ", lowered)
+    plain_text = re.sub(r"\s+", " ", plain_text)
+    phpids_enabled = bool(re.search(
+        r"phpids(?:\s+is\s+currently)?\s*:\s*enabled",
+        plain_text,
+        re.I,
+    ))
+    phpids_disabled = bool(re.search(
+        r"phpids(?:\s+is\s+currently)?\s*:\s*disabled",
+        plain_text,
+        re.I,
+    ))
+    security_low = (
+        bool(re.search(r"security(?:\s+level)?(?:\s+is\s+currently)?\s*:\s*low", plain_text, re.I))
+        or "value=\"low\" selected" in lowered
+        or "value='low' selected" in lowered
+    )
+
+    if phpids_enabled:
+        raise RuntimeError(
+            "The bundled lab request filter remained enabled after the initializer requested "
+            "security.php?phpids=off. Intentional scanner payloads would be "
+            "blocked and vulnerability coverage would be misleading."
+        )
+
+    return {
+        "security_page": summary,
+        "security_level_low": security_low,
+        "phpids_disabled": phpids_disabled or not phpids_enabled,
+        "actions": actions,
+    }
+
+
+def _finalize_local_lab_cookie(
     session: requests.Session,
 ) -> tuple[str, dict[str, Any]]:
-    php_session = _dvwa_cookie_value(session, "PHPSESSID")
+    php_session = _local_lab_cookie_value(session, "PHPSESSID")
     if not php_session:
-        raise RuntimeError("DVWA did not issue PHPSESSID after login.")
+        raise RuntimeError("The bundled local lab did not issue its session cookie after login.")
 
     _remove_named_cookies(session, "security")
     session.cookies.set(
@@ -839,6 +1258,7 @@ def _finalize_dvwa_cookie(
         path="/",
     )
 
+    lab_security = _configure_local_lab_profile(session)
     verification = session.get(
         f"{TARGET}/security.php",
         timeout=15,
@@ -846,10 +1266,11 @@ def _finalize_dvwa_cookie(
         headers={"Cache-Control": "no-cache"},
     )
     verification.raise_for_status()
-    summary = _dvwa_response_summary(verification)
-    if _dvwa_login_page(verification) or _dvwa_setup_page(verification):
+    summary = _local_lab_response_summary(verification)
+    summary["lab_security"] = lab_security
+    if _local_lab_login_page(verification) or _local_lab_setup_page(verification):
         raise RuntimeError(
-            "DVWA cookie verification failed after login: "
+            "The bundled local-lab cookie verification failed after login: "
             + json.dumps(summary, ensure_ascii=False)
         )
 
@@ -859,17 +1280,17 @@ def _finalize_dvwa_cookie(
     return cookie, summary
 
 
-def login_dvwa() -> str:
+def create_local_lab_session() -> str:
     """
     Try the existing database first, reset only when needed, then verify the
     exact scanner Cookie header.
     """
     if not wait_http(f"{TARGET}/login.php", 90):
-        raise RuntimeError("DVWA is not reachable.")
+        raise RuntimeError("The bundled local training lab is not reachable.")
 
     session = requests.Session()
     session.headers.update({
-        "User-Agent": "SecOpsAgent-DVWA-Initializer/4.0",
+        "User-Agent": "SecOps-Local-Lab-Initializer/5.0",
         "Accept": "text/html,application/xhtml+xml,*/*;q=0.8",
     })
     diagnostics: dict[str, Any] = {
@@ -878,7 +1299,7 @@ def login_dvwa() -> str:
     }
 
     try:
-        success_now, first_attempt = _attempt_dvwa_login(
+        success_now, first_attempt = _attempt_local_lab_login(
             session,
             "admin",
             "password",
@@ -888,10 +1309,10 @@ def login_dvwa() -> str:
             **first_attempt,
         })
         if success_now:
-            cookie, verification = _finalize_dvwa_cookie(session)
+            cookie, verification = _finalize_local_lab_cookie(session)
             diagnostics["verification"] = verification
             print(
-                "[+] DVWA automatic login succeeded using the existing database."
+                "[+] Bundled local-lab login succeeded using the existing database."
             )
             return cookie
     except requests.RequestException as exc:
@@ -903,7 +1324,7 @@ def login_dvwa() -> str:
     session.cookies.clear()
 
     try:
-        diagnostics["database_reset"] = _reset_dvwa_database(
+        diagnostics["database_reset"] = _reset_local_lab_database(
             session
         )
     except requests.RequestException as exc:
@@ -911,13 +1332,13 @@ def login_dvwa() -> str:
             "request_error": f"{type(exc).__name__}: {exc}",
         }
         raise RuntimeError(
-            "DVWA database setup request failed. Diagnostics: "
+            "Bundled local-lab database setup request failed. Diagnostics: "
             + json.dumps(diagnostics, ensure_ascii=False)
         ) from exc
 
     for attempt_number in range(1, 6):
         try:
-            success_now, attempt = _attempt_dvwa_login(
+            success_now, attempt = _attempt_local_lab_login(
                 session,
                 "admin",
                 "password",
@@ -928,12 +1349,12 @@ def login_dvwa() -> str:
                 **attempt,
             })
             if success_now:
-                cookie, verification = _finalize_dvwa_cookie(
+                cookie, verification = _finalize_local_lab_cookie(
                     session
                 )
                 diagnostics["verification"] = verification
                 print(
-                    "[+] DVWA database initialized and automatic login succeeded."
+                    "[+] Bundled local-lab database initialized and automatic login succeeded."
                 )
                 return cookie
         except requests.RequestException as exc:
@@ -946,7 +1367,7 @@ def login_dvwa() -> str:
 
     try:
         logs = run(
-            ["docker", "logs", "--tail", "80", "dvwa"],
+            ["docker", "logs", "--tail", "80", LOCAL_LAB_CONTAINER],
             required=False,
             capture=True,
             show_output=False,
@@ -966,7 +1387,7 @@ def login_dvwa() -> str:
         )
 
     raise RuntimeError(
-        "Automatic DVWA login failed after an existing-database attempt "
+        "Automatic local-lab login failed after an existing-database attempt "
         "and five post-reset retries. Redacted diagnostics: "
         + json.dumps(diagnostics, ensure_ascii=False)
     )
@@ -978,24 +1399,105 @@ def update_runtime_auth(cookie: str) -> None:
         payload = json.loads(RUNTIME_FILE.read_text(encoding="utf-8")) if RUNTIME_FILE.exists() else {}
     except (OSError, json.JSONDecodeError):
         payload = {}
+    parsed = urlparse(TARGET)
+    port = parsed.port or (443 if parsed.scheme == "https" else 80)
+    origin = f"{parsed.scheme.lower()}://{parsed.hostname.lower()}:{port}"
+    target_profiles = payload.get("target_profiles", {})
+    if not isinstance(target_profiles, dict):
+        target_profiles = {}
+    target_profiles[origin] = {
+        "target_url": TARGET,
+        "label": "bundled-local-training-lab",
+        "container_route": {
+            "scanner_container": "zap_mcp",
+            "target_container": LOCAL_LAB_CONTAINER,
+            "alias": LOCAL_LAB_CONTAINER,
+            "network": LOCAL_LAB_NETWORK,
+            "internal_port": 80,
+        },
+        "pre_scan_requests": [
+            {
+                "method": "GET",
+                "path": "/security.php?phpids=off",
+                "accepted_statuses": [200, 302],
+            }
+        ],
+        # Exact-target safety metadata consumed generically by the crawler and
+        # ZAP server. Other targets receive no special exclusions.
+        "excluded_query_keys": ["phpids", "security", "seclev_submit", "test"],
+        "probe_paths": ["/security.php", "/", "/index.php"],
+        "preferred_probe_paths": ["/security.php"],
+    }
     payload.update({
         "last_auth_target": TARGET,
         "last_auth_cookie": cookie,
         "last_auth_generated_at": datetime.now(timezone.utc).isoformat(),
+        "target_profiles": target_profiles,
     })
     RUNTIME_FILE.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
 
-def setup_lab(model: str) -> str:
+def _ensure_local_docker_image(image: str) -> None:
+    """Use a local image without contacting a registry; pull only when absent."""
+    if _docker_image_ready(image):
+        print(f"[+] Docker image already available locally; registry access skipped: {image}")
+        return
+    result = run(
+        ["docker", "pull", image],
+        required=False,
+        capture=True,
+        timeout=1800,
+    )
+    if result.returncode != 0 or not _docker_image_ready(image):
+        raise RuntimeError(
+            f"Docker image {image} is not available locally and could not be pulled. "
+            "Restore DNS/network access and rerun the initializer."
+        )
+
+
+def _ollama_model_available(model: str) -> bool:
+    try:
+        response = requests.get(
+            "http://127.0.0.1:11434/api/tags",
+            timeout=15,
+        )
+        response.raise_for_status()
+        payload = response.json()
+        models = payload.get("models", []) if isinstance(payload, dict) else []
+        wanted = model.lower()
+        wanted_base = wanted.split(":", 1)[0]
+        for item in models:
+            if not isinstance(item, dict):
+                continue
+            name = str(item.get("name") or item.get("model") or "").lower()
+            if name == wanted or (
+                ":" not in wanted
+                and name.split(":", 1)[0] == wanted_base
+            ):
+                return True
+    except Exception:
+        pass
+    return False
+
+
+def setup_local_lab(model: str) -> str:
     if not shutil.which("docker"):
         raise RuntimeError("Docker is required for --with-lab.")
     run(["docker", "info"], timeout=60)
-    ensure_network("secops-net")
-    ensure_container("dvwa", "vulnerables/web-dvwa", {"80/tcp": "80"}, f"{TARGET}/login.php")
-    # The ZAP image tag is mutable. Pull and recreate the container so the
-    # daemon and the current zaproxy Python API are not silently out of sync.
-    run(["docker", "pull", "zaproxy/zap-stable"], timeout=1800)
-    run(["docker", "pull", "ghcr.io/sullo/nikto:latest"], timeout=1800)
-    run(["docker", "rm", "-f", "zap_mcp"], required=False, timeout=180)
+    ensure_network(LOCAL_LAB_NETWORK)
+
+    _ensure_local_docker_image(LOCAL_LAB_IMAGE)
+    _ensure_local_docker_image("zaproxy/zap-stable")
+    _ensure_local_docker_image(NIKTO_DOCKER_IMAGE)
+    _ensure_local_docker_image("ollama/ollama")
+
+    ensure_container(
+        LOCAL_LAB_CONTAINER,
+        LOCAL_LAB_IMAGE,
+        {"80/tcp": "80"},
+        f"{TARGET}/login.php",
+    )
+    # Keep a valid local ZAP container. Recreate it only when its image,
+    # network, ports, or readiness are wrong; do not force a registry pull.
     ensure_container(
         "zap_mcp", "zaproxy/zap-stable", {"8080/tcp": "8080"},
         "http://127.0.0.1:8080/JSON/core/view/version/",
@@ -1015,9 +1517,23 @@ def setup_lab(model: str) -> str:
         print(f"[+] ZAP daemon version: {version or 'unknown'}")
     except Exception as exc:
         print(f"[!] Could not read ZAP version: {type(exc).__name__}: {exc}")
-    ensure_container("ollama_secops", "ollama/ollama", {"11434/tcp": "11434"}, "http://127.0.0.1:11434/api/tags", run_options=["-v", "ollama_secops:/root/.ollama"], attempts=120)
-    run(["docker", "exec", "ollama_secops", "ollama", "pull", model], timeout=7200)
-    return login_dvwa()
+
+    ensure_container(
+        "ollama_secops",
+        "ollama/ollama",
+        {"11434/tcp": "11434"},
+        "http://127.0.0.1:11434/api/tags",
+        run_options=["-v", "ollama_secops:/root/.ollama"],
+        attempts=120,
+    )
+    if _ollama_model_available(model):
+        print(f"[+] Ollama model already available; pull skipped: {model}")
+    else:
+        run(
+            ["docker", "exec", "ollama_secops", "ollama", "pull", model],
+            timeout=7200,
+        )
+    return create_local_lab_session()
 
 
 def run_preflight() -> None:
@@ -1027,35 +1543,91 @@ def run_preflight() -> None:
         raise RuntimeError("The live orchestrator preflight failed.")
 
 
-def print_commands(cookie: str, model: str) -> None:
-    python = str(Path(sys.executable).resolve())
-    def show(script: str, *arguments: str) -> None:
-        print(subprocess.list2cmdline([python, str(ROOT / script), *arguments]))
-    print("\n=== Commands to use from PowerShell ===")
-    show("initScript.py", "--with-lab")
-    show("orchestratorDeterministic.py", "--target", TARGET, "--preflight-only")
-    show("orchestratorDeterministic.py", "--target", TARGET, "--cookies", cookie)
-    show("orchestratorDeterministic.py", "--target", TARGET, "--cookies", cookie, "--auth-only")
-    show("orchestratorAgentic.py", "--target", TARGET, "--cookies", cookie, "--model", model)
-    show("orchestratorAgentic.py", "--target", TARGET, "--cookies", cookie, "--model", model, "--auth-only")
+def command_reference_text() -> str:
+    """Return the complete but compact target-agnostic operator guide."""
+    return 'SecOps FastMCP - guida operativa\n=================================\n\nPRIMA DI INIZIARE\n-----------------\n1. Apri PowerShell nella radice del progetto:\n   Set-Location "S:\\Cybersecurity_AgenticAI"\n2. Usa soltanto target tuoi o esplicitamente autorizzati.\n3. Per un target non locale aggiungi sempre --authorized.\n4. Mantieni l\'intero Cookie header tra virgolette.\n5. Scegli una sola pipeline: deterministic oppure agentic.\n\nSEGNAPOSTO\n----------\n<TARGET>         URL HTTP/HTTPS assoluto, ad esempio https://lab.example.test\n<COOKIE_HEADER>  Cookie completo, ad esempio session=abc; role=student\n<MODEL>          Modello Ollama, ad esempio qwen2.5:7b\n<URL>            Endpoint dello stesso target per un test isolato\n<PARAMETERS>     Parametri separati da virgole, ad esempio id,query\n<JWT>            Token JWT da analizzare\n\n1. AVVIO RAPIDO DEL LAB LOCALE INCLUSO\n--------------------------------------\nPrepara scanner, lab locale, ZAP e Ollama:\npython .\\initScript.py --with-lab --model qwen2.5:7b\n\nAlla fine init stampa quattro comandi già pronti con il cookie appena creato:\n- deterministic balanced\n- deterministic deep\n- agentic balanced\n- agentic deep\n\nInizializzazione senza avviare il lab:\npython .\\initScript.py\n\nRigenera questa guida:\npython .\\initScript.py --commands-only\n\nInizializza e avvia direttamente una pipeline locale:\npython .\\initScript.py --with-lab --run deterministic --mode balanced\npython .\\initScript.py --with-lab --run agentic --model qwen2.5:7b --mode balanced\n\n2. TARGET GENERICO - DETERMINISTIC\n----------------------------------\nBalanced autenticato, consigliato per i test normali:\npython .\\orchestratorDeterministic.py --target <TARGET> --cookies "<COOKIE_HEADER>" --auth-only --authorized --mode balanced\n\nDeep autenticato, più lento e più esteso:\npython .\\orchestratorDeterministic.py --target <TARGET> --cookies "<COOKIE_HEADER>" --auth-only --authorized --mode deep\n\nSolo superficie anonima:\npython .\\orchestratorDeterministic.py --target <TARGET> --authorized --mode balanced\n\nRimuovi --auth-only per eseguire sia il profilo anonimo sia quello autenticato.\nPer 127.0.0.1, localhost e ::1 non serve --authorized.\n\n3. TARGET GENERICO - AGENTIC\n----------------------------\nL\'agente IA sceglie strumenti e richieste dalla superficie realmente scoperta.\nLe azioni proposte vengono validate prima dell\'esecuzione; non sono precompilate\ncon un piano fisso. Il fallback adattivo viene usato soltanto se Ollama non è\ndisponibile o non produce alcuna azione valida.\n\nAI-planned balanced, consigliato:\npython .\\orchestratorAgentic.py --target <TARGET> --cookies "<COOKIE_HEADER>" --auth-only --authorized --model <MODEL> --max-rounds 2 --mode balanced\n\nAI-planned deep, più esteso:\npython .\\orchestratorAgentic.py --target <TARGET> --cookies "<COOKIE_HEADER>" --auth-only --authorized --model <MODEL> --max-rounds 3 --mode deep --ai-timeout 720\n\nStrict AI: termina invece di usare il fallback:\npython .\\orchestratorAgentic.py --target <TARGET> --cookies "<COOKIE_HEADER>" --auth-only --authorized --model <MODEL> --require-ai --max-rounds 2 --mode balanced\n\nModello già installato, senza pull automatico:\npython .\\orchestratorAgentic.py --target <TARGET> --authorized --model <MODEL> --no-model-pull --mode balanced\n\nEndpoint Ollama personalizzato:\npython .\\orchestratorAgentic.py --target <TARGET> --authorized --model <MODEL> --ollama-url http://127.0.0.1:11434 --mode balanced\n\n4. PREFLIGHT E DIAGNOSTICA\n--------------------------\nPreflight deterministic:\npython .\\orchestratorDeterministic.py --target <TARGET> --authorized --preflight-only\n\nPreflight agentic:\npython .\\orchestratorAgentic.py --target <TARGET> --authorized --preflight-only\n\nSessione autenticata e passaggio attraverso ZAP:\npython .\\diagnose_sessions.py --target <TARGET> --cookies "<COOKIE_HEADER>"\n\nZAP passivo:\npython .\\diagnose_zap.py --target <TARGET> --cookies "<COOKIE_HEADER>"\n\nZAP attivo prioritizzato:\npython .\\diagnose_zap.py --target <TARGET> --cookies "<COOKIE_HEADER>" --active --timeout 300\n\nConnettività Nikto/Python/Docker:\npython .\\diagnose_nikto.py --target <TARGET>\n\nLogin del solo lab locale incluso:\npython .\\diagnose_local_lab.py\n\n5. DEBUG DI UN SOLO STRUMENTO\n-----------------------------\nElenca strumenti, server MCP e funzioni:\npython .\\orchestratorDeterministic.py --list-tools\n\nForma generale:\npython .\\orchestratorDeterministic.py --target <TARGET> --cookies "<COOKIE_HEADER>" --authorized --tool <TOOL> --mode balanced\n\nStrumenti host:       ffuf, zap, nuclei, nikto\nStrumenti richieste:  arjun, sqlmap, dalfox, commix, traversal, idor\nStrumenti speciali:   jwt, interactsh\n\nRichiesta GET esplicita:\npython .\\orchestratorDeterministic.py --target <TARGET> --cookies "<COOKIE_HEADER>" --authorized --tool sqlmap --tool-url <URL> --method GET --parameters "<PARAMETERS>" --tool-timeout 180\n\nRichiesta POST esplicita:\npython .\\orchestratorDeterministic.py --target <TARGET> --cookies "<COOKIE_HEADER>" --authorized --tool commix --tool-url <URL> --method POST --data "field=value&submit=1" --parameters "field"\n\nDiagnostica ZAP senza scansione:\npython .\\orchestratorDeterministic.py --target <TARGET> --cookies "<COOKIE_HEADER>" --authorized --tool zap --diagnostic-only\n\nJWT:\npython .\\orchestratorDeterministic.py --target <TARGET> --authorized --tool jwt --jwt-token "<JWT>"\n\nOAST esplicito; FUZZ viene sostituito dal dominio di callback:\npython .\\orchestratorDeterministic.py --target <TARGET> --cookies "<COOKIE_HEADER>" --authorized --tool interactsh --interactsh-injection-url "<TARGET>/fetch?url=FUZZ" --method GET --parameters "url"\n\n6. PROFILI DI SCANSIONE\n-----------------------\nfast      Controllo rapido e budget ridotti.\nbalanced  Copertura ampia con priorità ai controlli più importanti.\ndeep      Limiti maggiori, più richieste e copertura ZAP/Nuclei più estesa.\n\nDeterministic e agentic condividono catalogo strumenti, limiti del profilo,\nselezione delle richieste, controlli di sessione e formato del report.\nL\'agentic conserva la differenza essenziale: è l\'LLM a scegliere il piano.\n\n7. OPZIONI INIT\n---------------\n--with-lab          Avvia/verifica lab locale, ZAP e Ollama.\n--run               none, deterministic oppure agentic; richiede --with-lab.\n--model             Modello Ollama.\n--mode              fast, balanced oppure deep.\n--skip-scanners     Non installare/verificare gli scanner esterni.\n--skip-preflight    Salta il preflight MCP live.\n--commands-only     Riscrive init.txt, mostra la guida e termina.\n--version           Mostra l\'identificatore della build.\n\n8. OPZIONI ORCHESTRATOR\n-----------------------\nCondivise:\n--target --cookies --auth-only --authorized --mode --preflight-only\n--ignore-preflight-errors --interactsh-injection-url\n\nSolo deterministic:\n--tool --list-tools --tool-url --tool-timeout --method --data --parameters\n--jwt-token --diagnostic-only\n\nSolo agentic:\n--model --ollama-url --no-model-pull --require-ai --max-rounds --ai-timeout\n\nDiagnostica ZAP:\n--target --cookies --active --timeout\n\n9. NUCLEI\n---------\nAggiorna motore e template ufficiali:\nnuclei -update\nnuclei -update-templates\n\nConta i template installati in PowerShell:\nnuclei -tl -silent -nc -disable-update-check | Measure-Object -Line\n\nRiparazione e registrazione del percorso esatto:\npython .\\initScript.py --with-lab --model <MODEL>\n\nIl percorso selezionato viene scritto in .secops_runtime.json e passato\nesplicitamente al server MCP Nuclei.\n\n10. REPORT\n----------\nDeterministic:\n.\\reports\\SecOps_Assessment_<timestamp>.pdf\n.\\reports\\SecOps_Assessment_<timestamp>.html\n.\\reports\\SecOps_Assessment_<timestamp>.json\n\nAgentic:\n.\\reports\\SecOps_Agentic_Assessment_<timestamp>.pdf\n.\\reports\\SecOps_Agentic_Assessment_<timestamp>.html\n.\\reports\\SecOps_Agentic_Assessment_<timestamp>.json\n\nNOTA POWERSHELL\n---------------\nIl backtick (`) alla fine di una riga continua lo stesso comando.\n'
 
+
+def write_command_reference() -> Path:
+    COMMAND_REFERENCE_FILE.write_text(command_reference_text(), encoding="utf-8")
+    return COMMAND_REFERENCE_FILE
+
+
+def print_command_reference(path: Path) -> None:
+    print("\n=== Complete SecOps command reference ===")
+    print(command_reference_text().rstrip())
+    print(f"\n[+] Command guide written: {path}")
+
+
+def _operator_command(script: str, *arguments: str) -> str:
+    """Return a copy/paste-safe one-line PowerShell command."""
+    values = ["python", f".\\{script}", *arguments]
+    return subprocess.list2cmdline(values)
+
+
+def print_important_commands(
+    model: str,
+    mode: str = "balanced",
+    cookie_header: str = "",
+) -> None:
+    """Print the four normal authenticated test commands after initialization."""
+    cookie = cookie_header or "<COOKIE_HEADER>"
+    print("\n=== Commands ready to run ===")
+    print("Run them from: " + str(ROOT))
+    commands = (
+        ("1. Deterministic BALANCED", _operator_command(
+            "orchestratorDeterministic.py", "--target", TARGET, "--cookies", cookie,
+            "--auth-only", "--mode", "balanced",
+        )),
+        ("2. Deterministic DEEP", _operator_command(
+            "orchestratorDeterministic.py", "--target", TARGET, "--cookies", cookie,
+            "--auth-only", "--mode", "deep",
+        )),
+        ("3. Agentic BALANCED", _operator_command(
+            "orchestratorAgentic.py", "--target", TARGET, "--cookies", cookie,
+            "--auth-only", "--model", model, "--max-rounds", "2",
+            "--mode", "balanced",
+        )),
+        ("4. Agentic DEEP", _operator_command(
+            "orchestratorAgentic.py", "--target", TARGET, "--cookies", cookie,
+            "--auth-only", "--model", model, "--max-rounds", "3",
+            "--mode", "deep",
+        )),
+    )
+    for label, command in commands:
+        print(f"\n{label}:\n{command}")
+    print("\nZAP isolated DEEP full-priority diagnostic:")
+    print(_operator_command(
+        "orchestratorDeterministic.py", "--target", TARGET, "--cookies", cookie,
+        "--tool", "zap", "--mode", "deep", "--tool-timeout", "480",
+    ))
+    print(f"\n[+] Every command and modifier: {COMMAND_REFERENCE_FILE}")
 
 def main() -> int:
     print(f"=== SecOps initializer [{BUILD_ID}] ===")
-    parser = argparse.ArgumentParser(description="Initialize the FastMCP SecOps project and local lab.")
-    parser.add_argument("--with-lab", action="store_true")
-    parser.add_argument("--run", choices=("none", "deterministic", "agentic"), default="none")
-    parser.add_argument("--model", default=DEFAULT_MODEL)
-    parser.add_argument("--skip-preflight", action="store_true")
-    parser.add_argument("--skip-scanners", action="store_true")
+    parser = argparse.ArgumentParser(
+        description="Initialize FastMCP SecOps and generate the complete operator command guide."
+    )
+    parser.add_argument("--with-lab", action="store_true", help="Start/verify the bundled local training lab, ZAP and Ollama, then create a session.")
+    parser.add_argument("--run", choices=("none", "deterministic", "agentic"), default="none", help="Run an orchestrator after initialization; deterministic/agentic requires --with-lab.")
+    parser.add_argument("--model", default=DEFAULT_MODEL, help=f"Ollama model for local-lab/agentic execution (default: {DEFAULT_MODEL}).")
+    parser.add_argument("--mode", choices=("fast", "balanced", "deep"), default="balanced", help="Scanner coverage/runtime profile (default: balanced).")
+    parser.add_argument("--skip-preflight", action="store_true", help="Skip the live deterministic MCP/dependency preflight.")
+    parser.add_argument("--skip-scanners", action="store_true", help="Skip scanner installation and do not require all scanner executables.")
+    parser.add_argument("--commands-only", action="store_true", help="Print every supported command/modifier, write init.txt, and exit.")
     parser.add_argument("--version", action="version", version=BUILD_ID)
     args = parser.parse_args()
 
     os.chdir(ROOT)
     setup_path()
     configure_path()
-    print("=== SecOps FastMCP initialization ===")
     try:
+        guide_path = write_command_reference()
+        if args.commands_only:
+            print_command_reference(guide_path)
+            return 0
+        print(f"[+] Full command guide written: {guide_path}")
+        print("\n=== SecOps FastMCP initialization ===")
         install_python_packages()
         create_wordlist()
         if not args.skip_scanners:
@@ -1066,18 +1638,18 @@ def main() -> int:
             run_preflight()
         cookie = ""
         if args.with_lab:
-            cookie = setup_lab(args.model)
+            cookie = setup_local_lab(args.model)
             update_runtime_auth(cookie)
-            print(f"\n[+] DVWA login created successfully.\n[+] Cookie header: {cookie}")
-            print_commands(cookie, args.model)
+            print(f"\n[+] Bundled local-lab login created successfully.\n[+] Cookie header: {cookie}")
         if args.run != "none":
             if not cookie:
-                raise RuntimeError("--run requires --with-lab.")
+                raise RuntimeError("--run requires --with-lab because it needs a generated local-lab session.")
             script = "orchestratorAgentic.py" if args.run == "agentic" else "orchestratorDeterministic.py"
-            command = [sys.executable, str(ROOT / script), "--target", TARGET, "--cookies", cookie]
+            command = [sys.executable, str(ROOT / script), "--target", TARGET, "--cookies", cookie, "--mode", args.mode]
             if args.run == "agentic":
-                command += ["--model", args.model]
+                command += ["--model", args.model, "--max-rounds", "1"]
             return run(command, required=False, timeout=7200, cwd=ROOT).returncode
+        print_important_commands(args.model, args.mode, cookie)
         return 0
     except Exception as exc:
         print(f"[-] Initialization failed: {type(exc).__name__}: {exc}", file=sys.stderr)

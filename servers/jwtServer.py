@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import argparse
+import sys
+import json
 from datetime import datetime, timezone
 
 import jwt
@@ -64,5 +67,26 @@ def run_jwt_scan(jwt_token: str = "", target_url: str = "") -> dict:
     )
 
 
+def _once() -> int:
+    try:
+        arguments = json.loads(sys.stdin.read() or "{}")
+        if not isinstance(arguments, dict):
+            raise ValueError("Expected a JSON object on stdin.")
+        result = run_jwt_scan(**arguments)
+    except Exception as exc:
+        result = failure(
+            "JWT Analyzer",
+            "",
+            f"One-shot JWT Analyzer execution failed: {type(exc).__name__}: {exc}",
+        )
+    print(json.dumps(result, ensure_ascii=False, default=str))
+    return 0
+
+
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser(add_help=False)
+    parser.add_argument("--once", action="store_true")
+    args, _ = parser.parse_known_args()
+    if args.once:
+        raise SystemExit(_once())
     mcp.run(transport="stdio")

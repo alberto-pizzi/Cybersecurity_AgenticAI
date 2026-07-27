@@ -63,11 +63,19 @@ def main() -> int:
         )
         result["docker"]["image_present"] = inspect.returncode == 0
 
-    result["root_cause"] = (
-        "Strawberry Perl socket layer cannot reach the target while Python can; use the Docker fallback."
-        if result["python"].get("tcp_connected") and not result["perl"].get("connected")
-        else "No Python-versus-Perl socket mismatch detected."
+    docker_ready = bool(
+        result["docker"].get("available")
+        and result["docker"].get("image_present")
     )
+    if perl is None and docker_ready:
+        root_cause = "Native Perl is unavailable; the official Docker Nikto fallback is ready."
+    elif result["python"].get("tcp_connected") and not result["perl"].get("connected") and docker_ready:
+        root_cause = "Native Perl cannot reach the target; the official Docker Nikto fallback is ready."
+    elif not result["python"].get("tcp_connected"):
+        root_cause = "The target TCP port is not reachable from the host."
+    else:
+        root_cause = "No blocking Nikto connectivity problem was detected."
+    result["root_cause"] = root_cause
 
     print(json.dumps(result, indent=2, ensure_ascii=False))
     return 0 if result["python"].get("tcp_connected") else 2
