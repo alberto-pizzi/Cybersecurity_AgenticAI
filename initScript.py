@@ -41,12 +41,13 @@ DEFAULT_MODEL = "llama3.1:8b"
 NUCLEI_TEMPLATE_MINIMUM = 1000
 NUCLEI_TEMPLATE_UPDATE_TIMEOUT = 600
 _NUCLEI_TEMPLATE_STATE: dict[str, Any] = {}
-BUILD_ID = "secops-init-resilient-v31.3-session-safe-nuclei-agentic-parity-20260727"
+BUILD_ID = "secops-init-resilient-v31.4.3-powershell-installer-parser-fix-20260727"
 
 PYTHON_PACKAGES = (
     "fastmcp==2.12.5", "langgraph>=0.6,<2", "requests>=2.32,<3",
     "beautifulsoup4>=4.13,<5", "zaproxy>=0.5,<0.6",
     "reportlab>=4.4,<5", "PyJWT>=2.10,<3", "arjun>=2.2,<3",
+    "playwright>=1.54,<2",
 )
 SCANNERS = ("nuclei", "nikto", "ffuf", "dalfox", "commix", "sqlmap", "arjun", "interactsh-client")
 REPOSITORY_TOOLS = {
@@ -247,6 +248,52 @@ def install_python_packages() -> None:
                 "Recreate the project virtual environment and ensure no local fastmcp.py or mcp.py shadows the package."
             )
     configure_path()
+
+
+def _playwright_chromium_ready() -> tuple[bool, str]:
+    """Verify that Chromium can launch from the exact active interpreter."""
+    probe_code = (
+        "from playwright.sync_api import sync_playwright; "
+        "p=sync_playwright().start(); "
+        "b=p.chromium.launch(headless=True); "
+        "print(b.version); b.close(); p.stop()"
+    )
+    probe = run(
+        [sys.executable, "-c", probe_code],
+        required=False, capture=True, show_output=False, timeout=120,
+    )
+    detail = "\n".join(
+        part for part in ((probe.stdout or "").strip(), (probe.stderr or "").strip())
+        if part
+    )
+    return probe.returncode == 0, detail
+
+
+def install_playwright_browser(*, required: bool = False) -> bool:
+    """Install/verify the Chromium runtime used by the optional browser scanner."""
+    ready, detail = _playwright_chromium_ready()
+    if ready:
+        print(f"[+] Playwright Chromium ready: {detail.splitlines()[-1] if detail else 'launch verified'}")
+        return True
+    print("[*] Installing Playwright Chromium for DOM/stored-XSS workflow verification.")
+    result = run(
+        [sys.executable, "-m", "playwright", "install", "chromium"],
+        required=False, capture=True, timeout=2400,
+    )
+    ready, detail = _playwright_chromium_ready()
+    if ready:
+        print(f"[+] Playwright Chromium installed: {detail.splitlines()[-1] if detail else 'launch verified'}")
+        return True
+    message = (
+        "Playwright is installed but Chromium could not be launched. "
+        f"Installer return code={result.returncode}. Diagnostic: {detail[-2500:]}"
+    )
+    if platform.system().lower() == "linux":
+        message += "\nOn Linux, install browser system dependencies with: python -m playwright install-deps chromium"
+    if required:
+        raise RuntimeError(message)
+    print(f"[!] {message}\n[!] Browser-only checks will be reported as skipped; all other scanners remain available.", file=sys.stderr)
+    return False
 
 
 def clone_or_update(url: str, destination: Path) -> None:
@@ -948,6 +995,10 @@ def write_runtime_config(status: dict[str, str | None]) -> None:
         "machine": platform.machine(),
         "tool_directories": list(dict.fromkeys(directories)),
         "executables": status,
+        "playwright_chromium": {
+            "ready": _playwright_chromium_ready()[0],
+            "interpreter": sys.executable,
+        },
         "nikto_perl": str(Path(find_perl()).resolve()) if find_perl() else "",
         "nikto_script": str((LOCAL_OPT / "nikto" / "program" / "nikto.pl").resolve()),
         "nikto_image": NIKTO_DOCKER_IMAGE,
@@ -1697,18 +1748,22 @@ initializer multipiattaforma per evitare divergenze tra Windows e macOS.
 ----------------
 {p('orchestratorDeterministic.py')} --target <TARGET> --cookies "<COOKIE_HEADER>" --auth-only --authorized --mode balanced
 {p('orchestratorDeterministic.py')} --target <TARGET> --cookies "<COOKIE_HEADER>" --auth-only --authorized --mode deep
+{p('orchestratorDeterministic.py')} --target <TARGET> --cookies "<PRIMARY_COOKIE>" --secondary-cookies "<SECOND_ACCOUNT_COOKIE>" --auth-only --authorized --mode deep
 {p('orchestratorDeterministic.py')} --target <TARGET> --authorized --mode balanced
 
 3. AGENTIC
 ----------
 {p('orchestratorAgentic.py')} --target <TARGET> --cookies "<COOKIE_HEADER>" --auth-only --authorized --model <MODEL> --max-rounds 2 --mode balanced
 {p('orchestratorAgentic.py')} --target <TARGET> --cookies "<COOKIE_HEADER>" --auth-only --authorized --model <MODEL> --max-rounds 3 --mode deep --ai-timeout 720
+{p('orchestratorAgentic.py')} --target <TARGET> --cookies "<PRIMARY_COOKIE>" --secondary-cookies "<SECOND_ACCOUNT_COOKIE>" --auth-only --authorized --model <MODEL> --max-rounds 3 --mode deep
 {p('orchestratorAgentic.py')} --target <TARGET> --cookies "<COOKIE_HEADER>" --auth-only --authorized --model <MODEL> --require-ai --max-rounds 2 --mode balanced
 {p('orchestratorAgentic.py')} --target <TARGET> --authorized --model <MODEL> --no-model-pull --mode balanced
 
-L'agentic usa il catalogo, i selector e l'interprete MCP del deterministic. Il
-guardrail aggiunge soltanto scanner applicabili omessi dal modello e continua i
-round finché restano azioni valide o viene raggiunto --max-rounds.
+L'agentic usa il catalogo, i selector e l'interprete MCP del deterministic.
+Quando il piano omette una classe applicabile, Ollama deve scegliere esplicitamente
+un candidato scoperto per riparare la copertura; non vengono inseriti endpoint
+hardcoded. I round continuano finché restano azioni valide o viene raggiunto
+--max-rounds.
 
 4. PREFLIGHT E DEBUG
 --------------------
@@ -1718,6 +1773,10 @@ round finché restano azioni valide o viene raggiunto --max-rounds.
 {p('orchestratorDeterministic.py')} --target <TARGET> --cookies "<COOKIE_HEADER>" --authorized --tool zap --mode deep --tool-timeout 480
 {p('orchestratorDeterministic.py')} --target <TARGET> --cookies "<COOKIE_HEADER>" --authorized --tool sqlmap --tool-url <URL> --method GET --parameters "id,query" --tool-timeout 180
 {p('orchestratorDeterministic.py')} --target <TARGET> --authorized --tool jwt --jwt-token "<JWT>"
+{p('orchestratorDeterministic.py')} --target <TARGET> --cookies "<COOKIE_HEADER>" --authorized --tool exposure --mode balanced
+{p('orchestratorDeterministic.py')} --target <TARGET> --cookies "<COOKIE_HEADER>" --authorized --tool browser --mode balanced
+{p('orchestratorDeterministic.py')} --target <TARGET> --cookies "<COOKIE_HEADER>" --authorized --tool workflow --mode balanced
+{p('orchestratorDeterministic.py')} --target <TARGET> --cookies "<PRIMARY_COOKIE>" --secondary-cookies "<SECOND_ACCOUNT_COOKIE>" --authorized --tool authorization --mode balanced
 
 5. PROFILI
 ----------
@@ -1728,7 +1787,11 @@ deep      più target, richieste e budget per ZAP/Nuclei/strumenti parametrizzat
 6. OPZIONI INIT
 ---------------
 --with-lab --run --model --mode --skip-scanners --skip-preflight
---commands-only --version
+--skip-browser --require-browser --commands-only --version
+
+Per un target remoto, i workflow che inviano POST o file di prova restano
+disabilitati salvo consenso esplicito con --authorized --allow-state-changes.
+Nei laboratori locali vengono abilitati automaticamente.
 
 7. NUCLEI
 ---------
@@ -1736,9 +1799,20 @@ nuclei -update
 nuclei -update-templates
 {count_templates}
 
-Le pipeline passano a Nuclei anche i request contract GET parametrizzati,
-same-origin e non distruttivi per una fase DAST limitata, oltre ai template
-normali per CVE, esposizioni e misconfigurazioni.
+Le pipeline passano a Nuclei request contract GET/POST same-origin e
+non distruttivi. Le fasi statiche per esposizioni, misconfigurazioni e
+controlli high-impact vengono eseguite prima del DAST, che usa soltanto i
+contratti parametrizzati con priorità maggiore.
+
+7B. COPERTURA WORKFLOW E BROWSER
+-------------------------------
+Exposure classifica backup, sorgenti, configurazioni, .git, .env e directory
+listing realmente recuperabili. Session analizza cookie e indicatori di
+unicità/fissazione. Browser usa Chromium per DOM/reflected/stored XSS con
+marker innocui. Workflow esegue controlli limitati su CSRF, upload, login
+throttling e CAPTCHA usando esclusivamente i form scoperti. Authorization
+confronta richieste GET ad alto valore tra identità primaria, anonima e, quando
+fornita, una seconda identità autenticata senza eseguire operazioni mutative.
 
 8. REPORT
 ---------
@@ -1817,6 +1891,8 @@ def main() -> int:
     parser.add_argument("--mode", choices=("fast", "balanced", "deep"), default="balanced", help="Scanner coverage/runtime profile (default: balanced).")
     parser.add_argument("--skip-preflight", action="store_true", help="Skip the live deterministic MCP/dependency preflight.")
     parser.add_argument("--skip-scanners", action="store_true", help="Skip scanner installation and do not require all scanner executables.")
+    parser.add_argument("--skip-browser", action="store_true", help="Do not install/verify Playwright Chromium; browser-only checks will be skipped.")
+    parser.add_argument("--require-browser", action="store_true", help="Fail initialization if Playwright Chromium cannot be installed/launched.")
     parser.add_argument("--commands-only", action="store_true", help="Print every supported command/modifier, write init.txt, and exit.")
     parser.add_argument("--version", action="version", version=BUILD_ID)
     args = parser.parse_args()
@@ -1832,6 +1908,10 @@ def main() -> int:
         print(f"[+] Full command guide written: {guide_path}")
         print("\n=== SecOps FastMCP initialization ===")
         install_python_packages()
+        if not args.skip_browser:
+            install_playwright_browser(required=args.require_browser)
+        elif args.require_browser:
+            raise RuntimeError("--require-browser cannot be combined with --skip-browser.")
         create_wordlist()
         if not args.skip_scanners:
             install_scanners()

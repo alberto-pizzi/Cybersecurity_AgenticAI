@@ -1,6 +1,6 @@
 {
   "schema_version": 3,
-  "generated_at": "2026-07-27T17:31:09.706403+00:00",
+  "generated_at": "2026-07-27T20:39:46.951988+00:00",
   "project_root": "S:\\Cybersecurity_AgenticAI",
   "python_executable": "C:\\Users\\tommy\\AppData\\Local\\Microsoft\\WindowsApps\\PythonSoftwareFoundation.Python.3.13_qbz5n2kfra8p0\\python.exe",
   "platform": "Windows-10-10.0.19045-SP0",
@@ -19,6 +19,10 @@
     "sqlmap": "C:\\Users\\tommy\\.local\\bin\\sqlmap.bat",
     "arjun": "C:\\Users\\tommy\\AppData\\Local\\Packages\\PythonSoftwareFoundation.Python.3.13_qbz5n2kfra8p0\\LocalCache\\local-packages\\Python313\\Scripts\\arjun.exe",
     "interactsh-client": "C:\\Users\\tommy\\.local\\bin\\interactsh-client.exe"
+  },
+  "playwright_chromium": {
+    "ready": true,
+    "interpreter": "C:\\Users\\tommy\\AppData\\Local\\Microsoft\\WindowsApps\\PythonSoftwareFoundation.Python.3.13_qbz5n2kfra8p0\\python.exe"
   },
   "nikto_perl": "",
   "nikto_script": "C:\\Users\\tommy\\.local\\opt\\nikto\\program\\nikto.pl",
@@ -51,8 +55,8 @@
     }
   },
   "last_auth_target": "http://127.0.0.1",
-  "last_auth_cookie": "PHPSESSID=o6scl33cd351hfmdgqj9evd7d1; security=low",
-  "last_auth_generated_at": "2026-07-27T17:31:27.151878+00:00",
+  "last_auth_cookie": "PHPSESSID=281cp7744iopl4egqlb0tqiuv0; security=low",
+  "last_auth_generated_at": "2026-07-27T20:40:11.479568+00:00",
   "target_profiles": {
     "http://127.0.0.1:80": {
       "target_url": "http://127.0.0.1",

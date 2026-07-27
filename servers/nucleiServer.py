@@ -444,29 +444,37 @@ def _phase_definitions(
     total_timeout: int,
     has_dast_targets: bool = False,
 ) -> list[dict[str, Any]]:
+    """Allocate the bounded budget to the phases most likely to finish usefully.
+
+    The previous deep order started with the largest DAST phase, so every phase
+    could reach its own limit without one concise exposure/technology pass ever
+    finishing. Static exposure and high-impact phases now run first; DAST is
+    restricted to ranked request contracts and still receives the largest
+    single share when applicable.
+    """
     usable = max(24, total_timeout - 12)
 
-    dast_phase = {
-        "name": "parameterized_dast",
-        "severities": "medium,high,critical",
-        "tags": "",
-        "dast": True,
+    exposure_phase = {
+        "name": "exposures_and_misconfigurations",
+        "severities": "info,low,medium,high,critical",
+        "tags": EXPOSURE_TAGS,
     }
     high_phase = {
         "name": "critical_high_value",
         "severities": "medium,high,critical",
         "tags": HIGH_IMPACT_TAGS,
     }
-    exposure_phase = {
-        "name": "exposures_and_misconfigurations",
-        "severities": "info,low,medium,high,critical",
-        "tags": EXPOSURE_TAGS,
-    }
     automatic_phase = {
         "name": "technology_automatic_scan",
         "severities": "low,medium,high,critical",
         "tags": "",
         "automatic_scan": True,
+    }
+    dast_phase = {
+        "name": "parameterized_dast",
+        "severities": "medium,high,critical",
+        "tags": "",
+        "dast": True,
     }
     broad_phase = {
         "name": "broad_safe_http_templates",
@@ -475,18 +483,26 @@ def _phase_definitions(
     }
 
     if scan_profile == "fast":
-        phases = [dast_phase] if has_dast_targets else [high_phase]
-        weights = [1.0]
+        phases = [exposure_phase, high_phase]
+        weights = [0.45, 0.55]
+        if has_dast_targets:
+            phases.append(dast_phase)
+            weights = [0.25, 0.30, 0.45]
     elif scan_profile == "balanced":
-        phases = ([dast_phase] if has_dast_targets else []) + [high_phase, exposure_phase, automatic_phase]
-        weights = [0.45, 0.25, 0.18, 0.12] if has_dast_targets else [0.46, 0.34, 0.20]
+        phases = [exposure_phase, high_phase, automatic_phase]
+        weights = [0.25, 0.35, 0.15]
+        if has_dast_targets:
+            phases.append(dast_phase)
+            weights.append(0.25)
     else:
-        phases = ([dast_phase] if has_dast_targets else []) + [high_phase, exposure_phase, automatic_phase, broad_phase]
-        weights = [0.44, 0.20, 0.14, 0.08, 0.14] if has_dast_targets else [0.31, 0.24, 0.18, 0.27]
+        phases = [exposure_phase, high_phase, automatic_phase]
+        weights = [0.18, 0.24, 0.10]
+        if has_dast_targets:
+            phases.append(dast_phase)
+            weights.append(0.34)
+        phases.append(broad_phase)
+        weights.append(0.14)
 
-    # Do not create more processes than the total budget can meaningfully start.
-    # This keeps manually requested low timeouts bounded instead of silently
-    # allocating more seconds than the caller supplied.
     max_phases = max(1, usable // 12)
     phases = phases[:max_phases]
     weights = weights[:len(phases)]
@@ -514,7 +530,6 @@ def _phase_definitions(
 
 
 
-
 _STATE_CHANGING_KEYS = {
     "action", "delete", "remove", "reset", "logout", "signout", "install",
     "create", "drop", "password", "password_new", "password_conf", "confirm",
@@ -533,13 +548,41 @@ def _same_origin_url(base_url: str, candidate: str) -> bool:
 
 
 
+def _dast_case_score(case: dict[str, Any]) -> int:
+    candidate = str(case.get("url") or case.get("target_url") or "")
+    parsed = urlparse(candidate)
+    path = parsed.path.lower()
+    method = str(case.get("method") or "GET").upper()
+    names = {
+        str(value).lower()
+        for value in case.get("parameters", [])
+        if str(value)
+    }
+    names.update(name.lower() for name, _ in parse_qsl(parsed.query, keep_blank_values=True))
+    if method == "POST":
+        names.update(name.lower() for name, _ in parse_qsl(str(case.get("data") or ""), keep_blank_values=True))
+    score = 0
+    weights = {
+        "id": 16, "uid": 18, "user_id": 20, "query": 16, "search": 14,
+        "name": 12, "message": 15, "comment": 15, "file": 18, "path": 18,
+        "page": 18, "include": 20, "template": 18, "url": 18, "host": 20,
+        "ip": 22, "cmd": 24, "command": 24, "xml": 20,
+    }
+    score += sum(weight for name, weight in weights.items() if name in names)
+    if any(token in path for token in ("sqli", "sql", "xss", "exec", "command", "file", "include", "ssrf", "xxe", "upload", "api")):
+        score += 70
+    if method == "POST":
+        score += 10
+    return score
+
+
 def _dast_request_cases(
     target_url: str,
     request_cases: list[dict[str, Any]] | None,
     limit: int = 30,
 ) -> list[dict[str, Any]]:
-    """Select safe same-origin GET and POST request contracts for Nuclei DAST."""
-    selected: list[dict[str, Any]] = []
+    """Select and rank safe same-origin GET/POST contracts for Nuclei DAST."""
+    candidates: list[dict[str, Any]] = []
     seen: set[tuple[str, str, str]] = set()
     for case in request_cases or []:
         if not isinstance(case, dict):
@@ -570,15 +613,15 @@ def _dast_request_cases(
         if key in seen:
             continue
         seen.add(key)
-        selected.append({
+        candidates.append({
             "url": candidate,
             "method": method,
             "data": data,
             "parameters": sorted(names),
+            "priority_score": _dast_case_score(case),
         })
-        if len(selected) >= max(1, min(int(limit), 60)):
-            break
-    return selected
+    candidates.sort(key=lambda item: (-int(item.get("priority_score", 0)), item["url"], item["method"]))
+    return candidates[: max(1, min(int(limit), 30))]
 
 
 def _write_proxify_jsonl(
@@ -645,8 +688,9 @@ def _dast_target_urls(
     request_cases: list[dict[str, Any]] | None,
     limit: int = 20,
 ) -> list[str]:
-    """Select safe, same-origin parameterized GET URLs for Nuclei DAST templates."""
-    selected: list[str] = []
+    """Select ranked safe same-origin parameterized GET URLs for DAST."""
+    candidates: list[tuple[int, str]] = []
+    seen: set[str] = set()
     for case in request_cases or []:
         if not isinstance(case, dict) or str(case.get("method") or "GET").upper() != "GET":
             continue
@@ -660,13 +704,12 @@ def _dast_target_urls(
         if any(word in path_lower for word in _STATE_CHANGING_PATH_WORDS):
             continue
         names = {name.lower() for name, _ in parse_qsl(parsed.query, keep_blank_values=True)}
-        if names & _STATE_CHANGING_KEYS:
+        if names & _STATE_CHANGING_KEYS or candidate in seen:
             continue
-        if candidate not in selected:
-            selected.append(candidate)
-        if len(selected) >= max(1, min(int(limit), 50)):
-            break
-    return selected
+        seen.add(candidate)
+        candidates.append((_dast_case_score(case), candidate))
+    candidates.sort(key=lambda item: (-item[0], item[1]))
+    return [value for _, value in candidates[: max(1, min(int(limit), 24))]]
 
 
 def _run_nuclei_core(
@@ -742,12 +785,12 @@ def _run_nuclei_core(
     dast_cases = _dast_request_cases(
         target_url,
         request_cases,
-        limit=30 if scan_profile == "deep" else 16 if scan_profile == "balanced" else 8,
+        limit=10 if scan_profile == "deep" else 6 if scan_profile == "balanced" else 3,
     )
     dast_targets = _dast_target_urls(
         target_url,
         request_cases,
-        limit=24 if scan_profile == "deep" else 12,
+        limit=10 if scan_profile == "deep" else 6,
     )
     dast_target_list = work_dir / f"{prefix}-dast-targets.txt"
     if dast_targets:
@@ -761,11 +804,11 @@ def _run_nuclei_core(
         phase_path.unlink(missing_ok=True)
 
     if scan_profile == "deep":
-        concurrency, rate_limit, request_timeout, retries = 30, 120, 6, 1
-        fuzz_aggression, fuzz_frequency = "high", 30
+        concurrency, rate_limit, request_timeout, retries = 40, 160, 5, 1
+        fuzz_aggression, fuzz_frequency = "high", 22
     elif scan_profile == "balanced":
-        concurrency, rate_limit, request_timeout, retries = 24, 100, 5, 1
-        fuzz_aggression, fuzz_frequency = "medium", 25
+        concurrency, rate_limit, request_timeout, retries = 30, 120, 4, 1
+        fuzz_aggression, fuzz_frequency = "medium", 20
     else:
         concurrency, rate_limit, request_timeout, retries = 16, 60, 3, 0
         fuzz_aggression, fuzz_frequency = "low", 15

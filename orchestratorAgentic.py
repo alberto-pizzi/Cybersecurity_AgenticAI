@@ -44,6 +44,9 @@ from orchestratorDeterministic import (
     run_preflight_checks,
     select_request_cases,
     select_tool_request_cases,
+    select_browser_request_cases,
+    select_workflow_request_cases,
+    select_authorization_request_cases,
     select_oast_request_cases,
     write_emergency_json_report,
 )
@@ -69,6 +72,8 @@ class AgentState(TypedDict):
     require_ai: bool
     planner_source: str
     ai_timeout: int
+    allow_state_changes: bool
+    secondary_cookies: str
 
 
 REGISTRY = deterministic_core.agentic_registry()
@@ -77,11 +82,13 @@ AI_PLANNER_TIMEOUTS = {"fast": 300, "balanced": 480, "deep": 720}
 AI_PLANNER_MAX_PREDICT = {"fast": 700, "balanced": 1000, "deep": 1400}
 LAST_OLLAMA_PLAN_DIAGNOSTICS: dict[str, Any] = {}
 
-BROAD_COVERAGE_TOOLS = ("ffuf", "zap", "nuclei", "nikto")
+BROAD_COVERAGE_TOOLS = ("ffuf", "exposure", "zap", "nuclei", "session", "nikto")
 DISCOVERY_COVERAGE_TOOLS = ("arjun",)
 PARAMETER_COVERAGE_TOOLS = ("sqlmap", "dalfox", "commix", "traversal", "idor")
+AUTHORIZATION_COVERAGE_TOOLS = ("authorization",)
+WORKFLOW_COVERAGE_TOOLS = ("browser", "workflow")
 OPTIONAL_COVERAGE_TOOLS = ("jwt", "interactsh")
-ROUND_ACTION_BUDGETS = {"fast": 12, "balanced": 20, "deep": 30}
+ROUND_ACTION_BUDGETS = {"fast": 14, "balanced": 24, "deep": 36}
 
 COVERAGE_REPAIR_SCHEMA = {
     "type": "object",
@@ -264,6 +271,10 @@ def compact_discovery_for_planner(discovery: dict[str, dict[str, Any]]) -> dict[
                 "method": str(case.get("method", "GET")).upper(),
                 "data": str(case.get("data", ""))[:900],
                 "parameters": [str(value) for value in case.get("parameters", [])][:20],
+                "file_parameters": [str(value) for value in case.get("file_parameters", [])][:8],
+                "token_parameters": [str(value) for value in case.get("token_parameters", [])][:8],
+                "enctype": str(case.get("enctype", ""))[:120],
+                "source_url": str(case.get("source_url", "")),
                 "priority_score": int(case.get("priority_score", 0) or 0),
             })
         compact[profile] = {
@@ -272,6 +283,16 @@ def compact_discovery_for_planner(discovery: dict[str, dict[str, Any]]) -> dict[
             "request_case_count": len(found.get("request_cases", [])),
             "high_value_html_urls": [str(value) for value in found.get("html_urls", [])[:45]],
             "request_cases": request_cases,
+            "client_side_candidates": [
+                {
+                    "url": str(item.get("url", "")),
+                    "script_url": str(item.get("script_url", "")),
+                    "sources": list(item.get("sources", []))[:8],
+                    "sinks": list(item.get("sinks", []))[:8],
+                }
+                for item in found.get("client_side_candidates", [])[:12]
+                if isinstance(item, dict)
+            ],
             "jwt_tokens": [str(value)[:1800] for value in found.get("jwt_tokens", [])[:4]],
             "crawl_errors": [
                 {
@@ -392,6 +413,9 @@ def ollama_plan(state: AgentState) -> dict[str, Any]:
             "target_url": action["target_url"],
             "method": action.get("method", "GET"),
             "parameters": action.get("parameters", []),
+            "file_parameters": action.get("file_parameters", []),
+            "token_parameters": action.get("token_parameters", []),
+            "source_url": action.get("source_url", ""),
         })
     coverage_contract = _coverage_contract(state, eligible)
     prompt = {
@@ -414,11 +438,12 @@ def ollama_plan(state: AgentState) -> dict[str, Any]:
         "before ZAP imports the enriched traffic and performs passive/active analysis; Nuclei checks templates and DAST, "
         "and Nikto checks server exposure; do not replace one with another. In the first round include "
         "all missing eligible broad scanners and Arjun discovery actions before expensive parameter "
-        "checks. In later rounds cover remaining eligible SQLMap, Dalfox, Commix, traversal, IDOR, JWT, "
-        "and Interactsh actions. The minimum_coverage_contract requires at least one AI-selected "
+        "checks. In later rounds cover remaining eligible SQLMap, Dalfox, Commix, traversal, IDOR, "
+        "read-only authorization/BOLA differentials, browser XSS, multi-step workflow, JWT and Interactsh actions. Exposure and session analysis "
+        "remain separate broad capabilities. The minimum_coverage_contract requires at least one AI-selected "
         "action for every still-applicable profile/tool class; do not omit a group merely because "
         "another scanner overlaps it. Use parameter tools only on an exactly matching discovered "
-        "request, IDOR only on numeric object references, and Interactsh only on compatible inputs. "
+        "request, IDOR only on numeric object references, authorization only on discovered read-only identity/object/resource signals, and Interactsh only on compatible inputs. "
         "Avoid duplicates and do not repeat completed actions. Do not set finish=true while "
         "remaining_eligible_actions is non-empty. Return up to round_action_budget actions and only "
         "schema-valid JSON with a concise reasoning_summary."
@@ -559,6 +584,42 @@ def discovery_candidate_actions(state: AgentState) -> list[dict[str, Any]]:
                     limit=deterministic_core.PARAMETER_TOOL_CASE_LIMITS.get(tool, 1),
                 ):
                     actions.append({"profile": name, "tool": tool, "target_url": case["url"], "method": case.get("method", "GET"), "data": case.get("data", ""), "parameters": case.get("parameters", []), "jwt_token": "", "injection_url": "", "reason": f"Highest-value discovered request for {tool}."})
+            for case in select_authorization_request_cases(
+                state["discovery"].get(name, {}),
+                limit=deterministic_core.tool_action_limit("authorization"),
+            ):
+                actions.append({
+                    "profile": name, "tool": "authorization", "target_url": case["url"],
+                    "method": "GET", "data": "",
+                    "parameters": case.get("parameters", []), "jwt_token": "", "injection_url": "",
+                    "reason": "Read-only authorization differential candidate derived from an identity, object or privileged-resource signal.",
+                })
+            for case in select_browser_request_cases(
+                state["discovery"].get(name, {}),
+                limit=deterministic_core.tool_action_limit("browser"),
+            ):
+                actions.append({
+                    "profile": name, "tool": "browser", "target_url": case["url"],
+                    "method": case.get("method", "GET"), "data": case.get("data", ""),
+                    "parameters": case.get("parameters", []), "jwt_token": "", "injection_url": "",
+                    "source_url": case.get("source_url", ""),
+                    "reason": "Browser verification candidate derived from XSS-like parameters or client-side source/sink evidence.",
+                })
+            for case in select_workflow_request_cases(
+                state["discovery"].get(name, {}),
+                limit=deterministic_core.tool_action_limit("workflow"),
+            ):
+                actions.append({
+                    "profile": name, "tool": "workflow", "target_url": case["url"],
+                    "method": case.get("method", "POST"), "data": case.get("data", ""),
+                    "parameters": case.get("parameters", []), "jwt_token": "", "injection_url": "",
+                    "source_url": case.get("source_url", ""),
+                    "fields": case.get("fields", []),
+                    "file_parameters": case.get("file_parameters", []),
+                    "token_parameters": case.get("token_parameters", []),
+                    "enctype": case.get("enctype", ""),
+                    "reason": "Multi-step workflow candidate derived from discovered form metadata.",
+                })
         tokens = state["discovery"].get(name, {}).get("jwt_tokens", [])
         if tokens:
             actions.append({"profile": name, "tool": "jwt", "target_url": state["target"], "jwt_token": tokens[0], "injection_url": "", "reason": "Discovered JWT."})
@@ -585,7 +646,8 @@ def validate_plan(state: AgentState, proposed: Any) -> list[dict[str, Any]]:
     profiles = {profile["name"] for profile in state["profiles"]}
     completed, valid = set(state["completed"]), []
     per_tool: dict[tuple[str, str], int] = {}
-    for raw in proposed[:30]:
+    proposal_limit = max(60, ROUND_ACTION_BUDGETS.get(deterministic_core.CURRENT_SCAN_MODE, 20) * 2)
+    for raw in proposed[:proposal_limit]:
         if not isinstance(raw, dict):
             continue
         profile, tool = str(raw.get("profile", "")), str(raw.get("tool", "")).lower()
@@ -609,7 +671,7 @@ def validate_plan(state: AgentState, proposed: Any) -> list[dict[str, Any]]:
             if (
                 profile == "anonymous"
                 and has_authenticated_profile
-                and tool in {"nikto", "sqlmap", "dalfox", "commix", "traversal", "idor"}
+                and tool in {"session", "nikto", "sqlmap", "dalfox", "commix", "traversal", "idor", "authorization", "browser", "workflow"}
             ):
                 continue
         found = state["discovery"].get(profile, {})
@@ -619,6 +681,11 @@ def validate_plan(state: AgentState, proposed: Any) -> list[dict[str, Any]]:
         method = str(raw.get("method", "")).upper().strip()
         data = ""
         parameters: list[str] = []
+        source_url = ""
+        fields: list[dict[str, Any]] = []
+        file_parameters: list[str] = []
+        token_parameters: list[str] = []
+        enctype = ""
         scope = REGISTRY[tool][2]
         if scope == "base":
             target_url = state["target"]
@@ -660,6 +727,45 @@ def validate_plan(state: AgentState, proposed: Any) -> list[dict[str, Any]]:
                 not any(value.isdigit() for _, value in parse_qsl(urlparse(target_url).query, keep_blank_values=True))
             ):
                 continue
+        elif scope == "authorization":
+            if not profile_has_cookie:
+                continue
+            cases = select_authorization_request_cases(found, limit=30)
+            matching = [case for case in cases if str(case.get("url", "")) == target_url]
+            if not matching:
+                continue
+            selected = matching[0]
+            method = "GET"
+            data = ""
+            parameters = [str(value) for value in selected.get("parameters", [])]
+        elif scope == "browser":
+            cases = select_browser_request_cases(found, limit=20)
+            matching = [case for case in cases if str(case.get("url", "")) == target_url]
+            if method:
+                matching = [case for case in matching if str(case.get("method", "GET")).upper() == method]
+            if not matching:
+                continue
+            selected = matching[0]
+            method = str(selected.get("method", "GET")).upper()
+            data = str(selected.get("data", ""))
+            parameters = [str(value) for value in selected.get("parameters", [])]
+            source_url = str(selected.get("source_url", ""))
+        elif scope == "workflow":
+            cases = select_workflow_request_cases(found, limit=30)
+            matching = [case for case in cases if str(case.get("url", "")) == target_url]
+            if method:
+                matching = [case for case in matching if str(case.get("method", "POST")).upper() == method]
+            if not matching:
+                continue
+            selected = matching[0]
+            method = str(selected.get("method", "POST")).upper()
+            data = str(selected.get("data", ""))
+            parameters = [str(value) for value in selected.get("parameters", [])]
+            source_url = str(selected.get("source_url", ""))
+            fields = [dict(value) for value in selected.get("fields", []) if isinstance(value, dict)]
+            file_parameters = [str(value) for value in selected.get("file_parameters", [])]
+            token_parameters = [str(value) for value in selected.get("token_parameters", [])]
+            enctype = str(selected.get("enctype", ""))
         elif scope == "jwt":
             if token not in set(found.get("jwt_tokens") or []):
                 continue
@@ -684,7 +790,9 @@ def validate_plan(state: AgentState, proposed: Any) -> list[dict[str, Any]]:
         action = {
             "profile": profile, "tool": tool, "target_url": target_url,
             "method": method or "GET", "data": data, "parameters": parameters,
-            "jwt_token": token, "injection_url": injection,
+            "source_url": source_url, "fields": fields,
+            "file_parameters": file_parameters, "token_parameters": token_parameters,
+            "enctype": enctype, "jwt_token": token, "injection_url": injection,
             "reason": str(raw.get("reason", ""))[:500] or "No planner reason supplied.",
         }
         identifier = action_id(action)
@@ -705,8 +813,12 @@ def _coverage_phase(tool: str) -> int:
         return 1
     if tool in PARAMETER_COVERAGE_TOOLS:
         return 2
-    if tool in OPTIONAL_COVERAGE_TOOLS:
+    if tool in AUTHORIZATION_COVERAGE_TOOLS:
         return 3
+    if tool in WORKFLOW_COVERAGE_TOOLS:
+        return 4
+    if tool in OPTIONAL_COVERAGE_TOOLS:
+        return 5
     return 9
 
 
@@ -973,7 +1085,7 @@ def _missing_tool_reason(state: AgentState, profile_name: str, tool: str) -> str
     if (
         profile_name == "anonymous" and has_authenticated_profile
         and deterministic_core.CURRENT_SCAN_MODE != "deep"
-        and tool in {"nikto", *PARAMETER_COVERAGE_TOOLS}
+        and tool in {"session", "nikto", *PARAMETER_COVERAGE_TOOLS, *AUTHORIZATION_COVERAGE_TOOLS, *WORKFLOW_COVERAGE_TOOLS}
     ):
         return "The richer authenticated profile provides this coverage in the selected scan mode."
     if tool in BROAD_COVERAGE_TOOLS:
@@ -982,6 +1094,14 @@ def _missing_tool_reason(state: AgentState, profile_name: str, tool: str) -> str
         return "" if select_arjun_request_cases(found, state["target"], limit=1) else "No suitable discovered GET/POST request was available for hidden-parameter discovery."
     if tool in PARAMETER_COVERAGE_TOOLS:
         return "" if select_tool_request_cases(found, tool, limit=1) else f"No discovered request matched {tool}'s vulnerability class."
+    if tool == "authorization":
+        if not profile_has_cookie:
+            return "Authorization comparison requires a primary authenticated profile."
+        return "" if select_authorization_request_cases(found, limit=1) else "No discovered read-only request contained a plausible identity, object or privileged-resource signal."
+    if tool == "browser":
+        return "" if select_browser_request_cases(found, limit=1) else "No discovered request or client-side page matched browser XSS verification."
+    if tool == "workflow":
+        return "" if select_workflow_request_cases(found, limit=1) else "No discovered POST form matched CSRF, upload, authentication or CAPTCHA workflow classes."
     if tool == "jwt":
         return "" if found.get("jwt_tokens") else "No JWT was discovered in crawled responses."
     if tool == "interactsh":
@@ -1159,7 +1279,13 @@ def planner_node(state: AgentState) -> dict[str, Any]:
     }
 
 
-async def execute_action(action: dict[str, Any], cookies: dict[str, str], discovery: dict[str, dict[str, Any]]) -> tuple[dict[str, Any], dict[str, Any]]:
+async def execute_action(
+    action: dict[str, Any],
+    cookies: dict[str, str],
+    discovery: dict[str, dict[str, Any]],
+    allow_state_changes: bool = False,
+    secondary_cookies: str = "",
+) -> tuple[dict[str, Any], dict[str, Any]]:
     server, function = REGISTRY[action["tool"]][:2]
     if action["tool"] == "jwt":
         arguments = {"jwt_token": action["jwt_token"], "target_url": action["target_url"]}
@@ -1175,10 +1301,18 @@ async def execute_action(action: dict[str, Any], cookies: dict[str, str], discov
         }
     else:
         arguments = {"target_url": action["target_url"], "cookies": cookies.get(action["profile"], "")}
+        profile_discovery = discovery.get(action["profile"], {})
+        local_authorized_state_changes = deterministic_core.state_changing_tests_allowed(
+            action["target_url"], allow_state_changes
+        )
         if action["tool"] in BROAD_SCANNER_TIMEOUTS:
             arguments["timeout"] = BROAD_SCANNER_TIMEOUTS[action["tool"]]
-            profile_discovery = discovery.get(action["profile"], {})
-            if action["tool"] == "zap":
+            if action["tool"] == "exposure":
+                arguments.update({
+                    "discovered_urls": profile_discovery.get("urls", []),
+                    "max_urls": 80 if deterministic_core.CURRENT_SCAN_MODE == "deep" else 45,
+                })
+            elif action["tool"] == "zap":
                 authenticated = bool(cookies.get(action["profile"], ""))
                 arguments.update({
                     "seed_urls": profile_discovery.get("html_urls", []),
@@ -1201,6 +1335,14 @@ async def execute_action(action: dict[str, Any], cookies: dict[str, str], discov
                     else 4 if deterministic_core.CURRENT_SCAN_MODE == "balanced"
                     else 1
                 )
+            elif action["tool"] == "session":
+                probe_root = deterministic_core.select_session_probe_url(
+                    profile_discovery, action["target_url"]
+                )
+                arguments.update({
+                    "probe_url": probe_root,
+                    "sample_count": 8 if deterministic_core.CURRENT_SCAN_MODE == "deep" else 5,
+                })
         elif action["tool"] == "arjun":
             arguments.update({
                 "timeout": deterministic_core.ARJUN_TIMEOUT,
@@ -1217,12 +1359,39 @@ async def execute_action(action: dict[str, Any], cookies: dict[str, str], discov
                 "parameters": action.get("parameters", []),
             })
             if action["tool"] == "dalfox":
-                arguments["allow_state_changes"] = urlparse(action["target_url"]).hostname in {"127.0.0.1", "localhost", "::1"}
+                arguments["allow_state_changes"] = local_authorized_state_changes
+        elif action["tool"] == "authorization":
+            arguments.update({
+                "secondary_cookies": secondary_cookies,
+                "method": "GET",
+                "data": "",
+                "parameters": action.get("parameters", []),
+            })
+        elif action["tool"] == "browser":
+            arguments.update({
+                "method": action.get("method", "GET"),
+                "data": action.get("data", ""),
+                "parameters": action.get("parameters", []),
+                "source_url": action.get("source_url", ""),
+                "allow_state_changes": local_authorized_state_changes,
+            })
+        elif action["tool"] == "workflow":
+            arguments.update({
+                "method": action.get("method", "POST"),
+                "data": action.get("data", ""),
+                "parameters": action.get("parameters", []),
+                "fields": action.get("fields", []),
+                "file_parameters": action.get("file_parameters", []),
+                "token_parameters": action.get("token_parameters", []),
+                "source_url": action.get("source_url", ""),
+                "enctype": action.get("enctype", ""),
+                "allow_state_changes": local_authorized_state_changes,
+            })
 
     state_refresh: dict[str, Any] | None = None
     if (
         cookies.get(action["profile"], "")
-        and action["tool"] in {"sqlmap", "dalfox", "commix", "traversal", "idor", "interactsh", "arjun"}
+        and action["tool"] in {"sqlmap", "dalfox", "commix", "traversal", "idor", "authorization", "interactsh", "arjun", "browser", "workflow"}
     ):
         parsed_target = urlparse(action["target_url"])
         refresh_target = f"{parsed_target.scheme}://{parsed_target.netloc}"
@@ -1293,7 +1462,13 @@ async def execute_action(action: dict[str, Any], cookies: dict[str, str], discov
         return action, result
 
 
-async def execute_plan(plan: list[dict[str, Any]], cookies: dict[str, str], discovery: dict[str, dict[str, Any]]) -> list[tuple[dict[str, Any], dict[str, Any]]]:
+async def execute_plan(
+    plan: list[dict[str, Any]],
+    cookies: dict[str, str],
+    discovery: dict[str, dict[str, Any]],
+    allow_state_changes: bool = False,
+    secondary_cookies: str = "",
+) -> list[tuple[dict[str, Any], dict[str, Any]]]:
     """Execute the AI-selected actions with live per-action CLI progress."""
     profile_order = {name: index for index, name in enumerate(cookies)}
     ordered = sorted(
@@ -1312,6 +1487,8 @@ async def execute_plan(plan: list[dict[str, Any]], cookies: dict[str, str], disc
         flush=True,
     )
     executed: list[tuple[dict[str, Any], dict[str, Any]]] = []
+    arjun_empty_limits: dict[str, int] = {}
+    arjun_threshold = 2 if deterministic_core.CURRENT_SCAN_MODE == "deep" else 1
     for index, action in enumerate(ordered, start=1):
         started = time.monotonic()
         print(
@@ -1320,7 +1497,31 @@ async def execute_plan(plan: list[dict[str, Any]], cookies: dict[str, str], disc
             flush=True,
         )
         try:
-            item = await execute_action(action, cookies, discovery)
+            if (
+                action["tool"] == "arjun"
+                and arjun_empty_limits.get(action["profile"], 0) >= arjun_threshold
+            ):
+                item = (
+                    action,
+                    {
+                        "tool": "arjun",
+                        "status": "skipped",
+                        "target": action["target_url"],
+                        "output": (
+                            "Adaptive budget reallocation: earlier high-priority Arjun actions "
+                            "reached their full budget without discovering a parameter; this "
+                            "lower-priority repeat was skipped."
+                        ),
+                        "diagnosis": "adaptive_budget_reallocated",
+                        "vulnerabilities": [],
+                    },
+                )
+            else:
+                item = await execute_action(
+                    action, cookies, discovery,
+                    allow_state_changes=allow_state_changes,
+                    secondary_cookies=secondary_cookies,
+                )
         except Exception as exc:
             message = f"Agent executor isolated failure: {type(exc).__name__}: {exc}"
             item = (
@@ -1337,6 +1538,16 @@ async def execute_plan(plan: list[dict[str, Any]], cookies: dict[str, str], disc
             )
         executed.append(item)
         _, result = item
+        if action["tool"] == "arjun":
+            found_parameters = int(result.get("phase_parameters", 0) or 0)
+            if (
+                str(result.get("diagnosis", "")) in deterministic_core.TIME_LIMIT_DIAGNOSES
+                and not result.get("vulnerabilities")
+                and found_parameters == 0
+            ):
+                arjun_empty_limits[action["profile"]] = arjun_empty_limits.get(action["profile"], 0) + 1
+            elif result.get("diagnosis") != "adaptive_budget_reallocated":
+                arjun_empty_limits[action["profile"]] = 0
         elapsed = time.monotonic() - started
         vulnerabilities = result.get("vulnerabilities", [])
         finding_count = len(vulnerabilities) if isinstance(vulnerabilities, list) else 0
@@ -1423,7 +1634,11 @@ def executor_node(state: AgentState) -> dict[str, Any]:
 
     if discovery_stage:
         print("\n[*] Discovery enrichment stage: FFUF runs before ZAP/Nuclei.", flush=True)
-        ffuf_executed = asyncio.run(execute_plan(discovery_stage, cookies, discovery))
+        ffuf_executed = asyncio.run(execute_plan(
+            discovery_stage, cookies, discovery,
+            allow_state_changes=state.get("allow_state_changes", False),
+            secondary_cookies=state.get("secondary_cookies", ""),
+        ))
         new_attack_surface += _record_execution_batch(
             ffuf_executed,
             state=state,
@@ -1444,7 +1659,11 @@ def executor_node(state: AgentState) -> dict[str, Any]:
         )
 
     if remaining_stage:
-        executed = asyncio.run(execute_plan(remaining_stage, cookies, discovery))
+        executed = asyncio.run(execute_plan(
+            remaining_stage, cookies, discovery,
+            allow_state_changes=state.get("allow_state_changes", False),
+            secondary_cookies=state.get("secondary_cookies", ""),
+        ))
         new_attack_surface += _record_execution_batch(
             executed,
             state=state,
@@ -1498,7 +1717,9 @@ def report_node(state: AgentState) -> dict[str, Any]:
         "python_executable": sys.executable,
         "mcp_server_python": deterministic_core._server_python(),
         "remaining_eligible_actions_at_report": len(remaining),
-        "execution_policy": "AI-selected actions are validated against the shared deterministic tool catalogue and discovered same-profile request contracts. A target-independent minimum-coverage contract is repaired by asking Ollama to choose explicit discovery-derived candidate IDs; successful AI plans are never silently supplemented with hard-coded endpoints. FFUF is credential-isolated, runs before ZAP/Nuclei, and newly discovered parameter candidates are returned to the AI in later rounds.",
+        "execution_policy": "AI-selected actions are validated against the shared deterministic tool catalogue and discovered same-profile request contracts. A target-independent minimum-coverage contract is repaired by asking Ollama to choose explicit discovery-derived candidate IDs; successful AI plans are never silently supplemented with hard-coded endpoints. FFUF is credential-isolated, runs before exposure/ZAP/Nuclei, and newly discovered parameter, authorization, browser and workflow candidates are returned to the AI in later rounds. Bounded state-changing workflow probes run automatically on local labs and require explicit --allow-state-changes for remote authorized targets.",
+        "allow_state_changes": state.get("allow_state_changes", False),
+        "secondary_identity_supplied": bool(state.get("secondary_cookies", "")),
     }
     report = asyncio.run(call_mcp("pwndocServer.py", "generate_report", {
         "findings_summary": report_results, "target_url": state["target"],
@@ -1539,8 +1760,16 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Ollama + LangGraph FastMCP security orchestrator.")
     parser.add_argument("--target", required=True)
     parser.add_argument("--cookies", default="")
+    parser.add_argument(
+        "--secondary-cookies", default="",
+        help="Optional second authenticated identity for read-only authorization/BOLA comparison.",
+    )
     parser.add_argument("--auth-only", action="store_true")
     parser.add_argument("--authorized", action="store_true")
+    parser.add_argument(
+        "--allow-state-changes", action="store_true",
+        help="Enable bounded POST/upload/stored-XSS workflow probes on an explicitly authorized remote target; local labs enable them automatically.",
+    )
     parser.add_argument("--preflight-only", action="store_true")
     parser.add_argument("--ignore-preflight-errors", action="store_true")
     parser.add_argument("--interactsh-injection-url", default="")
@@ -1577,6 +1806,8 @@ def main() -> int:
     target = normalize_url(args.target)
     if urlparse(target).hostname not in {"127.0.0.1", "localhost", "::1"} and not args.authorized:
         parser.error("Remote targets require --authorized.")
+    if args.allow_state_changes and urlparse(target).hostname not in {"127.0.0.1", "localhost", "::1"} and not args.authorized:
+        parser.error("--allow-state-changes on a remote target requires --authorized.")
     injection = args.interactsh_injection_url.strip()
     if injection and not same_origin(target, injection):
         parser.error("--interactsh-injection-url must have the same origin as --target.")
@@ -1593,6 +1824,21 @@ def main() -> int:
         profiles.append({"name": "authenticated", "cookies": normalized_cookie})
     elif args.auth_only:
         parser.error("--auth-only requires --cookies.")
+
+    secondary_cookie = ""
+    if args.secondary_cookies:
+        if not args.cookies:
+            parser.error("--secondary-cookies requires a primary --cookies value.")
+        try:
+            secondary_cookie = canonical_cookie_header(args.secondary_cookies)
+        except ValueError as exc:
+            parser.error(f"Invalid --secondary-cookies value: {exc}")
+        if secondary_cookie == normalized_cookie:
+            parser.error("--secondary-cookies must represent a different authenticated identity.")
+        print(
+            "[*] Secondary identity cookie names: "
+            + ", ".join(cookie_names(secondary_cookie))
+        )
 
     try:
         selected_model, ollama_diagnostics = ensure_ollama_model(
@@ -1665,6 +1911,8 @@ def main() -> int:
         "require_ai": args.require_ai,
         "planner_source": "pending",
         "ai_timeout": planner_timeout,
+        "allow_state_changes": args.allow_state_changes,
+        "secondary_cookies": secondary_cookie,
     }
     started = time.time()
     try:

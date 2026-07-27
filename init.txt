@@ -27,18 +27,22 @@ initializer multipiattaforma per evitare divergenze tra Windows e macOS.
 ----------------
 python .\orchestratorDeterministic.py --target <TARGET> --cookies "<COOKIE_HEADER>" --auth-only --authorized --mode balanced
 python .\orchestratorDeterministic.py --target <TARGET> --cookies "<COOKIE_HEADER>" --auth-only --authorized --mode deep
+python .\orchestratorDeterministic.py --target <TARGET> --cookies "<PRIMARY_COOKIE>" --secondary-cookies "<SECOND_ACCOUNT_COOKIE>" --auth-only --authorized --mode deep
 python .\orchestratorDeterministic.py --target <TARGET> --authorized --mode balanced
 
 3. AGENTIC
 ----------
 python .\orchestratorAgentic.py --target <TARGET> --cookies "<COOKIE_HEADER>" --auth-only --authorized --model <MODEL> --max-rounds 2 --mode balanced
 python .\orchestratorAgentic.py --target <TARGET> --cookies "<COOKIE_HEADER>" --auth-only --authorized --model <MODEL> --max-rounds 3 --mode deep --ai-timeout 720
+python .\orchestratorAgentic.py --target <TARGET> --cookies "<PRIMARY_COOKIE>" --secondary-cookies "<SECOND_ACCOUNT_COOKIE>" --auth-only --authorized --model <MODEL> --max-rounds 3 --mode deep
 python .\orchestratorAgentic.py --target <TARGET> --cookies "<COOKIE_HEADER>" --auth-only --authorized --model <MODEL> --require-ai --max-rounds 2 --mode balanced
 python .\orchestratorAgentic.py --target <TARGET> --authorized --model <MODEL> --no-model-pull --mode balanced
 
-L'agentic usa il catalogo, i selector e l'interprete MCP del deterministic. Il
-guardrail aggiunge soltanto scanner applicabili omessi dal modello e continua i
-round finché restano azioni valide o viene raggiunto --max-rounds.
+L'agentic usa il catalogo, i selector e l'interprete MCP del deterministic.
+Quando il piano omette una classe applicabile, Ollama deve scegliere esplicitamente
+un candidato scoperto per riparare la copertura; non vengono inseriti endpoint
+hardcoded. I round continuano finché restano azioni valide o viene raggiunto
+--max-rounds.
 
 4. PREFLIGHT E DEBUG
 --------------------
@@ -48,6 +52,10 @@ python .\orchestratorDeterministic.py --list-tools
 python .\orchestratorDeterministic.py --target <TARGET> --cookies "<COOKIE_HEADER>" --authorized --tool zap --mode deep --tool-timeout 480
 python .\orchestratorDeterministic.py --target <TARGET> --cookies "<COOKIE_HEADER>" --authorized --tool sqlmap --tool-url <URL> --method GET --parameters "id,query" --tool-timeout 180
 python .\orchestratorDeterministic.py --target <TARGET> --authorized --tool jwt --jwt-token "<JWT>"
+python .\orchestratorDeterministic.py --target <TARGET> --cookies "<COOKIE_HEADER>" --authorized --tool exposure --mode balanced
+python .\orchestratorDeterministic.py --target <TARGET> --cookies "<COOKIE_HEADER>" --authorized --tool browser --mode balanced
+python .\orchestratorDeterministic.py --target <TARGET> --cookies "<COOKIE_HEADER>" --authorized --tool workflow --mode balanced
+python .\orchestratorDeterministic.py --target <TARGET> --cookies "<PRIMARY_COOKIE>" --secondary-cookies "<SECOND_ACCOUNT_COOKIE>" --authorized --tool authorization --mode balanced
 
 5. PROFILI
 ----------
@@ -58,7 +66,11 @@ deep      più target, richieste e budget per ZAP/Nuclei/strumenti parametrizzat
 6. OPZIONI INIT
 ---------------
 --with-lab --run --model --mode --skip-scanners --skip-preflight
---commands-only --version
+--skip-browser --require-browser --commands-only --version
+
+Per un target remoto, i workflow che inviano POST o file di prova restano
+disabilitati salvo consenso esplicito con --authorized --allow-state-changes.
+Nei laboratori locali vengono abilitati automaticamente.
 
 7. NUCLEI
 ---------
@@ -66,9 +78,20 @@ nuclei -update
 nuclei -update-templates
 nuclei -tl -silent -nc -disable-update-check | Measure-Object -Line
 
-Le pipeline passano a Nuclei anche i request contract GET parametrizzati,
-same-origin e non distruttivi per una fase DAST limitata, oltre ai template
-normali per CVE, esposizioni e misconfigurazioni.
+Le pipeline passano a Nuclei request contract GET/POST same-origin e
+non distruttivi. Le fasi statiche per esposizioni, misconfigurazioni e
+controlli high-impact vengono eseguite prima del DAST, che usa soltanto i
+contratti parametrizzati con priorità maggiore.
+
+7B. COPERTURA WORKFLOW E BROWSER
+-------------------------------
+Exposure classifica backup, sorgenti, configurazioni, .git, .env e directory
+listing realmente recuperabili. Session analizza cookie e indicatori di
+unicità/fissazione. Browser usa Chromium per DOM/reflected/stored XSS con
+marker innocui. Workflow esegue controlli limitati su CSRF, upload, login
+throttling e CAPTCHA usando esclusivamente i form scoperti. Authorization
+confronta richieste GET ad alto valore tra identità primaria, anonima e, quando
+fornita, una seconda identità autenticata senza eseguire operazioni mutative.
 
 8. REPORT
 ---------
