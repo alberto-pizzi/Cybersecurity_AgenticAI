@@ -41,7 +41,7 @@ def _run(target_url: str, cookies: str, output: Path, wordlist: str, budget: int
     command=[
         "arjun", "-u", target_url, "-m", method,
         "-oJ", str(output), "-q", "-t", "2", "-T", "4",
-        "-w", wordlist, "-c", "15", "--rate-limit", "20",
+        "-w", wordlist, "-c", "15", "--ratelimit", "20",
     ]
     if data and method in {"POST", "JSON", "XML"}:
         command.extend(["--include", data])
@@ -86,7 +86,7 @@ def run_arjun_scan(
     method = str(method or "GET").upper()
     if method not in {"GET", "POST", "JSON", "XML"}:
         return failure("Arjun", target_url, "method must be GET, POST, JSON, or XML.")
-    timeout=max(20,min(int(timeout),60))
+    timeout=max(20,min(int(timeout),180))
     known = sorted({str(value) for value in (known_parameters or []) if str(value)})
     with tempfile.TemporaryDirectory(prefix="arjun-priority-") as td:
         temp=Path(td)

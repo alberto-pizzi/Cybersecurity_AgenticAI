@@ -1,197 +1,80 @@
-SecOps FastMCP - guida operativa
-=================================
+SecOps FastMCP - guida operativa multipiattaforma
+====================================================
 
-PRIMA DI INIZIARE
+AMBIENTE RILEVATO
 -----------------
-1. Apri PowerShell nella radice del progetto:
-   Set-Location "S:\Cybersecurity_AgenticAI"
-2. Usa soltanto target tuoi o esplicitamente autorizzati.
-3. Per un target non locale aggiungi sempre --authorized.
-4. Mantieni l'intero Cookie header tra virgolette.
-5. Scegli una sola pipeline: deterministic oppure agentic.
+Sistema: Windows AMD64
+Python attivo: C:\Users\tommy\AppData\Local\Microsoft\WindowsApps\PythonSoftwareFoundation.Python.3.13_qbz5n2kfra8p0\python.exe
+Radice progetto: S:\Cybersecurity_AgenticAI
+Apri il terminale nella radice:
+  Set-Location "S:\Cybersecurity_AgenticAI"
 
-SEGNAPOSTO
-----------
-<TARGET>         URL HTTP/HTTPS assoluto, ad esempio https://lab.example.test
-<COOKIE_HEADER>  Cookie completo, ad esempio session=abc; role=student
-<MODEL>          Modello Ollama, ad esempio qwen2.5:7b
-<URL>            Endpoint dello stesso target per un test isolato
-<PARAMETERS>     Parametri separati da virgole, ad esempio id,query
-<JWT>            Token JWT da analizzare
+Usa soltanto target tuoi o esplicitamente autorizzati. Per un target remoto
+aggiungi sempre --authorized e mantieni l'intero Cookie header tra virgolette.
 
-1. AVVIO RAPIDO DEL LAB LOCALE INCLUSO
---------------------------------------
-Prepara scanner, lab locale, ZAP e Ollama:
-python .\initScript.py --with-lab --model qwen2.5:7
-esempio:
-python .\initScript.py --with-lab --model llama3.1:8b
-
-Alla fine init stampa quattro comandi già pronti con il cookie appena creato:
-- deterministic balanced
-- deterministic deep
-- agentic balanced
-- agentic deep
-
-Inizializzazione senza avviare il lab:
+1. INIZIALIZZAZIONE E LAB LOCALE
+--------------------------------
+python .\initScript.py --with-lab --model qwen2.5:7b
 python .\initScript.py
-
-Rigenera questa guida:
 python .\initScript.py --commands-only
-
-Inizializza e avvia direttamente una pipeline locale:
 python .\initScript.py --with-lab --run deterministic --mode balanced
 python .\initScript.py --with-lab --run agentic --model qwen2.5:7b --mode balanced
 
-2. TARGET GENERICO - DETERMINISTIC
-----------------------------------
-Balanced autenticato, consigliato per i test normali:
+`initScriptMac.py` rimane disponibile come wrapper compatibile, ma usa lo stesso
+initializer multipiattaforma per evitare divergenze tra Windows e macOS.
+
+2. DETERMINISTIC
+----------------
 python .\orchestratorDeterministic.py --target <TARGET> --cookies "<COOKIE_HEADER>" --auth-only --authorized --mode balanced
-
-Deep autenticato, più lento e più esteso:
 python .\orchestratorDeterministic.py --target <TARGET> --cookies "<COOKIE_HEADER>" --auth-only --authorized --mode deep
-
-Solo superficie anonima:
 python .\orchestratorDeterministic.py --target <TARGET> --authorized --mode balanced
 
-Rimuovi --auth-only per eseguire sia il profilo anonimo sia quello autenticato.
-Per 127.0.0.1, localhost e ::1 non serve --authorized.
-
-3. TARGET GENERICO - AGENTIC
-----------------------------
-L'agente IA sceglie strumenti e richieste dalla superficie realmente scoperta.
-Le azioni proposte vengono validate prima dell'esecuzione; non sono precompilate
-con un piano fisso. Il fallback adattivo viene usato soltanto se Ollama non è
-disponibile o non produce alcuna azione valida.
-
-AI-planned balanced, consigliato:
+3. AGENTIC
+----------
 python .\orchestratorAgentic.py --target <TARGET> --cookies "<COOKIE_HEADER>" --auth-only --authorized --model <MODEL> --max-rounds 2 --mode balanced
-
-AI-planned deep, più esteso:
 python .\orchestratorAgentic.py --target <TARGET> --cookies "<COOKIE_HEADER>" --auth-only --authorized --model <MODEL> --max-rounds 3 --mode deep --ai-timeout 720
-
-Strict AI: termina invece di usare il fallback:
 python .\orchestratorAgentic.py --target <TARGET> --cookies "<COOKIE_HEADER>" --auth-only --authorized --model <MODEL> --require-ai --max-rounds 2 --mode balanced
-
-Modello già installato, senza pull automatico:
 python .\orchestratorAgentic.py --target <TARGET> --authorized --model <MODEL> --no-model-pull --mode balanced
 
-Endpoint Ollama personalizzato:
-python .\orchestratorAgentic.py --target <TARGET> --authorized --model <MODEL> --ollama-url http://127.0.0.1:11434 --mode balanced
+L'agentic usa il catalogo, i selector e l'interprete MCP del deterministic. Il
+guardrail aggiunge soltanto scanner applicabili omessi dal modello e continua i
+round finché restano azioni valide o viene raggiunto --max-rounds.
 
-4. PREFLIGHT E DIAGNOSTICA
---------------------------
-Preflight deterministic:
+4. PREFLIGHT E DEBUG
+--------------------
 python .\orchestratorDeterministic.py --target <TARGET> --authorized --preflight-only
-
-Preflight agentic:
 python .\orchestratorAgentic.py --target <TARGET> --authorized --preflight-only
-
-Sessione autenticata e passaggio attraverso ZAP:
-python .\diagnose_sessions.py --target <TARGET> --cookies "<COOKIE_HEADER>"
-
-ZAP passivo:
-python .\diagnose_zap.py --target <TARGET> --cookies "<COOKIE_HEADER>"
-
-ZAP attivo prioritizzato:
-python .\diagnose_zap.py --target <TARGET> --cookies "<COOKIE_HEADER>" --active --timeout 300
-
-Connettività Nikto/Python/Docker:
-python .\diagnose_nikto.py --target <TARGET>
-
-Login del solo lab locale incluso:
-python .\diagnose_local_lab.py
-
-5. DEBUG DI UN SOLO STRUMENTO
------------------------------
-Elenca strumenti, server MCP e funzioni:
 python .\orchestratorDeterministic.py --list-tools
-
-Forma generale:
-python .\orchestratorDeterministic.py --target <TARGET> --cookies "<COOKIE_HEADER>" --authorized --tool <TOOL> --mode balanced
-
-Strumenti host:       ffuf, zap, nuclei, nikto
-Strumenti richieste:  arjun, sqlmap, dalfox, commix, traversal, idor
-Strumenti speciali:   jwt, interactsh
-
-Richiesta GET esplicita:
-python .\orchestratorDeterministic.py --target <TARGET> --cookies "<COOKIE_HEADER>" --authorized --tool sqlmap --tool-url <URL> --method GET --parameters "<PARAMETERS>" --tool-timeout 180
-
-Richiesta POST esplicita:
-python .\orchestratorDeterministic.py --target <TARGET> --cookies "<COOKIE_HEADER>" --authorized --tool commix --tool-url <URL> --method POST --data "field=value&submit=1" --parameters "field"
-
-Diagnostica ZAP senza scansione:
-python .\orchestratorDeterministic.py --target <TARGET> --cookies "<COOKIE_HEADER>" --authorized --tool zap --diagnostic-only
-
-JWT:
+python .\orchestratorDeterministic.py --target <TARGET> --cookies "<COOKIE_HEADER>" --authorized --tool zap --mode deep --tool-timeout 480
+python .\orchestratorDeterministic.py --target <TARGET> --cookies "<COOKIE_HEADER>" --authorized --tool sqlmap --tool-url <URL> --method GET --parameters "id,query" --tool-timeout 180
 python .\orchestratorDeterministic.py --target <TARGET> --authorized --tool jwt --jwt-token "<JWT>"
 
-OAST esplicito; FUZZ viene sostituito dal dominio di callback:
-python .\orchestratorDeterministic.py --target <TARGET> --cookies "<COOKIE_HEADER>" --authorized --tool interactsh --interactsh-injection-url "<TARGET>/fetch?url=FUZZ" --method GET --parameters "url"
+5. PROFILI
+----------
+fast      controllo rapido e budget ridotti
+balanced  copertura ampia con priorità ai controlli importanti
+deep      più target, richieste e budget per ZAP/Nuclei/strumenti parametrizzati
 
-6. PROFILI DI SCANSIONE
------------------------
-fast      Controllo rapido e budget ridotti.
-balanced  Copertura ampia con priorità ai controlli più importanti.
-deep      Limiti maggiori, più richieste e copertura ZAP/Nuclei più estesa.
-
-Deterministic e agentic condividono catalogo strumenti, limiti del profilo,
-selezione delle richieste, controlli di sessione e formato del report.
-L'agentic conserva la differenza essenziale: è l'LLM a scegliere il piano.
-
-7. OPZIONI INIT
+6. OPZIONI INIT
 ---------------
---with-lab          Avvia/verifica lab locale, ZAP e Ollama.
---run               none, deterministic oppure agentic; richiede --with-lab.
---model             Modello Ollama.
---mode              fast, balanced oppure deep.
---skip-scanners     Non installare/verificare gli scanner esterni.
---skip-preflight    Salta il preflight MCP live.
---commands-only     Riscrive init.txt, mostra la guida e termina.
---version           Mostra l'identificatore della build.
+--with-lab --run --model --mode --skip-scanners --skip-preflight
+--commands-only --version
 
-8. OPZIONI ORCHESTRATOR
------------------------
-Condivise:
---target --cookies --auth-only --authorized --mode --preflight-only
---ignore-preflight-errors --interactsh-injection-url
-
-Solo deterministic:
---tool --list-tools --tool-url --tool-timeout --method --data --parameters
---jwt-token --diagnostic-only
-
-Solo agentic:
---model --ollama-url --no-model-pull --require-ai --max-rounds --ai-timeout
-
-Diagnostica ZAP:
---target --cookies --active --timeout
-
-9. NUCLEI
+7. NUCLEI
 ---------
-Aggiorna motore e template ufficiali:
 nuclei -update
 nuclei -update-templates
-
-Conta i template installati in PowerShell:
 nuclei -tl -silent -nc -disable-update-check | Measure-Object -Line
 
-Riparazione e registrazione del percorso esatto:
-python .\initScript.py --with-lab --model <MODEL>
+Le pipeline passano a Nuclei anche i request contract GET parametrizzati,
+same-origin e non distruttivi per una fase DAST limitata, oltre ai template
+normali per CVE, esposizioni e misconfigurazioni.
 
-Il percorso selezionato viene scritto in .secops_runtime.json e passato
-esplicitamente al server MCP Nuclei.
+8. REPORT
+---------
+Deterministic: .\reports\SecOps_Assessment_<timestamp>.pdf/.html/.json
+Agentic:       .\reports\SecOps_Agentic_Assessment_<timestamp>.pdf/.html/.json
 
-10. REPORT
+NOTA SHELL
 ----------
-Deterministic:
-.\reports\SecOps_Assessment_<timestamp>.pdf
-.\reports\SecOps_Assessment_<timestamp>.html
-.\reports\SecOps_Assessment_<timestamp>.json
-
-Agentic:
-.\reports\SecOps_Agentic_Assessment_<timestamp>.pdf
-.\reports\SecOps_Agentic_Assessment_<timestamp>.html
-.\reports\SecOps_Agentic_Assessment_<timestamp>.json
-
-NOTA POWERSHELL
----------------
-Il backtick (`) alla fine di una riga continua lo stesso comando.
+In PowerShell il backtick (`) continua un comando sulla riga successiva.

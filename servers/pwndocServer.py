@@ -26,7 +26,7 @@ mcp = FastMCP("SecOps Report Server")
 RISK_ORDER = {"critical": 5, "high": 4, "medium": 3, "low": 2, "info": 1}
 TOOL_PURPOSES = {
     "zap": "Traffic import, session handling, spider/site-tree population, passive analysis, and bounded high-value active checks when enabled.",
-    "nuclei": "Focused template checks for high-impact vulnerabilities, exposures and misconfigurations.",
+    "nuclei": "Focused template checks for high-impact vulnerabilities, exposures, misconfigurations and bounded DAST testing of discovered parameterized URLs.",
     "nikto": "Web-server hardening, exposed resource and outdated component checks.",
     "ffuf": "High-value path and resource discovery with content verification for selected sensitive paths.",
     "arjun": "Hidden GET/POST parameter discovery using the discovered request contract.",

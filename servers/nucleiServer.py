@@ -7,7 +7,7 @@ import re
 import tempfile
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import parse_qsl, urlparse
 
 from fastmcp import FastMCP
 
@@ -21,6 +21,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 # They remain excluded from automatic pipeline scans; the full safe HTTP pack is
 # still available in deep mode.
 EXCLUDED_TAGS = "dos,fuzz,creds-stuffing,token-spray"
+DAST_EXCLUDED_TAGS = "dos,creds-stuffing,token-spray"
 HIGH_IMPACT_TAGS = (
     "rce,sqli,xss,auth-bypass,lfi,rfi,ssrf,xxe,deserialization,"
     "cmdi,code-injection,ssti,path-traversal,default-login,cve"
@@ -114,6 +115,7 @@ def _deduplicate(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return unique
 
 
+
 def _command(
     target_url: str,
     cookies: str,
@@ -124,6 +126,7 @@ def _command(
     tags: str = "",
     compatibility: bool = False,
     automatic_scan: bool = False,
+    dast: bool = False,
     concurrency: int = 20,
     rate_limit: int = 80,
     request_timeout: int = 5,
@@ -148,11 +151,15 @@ def _command(
         command.extend(["-tags", tags])
     if automatic_scan:
         command.append("-as")
+    if dast:
+        command.append("-dast")
     if not compatibility:
-        command.extend(["-pt", "http", "-etags", EXCLUDED_TAGS, "-fhr"])
+        excluded = DAST_EXCLUDED_TAGS if dast else EXCLUDED_TAGS
+        command.extend(["-pt", "http", "-etags", excluded, "-fhr"])
     if cookies:
         command.extend(["-H", f"Cookie: {cookies}"])
     return command
+
 
 
 def _runtime_template_directories() -> list[Path]:
@@ -308,6 +315,7 @@ def _attempt_template_refresh() -> dict[str, Any]:
     return result
 
 
+
 def _run_phase(
     target_url: str,
     cookies: str,
@@ -319,35 +327,15 @@ def _run_phase(
     timeout: int,
     target_list: Path | None = None,
     automatic_scan: bool = False,
+    dast: bool = False,
     concurrency: int = 20,
     rate_limit: int = 80,
     request_timeout: int = 5,
     retries: int = 1,
     template_dir: str = "",
 ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
-    result = run_process(
-        "Nuclei",
-        _command(
-            target_url,
-            cookies,
-            path,
-            target_list,
-            severities=severities,
-            tags=tags,
-            automatic_scan=automatic_scan,
-            concurrency=concurrency,
-            rate_limit=rate_limit,
-            request_timeout=request_timeout,
-            retries=retries,
-            template_dir=template_dir,
-        ),
-        target=target_url,
-        timeout=timeout,
-    )
-    combined = "\n".join((str(result.get("stdout", "")), str(result.get("stderr", ""))))
-    if result.get("status") == "error" and "unknown flag" in combined.lower():
-        path.unlink(missing_ok=True)
-        result = run_process(
+    def execute(*, compatibility: bool) -> dict[str, Any]:
+        return run_process(
             "Nuclei",
             _command(
                 target_url,
@@ -355,9 +343,10 @@ def _run_phase(
                 path,
                 target_list,
                 severities=severities,
-                tags=tags or (f"{HIGH_IMPACT_TAGS},{EXPOSURE_TAGS}" if automatic_scan else ""),
-                compatibility=True,
-                automatic_scan=False,
+                tags=tags,
+                compatibility=compatibility,
+                automatic_scan=automatic_scan if not compatibility else False,
+                dast=dast,
                 concurrency=concurrency,
                 rate_limit=rate_limit,
                 request_timeout=request_timeout,
@@ -367,7 +356,20 @@ def _run_phase(
             target=target_url,
             timeout=timeout,
         )
+
+    result = execute(compatibility=False)
+    combined = "\n".join((str(result.get("stdout", "")), str(result.get("stderr", ""))))
+    if result.get("status") == "error" and "unknown flag" in combined.lower():
+        path.unlink(missing_ok=True)
+        result = execute(compatibility=True)
         result["compatibility_mode"] = True
+        retry_text = "\n".join((str(result.get("stdout", "")), str(result.get("stderr", ""))))
+        if dast and result.get("status") == "error" and "unknown flag" in retry_text.lower():
+            result["diagnosis"] = "nuclei_dast_unsupported"
+            result["output"] = (
+                "The installed Nuclei executable does not accept the DAST flag. "
+                "Update Nuclei through initScript.py; non-DAST phases can still continue."
+            )
 
     items = _read_items(path, str(result.get("stdout", "")))
     if result.get("diagnosis") == "timeout":
@@ -384,77 +386,133 @@ def _run_phase(
         phase_findings=len(items),
         phase_tags=tags,
         automatic_scan=automatic_scan,
+        dast=dast,
     )
     return result, items
 
 
-def _phase_definitions(scan_profile: str, total_timeout: int) -> list[dict[str, Any]]:
-    usable = max(30, total_timeout - 12)
-    if scan_profile == "fast":
-        return [{
-            "name": "critical_high_value",
-            "severities": "medium,high,critical",
-            "tags": HIGH_IMPACT_TAGS,
-            "timeout": usable,
-        }]
-    if scan_profile == "balanced":
-        budgets = [max(40, int(usable * 0.48)), max(35, int(usable * 0.32))]
-        third = max(25, usable - sum(budgets))
-        return [
-            {
-                "name": "critical_high_value",
-                "severities": "medium,high,critical",
-                "tags": HIGH_IMPACT_TAGS,
-                "timeout": budgets[0],
-            },
-            {
-                "name": "exposures_and_misconfigurations",
-                "severities": "info,low,medium,high,critical",
-                "tags": EXPOSURE_TAGS,
-                "timeout": budgets[1],
-            },
-            {
-                "name": "technology_automatic_scan",
-                "severities": "low,medium,high,critical",
-                "tags": "",
-                "automatic_scan": True,
-                "timeout": third,
-            },
-        ]
 
-    budgets = [
-        max(55, int(usable * 0.30)),
-        max(45, int(usable * 0.22)),
-        max(35, int(usable * 0.16)),
-    ]
-    fourth = max(45, usable - sum(budgets))
-    return [
-        {
-            "name": "critical_high_value",
-            "severities": "medium,high,critical",
-            "tags": HIGH_IMPACT_TAGS,
-            "timeout": budgets[0],
-        },
-        {
-            "name": "exposures_and_misconfigurations",
-            "severities": "info,low,medium,high,critical",
-            "tags": EXPOSURE_TAGS,
-            "timeout": budgets[1],
-        },
-        {
-            "name": "technology_automatic_scan",
-            "severities": "low,medium,high,critical",
-            "tags": "",
-            "automatic_scan": True,
-            "timeout": budgets[2],
-        },
-        {
-            "name": "broad_safe_http_templates",
-            "severities": "low,medium,high,critical",
-            "tags": "",
-            "timeout": fourth,
-        },
-    ]
+
+def _phase_definitions(
+    scan_profile: str,
+    total_timeout: int,
+    has_dast_targets: bool = False,
+) -> list[dict[str, Any]]:
+    usable = max(24, total_timeout - 12)
+
+    dast_phase = {
+        "name": "parameterized_dast",
+        "severities": "medium,high,critical",
+        "tags": "",
+        "dast": True,
+    }
+    high_phase = {
+        "name": "critical_high_value",
+        "severities": "medium,high,critical",
+        "tags": HIGH_IMPACT_TAGS,
+    }
+    exposure_phase = {
+        "name": "exposures_and_misconfigurations",
+        "severities": "info,low,medium,high,critical",
+        "tags": EXPOSURE_TAGS,
+    }
+    automatic_phase = {
+        "name": "technology_automatic_scan",
+        "severities": "low,medium,high,critical",
+        "tags": "",
+        "automatic_scan": True,
+    }
+    broad_phase = {
+        "name": "broad_safe_http_templates",
+        "severities": "low,medium,high,critical",
+        "tags": "",
+    }
+
+    if scan_profile == "fast":
+        phases = [dast_phase] if has_dast_targets else [high_phase]
+        weights = [1.0]
+    elif scan_profile == "balanced":
+        phases = ([dast_phase] if has_dast_targets else []) + [high_phase, exposure_phase, automatic_phase]
+        weights = [0.36, 0.29, 0.21, 0.14] if has_dast_targets else [0.46, 0.34, 0.20]
+    else:
+        phases = ([dast_phase] if has_dast_targets else []) + [high_phase, exposure_phase, automatic_phase, broad_phase]
+        weights = [0.32, 0.24, 0.17, 0.12, 0.15] if has_dast_targets else [0.31, 0.24, 0.18, 0.27]
+
+    # Do not create more processes than the total budget can meaningfully start.
+    # This keeps manually requested low timeouts bounded instead of silently
+    # allocating more seconds than the caller supplied.
+    max_phases = max(1, usable // 12)
+    phases = phases[:max_phases]
+    weights = weights[:len(phases)]
+    weight_total = sum(weights) or 1.0
+    normalized = [value / weight_total for value in weights]
+
+    budgets: list[int] = []
+    remaining = usable
+    for index, weight in enumerate(normalized):
+        if index == len(normalized) - 1:
+            value = remaining
+        else:
+            future = len(normalized) - index - 1
+            value = max(8, int(round(usable * weight)))
+            value = min(value, remaining - 8 * future)
+        budgets.append(value)
+        remaining -= value
+
+    definitions: list[dict[str, Any]] = []
+    for phase, budget in zip(phases, budgets):
+        item = dict(phase)
+        item["timeout"] = max(8, budget)
+        definitions.append(item)
+    return definitions
+
+
+
+
+_STATE_CHANGING_KEYS = {
+    "action", "delete", "remove", "reset", "logout", "signout", "install",
+    "create", "drop", "password", "password_new", "password_conf", "confirm",
+}
+_STATE_CHANGING_PATH_WORDS = ("logout", "signout", "setup", "install", "reset", "delete", "remove")
+
+
+def _same_origin_url(base_url: str, candidate: str) -> bool:
+    base = urlparse(base_url)
+    other = urlparse(candidate)
+    return (
+        base.scheme.lower(), base.hostname or "", base.port or (443 if base.scheme == "https" else 80)
+    ) == (
+        other.scheme.lower(), other.hostname or "", other.port or (443 if other.scheme == "https" else 80)
+    )
+
+
+def _dast_target_urls(
+    target_url: str,
+    request_cases: list[dict[str, Any]] | None,
+    limit: int = 20,
+) -> list[str]:
+    """Select safe, same-origin parameterized GET URLs for Nuclei DAST templates."""
+    selected: list[str] = []
+    for case in request_cases or []:
+        if not isinstance(case, dict) or str(case.get("method") or "GET").upper() != "GET":
+            continue
+        candidate = str(case.get("url") or case.get("target_url") or "").strip()
+        if not candidate.startswith(("http://", "https://")) or not _same_origin_url(target_url, candidate):
+            continue
+        parsed = urlparse(candidate)
+        if not parse_qsl(parsed.query, keep_blank_values=True):
+            continue
+        path_lower = parsed.path.lower()
+        if any(word in path_lower for word in _STATE_CHANGING_PATH_WORDS):
+            continue
+        names = {name.lower() for name, _ in parse_qsl(parsed.query, keep_blank_values=True)}
+        if names & _STATE_CHANGING_KEYS:
+            continue
+        if candidate not in selected:
+            selected.append(candidate)
+        if len(selected) >= max(1, min(int(limit), 50)):
+            break
+    return selected
 
 
 def _run_nuclei_core(
@@ -465,8 +523,9 @@ def _run_nuclei_core(
     seed_urls: list[str] | None = None,
     max_targets: int = 4,
     scan_profile: str = "balanced",
+    request_cases: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
-    """Run the official template pack in prioritized phases and preserve partial results."""
+    """Run official template phases plus bounded DAST on discovered GET contracts."""
     scan_profile = str(scan_profile or "balanced").lower()
     if scan_profile not in {"fast", "balanced", "deep"}:
         return failure("Nuclei", target_url, "scan_profile must be fast, balanced, or deep.")
@@ -481,7 +540,7 @@ def _run_nuclei_core(
         result = failure(
             "Nuclei",
             target_url,
-            "No Nuclei templates were detected after checking runtime metadata, standard Windows/Linux directories, Nuclei configuration files, and one bounded official update attempt. Run initScript.py with network access to restore the official template pack.",
+            "No Nuclei templates were detected after checking runtime metadata, standard directories, configuration files, and one bounded official update attempt. Run initScript.py with network access to restore the template pack.",
             diagnosis="nuclei_templates_missing",
         )
         result["template_inventory"] = inventory
@@ -517,6 +576,7 @@ def _run_nuclei_core(
         value for value in (seed_urls or [])
         if isinstance(value, str)
         and value.startswith(("http://", "https://"))
+        and _same_origin_url(target_url, value)
         and value != target_url
     ]
     ranked_seeds = sorted(dict.fromkeys(seed_candidates), key=target_score, reverse=True)
@@ -524,7 +584,12 @@ def _run_nuclei_core(
     target_list = work_dir / f"{prefix}-targets.txt"
     target_list.write_text("\n".join(focused_targets) + "\n", encoding="utf-8")
 
-    definitions = _phase_definitions(scan_profile, timeout)
+    dast_targets = _dast_target_urls(target_url, request_cases, limit=20 if scan_profile == "deep" else 10)
+    dast_target_list = work_dir / f"{prefix}-dast-targets.txt"
+    if dast_targets:
+        dast_target_list.write_text("\n".join(dast_targets) + "\n", encoding="utf-8")
+
+    definitions = _phase_definitions(scan_profile, timeout, bool(dast_targets))
     phase_paths = [work_dir / f"{prefix}-{index + 1}.jsonl" for index in range(len(definitions))]
     for phase_path in phase_paths:
         phase_path.unlink(missing_ok=True)
@@ -540,11 +605,12 @@ def _run_nuclei_core(
     all_items: list[dict[str, Any]] = []
     try:
         for phase_path, definition in zip(phase_paths, definitions):
+            phase_target_list = dast_target_list if definition.get("dast") else target_list
             phase, items = _run_phase(
                 target_url,
                 cookies,
                 phase_path,
-                target_list=target_list,
+                target_list=phase_target_list,
                 concurrency=concurrency,
                 rate_limit=rate_limit,
                 request_timeout=request_timeout,
@@ -575,6 +641,7 @@ def _run_nuclei_core(
                 "timeout_seconds": phase.get("phase_timeout_seconds"),
                 "tags": phase.get("phase_tags", ""),
                 "automatic_scan": phase.get("automatic_scan", False),
+                "dast": phase.get("dast", False),
                 "stderr_excerpt": str(phase.get("stderr", ""))[-1200:],
             }
             for phase in phases
@@ -586,10 +653,12 @@ def _run_nuclei_core(
             "scan_profile": scan_profile,
             "scan_scope": (
                 f"Official template inventory={inventory.get('count')}; profile={scan_profile}; "
-                f"targets={len(focused_targets)}; phases={','.join(item['name'] for item in definitions)}; "
-                f"excluded tags={EXCLUDED_TAGS}."
+                f"static_targets={len(focused_targets)}; dast_targets={len(dast_targets)}; "
+                f"phases={','.join(item['name'] for item in definitions)}; "
+                f"regular_excluded_tags={EXCLUDED_TAGS}; dast_excluded_tags={DAST_EXCLUDED_TAGS}."
             ),
             "focused_targets": focused_targets,
+            "dast_targets": dast_targets,
             "template_inventory": inventory,
             "template_refresh": refresh_result,
             "hard_failure": bool(hard_failures),
@@ -631,8 +700,11 @@ def _run_nuclei_core(
         for phase_path in phase_paths:
             phase_path.unlink(missing_ok=True)
         target_list.unlink(missing_ok=True)
+        dast_target_list.unlink(missing_ok=True)
         if temporary is not None:
             temporary.cleanup()
+
+
 
 
 @mcp.tool()
@@ -644,16 +716,19 @@ def run_nuclei_scan(
     seed_urls: list[str] | None = None,
     max_targets: int = 4,
     scan_profile: str = "balanced",
+    request_cases: list[dict[str, Any]] | None = None,
 ) -> dict:
     return _run_nuclei_core(
-        target_url,
-        cookies,
-        timeout,
-        output_file,
-        seed_urls,
-        max_targets,
-        scan_profile,
+        target_url=target_url,
+        cookies=cookies,
+        timeout=timeout,
+        output_file=output_file,
+        seed_urls=seed_urls,
+        max_targets=max_targets,
+        scan_profile=scan_profile,
+        request_cases=request_cases,
     )
+
 
 
 def _once() -> int:

@@ -160,7 +160,7 @@ TOOL_SCOPES = {
 TOOL_DESCRIPTIONS = {
     "ffuf": "Hidden resource and endpoint discovery.",
     "zap": "Session-aware crawling, passive analysis and prioritized active testing.",
-    "nuclei": "Template-based exposure, misconfiguration and known-vulnerability checks.",
+    "nuclei": "Template-based exposure, misconfiguration, known-vulnerability and bounded DAST checks on discovered parameterized URLs.",
     "nikto": "Web-server hardening and exposed-resource checks.",
     "arjun": "Hidden GET/POST parameter discovery.",
     "sqlmap": "SQL-injection confirmation on discovered request contracts.",
@@ -307,12 +307,16 @@ def resolve_server_path(filename: str, required_tool: str = "") -> Path:
 
 
 def _python_has_project_deps(python: str) -> bool:
-    """Check that `python` can actually import this project's server dependencies."""
+    """Return whether an interpreter can import the MCP server dependencies."""
     try:
         probe = subprocess.run(
             [python, "-c", "import requests, fastmcp, jwt"],
             capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
             timeout=30,
+            check=False,
         )
         return probe.returncode == 0
     except (OSError, subprocess.TimeoutExpired):
@@ -321,25 +325,19 @@ def _python_has_project_deps(python: str) -> bool:
 
 @functools.lru_cache(maxsize=1)
 def _server_python() -> str:
-    """Pick the Python interpreter used to launch every MCP server subprocess.
+    """Select a venv-safe interpreter for all MCP server subprocesses.
 
-    The interpreter currently running this process is always correct when
-    orchestratorDeterministic.py is launched by initScript.py (it *is* the
-    venv's python), and unlike a path cached in .secops_runtime.json it can
-    never go stale. Prefer it, and only fall back to the runtime-config
-    value — after actually verifying it works — for the case where this
-    script is invoked directly with some other interpreter.
+    On macOS/Linux, ``.venv/bin/python`` is commonly a symlink. Resolving it
+    follows the link to the base interpreter and can silently lose the venv's
+    site-packages. Therefore the active ``sys.executable`` is preferred without
+    calling ``Path.resolve()``. A runtime-config interpreter is used only after
+    its dependencies are verified.
     """
-    # NOTE: deliberately not calling .resolve() here — .venv/bin/python is
-    # normally a symlink to the base interpreter used to create the venv,
-    # and resolving it follows the symlink to that base interpreter, which
-    # has no knowledge of the venv (and therefore none of its packages).
-    # sys.executable is already an absolute path.
     current = sys.executable
     configured = _load_runtime().get("python_executable")
     if not (isinstance(configured, str) and Path(configured).is_file()):
         return current
-    if configured == current:
+    if os.path.normcase(configured) == os.path.normcase(current):
         return current
     if _python_has_project_deps(current):
         return current
@@ -354,11 +352,18 @@ def _server_env() -> dict[str, str]:
     paths = [part for part in env.get("PYTHONPATH", "").split(os.pathsep) if part]
     if str(ROOT) not in paths:
         paths.insert(0, str(ROOT))
+    warning_filters = [
+        value for value in env.get("PYTHONWARNINGS", "").split(",") if value
+    ]
+    authlib_filter = "ignore:authlib.jose module is deprecated"
+    if authlib_filter not in warning_filters:
+        warning_filters.append(authlib_filter)
     env.update({
         "PATH": os.environ.get("PATH", ""),
         "PYTHONPATH": os.pathsep.join(paths),
         "PYTHONUNBUFFERED": "1",
         "PYTHONIOENCODING": "utf-8",
+        "PYTHONWARNINGS": ",".join(warning_filters),
         "SECOPS_PROJECT_ROOT": str(ROOT),
     })
     return env
@@ -2224,6 +2229,7 @@ async def run_pipeline(target: str, profiles: list[dict[str, str]], injection_ur
                 })
             if spec.name == "nuclei":
                 arguments["seed_urls"] = discovery[name].get("html_urls", [])
+                arguments["request_cases"] = discovery[name].get("request_cases", [])
                 arguments["scan_profile"] = CURRENT_SCAN_MODE
                 arguments["max_targets"] = (
                     8 if CURRENT_SCAN_MODE == "deep"
@@ -2675,6 +2681,7 @@ async def run_single_tool_debug(
         elif tool == "nuclei":
             arguments.update({
                 "seed_urls": discovery.get("html_urls", []),
+                "request_cases": discovery.get("request_cases", []),
                 "scan_profile": mode,
                 "max_targets": 8 if mode == "deep" else 4 if mode == "balanced" else 1,
             })

@@ -6,6 +6,7 @@ import importlib.metadata
 import os
 import platform
 import re
+import shlex
 import shutil
 import stat
 import subprocess
@@ -40,7 +41,7 @@ DEFAULT_MODEL = "llama3.1:8b"
 NUCLEI_TEMPLATE_MINIMUM = 1000
 NUCLEI_TEMPLATE_UPDATE_TIMEOUT = 600
 _NUCLEI_TEMPLATE_STATE: dict[str, Any] = {}
-BUILD_ID = "secops-init-resilient-v29-generic-parity-v29.3.1-ai-nuclei-installer-fix-20260727"
+BUILD_ID = "secops-init-resilient-v31-crossplatform-venv-agentic-coverage-20260727"
 
 PYTHON_PACKAGES = (
     "fastmcp==2.12.5", "langgraph>=0.6,<2", "requests>=2.32,<3",
@@ -131,7 +132,7 @@ def configure_path() -> list[str]:
         candidates.append(Path(site.USER_BASE) / ("Scripts" if os.name == "nt" else "bin"))
     except Exception:
         pass
-    candidates.append(Path(sys.executable).resolve().parent)
+    candidates.append(Path(sys.executable).parent)
     added = []
     for path in candidates:
         if path.is_dir():
@@ -153,12 +154,28 @@ def write_launcher(name: str, command: list[str]) -> Path:
         path.write_text("@echo off\r\n" + subprocess.list2cmdline(command) + " %*\r\n", encoding="utf-8")
     else:
         path = LOCAL_BIN / name
-        quoted = " ".join(subprocess.list2cmdline([part]) for part in command)
+        quoted = shlex.join([str(part) for part in command])
         path.write_text(f"#!/usr/bin/env sh\nexec {quoted} \"$@\"\n", encoding="utf-8")
         path.chmod(path.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
     configure_path()
     print(f"[+] Launcher created: {path}")
     return path
+
+
+def _verify_fastmcp_import() -> tuple[bool, str]:
+    """Verify the exact FastMCP import used by the orchestrators."""
+    probe = run(
+        [sys.executable, "-c", "from fastmcp import Client; from fastmcp.client.transports import StdioTransport"],
+        required=False,
+        capture=True,
+        show_output=False,
+        timeout=60,
+    )
+    detail = "\n".join(
+        part for part in ((probe.stdout or "").strip(), (probe.stderr or "").strip())
+        if part
+    )
+    return probe.returncode == 0, detail
 
 
 def _missing_python_packages() -> list[str]:
@@ -182,7 +199,7 @@ def _missing_python_packages() -> list[str]:
 
 
 def install_python_packages() -> None:
-    # Remove the obsolete ZAP client only when it is actually installed.
+    """Install only missing requirements, then repair a stale FastMCP install."""
     try:
         importlib.metadata.version("python-owasp-zap-v2.4")
     except importlib.metadata.PackageNotFoundError:
@@ -199,12 +216,36 @@ def install_python_packages() -> None:
     missing = _missing_python_packages()
     if missing:
         print("[*] Installing missing/incompatible Python packages: " + ", ".join(missing))
-        run(
-            [sys.executable, "-m", "pip", "install", *missing],
-            timeout=3600,
-        )
+        run([sys.executable, "-m", "pip", "install", *missing], timeout=3600)
     else:
         print("[+] Python dependencies already satisfy the pinned requirements; PyPI access skipped.")
+
+    healthy, detail = _verify_fastmcp_import()
+    if not healthy:
+        print("[!] FastMCP import is stale or inconsistent; forcing a clean pinned reinstall.")
+        fastmcp_pin = next(
+            (package for package in PYTHON_PACKAGES if package.lower().startswith("fastmcp")),
+            "fastmcp==2.12.5",
+        )
+        run(
+            [sys.executable, "-m", "pip", "uninstall", "-y", "fastmcp"],
+            required=False,
+            capture=True,
+            show_output=False,
+            timeout=300,
+        )
+        run(
+            [sys.executable, "-m", "pip", "install", "--no-cache-dir", fastmcp_pin],
+            timeout=1800,
+        )
+        healthy, detail = _verify_fastmcp_import()
+        if not healthy:
+            raise RuntimeError(
+                "FastMCP still cannot be imported by the active interpreter after a clean reinstall.\n"
+                f"Interpreter: {sys.executable}\n"
+                f"Diagnostic: {detail[-2500:]}\n"
+                "Recreate the project virtual environment and ensure no local fastmcp.py or mcp.py shadows the package."
+            )
     configure_path()
 
 
@@ -236,12 +277,44 @@ def find_perl() -> str | None:
     found = shutil.which("perl")
     if found:
         return found
+    candidates: tuple[Path, ...] = ()
     if os.name == "nt":
-        for candidate in (Path(r"C:\Strawberry\perl\bin\perl.exe"), Path(r"C:\Program Files\Strawberry Perl\perl\bin\perl.exe")):
-            if candidate.is_file():
-                _add_path(candidate.parent)
-                return str(candidate)
+        candidates = (
+            Path(r"C:\Strawberry\perl\bin\perl.exe"),
+            Path(r"C:\Program Files\Strawberry Perl\perl\bin\perl.exe"),
+        )
+    elif platform.system().lower() == "darwin":
+        candidates = (
+            Path("/opt/homebrew/opt/perl/bin/perl"),
+            Path("/opt/homebrew/bin/perl"),
+            Path("/usr/local/opt/perl/bin/perl"),
+            Path("/usr/local/bin/perl"),
+            Path("/usr/bin/perl"),
+        )
+    for candidate in candidates:
+        if candidate.is_file():
+            _add_path(candidate.parent)
+            return str(candidate)
     return None
+
+
+def _perl_reinstall_hint() -> str:
+    if os.name == "nt":
+        return (
+            "Install/repair Strawberry Perl with:\n"
+            "  winget uninstall --id StrawberryPerl.StrawberryPerl --exact\n"
+            "  winget install --id StrawberryPerl.StrawberryPerl --exact"
+        )
+    if platform.system().lower() == "darwin":
+        return (
+            "Install the macOS build tools and Perl with:\n"
+            "  xcode-select --install\n"
+            "  brew install perl cpanminus"
+        )
+    return (
+        "Install Perl and build tools with your package manager, for example:\n"
+        "  sudo apt install perl cpanminus build-essential"
+    )
 
 
 def _perl_module_available(perl: Path, module: str) -> tuple[bool, str]:
@@ -258,17 +331,28 @@ def _perl_module_available(perl: Path, module: str) -> tuple[bool, str]:
 
 
 def _strawberry_root(perl: Path) -> Path:
-    """Return the Strawberry Perl installation root from .../perl/bin/perl.exe."""
+    """Return the Strawberry root on Windows; a harmless parent elsewhere."""
     resolved = perl.resolve()
-    if resolved.parent.name.lower() == "bin" and resolved.parent.parent.name.lower() == "perl":
-        return resolved.parent.parent.parent
+    if os.name == "nt":
+        parts = [part.lower() for part in resolved.parts]
+        try:
+            perl_index = parts.index("perl")
+            if perl_index > 0:
+                return Path(*resolved.parts[:perl_index])
+        except ValueError:
+            pass
     return resolved.parent.parent
 
 
 def _configure_perl_toolchain(perl: Path) -> tuple[Path | None, str]:
-    """Expose Strawberry Perl's compiler/make directory and resolve its configured make tool."""
-    root = _strawberry_root(perl)
-    tool_dirs = (perl.parent, root / "c" / "bin", root / "perl" / "site" / "bin")
+    """Resolve the make/compiler toolchain on Windows, macOS and Linux."""
+    is_windows = os.name == "nt"
+    root = _strawberry_root(perl) if is_windows else None
+    tool_dirs = (
+        (perl.parent, root / "c" / "bin", root / "perl" / "site" / "bin")
+        if root is not None
+        else (perl.parent,)
+    )
     for directory in tool_dirs:
         if directory.is_dir():
             _add_path(directory)
@@ -280,32 +364,33 @@ def _configure_perl_toolchain(perl: Path) -> tuple[Path | None, str]:
         show_output=False,
         timeout=30,
     )
-    configured_name = (probe.stdout or "").strip() or "gmake"
+    configured_name = (probe.stdout or "").strip() or "make"
     names = list(dict.fromkeys((configured_name, "gmake", "dmake", "make")))
-    candidates = [root / "c" / "bin" / name for name in names]
-    if os.name == "nt":
-        candidates += [root / "c" / "bin" / f"{name}.exe" for name in names if not name.lower().endswith(".exe")]
-
+    candidates: list[Path] = []
+    if root is not None:
+        candidates.extend(root / "c" / "bin" / name for name in names)
+        candidates.extend(
+            root / "c" / "bin" / f"{name}.exe"
+            for name in names
+            if not name.lower().endswith(".exe")
+        )
     make = next((path.resolve() for path in candidates if path.is_file()), None)
     if make is None:
         found = next((shutil.which(name) for name in names if shutil.which(name)), None)
         make = Path(found).resolve() if found else None
     if make is not None:
         _add_path(make.parent)
-    detail = f"configured make={configured_name}; resolved={make or 'missing'}; root={root}"
+    detail = f"configured make={configured_name}; resolved={make or 'missing'}; root={root or 'n/a'}"
     return make, detail
 
 
 def _install_perl_module(perl: Path, module: str) -> None:
-    """Install a Strawberry Perl module with the bundled make tool and a CPAN fallback."""
+    """Install a missing Perl module through cpanm or CPAN."""
     make, toolchain_detail = _configure_perl_toolchain(perl)
     if make is None:
         raise RuntimeError(
-            "Strawberry Perl is missing its bundled make/compiler toolchain. "
-            f"{toolchain_detail}\n"
-            "Reinstall it with:\n"
-            "  winget uninstall --id StrawberryPerl.StrawberryPerl --exact\n"
-            "  winget install --id StrawberryPerl.StrawberryPerl --exact"
+            "Perl is missing the required build toolchain. "
+            f"{toolchain_detail}\n{_perl_reinstall_hint()}"
         )
 
     environment = {
@@ -321,6 +406,8 @@ def _install_perl_module(perl: Path, module: str) -> None:
         perl.parent / "cpanm",
         perl.parent.parent / "site" / "bin" / "cpanm.bat",
         perl.parent.parent / "site" / "bin" / "cpanm.exe",
+        Path("/opt/homebrew/bin/cpanm"),
+        Path("/usr/local/bin/cpanm"),
     )
     attempts: list[str] = []
     cpanm = next((path for path in cpanm_candidates if path.exists()), None)
@@ -337,7 +424,10 @@ def _install_perl_module(perl: Path, module: str) -> None:
         if healthy:
             return
 
-    cpan_candidates = (perl.parent / "cpan.bat", perl.parent / "cpan.exe", perl.parent / "cpan")
+    cpan_candidates = (
+        perl.parent / "cpan.bat", perl.parent / "cpan.exe", perl.parent / "cpan",
+        Path("/opt/homebrew/bin/cpan"), Path("/usr/local/bin/cpan"), Path("/usr/bin/cpan"),
+    )
     cpan = next((path for path in cpan_candidates if path.exists()), None)
     command = [str(cpan), "-T", module] if cpan else [str(perl), "-MCPAN", "-e", f"CPAN::Shell->install('{module}')"]
     result = run(
@@ -353,14 +443,13 @@ def _install_perl_module(perl: Path, module: str) -> None:
         diagnostics = "\n--- installer attempt ---\n".join(value for value in attempts if value)
         raise RuntimeError(
             f"Perl module {module} could not be installed. {toolchain_detail}. {detail}\n{diagnostics}\n"
-            "To reinstall Strawberry Perl:\n"
-            "  winget uninstall --id StrawberryPerl.StrawberryPerl --exact\n"
-            "  winget install --id StrawberryPerl.StrawberryPerl --exact"
+            "Install the missing modules manually with: cpan JSON XML::Writer\n"
+            f"{_perl_reinstall_hint()}"
         )
 
 
 def _write_nikto_launcher(perl: Path, script: Path) -> Path:
-    """Use a small Python launcher so cmd.exe never reparses the Perl script path."""
+    """Create a quoting-safe native Nikto launcher on every platform."""
     LOCAL_BIN.mkdir(parents=True, exist_ok=True)
     wrapper = LOCAL_OPT / "nikto_launcher.py"
     wrapper.write_text(
@@ -372,13 +461,16 @@ def _write_nikto_launcher(perl: Path, script: Path) -> Path:
         launcher = LOCAL_BIN / "nikto.bat"
         launcher.write_text(
             "@echo off\r\n"
-            f'"{Path(sys.executable).resolve()}" "{wrapper}" %*\r\n'
+            f'"{sys.executable}" "{wrapper}" %*\r\n'
             "exit /b %ERRORLEVEL%\r\n",
             encoding="utf-8",
         )
     else:
         launcher = LOCAL_BIN / "nikto"
-        launcher.write_text(f'#!/usr/bin/env sh\nexec "{Path(sys.executable).resolve()}" "{wrapper}" "$@"\n', encoding="utf-8")
+        launcher.write_text(
+            f"#!/usr/bin/env sh\nexec {shlex.quote(sys.executable)} {shlex.quote(str(wrapper))} \"$@\"\n",
+            encoding="utf-8",
+        )
         launcher.chmod(launcher.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
     configure_path()
     return launcher
@@ -469,12 +561,7 @@ def _write_nikto_docker_launcher() -> Path:
 
 
 def install_nikto() -> None:
-    """Prefer the official Docker Nikto image; keep native Perl optional.
-
-    The MCP Nikto server already supports Docker and should not force users to
-    uninstall/reinstall Strawberry Perl. Native Perl remains a secondary
-    fallback for systems without Docker.
-    """
+    """Prefer the official Docker image; use native Perl when Docker is absent."""
     if _ensure_nikto_docker_image():
         _write_nikto_docker_launcher()
         return
@@ -487,22 +574,19 @@ def install_nikto() -> None:
     perl_value = find_perl()
     if not script.is_file() or not perl_value:
         raise RuntimeError(
-            "Nikto is unavailable: the official Docker image is not ready and "
-            "the optional native Perl runtime is missing. Restore network/Docker "
-            "access and rerun the initializer. Do not uninstall working runtimes."
+            "Nikto is unavailable: the official Docker image is not ready and the native Perl fallback is incomplete.\n"
+            f"{_perl_reinstall_hint()}"
         )
 
     perl = Path(perl_value).resolve()
     make, toolchain_detail = _configure_perl_toolchain(perl)
     if make is None:
         raise RuntimeError(
-            "The optional native Strawberry Perl toolchain is incomplete and "
-            "the Docker fallback is unavailable. "
-            f"{toolchain_detail}. Restore Docker/network access or repair Perl manually; "
-            "the initializer will not uninstall it."
+            "The native Perl build toolchain is incomplete and the Docker fallback is unavailable. "
+            f"{toolchain_detail}.\n{_perl_reinstall_hint()}"
         )
-    print(f"[+] Strawberry Perl build tool: {make}")
-    for module in ("XML::Writer",):
+    print(f"[+] Perl build tool: {make}")
+    for module in ("XML::Writer", "JSON"):
         available, _ = _perl_module_available(perl, module)
         if not available:
             print(f"[*] Installing missing Perl module: {module}")
@@ -512,8 +596,7 @@ def install_nikto() -> None:
     healthy, detail = _nikto_health(perl, script.resolve(), launcher)
     if not healthy:
         raise RuntimeError(
-            f"Optional native Nikto runtime verification failed: {detail}. "
-            "The initializer will not uninstall Perl."
+            f"Native Nikto runtime verification failed: {detail}.\n{_perl_reinstall_hint()}"
         )
     print(f"[+] Nikto runtime and launcher verified: {launcher}")
 
@@ -856,19 +939,20 @@ def verify_scanners(required: bool = True) -> dict[str, str | None]:
 def write_runtime_config(status: dict[str, str | None]) -> None:
     directories = configure_path() + [str(Path(path).parent) for path in status.values() if path]
     payload = {
-        "schema_version": 2,
+        "schema_version": 3,
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "project_root": str(ROOT),
-        "python_executable": str(Path(sys.executable).resolve()),
+        # Never resolve a macOS/Linux venv symlink to its base interpreter.
+        "python_executable": sys.executable,
+        "platform": platform.platform(),
+        "machine": platform.machine(),
         "tool_directories": list(dict.fromkeys(directories)),
         "executables": status,
         "nikto_perl": str(Path(find_perl()).resolve()) if find_perl() else "",
         "nikto_script": str((LOCAL_OPT / "nikto" / "program" / "nikto.pl").resolve()),
         "nikto_image": NIKTO_DOCKER_IMAGE,
         "nikto_execution_mode": (
-            "docker_official_image"
-            if _docker_image_ready(NIKTO_DOCKER_IMAGE)
-            else "native_perl"
+            "docker_official_image" if _docker_image_ready(NIKTO_DOCKER_IMAGE) else "native_perl"
         ),
         "nuclei_templates": (
             dict(_NUCLEI_TEMPLATE_STATE)
@@ -1436,17 +1520,16 @@ def update_runtime_auth(cookie: str) -> None:
     })
     RUNTIME_FILE.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
 
-def _ensure_local_docker_image(image: str) -> None:
-    """Use a local image without contacting a registry; pull only when absent."""
+def _ensure_local_docker_image(image: str, platform_name: str = "") -> None:
+    """Use a local image; pull only when absent, optionally for a platform."""
     if _docker_image_ready(image):
         print(f"[+] Docker image already available locally; registry access skipped: {image}")
         return
-    result = run(
-        ["docker", "pull", image],
-        required=False,
-        capture=True,
-        timeout=1800,
-    )
+    command = ["docker", "pull"]
+    if platform_name:
+        command.extend(["--platform", platform_name])
+    command.append(image)
+    result = run(command, required=False, capture=True, timeout=1800)
     if result.returncode != 0 or not _docker_image_ready(image):
         raise RuntimeError(
             f"Docker image {image} is not available locally and could not be pulled. "
@@ -1481,23 +1564,28 @@ def _ollama_model_available(model: str) -> bool:
 
 def setup_local_lab(model: str) -> str:
     if not shutil.which("docker"):
-        raise RuntimeError("Docker is required for --with-lab.")
+        raise RuntimeError("Docker Desktop/Engine is required for --with-lab.")
     run(["docker", "info"], timeout=60)
     ensure_network(LOCAL_LAB_NETWORK)
 
-    _ensure_local_docker_image(LOCAL_LAB_IMAGE)
+    apple_silicon = (
+        platform.system().lower() == "darwin"
+        and platform.machine().lower() in {"arm64", "aarch64"}
+    )
+    dvwa_platform = "linux/amd64" if apple_silicon else ""
+    _ensure_local_docker_image(LOCAL_LAB_IMAGE, dvwa_platform)
     _ensure_local_docker_image("zaproxy/zap-stable")
     _ensure_local_docker_image(NIKTO_DOCKER_IMAGE)
     _ensure_local_docker_image("ollama/ollama")
 
+    dvwa_options = ["--platform", dvwa_platform] if dvwa_platform else []
     ensure_container(
         LOCAL_LAB_CONTAINER,
         LOCAL_LAB_IMAGE,
         {"80/tcp": "80"},
         f"{TARGET}/login.php",
+        run_options=dvwa_options,
     )
-    # Keep a valid local ZAP container. Recreate it only when its image,
-    # network, ports, or readiness are wrong; do not force a registry pull.
     ensure_container(
         "zap_mcp", "zaproxy/zap-stable", {"8080/tcp": "8080"},
         "http://127.0.0.1:8080/JSON/core/view/version/",
@@ -1526,26 +1614,141 @@ def setup_local_lab(model: str) -> str:
         run_options=["-v", "ollama_secops:/root/.ollama"],
         attempts=120,
     )
+    if apple_silicon:
+        print("[!] Ollama is running in Docker on Apple Silicon and may use CPU emulation. A native Ollama service can be faster.")
     if _ollama_model_available(model):
         print(f"[+] Ollama model already available; pull skipped: {model}")
     else:
-        run(
-            ["docker", "exec", "ollama_secops", "ollama", "pull", model],
-            timeout=7200,
-        )
+        run(["docker", "exec", "ollama_secops", "ollama", "pull", model], timeout=7200)
     return create_local_lab_session()
 
 
 def run_preflight() -> None:
     script = ROOT / "orchestratorDeterministic.py"
-    result = run([sys.executable, str(script), "--target", TARGET, "--preflight-only"], required=False, capture=True, timeout=300, cwd=ROOT)
+    environment = {"PATH": os.environ.get("PATH", "")}
+    if sys.prefix != getattr(sys, "base_prefix", sys.prefix):
+        environment["VIRTUAL_ENV"] = str(Path(sys.executable).parent.parent)
+    result = run(
+        [sys.executable, str(script), "--target", TARGET, "--preflight-only"],
+        required=False,
+        capture=True,
+        timeout=300,
+        cwd=ROOT,
+        env_overrides=environment,
+    )
     if result.returncode:
-        raise RuntimeError("The live orchestrator preflight failed.")
+        combined = "\n".join(filter(None, ((result.stdout or ""), (result.stderr or ""))))
+        if "ModuleNotFoundError" in combined:
+            raise RuntimeError(
+                "The live preflight launched an MCP server with an interpreter missing project dependencies.\n"
+                f"Initializer interpreter: {sys.executable}\n"
+                "The unified orchestrator should prefer this exact interpreter; verify that the project files were all updated together.\n"
+                f"Diagnostic: {combined[-2500:]}"
+            )
+        raise RuntimeError("The live orchestrator preflight failed.\n" + combined[-2500:])
 
 
 def command_reference_text() -> str:
-    """Return the complete but compact target-agnostic operator guide."""
-    return 'SecOps FastMCP - guida operativa\n=================================\n\nPRIMA DI INIZIARE\n-----------------\n1. Apri PowerShell nella radice del progetto:\n   Set-Location "S:\\Cybersecurity_AgenticAI"\n2. Usa soltanto target tuoi o esplicitamente autorizzati.\n3. Per un target non locale aggiungi sempre --authorized.\n4. Mantieni l\'intero Cookie header tra virgolette.\n5. Scegli una sola pipeline: deterministic oppure agentic.\n\nSEGNAPOSTO\n----------\n<TARGET>         URL HTTP/HTTPS assoluto, ad esempio https://lab.example.test\n<COOKIE_HEADER>  Cookie completo, ad esempio session=abc; role=student\n<MODEL>          Modello Ollama, ad esempio qwen2.5:7b\n<URL>            Endpoint dello stesso target per un test isolato\n<PARAMETERS>     Parametri separati da virgole, ad esempio id,query\n<JWT>            Token JWT da analizzare\n\n1. AVVIO RAPIDO DEL LAB LOCALE INCLUSO\n--------------------------------------\nPrepara scanner, lab locale, ZAP e Ollama:\npython .\\initScript.py --with-lab --model qwen2.5:7b\n\nAlla fine init stampa quattro comandi già pronti con il cookie appena creato:\n- deterministic balanced\n- deterministic deep\n- agentic balanced\n- agentic deep\n\nInizializzazione senza avviare il lab:\npython .\\initScript.py\n\nRigenera questa guida:\npython .\\initScript.py --commands-only\n\nInizializza e avvia direttamente una pipeline locale:\npython .\\initScript.py --with-lab --run deterministic --mode balanced\npython .\\initScript.py --with-lab --run agentic --model qwen2.5:7b --mode balanced\n\n2. TARGET GENERICO - DETERMINISTIC\n----------------------------------\nBalanced autenticato, consigliato per i test normali:\npython .\\orchestratorDeterministic.py --target <TARGET> --cookies "<COOKIE_HEADER>" --auth-only --authorized --mode balanced\n\nDeep autenticato, più lento e più esteso:\npython .\\orchestratorDeterministic.py --target <TARGET> --cookies "<COOKIE_HEADER>" --auth-only --authorized --mode deep\n\nSolo superficie anonima:\npython .\\orchestratorDeterministic.py --target <TARGET> --authorized --mode balanced\n\nRimuovi --auth-only per eseguire sia il profilo anonimo sia quello autenticato.\nPer 127.0.0.1, localhost e ::1 non serve --authorized.\n\n3. TARGET GENERICO - AGENTIC\n----------------------------\nL\'agente IA sceglie strumenti e richieste dalla superficie realmente scoperta.\nLe azioni proposte vengono validate prima dell\'esecuzione; non sono precompilate\ncon un piano fisso. Il fallback adattivo viene usato soltanto se Ollama non è\ndisponibile o non produce alcuna azione valida.\n\nAI-planned balanced, consigliato:\npython .\\orchestratorAgentic.py --target <TARGET> --cookies "<COOKIE_HEADER>" --auth-only --authorized --model <MODEL> --max-rounds 2 --mode balanced\n\nAI-planned deep, più esteso:\npython .\\orchestratorAgentic.py --target <TARGET> --cookies "<COOKIE_HEADER>" --auth-only --authorized --model <MODEL> --max-rounds 3 --mode deep --ai-timeout 720\n\nStrict AI: termina invece di usare il fallback:\npython .\\orchestratorAgentic.py --target <TARGET> --cookies "<COOKIE_HEADER>" --auth-only --authorized --model <MODEL> --require-ai --max-rounds 2 --mode balanced\n\nModello già installato, senza pull automatico:\npython .\\orchestratorAgentic.py --target <TARGET> --authorized --model <MODEL> --no-model-pull --mode balanced\n\nEndpoint Ollama personalizzato:\npython .\\orchestratorAgentic.py --target <TARGET> --authorized --model <MODEL> --ollama-url http://127.0.0.1:11434 --mode balanced\n\n4. PREFLIGHT E DIAGNOSTICA\n--------------------------\nPreflight deterministic:\npython .\\orchestratorDeterministic.py --target <TARGET> --authorized --preflight-only\n\nPreflight agentic:\npython .\\orchestratorAgentic.py --target <TARGET> --authorized --preflight-only\n\nSessione autenticata e passaggio attraverso ZAP:\npython .\\diagnose_sessions.py --target <TARGET> --cookies "<COOKIE_HEADER>"\n\nZAP passivo:\npython .\\diagnose_zap.py --target <TARGET> --cookies "<COOKIE_HEADER>"\n\nZAP attivo prioritizzato:\npython .\\diagnose_zap.py --target <TARGET> --cookies "<COOKIE_HEADER>" --active --timeout 300\n\nConnettività Nikto/Python/Docker:\npython .\\diagnose_nikto.py --target <TARGET>\n\nLogin del solo lab locale incluso:\npython .\\diagnose_local_lab.py\n\n5. DEBUG DI UN SOLO STRUMENTO\n-----------------------------\nElenca strumenti, server MCP e funzioni:\npython .\\orchestratorDeterministic.py --list-tools\n\nForma generale:\npython .\\orchestratorDeterministic.py --target <TARGET> --cookies "<COOKIE_HEADER>" --authorized --tool <TOOL> --mode balanced\n\nStrumenti host:       ffuf, zap, nuclei, nikto\nStrumenti richieste:  arjun, sqlmap, dalfox, commix, traversal, idor\nStrumenti speciali:   jwt, interactsh\n\nRichiesta GET esplicita:\npython .\\orchestratorDeterministic.py --target <TARGET> --cookies "<COOKIE_HEADER>" --authorized --tool sqlmap --tool-url <URL> --method GET --parameters "<PARAMETERS>" --tool-timeout 180\n\nRichiesta POST esplicita:\npython .\\orchestratorDeterministic.py --target <TARGET> --cookies "<COOKIE_HEADER>" --authorized --tool commix --tool-url <URL> --method POST --data "field=value&submit=1" --parameters "field"\n\nDiagnostica ZAP senza scansione:\npython .\\orchestratorDeterministic.py --target <TARGET> --cookies "<COOKIE_HEADER>" --authorized --tool zap --diagnostic-only\n\nJWT:\npython .\\orchestratorDeterministic.py --target <TARGET> --authorized --tool jwt --jwt-token "<JWT>"\n\nOAST esplicito; FUZZ viene sostituito dal dominio di callback:\npython .\\orchestratorDeterministic.py --target <TARGET> --cookies "<COOKIE_HEADER>" --authorized --tool interactsh --interactsh-injection-url "<TARGET>/fetch?url=FUZZ" --method GET --parameters "url"\n\n6. PROFILI DI SCANSIONE\n-----------------------\nfast      Controllo rapido e budget ridotti.\nbalanced  Copertura ampia con priorità ai controlli più importanti.\ndeep      Limiti maggiori, più richieste e copertura ZAP/Nuclei più estesa.\n\nDeterministic e agentic condividono catalogo strumenti, limiti del profilo,\nselezione delle richieste, controlli di sessione e formato del report.\nL\'agentic conserva la differenza essenziale: è l\'LLM a scegliere il piano.\n\n7. OPZIONI INIT\n---------------\n--with-lab          Avvia/verifica lab locale, ZAP e Ollama.\n--run               none, deterministic oppure agentic; richiede --with-lab.\n--model             Modello Ollama.\n--mode              fast, balanced oppure deep.\n--skip-scanners     Non installare/verificare gli scanner esterni.\n--skip-preflight    Salta il preflight MCP live.\n--commands-only     Riscrive init.txt, mostra la guida e termina.\n--version           Mostra l\'identificatore della build.\n\n8. OPZIONI ORCHESTRATOR\n-----------------------\nCondivise:\n--target --cookies --auth-only --authorized --mode --preflight-only\n--ignore-preflight-errors --interactsh-injection-url\n\nSolo deterministic:\n--tool --list-tools --tool-url --tool-timeout --method --data --parameters\n--jwt-token --diagnostic-only\n\nSolo agentic:\n--model --ollama-url --no-model-pull --require-ai --max-rounds --ai-timeout\n\nDiagnostica ZAP:\n--target --cookies --active --timeout\n\n9. NUCLEI\n---------\nAggiorna motore e template ufficiali:\nnuclei -update\nnuclei -update-templates\n\nConta i template installati in PowerShell:\nnuclei -tl -silent -nc -disable-update-check | Measure-Object -Line\n\nRiparazione e registrazione del percorso esatto:\npython .\\initScript.py --with-lab --model <MODEL>\n\nIl percorso selezionato viene scritto in .secops_runtime.json e passato\nesplicitamente al server MCP Nuclei.\n\n10. REPORT\n----------\nDeterministic:\n.\\reports\\SecOps_Assessment_<timestamp>.pdf\n.\\reports\\SecOps_Assessment_<timestamp>.html\n.\\reports\\SecOps_Assessment_<timestamp>.json\n\nAgentic:\n.\\reports\\SecOps_Agentic_Assessment_<timestamp>.pdf\n.\\reports\\SecOps_Agentic_Assessment_<timestamp>.html\n.\\reports\\SecOps_Agentic_Assessment_<timestamp>.json\n\nNOTA POWERSHELL\n---------------\nIl backtick (`) alla fine di una riga continua lo stesso comando.\n'
+    python = "python" if os.name == "nt" else "python3"
+    prefix = ".\\" if os.name == "nt" else "./"
+    report_prefix = ".\\reports\\" if os.name == "nt" else "./reports/"
+    set_location = (
+        f'Set-Location "{ROOT}"'
+        if os.name == "nt"
+        else f'cd {shlex.quote(str(ROOT))}'
+    )
+    count_templates = (
+        "nuclei -tl -silent -nc -disable-update-check | Measure-Object -Line"
+        if os.name == "nt"
+        else "nuclei -tl -silent -nc -disable-update-check | wc -l"
+    )
+    shell_note = (
+        "In PowerShell il backtick (`) continua un comando sulla riga successiva."
+        if os.name == "nt"
+        else "In zsh/bash usa \\ alla fine della riga per continuare un comando."
+    )
+    p = lambda script: f"{python} {prefix}{script}"
+    return f"""SecOps FastMCP - guida operativa multipiattaforma
+====================================================
+
+AMBIENTE RILEVATO
+-----------------
+Sistema: {platform.system()} {platform.machine()}
+Python attivo: {sys.executable}
+Radice progetto: {ROOT}
+Apri il terminale nella radice:
+  {set_location}
+
+Usa soltanto target tuoi o esplicitamente autorizzati. Per un target remoto
+aggiungi sempre --authorized e mantieni l'intero Cookie header tra virgolette.
+
+1. INIZIALIZZAZIONE E LAB LOCALE
+--------------------------------
+{p('initScript.py')} --with-lab --model qwen2.5:7b
+{p('initScript.py')}
+{p('initScript.py')} --commands-only
+{p('initScript.py')} --with-lab --run deterministic --mode balanced
+{p('initScript.py')} --with-lab --run agentic --model qwen2.5:7b --mode balanced
+
+`initScriptMac.py` rimane disponibile come wrapper compatibile, ma usa lo stesso
+initializer multipiattaforma per evitare divergenze tra Windows e macOS.
+
+2. DETERMINISTIC
+----------------
+{p('orchestratorDeterministic.py')} --target <TARGET> --cookies "<COOKIE_HEADER>" --auth-only --authorized --mode balanced
+{p('orchestratorDeterministic.py')} --target <TARGET> --cookies "<COOKIE_HEADER>" --auth-only --authorized --mode deep
+{p('orchestratorDeterministic.py')} --target <TARGET> --authorized --mode balanced
+
+3. AGENTIC
+----------
+{p('orchestratorAgentic.py')} --target <TARGET> --cookies "<COOKIE_HEADER>" --auth-only --authorized --model <MODEL> --max-rounds 2 --mode balanced
+{p('orchestratorAgentic.py')} --target <TARGET> --cookies "<COOKIE_HEADER>" --auth-only --authorized --model <MODEL> --max-rounds 3 --mode deep --ai-timeout 720
+{p('orchestratorAgentic.py')} --target <TARGET> --cookies "<COOKIE_HEADER>" --auth-only --authorized --model <MODEL> --require-ai --max-rounds 2 --mode balanced
+{p('orchestratorAgentic.py')} --target <TARGET> --authorized --model <MODEL> --no-model-pull --mode balanced
+
+L'agentic usa il catalogo, i selector e l'interprete MCP del deterministic. Il
+guardrail aggiunge soltanto scanner applicabili omessi dal modello e continua i
+round finché restano azioni valide o viene raggiunto --max-rounds.
+
+4. PREFLIGHT E DEBUG
+--------------------
+{p('orchestratorDeterministic.py')} --target <TARGET> --authorized --preflight-only
+{p('orchestratorAgentic.py')} --target <TARGET> --authorized --preflight-only
+{p('orchestratorDeterministic.py')} --list-tools
+{p('orchestratorDeterministic.py')} --target <TARGET> --cookies "<COOKIE_HEADER>" --authorized --tool zap --mode deep --tool-timeout 480
+{p('orchestratorDeterministic.py')} --target <TARGET> --cookies "<COOKIE_HEADER>" --authorized --tool sqlmap --tool-url <URL> --method GET --parameters "id,query" --tool-timeout 180
+{p('orchestratorDeterministic.py')} --target <TARGET> --authorized --tool jwt --jwt-token "<JWT>"
+
+5. PROFILI
+----------
+fast      controllo rapido e budget ridotti
+balanced  copertura ampia con priorità ai controlli importanti
+deep      più target, richieste e budget per ZAP/Nuclei/strumenti parametrizzati
+
+6. OPZIONI INIT
+---------------
+--with-lab --run --model --mode --skip-scanners --skip-preflight
+--commands-only --version
+
+7. NUCLEI
+---------
+nuclei -update
+nuclei -update-templates
+{count_templates}
+
+Le pipeline passano a Nuclei anche i request contract GET parametrizzati,
+same-origin e non distruttivi per una fase DAST limitata, oltre ai template
+normali per CVE, esposizioni e misconfigurazioni.
+
+8. REPORT
+---------
+Deterministic: {report_prefix}SecOps_Assessment_<timestamp>.pdf/.html/.json
+Agentic:       {report_prefix}SecOps_Agentic_Assessment_<timestamp>.pdf/.html/.json
+
+NOTA SHELL
+----------
+{shell_note}
+"""
 
 
 def write_command_reference() -> Path:
@@ -1560,9 +1763,9 @@ def print_command_reference(path: Path) -> None:
 
 
 def _operator_command(script: str, *arguments: str) -> str:
-    """Return a copy/paste-safe one-line PowerShell command."""
-    values = ["python", f".\\{script}", *arguments]
-    return subprocess.list2cmdline(values)
+    """Return a copy/paste-safe command for PowerShell or a POSIX shell."""
+    values = [sys.executable, str(ROOT / script), *arguments]
+    return subprocess.list2cmdline(values) if os.name == "nt" else shlex.join(values)
 
 
 def print_important_commands(

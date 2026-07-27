@@ -1,0 +1,93 @@
+{
+  "schema_version": 3,
+  "generated_at": "2026-07-27T11:22:59.651193+00:00",
+  "project_root": "S:\\Cybersecurity_AgenticAI",
+  "python_executable": "C:\\Users\\tommy\\AppData\\Local\\Microsoft\\WindowsApps\\PythonSoftwareFoundation.Python.3.13_qbz5n2kfra8p0\\python.exe",
+  "platform": "Windows-10-10.0.19045-SP0",
+  "machine": "AMD64",
+  "tool_directories": [
+    "C:\\Users\\tommy\\.local\\bin",
+    "C:\\Users\\tommy\\AppData\\Local\\Packages\\PythonSoftwareFoundation.Python.3.13_qbz5n2kfra8p0\\LocalCache\\local-packages\\Python313\\Scripts",
+    "C:\\Users\\tommy\\AppData\\Local\\Microsoft\\WindowsApps\\PythonSoftwareFoundation.Python.3.13_qbz5n2kfra8p0"
+  ],
+  "executables": {
+    "nuclei": "C:\\Users\\tommy\\.local\\bin\\nuclei.exe",
+    "nikto": "C:\\Users\\tommy\\.local\\bin\\nikto.bat",
+    "ffuf": "C:\\Users\\tommy\\.local\\bin\\ffuf.exe",
+    "dalfox": "C:\\Users\\tommy\\.local\\bin\\dalfox.exe",
+    "commix": "C:\\Users\\tommy\\.local\\bin\\commix.bat",
+    "sqlmap": "C:\\Users\\tommy\\.local\\bin\\sqlmap.bat",
+    "arjun": "C:\\Users\\tommy\\AppData\\Local\\Packages\\PythonSoftwareFoundation.Python.3.13_qbz5n2kfra8p0\\LocalCache\\local-packages\\Python313\\Scripts\\arjun.exe",
+    "interactsh-client": "C:\\Users\\tommy\\.local\\bin\\interactsh-client.exe"
+  },
+  "nikto_perl": "",
+  "nikto_script": "C:\\Users\\tommy\\.local\\opt\\nikto\\program\\nikto.pl",
+  "nikto_image": "ghcr.io/sullo/nikto:latest",
+  "nikto_execution_mode": "docker_official_image",
+  "nuclei_templates": {
+    "count": 13412,
+    "count_before_update": 13412,
+    "minimum_expected": 1000,
+    "sufficient": true,
+    "update_returncode": 0,
+    "update_output_excerpt": "\n\n                     __     _\n   ____  __  _______/ /__  (_)\n  / __ \\/ / / / ___/ / _ \\/ /\n / / / / /_/ / /__/ /  __/ /\n/_/ /_/\\__,_/\\___/_/\\___/_/   v3.11.0\n\n\t\tprojectdiscovery.io\n\n[\u001b[34mINF\u001b[0m] No new updates found for nuclei templates\n",
+    "fallback_used": false,
+    "directory": "C:\\Users\\tommy\\nuclei-templates",
+    "directories": [
+      "C:\\Users\\tommy\\nuclei-templates"
+    ],
+    "filesystem_candidates": [
+      {
+        "directory": "C:\\Users\\tommy\\nuclei-templates",
+        "count": 13412
+      }
+    ],
+    "list_probe_excerpt": "2.yaml\nssl\\c2\\gozi-malware-c2.yaml\nssl\\c2\\havoc-c2.yaml\nssl\\c2\\icedid.yaml\nssl\\c2\\metasploit-c2.yaml\nssl\\c2\\mythic-c2-ssl.yaml\nssl\\c2\\onimai-rat-c2.yaml\nssl\\c2\\orcus-rat-c2.yaml\nssl\\c2\\posh-c2.yaml\nssl\\c2\\quasar-rat-c2.yaml\nssl\\c2\\shadowpad-c2.yaml\nssl\\c2\\sliver-c2.yaml\nssl\\c2\\venomrat.yaml\nssl\\deprecated-tls.yaml\nssl\\detect-ssl-issuer.yaml\nssl\\expired-ssl.yaml\nssl\\fortinet\\fortianalyzer-certificate.yaml\nssl\\fortinet\\fortiauthenticator-certificate.yaml\nssl\\fortinet\\fortiddos-certificate.yaml\nssl\\fortinet\\fortigate-certificate.yaml\nssl\\fortinet\\fortimanager-certificate.yaml\nssl\\fortinet\\fortiswitch-certificate.yaml\nssl\\fortinet\\fortiweb-certificate.yaml\nssl\\fortinet\\fortiwifi-certificate.yaml\nssl\\insecure-cipher-suite-detect.yaml\nssl\\kubernetes-fake-certificate.yaml\nssl\\mismatched-ssl-certificate.yaml\nssl\\revoked-ssl-certificate.yaml\nssl\\self-signed-ssl.yaml\nssl\\ssl-dns-names.yaml\nssl\\tls-version.yaml\nssl\\untrusted-root-certificate.yaml\nssl\\weak-cipher-suites.yaml\nssl\\wildcard-tls.yaml\n",
+    "engine": {
+      "update_returncode": 0,
+      "version_before": "[\u001b[34mINF\u001b[0m] Nuclei Engine Version: v3.11.0\n[\u001b[34mINF\u001b[0m] Nuclei Config Directory: C:\\Users\\tommy\\AppData\\Roaming\\nuclei\n[\u001b[34mINF\u001b[0m] Nuclei Cache Directory: C:\\Users\\tommy\\AppData\\Local\\nuclei\n[\u001b[34mINF\u001b[0m] PDCP Directory: C:\\Users\\tommy\\.pdcp",
+      "version_after": "[\u001b[34mINF\u001b[0m] Nuclei Engine Version: v3.11.0\n[\u001b[34mINF\u001b[0m] Nuclei Config Directory: C:\\Users\\tommy\\AppData\\Roaming\\nuclei\n[\u001b[34mINF\u001b[0m] Nuclei Cache Directory: C:\\Users\\tommy\\AppData\\Local\\nuclei\n[\u001b[34mINF\u001b[0m] PDCP Directory: C:\\Users\\tommy\\.pdcp",
+      "update_output_excerpt": "__     _\n   ____  __  _______/ /__  (_)\n  / __ \\/ / / / ___/ / _ \\/ /\n / / / / /_/ / /__/ /  __/ /\n/_/ /_/\\__,_/\\___/_/\\___/_/   v3.11.0\n\n\t\tprojectdiscovery.io\n\n[\u001b[34mINF\u001b[0m] nuclei is already updated to latest version"
+    }
+  },
+  "last_auth_target": "http://127.0.0.1",
+  "last_auth_cookie": "PHPSESSID=5o65e3p523pnb9d18gi407e3v2; security=low",
+  "last_auth_generated_at": "2026-07-27T11:23:59.523094+00:00",
+  "target_profiles": {
+    "http://127.0.0.1:80": {
+      "target_url": "http://127.0.0.1",
+      "label": "bundled-local-training-lab",
+      "container_route": {
+        "scanner_container": "zap_mcp",
+        "target_container": "dvwa",
+        "alias": "dvwa",
+        "network": "secops-net",
+        "internal_port": 80
+      },
+      "pre_scan_requests": [
+        {
+          "method": "GET",
+          "path": "/security.php?phpids=off",
+          "accepted_statuses": [
+            200,
+            302
+          ]
+        }
+      ],
+      "excluded_query_keys": [
+        "phpids",
+        "security",
+        "seclev_submit",
+        "test"
+      ],
+      "probe_paths": [
+        "/security.php",
+        "/",
+        "/index.php"
+      ],
+      "preferred_probe_paths": [
+        "/security.php"
+      ]
+    }
+  }
+}
