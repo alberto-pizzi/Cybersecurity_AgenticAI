@@ -41,7 +41,7 @@ DEFAULT_MODEL = "llama3.1:8b"
 NUCLEI_TEMPLATE_MINIMUM = 1000
 NUCLEI_TEMPLATE_UPDATE_TIMEOUT = 600
 _NUCLEI_TEMPLATE_STATE: dict[str, Any] = {}
-BUILD_ID = "secops-init-resilient-v31.4.3-powershell-installer-parser-fix-20260727"
+BUILD_ID = "secops-init-resilient-v31.5-async-browser-adaptive-nuclei-quality-20260728"
 
 PYTHON_PACKAGES = (
     "fastmcp==2.12.5", "langgraph>=0.6,<2", "requests>=2.32,<3",

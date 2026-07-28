@@ -7,7 +7,7 @@ import re
 import sys
 from difflib import SequenceMatcher
 from typing import Any
-from urllib.parse import urljoin, urlparse
+from urllib.parse import parse_qsl, urljoin, urlparse
 
 import requests
 from fastmcp import FastMCP
@@ -21,6 +21,43 @@ DESTRUCTIVE_RE = re.compile(
     re.I,
 )
 
+
+
+PUBLIC_CONTENT_RE = re.compile(
+    r"(?:^|/)(?:docs?|documentation|instructions?|help|about|changelog|license|copying|readme|static|assets?)(?:/|$)",
+    re.I,
+)
+AUTHZ_PATH_RE = re.compile(
+    r"(?:^|/)(?:admin|accounts?|profiles?|users?|members?|orders?|invoices?|documents?|downloads?|reports?|records?|settings|manage(?:ment)?|roles?|permissions?|api|private|internal|dashboard|billing|payments?)(?:/|$)",
+    re.I,
+)
+AUTHZ_PARAMETER_RE = re.compile(
+    r"^(?:id|uid|user_id|userid|account_id|member_id|profile_id|order_id|invoice_id|document_id|record_id|file_id|report_id|customer_id|owner_id|tenant_id|role_id)$",
+    re.I,
+)
+
+
+def _authorization_relevance(target_url: str, parameters: list[str] | None) -> tuple[int, list[str]]:
+    parsed = urlparse(target_url)
+    reasons: list[str] = []
+    score = 0
+    if PUBLIC_CONTENT_RE.search(parsed.path):
+        reasons.append("public-content-path")
+        score -= 100
+    if AUTHZ_PATH_RE.search(parsed.path):
+        reasons.append("authorization-sensitive-path")
+        score += 45
+    pairs = parse_qsl(parsed.query, keep_blank_values=True)
+    names = {str(value).lower() for value in (parameters or []) if str(value)}
+    names.update(name.lower() for name, _ in pairs)
+    auth_names = sorted(name for name in names if AUTHZ_PARAMETER_RE.fullmatch(name))
+    if auth_names:
+        reasons.append("object-identifier-parameter=" + ",".join(auth_names))
+        score += 35 + 8 * len(auth_names)
+    if any(value.isdigit() and AUTHZ_PARAMETER_RE.fullmatch(name) for name, value in pairs):
+        reasons.append("numeric-object-reference")
+        score += 25
+    return score, reasons
 
 def _same_origin(left: str, right: str) -> bool:
     a, b = urlparse(left), urlparse(right)
@@ -200,6 +237,16 @@ def run_authorization_scan(
             "Destructive logout, setup, reset or deletion routes are excluded.",
         )
     timeout = max(5, min(int(timeout), 60))
+    relevance_score, relevance_reasons = _authorization_relevance(target_url, parameters)
+    if relevance_score <= 0 and not secondary_cookies:
+        return skipped(
+            "Authorization Differential Verifier",
+            target_url,
+            "The request resembles public/static documentation and has no object or identity reference suitable for an authorization differential.",
+            diagnosis="authorization_candidate_not_relevant",
+            relevance_score=relevance_score,
+            relevance_reasons=relevance_reasons,
+        )
     try:
         primary, primary_guard = _safe_get(target_url, cookies, timeout)
         anonymous, anonymous_guard = _safe_get(target_url, "", timeout)
@@ -240,6 +287,8 @@ def run_authorization_scan(
         "primary": _summary(primary, primary_guard),
         "anonymous": _summary(anonymous, anonymous_guard),
         "secondary_supplied": bool(secondary_cookies),
+        "relevance_score": relevance_score,
+        "relevance_reasons": relevance_reasons,
     }
     if anonymous is not None:
         accepted, similarity, length_ratio = _matching_access(primary, anonymous)
@@ -248,7 +297,7 @@ def run_authorization_scan(
             "similarity": round(similarity, 4),
             "length_ratio": round(length_ratio, 4),
         }
-        if accepted:
+        if accepted and relevance_score > 0:
             findings.append(_finding(
                 target_url, "anonymous", primary, anonymous, similarity, length_ratio
             ))

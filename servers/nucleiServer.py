@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qsl, urlparse
 
+import requests
 from fastmcp import FastMCP
 
 from utils import failure, partial, read_json_lines, run_process, success
@@ -24,13 +25,36 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 EXCLUDED_TAGS = "dos,fuzz,creds-stuffing,token-spray"
 DAST_EXCLUDED_TAGS = "dos,creds-stuffing,token-spray"
 HIGH_IMPACT_TAGS = (
-    "rce,sqli,xss,auth-bypass,lfi,rfi,ssrf,xxe,deserialization,"
-    "cmdi,code-injection,ssti,path-traversal,default-login,cve"
+    "rce,auth-bypass,ssrf,xxe,deserialization,ssti,default-login,takeover"
 )
 EXPOSURE_TAGS = (
-    "misconfig,exposure,default-login,panel,backup,config,debug,api,"
-    "swagger,graphql,token,secret,files,open-redirect,takeover"
+    "misconfig,exposure,default-login,panel,backup,config,debug,"
+    "swagger,graphql,takeover"
 )
+SPECIALIST_COVERED_TAGS = "sqli,xss,cmdi,lfi,rfi,path-traversal,fuzz"
+DAST_FOCUSED_TAGS = "ssrf,xxe,ssti,deserialization,code-injection,auth-bypass"
+TECHNOLOGY_MARKERS: dict[str, tuple[str, ...]] = {
+    "php": ("x-powered-by: php", "<?php", ".php"),
+    "apache": ("server: apache",),
+    "nginx": ("server: nginx",),
+    "wordpress": ("wp-content", "wp-includes"),
+    "drupal": ("drupal-settings-json", "sites/default"),
+    "joomla": ("joomla", "com_content"),
+    "laravel": ("laravel_session", "x-powered-by: laravel"),
+    "django": ("csrftoken", "django"),
+    "flask": ("werkzeug", "flask"),
+    "express": ("x-powered-by: express",),
+    "nodejs": ("x-powered-by: express", "node.js"),
+    "springboot": ("whitelabel error page", "spring boot"),
+    "tomcat": ("server: apache-coyote", "apache tomcat"),
+    "aspnet": ("x-aspnet-version", "asp.net"),
+    "graphql": ("graphql",),
+    "swagger": ("swagger-ui", "openapi"),
+    "jenkins": ("x-jenkins", "jenkins"),
+    "grafana": ("grafana",),
+    "kibana": ("kbn-name", "kibana"),
+    "phpmyadmin": ("phpmyadmin",),
+}
 MIN_EXPECTED_TEMPLATE_COUNT = 1000
 
 
@@ -117,6 +141,78 @@ def _deduplicate(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
 
 
+def _fingerprint_targets(target_url: str, cookies: str, seed_urls: list[str] | None) -> dict[str, Any]:
+    candidates = [target_url]
+    for value in seed_urls or []:
+        if isinstance(value, str) and value.startswith(("http://", "https://")) and _same_origin_url(target_url, value):
+            candidates.append(value)
+    selected = list(dict.fromkeys(candidates))[:3]
+    headers: dict[str, str] = {}
+    body_parts: list[str] = []
+    observed: list[dict[str, Any]] = []
+    request_headers = {"User-Agent": "SecOps-Nuclei-Fingerprint/1.0", "Accept": "text/html,application/json,*/*;q=0.5"}
+    if cookies:
+        request_headers["Cookie"] = cookies
+    for url in selected:
+        try:
+            response = requests.get(url, headers=request_headers, timeout=(3, 8), allow_redirects=True)
+        except requests.RequestException as exc:
+            observed.append({"url": url, "error": f"{type(exc).__name__}: {exc}"})
+            continue
+        for key, value in response.headers.items():
+            headers[key.lower()] = str(value)
+        body_parts.append(response.text[:60_000].lower())
+        observed.append({
+            "url": url,
+            "status": response.status_code,
+            "final_url": str(response.url),
+            "server": str(response.headers.get("Server") or ""),
+            "powered_by": str(response.headers.get("X-Powered-By") or ""),
+        })
+    haystack = "\n".join([*(f"{key}: {value}".lower() for key, value in headers.items()), *body_parts])
+    tags = [tag for tag, markers in TECHNOLOGY_MARKERS.items() if any(marker in haystack for marker in markers)]
+    return {
+        "tags": sorted(set(tags)),
+        "headers": headers,
+        "observed": observed,
+        "known": bool(tags),
+    }
+
+
+def _dast_specialist_gap_score(case: dict[str, Any]) -> int:
+    url = str(case.get("url") or case.get("target_url") or "")
+    parsed = urlparse(url)
+    method = str(case.get("method") or "GET").upper()
+    names = {str(value).lower() for value in case.get("parameters", []) if str(value)}
+    names.update(name.lower() for name, _ in parse_qsl(parsed.query, keep_blank_values=True))
+    if method == "POST":
+        names.update(name.lower() for name, _ in parse_qsl(str(case.get("data") or ""), keep_blank_values=True))
+    path = parsed.path.lower()
+    weights = {
+        "url": 35, "uri": 35, "host": 35, "hostname": 35, "domain": 30,
+        "callback": 45, "webhook": 45, "endpoint": 28, "target": 22,
+        "redirect": 18, "next": 14, "return": 14, "fetch": 40, "proxy": 35,
+        "xml": 45, "soap": 35, "template": 35, "view": 18, "engine": 30,
+        "object": 22, "serialized": 45, "data": 10, "payload": 18,
+    }
+    score = sum(weight for name, weight in weights.items() if name in names)
+    if any(token in path for token in ("ssrf", "xxe", "xml", "soap", "template", "render", "deserialize", "callback", "webhook", "fetch", "proxy")):
+        score += 70
+    return score
+
+
+def _focused_dast_request_cases(
+    target_url: str,
+    request_cases: list[dict[str, Any]] | None,
+    limit: int,
+) -> list[dict[str, Any]]:
+    candidates = _dast_request_cases(target_url, request_cases, limit=30)
+    ranked = [dict(item, specialist_gap_score=_dast_specialist_gap_score(item)) for item in candidates]
+    ranked = [item for item in ranked if int(item.get("specialist_gap_score", 0)) > 0]
+    ranked.sort(key=lambda item: (-int(item.get("specialist_gap_score", 0)), -int(item.get("priority_score", 0)), str(item.get("url") or "")))
+    return ranked[: max(0, min(int(limit), 4))]
+
+
 def _command(
     target_url: str,
     cookies: str,
@@ -136,6 +232,7 @@ def _command(
     request_timeout: int = 5,
     retries: int = 1,
     template_dir: str = "",
+    excluded_tags: str = "",
 ) -> list[str]:
     input_args = (
         ["-l", str(target_list), *(["-im", input_mode] if input_mode else [])]
@@ -167,7 +264,7 @@ def _command(
                 "-fa", fuzz_aggression if fuzz_aggression in {"low", "medium", "high"} else "medium",
             ])
     if not compatibility:
-        excluded = DAST_EXCLUDED_TAGS if dast else EXCLUDED_TAGS
+        excluded = excluded_tags or (DAST_EXCLUDED_TAGS if dast else EXCLUDED_TAGS)
         command.extend(["-pt", "http", "-etags", excluded, "-fhr"])
     if cookies:
         command.extend(["-H", f"Cookie: {cookies}"])
@@ -373,6 +470,8 @@ def _run_phase(
     request_timeout: int = 5,
     retries: int = 1,
     template_dir: str = "",
+    excluded_tags: str = "",
+    target_scope: str = "focused",
 ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     def execute(*, compatibility: bool) -> dict[str, Any]:
         return run_process(
@@ -395,6 +494,7 @@ def _run_phase(
                 request_timeout=request_timeout,
                 retries=retries,
                 template_dir=template_dir,
+                excluded_tags=excluded_tags,
             ),
             target=target_url,
             timeout=timeout,
@@ -433,6 +533,8 @@ def _run_phase(
         input_mode=input_mode,
         fuzz_aggression=fuzz_aggression if dast else "",
         fuzz_param_frequency=fuzz_param_frequency if dast else 0,
+        excluded_tags=excluded_tags,
+        target_scope=target_scope,
     )
     return result, items
 
@@ -443,91 +545,76 @@ def _phase_definitions(
     scan_profile: str,
     total_timeout: int,
     has_dast_targets: bool = False,
+    technology_tags: list[str] | None = None,
 ) -> list[dict[str, Any]]:
-    """Allocate the bounded budget to the phases most likely to finish usefully.
+    """Build a small adaptive Nuclei plan that complements specialist scanners.
 
-    The previous deep order started with the largest DAST phase, so every phase
-    could reach its own limit without one concise exposure/technology pass ever
-    finishing. Static exposure and high-impact phases now run first; DAST is
-    restricted to ranked request contracts and still receives the largest
-    single share when applicable.
+    The automatic pipeline no longer launches the complete HTTP and DAST packs.
+    It fingerprints the target, checks concise exposure/high-impact groups, and
+    only uses DAST for SSRF/XXE/SSTI/deserialization-style gaps not already
+    covered by SQLMap, Dalfox, Commix, traversal and ZAP.
     """
-    usable = max(24, total_timeout - 12)
-
-    exposure_phase = {
-        "name": "exposures_and_misconfigurations",
-        "severities": "info,low,medium,high,critical",
-        "tags": EXPOSURE_TAGS,
-    }
-    high_phase = {
-        "name": "critical_high_value",
-        "severities": "medium,high,critical",
-        "tags": HIGH_IMPACT_TAGS,
-    }
-    automatic_phase = {
-        "name": "technology_automatic_scan",
-        "severities": "low,medium,high,critical",
-        "tags": "",
-        "automatic_scan": True,
-    }
-    dast_phase = {
-        "name": "parameterized_dast",
-        "severities": "medium,high,critical",
-        "tags": "",
-        "dast": True,
-    }
-    broad_phase = {
-        "name": "broad_safe_http_templates",
-        "severities": "low,medium,high,critical",
-        "tags": "",
-    }
-
+    technology_tags = sorted(set(str(value).strip().lower() for value in (technology_tags or []) if str(value).strip()))
     if scan_profile == "fast":
-        phases = [exposure_phase, high_phase]
-        weights = [0.45, 0.55]
-        if has_dast_targets:
-            phases.append(dast_phase)
-            weights = [0.25, 0.30, 0.45]
+        desired = {"exposure": 35, "high": 45, "technology": 35, "dast": 50}
     elif scan_profile == "balanced":
-        phases = [exposure_phase, high_phase, automatic_phase]
-        weights = [0.25, 0.35, 0.15]
-        if has_dast_targets:
-            phases.append(dast_phase)
-            weights.append(0.25)
+        desired = {"exposure": 50, "high": 65, "technology": 50, "dast": 70}
     else:
-        phases = [exposure_phase, high_phase, automatic_phase]
-        weights = [0.18, 0.24, 0.10]
-        if has_dast_targets:
-            phases.append(dast_phase)
-            weights.append(0.34)
-        phases.append(broad_phase)
-        weights.append(0.14)
+        desired = {"exposure": 65, "high": 85, "technology": 70, "dast": 90}
 
-    max_phases = max(1, usable // 12)
-    phases = phases[:max_phases]
-    weights = weights[:len(phases)]
-    weight_total = sum(weights) or 1.0
-    normalized = [value / weight_total for value in weights]
+    phases: list[dict[str, Any]] = [
+        {
+            "name": "focused_exposures_and_misconfigurations",
+            "severities": "info,low,medium,high,critical",
+            "tags": EXPOSURE_TAGS,
+            "timeout": desired["exposure"],
+            "target_scope": "focused",
+            "excluded_tags": EXCLUDED_TAGS,
+        },
+        {
+            "name": "focused_high_impact_templates",
+            "severities": "medium,high,critical",
+            "tags": HIGH_IMPACT_TAGS,
+            "timeout": desired["high"],
+            "target_scope": "base",
+            "excluded_tags": EXCLUDED_TAGS + "," + SPECIALIST_COVERED_TAGS,
+        },
+    ]
+    if technology_tags:
+        phases.append({
+            "name": "fingerprint_relevant_templates",
+            "severities": "low,medium,high,critical",
+            "tags": ",".join(technology_tags),
+            "timeout": desired["technology"],
+            "target_scope": "base",
+            "excluded_tags": EXCLUDED_TAGS + "," + SPECIALIST_COVERED_TAGS,
+        })
+    if has_dast_targets:
+        phases.append({
+            "name": "specialist_gap_dast",
+            "severities": "medium,high,critical",
+            "tags": DAST_FOCUSED_TAGS,
+            "dast": True,
+            "timeout": desired["dast"],
+            "target_scope": "dast",
+            "excluded_tags": DAST_EXCLUDED_TAGS + "," + SPECIALIST_COVERED_TAGS,
+        })
 
-    budgets: list[int] = []
-    remaining = usable
-    for index, weight in enumerate(normalized):
-        if index == len(normalized) - 1:
-            value = remaining
-        else:
-            future = len(normalized) - index - 1
-            value = max(8, int(round(usable * weight)))
-            value = min(value, remaining - 8 * future)
-        budgets.append(value)
-        remaining -= value
-
-    definitions: list[dict[str, Any]] = []
-    for phase, budget in zip(phases, budgets):
-        item = dict(phase)
-        item["timeout"] = max(8, budget)
-        definitions.append(item)
-    return definitions
-
+    usable = max(30, int(total_timeout) - 12)
+    requested = sum(int(item["timeout"]) for item in phases)
+    if requested > usable:
+        scale = usable / requested
+        remaining = usable
+        for index, item in enumerate(phases):
+            if index == len(phases) - 1:
+                value = remaining
+            else:
+                future = len(phases) - index - 1
+                value = max(12, int(round(int(item["timeout"]) * scale)))
+                value = min(value, remaining - 12 * future)
+            item["timeout"] = value
+            remaining -= value
+    return phases
 
 
 _STATE_CHANGING_KEYS = {
@@ -722,7 +809,7 @@ def _run_nuclei_core(
     scan_profile: str = "balanced",
     request_cases: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
-    """Run official template phases plus bounded DAST on discovered GET contracts."""
+    """Run adaptive fingerprint-driven template phases and specialist-gap DAST."""
     scan_profile = str(scan_profile or "balanced").lower()
     if scan_profile not in {"fast", "balanced", "deep"}:
         return failure("Nuclei", target_url, "scan_profile must be fast, balanced, or deep.")
@@ -769,7 +856,8 @@ def _run_nuclei_core(
             score += 20
         return score
 
-    max_targets = max(1, min(int(max_targets), 20))
+    profile_target_cap = 1 if scan_profile == "fast" else 2
+    max_targets = max(1, min(int(max_targets), profile_target_cap))
     seed_candidates = [
         value for value in (seed_urls or [])
         if isinstance(value, str)
@@ -781,48 +869,57 @@ def _run_nuclei_core(
     focused_targets = [target_url, *ranked_seeds[: max(0, max_targets - 1)]]
     target_list = work_dir / f"{prefix}-targets.txt"
     target_list.write_text("\n".join(focused_targets) + "\n", encoding="utf-8")
+    base_target_list = work_dir / f"{prefix}-base-target.txt"
+    base_target_list.write_text(target_url + "\n", encoding="utf-8")
 
-    dast_cases = _dast_request_cases(
+    fingerprint = _fingerprint_targets(target_url, cookies, focused_targets)
+    dast_cases = _focused_dast_request_cases(
         target_url,
         request_cases,
-        limit=10 if scan_profile == "deep" else 6 if scan_profile == "balanced" else 3,
+        limit=3 if scan_profile == "deep" else 2 if scan_profile == "balanced" else 1,
     )
-    dast_targets = _dast_target_urls(
-        target_url,
-        request_cases,
-        limit=10 if scan_profile == "deep" else 6,
-    )
+    dast_targets = [
+        str(item.get("url") or "")
+        for item in dast_cases
+        if str(item.get("method") or "GET").upper() == "GET"
+    ]
     dast_target_list = work_dir / f"{prefix}-dast-targets.txt"
     if dast_targets:
         dast_target_list.write_text("\n".join(dast_targets) + "\n", encoding="utf-8")
     dast_request_log = work_dir / f"{prefix}-dast-requests.jsonl"
     dast_request_count = _write_proxify_jsonl(dast_request_log, dast_cases, cookies) if dast_cases else 0
 
-    definitions = _phase_definitions(scan_profile, timeout, bool(dast_cases or dast_targets))
+    definitions = _phase_definitions(
+        scan_profile, timeout, bool(dast_cases or dast_targets),
+        technology_tags=list(fingerprint.get("tags") or []),
+    )
     phase_paths = [work_dir / f"{prefix}-{index + 1}.jsonl" for index in range(len(definitions))]
     for phase_path in phase_paths:
         phase_path.unlink(missing_ok=True)
 
     if scan_profile == "deep":
-        concurrency, rate_limit, request_timeout, retries = 40, 160, 5, 1
-        fuzz_aggression, fuzz_frequency = "high", 22
+        concurrency, rate_limit, request_timeout, retries = 24, 100, 5, 1
+        fuzz_aggression, fuzz_frequency = "medium", 18
     elif scan_profile == "balanced":
-        concurrency, rate_limit, request_timeout, retries = 30, 120, 4, 1
-        fuzz_aggression, fuzz_frequency = "medium", 20
+        concurrency, rate_limit, request_timeout, retries = 18, 75, 4, 1
+        fuzz_aggression, fuzz_frequency = "medium", 16
     else:
-        concurrency, rate_limit, request_timeout, retries = 16, 60, 3, 0
-        fuzz_aggression, fuzz_frequency = "low", 15
+        concurrency, rate_limit, request_timeout, retries = 10, 40, 3, 0
+        fuzz_aggression, fuzz_frequency = "low", 12
 
     phases: list[dict[str, Any]] = []
     all_items: list[dict[str, Any]] = []
     try:
         for phase_path, definition in zip(phase_paths, definitions):
             is_dast = bool(definition.get("dast"))
+            target_scope = str(definition.get("target_scope") or "focused")
             phase_target_list = (
                 dast_request_log
                 if is_dast and dast_request_count
                 else dast_target_list
                 if is_dast
+                else base_target_list
+                if target_scope == "base"
                 else target_list
             )
             input_mode = "jsonl" if is_dast and dast_request_count else ""
@@ -909,6 +1006,8 @@ def _run_nuclei_core(
                 "fuzz_aggression": phase.get("fuzz_aggression", ""),
                 "fuzz_param_frequency": phase.get("fuzz_param_frequency", 0),
                 "request_log_fallback": phase.get("request_log_fallback", False),
+                "target_scope": phase.get("target_scope", ""),
+                "excluded_tags": phase.get("excluded_tags", ""),
                 "stderr_excerpt": str(phase.get("stderr", ""))[-1200:],
             }
             for phase in phases
@@ -920,8 +1019,9 @@ def _run_nuclei_core(
             "scan_profile": scan_profile,
             "scan_scope": (
                 f"Official template inventory={inventory.get('count')}; profile={scan_profile}; "
-                f"static_targets={len(focused_targets)}; dast_request_cases={len(dast_cases)}; "
-                f"dast_get_targets={len(dast_targets)}; dast_templates={inventory.get('dast_count', 0)}; "
+                f"static_targets={len(focused_targets)}; technology_tags={','.join(fingerprint.get('tags') or []) or 'none'}; "
+                f"dast_request_cases={len(dast_cases)}; dast_get_targets={len(dast_targets)}; "
+                f"dast_templates={inventory.get('dast_count', 0)}; "
                 f"phases={','.join(item['name'] for item in definitions)}; "
                 f"regular_excluded_tags={EXCLUDED_TAGS}; dast_excluded_tags={DAST_EXCLUDED_TAGS}."
             ),
@@ -938,6 +1038,7 @@ def _run_nuclei_core(
             "dast_request_count": dast_request_count,
             "dast_input_mode": "jsonl" if dast_request_count else "list",
             "dast_template_directory": dast_template_dir,
+            "technology_fingerprint": fingerprint,
             "template_inventory": inventory,
             "template_refresh": refresh_result,
             "hard_failure": bool(hard_failures),
@@ -960,7 +1061,7 @@ def _run_nuclei_core(
             return partial(
                 "Nuclei",
                 target_url,
-                f"Prioritized {scan_profile} Nuclei scan ended with incomplete coverage. Findings preserved: {len(findings)}.",
+                f"Adaptive {scan_profile} Nuclei scan ended with incomplete coverage. Findings preserved: {len(findings)}.",
                 diagnosis="time_limit_reached" if limited and not hard_failures else "partial_scan",
                 timed_out=bool(limited),
                 time_limit_reached=bool(limited),
@@ -970,7 +1071,7 @@ def _run_nuclei_core(
         return success(
             "Nuclei",
             target_url,
-            f"Prioritized {scan_profile} Nuclei scan completed. Findings: {len(findings)}.",
+            f"Adaptive {scan_profile} Nuclei scan completed. Findings: {len(findings)}.",
             timed_out=False,
             time_limit_reached=False,
             **common,
@@ -979,6 +1080,7 @@ def _run_nuclei_core(
         for phase_path in phase_paths:
             phase_path.unlink(missing_ok=True)
         target_list.unlink(missing_ok=True)
+        base_target_list.unlink(missing_ok=True)
         dast_target_list.unlink(missing_ok=True)
         dast_request_log.unlink(missing_ok=True)
         if temporary is not None:

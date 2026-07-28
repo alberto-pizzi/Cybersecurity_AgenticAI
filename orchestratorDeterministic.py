@@ -49,21 +49,21 @@ MAX_SCRIPT_ASSETS = max(4, int(os.getenv("SECOPS_MAX_SCRIPT_ASSETS", "24")))
 SCANNER_PROGRESS_INTERVAL = max(10, int(os.getenv("SECOPS_PROGRESS_INTERVAL", "30")))
 SCAN_MODES = {
     "fast": {
-        "broad": {"zap": 90, "nuclei": 45, "nikto": 45, "ffuf": 40, "exposure": 25, "session": 20},
+        "broad": {"zap": 90, "nuclei": 90, "nikto": 45, "ffuf": 40, "exposure": 25, "session": 20},
         "parameter": {"sqlmap": 60, "dalfox": 35, "commix": 40, "traversal": 25, "idor": 12, "authorization": 25, "browser": 35, "workflow": 30},
         "limits": {"sqlmap": 1, "dalfox": 1, "commix": 1, "traversal": 1, "idor": 1, "authorization": 1, "browser": 1, "workflow": 1},
         "arjun": 30,
         "arjun_limit": 1,
     },
     "balanced": {
-        "broad": {"zap": 360, "nuclei": 300, "nikto": 90, "ffuf": 75, "exposure": 45, "session": 35},
+        "broad": {"zap": 360, "nuclei": 210, "nikto": 90, "ffuf": 75, "exposure": 45, "session": 35},
         "parameter": {"sqlmap": 120, "dalfox": 90, "commix": 75, "traversal": 45, "idor": 20, "authorization": 40, "browser": 75, "workflow": 60},
         "limits": {"sqlmap": 3, "dalfox": 3, "commix": 1, "traversal": 2, "idor": 2, "authorization": 3, "browser": 2, "workflow": 3},
         "arjun": 75,
         "arjun_limit": 2,
     },
     "deep": {
-        "broad": {"zap": 900, "nuclei": 600, "nikto": 180, "ffuf": 120, "exposure": 75, "session": 50},
+        "broad": {"zap": 900, "nuclei": 360, "nikto": 180, "ffuf": 120, "exposure": 75, "session": 50},
         "parameter": {"sqlmap": 240, "dalfox": 180, "commix": 150, "traversal": 90, "idor": 45, "authorization": 60, "browser": 120, "workflow": 90},
         "limits": {"sqlmap": 5, "dalfox": 4, "commix": 2, "traversal": 3, "idor": 3, "authorization": 5, "browser": 4, "workflow": 5},
         "arjun": 90,
@@ -2060,7 +2060,7 @@ AUTHORIZATION_PATH_HINTS = {
 AUTHORIZATION_PARAMETER_HINTS = {
     "id", "uid", "user", "user_id", "userid", "account", "account_id",
     "member", "member_id", "profile", "profile_id", "order", "order_id",
-    "invoice", "invoice_id", "document", "document_id", "doc", "record",
+    "invoice", "invoice_id", "document", "document_id", "record",
     "record_id", "file", "file_id", "download", "report", "report_id",
     "customer", "customer_id", "owner", "owner_id", "tenant", "tenant_id",
     "role", "role_id",
@@ -2069,6 +2069,8 @@ AUTHORIZATION_EXCLUDED_PATH_HINTS = {
     "login", "signin", "sign-in", "logout", "signout", "logoff", "setup",
     "install", "reset", "delete", "remove", "drop", "truncate", "purge",
     "wipe", "csrf", "captcha", "xss", "sqli", "exec", "command",
+    "docs", "documentation", "instructions", "help", "about", "changelog",
+    "license", "copying", "readme", "static", "assets",
 }
 
 
@@ -2568,6 +2570,13 @@ def log_result(profile: str, name: str, result: dict[str, Any], target: str = ""
             f"{inventory.get('count', 0)}; dast={inventory.get('dast_count', 0)}; "
             f"directory={inventory.get('directory', '') or 'not-resolved'}"
         )
+        fingerprint = result.get("technology_fingerprint") if isinstance(result.get("technology_fingerprint"), dict) else {}
+        print(
+            "    [NUCLEI STRATEGY] adaptive=True; technologies="
+            f"{','.join(fingerprint.get('tags') or []) or 'unknown'}; "
+            f"dast_cases={result.get('dast_request_count', 0)}; "
+            "specialist-covered SQLi/XSS/CMDi/traversal templates deferred"
+        )
         phases = result.get("phases") if isinstance(result.get("phases"), list) else []
         for phase in phases:
             if not isinstance(phase, dict):
@@ -2577,7 +2586,8 @@ def log_result(profile: str, name: str, result: dict[str, Any], target: str = ""
                 f"{phase.get('name', 'unknown')}: status={phase.get('status', 'unknown')}; "
                 f"findings={phase.get('findings', 0)}; budget={phase.get('timeout_seconds', 0)}s; "
                 f"input={phase.get('input_mode') or 'list'}; "
-                f"aggression={phase.get('fuzz_aggression') or 'n/a'}"
+                f"aggression={phase.get('fuzz_aggression') or 'n/a'}; "
+                f"scope={phase.get('target_scope') or 'focused'}"
             )
         if not total:
             print(
@@ -3356,39 +3366,37 @@ def summarize_results(results: dict[str, Any]) -> tuple[int, int, int]:
 
 
 def print_security_finding_summary(results: dict[str, Any]) -> None:
-    confirmed: list[tuple[str, str, str, str, str]] = []
-    candidates: list[tuple[str, str, str, str, str]] = []
-    seen: set[tuple[str, str, str, str]] = set()
-    for _, tools in results.items():
-        if not isinstance(tools, dict):
-            continue
-        for _, result in iter_leaf_results(tools):
-            tool = str(result.get("tool") or "unknown")
-            for finding in result.get("vulnerabilities") or []:
-                if not isinstance(finding, dict):
-                    continue
-                category = str(finding.get("category") or ("observation" if str(finding.get("risk", "info")).lower() == "info" else "candidate")).lower()
-                if category not in {"vulnerability", "candidate"}:
-                    continue
-                item = (
-                    str(finding.get("alert") or "Unnamed finding"),
-                    str(finding.get("risk") or "info").upper(),
-                    tool,
-                    str(finding.get("url") or ""),
-                    str(finding.get("parameter") or "-"),
-                )
-                key = (item[0], item[2], item[3], item[4])
-                if key in seen:
-                    continue
-                seen.add(key)
-                (confirmed if category == "vulnerability" else candidates).append(item)
-    print("\n=== Security findings ===")
+    """Print the same semantically deduplicated findings used by the report."""
+    try:
+        from servers.pwndocServer import flatten_findings
+        rows = flatten_findings(results)
+    except Exception:
+        rows = []
+        for _, tools in results.items():
+            if not isinstance(tools, dict):
+                continue
+            for _, result in iter_leaf_results(tools):
+                tool = str(result.get("tool") or "unknown")
+                for finding in result.get("vulnerabilities") or []:
+                    if isinstance(finding, dict):
+                        rows.append({**finding, "tool": tool})
+    confirmed = [row for row in rows if str(row.get("category") or "").lower() == "vulnerability"]
+    candidates = [row for row in rows if str(row.get("category") or "").lower() == "candidate"]
+    print("\n=== Security findings (deduplicated) ===")
     print(f"[+] Confirmed vulnerabilities: {len(confirmed)}")
-    for index, (title, risk, tool, url, parameter) in enumerate(confirmed, 1):
-        print(f"    {index}. [{risk}] {title} - tool={tool}; parameter={parameter}; url={url}")
+    for index, row in enumerate(confirmed, 1):
+        print(
+            f"    {index}. [{str(row.get('risk') or 'info').upper()}] "
+            f"{row.get('alert') or 'Unnamed finding'} - tool={row.get('tool') or 'unknown'}; "
+            f"parameter={row.get('parameter') or '-'}; url={row.get('url') or ''}"
+        )
     print(f"[+] Candidates requiring validation: {len(candidates)}")
-    for index, (title, risk, tool, url, parameter) in enumerate(candidates, 1):
-        print(f"    {index}. [{risk}] {title} - tool={tool}; parameter={parameter}; url={url}")
+    for index, row in enumerate(candidates, 1):
+        print(
+            f"    {index}. [{str(row.get('risk') or 'info').upper()}] "
+            f"{row.get('alert') or 'Unnamed finding'} - tool={row.get('tool') or 'unknown'}; "
+            f"parameter={row.get('parameter') or '-'}; url={row.get('url') or ''}"
+        )
 
 
 

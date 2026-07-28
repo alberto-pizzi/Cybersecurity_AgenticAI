@@ -6,7 +6,7 @@ import re
 import sys
 from pathlib import Path
 from typing import Any
-from urllib.parse import parse_qsl, urljoin, urlparse
+from urllib.parse import parse_qsl, urlencode, urljoin, urlparse, urlunparse
 
 import requests
 from fastmcp import FastMCP
@@ -44,9 +44,11 @@ GIT_HEAD_RE = re.compile(r"^ref:\s+refs/heads/", re.I | re.M)
 ENV_LINE_RE = re.compile(r"(?m)^[A-Za-z_][A-Za-z0-9_]*\s*=\s*.+$")
 SECRET_REDACTIONS = (
     (re.compile(r"(?im)^\s*((?:db_|database_|mysql_|postgres_|redis_|smtp_)?(?:password|passwd|pass|secret|token|api_key|access_key|private_key|client_secret)\s*[=:]\s*)[^\r\n]+"), r"\1<redacted>"),
+    (re.compile(r"(?i)(\[\s*['\"]?(?:db_password|db_pass|database_password|db_user|db_username|api_key|secret_key|client_secret|private_key|token)['\"]?\s*\]\s*=\s*['\"])[^'\"]+"), r"\1<redacted>"),
     (re.compile(r"(?i)(authorization\s*:\s*bearer\s+)[A-Za-z0-9._~+/-]+"), r"\1<redacted>"),
     (re.compile(r"eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]*"), "<redacted-jwt>"),
 )
+AUTO_INDEX_QUERY_KEYS = {"c", "n", "m", "s", "d", "o"}
 
 
 def _same_origin(left: str, right: str) -> bool:
@@ -62,6 +64,37 @@ def _redact(text: str, limit: int = 2500) -> str:
         value = pattern.sub(replacement, value)
     return value
 
+
+
+
+def _canonical_resource_url(url: str) -> str:
+    parsed = urlparse(url)
+    pairs = parse_qsl(parsed.query, keep_blank_values=True)
+    query = "" if pairs and {name.lower() for name, _ in pairs} <= AUTO_INDEX_QUERY_KEYS else urlencode(pairs)
+    path = parsed.path or "/"
+    if path != "/":
+        path = path.rstrip("/")
+    return urlunparse((parsed.scheme.lower(), parsed.netloc.lower(), path, "", query, ""))
+
+
+def _deduplicate_findings(findings: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    merged: dict[tuple[str, str, str], dict[str, Any]] = {}
+    for finding in findings:
+        canonical = _canonical_resource_url(str(finding.get("url") or ""))
+        key = (str(finding.get("alert") or "").lower(), str(finding.get("category") or ""), canonical)
+        row = dict(finding)
+        row["url"] = canonical
+        existing = merged.get(key)
+        if existing is None:
+            row["affected_urls"] = [str(finding.get("url") or canonical)]
+            merged[key] = row
+            continue
+        urls = existing.setdefault("affected_urls", [existing.get("url", canonical)])
+        original = str(finding.get("url") or canonical)
+        if original not in urls:
+            urls.append(original)
+        existing["occurrence_count"] = int(existing.get("occurrence_count", 1)) + 1
+    return list(merged.values())
 
 def _candidate_score(url: str) -> int:
     parsed = urlparse(url)
@@ -164,7 +197,7 @@ def _finding_for_response(url: str, response: requests.Response, redirect_guard:
     backup_name = any(path.lower().endswith(suffix.lower()) for suffix in BACKUP_SUFFIXES)
     source_code = any(marker.lower() in lowered for marker in SOURCE_MARKERS)
     config_content = any(marker in lowered for marker in CONFIG_MARKERS)
-    sensitive_name = basename in {value.lower() for value in SENSITIVE_BASENAMES}
+    sensitive_name = basename in {value.lower() for value in SENSITIVE_BASENAMES} and basename != "phpinfo.php"
 
     if git_head:
         findings.append({
@@ -245,6 +278,13 @@ def run_exposure_scan(
     """Verify same-origin backup, source, configuration and directory-index exposures."""
     urls = [str(value) for value in (discovered_urls or []) if str(value).startswith(("http://", "https://"))]
     urls = [url for url in dict.fromkeys([target_url, *urls]) if _same_origin(target_url, url)]
+    canonical_candidates: dict[str, str] = {}
+    for value in urls:
+        canonical = _canonical_resource_url(value)
+        current = canonical_candidates.get(canonical)
+        if current is None or _candidate_score(value) > _candidate_score(current):
+            canonical_candidates[canonical] = value
+    urls = list(canonical_candidates.values())
     ranked = sorted(urls, key=lambda value: (_candidate_score(value), value), reverse=True)
     candidates = [url for url in ranked if _candidate_score(url) > 0][: max(1, min(int(max_urls), 100))]
     if not candidates:
@@ -280,8 +320,8 @@ def run_exposure_scan(
     return success(
         "Sensitive Exposure Verifier",
         target_url,
-        f"Verified {len(checked)} high-value discovered resource(s). Findings: {len(findings)}.",
-        vulnerabilities=findings,
+        f"Verified {len(checked)} high-value discovered resource(s). Findings: {len(_deduplicate_findings(findings))}.",
+        vulnerabilities=_deduplicate_findings(findings),
         checked_resources=checked,
         request_errors=errors,
         authenticated=bool(cookies),

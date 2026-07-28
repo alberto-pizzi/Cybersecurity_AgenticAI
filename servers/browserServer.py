@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
 import json
 import re
+import shutil
 import sys
 import time
 from typing import Any
@@ -46,7 +48,7 @@ def _browser_cookies(target_url: str, cookies: str) -> list[dict[str, Any]]:
     parsed = urlparse(target_url)
     rows: list[dict[str, Any]] = []
     for name, value in parse_cookie_header(cookies):
-        row: dict[str, Any] = {
+        rows.append({
             "name": name,
             "value": value,
             "domain": parsed.hostname or "localhost",
@@ -54,8 +56,7 @@ def _browser_cookies(target_url: str, cookies: str) -> list[dict[str, Any]]:
             "httpOnly": False,
             "secure": parsed.scheme == "https",
             "sameSite": "Lax",
-        }
-        rows.append(row)
+        })
     return rows
 
 
@@ -66,31 +67,36 @@ def _marker_payload(marker: str) -> str:
     )
 
 
-def _executed(page: Any, marker: str) -> bool:
+async def _executed(page: Any, marker: str) -> bool:
     try:
-        value = page.evaluate("document.documentElement.getAttribute('data-secops-browser-xss')")
+        value = await page.evaluate("document.documentElement.getAttribute('data-secops-browser-xss')")
         return str(value or "") == marker
     except Exception:
         return False
 
 
-def _reflection_present(page: Any, marker: str) -> bool:
+async def _reflection_present(page: Any, marker: str) -> bool:
     try:
-        return marker in str(page.content())
+        return marker in str(await page.content())
     except Exception:
         return False
 
 
-def _safe_goto(page: Any, url: str, timeout_ms: int) -> tuple[bool, str]:
+async def _safe_goto(page: Any, url: str, timeout_ms: int) -> tuple[bool, str]:
     try:
-        response = page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
-        page.wait_for_timeout(700)
+        response = await page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
+        await page.wait_for_timeout(700)
         return True, f"status={response.status if response else 'unknown'}"
     except Exception as exc:
         return False, f"{type(exc).__name__}: {exc}"
 
 
-def _dom_checks(page: Any, target_url: str, parameters: list[str], timeout_ms: int) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+async def _dom_checks(
+    page: Any,
+    target_url: str,
+    parameters: list[str],
+    timeout_ms: int,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     findings: list[dict[str, Any]] = []
     attempts: list[dict[str, Any]] = []
     candidates = [value for value in parameters if value and XSS_NAME_RE.search(value)] or list(parameters)
@@ -99,9 +105,9 @@ def _dom_checks(page: Any, target_url: str, parameters: list[str], timeout_ms: i
         marker = "SECOPS_DOM_" + re.sub(r"[^A-Za-z0-9]", "", parameter)[:12] + str(int(time.time() * 1000))[-6:]
         payload = _marker_payload(marker)
         mutated = _mutate_query(target_url, parameter, payload)
-        ok, detail = _safe_goto(page, mutated, timeout_ms)
-        executed = ok and _executed(page, marker)
-        reflected = ok and _reflection_present(page, marker)
+        ok, detail = await _safe_goto(page, mutated, timeout_ms)
+        executed = ok and await _executed(page, marker)
+        reflected = ok and await _reflection_present(page, marker)
         attempts.append({
             "mode": "query",
             "parameter": parameter,
@@ -147,16 +153,30 @@ def _dom_checks(page: Any, target_url: str, parameters: list[str], timeout_ms: i
                 "owasp_category": "A03:2021 Injection",
             })
 
-    # A location.hash probe covers client-side routers and DOM code that never sends the value to the server.
     marker = "SECOPS_HASH_" + str(int(time.time() * 1000))[-8:]
     payload = _marker_payload(marker)
-    fragment_url = target_url.split("#", 1)[0] + "#" + quote(payload, safe="<>/'\"=() -_:;")
-    ok, detail = _safe_goto(page, fragment_url, timeout_ms)
-    executed = ok and _executed(page, marker)
+    base_url = target_url.split("#", 1)[0]
+    fragment_url = base_url + "#" + quote(payload, safe="<>/'\"=() -_:;")
+    ok, detail = await _safe_goto(page, base_url, timeout_ms)
+    executed = False
+    reload_detail = "not-attempted"
+    if ok:
+        try:
+            await page.evaluate("payload => { window.location.hash = payload; }", payload)
+            await page.wait_for_timeout(700)
+            executed = await _executed(page, marker)
+            if not executed:
+                await page.reload(wait_until="domcontentloaded", timeout=timeout_ms)
+                await page.wait_for_timeout(700)
+                executed = await _executed(page, marker)
+                reload_detail = "completed"
+        except Exception as exc:
+            reload_detail = f"{type(exc).__name__}: {exc}"
     attempts.append({
         "mode": "fragment",
         "url": fragment_url,
         "navigation": detail,
+        "reload": reload_detail,
         "executed": executed,
     })
     if executed:
@@ -180,7 +200,7 @@ def _dom_checks(page: Any, target_url: str, parameters: list[str], timeout_ms: i
     return findings, attempts
 
 
-def _stored_check(
+async def _stored_check(
     page: Any,
     target_url: str,
     source_url: str,
@@ -191,9 +211,10 @@ def _stored_check(
     diagnostic: dict[str, Any] = {"attempted": False}
     findings: list[dict[str, Any]] = []
     if not allow_state_changes or DESTRUCTIVE_RE.search(urlparse(target_url).path):
+        diagnostic["reason"] = "state changes not authorized or route excluded"
         return findings, diagnostic
     start_url = source_url if source_url and _same_origin(target_url, source_url) else target_url
-    ok, detail = _safe_goto(page, start_url, timeout_ms)
+    ok, detail = await _safe_goto(page, start_url, timeout_ms)
     if not ok:
         diagnostic["navigation"] = detail
         return findings, diagnostic
@@ -201,10 +222,11 @@ def _stored_check(
     candidate_parameters = [value for value in parameters if XSS_NAME_RE.search(value)] or list(parameters)
     candidate_parameters = list(dict.fromkeys(candidate_parameters))[:2]
     for parameter in candidate_parameters:
-        selector = f'[name="{parameter.replace(chr(34), chr(92) + chr(34))}"]'
+        escaped = parameter.replace('"', '\\"')
+        selector = f'[name="{escaped}"]'
         locator = page.locator(selector)
         try:
-            if locator.count() == 0:
+            if await locator.count() == 0:
                 continue
         except Exception:
             continue
@@ -214,47 +236,48 @@ def _stored_check(
         diagnostic["parameter"] = parameter
         try:
             element = locator.first
-            tag = element.evaluate("el => el.tagName.toLowerCase()")
-            field_type = element.get_attribute("type") or ""
+            tag = await element.evaluate("el => el.tagName.toLowerCase()")
+            field_type = await element.get_attribute("type") or ""
             if tag == "select":
-                values = element.locator("option").evaluate_all("els => els.map(e => e.value)")
+                values = await element.locator("option").evaluate_all("els => els.map(e => e.value)")
                 if values:
-                    element.select_option(str(values[0]))
+                    await element.select_option(str(values[0]))
             elif field_type.lower() not in {"hidden", "submit", "button", "file", "checkbox", "radio"}:
-                element.fill(payload)
+                await element.fill(payload)
             else:
                 continue
 
-            # Populate other required text controls conservatively so the form can submit.
-            for other in page.locator("form input, form textarea, form select").all()[:80]:
+            controls = await page.locator("form input, form textarea, form select").all()
+            for other in controls[:80]:
                 try:
-                    name = other.get_attribute("name") or ""
-                    field_type = (other.get_attribute("type") or "text").lower()
+                    name = await other.get_attribute("name") or ""
+                    other_type = (await other.get_attribute("type") or "text").lower()
                     if not name or name == parameter or TOKEN_RE.search(name):
                         continue
-                    if field_type in {"hidden", "submit", "button", "file", "reset", "checkbox", "radio"}:
+                    if other_type in {"hidden", "submit", "button", "file", "reset", "checkbox", "radio"}:
                         continue
-                    if other.evaluate("el => el.tagName.toLowerCase()") == "select":
-                        values = other.locator("option").evaluate_all("els => els.map(e => e.value)")
+                    other_tag = await other.evaluate("el => el.tagName.toLowerCase()")
+                    if other_tag == "select":
+                        values = await other.locator("option").evaluate_all("els => els.map(e => e.value)")
                         if values:
-                            other.select_option(str(values[0]))
-                    elif not other.input_value():
-                        other.fill("secops")
+                            await other.select_option(str(values[0]))
+                    elif not await other.input_value():
+                        await other.fill("secops")
                 except Exception:
                     continue
 
             form = element.locator("xpath=ancestor::form[1]")
-            if form.count() == 0:
+            if await form.count() == 0:
                 continue
-            form.evaluate("form => form.requestSubmit ? form.requestSubmit() : form.submit()")
-            page.wait_for_timeout(1200)
+            await form.evaluate("form => form.requestSubmit ? form.requestSubmit() : form.submit()")
+            await page.wait_for_timeout(1200)
             revisit_urls = list(dict.fromkeys([start_url, target_url, str(page.url)]))
             executed_url = ""
             for revisit in revisit_urls:
                 if not _same_origin(target_url, revisit):
                     continue
-                _safe_goto(page, revisit, timeout_ms)
-                if _executed(page, marker):
+                await _safe_goto(page, revisit, timeout_ms)
+                if await _executed(page, marker):
                     executed_url = revisit
                     break
             diagnostic.update({"submitted": True, "marker": marker, "executed_url": executed_url})
@@ -282,8 +305,7 @@ def _stored_check(
     return findings, diagnostic
 
 
-@mcp.tool()
-def run_browser_scan(
+async def _run_browser_scan_core(
     target_url: str,
     cookies: str = "",
     method: str = "GET",
@@ -292,11 +314,10 @@ def run_browser_scan(
     source_url: str = "",
     timeout: int = 60,
     allow_state_changes: bool = False,
-) -> dict:
-    """Use Chromium to verify DOM, reflected and stored XSS with harmless markers."""
+) -> dict[str, Any]:
     try:
-        from playwright.sync_api import Error as PlaywrightError
-        from playwright.sync_api import sync_playwright
+        from playwright.async_api import Error as PlaywrightError
+        from playwright.async_api import async_playwright
     except Exception as exc:
         return skipped(
             "Browser XSS and Workflow Verifier",
@@ -318,40 +339,55 @@ def run_browser_scan(
         "parameters": parameters,
         "source_url": source_url,
         "allow_state_changes": bool(allow_state_changes),
+        "playwright_api": "async",
     }
 
     try:
-        with sync_playwright() as playwright:
+        async with async_playwright() as playwright:
             try:
-                browser = playwright.chromium.launch(headless=True)
+                browser = await playwright.chromium.launch(headless=True)
+                diagnostics["browser_executable"] = "playwright-managed"
             except PlaywrightError as exc:
-                return skipped(
-                    "Browser XSS and Workflow Verifier",
-                    target_url,
-                    f"Playwright Chromium is not installed: {exc}. Run: python -m playwright install chromium",
-                    diagnosis="missing_playwright_browser",
+                system_browser = next((
+                    value for name in ("chromium", "chromium-browser", "google-chrome", "google-chrome-stable", "msedge")
+                    if (value := shutil.which(name))
+                ), None)
+                if not system_browser:
+                    return skipped(
+                        "Browser XSS and Workflow Verifier",
+                        target_url,
+                        f"Playwright Chromium is not installed: {exc}. Run: python -m playwright install chromium",
+                        diagnosis="missing_playwright_browser",
+                    )
+                browser = await playwright.chromium.launch(headless=True, executable_path=system_browser)
+                diagnostics["browser_executable"] = system_browser
+                diagnostics["managed_browser_error"] = str(exc)
+            context = await browser.new_context(ignore_https_errors=True)
+            try:
+                if cookies:
+                    await context.add_cookies(_browser_cookies(target_url, cookies))
+                page = await context.new_page()
+                page.set_default_timeout(timeout_ms)
+                await page.add_init_script(
+                    "document.addEventListener('DOMContentLoaded', () => { "
+                    "document.documentElement.removeAttribute('data-secops-browser-xss'); });"
                 )
-            context = browser.new_context(ignore_https_errors=True)
-            if cookies:
-                context.add_cookies(_browser_cookies(target_url, cookies))
-            page = context.new_page()
-            page.set_default_timeout(timeout_ms)
-            page.add_init_script("document.addEventListener('DOMContentLoaded', () => { document.documentElement.removeAttribute('data-secops-browser-xss'); });")
 
-            dom_findings, dom_attempts = _dom_checks(page, target_url, parameters, timeout_ms)
-            findings.extend(dom_findings)
-            diagnostics["dom_attempts"] = dom_attempts
+                dom_findings, dom_attempts = await _dom_checks(page, target_url, parameters, timeout_ms)
+                findings.extend(dom_findings)
+                diagnostics["dom_attempts"] = dom_attempts
 
-            if str(method or "GET").upper() == "POST":
-                stored_findings, stored_diag = _stored_check(
-                    page, target_url, source_url, parameters, timeout_ms, allow_state_changes
-                )
-                findings.extend(stored_findings)
-                diagnostics["stored"] = stored_diag
-            else:
-                diagnostics["stored"] = {"attempted": False, "reason": "request method is not POST"}
-            context.close()
-            browser.close()
+                if str(method or "GET").upper() == "POST":
+                    stored_findings, stored_diag = await _stored_check(
+                        page, target_url, source_url, parameters, timeout_ms, allow_state_changes
+                    )
+                    findings.extend(stored_findings)
+                    diagnostics["stored"] = stored_diag
+                else:
+                    diagnostics["stored"] = {"attempted": False, "reason": "request method is not POST"}
+            finally:
+                await context.close()
+                await browser.close()
     except Exception as exc:
         return failure(
             "Browser XSS and Workflow Verifier",
@@ -369,12 +405,36 @@ def run_browser_scan(
     )
 
 
+@mcp.tool()
+async def run_browser_scan(
+    target_url: str,
+    cookies: str = "",
+    method: str = "GET",
+    data: str = "",
+    parameters: list[str] | None = None,
+    source_url: str = "",
+    timeout: int = 60,
+    allow_state_changes: bool = False,
+) -> dict:
+    """Use async Chromium to verify DOM, reflected and stored XSS with harmless markers."""
+    return await _run_browser_scan_core(
+        target_url=target_url,
+        cookies=cookies,
+        method=method,
+        data=data,
+        parameters=parameters,
+        source_url=source_url,
+        timeout=timeout,
+        allow_state_changes=allow_state_changes,
+    )
+
+
 def _once() -> int:
     try:
         arguments = json.loads(sys.stdin.read() or "{}")
         if not isinstance(arguments, dict):
             raise ValueError("Expected a JSON object on stdin.")
-        result = run_browser_scan(**arguments)
+        result = asyncio.run(_run_browser_scan_core(**arguments))
     except Exception as exc:
         result = failure("Browser XSS and Workflow Verifier", "", f"One-shot browser scan failed: {type(exc).__name__}: {exc}")
     print(json.dumps(result, ensure_ascii=False, default=str))

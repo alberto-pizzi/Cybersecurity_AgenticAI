@@ -10,7 +10,7 @@ from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterator
-from urllib.parse import urlparse
+from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 
 import requests
 from fastmcp import FastMCP
@@ -26,7 +26,7 @@ mcp = FastMCP("SecOps Report Server")
 RISK_ORDER = {"critical": 5, "high": 4, "medium": 3, "low": 2, "info": 1}
 TOOL_PURPOSES = {
     "zap": "Traffic import, session handling, spider/site-tree population, passive analysis, and bounded high-value active checks when enabled.",
-    "nuclei": "Focused template checks for high-impact vulnerabilities, exposures, misconfigurations and bounded DAST testing of discovered parameterized URLs.",
+    "nuclei": "Adaptive fingerprint-driven template checks for CVEs, exposures and misconfigurations, plus bounded DAST only for specialist coverage gaps.",
     "nikto": "Web-server hardening, exposed resource and outdated component checks.",
     "ffuf": "High-value path and resource discovery with content verification for selected sensitive paths.",
     "exposure": "Read-only verification of exposed backups, source files, configuration artifacts and directory indexes.",
@@ -47,6 +47,8 @@ SECRET_PATTERNS = (
     (re.compile(r"(?i)((?:session(?:_?id)?|sid|jsessionid|connect\.sid|asp\.net_sessionid)=)[^;\s]+"), r"\1<redacted>"),
     (re.compile(r"(?i)(Cookie:\s*)[^\r\n]+"), r"\1<redacted>"),
     (re.compile(r"(?i)(Authorization:\s*Bearer\s+)[A-Za-z0-9._~-]+"), r"\1<redacted>"),
+    (re.compile(r"(?im)^\s*((?:db_|database_|mysql_|postgres_|redis_|smtp_)?(?:password|passwd|pass|secret|token|api_key|access_key|private_key|client_secret)\s*[=:]\s*)[^\r\n]+"), r"\1<redacted>"),
+    (re.compile(r"(?i)(\[\s*['\"]?(?:db_password|db_pass|database_password|db_user|db_username|api_key|secret_key|client_secret|private_key|token)['\"]?\s*\]\s*=\s*['\"])[^'\"]+"), r"\1<redacted>"),
     (re.compile(r"eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]*"), "<redacted-jwt>"),
 )
 
@@ -219,13 +221,101 @@ def _normalize_finding(raw: dict[str, Any], profile: str, tool: str) -> dict[str
     }
 
 
-def flatten_findings(results: dict[str, Any]) -> list[dict[str, Any]]:
-    """
-    Normalize findings and merge identical evidence observed in multiple profiles.
+AUTO_INDEX_QUERY_KEYS = {"c", "n", "m", "s", "d", "o"}
 
-    Access context remains explicit through the `profiles` field, avoiding pages
-    of duplicate anonymous/authenticated entries in the human-readable report.
-    """
+
+def _canonical_finding_url(value: str) -> str:
+    parsed = urlparse(str(value or ""))
+    pairs = parse_qsl(parsed.query, keep_blank_values=True)
+    query = "" if pairs and {name.lower() for name, _ in pairs} <= AUTO_INDEX_QUERY_KEYS else urlencode(pairs)
+    path = parsed.path or "/"
+    if path != "/":
+        path = path.rstrip("/")
+    return urlunparse((parsed.scheme.lower(), parsed.netloc.lower(), path, "", query, ""))
+
+
+def _finding_family(row: dict[str, Any]) -> str:
+    alert = str(row.get("alert") or "").lower()
+    verification = str(row.get("verification_status") or "").lower()
+    if "php diagnostic" in alert or "phpinfo" in alert:
+        return "php-diagnostic-exposure"
+    if "directory listing" in alert or "directory-index" in verification:
+        return "directory-listing"
+    if "backup configuration or source" in alert or "source-disclosure" in verification:
+        return "source-configuration-disclosure"
+    if "environment configuration" in alert:
+        return "environment-file-disclosure"
+    if "git repository" in alert or "git-metadata" in verification:
+        return "git-metadata-disclosure"
+    if "sql injection" in alert:
+        return "sql-injection"
+    if "stored xss" in alert or "stored-marker" in verification:
+        return "stored-xss"
+    if "dom xss" in alert or "url fragment" in alert:
+        return "dom-xss"
+    if "reflected" in alert and ("xss" in alert or "cross-site scripting" in alert):
+        return "reflected-xss"
+    if "cross-site scripting" in alert or re.search(r"\bxss\b", alert):
+        return "xss"
+    if "path traversal" in alert or "local file inclusion" in alert:
+        return "path-traversal-lfi"
+    if "out-of-band interaction" in alert:
+        return "oast-interaction"
+    if "csrf" in alert or "anti-csrf" in alert:
+        return "csrf"
+    if "session fixation" in alert:
+        return "session-fixation"
+    if "lacks httponly" in alert:
+        return "cookie-httponly"
+    if "lacks secure" in alert:
+        return "cookie-secure"
+    if "lacks samesite" in alert:
+        return "cookie-samesite"
+    normalized = re.sub(r"\s+in parameter ['\"][^'\"]+['\"]$", "", alert)
+    return normalized
+
+
+def _finding_strength(row: dict[str, Any]) -> tuple[int, int, int, int]:
+    category_score = {"vulnerability": 3, "candidate": 2, "observation": 1, "discovery": 0}.get(str(row.get("category") or ""), 0)
+    confidence_score = {"high": 3, "medium": 2, "low": 1}.get(str(row.get("confidence") or "").lower(), 0)
+    return (category_score, RISK_ORDER.get(str(row.get("risk") or "info"), 0), confidence_score, len(str(row.get("evidence") or "")))
+
+
+def _merge_finding_rows(existing: dict[str, Any], row: dict[str, Any], profile: str, tool: str) -> None:
+    profiles = existing.setdefault("profiles", [])
+    if profile not in profiles:
+        profiles.append(profile)
+    tools = existing.setdefault("tools", [existing.get("tool", "unknown")])
+    if tool not in tools:
+        tools.append(tool)
+    affected_urls = existing.setdefault("affected_urls", [existing.get("url", "")])
+    if row.get("url") and row.get("url") not in affected_urls:
+        affected_urls.append(row.get("url"))
+    corroboration = existing.setdefault("corroborating_findings", [])
+    corroboration.append({
+        "tool": tool,
+        "profile": profile,
+        "verification_status": row.get("verification_status", ""),
+        "risk": row.get("risk", ""),
+        "url": row.get("url", ""),
+    })
+    if _finding_strength(row) > _finding_strength(existing):
+        for key in (
+            "alert", "risk", "category", "verification_status", "confidence",
+            "description", "technical_details", "evidence", "impact", "solution",
+            "reproduction", "attack_preconditions", "owasp_category", "payload",
+            "payloads", "references", "identifiers", "data_quality_notes", "scanner_fields",
+            "method", "parameter",
+        ):
+            if row.get(key) not in (None, "", [], {}):
+                existing[key] = row[key]
+    existing["tool"] = ", ".join(sorted(set(str(value) for value in tools if value)))
+    existing["profile"] = ", ".join(sorted(set(profiles)))
+    existing["occurrence_count"] = int(existing.get("occurrence_count", 1)) + 1
+
+
+def flatten_findings(results: dict[str, Any]) -> list[dict[str, Any]]:
+    """Normalize and semantically merge corroborating findings from all tools."""
     merged: dict[tuple[str, ...], dict[str, Any]] = {}
     for path, result in _iter_leaf_results(results):
         profile = path[0] if path else str(result.get("profile") or "unknown")
@@ -234,50 +324,38 @@ def flatten_findings(results: dict[str, Any]) -> list[dict[str, Any]]:
             if not isinstance(raw, dict):
                 continue
             row = _normalize_finding(raw, profile, tool)
+            canonical_url = _canonical_finding_url(str(row.get("url") or ""))
             if row.get("category") in {"vulnerability", "candidate"}:
-                parsed_url = urlparse(str(row.get("url") or ""))
-                normalized_path = parsed_url.path.rstrip("/").lower() or "/"
-                normalized_alert = re.sub(
-                    r"\s+in parameter ['\"][^'\"]+['\"]$",
-                    "",
-                    str(row.get("alert") or "").lower(),
-                )
+                family = _finding_family(row)
+                parameter = str(row.get("parameter") or "").lower()
+                fingerprint = (family, canonical_url, parameter)
+            else:
                 fingerprint = (
-                    normalized_alert,
+                    str(row.get("tool") or ""),
+                    str(row.get("alert") or ""),
                     str(row.get("risk") or ""),
                     str(row.get("category") or ""),
-                    normalized_path,
-                    str(row.get("method") or "").upper(),
+                    canonical_url,
                     str(row.get("parameter") or "").lower(),
+                    str(row.get("verification_status") or ""),
                 )
-            else:
-                fingerprint_keys = (
-                    "tool", "alert", "risk", "category", "url", "method",
-                    "parameter", "verification_status",
-                )
-                fingerprint = tuple(str(row.get(key) or "") for key in fingerprint_keys)
             existing = merged.get(fingerprint)
             if existing is None:
                 row["profiles"] = [profile]
+                row["tools"] = [tool]
+                row["canonical_url"] = canonical_url
+                row["affected_urls"] = [row.get("url", "")] if row.get("url") else []
+                row["corroborating_findings"] = []
                 merged[fingerprint] = row
             else:
-                profiles = existing.setdefault("profiles", [])
-                if profile not in profiles:
-                    profiles.append(profile)
-                tools = existing.setdefault("tools", [existing.get("tool", "unknown")])
-                if tool not in tools:
-                    tools.append(tool)
-                affected_urls = existing.setdefault("affected_urls", [existing.get("url", "")])
-                if row.get("url") and row.get("url") not in affected_urls:
-                    affected_urls.append(row.get("url"))
-                existing["tool"] = ", ".join(sorted(set(str(value) for value in tools if value)))
-                existing["profile"] = ", ".join(profiles)
-                existing["occurrence_count"] = int(existing.get("occurrence_count", 1)) + 1
+                _merge_finding_rows(existing, row, profile, tool)
 
     rows = list(merged.values())
     for row in rows:
         row["profiles"] = sorted(set(row.get("profiles") or [row.get("profile", "unknown")]))
         row["profile"] = ", ".join(row["profiles"])
+        row["tools"] = sorted(set(str(value) for value in row.get("tools", []) if value))
+        row["tool"] = ", ".join(row["tools"]) or str(row.get("tool") or "unknown")
     return sorted(
         rows,
         key=lambda row: (

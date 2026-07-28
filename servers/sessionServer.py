@@ -19,6 +19,28 @@ from utils import failure, parse_cookie_header, skipped, success
 mcp = FastMCP("Session Security Analyzer")
 
 
+
+
+SESSION_COOKIE_RE = re.compile(
+    r"(?:^|[_\-.])(?:session|sess|sid|phpsessid|jsessionid|connect\.sid|auth|identity|remember|login)(?:$|[_\-.])",
+    re.I,
+)
+NON_SESSION_COOKIE_NAMES = {
+    "security", "theme", "lang", "language", "locale", "consent",
+    "csrftoken", "csrf", "xsrf-token", "timezone", "tz", "preferences",
+}
+
+
+def _is_session_cookie_name(name: str) -> bool:
+    lowered = str(name or "").strip().lower()
+    if not lowered or lowered in NON_SESSION_COOKIE_NAMES:
+        return False
+    return bool(SESSION_COOKIE_RE.search(lowered))
+
+
+def _session_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [row for row in rows if _is_session_cookie_name(str(row.get("name") or ""))]
+
 def _same_origin(left: str, right: str) -> bool:
     a, b = urlparse(left), urlparse(right)
     return (a.scheme.lower(), a.hostname, a.port or (443 if a.scheme == "https" else 80)) == (
@@ -76,7 +98,7 @@ def _entropy_per_character(value: str) -> float:
 
 def _cookie_attribute_findings(url: str, rows: list[dict[str, Any]], https: bool) -> list[dict[str, Any]]:
     findings: list[dict[str, Any]] = []
-    for row in rows:
+    for row in _session_rows(rows):
         name = str(row.get("name") or "")
         if not name:
             continue
@@ -173,7 +195,9 @@ def run_session_scan(
     findings.extend(_cookie_attribute_findings(str(baseline.url), set_cookie_rows, urlparse(str(baseline.url)).scheme == "https"))
 
     supplied_names = [name for name, _ in parse_cookie_header(cookies)] if cookies else []
+    supplied_session_names = [name for name in supplied_names if _is_session_cookie_name(name)]
     diagnostics["supplied_cookie_names"] = supplied_names
+    diagnostics["supplied_session_cookie_names"] = supplied_session_names
     if cookies:
         try:
             authenticated = requests.get(
@@ -224,6 +248,8 @@ def run_session_scan(
     }
 
     for name, values in samples.items():
+        if not _is_session_cookie_name(name):
+            continue
         if len(values) >= 3 and len(set(values)) < len(values):
             findings.append({
                 "alert": f"Repeated session identifier observed for cookie '{name}'",
@@ -260,9 +286,9 @@ def run_session_scan(
 
     # Bounded anonymous fixation indicator: check whether an arbitrary supplied value is
     # accepted without rotation. This is not a full fixation proof because no login is performed.
-    if supplied_names:
+    if supplied_session_names:
         fixation_rows: list[dict[str, Any]] = []
-        for name in supplied_names[:3]:
+        for name in supplied_session_names[:3]:
             chosen = "SECOPS" + secrets.token_hex(12)
             try:
                 response = requests.get(
@@ -306,7 +332,7 @@ def run_session_scan(
                 })
         diagnostics["fixation_indicators"] = fixation_rows
 
-    if not set_cookie_rows and not samples and not supplied_names:
+    if not _session_rows(set_cookie_rows) and not any(_is_session_cookie_name(name) for name in samples) and not supplied_session_names:
         return skipped("Session Security Analyzer", target_url, "No cookie or session identifier was observed or supplied.")
 
     return success(
