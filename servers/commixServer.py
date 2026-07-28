@@ -116,17 +116,18 @@ def _command_canary(
         return {"performed": False, "confirmed": False, "reason": "no_command_like_parameter"}
 
     parameter = candidates[0]
-    marker = f"SECOPS_CMD_{uuid.uuid4().hex[:10].upper()}"
-    # Try the cross-platform ampersand form first.  On Unix it backgrounds the
-    # preceding ping and returns the marker immediately; on Windows cmd.exe it
-    # is a command separator.  The previous order tried several potentially
-    # slow ping variants before this one and could exhaust the canary budget.
+    nonce = uuid.uuid4().hex[:10].upper()
+    marker = f"SECOPS_CMD_{nonce}"
+    # The expected marker is intentionally NOT present verbatim in any request
+    # payload.  A simple reflection of the submitted value therefore cannot be
+    # mistaken for command execution.  The shell must join independently
+    # supplied fragments (Unix printf or Windows variable expansion) before the
+    # exact marker can appear in the response.
     suffixes = (
-        f" & echo {marker}",
-        f" | echo {marker}",
-        f"; printf '{marker}'; #",
-        f"; echo {marker}; #",
-        f" && echo {marker}",
+        f" & printf 'SECOPS_%s' 'CMD_{nonce}'",
+        f" | printf 'SECOPS_%s' 'CMD_{nonce}'",
+        f"; printf 'SECOPS_%s' 'CMD_{nonce}'; #",
+        f' & set "SECOPS_PART=CMD_{nonce}" & call echo SECOPS_%%SECOPS_PART%%',
     )
     headers = {
         "Cache-Control": "no-cache",
@@ -208,7 +209,18 @@ def _command_canary(
             attempts.append({"payload_suffix": command_suffix, "error": f"{type(exc).__name__}: {exc}"})
             continue
         decoded_body = html.unescape(response.text)
-        confirmed = bool(baseline.get("marker_absent", True)) and marker in decoded_body
+        marker_absent_from_payload = marker not in injected_value
+        baseline_valid = (
+            "status" in baseline
+            and bool(baseline.get("marker_absent"))
+            and int(baseline.get("status") or 0) < 500
+        )
+        confirmed = (
+            baseline_valid
+            and marker_absent_from_payload
+            and marker in decoded_body
+            and response.status_code < 500
+        )
         attempt = {
             "payload_suffix": command_suffix,
             "status": response.status_code,
@@ -217,6 +229,8 @@ def _command_canary(
             "request_data": request_data,
             "response_bytes": len(response.content),
             "confirmed": confirmed,
+            "marker_absent_from_payload": marker_absent_from_payload,
+            "baseline_valid": baseline_valid,
             "response_excerpt": _response_excerpt(response.text, marker),
         }
         attempts.append(attempt)
@@ -230,6 +244,7 @@ def _command_canary(
                 "base_value": base_value,
                 "baseline": baseline,
                 "attempts": attempts,
+                "verification_method": "non-reflective-transformed-marker-v2",
                 **attempt,
             }
     return {
@@ -241,6 +256,7 @@ def _command_canary(
         "baseline": baseline,
         "attempts": attempts,
         "canary_budget_seconds": max(8, min(int(timeout), 35)),
+        "verification_method": "non-reflective-transformed-marker-v2",
     }
 
 
@@ -258,7 +274,7 @@ def _canary_finding(
         "category": "vulnerability",
         "verification_status": "unique-response-marker-command-execution-confirmed",
         "confidence": "high",
-        "description": "A benign shell output command appended to the selected input produced a unique server-side marker in the HTTP response. The marker was not present in the original input value and therefore confirms operating-system command execution.",
+        "description": "A benign shell transformation appended to the selected input produced a unique server-side marker in the HTTP response. The exact marker was absent from both the baseline response and the submitted payload, so ordinary input reflection cannot explain the result.",
         "attack_preconditions": "An attacker must be able to submit the affected parameter to the command-execution handler.",
         "impact": "The attacker can execute operating-system commands with the web-server account's privileges, read accessible files and secrets, modify application data, and potentially pivot to other services reachable from the container or host.",
         "solution": "Remove shell command construction from untrusted input. Use a dedicated networking or process API, enforce a strict allow-list, avoid invoking a shell, and run the service under a minimally privileged account.",
@@ -270,12 +286,15 @@ def _canary_finding(
         "owasp_category": "A03:2021 Injection",
         "technical_details": (
             f"HTTP {canary.get('status')}; marker={canary.get('marker')}; "
+            f"marker absent from payload={canary.get('marker_absent_from_payload')}; "
+            f"baseline valid={canary.get('baseline_valid')}; "
+            f"verification={canary.get('verification_method')}; "
             f"response bytes={canary.get('response_bytes')}."
         ),
         "reproduction": (
             f"1. Send the {method} request to {target_url}.\n"
-            f"2. Append '{canary.get('payload_suffix')}' to parameter '{parameter}'.\n"
-            f"3. Confirm that the response contains the unique marker '{canary.get('marker')}'."
+            f"2. Append the bounded transformation payload shown in the evidence to parameter '{parameter}'.\n"
+            f"3. Confirm that the response contains '{canary.get('marker')}', even though that exact marker is absent from the submitted payload."
         ),
         "evidence": (
             f"Request URL: {canary.get('request_url')}\n"
@@ -316,7 +335,7 @@ def run_commix_scan(
     )
     canary_findings = _canary_finding(target_url, method, canary)
     if canary_findings:
-        return success("Commix", target_url, "A bounded response-marker canary confirmed command execution; the slower Commix phase was not required.", vulnerabilities=canary_findings, command_injection_found=True, request_method=method, tested_parameters=parameters, authenticated=bool(cookies), session_probe=session_probe, command_canary=canary, execution_mode="direct_canary")
+        return success("Commix", target_url, "The Commix MCP pre-verifier confirmed command execution with a non-reflective transformed marker; the slower full Commix phase was not required.", vulnerabilities=canary_findings, command_injection_found=True, request_method=method, tested_parameters=parameters, authenticated=bool(cookies), session_probe=session_probe, command_canary=canary, execution_mode="direct_canary", confirmation_engine="secops_non_reflective_command_canary")
     script = _find_commix_script()
     if script is None:
         return failure(

@@ -273,6 +273,7 @@ def _command(
     excluded_tags: str = "",
     bulk_size: int = 4,
     payload_concurrency: int = 8,
+    enable_global_matchers: bool = False,
 ) -> list[str]:
     input_args = (
         ["-l", str(target_list), *(["-im", input_mode] if input_mode else [])]
@@ -302,6 +303,8 @@ def _command(
         command.extend(["-t", template_dir])
     if tags and not exact_templates:
         command.extend(["-tags", tags])
+    if enable_global_matchers:
+        command.append("-enable-global-matchers")
     if automatic_scan:
         command.append("-as")
     if dast:
@@ -535,6 +538,10 @@ def _template_catalog(template_root: Path) -> list[dict[str, Any]]:
         # passing one of those to an HTTP-only command can make Nuclei exit with
         # a non-zero status before the remaining valid templates are attempted.
         top_level_http = bool(re.search(r"(?im)^(?:http|requests)\s*:\s*$", content))
+        global_matchers = bool(re.search(
+            r"(?im)^\s*global-matchers\s*:\s*true(?:\s*#.*)?$",
+            content,
+        ))
         unsupported_protocols = sorted({
             value
             for value in ("headless", "code", "javascript", "dns", "network", "ssl", "websocket", "file")
@@ -549,6 +556,7 @@ def _template_catalog(template_root: Path) -> list[dict[str, Any]]:
             "name": (name_match.group(1).strip() if name_match else path.stem),
             "id": (id_match.group(1).strip() if id_match else path.stem),
             "http_compatible": top_level_http and not unsupported_protocols,
+            "global_matchers": global_matchers,
             "unsupported_protocols": unsupported_protocols,
         })
     _TEMPLATE_CATALOG_CACHE[key] = (stamp, rows)
@@ -705,6 +713,8 @@ def _run_phase(
     target_scope: str = "focused",
     bulk_size: int = 4,
     payload_concurrency: int = 8,
+    enable_global_matchers: bool = False,
+    global_matcher_template_count: int = 0,
 ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     def execute(
         *,
@@ -737,10 +747,46 @@ def _run_phase(
                 excluded_tags=excluded_tags,
                 bulk_size=bulk_size,
                 payload_concurrency=payload_concurrency,
+                enable_global_matchers=enable_global_matchers,
             ),
             target=target_url,
             timeout=budget if budget is not None else timeout,
         )
+
+    def result_text(result: dict[str, Any]) -> str:
+        return "\n".join((
+            str(result.get("stdout", "")),
+            str(result.get("stderr", "")),
+            str(result.get("output", "")),
+        )).lower()
+
+    def template_error(result: dict[str, Any]) -> bool:
+        text = result_text(result)
+        # Only classify a file as invalid when Nuclei explicitly attributes a
+        # parse, validation, compilation, signature, helper-file, or protocol
+        # error to that template. Generic YAML words are deliberately excluded.
+        patterns = (
+            r"could not (?:load|parse|compile|validate) template",
+            r"failed to (?:load|parse|compile|validate) template",
+            r"template validation (?:failed|error)",
+            r"invalid template(?: file)?",
+            r"unmarshal errors?",
+            r"unsupported protocol(?: type)?",
+            r"missing mandatory field.*(?:id|info|requests?|http)",
+            r"could not compile request",
+            r"helper(?: file)? .* (?:missing|not found)",
+            r"signature .* (?:invalid|verification failed)",
+        )
+        return any(re.search(pattern, text) for pattern in patterns)
+
+    def no_templates_loaded(result: dict[str, Any]) -> bool:
+        text = result_text(result)
+        return any(token in text for token in (
+            "no templates provided for scan",
+            "no templates provided",
+            "no templates found",
+            "no templates were loaded",
+        ))
 
     def execute_with_compatibility(
         selected_paths: list[str],
@@ -753,29 +799,31 @@ def _run_phase(
             output_path=output_path,
             budget=budget,
         )
-        current_text = "\n".join((str(current.get("stdout", "")), str(current.get("stderr", ""))))
-        if current.get("status") == "error" and "unknown flag" in current_text.lower():
+        primary_text = result_text(current)
+        # Exact official templates can be rejected by a particular Nuclei build
+        # because of protocol filters, global-matcher handling, or newer CLI
+        # flags even though the template itself is usable. Retry once without
+        # the optional filtering flags before declaring the template invalid.
+        should_retry = (
+            current.get("status") == "error"
+            and (
+                "unknown flag" in primary_text
+                or template_error(current)
+                or no_templates_loaded(current)
+            )
+        )
+        if should_retry:
             output_path.unlink(missing_ok=True)
-            current = execute(
+            retry = execute(
                 compatibility=True,
                 selected_paths=selected_paths,
                 output_path=output_path,
                 budget=budget,
             )
-            current["compatibility_mode"] = True
+            retry["compatibility_mode"] = True
+            retry["primary_attempt_error_excerpt"] = primary_text[-1600:]
+            current = retry
         return current
-
-    def template_error(result: dict[str, Any]) -> bool:
-        text = "\n".join((
-            str(result.get("stdout", "")),
-            str(result.get("stderr", "")),
-            str(result.get("output", "")),
-        )).lower()
-        return any(token in text for token in (
-            "could not load template", "could not parse template", "failed to load template",
-            "template validation", "invalid template", "yaml:", "unmarshal errors",
-            "could not compile", "unsupported protocol", "no templates provided",
-        ))
 
     exact_paths = [str(value) for value in (template_paths or []) if str(value)]
 
@@ -877,6 +925,57 @@ def _run_phase(
             })
             recovered_items.extend(batch_items)
 
+        # If every statically selected exact file was rejected, let the Nuclei
+        # engine perform its own validated tag selection. This is bounded by the
+        # remaining phase budget and avoids claiming coverage from zero executed
+        # templates while still preserving the adaptive Apache/PHP fingerprint.
+        engine_tag_fallback_used = False
+        engine_tag_fallback_status = ""
+        engine_tag_fallback_diagnosis = ""
+        engine_tag_fallback_command: list[str] = []
+        engine_tag_fallback_success = False
+        if (
+            not completed_templates
+            and invalid_templates
+            and not runtime_failures
+            and not timed_out_templates
+            and remaining_seconds() >= 6
+            and tags
+        ):
+            engine_tag_fallback_used = True
+            fallback_path = path.with_name(f"{path.stem}-engine-tags{path.suffix}")
+            fallback_path.unlink(missing_ok=True)
+            fallback_budget = max(6, remaining_seconds())
+            fallback_result = execute(
+                compatibility=True,
+                selected_paths=[],
+                output_path=fallback_path,
+                budget=fallback_budget,
+            )
+            fallback_items = _read_items(fallback_path, str(fallback_result.get("stdout", "")))
+            fallback_path.unlink(missing_ok=True)
+            stdout_parts.append(str(fallback_result.get("stdout", "")))
+            stderr_parts.append(str(fallback_result.get("stderr", "")))
+            if isinstance(fallback_result.get("command"), list):
+                engine_tag_fallback_command = list(fallback_result["command"])
+                commands.append(engine_tag_fallback_command)
+            engine_tag_fallback_status = str(fallback_result.get("status") or "error")
+            engine_tag_fallback_diagnosis = str(fallback_result.get("diagnosis") or "")
+            if fallback_result.get("status") == "success":
+                engine_tag_fallback_success = True
+                recovered_items.extend(fallback_items)
+            elif fallback_result.get("diagnosis") == "timeout" or fallback_result.get("timed_out"):
+                timed_out_templates.append("engine-tag-selection")
+                recovered_items.extend(fallback_items)
+            elif not no_templates_loaded(fallback_result):
+                runtime_failures.append({
+                    "template": "engine-tag-selection",
+                    "error": "\n".join((
+                        str(fallback_result.get("stderr", "")),
+                        str(fallback_result.get("output", "")),
+                    ))[-1200:],
+                })
+
         recovered_items = _deduplicate(recovered_items)
         if recovered_items:
             path.write_text(
@@ -902,14 +1001,30 @@ def _run_phase(
                 f"Completed={len(completed_templates)}; timed out={len(timed_out_templates)}; "
                 f"findings preserved={len(recovered_items)}."
             )
+        elif not completed_templates and invalid_templates and not engine_tag_fallback_success:
+            phase_status = "skipped"
+            diagnosis = "no_compatible_fingerprint_templates"
+            output = (
+                "No selected technology template was executable by the installed Nuclei engine, "
+                "and the engine-managed tag fallback did not load a compatible template. "
+                f"Exact templates rejected={len(invalid_templates)}; findings={len(recovered_items)}."
+            )
         else:
             phase_status = "success"
-            diagnosis = "invalid_templates_isolated" if invalid_templates else ""
-            output = (
-                "Nuclei completed all runnable technology-template batches. "
-                f"Completed={len(completed_templates)}; invalid/unsupported skipped={len(invalid_templates)}; "
-                f"findings={len(recovered_items)}."
-            )
+            if engine_tag_fallback_success:
+                diagnosis = "engine_tag_fallback_completed"
+                output = (
+                    "Nuclei rejected the statically selected exact technology templates, then completed "
+                    "a bounded engine-managed tag scan for the detected technologies. "
+                    f"Exact templates rejected={len(invalid_templates)}; findings={len(recovered_items)}."
+                )
+            else:
+                diagnosis = "invalid_templates_isolated" if invalid_templates else ""
+                output = (
+                    "Nuclei completed all runnable technology-template batches. "
+                    f"Completed={len(completed_templates)}; invalid/unsupported skipped={len(invalid_templates)}; "
+                    f"findings={len(recovered_items)}."
+                )
 
         result = {
             "tool": "Nuclei",
@@ -930,6 +1045,13 @@ def _run_phase(
             "invalid_templates": invalid_templates,
             "runtime_template_failures": runtime_failures,
             "timed_out_templates": timed_out_templates,
+            "engine_tag_fallback_used": engine_tag_fallback_used,
+            "engine_tag_fallback_success": engine_tag_fallback_success,
+            "engine_tag_fallback_status": engine_tag_fallback_status,
+            "engine_tag_fallback_diagnosis": engine_tag_fallback_diagnosis,
+            "engine_tag_fallback_command": engine_tag_fallback_command,
+            "global_matchers_enabled": bool(enable_global_matchers),
+            "global_matcher_template_count": int(global_matcher_template_count),
         }
         result.update(
             phase=name,
@@ -947,6 +1069,8 @@ def _run_phase(
             selected_template_sample=[Path(value).name for value in exact_paths[:20]],
             bulk_size=bulk_size,
             payload_concurrency=payload_concurrency,
+            global_matchers_enabled=bool(enable_global_matchers),
+            global_matcher_template_count=int(global_matcher_template_count),
         )
         return result, recovered_items
 
@@ -989,6 +1113,8 @@ def _run_phase(
         selected_template_sample=[Path(value).name for value in (template_paths or [])[:20]],
         bulk_size=bulk_size,
         payload_concurrency=payload_concurrency,
+        global_matchers_enabled=bool(enable_global_matchers),
+        global_matcher_template_count=int(global_matcher_template_count),
     )
     return result, items
 
@@ -1048,7 +1174,12 @@ def _phase_definitions(
     if technology_tags:
         phases.append({
             "name": "fingerprint_relevant_templates",
-            "severities": "low,medium,high,critical",
+            # Technology detectors and global matchers are commonly severity
+            # ``info``.  Excluding info after selecting those exact files makes
+            # Nuclei report that no templates were loaded, even though the files
+            # are valid.  Product CVEs in the same bounded phase still retain
+            # their original medium/high/critical severities.
+            "severities": "info,low,medium,high,critical",
             "tags": ",".join(technology_tags),
             "timeout": desired["technology"],
             "target_scope": "base",
@@ -1428,6 +1559,9 @@ def _run_nuclei_core(
                 })
                 continue
             template_paths = [str(item.get("path") or "") for item in selected_templates]
+            global_matcher_template_count = sum(
+                1 for item in selected_templates if bool(item.get("global_matchers"))
+            )
             phase, items = _run_phase(
                 target_url,
                 cookies,
@@ -1444,6 +1578,8 @@ def _run_nuclei_core(
                 template_paths=template_paths,
                 bulk_size=bulk_size,
                 payload_concurrency=payload_concurrency,
+                enable_global_matchers=bool(global_matcher_template_count),
+                global_matcher_template_count=global_matcher_template_count,
                 **definition,
             )
 
@@ -1478,6 +1614,8 @@ def _run_nuclei_core(
                     template_paths=template_paths,
                     bulk_size=bulk_size,
                     payload_concurrency=payload_concurrency,
+                    enable_global_matchers=bool(global_matcher_template_count),
+                    global_matcher_template_count=global_matcher_template_count,
                     **definition,
                 )
                 fallback_phase["request_log_fallback"] = True
@@ -1524,6 +1662,12 @@ def _run_nuclei_core(
                 "invalid_templates": phase.get("invalid_templates", []),
                 "runtime_template_failures": phase.get("runtime_template_failures", []),
                 "timed_out_templates": phase.get("timed_out_templates", []),
+                "engine_tag_fallback_used": phase.get("engine_tag_fallback_used", False),
+                "engine_tag_fallback_success": phase.get("engine_tag_fallback_success", False),
+                "engine_tag_fallback_status": phase.get("engine_tag_fallback_status", ""),
+                "engine_tag_fallback_diagnosis": phase.get("engine_tag_fallback_diagnosis", ""),
+                "global_matchers_enabled": phase.get("global_matchers_enabled", False),
+                "global_matcher_template_count": phase.get("global_matcher_template_count", 0),
                 "stderr_excerpt": str(phase.get("stderr", ""))[-1200:],
             }
             for phase in phases

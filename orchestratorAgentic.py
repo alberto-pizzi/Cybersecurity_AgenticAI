@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import Any, Literal, TypedDict
 from urllib.parse import parse_qsl, urlparse
 
-warnings.filterwarnings("ignore", message=r"authlib\.jose module is deprecated.*")
+warnings.filterwarnings("ignore", message=r".*authlib\.jose.*deprecated.*")
 
 import requests
 from langgraph.graph import END, START, StateGraph
@@ -1394,6 +1394,8 @@ async def execute_action(
                         else 25
                     ),
                 })
+            elif action["tool"] == "nikto":
+                arguments["scan_profile"] = deterministic_core.CURRENT_SCAN_MODE
             elif action["tool"] == "nuclei":
                 arguments["seed_urls"] = profile_discovery.get("urls", [])
                 arguments["request_cases"] = profile_discovery.get("request_cases", [])

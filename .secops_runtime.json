@@ -1,6 +1,6 @@
 {
   "schema_version": 3,
-  "generated_at": "2026-07-28T16:20:26.736159+00:00",
+  "generated_at": "2026-07-28T21:09:41.419481+00:00",
   "project_root": "S:\\Cybersecurity_AgenticAI",
   "python_executable": "C:\\Users\\tommy\\AppData\\Local\\Microsoft\\WindowsApps\\PythonSoftwareFoundation.Python.3.13_qbz5n2kfra8p0\\python.exe",
   "platform": "Windows-10-10.0.19045-SP0",
@@ -55,8 +55,8 @@
     }
   },
   "last_auth_target": "http://127.0.0.1",
-  "last_auth_cookie": "PHPSESSID=0dbbd7jvg2h6attgu8psinqt15; security=low",
-  "last_auth_generated_at": "2026-07-28T16:20:53.190186+00:00",
+  "last_auth_cookie": "PHPSESSID=nuoapqio24d88qchles443anl1; security=low",
+  "last_auth_generated_at": "2026-07-28T21:10:09.089726+00:00",
   "target_profiles": {
     "http://127.0.0.1:80": {
       "target_url": "http://127.0.0.1",

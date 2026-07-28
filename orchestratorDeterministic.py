@@ -24,11 +24,13 @@ from pathlib import Path
 from typing import Any, Iterator
 from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 
-warnings.filterwarnings("ignore", message=r"authlib\.jose module is deprecated.*")
+warnings.filterwarnings("ignore", message=r".*authlib\.jose.*deprecated.*")
 
 import requests
-from fastmcp import Client
-from fastmcp.client.transports import StdioTransport
+with warnings.catch_warnings():
+    warnings.simplefilter("ignore")
+    from fastmcp import Client
+    from fastmcp.client.transports import StdioTransport
 
 from utils import (
     apply_runtime_target_preparation, absolute_url, canonical_cookie_header,
@@ -2724,8 +2726,11 @@ def log_result(profile: str, name: str, result: dict[str, Any], target: str = ""
             if phase.get("template_batch_recovery"):
                 print(
                     "    [NUCLEI RECOVERY] "
-                    f"completed templates={phase.get('completed_template_count', 0)}; "
-                    f"invalid/unsupported skipped={phase.get('invalid_template_count', 0)}; "
+                    f"completed exact templates={phase.get('completed_template_count', 0)}; "
+                    f"exact rejected={phase.get('invalid_template_count', 0)}; "
+                    f"engine tag fallback={phase.get('engine_tag_fallback_success', False)}; "
+                    f"global matchers={phase.get('global_matcher_template_count', 0)}; "
+                    f"global matchers enabled={phase.get('global_matchers_enabled', False)}; "
                     f"runtime failures={len(phase.get('runtime_template_failures') or [])}; "
                     f"timed out={len(phase.get('timed_out_templates') or [])}"
                 )
@@ -2734,6 +2739,41 @@ def log_result(profile: str, name: str, result: dict[str, Any], target: str = ""
                 "    [NUCLEI RESULT] No template matcher completed with positive evidence. "
                 "This does not mean the target is clean; inspect phase status, DAST input count, "
                 "template inventory and time-limit diagnostics above."
+            )
+
+    if name == "nikto":
+        metrics = result.get("scan_metrics") if isinstance(result.get("scan_metrics"), dict) else {}
+        structured = result.get("structured_report") if isinstance(result.get("structured_report"), dict) else {}
+        print(
+            "    [NIKTO COVERAGE] mode="
+            f"{result.get('execution_mode', 'unknown')}; requests={metrics.get('requests', 0)}; "
+            f"reported={metrics.get('items_reported', 0)}; hosts={metrics.get('hosts_tested', 0)}; "
+            f"report copied={structured.get('copied', False)}; report bytes={structured.get('bytes', 0)}; "
+            f"coverage verified={result.get('coverage_verified', False)}; "
+            f"zero verified={result.get('zero_result_verified', False)}; "
+            f"profile={result.get('scan_profile', 'unknown')}; "
+            f"plugins={result.get('plugins', 'unknown')}; tuning={result.get('safe_tuning', 'unknown')}; "
+            f"cgi_dirs={result.get('cgi_dirs', 'unknown')}"
+        )
+        docker_state = result.get("docker_state") if isinstance(result.get("docker_state"), dict) else {}
+        docker_create = result.get("docker_create") if isinstance(result.get("docker_create"), dict) else {}
+        if result.get("execution_mode", "").startswith("official_docker"):
+            print(
+                "    [NIKTO DOCKER] "
+                f"create_rc={docker_create.get('return_code', 'n/a')}; "
+                f"state_available={docker_state.get('available', False)}; "
+                f"exit={docker_state.get('ExitCode', 'n/a')}; "
+                f"state_error={docker_state.get('Error') or 'none'}; "
+                f"report_path={structured.get('path') or 'not-created'}; "
+                f"copy_attempts={len(structured.get('attempts') or [])}"
+            )
+        baseline = result.get("baseline_probe") if isinstance(result.get("baseline_probe"), dict) else {}
+        if baseline.get("performed"):
+            print(
+                "    [NIKTO BASELINE] "
+                f"status={baseline.get('status', 'n/a')}; server={baseline.get('server') or 'not-disclosed'}; "
+                f"signals={baseline.get('signal_count', 0)}; "
+                f"missing headers={','.join(baseline.get('missing_security_headers') or []) or 'none'}"
             )
 
 def aggregate_runs(tool: str, target: str, runs: list[dict[str, Any]]) -> dict[str, Any]:
@@ -2961,6 +3001,8 @@ async def run_pipeline(
                     ),
                     "max_observations": (100 if CURRENT_SCAN_MODE == "deep" else 50 if CURRENT_SCAN_MODE == "balanced" else 25),
                 })
+            if spec.name == "nikto":
+                arguments["scan_profile"] = CURRENT_SCAN_MODE
             if spec.name == "nuclei":
                 arguments["seed_urls"] = discovery[name].get("urls", [])
                 arguments["request_cases"] = discovery[name].get("request_cases", [])
