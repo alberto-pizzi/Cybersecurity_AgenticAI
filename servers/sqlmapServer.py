@@ -279,10 +279,59 @@ def _quick_sqli_probe(
     true_false_delta = abs(len(true_response.content) - len(false_response.content))
     blind_true = any(marker in true_lower for marker in BLIND_TRUE_MARKERS)
     blind_false = any(marker in false_lower for marker in BLIND_FALSE_MARKERS)
-    blind_confirmed = (
-        true_response.status_code == false_response.status_code == 200
-        and blind_true and blind_false
+    false_has_true_marker = any(marker in false_lower for marker in BLIND_TRUE_MARKERS)
+    true_has_false_marker = any(marker in true_lower for marker in BLIND_FALSE_MARKERS)
+    blind_marker_polarity = (
+        blind_true and blind_false
+        and not false_has_true_marker
+        and not true_has_false_marker
     )
+    blind_status_polarity = (
+        true_response.status_code < 400
+        and false_response.status_code >= 400
+        and baseline.status_code == true_response.status_code
+    )
+    blind_same_status = (
+        true_response.status_code == false_response.status_code == 200
+    )
+
+    # Some applications express the false branch with a deliberate 404 while
+    # the baseline and true branch remain HTTP 200.  Requiring both probes to
+    # return 200 caused a confirmed blind differential to fall through to a
+    # long SQLMap run.  Repeat marker/status polarity once before accepting the
+    # bounded verifier so a transient response cannot create a false positive.
+    blind_repeat_confirmed = False
+    if blind_marker_polarity and (blind_same_status or blind_status_polarity):
+        try:
+            repeat_true_url, repeat_true_data = _mutated_request(
+                target_url, method, data, parameter, payload_true
+            )
+            repeat_false_url, repeat_false_data = _mutated_request(
+                target_url, method, data, parameter, payload_false
+            )
+            repeat_true = _send_http(
+                repeat_true_url, cookies, method, repeat_true_data
+            )
+            repeat_false = _send_http(
+                repeat_false_url, cookies, method, repeat_false_data
+            )
+            repeat_true_lower = repeat_true.text.lower()
+            repeat_false_lower = repeat_false.text.lower()
+            repeat_marker_polarity = (
+                any(marker in repeat_true_lower for marker in BLIND_TRUE_MARKERS)
+                and any(marker in repeat_false_lower for marker in BLIND_FALSE_MARKERS)
+                and not any(marker in repeat_false_lower for marker in BLIND_TRUE_MARKERS)
+                and not any(marker in repeat_true_lower for marker in BLIND_FALSE_MARKERS)
+            )
+            repeat_status_polarity = (
+                repeat_true.status_code == true_response.status_code
+                and repeat_false.status_code == false_response.status_code
+            )
+            blind_repeat_confirmed = repeat_marker_polarity and repeat_status_polarity
+        except requests.RequestException:
+            blind_repeat_confirmed = False
+
+    blind_confirmed = blind_repeat_confirmed
     boolean_confirmed = (
         true_response.status_code < 400
         and false_response.status_code < 400
@@ -329,6 +378,9 @@ def _quick_sqli_probe(
         "true_false_byte_delta": true_false_delta,
         "blind_true_marker": blind_true,
         "blind_false_marker": blind_false,
+        "blind_marker_polarity": blind_marker_polarity,
+        "blind_status_polarity": blind_status_polarity,
+        "blind_repeat_confirmed": blind_repeat_confirmed,
         "blind_confirmed": blind_confirmed,
     }
 

@@ -18,6 +18,7 @@ from utils import failure, partial, read_json_lines, run_process, success
 mcp = FastMCP("Nuclei Scanner")
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
+CUSTOM_TEMPLATE_DIR = PROJECT_ROOT / "nuclei-templates-secops"
 
 # The official template repository contains some deliberately aggressive checks.
 # They remain excluded from automatic pipeline scans; the full safe HTTP pack is
@@ -56,6 +57,7 @@ TECHNOLOGY_MARKERS: dict[str, tuple[str, ...]] = {
     "phpmyadmin": ("phpmyadmin",),
 }
 MIN_EXPECTED_TEMPLATE_COUNT = 1000
+_TEMPLATE_CATALOG_CACHE: dict[str, tuple[float, list[dict[str, Any]]]] = {}
 
 
 def _as_list(value: Any) -> list[Any]:
@@ -75,6 +77,11 @@ def _finding(item: dict[str, Any], target_url: str) -> dict[str, Any]:
     request = str(item.get("request") or "")[:5000]
     response = str(item.get("response") or "")[:7000]
     severity = str(info.get("severity") or "info").lower()
+    metadata = info.get("metadata") if isinstance(info.get("metadata"), dict) else {}
+    metadata_category = str(metadata.get("secops-category") or metadata.get("secops_category") or "").lower()
+    category = metadata_category if metadata_category in {"vulnerability", "candidate", "observation", "discovery"} else ("observation" if severity == "info" else "vulnerability")
+    verification_status = str(metadata.get("secops-verification-status") or metadata.get("secops_verification_status") or "automated-template-match")
+    confidence = str(metadata.get("secops-confidence") or metadata.get("secops_confidence") or "high").lower()
 
     evidence_parts = [
         f"Template ID: {template_id}" if template_id else "",
@@ -91,9 +98,9 @@ def _finding(item: dict[str, Any], target_url: str) -> dict[str, Any]:
     return {
         "alert": str(info.get("name") or template_id or "Nuclei template match"),
         "risk": severity,
-        "category": "observation" if severity == "info" else "vulnerability",
-        "verification_status": "automated-template-match",
-        "confidence": "high",
+        "category": category,
+        "verification_status": verification_status,
+        "confidence": confidence,
         "description": str(info.get("description") or "").strip(),
         "impact": str(info.get("impact") or "").strip(),
         "solution": str(info.get("remediation") or "").strip(),
@@ -139,6 +146,35 @@ def _deduplicate(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
             unique.append(item)
     return unique
 
+
+
+def _custom_template_paths() -> list[str]:
+    """Return the project-managed, read-only Nuclei templates.
+
+    These small response-classification templates complement the official pack
+    and make exact discovered resources (for example a backup file or phpinfo
+    page) testable without asking Nuclei to enumerate thousands of paths again.
+    """
+    if not CUSTOM_TEMPLATE_DIR.is_dir():
+        return []
+    return [str(path.resolve()) for path in sorted(CUSTOM_TEMPLATE_DIR.glob("*.yaml")) if path.is_file()]
+
+
+def _evidence_target_score(value: str) -> int:
+    parsed = urlparse(str(value or ""))
+    path = parsed.path.lower()
+    score = 0
+    if any(token in path for token in (".env", ".git/", "phpinfo", "server-status", "swagger", "openapi")):
+        score += 180
+    if any(token in path for token in (".bak", ".dist", ".old", ".orig", "backup", "config", "debug", "dump", "database")):
+        score += 150
+    if any(token in path for token in ("/admin", "/api", "/docs", "/actuator", "/graphql")):
+        score += 90
+    if parsed.query and {name.lower() for name, _ in parse_qsl(parsed.query, keep_blank_values=True)} <= {"c", "n", "m", "s", "d", "o"}:
+        score += 80
+    if path.endswith("/"):
+        score += 15
+    return score
 
 
 def _fingerprint_targets(target_url: str, cookies: str, seed_urls: list[str] | None) -> dict[str, Any]:
@@ -232,7 +268,10 @@ def _command(
     request_timeout: int = 5,
     retries: int = 1,
     template_dir: str = "",
+    template_paths: list[str] | None = None,
     excluded_tags: str = "",
+    bulk_size: int = 4,
+    payload_concurrency: int = 8,
 ) -> list[str]:
     input_args = (
         ["-l", str(target_list), *(["-im", input_mode] if input_mode else [])]
@@ -245,14 +284,22 @@ def _command(
         "-jsonl", "-silent", "-nc",
         "-o", str(output_file),
         "-disable-update-check",
+        "-no-stdin",
+        *( ["-stream"] if target_list else [] ),
         "-timeout", str(max(2, request_timeout)),
         "-retries", str(max(0, retries)),
         "-c", str(max(1, concurrency)),
+        "-bs", str(max(1, bulk_size)),
+        "-pc", str(max(1, payload_concurrency)),
         "-rl", str(max(1, rate_limit)),
     ]
-    if template_dir:
+    exact_templates = [str(value) for value in (template_paths or []) if str(value)]
+    if exact_templates:
+        for template_path in exact_templates:
+            command.extend(["-t", template_path])
+    elif template_dir:
         command.extend(["-t", template_dir])
-    if tags:
+    if tags and not exact_templates:
         command.extend(["-tags", tags])
     if automatic_scan:
         command.append("-as")
@@ -397,27 +444,38 @@ def _filesystem_template_inventory() -> dict[str, Any]:
 
 
 def _template_inventory() -> dict[str, Any]:
-    # The CLI listing can stall on Windows even when the official repository is
-    # present. Filesystem inventory is therefore authoritative fallback and the
-    # selected directory is passed explicitly to every scan phase.
+    """Return a bounded filesystem inventory without enumerating every template through Nuclei.
+
+    ``nuclei -tl`` with an unrestricted official pack can itself take tens of
+    seconds on Windows.  The filesystem is authoritative when a complete pack
+    is present; the CLI probe is only used as a fallback for unusual layouts.
+    """
     filesystem = _filesystem_template_inventory()
-    result = run_process(
-        "Nuclei template inventory",
-        ["nuclei", "-tl", "-silent", "-nc", "-disable-update-check"],
-        target="templates",
-        timeout=45,
-    )
-    lines = {
-        line.strip()
-        for line in str(result.get("stdout", "")).splitlines()
-        if line.strip() and not line.lstrip().startswith("[")
+    filesystem_count = int(filesystem.get("count", 0))
+    result: dict[str, Any] = {
+        "status": "skipped",
+        "diagnosis": "filesystem_inventory_sufficient",
+        "stderr": "",
     }
-    cli_count = len(lines)
-    count = max(cli_count, int(filesystem.get("count", 0)))
+    cli_count = 0
+    if filesystem_count < MIN_EXPECTED_TEMPLATE_COUNT:
+        result = run_process(
+            "Nuclei template inventory",
+            ["nuclei", "-tl", "-silent", "-nc", "-disable-update-check"],
+            target="templates",
+            timeout=15,
+        )
+        lines = {
+            line.strip()
+            for line in str(result.get("stdout", "")).splitlines()
+            if line.strip() and not line.lstrip().startswith("[")
+        }
+        cli_count = len(lines)
+    count = max(cli_count, filesystem_count)
     return {
         "count": count,
         "cli_count": cli_count,
-        "filesystem_count": int(filesystem.get("count", 0)),
+        "filesystem_count": filesystem_count,
         "directory": str(filesystem.get("directory", "")),
         "dast_directory": str(filesystem.get("dast_directory", "")),
         "dast_count": int(filesystem.get("dast_count", 0)),
@@ -429,6 +487,162 @@ def _template_inventory() -> dict[str, Any]:
         "stderr_excerpt": str(result.get("stderr", ""))[-1200:],
     }
 
+
+def _template_catalog(template_root: Path) -> list[dict[str, Any]]:
+    """Build a lightweight metadata catalogue from the installed official pack."""
+    try:
+        stamp = template_root.stat().st_mtime
+    except OSError:
+        return []
+    key = str(template_root.resolve())
+    cached = _TEMPLATE_CATALOG_CACHE.get(key)
+    if cached and cached[0] == stamp:
+        return cached[1]
+
+    tag_re = re.compile(r"(?im)^\s*tags\s*:\s*(?:\[([^\]]*)\]|([^\r\n#]+))")
+    severity_re = re.compile(r"(?im)^\s*severity\s*:\s*[\"']?([a-z]+)")
+    name_re = re.compile(r"(?im)^\s*name\s*:\s*[\"']?([^\r\n\"']+)")
+    id_re = re.compile(r"(?im)^\s*id\s*:\s*[\"']?([^\r\n\"']+)")
+    rows: list[dict[str, Any]] = []
+    for path in template_root.rglob("*"):
+        if not path.is_file() or path.suffix.lower() not in {".yaml", ".yml"}:
+            continue
+        try:
+            relative = path.relative_to(template_root).as_posix()
+        except ValueError:
+            relative = path.name
+        relative_lower = relative.lower()
+        if any(token in relative_lower for token in ("/.git/", "/helpers/", "/workflows/")):
+            continue
+        try:
+            content = path.read_text(encoding="utf-8", errors="replace")[:24_000]
+        except OSError:
+            continue
+        tag_match = tag_re.search(content)
+        tag_text = (tag_match.group(1) or tag_match.group(2) or "") if tag_match else ""
+        tags = {
+            value.strip().strip("\"'").lower()
+            for value in re.split(r"[,\s]+", tag_text)
+            if value.strip().strip("\"'")
+        }
+        severity_match = severity_re.search(content)
+        name_match = name_re.search(content)
+        id_match = id_re.search(content)
+        rows.append({
+            "path": str(path.resolve()),
+            "relative": relative,
+            "relative_lower": relative_lower,
+            "tags": tags,
+            "severity": (severity_match.group(1).lower() if severity_match else "unknown"),
+            "name": (name_match.group(1).strip() if name_match else path.stem),
+            "id": (id_match.group(1).strip() if id_match else path.stem),
+        })
+    _TEMPLATE_CATALOG_CACHE[key] = (stamp, rows)
+    return rows
+
+
+def _phase_template_limit(scan_profile: str, phase_name: str) -> int:
+    limits = {
+        "fast": {"direct_evidence_classification": 8, "focused_exposures_and_misconfigurations": 8, "focused_high_impact_templates": 6, "fingerprint_relevant_templates": 4, "specialist_gap_dast": 4},
+        "balanced": {"direct_evidence_classification": 8, "focused_exposures_and_misconfigurations": 14, "focused_high_impact_templates": 12, "fingerprint_relevant_templates": 8, "specialist_gap_dast": 6},
+        "deep": {"direct_evidence_classification": 8, "focused_exposures_and_misconfigurations": 20, "focused_high_impact_templates": 18, "fingerprint_relevant_templates": 12, "specialist_gap_dast": 8},
+    }
+    return limits.get(scan_profile, limits["balanced"]).get(phase_name, 40)
+
+
+def _select_phase_templates(
+    catalog: list[dict[str, Any]],
+    definition: dict[str, Any],
+    technology_tags: list[str],
+    scan_profile: str,
+) -> list[dict[str, Any]]:
+    """Choose exact template files instead of loading broad tag collections."""
+    name = str(definition.get("name") or "")
+    technologies = {str(value).lower() for value in technology_tags if str(value)}
+    excluded = {value for value in (EXCLUDED_TAGS + "," + SPECIALIST_COVERED_TAGS).split(",") if value}
+    exposure_tags = {value for value in EXPOSURE_TAGS.split(",") if value}
+    high_tags = {value for value in HIGH_IMPACT_TAGS.split(",") if value}
+    dast_tags = {value for value in DAST_FOCUSED_TAGS.split(",") if value}
+    severity_score = {"critical": 35, "high": 25, "medium": 12, "low": 4, "info": 1, "unknown": 0}
+    ranked: list[tuple[int, str, dict[str, Any]]] = []
+
+    for item in catalog:
+        relative = str(item.get("relative_lower") or "")
+        tags = set(item.get("tags") or set())
+        severity = str(item.get("severity") or "unknown")
+        if tags & excluded and name != "specialist_gap_dast":
+            continue
+        is_dast = relative.startswith("dast/") or "/dast/" in relative
+        score = severity_score.get(severity, 0)
+
+        if name == "focused_exposures_and_misconfigurations":
+            if is_dast:
+                continue
+            if "http/exposures/" in relative:
+                score += 120
+            if "http/misconfiguration/" in relative:
+                score += 115
+            if "http/default-logins/" in relative:
+                score += 80
+            if "http/takeovers/" in relative:
+                score += 65
+            score += 35 * len(tags & exposure_tags)
+            if any(token in relative for token in ("backup", "config", "debug", "phpinfo", "git-", "swagger", "graphql", "panel", "exposure")):
+                score += 45
+            if score < 50:
+                continue
+        elif name == "focused_high_impact_templates":
+            if is_dast or tags & {"sqli", "xss", "cmdi", "lfi", "rfi", "path-traversal", "fuzz"}:
+                continue
+            impact_hits = tags & high_tags
+            impact_path = any(token in relative for token in ("auth-bypass", "rce", "ssrf", "xxe", "ssti", "deserial", "takeover"))
+            technology_cve = (
+                "http/cves/" in relative
+                and bool(technologies)
+                and bool((tags & technologies) or {tech for tech in technologies if tech in relative})
+                and severity in {"medium", "high", "critical"}
+            )
+            if not impact_hits and not impact_path and not technology_cve:
+                continue
+            score += 45 * len(impact_hits)
+            if technology_cve:
+                score += 90
+            if "http/cves/" in relative:
+                score += 20
+            if impact_path:
+                score += 55
+        elif name == "fingerprint_relevant_templates":
+            if is_dast or not technologies:
+                continue
+            if tags & {"sqli", "xss", "cmdi", "lfi", "rfi", "path-traversal", "fuzz", "exposure", "misconfig", "backup", "config"}:
+                continue
+            tech_hits = tags & technologies
+            path_hits = {tech for tech in technologies if tech in relative}
+            if not tech_hits and not path_hits:
+                continue
+            # Keep this phase for product/technology detection and product CVEs;
+            # exposure templates already ran in the first phase.
+            if not ("http/technologies/" in relative or "http/cves/" in relative or "detect" in relative):
+                continue
+            score += 90 * len(tech_hits) + 55 * len(path_hits)
+            if "http/technologies/" in relative:
+                score += 30
+            if "http/cves/" in relative and severity in {"medium", "high", "critical"}:
+                score += 45
+        elif name == "specialist_gap_dast":
+            if not is_dast:
+                continue
+            hits = tags & dast_tags
+            if not hits and not any(token in relative for token in ("ssrf", "xxe", "ssti", "deserial", "auth-bypass")):
+                continue
+            score += 80 * len(hits)
+        else:
+            continue
+        ranked.append((score, str(item.get("relative") or ""), item))
+
+    limit = _phase_template_limit(scan_profile, name)
+    selected = [item for _, _, item in sorted(ranked, key=lambda row: (-row[0], row[1]))[:limit]]
+    return selected
 
 def _attempt_template_refresh() -> dict[str, Any]:
     """Ask the installed Nuclei engine to restore its official template pack."""
@@ -470,8 +684,11 @@ def _run_phase(
     request_timeout: int = 5,
     retries: int = 1,
     template_dir: str = "",
+    template_paths: list[str] | None = None,
     excluded_tags: str = "",
     target_scope: str = "focused",
+    bulk_size: int = 4,
+    payload_concurrency: int = 8,
 ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     def execute(*, compatibility: bool) -> dict[str, Any]:
         return run_process(
@@ -494,7 +711,10 @@ def _run_phase(
                 request_timeout=request_timeout,
                 retries=retries,
                 template_dir=template_dir,
+                template_paths=template_paths,
                 excluded_tags=excluded_tags,
+                bulk_size=bulk_size,
+                payload_concurrency=payload_concurrency,
             ),
             target=target_url,
             timeout=timeout,
@@ -535,6 +755,10 @@ def _run_phase(
         fuzz_param_frequency=fuzz_param_frequency if dast else 0,
         excluded_tags=excluded_tags,
         target_scope=target_scope,
+        selected_template_count=len(template_paths or []),
+        selected_template_sample=[Path(value).name for value in (template_paths or [])[:20]],
+        bulk_size=bulk_size,
+        payload_concurrency=payload_concurrency,
     )
     return result, items
 
@@ -546,6 +770,7 @@ def _phase_definitions(
     total_timeout: int,
     has_dast_targets: bool = False,
     technology_tags: list[str] | None = None,
+    has_custom_templates: bool = False,
 ) -> list[dict[str, Any]]:
     """Build a small adaptive Nuclei plan that complements specialist scanners.
 
@@ -556,19 +781,29 @@ def _phase_definitions(
     """
     technology_tags = sorted(set(str(value).strip().lower() for value in (technology_tags or []) if str(value).strip()))
     if scan_profile == "fast":
-        desired = {"exposure": 35, "high": 45, "technology": 35, "dast": 50}
+        desired = {"direct": 14, "exposure": 18, "high": 20, "technology": 14, "dast": 18}
     elif scan_profile == "balanced":
-        desired = {"exposure": 50, "high": 65, "technology": 50, "dast": 70}
+        desired = {"direct": 18, "exposure": 30, "high": 38, "technology": 25, "dast": 35}
     else:
-        desired = {"exposure": 65, "high": 85, "technology": 70, "dast": 90}
+        desired = {"direct": 22, "exposure": 40, "high": 50, "technology": 35, "dast": 45}
 
-    phases: list[dict[str, Any]] = [
+    phases: list[dict[str, Any]] = []
+    if has_custom_templates:
+        phases.append({
+            "name": "direct_evidence_classification",
+            "severities": "info,low,medium,high,critical",
+            "tags": "secops",
+            "timeout": desired["direct"],
+            "target_scope": "evidence",
+            "excluded_tags": EXCLUDED_TAGS,
+        })
+    phases.extend([
         {
             "name": "focused_exposures_and_misconfigurations",
             "severities": "info,low,medium,high,critical",
             "tags": EXPOSURE_TAGS,
             "timeout": desired["exposure"],
-            "target_scope": "focused",
+            "target_scope": "evidence",
             "excluded_tags": EXCLUDED_TAGS,
         },
         {
@@ -579,7 +814,7 @@ def _phase_definitions(
             "target_scope": "base",
             "excluded_tags": EXCLUDED_TAGS + "," + SPECIALIST_COVERED_TAGS,
         },
-    ]
+    ])
     if technology_tags:
         phases.append({
             "name": "fingerprint_relevant_templates",
@@ -856,7 +1091,7 @@ def _run_nuclei_core(
             score += 20
         return score
 
-    profile_target_cap = 1 if scan_profile == "fast" else 2
+    profile_target_cap = 6 if scan_profile == "fast" else 10 if scan_profile == "balanced" else 16
     max_targets = max(1, min(int(max_targets), profile_target_cap))
     seed_candidates = [
         value for value in (seed_urls or [])
@@ -865,14 +1100,20 @@ def _run_nuclei_core(
         and _same_origin_url(target_url, value)
         and value != target_url
     ]
-    ranked_seeds = sorted(dict.fromkeys(seed_candidates), key=target_score, reverse=True)
+    ranked_seeds = sorted(dict.fromkeys(seed_candidates), key=lambda value: (_evidence_target_score(value), target_score(value), value), reverse=True)
     focused_targets = [target_url, *ranked_seeds[: max(0, max_targets - 1)]]
+    evidence_ranked = [value for value in ranked_seeds if _evidence_target_score(value) > 0]
+    evidence_targets = list(dict.fromkeys([target_url, *evidence_ranked[: max_targets]]))
     target_list = work_dir / f"{prefix}-targets.txt"
     target_list.write_text("\n".join(focused_targets) + "\n", encoding="utf-8")
+    evidence_target_list = work_dir / f"{prefix}-evidence-targets.txt"
+    evidence_target_list.write_text("\n".join(evidence_targets) + "\n", encoding="utf-8")
     base_target_list = work_dir / f"{prefix}-base-target.txt"
     base_target_list.write_text(target_url + "\n", encoding="utf-8")
 
     fingerprint = _fingerprint_targets(target_url, cookies, focused_targets)
+    catalog = _template_catalog(Path(template_dir)) if template_dir else []
+    custom_template_paths = _custom_template_paths()
     dast_cases = _focused_dast_request_cases(
         target_url,
         request_cases,
@@ -892,19 +1133,23 @@ def _run_nuclei_core(
     definitions = _phase_definitions(
         scan_profile, timeout, bool(dast_cases or dast_targets),
         technology_tags=list(fingerprint.get("tags") or []),
+        has_custom_templates=bool(custom_template_paths),
     )
     phase_paths = [work_dir / f"{prefix}-{index + 1}.jsonl" for index in range(len(definitions))]
     for phase_path in phase_paths:
         phase_path.unlink(missing_ok=True)
 
     if scan_profile == "deep":
-        concurrency, rate_limit, request_timeout, retries = 24, 100, 5, 1
+        concurrency, bulk_size, payload_concurrency = 20, 8, 8
+        rate_limit, request_timeout, retries = 120, 5, 0
         fuzz_aggression, fuzz_frequency = "medium", 18
     elif scan_profile == "balanced":
-        concurrency, rate_limit, request_timeout, retries = 18, 75, 4, 1
+        concurrency, bulk_size, payload_concurrency = 14, 6, 6
+        rate_limit, request_timeout, retries = 80, 4, 0
         fuzz_aggression, fuzz_frequency = "medium", 16
     else:
-        concurrency, rate_limit, request_timeout, retries = 10, 40, 3, 0
+        concurrency, bulk_size, payload_concurrency = 8, 4, 4
+        rate_limit, request_timeout, retries = 40, 3, 0
         fuzz_aggression, fuzz_frequency = "low", 12
 
     phases: list[dict[str, Any]] = []
@@ -920,14 +1165,39 @@ def _run_nuclei_core(
                 if is_dast
                 else base_target_list
                 if target_scope == "base"
+                else evidence_target_list
+                if target_scope == "evidence"
                 else target_list
             )
             input_mode = "jsonl" if is_dast and dast_request_count else ""
-            phase_template_dir = (
-                dast_template_dir
-                if is_dast and dast_template_dir
-                else template_dir
-            )
+            if str(definition.get("name") or "") == "direct_evidence_classification":
+                selected_templates = [
+                    {"path": value, "relative": Path(value).name, "relative_lower": Path(value).name.lower()}
+                    for value in custom_template_paths[:_phase_template_limit(scan_profile, "direct_evidence_classification")]
+                ]
+            else:
+                selected_templates = _select_phase_templates(
+                    catalog,
+                    definition,
+                    list(fingerprint.get("tags") or []),
+                    scan_profile,
+                )
+            if not selected_templates:
+                phases.append({
+                    "phase": definition.get("name"),
+                    "status": "skipped",
+                    "diagnosis": "no_applicable_templates_selected",
+                    "output": "No exact installed template matched this adaptive phase.",
+                    "phase_timeout_seconds": definition.get("timeout"),
+                    "phase_findings": 0,
+                    "phase_tags": definition.get("tags", ""),
+                    "selected_template_count": 0,
+                    "selected_template_sample": [],
+                    "target_scope": target_scope,
+                    "dast": is_dast,
+                })
+                continue
+            template_paths = [str(item.get("path") or "") for item in selected_templates]
             phase, items = _run_phase(
                 target_url,
                 cookies,
@@ -940,7 +1210,10 @@ def _run_nuclei_core(
                 rate_limit=rate_limit,
                 request_timeout=request_timeout,
                 retries=retries,
-                template_dir=phase_template_dir,
+                template_dir="",
+                template_paths=template_paths,
+                bulk_size=bulk_size,
+                payload_concurrency=payload_concurrency,
                 **definition,
             )
 
@@ -971,7 +1244,10 @@ def _run_nuclei_core(
                     rate_limit=rate_limit,
                     request_timeout=request_timeout,
                     retries=retries,
-                    template_dir=phase_template_dir,
+                    template_dir="",
+                    template_paths=template_paths,
+                    bulk_size=bulk_size,
+                    payload_concurrency=payload_concurrency,
                     **definition,
                 )
                 fallback_phase["request_log_fallback"] = True
@@ -1008,6 +1284,10 @@ def _run_nuclei_core(
                 "request_log_fallback": phase.get("request_log_fallback", False),
                 "target_scope": phase.get("target_scope", ""),
                 "excluded_tags": phase.get("excluded_tags", ""),
+                "selected_template_count": phase.get("selected_template_count", 0),
+                "selected_template_sample": phase.get("selected_template_sample", []),
+                "bulk_size": phase.get("bulk_size", 0),
+                "payload_concurrency": phase.get("payload_concurrency", 0),
                 "stderr_excerpt": str(phase.get("stderr", ""))[-1200:],
             }
             for phase in phases
@@ -1026,6 +1306,9 @@ def _run_nuclei_core(
                 f"regular_excluded_tags={EXCLUDED_TAGS}; dast_excluded_tags={DAST_EXCLUDED_TAGS}."
             ),
             "focused_targets": focused_targets,
+            "evidence_targets": evidence_targets,
+            "custom_template_count": len(custom_template_paths),
+            "custom_template_directory": str(CUSTOM_TEMPLATE_DIR),
             "dast_targets": dast_targets,
             "dast_request_cases": [
                 {
@@ -1039,6 +1322,8 @@ def _run_nuclei_core(
             "dast_input_mode": "jsonl" if dast_request_count else "list",
             "dast_template_directory": dast_template_dir,
             "technology_fingerprint": fingerprint,
+            "template_catalog_count": len(catalog),
+            "template_selection_strategy": "exact-files-from-local-metadata-catalog",
             "template_inventory": inventory,
             "template_refresh": refresh_result,
             "hard_failure": bool(hard_failures),

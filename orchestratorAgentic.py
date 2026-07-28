@@ -74,6 +74,7 @@ class AgentState(TypedDict):
     ai_timeout: int
     allow_state_changes: bool
     secondary_cookies: str
+    planner_audit: list[dict[str, Any]]
 
 
 REGISTRY = deterministic_core.agentic_registry()
@@ -602,7 +603,10 @@ def discovery_candidate_actions(state: AgentState) -> list[dict[str, Any]]:
                     "profile": name, "tool": "browser", "target_url": case["url"],
                     "method": case.get("method", "GET"), "data": case.get("data", ""),
                     "parameters": case.get("parameters", []), "jwt_token": "", "injection_url": "",
+                    "fields": case.get("fields", []),
                     "source_url": case.get("source_url", ""),
+                    "client_sources": case.get("client_sources", []),
+                    "client_sinks": case.get("client_sinks", []),
                     "reason": "Browser verification candidate derived from XSS-like parameters or client-side source/sink evidence.",
                 })
             for case in select_workflow_request_cases(
@@ -683,6 +687,8 @@ def validate_plan(state: AgentState, proposed: Any) -> list[dict[str, Any]]:
         parameters: list[str] = []
         source_url = ""
         fields: list[dict[str, Any]] = []
+        client_sources: list[str] = []
+        client_sinks: list[str] = []
         file_parameters: list[str] = []
         token_parameters: list[str] = []
         enctype = ""
@@ -750,6 +756,9 @@ def validate_plan(state: AgentState, proposed: Any) -> list[dict[str, Any]]:
             data = str(selected.get("data", ""))
             parameters = [str(value) for value in selected.get("parameters", [])]
             source_url = str(selected.get("source_url", ""))
+            fields = [dict(value) for value in selected.get("fields", []) if isinstance(value, dict)]
+            client_sources = [str(value) for value in selected.get("client_sources", []) if str(value)]
+            client_sinks = [str(value) for value in selected.get("client_sinks", []) if str(value)]
         elif scope == "workflow":
             cases = select_workflow_request_cases(found, limit=30)
             matching = [case for case in cases if str(case.get("url", "")) == target_url]
@@ -791,6 +800,7 @@ def validate_plan(state: AgentState, proposed: Any) -> list[dict[str, Any]]:
             "profile": profile, "tool": tool, "target_url": target_url,
             "method": method or "GET", "data": data, "parameters": parameters,
             "source_url": source_url, "fields": fields,
+            "client_sources": client_sources, "client_sinks": client_sinks,
             "file_parameters": file_parameters, "token_parameters": token_parameters,
             "enctype": enctype, "jwt_token": token, "injection_url": injection,
             "reason": str(raw.get("reason", ""))[:500] or "No planner reason supplied.",
@@ -1138,35 +1148,63 @@ def _materialize_missing_coverage(state: AgentState) -> dict[str, dict[str, Any]
     return results
 
 
+def _audit_action_summary(action: dict[str, Any]) -> dict[str, Any]:
+    """Return a bounded, secret-free action summary for the report audit."""
+    return {
+        "profile": str(action.get("profile") or ""),
+        "tool": str(action.get("tool") or ""),
+        "target_url": str(action.get("target_url") or ""),
+        "method": str(action.get("method") or "GET"),
+        "parameters": [str(value) for value in action.get("parameters", [])][:12],
+        "reason": str(action.get("reason") or "")[:500],
+    }
+
+
+def _coverage_group_counts(actions: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    grouped: dict[tuple[str, str], int] = {}
+    for action in actions:
+        key = _coverage_group_key(action)
+        grouped[key] = grouped.get(key, 0) + 1
+    return [
+        {"profile": profile, "tool": tool, "candidate_count": count}
+        for (profile, tool), count in sorted(grouped.items())
+    ]
+
+
 def planner_node(state: AgentState) -> dict[str, Any]:
     round_number = state["round"] + 1
     notes = list(state["notes"])
+    audit = list(state.get("planner_audit", []))
     eligible = _eligible_action_catalog(state)
     budget = ROUND_ACTION_BUDGETS.get(deterministic_core.CURRENT_SCAN_MODE, 20)
     planner_source = "ai"
     repair_summaries: list[str] = []
+    summary = ""
+    endpoint = "unavailable"
+    context_bytes = 0
+    ai_selected_count = 0
+    fallback_reason = ""
+    gaps: list[dict[str, Any]] = []
 
     try:
         decision = ollama_plan(state)
         proposed = decision.get("actions", [])
         ai_plan = validate_plan(state, proposed)
+        ai_selected_count = len(ai_plan)
         plan = _merge_ai_actions([], ai_plan, budget=budget)
         summary = str(decision.get("reasoning_summary", ""))[:1000]
 
         # A weak local model may return a syntactically valid but under-covered
-        # plan.  Repair is still agentic: Ollama receives discovery-derived
-        # candidate IDs and explicitly chooses which endpoints to add.  The
-        # orchestrator never inserts a candidate merely because it is eligible.
+        # plan. Repair remains agentic: Ollama explicitly chooses discovery-
+        # derived candidate IDs; the orchestrator never inserts a route merely
+        # because it is eligible.
         for repair_attempt in range(1, 3):
             gaps = _coverage_gaps(state, plan, eligible)
             if not gaps or len(plan) >= budget:
                 break
             try:
                 additions, repair_summary = ollama_coverage_repair(
-                    state,
-                    plan,
-                    gaps,
-                    attempt=repair_attempt,
+                    state, plan, gaps, attempt=repair_attempt,
                 )
             except Exception as repair_exc:
                 repair_summaries.append(
@@ -1205,15 +1243,9 @@ def planner_node(state: AgentState) -> dict[str, Any]:
             raise RuntimeError(
                 "Ollama returned no executable action despite applicable discovered candidates."
             )
-        finished = (
-            bool(decision.get("finish", False))
-            and not plan
-            and not eligible
-        )
+        finished = bool(decision.get("finish", False)) and not plan and not eligible
         endpoint = str(LAST_OLLAMA_PLAN_DIAGNOSTICS.get("endpoint", "unknown"))
-        context_bytes = int(
-            LAST_OLLAMA_PLAN_DIAGNOSTICS.get("context_bytes", 0) or 0
-        )
+        context_bytes = int(LAST_OLLAMA_PLAN_DIAGNOSTICS.get("context_bytes", 0) or 0)
         notes.append(
             f"Round {round_number} [{planner_source}/{endpoint}; "
             f"context={context_bytes}B]: {summary}"
@@ -1230,9 +1262,6 @@ def planner_node(state: AgentState) -> dict[str, Any]:
                 f"coverage repair: {type(exc).__name__}: {exc}"
             ) from exc
 
-        # The fallback is used only when the AI call itself cannot produce a
-        # usable plan.  It is generic and discovery-driven, but it is clearly
-        # labelled so a fallback run is never confused with a model decision.
         ordered_fallback = sorted(
             eligible,
             key=lambda action: (
@@ -1249,19 +1278,45 @@ def planner_node(state: AgentState) -> dict[str, Any]:
         )
         plan = ordered_fallback[:budget]
         finished = not plan
+        fallback_reason = f"{type(exc).__name__}: {exc}"
         message = (
             "AI planning/repair failed after streamed retries; the explicitly "
-            "labelled discovery-driven fallback was used: "
-            f"{type(exc).__name__}: {exc}"
+            "labelled discovery-driven fallback was used: " + fallback_reason
         )
         notes.append(message)
         planner_source = "fallback"
+        summary = message[:1000]
+        gaps = _coverage_gaps(state, plan, eligible)
         print(f"\n[!] {message}", file=sys.stderr, flush=True)
 
     if not plan and not eligible:
         finished = True
     elif not plan:
         finished = False
+
+    audit.append({
+        "round": round_number,
+        "planner_source": planner_source,
+        "planner_endpoint": endpoint,
+        "context_bytes": context_bytes,
+        "eligible_action_count": len(eligible),
+        "eligible_groups": _coverage_group_counts(eligible),
+        "round_action_budget": budget,
+        "ai_selected_action_count": ai_selected_count,
+        "repair_attempts": repair_summaries,
+        "fallback_reason": fallback_reason,
+        "selected_action_count": len(plan),
+        "selected_actions": [_audit_action_summary(action) for action in plan],
+        "remaining_coverage_gaps": [
+            {
+                "profile": str(gap.get("profile") or ""),
+                "tool": str(gap.get("tool") or ""),
+                "candidate_count": int(gap.get("candidate_count", 0) or 0),
+            }
+            for gap in gaps
+        ],
+        "reasoning_summary": summary[:1500],
+    })
 
     print(f"[*] Validated actions: {len(plan)}", flush=True)
     for action in plan:
@@ -1276,6 +1331,7 @@ def planner_node(state: AgentState) -> dict[str, Any]:
         "notes": notes,
         "finished": finished,
         "planner_source": planner_source,
+        "planner_audit": audit,
     }
 
 
@@ -1297,7 +1353,11 @@ async def execute_action(
             "method": action.get("method", "GET"),
             "data": action.get("data", ""),
             "parameter": (action.get("parameters") or [""])[0],
-            "timeout": 120 if deterministic_core.CURRENT_SCAN_MODE == "deep" else 75,
+            "timeout": (
+                120 if deterministic_core.CURRENT_SCAN_MODE == "deep"
+                else 75 if deterministic_core.CURRENT_SCAN_MODE == "balanced"
+                else 60
+            ),
         }
     else:
         arguments = {"target_url": action["target_url"], "cookies": cookies.get(action["profile"], "")}
@@ -1310,7 +1370,11 @@ async def execute_action(
             if action["tool"] == "exposure":
                 arguments.update({
                     "discovered_urls": profile_discovery.get("urls", []),
-                    "max_urls": 80 if deterministic_core.CURRENT_SCAN_MODE == "deep" else 45,
+                    "max_urls": (
+                        80 if deterministic_core.CURRENT_SCAN_MODE == "deep"
+                        else 45 if deterministic_core.CURRENT_SCAN_MODE == "balanced"
+                        else 20
+                    ),
                 })
             elif action["tool"] == "zap":
                 authenticated = bool(cookies.get(action["profile"], ""))
@@ -1324,16 +1388,20 @@ async def execute_action(
                         else "prioritized" if authenticated and deterministic_core.CURRENT_SCAN_MODE == "balanced"
                         else "passive"
                     ),
-                    "max_observations": 100 if deterministic_core.CURRENT_SCAN_MODE == "deep" else 50,
+                    "max_observations": (
+                        100 if deterministic_core.CURRENT_SCAN_MODE == "deep"
+                        else 50 if deterministic_core.CURRENT_SCAN_MODE == "balanced"
+                        else 25
+                    ),
                 })
             elif action["tool"] == "nuclei":
-                arguments["seed_urls"] = profile_discovery.get("html_urls", [])
+                arguments["seed_urls"] = profile_discovery.get("urls", [])
                 arguments["request_cases"] = profile_discovery.get("request_cases", [])
                 arguments["scan_profile"] = deterministic_core.CURRENT_SCAN_MODE
                 arguments["max_targets"] = (
-                    8 if deterministic_core.CURRENT_SCAN_MODE == "deep"
-                    else 4 if deterministic_core.CURRENT_SCAN_MODE == "balanced"
-                    else 1
+                    16 if deterministic_core.CURRENT_SCAN_MODE == "deep"
+                    else 10 if deterministic_core.CURRENT_SCAN_MODE == "balanced"
+                    else 6
                 )
             elif action["tool"] == "session":
                 probe_root = deterministic_core.select_session_probe_url(
@@ -1341,7 +1409,11 @@ async def execute_action(
                 )
                 arguments.update({
                     "probe_url": probe_root,
-                    "sample_count": 8 if deterministic_core.CURRENT_SCAN_MODE == "deep" else 5,
+                    "sample_count": (
+                        7 if deterministic_core.CURRENT_SCAN_MODE == "deep"
+                        else 5 if deterministic_core.CURRENT_SCAN_MODE == "balanced"
+                        else 3
+                    ),
                 })
         elif action["tool"] == "arjun":
             arguments.update({
@@ -1372,7 +1444,10 @@ async def execute_action(
                 "method": action.get("method", "GET"),
                 "data": action.get("data", ""),
                 "parameters": action.get("parameters", []),
+                "fields": action.get("fields", []),
                 "source_url": action.get("source_url", ""),
+                "client_sources": action.get("client_sources", []),
+                "client_sinks": action.get("client_sinks", []),
                 "allow_state_changes": local_authorized_state_changes,
             })
         elif action["tool"] == "workflow":
@@ -1684,11 +1759,31 @@ def executor_node(state: AgentState) -> dict[str, Any]:
         f"Round {state['round']} execution: new request contracts={new_attack_surface}; "
         f"remaining eligible actions={len(remaining)}."
     )
+    audit = [dict(item) for item in state.get("planner_audit", [])]
+    if audit and int(audit[-1].get("round", 0) or 0) == state["round"]:
+        outcome_rows: list[dict[str, Any]] = []
+        for profile, profile_results in results.items():
+            for key, result in profile_results.items():
+                if not isinstance(result, dict) or int(result.get("planner_round", 0) or 0) != state["round"]:
+                    continue
+                outcome_rows.append({
+                    "profile": profile,
+                    "result_key": key,
+                    "tool": str(result.get("tool") or key.split(":", 1)[0]),
+                    "status": str(result.get("status") or "unknown"),
+                    "diagnosis": str(result.get("diagnosis") or ""),
+                    "findings": len(result.get("vulnerabilities") or []),
+                    "duration_seconds": result.get("duration_seconds") or (result.get("_meta") or {}).get("duration_seconds"),
+                })
+        audit[-1]["execution_outcomes"] = outcome_rows
+        audit[-1]["new_request_contracts"] = new_attack_surface
+        audit[-1]["remaining_eligible_actions_after_execution"] = len(remaining)
     return {
         "results": results,
         "discovery": discovery,
         "completed": completed,
         "notes": notes,
+        "planner_audit": audit,
         "finished": not can_continue,
     }
 
@@ -1712,6 +1807,7 @@ def report_node(state: AgentState) -> dict[str, Any]:
         "ollama_url": state["ollama_url"],
         "strict_ai_required": state.get("require_ai", False),
         "planner_source": state.get("planner_source", "unknown"),
+        "planner_audit": state.get("planner_audit", []),
         "scan_mode": deterministic_core.CURRENT_SCAN_MODE,
         "runtime_platform": platform.platform(),
         "python_executable": sys.executable,
@@ -1913,6 +2009,7 @@ def main() -> int:
         "ai_timeout": planner_timeout,
         "allow_state_changes": args.allow_state_changes,
         "secondary_cookies": secondary_cookie,
+        "planner_audit": [],
     }
     started = time.time()
     try:

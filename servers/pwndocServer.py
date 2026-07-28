@@ -234,6 +234,26 @@ def _canonical_finding_url(value: str) -> str:
     return urlunparse((parsed.scheme.lower(), parsed.netloc.lower(), path, "", query, ""))
 
 
+def _finding_route_key(value: str) -> str:
+    """Normalize a finding URL by route and parameter names, not test values.
+
+    Corroborating scanners often use different payload values for the same
+    endpoint/parameter.  Using the raw query string made those confirmations
+    appear as separate vulnerabilities (and also split repeated LFI examples).
+    """
+    parsed = urlparse(str(value or ""))
+    pairs = parse_qsl(parsed.query, keep_blank_values=True)
+    names = sorted({name.lower() for name, _ in pairs if name})
+    if names and set(names) <= AUTO_INDEX_QUERY_KEYS:
+        query = ""
+    else:
+        query = urlencode([(name, "*") for name in names])
+    path = parsed.path or "/"
+    if path != "/":
+        path = path.rstrip("/")
+    return urlunparse((parsed.scheme.lower(), parsed.netloc.lower(), path, "", query, ""))
+
+
 def _finding_family(row: dict[str, Any]) -> str:
     alert = str(row.get("alert") or "").lower()
     verification = str(row.get("verification_status") or "").lower()
@@ -328,7 +348,7 @@ def flatten_findings(results: dict[str, Any]) -> list[dict[str, Any]]:
             if row.get("category") in {"vulnerability", "candidate"}:
                 family = _finding_family(row)
                 parameter = str(row.get("parameter") or "").lower()
-                fingerprint = (family, canonical_url, parameter)
+                fingerprint = (family, _finding_route_key(str(row.get("url") or "")), parameter)
             else:
                 fingerprint = (
                     str(row.get("tool") or ""),
@@ -704,11 +724,42 @@ def _render_html(payload: dict[str, Any]) -> str:
         "<h2>Security findings at a glance</h2><p>No confirmed vulnerabilities or validation candidates were recorded.</p>"
     )
 
+    context_value = _redact_value(payload.get("assessment_context") or {})
     context_json = json.dumps(
-        _redact_value(payload.get("assessment_context") or {}),
+        context_value,
         indent=2,
         ensure_ascii=False,
         default=str,
+    )
+    planner_audit = context_value.get("planner_audit", []) if isinstance(context_value, dict) else []
+    audit_rows = ""
+    audit_details: list[str] = []
+    for item in planner_audit if isinstance(planner_audit, list) else []:
+        if not isinstance(item, dict):
+            continue
+        outcomes = item.get("execution_outcomes", []) if isinstance(item.get("execution_outcomes"), list) else []
+        audit_rows += (
+            "<tr>"
+            f"<td>{_esc(item.get('round',''))}</td>"
+            f"<td>{_esc(item.get('planner_source',''))}</td>"
+            f"<td>{_esc(item.get('eligible_action_count',0))}</td>"
+            f"<td>{_esc(item.get('ai_selected_action_count',0))}</td>"
+            f"<td>{_esc(item.get('selected_action_count',0))}</td>"
+            f"<td>{_esc(len(item.get('remaining_coverage_gaps',[]) or []))}</td>"
+            f"<td>{_esc(len(outcomes))}</td>"
+            "</tr>"
+        )
+        audit_details.append(
+            f"<details><summary>Round {_esc(item.get('round',''))}: {_esc(item.get('planner_source',''))}</summary>"
+            f"<p><b>Planner summary:</b> {_esc(item.get('reasoning_summary',''))}</p>"
+            f"<pre>{_esc(json.dumps(item, indent=2, ensure_ascii=False, default=str))}</pre></details>"
+        )
+    agentic_audit_html = (
+        "<h2>Agentic planning audit</h2>"
+        "<p class='section-note'>This section records model-selected actions, coverage repair, fallback use and execution outcomes. It contains concise planner summaries, not hidden chain-of-thought.</p>"
+        "<table><thead><tr><th>Round</th><th>Planner</th><th>Eligible</th><th>AI selected</th><th>Executed plan</th><th>Gaps</th><th>Outcomes</th></tr></thead>"
+        f"<tbody>{audit_rows}</tbody></table>{''.join(audit_details)}"
+        if audit_rows else ""
     )
     return f"""<!doctype html><html><head><meta charset="utf-8"><title>SecOps Assessment Report</title>
 <style>
@@ -739,6 +790,7 @@ details{{margin-top:14px}}.section-note{{background:#eaf1f7;border-left:4px soli
 {detail_cap_note}
 <h2>Scope and assessment context</h2>
 <details><summary>Profiles, discovery counts and configured limits</summary><pre>{_esc(context_json)}</pre></details>
+{agentic_audit_html}
 
 <h2>Assessment execution</h2>
 <p class="section-note">This section records tools, targets, duration and execution status. It is deliberately separate from security findings.</p>
@@ -890,9 +942,52 @@ def _build_pdf(path: Path, payload: dict[str, Any]) -> None:
         ("VALIGN", (0, 0), (-1, -1), "TOP"),
         ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, colors.HexColor("#F4F7FA")]),
     ]))
+    story.extend([scope_table, Spacer(1, 8)])
+
+    planner_audit = context.get("planner_audit") if isinstance(context.get("planner_audit"), list) else []
+    if planner_audit:
+        story.append(Paragraph("Agentic planning audit", styles["Heading2"]))
+        story.append(Paragraph(
+            "Model-selected actions, coverage repair, fallback use and execution outcomes are recorded here. "
+            "The summaries are concise planner outputs, not hidden chain-of-thought.",
+            section_note,
+        ))
+        audit_data = [[Paragraph(value, header) for value in (
+            "Round", "Planner", "Eligible", "AI selected", "Plan", "Gaps", "Outcomes"
+        )]]
+        for item in planner_audit:
+            if not isinstance(item, dict):
+                continue
+            outcomes = item.get("execution_outcomes", []) if isinstance(item.get("execution_outcomes"), list) else []
+            audit_data.append([
+                Paragraph(_p(item.get("round", "")), small),
+                Paragraph(_p(item.get("planner_source", "")), small),
+                Paragraph(_p(item.get("eligible_action_count", 0)), small),
+                Paragraph(_p(item.get("ai_selected_action_count", 0)), small),
+                Paragraph(_p(item.get("selected_action_count", 0)), small),
+                Paragraph(_p(len(item.get("remaining_coverage_gaps", []) or [])), small),
+                Paragraph(_p(len(outcomes)), small),
+            ])
+        audit_table = Table(audit_data, colWidths=[36, 78, 58, 66, 48, 44, 55], repeatRows=1)
+        audit_table.setStyle(TableStyle([
+            ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#365D7D")),
+            ("GRID", (0, 0), (-1, -1), .35, colors.HexColor("#B8C2CC")),
+            ("VALIGN", (0, 0), (-1, -1), "TOP"),
+            ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, colors.HexColor("#F4F7FA")]),
+        ]))
+        story.append(audit_table)
+        for item in planner_audit:
+            if not isinstance(item, dict):
+                continue
+            summary_text = str(item.get("reasoning_summary") or "").strip()
+            if summary_text:
+                story.append(Paragraph(
+                    f"<b>Round {_p(item.get('round',''))} summary:</b> {_p(summary_text)}",
+                    small,
+                ))
+        story.append(Spacer(1, 8))
+
     story.extend([
-        scope_table,
-        Spacer(1, 8),
         Paragraph("Assessment execution", styles["Heading2"]),
         Paragraph(
             "Tool execution is listed separately from findings. A time-limited or "

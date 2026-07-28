@@ -6,6 +6,8 @@ import html
 import os
 import re
 import sys
+import time
+import uuid
 from pathlib import Path
 from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 
@@ -101,91 +103,101 @@ def _command_canary(
     method: str,
     data: str,
     parameters: list[str],
+    timeout: int = 25,
 ) -> dict[str, Any]:
+    """Attempt a harmless, bounded response-marker confirmation first.
+
+    Network-like parameters use 127.0.0.1 instead of the crawler's placeholder
+    value.  A placeholder such as ``1`` can make ping wait long enough that the
+    appended marker command never executes before the HTTP timeout.
+    """
     candidates = [value for value in parameters if value.lower() in COMMAND_PARAMETERS]
     if not candidates:
-        return {"performed": False, "confirmed": False}
-    import requests as http_requests
+        return {"performed": False, "confirmed": False, "reason": "no_command_like_parameter"}
+
     parameter = candidates[0]
-    marker = "SECOPS_CMD_4E91"
+    marker = f"SECOPS_CMD_{uuid.uuid4().hex[:10].upper()}"
     suffixes = (
-        f";printf {marker}",
-        f"; echo {marker}; #",
+        f"; printf '{marker}'",
+        f"; echo {marker}",
         f"&& echo {marker}",
-        f"|| echo {marker}",
         f"| echo {marker}",
-        f"; /bin/echo {marker}",
+        f"& echo {marker}",
     )
     headers = {
         "Cache-Control": "no-cache",
-        "User-Agent": "SecOps-Command-Injection-Verifier/2.0",
+        "User-Agent": "SecOps-Command-Injection-Verifier/3.0",
     }
     if cookies:
         headers["Cookie"] = cookies
-    source_pairs = (
-        parse_qsl(urlparse(target_url).query, keep_blank_values=True)
-        if method == "GET" else parse_qsl(data, keep_blank_values=True)
-    )
-    current = next((value for name, value in source_pairs if name.lower() == parameter.lower()), "")
-    base_value = current.strip() or (
-        "127.0.0.1" if parameter.lower() in {"ip", "host", "hostname", "target", "domain"} else "echo"
-    )
-    attempts: list[dict[str, Any]] = []
 
-    def send(request_method: str, request_url: str, request_data: str = "") -> requests.Response:
-        last: requests.RequestException | None = None
-        for attempt in range(3):
-            try:
-                return http_requests.request(
-                    request_method, request_url,
-                    data=request_data if request_method != "GET" else None,
-                    headers=headers, timeout=(4, 16), allow_redirects=True,
-                )
-            except (http_requests.Timeout, http_requests.ConnectionError) as exc:
-                last = exc
-                if attempt < 2:
-                    import time as _time
-                    _time.sleep(0.7 * (attempt + 1))
-            except http_requests.RequestException:
-                raise
-        assert last is not None
-        raise last
+    network_parameter = parameter.lower() in {"ip", "host", "hostname", "target", "domain"}
+    base_value = "127.0.0.1" if network_parameter else "echo"
+    attempts: list[dict[str, Any]] = []
+    deadline = time.monotonic() + max(8, min(int(timeout), 35))
+
+    def mutate(value: str) -> tuple[str, str]:
+        if method == "GET":
+            parsed = urlparse(target_url)
+            pairs = parse_qsl(parsed.query, keep_blank_values=True)
+            changed: list[tuple[str, str]] = []
+            replaced = False
+            for name, current in pairs:
+                if not replaced and name.lower() == parameter.lower():
+                    changed.append((name, value)); replaced = True
+                else:
+                    changed.append((name, current))
+            if not replaced:
+                changed.append((parameter, value))
+            return urlunparse(parsed._replace(query=urlencode(changed))), ""
+        pairs = parse_qsl(data, keep_blank_values=True)
+        changed = []
+        replaced = False
+        for name, current in pairs:
+            if not replaced and name.lower() == parameter.lower():
+                changed.append((name, value)); replaced = True
+            else:
+                changed.append((name, current))
+        if not replaced:
+            changed.append((parameter, value))
+        return target_url, urlencode(changed)
+
+    def send(value: str) -> requests.Response:
+        request_url, request_data = mutate(value)
+        remaining = max(3.0, deadline - time.monotonic())
+        return requests.request(
+            method,
+            request_url,
+            data=request_data if method != "GET" else None,
+            headers=headers,
+            timeout=(3, min(8.0, remaining)),
+            allow_redirects=True,
+        )
+
+    baseline: dict[str, Any] = {}
+    try:
+        response = send(base_value)
+        baseline = {
+            "status": response.status_code,
+            "final_url": str(response.url),
+            "response_bytes": len(response.content),
+            "marker_absent": marker not in html.unescape(response.text),
+        }
+    except requests.RequestException as exc:
+        baseline = {"error": f"{type(exc).__name__}: {exc}", "marker_absent": True}
 
     for command_suffix in suffixes:
+        if time.monotonic() >= deadline - 2:
+            break
         injected_value = f"{base_value}{command_suffix}"
+        request_url, request_data = mutate(injected_value)
         try:
-            if method == "GET":
-                parsed = urlparse(target_url)
-                pairs = parse_qsl(parsed.query, keep_blank_values=True)
-                changed, replaced = [], False
-                for name, value in pairs:
-                    if not replaced and name.lower() == parameter.lower():
-                        changed.append((name, injected_value)); replaced = True
-                    else:
-                        changed.append((name, value))
-                if not replaced:
-                    changed.append((parameter, injected_value))
-                request_url = urlunparse(parsed._replace(query=urlencode(changed)))
-                request_data = ""
-                response = send("GET", request_url)
-            else:
-                pairs = parse_qsl(data, keep_blank_values=True)
-                changed, replaced = [], False
-                for name, value in pairs:
-                    if not replaced and name.lower() == parameter.lower():
-                        changed.append((name, injected_value)); replaced = True
-                    else:
-                        changed.append((name, value))
-                if not replaced:
-                    changed.append((parameter, injected_value))
-                request_url = target_url
-                request_data = urlencode(changed)
-                response = send(method, target_url, request_data)
+            response = send(injected_value)
         except requests.RequestException as exc:
             attempts.append({"payload_suffix": command_suffix, "error": f"{type(exc).__name__}: {exc}"})
             continue
         decoded_body = html.unescape(response.text)
-        confirmed = marker in decoded_body
+        confirmed = bool(baseline.get("marker_absent", True)) and marker in decoded_body
         attempt = {
             "payload_suffix": command_suffix,
             "status": response.status_code,
@@ -199,15 +211,25 @@ def _command_canary(
         attempts.append(attempt)
         if confirmed:
             return {
-                "performed": True, "confirmed": True,
-                "parameter": parameter, "marker": marker,
-                "payload_suffix": command_suffix, "base_value": base_value,
-                "attempts": attempts, **attempt,
+                "performed": True,
+                "confirmed": True,
+                "parameter": parameter,
+                "marker": marker,
+                "payload_suffix": command_suffix,
+                "base_value": base_value,
+                "baseline": baseline,
+                "attempts": attempts,
+                **attempt,
             }
     return {
-        "performed": True, "confirmed": False,
-        "parameter": parameter, "marker": marker,
-        "base_value": base_value, "attempts": attempts,
+        "performed": True,
+        "confirmed": False,
+        "parameter": parameter,
+        "marker": marker,
+        "base_value": base_value,
+        "baseline": baseline,
+        "attempts": attempts,
+        "canary_budget_seconds": max(8, min(int(timeout), 35)),
     }
 
 
@@ -225,7 +247,7 @@ def _canary_finding(
         "category": "vulnerability",
         "verification_status": "unique-response-marker-command-execution-confirmed",
         "confidence": "high",
-        "description": "A benign shell printf command appended to the selected input produced a unique server-side marker in the HTTP response. The marker was not present in the original input value and therefore confirms operating-system command execution.",
+        "description": "A benign shell output command appended to the selected input produced a unique server-side marker in the HTTP response. The marker was not present in the original input value and therefore confirms operating-system command execution.",
         "attack_preconditions": "An attacker must be able to submit the affected parameter to the command-execution handler.",
         "impact": "The attacker can execute operating-system commands with the web-server account's privileges, read accessible files and secrets, modify application data, and potentially pivot to other services reachable from the container or host.",
         "solution": "Remove shell command construction from untrusted input. Use a dedicated networking or process API, enforce a strict allow-list, avoid invoking a shell, and run the service under a minimally privileged account.",
@@ -276,7 +298,11 @@ def run_commix_scan(
     session_probe = scanner_session_probe(target_url, cookies, method, data)
     if cookies and session_probe.get("performed") and session_probe.get("conclusive") and session_probe.get("authenticated") is False:
         return partial("Commix", target_url, "Commix was not started because the authenticated request redirected to a login page.", diagnosis="authentication_precheck_failed", timed_out=False, vulnerabilities=[], session_probe=session_probe)
-    canary = _command_canary(target_url, cookies, method, data, parameters)
+    started = time.monotonic()
+    canary = _command_canary(
+        target_url, cookies, method, data, parameters,
+        timeout=max(8, min(35, timeout // 2)),
+    )
     canary_findings = _canary_finding(target_url, method, canary)
     if canary_findings:
         return success("Commix", target_url, "A bounded response-marker canary confirmed command execution; the slower Commix phase was not required.", vulnerabilities=canary_findings, command_injection_found=True, request_method=method, tested_parameters=parameters, authenticated=bool(cookies), session_probe=session_probe, command_canary=canary, execution_mode="direct_canary")
@@ -288,12 +314,25 @@ def run_commix_scan(
             diagnosis="missing_commix_script",
         )
 
+    elapsed_canary = max(0, int(time.monotonic() - started))
+    remaining_budget = max(10, timeout - elapsed_canary - 3)
+    if remaining_budget < 20:
+        return partial(
+            "Commix", target_url,
+            "The bounded response-marker check was inconclusive and consumed the available scanner budget; the slower Commix phase was not started.",
+            diagnosis="bounded_canary_inconclusive",
+            timed_out=False, vulnerabilities=[], request_method=method,
+            tested_parameters=parameters, authenticated=bool(cookies),
+            session_probe=session_probe, command_canary=canary,
+            execution_mode="direct_canary_only",
+        )
+
     command = [
         sys.executable, str(script),
         "--url", target_url,
         "--batch", "--level", "1",
         "--timeout", "5", "--retries", "0", "--drop-set-cookie",
-        "--time-limit", str(max(30, timeout - 15)),
+        "--time-limit", str(max(15, remaining_budget - 5)),
     ]
     if data:
         command.extend(["--data", data])
@@ -306,7 +345,7 @@ def run_commix_scan(
         "Commix",
         command,
         target=target_url,
-        timeout=timeout,
+        timeout=remaining_budget,
         accepted_codes=(0, 1),
         cwd=script.parent,
     )

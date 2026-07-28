@@ -64,7 +64,7 @@ SCAN_MODES = {
     },
     "deep": {
         "broad": {"zap": 900, "nuclei": 360, "nikto": 180, "ffuf": 120, "exposure": 75, "session": 50},
-        "parameter": {"sqlmap": 240, "dalfox": 180, "commix": 150, "traversal": 90, "idor": 45, "authorization": 60, "browser": 120, "workflow": 90},
+        "parameter": {"sqlmap": 240, "dalfox": 180, "commix": 90, "traversal": 90, "idor": 45, "authorization": 60, "browser": 120, "workflow": 90},
         "limits": {"sqlmap": 5, "dalfox": 4, "commix": 2, "traversal": 3, "idor": 3, "authorization": 5, "browser": 4, "workflow": 5},
         "arjun": 90,
         "arjun_limit": 3,
@@ -1671,6 +1671,41 @@ def _case_parameters(case: dict[str, Any]) -> set[str]:
     return parameters
 
 
+def _prefer_browser_for_xss_case(case: dict[str, Any]) -> bool:
+    """Return True when a real browser is better suited than Dalfox CLI.
+
+    Stored/multi-step forms and DOM-only select/source contracts repeatedly
+    consumed Dalfox's full budget without adding evidence.  Chromium receives
+    the complete fields and client-side source/sink metadata for these cases.
+    """
+    method = str(case.get("method", "GET")).upper()
+    fields = [item for item in case.get("fields", []) if isinstance(item, dict)]
+    field_types = {
+        str(item.get("type") or item.get("tag") or "").lower()
+        for item in fields
+    }
+    names = {str(item.get("name") or "").lower() for item in fields}
+    path = urlparse(str(case.get("url", ""))).path.lower()
+    stored_shape = (
+        method == "POST"
+        and (
+            "textarea" in field_types
+            or bool(names & {"message", "comment", "content", "body", "description", "bio"})
+            or any(token in path for token in ("guestbook", "comment", "message", "feedback", "stored"))
+        )
+    )
+    dom_shape = (
+        method == "GET"
+        and (
+            "select" in field_types
+            or bool(case.get("client_sources"))
+            or bool(case.get("client_side_evidence"))
+        )
+        and any(token in path for token in ("xss", "dom", "javascript", "client"))
+    )
+    return stored_shape or dom_shape
+
+
 def _tool_case_priority(tool: str, case: dict[str, Any]) -> int:
     """Score request cases for the scanner that is actually suited to them."""
     if _is_auto_index_case(case):
@@ -1702,6 +1737,11 @@ def _tool_case_priority(tool: str, case: dict[str, Any]) -> int:
         return score
 
     if tool == "dalfox":
+        # Browser verification is authoritative for stored and DOM-only
+        # contracts.  Keep Dalfox focused on reflected server-side inputs where
+        # it is fast and productive instead of spending two full timeout slots.
+        if _prefer_browser_for_xss_case(case):
+            return -1000
         score += 45 if any(token in path for token in ("xss", "comment", "message", "search", "feedback")) else 0
         score += 10 * len(parameters & XSS_HINTS)
         if any(token in path for token in ("sqli", "/exec", "/csp")) and not (parameters & XSS_HINTS):
@@ -1753,6 +1793,8 @@ def _tool_case_skip_reason(tool: str, case: dict[str, Any]) -> str:
         return "The request has no testable application parameter for this parameter scanner."
     if _is_auto_index_case(case):
         return "Directory-index sorting parameters are navigation controls, not application inputs."
+    if tool == "dalfox" and _prefer_browser_for_xss_case(case):
+        return "Stored or DOM-oriented XSS contracts are delegated to the Chromium verifier, which can execute JavaScript and revisit state."
     if tool in {"dalfox", "commix"} and _is_login_case(case):
         return f"{tool} is not suited to the generic login form; SQLMap remains available for SQL-injection checks."
     if tool == "sqlmap" and "brute" in urlparse(str(case.get("url", ""))).path.lower():
@@ -1835,7 +1877,16 @@ def _case_field_names(case: dict[str, Any]) -> set[str]:
     return names
 
 
-def _browser_case_priority(case: dict[str, Any], client_urls: set[str]) -> int:
+def _browser_url_key(value: str) -> tuple[str, str, int, str]:
+    parsed = urlparse(str(value or ""))
+    port = parsed.port or (443 if parsed.scheme.lower() == "https" else 80)
+    path = re.sub(r"/+", "/", parsed.path or "/")
+    if path != "/":
+        path = path.rstrip("/")
+    return parsed.scheme.lower(), (parsed.hostname or "").lower(), port, path.lower()
+
+
+def _browser_case_priority(case: dict[str, Any], client_keys: set[tuple[str, str, int, str]]) -> int:
     url = str(case.get("url", ""))
     path = urlparse(url).path.lower()
     if _is_auto_index_case(case) or _destructive_crawl_url(url):
@@ -1844,8 +1895,9 @@ def _browser_case_priority(case: dict[str, Any], client_urls: set[str]) -> int:
     path_match = any(token in path for token in ("xss", "dom", "comment", "message", "feedback", "search", "query", "profile", "preview"))
     xss_hits = parameters & XSS_HINTS
     client_match = (
-        url in client_urls
-        or (str(case.get("source_url") or "") in client_urls and bool(xss_hits))
+        _browser_url_key(url) in client_keys
+        or _browser_url_key(str(case.get("source_url") or "")) in client_keys
+        or bool(case.get("client_sources"))
     )
     score = 0
     if path_match:
@@ -1855,6 +1907,12 @@ def _browser_case_priority(case: dict[str, Any], client_urls: set[str]) -> int:
         score += 18
     if client_match:
         score += 100
+    # Prefer a real parameterized request contract over a synthetic client-only
+    # page so Chromium mutates the same query/body discovered by the crawler.
+    if case.get("client_side_only"):
+        score -= 35
+    if case.get("parameters"):
+        score += 20
     if _is_login_case(case):
         score -= 60
     return score
@@ -1864,36 +1922,81 @@ def select_browser_request_cases(
     discovery: dict[str, Any],
     limit: int | None = None,
 ) -> list[dict[str, Any]]:
-    """Select real request contracts and DOM-source/sink pages for Chromium verification."""
+    """Select request contracts while preserving client-side source/sink evidence.
+
+    Client-side discovery often reports the route without its example query
+    string (for example ``/page/``), while the form crawler records a real
+    contract such as ``/page/?default=1``.  These are merged by same-origin path
+    so the browser receives the actual parameter rather than a parameterless
+    synthetic duplicate.
+    """
     effective_limit = limit or PARAMETER_TOOL_CASE_LIMITS.get("browser", 2)
-    client_urls = {
-        str(item.get("url") or "")
+    raw_client = [
+        dict(item)
         for item in discovery.get("client_side_candidates", [])
         if isinstance(item, dict) and str(item.get("url") or "")
-    }
+    ]
+    client_by_key: dict[tuple[str, str, int, str], list[dict[str, Any]]] = {}
+    for item in raw_client:
+        client_by_key.setdefault(_browser_url_key(str(item.get("url") or "")), []).append(item)
+    client_keys = set(client_by_key)
+
     cases = [dict(case) for case in discovery.get("request_cases", []) if isinstance(case, dict)]
-    known_urls = {str(case.get("url") or "") for case in cases}
-    for url in sorted(client_urls):
-        if url in known_urls:
+    matched_client_keys: set[tuple[str, str, int, str]] = set()
+    for case in cases:
+        keys = {
+            _browser_url_key(str(case.get("url") or "")),
+            _browser_url_key(str(case.get("source_url") or "")),
+        }
+        evidence = [item for key in keys for item in client_by_key.get(key, [])]
+        if not evidence:
             continue
+        matched_client_keys.update(keys & client_keys)
+        case["client_sources"] = sorted({
+            str(value)
+            for item in evidence
+            for value in item.get("sources", [])
+            if str(value)
+        })
+        case["client_sinks"] = sorted({
+            str(value)
+            for item in evidence
+            for value in item.get("sinks", [])
+            if str(value)
+        })
+        case["client_side_evidence"] = evidence
+
+    for key, evidence in sorted(client_by_key.items(), key=lambda item: item[0]):
+        if key in matched_client_keys:
+            continue
+        url = str(evidence[0].get("url") or "")
         cases.append({
             "url": url,
             "method": "GET",
             "data": "",
             "parameters": [name for name, _ in parse_qsl(urlparse(url).query, keep_blank_values=True)],
+            "fields": [],
             "source_url": url,
             "client_side_only": True,
+            "client_sources": sorted({str(value) for item in evidence for value in item.get("sources", []) if str(value)}),
+            "client_sinks": sorted({str(value) for item in evidence for value in item.get("sinks", []) if str(value)}),
+            "client_side_evidence": evidence,
         })
+
     ranked = sorted(
-        (( _browser_case_priority(case, client_urls), -index, case) for index, case in enumerate(cases)),
+        ((_browser_case_priority(case, client_keys), -index, case) for index, case in enumerate(cases)),
         key=lambda item: (-item[0], -item[1]),
     )
     selected: list[dict[str, Any]] = []
-    seen: set[tuple[str, str]] = set()
+    seen: set[tuple[str, tuple[str, str, int, str], tuple[str, ...]]] = set()
     for score, _, case in ranked:
         if score <= 0:
             continue
-        key = (str(case.get("method", "GET")).upper(), str(case.get("url", "")))
+        key = (
+            str(case.get("method", "GET")).upper(),
+            _browser_url_key(str(case.get("url", ""))),
+            tuple(sorted(str(value) for value in case.get("parameters", []))),
+        )
         if key in seen:
             continue
         seen.add(key)
@@ -1901,7 +2004,6 @@ def select_browser_request_cases(
         if len(selected) >= effective_limit:
             break
     return selected
-
 
 def _workflow_case_priority(case: dict[str, Any]) -> int:
     if str(case.get("method", "GET")).upper() != "POST":
@@ -2148,13 +2250,16 @@ def select_arjun_request_cases(
     target: str,
     limit: int = MAX_ARJUN_ENDPOINTS,
 ) -> list[dict[str, Any]]:
-    """Select real GET/POST request contracts for Arjun.
+    """Select only endpoints where hidden-name discovery adds real coverage.
 
-    Existing code passed POST-only handlers to Arjun while forcing `-m GET`.
-    This function preserves the discovered method and form body and excludes
-    login/state-changing utility pages.
+    Fully modelled HTML forms already expose their input names. Running Arjun
+    against several such POST handlers cost minutes and found nothing.  This
+    selector instead prefers parameterless GET/API handlers and only retains a
+    known contract when it is sparse enough that undocumented inputs remain
+    plausible.
     """
     ranked: list[tuple[int, dict[str, Any]]] = []
+    represented_paths: set[str] = set()
     for case in discovery.get("request_cases", []):
         if not isinstance(case, dict):
             continue
@@ -2162,23 +2267,48 @@ def select_arjun_request_cases(
         method = str(case.get("method") or "GET").upper()
         if not url or method not in {"GET", "POST"} or not same_origin(target, url):
             continue
-        path = urlparse(url).path.lower()
+        parsed = urlparse(url)
+        path = parsed.path.lower()
+        represented_paths.add(path)
         if _destructive_crawl_url(url) or path.endswith(("/login.php", "/login", "/setup.php")):
             continue
         parameters = [str(value) for value in case.get("parameters", []) if str(value)]
-        # Existing parameters reduce the value of hidden-name discovery, while
-        # POST contracts remain important for generic applications.
-        score = _risk_terms(path) + (15 if method == "POST" else 5)
-        score -= min(20, len(parameters) * 4)
+        fields = [item for item in case.get("fields", []) if isinstance(item, dict)]
+        file_parameters = [str(value) for value in case.get("file_parameters", []) if str(value)]
+        enctype = str(case.get("enctype") or "").lower()
+        fully_modelled_form = bool(fields and parameters)
+        if file_parameters or "multipart/form-data" in enctype:
+            continue
+        if method == "POST" and fully_modelled_form:
+            continue
+        score = _risk_terms(path)
+        score += 18 if any(token in path for token in ("/api/", "callback", "webhook", "debug", "admin")) else 0
+        score += 8 if not parameters else -min(16, len(parameters) * 4)
+        if method == "POST":
+            score += 4
+        if score < 12:
+            continue
         ranked.append((score, {
             "url": url,
             "method": method,
             "data": str(case.get("data") or ""),
             "parameters": parameters,
         }))
+
+    # Add parameterless same-origin pages that have no discovered form contract.
+    for url in select_arjun_candidates(discovery, target, limit=max(limit * 3, 6)):
+        parsed = urlparse(url)
+        path = parsed.path.lower()
+        if path in represented_paths or parsed.query or _destructive_crawl_url(url):
+            continue
+        score = _risk_terms(path) + (18 if any(token in path for token in ("/api/", "callback", "webhook", "debug", "admin")) else 0)
+        if score < 12:
+            continue
+        ranked.append((score, {"url": url, "method": "GET", "data": "", "parameters": []}))
+
     selected: list[dict[str, Any]] = []
     seen: set[tuple[str, str]] = set()
-    for _, case in sorted(ranked, key=lambda item: -item[0]):
+    for _, case in sorted(ranked, key=lambda item: (-item[0], item[1]["url"])):
         key = (case["method"], urlparse(case["url"]).path.lower())
         if key in seen:
             continue
@@ -2575,7 +2705,9 @@ def log_result(profile: str, name: str, result: dict[str, Any], target: str = ""
             "    [NUCLEI STRATEGY] adaptive=True; technologies="
             f"{','.join(fingerprint.get('tags') or []) or 'unknown'}; "
             f"dast_cases={result.get('dast_request_count', 0)}; "
-            "specialist-covered SQLi/XSS/CMDi/traversal templates deferred"
+            f"direct_templates={result.get('custom_template_count', 0)}; "
+            f"evidence_targets={len(result.get('evidence_targets') or [])}; "
+            "stdin_disabled=True; specialist-covered SQLi/XSS/CMDi/traversal templates deferred"
         )
         phases = result.get("phases") if isinstance(result.get("phases"), list) else []
         for phase in phases:
@@ -2822,13 +2954,13 @@ async def run_pipeline(
                     "max_observations": (100 if CURRENT_SCAN_MODE == "deep" else 50 if CURRENT_SCAN_MODE == "balanced" else 25),
                 })
             if spec.name == "nuclei":
-                arguments["seed_urls"] = discovery[name].get("html_urls", [])
+                arguments["seed_urls"] = discovery[name].get("urls", [])
                 arguments["request_cases"] = discovery[name].get("request_cases", [])
                 arguments["scan_profile"] = CURRENT_SCAN_MODE
                 arguments["max_targets"] = (
-                    8 if CURRENT_SCAN_MODE == "deep"
-                    else 4 if CURRENT_SCAN_MODE == "balanced"
-                    else 1
+                    16 if CURRENT_SCAN_MODE == "deep"
+                    else 10 if CURRENT_SCAN_MODE == "balanced"
+                    else 6
                 )
             result = await call_mcp_with_progress(spec, arguments)
             results[name][spec.name] = result
@@ -3152,7 +3284,10 @@ async def run_pipeline(
                 "method": str(case.get("method", "GET")).upper(),
                 "url": str(case.get("url", "")),
                 "parameters": list(case.get("parameters", [])),
+                "fields": list(case.get("fields", [])),
                 "source_url": str(case.get("source_url", "")),
+                "client_sources": list(case.get("client_sources", [])),
+                "client_sinks": list(case.get("client_sinks", [])),
             }
             for case in browser_cases
         ]
@@ -3195,7 +3330,10 @@ async def run_pipeline(
                         "method": str(case.get("method", "GET")),
                         "data": str(case.get("data", "")),
                         "parameters": list(case.get("parameters", [])),
+                        "fields": list(case.get("fields", [])),
                         "source_url": str(case.get("source_url", "")),
+                        "client_sources": list(case.get("client_sources", [])),
+                        "client_sinks": list(case.get("client_sinks", [])),
                         "timeout": PARAMETER_TOOL_TIMEOUTS.get("browser", 75),
                         "allow_state_changes": workflow_state_changes,
                     },
@@ -3527,10 +3665,10 @@ async def run_single_tool_debug(
             })
         elif tool == "nuclei":
             arguments.update({
-                "seed_urls": discovery.get("html_urls", []),
+                "seed_urls": discovery.get("urls", []),
                 "request_cases": discovery.get("request_cases", []),
                 "scan_profile": mode,
-                "max_targets": 8 if mode == "deep" else 4 if mode == "balanced" else 1,
+                "max_targets": 16 if mode == "deep" else 10 if mode == "balanced" else 6,
             })
     elif tool == "arjun":
         case = _single_tool_case(
