@@ -117,12 +117,16 @@ def _command_canary(
 
     parameter = candidates[0]
     marker = f"SECOPS_CMD_{uuid.uuid4().hex[:10].upper()}"
+    # Try the cross-platform ampersand form first.  On Unix it backgrounds the
+    # preceding ping and returns the marker immediately; on Windows cmd.exe it
+    # is a command separator.  The previous order tried several potentially
+    # slow ping variants before this one and could exhaust the canary budget.
     suffixes = (
-        f"; printf '{marker}'",
-        f"; echo {marker}",
-        f"&& echo {marker}",
-        f"| echo {marker}",
-        f"& echo {marker}",
+        f" & echo {marker}",
+        f" | echo {marker}",
+        f"; printf '{marker}'; #",
+        f"; echo {marker}; #",
+        f" && echo {marker}",
     )
     headers = {
         "Cache-Control": "no-cache",
@@ -130,6 +134,13 @@ def _command_canary(
     }
     if cookies:
         headers["Cookie"] = cookies
+    if method != "GET":
+        stripped = str(data or "").lstrip()
+        headers["Content-Type"] = (
+            "application/json"
+            if stripped.startswith(("{", "["))
+            else "application/x-www-form-urlencoded"
+        )
 
     network_parameter = parameter.lower() in {"ip", "host", "hostname", "target", "domain"}
     base_value = "127.0.0.1" if network_parameter else "echo"
@@ -170,7 +181,7 @@ def _command_canary(
             request_url,
             data=request_data if method != "GET" else None,
             headers=headers,
-            timeout=(3, min(8.0, remaining)),
+            timeout=(3, min(10.0, remaining)),
             allow_redirects=True,
         )
 

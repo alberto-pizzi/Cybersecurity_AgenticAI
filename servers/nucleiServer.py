@@ -5,6 +5,7 @@ import json
 import os
 import re
 import tempfile
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -528,6 +529,17 @@ def _template_catalog(template_root: Path) -> list[dict[str, Any]]:
         severity_match = severity_re.search(content)
         name_match = name_re.search(content)
         id_match = id_re.search(content)
+        # Exact-file phases should only receive templates that can be executed
+        # by the bounded HTTP runner.  The official repository also contains
+        # headless/code/javascript/network templates and mixed workflow files;
+        # passing one of those to an HTTP-only command can make Nuclei exit with
+        # a non-zero status before the remaining valid templates are attempted.
+        top_level_http = bool(re.search(r"(?im)^(?:http|requests)\s*:\s*$", content))
+        unsupported_protocols = sorted({
+            value
+            for value in ("headless", "code", "javascript", "dns", "network", "ssl", "websocket", "file")
+            if re.search(rf"(?im)^{re.escape(value)}\s*:\s*$", content)
+        })
         rows.append({
             "path": str(path.resolve()),
             "relative": relative,
@@ -536,6 +548,8 @@ def _template_catalog(template_root: Path) -> list[dict[str, Any]]:
             "severity": (severity_match.group(1).lower() if severity_match else "unknown"),
             "name": (name_match.group(1).strip() if name_match else path.stem),
             "id": (id_match.group(1).strip() if id_match else path.stem),
+            "http_compatible": top_level_http and not unsupported_protocols,
+            "unsupported_protocols": unsupported_protocols,
         })
     _TEMPLATE_CATALOG_CACHE[key] = (stamp, rows)
     return rows
@@ -570,6 +584,8 @@ def _select_phase_templates(
         relative = str(item.get("relative_lower") or "")
         tags = set(item.get("tags") or set())
         severity = str(item.get("severity") or "unknown")
+        if not bool(item.get("http_compatible", True)):
+            continue
         if tags & excluded and name != "specialist_gap_dast":
             continue
         is_dast = relative.startswith("dast/") or "/dast/" in relative
@@ -690,13 +706,19 @@ def _run_phase(
     bulk_size: int = 4,
     payload_concurrency: int = 8,
 ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
-    def execute(*, compatibility: bool) -> dict[str, Any]:
+    def execute(
+        *,
+        compatibility: bool,
+        selected_paths: list[str] | None = None,
+        output_path: Path | None = None,
+        budget: int | None = None,
+    ) -> dict[str, Any]:
         return run_process(
             "Nuclei",
             _command(
                 target_url,
                 cookies,
-                path,
+                output_path or path,
                 target_list,
                 severities=severities,
                 tags=tags,
@@ -711,14 +733,222 @@ def _run_phase(
                 request_timeout=request_timeout,
                 retries=retries,
                 template_dir=template_dir,
-                template_paths=template_paths,
+                template_paths=selected_paths if selected_paths is not None else template_paths,
                 excluded_tags=excluded_tags,
                 bulk_size=bulk_size,
                 payload_concurrency=payload_concurrency,
             ),
             target=target_url,
-            timeout=timeout,
+            timeout=budget if budget is not None else timeout,
         )
+
+    def execute_with_compatibility(
+        selected_paths: list[str],
+        output_path: Path,
+        budget: int,
+    ) -> dict[str, Any]:
+        current = execute(
+            compatibility=False,
+            selected_paths=selected_paths,
+            output_path=output_path,
+            budget=budget,
+        )
+        current_text = "\n".join((str(current.get("stdout", "")), str(current.get("stderr", ""))))
+        if current.get("status") == "error" and "unknown flag" in current_text.lower():
+            output_path.unlink(missing_ok=True)
+            current = execute(
+                compatibility=True,
+                selected_paths=selected_paths,
+                output_path=output_path,
+                budget=budget,
+            )
+            current["compatibility_mode"] = True
+        return current
+
+    def template_error(result: dict[str, Any]) -> bool:
+        text = "\n".join((
+            str(result.get("stdout", "")),
+            str(result.get("stderr", "")),
+            str(result.get("output", "")),
+        )).lower()
+        return any(token in text for token in (
+            "could not load template", "could not parse template", "failed to load template",
+            "template validation", "invalid template", "yaml:", "unmarshal errors",
+            "could not compile", "unsupported protocol", "no templates provided",
+        ))
+
+    exact_paths = [str(value) for value in (template_paths or []) if str(value)]
+
+    # Technology/CVE packs occasionally contain a stale or protocol-specific
+    # template even when the repository inventory itself is healthy.  Running
+    # all exact files in one Nuclei process lets one bad file abort the whole
+    # phase.  Execute this phase in bounded batches, isolate a failing batch,
+    # and skip only templates that Nuclei itself reports as invalid.
+    if name == "fingerprint_relevant_templates" and exact_paths:
+        started = time.monotonic()
+        batch_size = 4
+        batches = [exact_paths[index:index + batch_size] for index in range(0, len(exact_paths), batch_size)]
+        recovered_items: list[dict[str, Any]] = []
+        completed_templates: list[str] = []
+        invalid_templates: list[dict[str, str]] = []
+        runtime_failures: list[dict[str, str]] = []
+        timed_out_templates: list[str] = []
+        stdout_parts: list[str] = []
+        stderr_parts: list[str] = []
+        commands: list[list[str]] = []
+
+        def remaining_seconds() -> int:
+            return max(0, int(timeout - (time.monotonic() - started)))
+
+        def run_group(paths: list[str], label: str, minimum_budget: int = 4) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+            remaining = remaining_seconds()
+            if remaining < minimum_budget:
+                return ({
+                    "status": "partial",
+                    "diagnosis": "phase_recovery_budget_exhausted",
+                    "output": "No phase budget remained for the isolated template retry.",
+                    "timed_out": True,
+                }, [])
+            groups_left = max(1, len(batches))
+            budget = max(minimum_budget, min(14, remaining // groups_left if groups_left else remaining))
+            candidate_path = path.with_name(f"{path.stem}-{label}{path.suffix}")
+            candidate_path.unlink(missing_ok=True)
+            candidate = execute_with_compatibility(paths, candidate_path, budget)
+            candidate_items = _read_items(candidate_path, str(candidate.get("stdout", "")))
+            candidate_path.unlink(missing_ok=True)
+            stdout_parts.append(str(candidate.get("stdout", "")))
+            stderr_parts.append(str(candidate.get("stderr", "")))
+            if isinstance(candidate.get("command"), list):
+                commands.append(candidate["command"])
+            return candidate, candidate_items
+
+        for batch_index, batch in enumerate(batches, 1):
+            if remaining_seconds() < 4:
+                timed_out_templates.extend(batch)
+                continue
+            batch_result, batch_items = run_group(batch, f"batch-{batch_index}")
+            if batch_result.get("status") == "success":
+                completed_templates.extend(batch)
+                recovered_items.extend(batch_items)
+                continue
+            if batch_result.get("diagnosis") == "timeout" or batch_result.get("timed_out"):
+                timed_out_templates.extend(batch)
+                recovered_items.extend(batch_items)
+                continue
+            if len(batch) > 1 and template_error(batch_result):
+                for item_index, template_path in enumerate(batch, 1):
+                    if remaining_seconds() < 4:
+                        timed_out_templates.append(template_path)
+                        continue
+                    single_result, single_items = run_group(
+                        [template_path],
+                        f"batch-{batch_index}-template-{item_index}",
+                        minimum_budget=4,
+                    )
+                    if single_result.get("status") == "success":
+                        completed_templates.append(template_path)
+                        recovered_items.extend(single_items)
+                    elif template_error(single_result):
+                        invalid_templates.append({
+                            "template": template_path,
+                            "error": "\n".join((
+                                str(single_result.get("stderr", "")),
+                                str(single_result.get("output", "")),
+                            ))[-1200:],
+                        })
+                    elif single_result.get("diagnosis") == "timeout" or single_result.get("timed_out"):
+                        timed_out_templates.append(template_path)
+                        recovered_items.extend(single_items)
+                    else:
+                        runtime_failures.append({
+                            "template": template_path,
+                            "error": "\n".join((
+                                str(single_result.get("stderr", "")),
+                                str(single_result.get("output", "")),
+                            ))[-1200:],
+                        })
+                continue
+            runtime_failures.append({
+                "template": ", ".join(batch),
+                "error": "\n".join((
+                    str(batch_result.get("stderr", "")),
+                    str(batch_result.get("output", "")),
+                ))[-1200:],
+            })
+            recovered_items.extend(batch_items)
+
+        recovered_items = _deduplicate(recovered_items)
+        if recovered_items:
+            path.write_text(
+                "\n".join(json.dumps(item, ensure_ascii=False, default=str) for item in recovered_items) + "\n",
+                encoding="utf-8",
+            )
+        else:
+            path.unlink(missing_ok=True)
+
+        if runtime_failures:
+            phase_status = "partial" if completed_templates or recovered_items else "error"
+            diagnosis = "template_batch_runtime_failure"
+            output = (
+                "Nuclei isolated the technology templates, but one or more runnable templates still failed. "
+                f"Completed={len(completed_templates)}; runtime failures={len(runtime_failures)}; "
+                f"findings preserved={len(recovered_items)}."
+            )
+        elif timed_out_templates:
+            phase_status = "partial"
+            diagnosis = "template_batch_time_limit"
+            output = (
+                "Nuclei completed the runnable technology-template batches that fit the phase budget. "
+                f"Completed={len(completed_templates)}; timed out={len(timed_out_templates)}; "
+                f"findings preserved={len(recovered_items)}."
+            )
+        else:
+            phase_status = "success"
+            diagnosis = "invalid_templates_isolated" if invalid_templates else ""
+            output = (
+                "Nuclei completed all runnable technology-template batches. "
+                f"Completed={len(completed_templates)}; invalid/unsupported skipped={len(invalid_templates)}; "
+                f"findings={len(recovered_items)}."
+            )
+
+        result = {
+            "tool": "Nuclei",
+            "status": phase_status,
+            "target": target_url,
+            "output": output,
+            "vulnerabilities": [],
+            "diagnosis": diagnosis,
+            "stdout": "\n".join(part for part in stdout_parts if part)[-12000:],
+            "stderr": "\n".join(part for part in stderr_parts if part)[-12000:],
+            "commands": commands,
+            "duration_seconds": round(time.monotonic() - started, 3),
+            "timed_out": bool(timed_out_templates),
+            "time_limit_reached": bool(timed_out_templates),
+            "template_batch_recovery": True,
+            "completed_template_count": len(completed_templates),
+            "invalid_template_count": len(invalid_templates),
+            "invalid_templates": invalid_templates,
+            "runtime_template_failures": runtime_failures,
+            "timed_out_templates": timed_out_templates,
+        }
+        result.update(
+            phase=name,
+            phase_timeout_seconds=timeout,
+            phase_findings=len(recovered_items),
+            phase_tags=tags,
+            automatic_scan=automatic_scan,
+            dast=dast,
+            input_mode=input_mode,
+            fuzz_aggression="",
+            fuzz_param_frequency=0,
+            excluded_tags=excluded_tags,
+            target_scope=target_scope,
+            selected_template_count=len(exact_paths),
+            selected_template_sample=[Path(value).name for value in exact_paths[:20]],
+            bulk_size=bulk_size,
+            payload_concurrency=payload_concurrency,
+        )
+        return result, recovered_items
 
     result = execute(compatibility=False)
     combined = "\n".join((str(result.get("stdout", "")), str(result.get("stderr", ""))))
@@ -1288,6 +1518,12 @@ def _run_nuclei_core(
                 "selected_template_sample": phase.get("selected_template_sample", []),
                 "bulk_size": phase.get("bulk_size", 0),
                 "payload_concurrency": phase.get("payload_concurrency", 0),
+                "template_batch_recovery": phase.get("template_batch_recovery", False),
+                "completed_template_count": phase.get("completed_template_count", 0),
+                "invalid_template_count": phase.get("invalid_template_count", 0),
+                "invalid_templates": phase.get("invalid_templates", []),
+                "runtime_template_failures": phase.get("runtime_template_failures", []),
+                "timed_out_templates": phase.get("timed_out_templates", []),
                 "stderr_excerpt": str(phase.get("stderr", ""))[-1200:],
             }
             for phase in phases

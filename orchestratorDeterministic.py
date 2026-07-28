@@ -2721,6 +2721,14 @@ def log_result(profile: str, name: str, result: dict[str, Any], target: str = ""
                 f"aggression={phase.get('fuzz_aggression') or 'n/a'}; "
                 f"scope={phase.get('target_scope') or 'focused'}"
             )
+            if phase.get("template_batch_recovery"):
+                print(
+                    "    [NUCLEI RECOVERY] "
+                    f"completed templates={phase.get('completed_template_count', 0)}; "
+                    f"invalid/unsupported skipped={phase.get('invalid_template_count', 0)}; "
+                    f"runtime failures={len(phase.get('runtime_template_failures') or [])}; "
+                    f"timed out={len(phase.get('timed_out_templates') or [])}"
+                )
         if not total:
             print(
                 "    [NUCLEI RESULT] No template matcher completed with positive evidence. "
