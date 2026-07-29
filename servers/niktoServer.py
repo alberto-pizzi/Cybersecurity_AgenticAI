@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import ipaddress
 import csv
 import json
 import os
@@ -19,7 +20,7 @@ import requests
 
 from fastmcp import FastMCP
 
-from utils import ROOT_DIR, failure, partial, runtime_container_route, success
+from utils import ROOT_DIR, failure, parse_cookie_header, partial, runtime_container_route, success
 
 mcp = FastMCP("Nikto Scanner")
 
@@ -109,6 +110,42 @@ def _nikto_profile_arguments(scan_profile: str) -> list[str]:
     return arguments
 
 
+def _nikto_static_cookie_value(cookies: str) -> str:
+    """Encode a Cookie header for Nikto's long-standing STATIC-COOKIE option.
+
+    ``-Add-header`` was added only in newer Nikto revisions and is rejected by
+    older cached Docker images. ``-Option STATIC-COOKIE=...`` is supported by
+    old and new releases and populates Nikto's cookie jar for every request.
+    """
+    pairs = parse_cookie_header(cookies)
+    encoded: list[str] = []
+    for name, value in pairs:
+        # Nikto parses quoted name=value pairs separated by semicolons. Cookie
+        # values are opaque; reject quotes rather than silently changing them.
+        if '"' in value:
+            raise ValueError(f'Nikto STATIC-COOKIE cannot safely encode a quote in cookie {name!r}.')
+        encoded.append(f'"{name}={value}"')
+    return ";".join(encoded) + (";" if encoded else "")
+
+
+def _nikto_cookie_arguments(cookies: str) -> list[str]:
+    if not str(cookies or "").strip():
+        # Keep anonymous scans isolated from cookies set by the target.
+        return ["-nocookies"]
+    return ["-Option", f"STATIC-COOKIE={_nikto_static_cookie_value(cookies)}"]
+
+
+def _redact_nikto_command(command: list[str]) -> list[str]:
+    """Return a report-safe copy of a Nikto command without session secrets."""
+    redacted = list(command)
+    for index, value in enumerate(redacted):
+        if str(value).startswith("STATIC-COOKIE="):
+            redacted[index] = "STATIC-COOKIE=<redacted>"
+        elif str(value).lower().startswith("cookie:"):
+            redacted[index] = "Cookie: <redacted>"
+    return redacted
+
+
 def _baseline_security_signals(target_url: str, cookies: str) -> dict[str, Any]:
     """Collect a read-only sanity baseline for evaluating a zero-result scan.
 
@@ -154,25 +191,42 @@ def _baseline_security_signals(target_url: str, cookies: str) -> dict[str, Any]:
     }
 
 
+def _nikto_coverage_verified(
+    metrics: dict[str, Any],
+    structured_report: dict[str, Any],
+    scan_profile: str,
+) -> bool:
+    """Return true only when Nikto demonstrably completed the selected profile.
+
+    A copied structured report is preferred.  A console-only retry is accepted
+    when the image cannot write a report file, but only if Nikto prints its
+    normal completion summary and reaches the profile's request threshold.
+    """
+    profile = NIKTO_SCAN_PROFILES[_normalize_scan_profile(scan_profile)]
+    minimum = int(profile["minimum_clean_requests"])
+    evidence_channel = bool(
+        structured_report.get("copied")
+        or structured_report.get("console_only")
+    )
+    return bool(
+        metrics.get("completion_marker")
+        and int(metrics.get("requests") or 0) >= minimum
+        and int(metrics.get("errors") or 0) == 0
+        and evidence_channel
+    )
+
+
 def _nikto_zero_result_verified(
     findings: list[dict[str, Any]],
     metrics: dict[str, Any],
     structured_report: dict[str, Any],
     scan_profile: str,
 ) -> bool:
+    # This flag describes a *clean zero*.  A run with findings is not a zero,
+    # and a runtime-error line must never make this value true.
     if findings:
-        return True
-    profile = NIKTO_SCAN_PROFILES[_normalize_scan_profile(scan_profile)]
-    minimum = int(profile["minimum_clean_requests"])
-    # CSV contains findings rather than an independent scan summary, so a
-    # legitimately clean scan may create a zero-byte report. Creation/copy of
-    # the requested file plus Nikto's own completion counters is sufficient.
-    return bool(
-        metrics.get("completion_marker")
-        and int(metrics.get("requests") or 0) >= minimum
-        and int(metrics.get("errors") or 0) == 0
-        and structured_report.get("copied")
-    )
+        return False
+    return _nikto_coverage_verified(metrics, structured_report, scan_profile)
 
 
 def _load_runtime() -> dict[str, Any]:
@@ -403,6 +457,17 @@ def _parse_text_findings(log_text: str, target_url: str) -> list[dict[str, Any]]
         lower = message.lower()
         if not message or any(lower.startswith(prefix) for prefix in ignored):
             continue
+        # Runtime/configuration failures are execution diagnostics, not target
+        # findings.  Treating "+ ERROR: ..." as a hardening observation caused
+        # failed Nikto invocations to report a fake finding and to mark coverage
+        # as verified.
+        if lower.startswith(("error:", "fatal:", "unable to open", "cannot open")):
+            continue
+        if any(marker in lower for marker in (
+            "unknown option", "invalid plugin", "plugin not found",
+            "no plugins were selected", "permission denied",
+        )):
+            continue
         if lower in {"requires a value", "+ requires a value"} or lower.endswith(" requires a value"):
             continue
         if any(marker in lower for marker in (
@@ -467,6 +532,34 @@ def _fatal_runtime_error(log_text: str) -> str:
     return ""
 
 
+def _nikto_nolookup_arguments(target_url: str) -> list[str]:
+    """Use ``-nolookup`` only when Nikto receives a literal IP address.
+
+    Nikto 2.5.0 exits before scanning when ``-nolookup`` is combined with a
+    hostname such as a Docker network alias (for example ``http://dvwa``).
+    Container aliases must be resolved by Docker DNS, while literal IPv4/IPv6
+    targets can safely keep the optimisation.
+    """
+    hostname = str(urlparse(str(target_url or "")).hostname or "").strip()
+    if not hostname:
+        return []
+    try:
+        ipaddress.ip_address(hostname)
+    except ValueError:
+        return []
+    return ["-nolookup"]
+
+
+def _remove_command_flag(command: list[str], flag: str) -> list[str]:
+    """Return a copy with a standalone compatibility flag removed."""
+    return [value for value in command if value != flag]
+
+
+def _nikto_nolookup_name_failure(log_text: str) -> bool:
+    value = str(log_text or "").lower()
+    return "-nolookup set, but given name" in value
+
+
 def _run_native_nikto_scan(
     target_url: str,
     cookies: str = "",
@@ -506,15 +599,14 @@ def _run_native_nikto_scan(
             str(script),
             "-h", target_url,
             "-nointeractive",
-            "-nolookup",
+            *_nikto_nolookup_arguments(target_url),
             "-timeout", "5",
             "-maxtime", f"{nikto_limit}s",
             "-Format", "csv",
             "-output", str(output_file),
             *_nikto_profile_arguments(scan_profile),
         ]
-        if cookies:
-            command.extend(["-Add-header", f"Cookie: {cookies}"])
+        command.extend(_nikto_cookie_arguments(cookies))
 
         creation_flags = 0
         if os.name == "nt":
@@ -574,17 +666,17 @@ def _run_native_nikto_scan(
             "bytes": output_file.stat().st_size if output_file.is_file() else 0,
         }
         baseline_probe = _baseline_security_signals(target_url, cookies)
-        zero_result_verified = _nikto_zero_result_verified(
-            findings, metrics, structured_report, scan_profile
+        coverage_verified = _nikto_coverage_verified(
+            metrics, structured_report, scan_profile
         )
-        coverage_verified = bool(findings or zero_result_verified)
+        zero_result_verified = bool(not findings and coverage_verified)
 
         common = {
             "vulnerabilities": findings,
             "duration_seconds": duration,
             "return_code": return_code,
             "authenticated": bool(cookies),
-            "command": command,
+            "command": _redact_nikto_command(command),
             "execution_mode": "direct_perl",
             "nikto_script": str(script),
             "perl_executable": str(perl),
@@ -870,14 +962,17 @@ def _docker_nikto_command(
     cookies: str,
     nikto_limit: int,
     scan_profile: str,
-    report_path: str = "/home/nikto/secops-nikto.csv",
+    report_path: str = "/tmp/secops-nikto.csv",
+    *,
+    structured_output: bool = True,
 ) -> list[str]:
-    """Build a named-container command using Nikto's documented CLI.
+    """Build a portable named-container Nikto command.
 
-    The official image runs as user ``nikto`` and owns /home/nikto. Keeping the
-    report there avoids Docker Desktop and image-specific /tmp permission or
-    mount behaviour. ``docker create`` is intentional: it gives us a stable
-    container to inspect and copy from even when Nikto exits non-zero.
+    The official image currently runs as an unprivileged user.  Its home
+    directory is not guaranteed to be writable in every image revision, while
+    ``/tmp`` is the portable writable location.  If even structured output is
+    rejected, the caller retries without ``-Format/-o`` and audits the normal
+    console summary instead.
     """
     command = [
         "docker", "create", "--name", container_name,
@@ -886,18 +981,15 @@ def _docker_nikto_command(
         "-h", docker_target,
         "-nointeractive",
         "-ask", "no",
-        "-nolookup",
+        *_nikto_nolookup_arguments(docker_target),
         "-followredirects",
         "-timeout", "4",
         "-maxtime", f"{nikto_limit}s",
-        "-Format", "csv",
-        "-o", report_path,
-        *_nikto_profile_arguments(scan_profile),
     ]
-    if cookies:
-        command.extend(["-Add-header", f"Cookie: {cookies}"])
-    else:
-        command.append("-nocookies")
+    if structured_output:
+        command.extend(["-Format", "csv", "-o", report_path])
+    command.extend(_nikto_profile_arguments(scan_profile))
+    command.extend(_nikto_cookie_arguments(cookies))
     return command
 
 
@@ -997,6 +1089,145 @@ def _copy_nikto_report(container_name: str, report_path: Path, preferred_path: s
     }
 
 
+
+def _run_named_nikto_container(
+    command: list[str],
+    container_name: str,
+    timeout: int,
+    report_path: Path,
+    preferred_report_path: str = "",
+) -> dict[str, Any]:
+    """Execute one named Nikto container and preserve auditable diagnostics."""
+    create_result: dict[str, Any] = {}
+    start_result: dict[str, Any] = {}
+    state: dict[str, Any] = {}
+    stdout = ""
+    stderr = ""
+    timed_out = False
+    report_copy: dict[str, Any] = {
+        "attempted": False,
+        "copied": False,
+        "path": "",
+        "return_code": None,
+        "stderr": "",
+        "bytes": 0,
+        "empty": False,
+        "attempts": [],
+        "container_diff": [],
+        "console_only": not bool(preferred_report_path),
+    }
+    try:
+        created = subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=60,
+            shell=False,
+            check=False,
+        )
+        create_result = {
+            "return_code": created.returncode,
+            "stdout": (created.stdout or "")[-1200:],
+            "stderr": (created.stderr or "")[-2400:],
+        }
+        if created.returncode != 0:
+            return {
+                "create_failed": True,
+                "create": create_result,
+                "start": start_result,
+                "state": state,
+                "stdout": stdout,
+                "stderr": stderr,
+                "timed_out": False,
+                "report": report_copy,
+            }
+
+        try:
+            started_process = subprocess.run(
+                ["docker", "start", "-a", container_name],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=timeout,
+                shell=False,
+                check=False,
+            )
+            stdout = started_process.stdout or ""
+            stderr = started_process.stderr or ""
+            start_result = {
+                "return_code": started_process.returncode,
+                "stdout_bytes": len(stdout.encode("utf-8", "replace")),
+                "stderr_bytes": len(stderr.encode("utf-8", "replace")),
+            }
+        except subprocess.TimeoutExpired as exc:
+            timed_out = True
+            stdout = exc.stdout.decode("utf-8", "replace") if isinstance(exc.stdout, bytes) else (exc.stdout or "")
+            stderr = exc.stderr.decode("utf-8", "replace") if isinstance(exc.stderr, bytes) else (exc.stderr or "")
+            subprocess.run(
+                ["docker", "stop", "-t", "2", container_name],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                check=False,
+                timeout=10,
+            )
+            start_result = {"return_code": None, "timed_out": True}
+
+        try:
+            logs = subprocess.run(
+                ["docker", "logs", container_name],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=20,
+                check=False,
+            )
+            stdout = logs.stdout or stdout
+            stderr = logs.stderr or stderr
+        except (OSError, subprocess.SubprocessError):
+            pass
+
+        state = _docker_container_state(container_name)
+        if preferred_report_path:
+            report_copy = _copy_nikto_report(
+                container_name, report_path, preferred_report_path
+            )
+            report_copy["console_only"] = False
+    finally:
+        try:
+            subprocess.run(
+                ["docker", "rm", "-f", container_name],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                check=False,
+                timeout=15,
+            )
+        except (OSError, subprocess.SubprocessError):
+            pass
+
+    return {
+        "create_failed": False,
+        "create": create_result,
+        "start": start_result,
+        "state": state,
+        "stdout": stdout,
+        "stderr": stderr,
+        "timed_out": timed_out,
+        "report": report_copy,
+    }
+
+
+def _nikto_report_write_failure(log_text: str) -> bool:
+    lower = str(log_text or "").lower()
+    return bool(
+        re.search(r"unable to open ['\"]?[^\r\n]+['\"]? for write", lower)
+        or "cannot open output" in lower
+        or "could not open output" in lower
+    )
+
 def _run_docker_nikto(
     target_url: str,
     cookies: str,
@@ -1004,15 +1235,7 @@ def _run_docker_nikto(
     connectivity: dict[str, Any],
     scan_profile: str = "balanced",
 ) -> dict[str, Any]:
-    """Run Nikto in a named official-image container with auditable lifecycle.
-
-    v31.10 used ``-Plugins ALL``. v31.11 also passed ``-nocheck``, which some cached Docker image revisions reject. Nikto's documented macros are ``@@DEFAULT``
-    and ``@@ALL``; overriding the plugin string can also omit the report plugin.
-    That made Nikto exit in a few seconds with no report. This implementation
-    leaves the official plugin selection implicit, creates the container first,
-    starts it separately, inspects its real state, and copies the report before
-    removing it.
-    """
+    """Run the official image with structured-output and console fallbacks."""
     if not _docker_command_available():
         return failure(
             "Nikto",
@@ -1024,122 +1247,127 @@ def _run_docker_nikto(
 
     docker_target, network_args, mapping_mode = _docker_target(target_url)
     started = time.monotonic()
+    normalized_profile = _normalize_scan_profile(scan_profile)
     nikto_limit = max(25, timeout - 20)
-    container_name = f"secops-nikto-{uuid.uuid4().hex[:12]}"
-    container_report_path = "/home/nikto/secops-nikto.csv"
-    command = _docker_nikto_command(
-        container_name, docker_target, network_args, cookies, nikto_limit,
-        scan_profile, container_report_path,
+    primary_name = f"secops-nikto-{uuid.uuid4().hex[:12]}"
+    container_report_path = "/tmp/secops-nikto.csv"
+    primary_command = _docker_nikto_command(
+        primary_name, docker_target, network_args, cookies, nikto_limit,
+        normalized_profile, container_report_path, structured_output=True,
     )
-
-    timed_out = False
-    create_result: dict[str, Any] = {}
-    start_result: dict[str, Any] = {}
-    state: dict[str, Any] = {}
-    stdout = ""
-    stderr = ""
 
     with tempfile.TemporaryDirectory(prefix="nikto-docker-") as temp_dir:
         report_path = Path(temp_dir) / "nikto.csv"
         try:
-            created = subprocess.run(
-                command,
-                capture_output=True,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                timeout=60,
-                shell=False,
-                check=False,
+            primary = _run_named_nikto_container(
+                primary_command, primary_name, timeout, report_path,
+                container_report_path,
             )
-            create_result = {
-                "return_code": created.returncode,
-                "stdout": (created.stdout or "")[-1200:],
-                "stderr": (created.stderr or "")[-2400:],
-            }
-            if created.returncode != 0:
-                return failure(
-                    "Nikto", target_url,
-                    "Docker could not create the official Nikto container: "
-                    + (created.stderr or created.stdout or f"exit {created.returncode}").strip(),
-                    diagnosis="nikto_docker_create_failed",
-                    connectivity_diagnostics=connectivity,
-                    command=command,
-                    docker_create=create_result,
-                )
-
-            try:
-                started_process = subprocess.run(
-                    ["docker", "start", "-a", container_name],
-                    capture_output=True,
-                    text=True,
-                    encoding="utf-8",
-                    errors="replace",
-                    timeout=timeout,
-                    shell=False,
-                    check=False,
-                )
-                stdout = started_process.stdout or ""
-                stderr = started_process.stderr or ""
-                start_result = {
-                    "return_code": started_process.returncode,
-                    "stdout_bytes": len(stdout.encode("utf-8", "replace")),
-                    "stderr_bytes": len(stderr.encode("utf-8", "replace")),
-                }
-            except subprocess.TimeoutExpired as exc:
-                timed_out = True
-                stdout = exc.stdout.decode("utf-8", "replace") if isinstance(exc.stdout, bytes) else (exc.stdout or "")
-                stderr = exc.stderr.decode("utf-8", "replace") if isinstance(exc.stderr, bytes) else (exc.stderr or "")
-                subprocess.run(
-                    ["docker", "stop", "-t", "2", container_name],
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                    check=False,
-                    timeout=10,
-                )
-                start_result = {"return_code": None, "timed_out": True}
-
-            # docker logs is authoritative even if start -a was interrupted or
-            # the Docker CLI returned a shortened stream.
-            try:
-                logs = subprocess.run(
-                    ["docker", "logs", container_name],
-                    capture_output=True,
-                    text=True,
-                    encoding="utf-8",
-                    errors="replace",
-                    timeout=20,
-                    check=False,
-                )
-                stdout = logs.stdout or stdout
-                stderr = logs.stderr or stderr
-            except (OSError, subprocess.SubprocessError):
-                pass
-
-            state = _docker_container_state(container_name)
-            report_copy = _copy_nikto_report(container_name, report_path, container_report_path)
         except OSError as exc:
             return failure(
                 "Nikto", target_url,
                 f"Cannot start the official Nikto Docker image: {exc}",
                 diagnosis="nikto_docker_start_failed",
                 connectivity_diagnostics=connectivity,
-                command=command,
+                command=_redact_nikto_command(primary_command),
             )
-        finally:
-            try:
-                subprocess.run(
-                    ["docker", "rm", "-f", container_name],
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                    check=False,
-                    timeout=15,
-                )
-            except (OSError, subprocess.SubprocessError):
-                pass
 
+        if primary.get("create_failed"):
+            created = primary.get("create") or {}
+            return failure(
+                "Nikto", target_url,
+                "Docker could not create the official Nikto container: "
+                + str(created.get("stderr") or created.get("stdout") or "unknown Docker error").strip(),
+                diagnosis="nikto_docker_create_failed",
+                connectivity_diagnostics=connectivity,
+                command=_redact_nikto_command(primary_command),
+                docker_create=created,
+            )
+
+        primary_log = "\n".join(
+            part for part in (primary.get("stdout", ""), primary.get("stderr", "")) if part
+        )
+        active = primary
+        active_command = primary_command
+        fallback: dict[str, Any] | None = None
+        console_fallback_used = False
+        compatibility_retry_used = False
+
+        # Defensive compatibility retry for cached/older project files or
+        # unusual target translations. Nikto 2.5.0 rejects -nolookup when -h
+        # contains a hostname. The normal command builder already avoids this,
+        # but this retry prevents the entire assessment from failing if such a
+        # command is ever supplied by a legacy path.
+        if (
+            _nikto_nolookup_name_failure(primary_log)
+            and "-nolookup" in primary_command
+            and not primary.get("timed_out")
+            and time.monotonic() - started < max(20, timeout - 35)
+        ):
+            remaining = max(35, int(timeout - (time.monotonic() - started)))
+            retry_name = f"secops-nikto-{uuid.uuid4().hex[:12]}"
+            retry_command = _remove_command_flag(
+                _docker_nikto_command(
+                    retry_name, docker_target, network_args, cookies,
+                    max(25, remaining - 10), normalized_profile,
+                    container_report_path, structured_output=True,
+                ),
+                "-nolookup",
+            )
+            retry_report = Path(temp_dir) / "nikto-compatibility-retry.csv"
+            retry = _run_named_nikto_container(
+                retry_command, retry_name, remaining, retry_report,
+                container_report_path,
+            )
+            if not retry.get("create_failed"):
+                primary = retry
+                primary_command = retry_command
+                report_path = retry_report
+                primary_log = "\n".join(
+                    part for part in (retry.get("stdout", ""), retry.get("stderr", "")) if part
+                )
+                active = retry
+                active_command = retry_command
+                compatibility_retry_used = True
+
+        # Some official/cached image revisions run as a user whose home is not
+        # writable.  Retry without a report plugin rather than failing before
+        # the first HTTP request.  The console path still provides Nikto's full
+        # findings and request/completion summary.
+        if (
+            _nikto_report_write_failure(primary_log)
+            and not primary.get("timed_out")
+            and time.monotonic() - started < max(20, timeout - 35)
+        ):
+            remaining = max(35, int(timeout - (time.monotonic() - started)))
+            fallback_name = f"secops-nikto-{uuid.uuid4().hex[:12]}"
+            fallback_command = _docker_nikto_command(
+                fallback_name, docker_target, network_args, cookies,
+                max(25, remaining - 10), normalized_profile,
+                structured_output=False,
+            )
+            fallback_report = Path(temp_dir) / "nikto-console-only.csv"
+            fallback = _run_named_nikto_container(
+                fallback_command, fallback_name, remaining, fallback_report, ""
+            )
+            if not fallback.get("create_failed"):
+                active = fallback
+                active_command = fallback_command
+                console_fallback_used = True
+
+        stdout = str(active.get("stdout") or "")
+        stderr = str(active.get("stderr") or "")
         log_text = "\n".join(part for part in (stdout, stderr) if part)
-        csv_findings = _parse_csv(report_path, target_url)
+        state = active.get("state") if isinstance(active.get("state"), dict) else {}
+        report_copy = active.get("report") if isinstance(active.get("report"), dict) else {}
+        if console_fallback_used:
+            report_copy.update({
+                "console_only": True,
+                "fallback_reason": "structured_report_not_writable",
+                "primary_report": primary.get("report", {}),
+            })
+
+        csv_findings = _parse_csv(report_path, target_url) if not console_fallback_used else []
         console_findings = _parse_text_findings(log_text, target_url)
         findings = _merge_nikto_findings(csv_findings, console_findings)
         metrics = _nikto_scan_metrics(log_text)
@@ -1151,24 +1379,40 @@ def _run_docker_nikto(
         state_error = str(state.get("Error") or "").strip() if state.get("available") else ""
         completion_marker = bool(metrics.get("completion_marker"))
         baseline_probe = _baseline_security_signals(target_url, cookies)
-        zero_result_verified = _nikto_zero_result_verified(findings, metrics, report_copy, scan_profile)
-        coverage_verified = bool(findings or zero_result_verified)
+        coverage_verified = _nikto_coverage_verified(
+            metrics, report_copy, normalized_profile
+        )
+        zero_result_verified = bool(
+            not findings and coverage_verified
+        )
 
         common = {
             "vulnerabilities": findings,
             "duration_seconds": duration,
             "return_code": state_exit_code,
             "authenticated": bool(cookies),
-            "execution_mode": "official_docker_create_start_copy",
+            "execution_mode": (
+                "official_docker_console_fallback"
+                if console_fallback_used
+                else "official_docker_create_start_copy"
+            ),
             "docker_image": NIKTO_DOCKER_IMAGE,
             "docker_target": docker_target,
             "docker_target_mapping": mapping_mode,
             "connectivity_diagnostics": connectivity,
             "scanner_log": log_text[-16000:],
-            "command": command,
-            "docker_create": create_result,
-            "docker_start": start_result,
+            "command": _redact_nikto_command(active_command),
+            "primary_command": _redact_nikto_command(primary_command),
+            "docker_create": active.get("create", {}),
+            "docker_start": active.get("start", {}),
             "docker_state": state,
+            "structured_retry": ({
+                "used": console_fallback_used,
+                "compatibility_retry_used": compatibility_retry_used,
+                "primary_state": primary.get("state", {}),
+                "primary_log_excerpt": primary_log[-4000:],
+                "fallback_create": fallback.get("create", {}) if fallback else {},
+            }),
             "scan_completion_marker": completion_marker,
             "completion_inferred_from_exit_code": False,
             "structured_report": report_copy,
@@ -1176,16 +1420,16 @@ def _run_docker_nikto(
             "coverage_verified": coverage_verified,
             "csv_findings": len(csv_findings),
             "console_findings": len(console_findings),
-            "scan_profile": _normalize_scan_profile(scan_profile),
-            "minimum_clean_requests": NIKTO_SCAN_PROFILES[_normalize_scan_profile(scan_profile)]["minimum_clean_requests"],
+            "scan_profile": normalized_profile,
+            "minimum_clean_requests": NIKTO_SCAN_PROFILES[normalized_profile]["minimum_clean_requests"],
             "zero_result_verified": zero_result_verified,
             "baseline_probe": baseline_probe,
-            "safe_tuning": NIKTO_SCAN_PROFILES[_normalize_scan_profile(scan_profile)]["tuning"],
-            "plugins": NIKTO_SCAN_PROFILES[_normalize_scan_profile(scan_profile)]["plugins_label"],
-            "cgi_dirs": NIKTO_SCAN_PROFILES[_normalize_scan_profile(scan_profile)]["cgi_dirs"],
+            "safe_tuning": NIKTO_SCAN_PROFILES[normalized_profile]["tuning"],
+            "plugins": NIKTO_SCAN_PROFILES[normalized_profile]["plugins_label"],
+            "cgi_dirs": NIKTO_SCAN_PROFILES[normalized_profile]["cgi_dirs"],
         }
 
-        if timed_out:
+        if active.get("timed_out"):
             return partial(
                 "Nikto", target_url,
                 f"Containerized Nikto reached its configured budget. Findings preserved: {len(findings)}.",
@@ -1231,13 +1475,12 @@ def _run_docker_nikto(
             result.update(common)
             return result
 
-        # Exit code 1 without findings, requests, completion, or report means an
-        # invocation/configuration failure—not a valid clean scan.
         if (
             state_exit_code == 1
             and not findings
             and not metrics.get("normal_summary_present")
             and not report_copy.get("copied")
+            and not report_copy.get("console_only")
         ):
             result = failure(
                 "Nikto", target_url,
@@ -1253,9 +1496,9 @@ def _run_docker_nikto(
         if not coverage_verified:
             return partial(
                 "Nikto", target_url,
-                "Nikto did not provide enough request/completion evidence for a clean result. "
+                "Nikto did not provide enough request/completion evidence for the selected scan profile. "
                 "Findings and diagnostics were preserved, but coverage remains incomplete.",
-                diagnosis="nikto_zero_result_unverified",
+                diagnosis="nikto_coverage_unverified",
                 timed_out=False,
                 time_limit_reached=False,
                 **common,
@@ -1264,12 +1507,14 @@ def _run_docker_nikto(
         completion_note = (
             "Nikto emitted its completion summary and met the clean-result request threshold."
             if not findings
-            else "Nikto produced parseable findings with auditable container/report evidence."
+            else "Nikto completed the selected profile and produced parseable findings."
         )
+        if console_fallback_used:
+            completion_note += " Structured output was unavailable, so the verified console-summary fallback was used."
         return success(
             "Nikto", target_url,
             f"Containerized Nikto completed. Findings: {len(findings)}; requests={metrics.get('requests', 0)}; "
-            f"profile={_normalize_scan_profile(scan_profile)}. {completion_note}",
+            f"profile={normalized_profile}. {completion_note}",
             **common,
         )
 

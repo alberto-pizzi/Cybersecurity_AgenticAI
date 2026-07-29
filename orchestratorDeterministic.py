@@ -2749,12 +2749,19 @@ def log_result(profile: str, name: str, result: dict[str, Any], target: str = ""
             f"{result.get('execution_mode', 'unknown')}; requests={metrics.get('requests', 0)}; "
             f"reported={metrics.get('items_reported', 0)}; hosts={metrics.get('hosts_tested', 0)}; "
             f"report copied={structured.get('copied', False)}; report bytes={structured.get('bytes', 0)}; "
+            f"console fallback={structured.get('console_only', False)}; "
             f"coverage verified={result.get('coverage_verified', False)}; "
             f"zero verified={result.get('zero_result_verified', False)}; "
             f"profile={result.get('scan_profile', 'unknown')}; "
             f"plugins={result.get('plugins', 'unknown')}; tuning={result.get('safe_tuning', 'unknown')}; "
             f"cgi_dirs={result.get('cgi_dirs', 'unknown')}"
         )
+        retry = result.get("structured_retry") if isinstance(result.get("structured_retry"), dict) else {}
+        if retry.get("used"):
+            print(
+                "    [NIKTO FALLBACK] Structured CSV output was not writable; "
+                "Nikto was automatically rerun in console-summary mode."
+            )
         docker_state = result.get("docker_state") if isinstance(result.get("docker_state"), dict) else {}
         docker_create = result.get("docker_create") if isinstance(result.get("docker_create"), dict) else {}
         if result.get("execution_mode", "").startswith("official_docker"):
@@ -3720,6 +3727,11 @@ async def run_single_tool_debug(
                 "scan_profile": mode,
                 "max_targets": 16 if mode == "deep" else 10 if mode == "balanced" else 6,
             })
+        elif tool == "nikto":
+            # Single-tool runs previously ignored --mode and silently used
+            # Nikto's balanced defaults. Keep the isolated diagnostic aligned
+            # with the same profile selected by a full pipeline run.
+            arguments["scan_profile"] = mode
     elif tool == "arjun":
         case = _single_tool_case(
             discovery, tool, target, explicit_url, method, data, parameters
@@ -3900,7 +3912,7 @@ async def run_single_tool_debug(
         "method": arguments.get("method", ""),
         "parameters": arguments.get("parameters", arguments.get("known_parameters", [])),
         "timeout": arguments.get("timeout", 0),
-        "scan_mode": arguments.get("scan_mode", ""),
+        "scan_mode": arguments.get("scan_mode", arguments.get("scan_profile", "")),
     })
     result.setdefault("discovery_summary", {
         "html_urls": len(discovery.get("html_urls", [])),
