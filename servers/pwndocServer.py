@@ -260,7 +260,7 @@ def _finding_family(row: dict[str, Any]) -> str:
     verification = str(row.get("verification_status") or "").lower()
     if "php diagnostic" in alert or "phpinfo" in alert:
         return "php-diagnostic-exposure"
-    if "directory listing" in alert or "directory-index" in verification:
+    if "directory listing" in alert or "directory indexing" in alert or "directory-index" in verification:
         return "directory-listing"
     if "backup configuration or source" in alert or "source-disclosure" in verification:
         return "source-configuration-disclosure"
@@ -566,6 +566,107 @@ def build_coverage(results: dict[str, Any], context: dict[str, Any]) -> list[dic
     return rows
 
 
+def _coverage_constraints(
+    results: dict[str, Any],
+    findings: list[dict[str, Any]],
+    coverage: list[dict[str, Any]],
+    context: dict[str, Any],
+) -> list[dict[str, str]]:
+    """Describe meaningful untested classes separately from scanner failures.
+
+    A successful or deliberately skipped tool run can still leave a class of
+    behaviour unverified (for example, BOLA without a second identity).  These
+    rows must not be mixed with execution errors, but they should be visible in
+    PDF/HTML/JSON so that a clean execution summary is not mistaken for total
+    security coverage.
+    """
+    constraints: list[dict[str, str]] = []
+
+    def add(area: str, reason: str, next_step: str) -> None:
+        key = (area.strip().lower(), reason.strip().lower())
+        if not area or not reason:
+            return
+        if any((row["area"].lower(), row["reason"].lower()) == key for row in constraints):
+            return
+        constraints.append({"area": area, "reason": reason, "recommended_next_step": next_step})
+
+    profiles = context.get("profiles") if isinstance(context.get("profiles"), list) else []
+    authenticated_profiles = [
+        row for row in profiles
+        if isinstance(row, dict) and bool(row.get("authenticated"))
+    ]
+    anonymous_profiles = [
+        row for row in profiles
+        if isinstance(row, dict) and not bool(row.get("authenticated"))
+    ]
+    if authenticated_profiles and not anonymous_profiles:
+        add(
+            "Anonymous attack surface",
+            "The assessment was run with authenticated profiles only, so unauthenticated exposure and access-control differences were not compared.",
+            "Repeat the assessment without --auth-only or include both anonymous and authenticated profiles.",
+        )
+
+    if authenticated_profiles and not bool(context.get("secondary_identity_supplied")):
+        add(
+            "Authorization / BOLA",
+            "Only one authenticated identity was supplied. Horizontal and vertical authorization differences between users or roles could not be confirmed.",
+            "Provide --secondary-cookies for an account with different ownership or privileges and repeat the read-only authorization checks.",
+        )
+
+    coverage_by_tool = {
+        str(row.get("tool") or "").lower(): row
+        for row in coverage if isinstance(row, dict)
+    }
+    arjun = coverage_by_tool.get("arjun")
+    if arjun and arjun.get("status") == "skipped":
+        add(
+            "Hidden HTTP parameters",
+            "No Arjun-compatible request contract was exercised, so undocumented parameter names were not actively searched.",
+            "Review the relaxed Arjun candidate selected in deep/balanced mode or provide an explicit --tool-url for a safe endpoint.",
+        )
+    idor = coverage_by_tool.get("idor")
+    if idor and idor.get("status") == "skipped":
+        add(
+            "Object-level authorization",
+            "No compatible numeric object reference was discovered. UUID, path-segment, JSON-body and multi-step ownership checks remain outside the bounded IDOR verifier.",
+            "Supply representative object endpoints and two identities, then perform manual ownership validation.",
+        )
+    jwt = coverage_by_tool.get("jwt")
+    if jwt and jwt.get("status") == "skipped":
+        add(
+            "JWT validation",
+            "No JWT was discovered in the crawled traffic, so token algorithm, lifetime and claim structure were not analysed.",
+            "Provide a representative JWT or capture an authenticated API flow if the application uses bearer tokens.",
+        )
+
+    for row in findings:
+        verification = str(row.get("verification_status") or "").lower()
+        if verification == "upload-accepted-location-not-confirmed":
+            add(
+                "File-upload retrieval and execution",
+                "A harmless file was accepted, but no same-origin retrieval URL was confirmed.",
+                "Inspect the upload response and discovered upload directories, then verify storage, MIME type and retrieval with a harmless marker.",
+            )
+            break
+
+    remaining = int(context.get("remaining_eligible_actions_at_report", 0) or 0)
+    if remaining:
+        add(
+            "Agentic execution plan",
+            f"{remaining} applicable discovery-derived action(s) remained when the report was created.",
+            "Increase --max-rounds or review the agentic planning audit and rerun the omitted applicable actions.",
+        )
+    planner_audit = context.get("planner_audit") if isinstance(context.get("planner_audit"), list) else []
+    if any(isinstance(item, dict) and item.get("remaining_coverage_gaps") for item in planner_audit):
+        add(
+            "Agentic coverage contract",
+            "At least one planner round ended with unresolved applicable tool groups.",
+            "Review the round-level coverage gaps and rerun with a stronger model, more rounds or the deterministic baseline.",
+        )
+
+    return constraints
+
+
 def summarize(results: dict[str, Any], findings: list[dict[str, Any]], coverage: list[dict[str, Any]], context: dict[str, Any]) -> dict[str, Any]:
     limitations: list[dict[str, Any]] = []
     for path, result in _iter_leaf_results(results):
@@ -580,11 +681,15 @@ def summarize(results: dict[str, Any], findings: list[dict[str, Any]], coverage:
     risks = Counter(item["risk"] for item in findings)
     categories = Counter(item["category"] for item in findings)
     discovery = context.get("discovery") if isinstance(context.get("discovery"), dict) else {}
+    constraints = _coverage_constraints(results, findings, coverage, context)
+    execution_complete = not any(row["status"] in {"error", "partial", "time_limit", "not_run"} for row in coverage)
     return {
         "risk_counts": dict(risks),
         "category_counts": dict(categories),
         "limitations": limitations,
-        "coverage_complete": not any(row["status"] in {"error", "partial", "time_limit", "not_run"} for row in coverage),
+        "coverage_constraints": constraints,
+        "execution_complete": execution_complete,
+        "coverage_complete": execution_complete and not constraints,
         "discovery": discovery,
     }
 
@@ -594,9 +699,10 @@ def _executive_text(summary: dict[str, Any], findings: list[dict[str, Any]]) -> 
     candidates = sum(item["category"] == "candidate" for item in findings)
     observations = sum(item["category"] in {"observation", "discovery"} for item in findings)
     limits = len(summary["limitations"])
+    constraints = len(summary.get("coverage_constraints") or [])
     return (
         f"The automated assessment produced {confirmed} scanner-confirmed findings, {candidates} candidates requiring manual validation, "
-        f"and {observations} discovery or hardening observations. {limits} execution limitation(s) were recorded. "
+        f"and {observations} discovery or hardening observations. {limits} execution limitation(s) and {constraints} coverage constraint(s) were recorded. "
         "The report preserves scanner evidence and metadata; it does not invent unsupported exploitability claims. Confirmed findings include the exact tested parameter, bounded payload, response evidence, impact, remediation and reproduction steps when supplied by the scanner. Repetitive informational details may be summarized in PDF/HTML while the complete normalized set remains in JSON."
     )
 
@@ -648,6 +754,10 @@ def _render_html(payload: dict[str, Any]) -> str:
         f"<tr><td>{_esc(row['path'])}</td><td>{_esc(row['status'])}</td><td>{_esc(row['cause'])}</td><td>{_esc(row['explanation'])}</td></tr>"
         for row in summary["limitations"]
     ) or '<tr><td colspan="4">No recorded execution limitations.</td></tr>'
+    constraint_rows = "".join(
+        f"<tr><td>{_esc(row['area'])}</td><td>{_esc(row['reason'])}</td><td>{_esc(row['recommended_next_step'])}</td></tr>"
+        for row in summary.get("coverage_constraints", [])
+    ) or '<tr><td colspan="3">No additional coverage constraints were recorded.</td></tr>'
 
     def finding_card(item: dict[str, Any], index: int) -> str:
         notes = item.get("data_quality_notes") or []
@@ -786,7 +896,7 @@ details{{margin-top:14px}}.section-note{{background:#eaf1f7;border-left:4px soli
 <div class="meta"><b>Target:</b> {_esc(payload['target'])}<br><b>Generated:</b> {_esc(payload['generated_at'])}<br><b>Evidence policy:</b> scanner-grounded; missing statements are not fabricated.</div>
 <h2>Executive summary</h2><div class="card">{_esc(payload['executive_summary'])}</div>
 {glance_html}
-<div class="grid">{''.join(f'<div class="card"><div class="value">{risks.get(risk,0)}</div><div>{risk.title()}</div></div>' for risk in ('critical','high','medium','low'))}<div class="card"><div class="value">{len(summary['limitations'])}</div><div>Limitations</div></div></div>
+<div class="grid">{''.join(f'<div class="card"><div class="value">{risks.get(risk,0)}</div><div>{risk.title()}</div></div>' for risk in ('critical','high','medium','low'))}<div class="card"><div class="value">{len(summary['limitations'])}</div><div>Execution limitations</div><div class="value">{len(summary.get('coverage_constraints', []))}</div><div>Coverage constraints</div></div></div>
 
 {detail_cap_note}
 <h2>Scope and assessment context</h2>
@@ -797,8 +907,12 @@ details{{margin-top:14px}}.section-note{{background:#eaf1f7;border-left:4px soli
 <p class="section-note">This section records tools, targets, duration and execution status. It is deliberately separate from security findings.</p>
 <table><thead><tr><th>Profile</th><th>Tool and purpose</th><th>Status</th><th>Targets</th><th>Confirmed</th><th>Candidates</th><th>Info/discovery</th><th>Seconds</th><th>Execution details</th></tr></thead><tbody>{coverage_rows}</tbody></table>
 
-<h2>Execution limitations and incomplete coverage</h2>
+<h2>Execution limitations</h2>
 <table><thead><tr><th>Run</th><th>Status</th><th>Cause</th><th>Explanation</th></tr></thead><tbody>{limitation_rows}</tbody></table>
+
+<h2>Coverage constraints and untested classes</h2>
+<p class="section-note">These rows are not scanner failures. They identify security classes that could not be fully validated with the supplied identities, traffic and request contracts.</p>
+<table><thead><tr><th>Area</th><th>Reason</th><th>Recommended next step</th></tr></thead><tbody>{constraint_rows}</tbody></table>
 
 {''.join(finding_sections)}
 </main></body></html>"""
@@ -1081,6 +1195,37 @@ def _build_pdf(path: Path, payload: dict[str, Any]) -> None:
     else:
         story.append(Paragraph("No execution limitations were recorded.", body))
 
+    story.extend([
+        Spacer(1, 10),
+        Paragraph("Coverage constraints and untested classes", styles["Heading2"]),
+        Paragraph(
+            "These rows are not scanner failures. They identify security classes that could not be fully validated with the supplied identities, traffic and request contracts.",
+            section_note,
+        ),
+    ])
+    constraints = payload["summary"].get("coverage_constraints", [])
+    if constraints:
+        constraint_data = [[
+            Paragraph(value, header)
+            for value in ("Area", "Reason", "Recommended next step")
+        ]]
+        for row in constraints:
+            constraint_data.append([
+                Paragraph(_p(row.get("area", "")), small),
+                Paragraph(_p(row.get("reason", "")), small),
+                Paragraph(_p(row.get("recommended_next_step", "")), small),
+            ])
+        constraint_table = Table(constraint_data, colWidths=[105, 215, 215], repeatRows=1)
+        constraint_table.setStyle(TableStyle([
+            ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#355B73")),
+            ("GRID", (0, 0), (-1, -1), .35, colors.HexColor("#B8C7D1")),
+            ("VALIGN", (0, 0), (-1, -1), "TOP"),
+            ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, colors.HexColor("#F2F7FA")]),
+        ]))
+        story.append(constraint_table)
+    else:
+        story.append(Paragraph("No additional coverage constraints were recorded.", body))
+
     groups = _finding_groups(payload["findings"])
     global_index = 1
     for category in ("vulnerability", "candidate", "observation", "discovery"):
@@ -1248,6 +1393,10 @@ def generate_report(
         security_findings_count=payload["security_findings_count"],
         candidate_findings_count=payload["candidate_findings_count"],
         observations_count=payload["observations_count"],
+        execution_limitations_count=len(summary.get("limitations") or []),
+        coverage_constraints_count=len(summary.get("coverage_constraints") or []),
+        execution_complete=bool(summary.get("execution_complete")),
+        coverage_complete=bool(summary.get("coverage_complete")),
         pwndoc_status=pwndoc_status,
     )
 

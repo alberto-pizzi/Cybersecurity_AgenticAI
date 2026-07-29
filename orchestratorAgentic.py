@@ -628,7 +628,7 @@ def discovery_candidate_actions(state: AgentState) -> list[dict[str, Any]]:
         if tokens:
             actions.append({"profile": name, "tool": "jwt", "target_url": state["target"], "jwt_token": tokens[0], "injection_url": "", "reason": "Discovered JWT."})
         if state["injection_url"]:
-            actions.append({"profile": name, "tool": "interactsh", "target_url": state["target"], "method": "GET", "data": "", "parameters": ["explicit"], "jwt_token": "", "injection_url": state["injection_url"], "reason": "Configured OAST URL."})
+            actions.append({"profile": name, "tool": "interactsh", "target_url": state["target"], "method": "GET", "data": "", "parameters": ["explicit"], "jwt_token": "", "injection_url": state["injection_url"], "oast_class": "explicit", "reason": "Configured OAST URL."})
         else:
             for case in select_oast_request_cases(
                 state["discovery"].get(name, {}), state["target"],
@@ -639,6 +639,7 @@ def discovery_candidate_actions(state: AgentState) -> list[dict[str, Any]]:
                     "method": case.get("method", "GET"), "data": case.get("data", ""),
                     "parameters": case.get("parameters", []), "jwt_token": "",
                     "injection_url": case.get("injection_url", ""),
+                    "oast_class": case.get("oast_class", "remote-fetch"),
                     "reason": f"Automatically selected OAST-capable parameter: {case.get('parameter', 'unknown')}.",
                 })
     return actions
@@ -692,6 +693,7 @@ def validate_plan(state: AgentState, proposed: Any) -> list[dict[str, Any]]:
         file_parameters: list[str] = []
         token_parameters: list[str] = []
         enctype = ""
+        oast_class = str(raw.get("oast_class") or "")
         scope = REGISTRY[tool][2]
         if scope == "base":
             target_url = state["target"]
@@ -786,6 +788,7 @@ def validate_plan(state: AgentState, proposed: Any) -> list[dict[str, Any]]:
                 method = "GET"
                 data = ""
                 parameters = ["explicit"]
+                oast_class = "explicit"
             else:
                 candidates = select_oast_request_cases(found, state["target"], limit=5)
                 matching = [item for item in candidates if not injection or item.get("injection_url") == injection]
@@ -796,6 +799,7 @@ def validate_plan(state: AgentState, proposed: Any) -> list[dict[str, Any]]:
                 method = str(selected.get("method", "GET")).upper()
                 data = str(selected.get("data", ""))
                 parameters = [str(value) for value in selected.get("parameters", [])]
+                oast_class = str(selected.get("oast_class") or "remote-fetch")
         action = {
             "profile": profile, "tool": tool, "target_url": target_url,
             "method": method or "GET", "data": data, "parameters": parameters,
@@ -803,6 +807,7 @@ def validate_plan(state: AgentState, proposed: Any) -> list[dict[str, Any]]:
             "client_sources": client_sources, "client_sinks": client_sinks,
             "file_parameters": file_parameters, "token_parameters": token_parameters,
             "enctype": enctype, "jwt_token": token, "injection_url": injection,
+            "oast_class": oast_class,
             "reason": str(raw.get("reason", ""))[:500] or "No planner reason supplied.",
         }
         identifier = action_id(action)
@@ -1346,6 +1351,13 @@ async def execute_action(
     if action["tool"] == "jwt":
         arguments = {"jwt_token": action["jwt_token"], "target_url": action["target_url"]}
     elif action["tool"] == "interactsh":
+        oast_class = str(action.get("oast_class") or "remote-fetch")
+        if oast_class == "explicit":
+            oast_timeout = 120 if deterministic_core.CURRENT_SCAN_MODE == "deep" else 75
+        elif oast_class == "command":
+            oast_timeout = 75 if deterministic_core.CURRENT_SCAN_MODE == "deep" else 55
+        else:
+            oast_timeout = 60 if deterministic_core.CURRENT_SCAN_MODE == "deep" else 45
         arguments = {
             "target_url": action["target_url"],
             "injection_url": action["injection_url"],
@@ -1353,11 +1365,7 @@ async def execute_action(
             "method": action.get("method", "GET"),
             "data": action.get("data", ""),
             "parameter": (action.get("parameters") or [""])[0],
-            "timeout": (
-                120 if deterministic_core.CURRENT_SCAN_MODE == "deep"
-                else 75 if deterministic_core.CURRENT_SCAN_MODE == "balanced"
-                else 60
-            ),
+            "timeout": oast_timeout,
         }
     else:
         arguments = {"target_url": action["target_url"], "cookies": cookies.get(action["profile"], "")}
@@ -1463,6 +1471,7 @@ async def execute_action(
                 "source_url": action.get("source_url", ""),
                 "enctype": action.get("enctype", ""),
                 "allow_state_changes": local_authorized_state_changes,
+                "known_urls": list(profile_discovery.get("urls", [])),
             })
 
     state_refresh: dict[str, Any] | None = None
@@ -1565,6 +1574,7 @@ async def execute_plan(
     )
     executed: list[tuple[dict[str, Any], dict[str, Any]]] = []
     arjun_empty_limits: dict[str, int] = {}
+    confirmed_oast_classes: set[tuple[str, str]] = set()
     arjun_threshold = 2 if deterministic_core.CURRENT_SCAN_MODE == "deep" else 1
     for index, action in enumerate(ordered, start=1):
         started = time.monotonic()
@@ -1574,7 +1584,23 @@ async def execute_plan(
             flush=True,
         )
         try:
-            if (
+            oast_key = (action["profile"], str(action.get("oast_class") or "remote-fetch"))
+            if action["tool"] == "interactsh" and oast_key in confirmed_oast_classes:
+                item = (
+                    action,
+                    {
+                        "tool": "interactsh",
+                        "status": "skipped",
+                        "target": action["target_url"],
+                        "output": (
+                            "A callback was already confirmed for the same OAST class in this profile; "
+                            "the duplicate polling wait was omitted."
+                        ),
+                        "diagnosis": "duplicate_oast_class_already_confirmed",
+                        "vulnerabilities": [],
+                    },
+                )
+            elif (
                 action["tool"] == "arjun"
                 and arjun_empty_limits.get(action["profile"], 0) >= arjun_threshold
             ):
@@ -1615,6 +1641,8 @@ async def execute_plan(
             )
         executed.append(item)
         _, result = item
+        if action["tool"] == "interactsh" and result.get("callback_confirmed"):
+            confirmed_oast_classes.add((action["profile"], str(action.get("oast_class") or "remote-fetch")))
         if action["tool"] == "arjun":
             found_parameters = int(result.get("phase_parameters", 0) or 0)
             if (
@@ -2029,6 +2057,7 @@ def main() -> int:
     print(f"[+] PDF: {report.get('pdf_filename') or 'not generated'}")
     print(f"[+] HTML preview: {report.get('html_filename') or 'not generated'}")
     print(f"[+] JSON: {report.get('json_filename') or 'not generated'}")
+    print(f"[+] Coverage constraints recorded: {report.get('coverage_constraints_count', 0)}")
     print_security_finding_summary(final.get("results", {}))
     print(f"[+] Scanner run errors: {errors}\n[+] Time-limited/partial scanner runs: {partial}\n[+] Scanner run skips: {skips}")
     return 1 if report.get("status") != "success" else 0

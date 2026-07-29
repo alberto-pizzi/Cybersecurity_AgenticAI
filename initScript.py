@@ -41,7 +41,7 @@ DEFAULT_MODEL = "llama3.1:8b"
 NUCLEI_TEMPLATE_MINIMUM = 1000
 NUCLEI_TEMPLATE_UPDATE_TIMEOUT = 600
 _NUCLEI_TEMPLATE_STATE: dict[str, Any] = {}
-BUILD_ID = "secops-init-resilient-v31.11.4-nikto-docker-dns-nolookup-fix-20260729"
+BUILD_ID = "secops-init-resilient-v31.12-coverage-quality-agentic-parity-20260729"
 
 PYTHON_PACKAGES = (
     "fastmcp==2.12.5", "langgraph>=0.6,<2", "requests>=2.32,<3",

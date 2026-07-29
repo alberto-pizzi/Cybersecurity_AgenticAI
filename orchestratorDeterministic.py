@@ -2308,6 +2308,29 @@ def select_arjun_request_cases(
             continue
         ranked.append((score, {"url": url, "method": "GET", "data": "", "parameters": []}))
 
+    # If strict selection found nothing, balanced/deep mode still exercises one
+    # safe high-value parameterless page. This records hidden-parameter coverage
+    # without returning to the previous multi-endpoint timeout-heavy behaviour.
+    if not ranked and CURRENT_SCAN_MODE in {"balanced", "deep"}:
+        relaxed: list[tuple[int, dict[str, Any]]] = []
+        for raw_url in discovery.get("html_urls", []) or discovery.get("urls", []):
+            url = normalize_url(str(raw_url or ""))
+            if not url or not same_origin(target, url) or urlparse(url).query or _destructive_crawl_url(url):
+                continue
+            path = urlparse(url).path.lower()
+            if path.endswith(("/login.php", "/login", "/setup.php", "/logout.php")):
+                continue
+            score = _risk_terms(path)
+            if any(token in path for token in ("security", "vulnerabilities", "admin", "debug", "api")):
+                score += 8
+            if score >= 6:
+                relaxed.append((score, {
+                    "url": url, "method": "GET", "data": "", "parameters": [],
+                    "selection_reason": "relaxed-safe-hidden-parameter-fallback",
+                }))
+        if relaxed:
+            ranked.append(max(relaxed, key=lambda item: (item[0], item[1]["url"])))
+
     selected: list[dict[str, Any]] = []
     seen: set[tuple[str, str]] = set()
     for _, case in sorted(ranked, key=lambda item: (-item[0], item[1]["url"])):
@@ -2436,6 +2459,7 @@ def select_oast_request_cases(
             "parameter": parameter,
             "parameters": [parameter],
             "priority_score": score,
+            "oast_class": "command" if command_context else "remote-fetch",
         }))
 
     selected: list[dict[str, Any]] = []
@@ -2748,6 +2772,10 @@ def log_result(profile: str, name: str, result: dict[str, Any], target: str = ""
             "    [NIKTO COVERAGE] mode="
             f"{result.get('execution_mode', 'unknown')}; requests={metrics.get('requests', 0)}; "
             f"reported={metrics.get('items_reported', 0)}; hosts={metrics.get('hosts_tested', 0)}; "
+            f"parsed unique={len(result.get('vulnerabilities') or [])}; "
+            f"raw parsed={result.get('raw_parsed_findings', len(result.get('vulnerabilities') or []))}; "
+            f"cross-source duplicates removed={result.get('cross_source_duplicates_removed', 0)}; "
+            f"parser count consistent={result.get('parser_count_consistent', True)}; "
             f"report copied={structured.get('copied', False)}; report bytes={structured.get('bytes', 0)}; "
             f"console fallback={structured.get('console_only', False)}; "
             f"coverage verified={result.get('coverage_verified', False)}; "
@@ -3433,6 +3461,7 @@ async def run_pipeline(
                         "enctype": str(case.get("enctype", "")),
                         "timeout": PARAMETER_TOOL_TIMEOUTS.get("workflow", 60),
                         "allow_state_changes": workflow_state_changes,
+                        "known_urls": list(discovery[name].get("urls", [])),
                     },
                     timeout_seconds=PARAMETER_TOOL_TIMEOUTS.get("workflow", 60) + 35,
                 )
@@ -3477,10 +3506,26 @@ async def run_pipeline(
             )
         oast_selection_summary[name] = oast_cases
         interactsh_runs: list[dict[str, Any]] = []
+        confirmed_oast_classes: set[str] = set()
         for oast_case in oast_cases:
+            oast_class = str(oast_case.get("oast_class") or "explicit")
+            if oast_class in confirmed_oast_classes:
+                skipped_duplicate = make_skipped_result(
+                    "interactsh", oast_case.get("source_url", target),
+                    f"A callback was already confirmed for the same OAST class ({oast_class}); the duplicate wait was omitted.",
+                )
+                interactsh_runs.append(skipped_duplicate)
+                log_result(name, "interactsh", skipped_duplicate, oast_case.get("source_url", target))
+                continue
             interactsh_spec = next(
                 item for item in OPTIONAL_TOOLS if item.name == "interactsh"
             )
+            if injection_url:
+                oast_timeout = 120 if CURRENT_SCAN_MODE == "deep" else 75
+            elif oast_class == "command":
+                oast_timeout = 75 if CURRENT_SCAN_MODE == "deep" else 55
+            else:
+                oast_timeout = 60 if CURRENT_SCAN_MODE == "deep" else 45
             result = await call_mcp_with_progress(
                 interactsh_spec,
                 {
@@ -3490,12 +3535,15 @@ async def run_pipeline(
                     "method": oast_case.get("method", "GET"),
                     "data": oast_case.get("data", ""),
                     "parameter": oast_case.get("parameter", ""),
-                    "timeout": 120 if CURRENT_SCAN_MODE == "deep" else 75,
+                    "timeout": oast_timeout,
                 },
-                timeout_seconds=155 if CURRENT_SCAN_MODE == "deep" else 110,
+                timeout_seconds=oast_timeout + 35,
             )
+            result["oast_class"] = oast_class
             interactsh_runs.append(result)
             log_result(name, "interactsh", result, oast_case.get("source_url", target))
+            if result.get("callback_confirmed"):
+                confirmed_oast_classes.add(oast_class)
         interactsh_result = (
             aggregate_runs("interactsh", target, interactsh_runs)
             if interactsh_runs
@@ -4115,6 +4163,7 @@ def main() -> int:
     print(f"[+] PDF: {report.get('pdf_filename') or 'not generated'}")
     print(f"[+] HTML preview: {report.get('html_filename') or 'not generated'}")
     print(f"[+] JSON: {report.get('json_filename') or 'not generated'}")
+    print(f"[+] Coverage constraints recorded: {report.get('coverage_constraints_count', 0)}")
     print(
         f"[+] Scanner run errors: {errors}\n"
         f"[+] Time-limited/partial scanner runs: {partial}\n"

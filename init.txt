@@ -1,42 +1,42 @@
 SecOps FastMCP - guida operativa multipiattaforma
 ====================================================
 
-AMBIENTE RILEVATO
------------------
-Sistema: Windows AMD64
-Python attivo: C:\Users\tommy\AppData\Local\Microsoft\WindowsApps\PythonSoftwareFoundation.Python.3.13_qbz5n2kfra8p0\python.exe
-Radice progetto: S:\Cybersecurity_AgenticAI
-Apri il terminale nella radice:
-  Set-Location "S:\Cybersecurity_AgenticAI"
+AMBIENTE
+--------
+Apri il terminale nella radice del progetto:
+  Windows PowerShell: Set-Location "<PROJECT_ROOT>"
+  macOS/Linux:        cd "<PROJECT_ROOT>"
 
-Usa soltanto target tuoi o esplicitamente autorizzati. Per un target remoto
-aggiungi sempre --authorized e mantieni l'intero Cookie header tra virgolette.
+Nei comandi seguenti, sostituisci <PYTHON> con `python` su Windows oppure
+`python3` su macOS/Linux. Usa soltanto target tuoi o esplicitamente autorizzati.
+Per un target remoto aggiungi sempre --authorized e mantieni l'intero Cookie
+header tra virgolette.
 
 1. INIZIALIZZAZIONE E LAB LOCALE
 --------------------------------
-python .\initScript.py --with-lab --model qwen2.5:7b
-python .\initScript.py
-python .\initScript.py --commands-only
-python .\initScript.py --with-lab --run deterministic --mode balanced
-python .\initScript.py --with-lab --run agentic --model qwen2.5:7b --mode balanced
+<PYTHON> ./initScript.py --with-lab --model qwen2.5:7b
+<PYTHON> ./initScript.py
+<PYTHON> ./initScript.py --commands-only
+<PYTHON> ./initScript.py --with-lab --run deterministic --mode balanced
+<PYTHON> ./initScript.py --with-lab --run agentic --model qwen2.5:7b --mode balanced
 
 `initScriptMac.py` rimane disponibile come wrapper compatibile, ma usa lo stesso
 initializer multipiattaforma per evitare divergenze tra Windows e macOS.
 
 2. DETERMINISTIC
 ----------------
-python .\orchestratorDeterministic.py --target <TARGET> --cookies "<COOKIE_HEADER>" --auth-only --authorized --mode balanced
-python .\orchestratorDeterministic.py --target <TARGET> --cookies "<COOKIE_HEADER>" --auth-only --authorized --mode deep
-python .\orchestratorDeterministic.py --target <TARGET> --cookies "<PRIMARY_COOKIE>" --secondary-cookies "<SECOND_ACCOUNT_COOKIE>" --auth-only --authorized --mode deep
-python .\orchestratorDeterministic.py --target <TARGET> --authorized --mode balanced
+<PYTHON> ./orchestratorDeterministic.py --target <TARGET> --cookies "<COOKIE_HEADER>" --auth-only --authorized --mode balanced
+<PYTHON> ./orchestratorDeterministic.py --target <TARGET> --cookies "<COOKIE_HEADER>" --auth-only --authorized --mode deep
+<PYTHON> ./orchestratorDeterministic.py --target <TARGET> --cookies "<PRIMARY_COOKIE>" --secondary-cookies "<SECOND_ACCOUNT_COOKIE>" --auth-only --authorized --mode deep
+<PYTHON> ./orchestratorDeterministic.py --target <TARGET> --authorized --mode balanced
 
 3. AGENTIC
 ----------
-python .\orchestratorAgentic.py --target <TARGET> --cookies "<COOKIE_HEADER>" --auth-only --authorized --model <MODEL> --max-rounds 2 --mode balanced
-python .\orchestratorAgentic.py --target <TARGET> --cookies "<COOKIE_HEADER>" --auth-only --authorized --model <MODEL> --max-rounds 3 --mode deep --ai-timeout 720
-python .\orchestratorAgentic.py --target <TARGET> --cookies "<PRIMARY_COOKIE>" --secondary-cookies "<SECOND_ACCOUNT_COOKIE>" --auth-only --authorized --model <MODEL> --max-rounds 3 --mode deep
-python .\orchestratorAgentic.py --target <TARGET> --cookies "<COOKIE_HEADER>" --auth-only --authorized --model <MODEL> --require-ai --max-rounds 2 --mode balanced
-python .\orchestratorAgentic.py --target <TARGET> --authorized --model <MODEL> --no-model-pull --mode balanced
+<PYTHON> ./orchestratorAgentic.py --target <TARGET> --cookies "<COOKIE_HEADER>" --auth-only --authorized --model <MODEL> --max-rounds 2 --mode balanced
+<PYTHON> ./orchestratorAgentic.py --target <TARGET> --cookies "<COOKIE_HEADER>" --auth-only --authorized --model <MODEL> --max-rounds 3 --mode deep --ai-timeout 720
+<PYTHON> ./orchestratorAgentic.py --target <TARGET> --cookies "<PRIMARY_COOKIE>" --secondary-cookies "<SECOND_ACCOUNT_COOKIE>" --auth-only --authorized --model <MODEL> --max-rounds 3 --mode deep
+<PYTHON> ./orchestratorAgentic.py --target <TARGET> --cookies "<COOKIE_HEADER>" --auth-only --authorized --model <MODEL> --require-ai --max-rounds 2 --mode balanced
+<PYTHON> ./orchestratorAgentic.py --target <TARGET> --authorized --model <MODEL> --no-model-pull --mode balanced
 
 L'agentic usa il catalogo, i selector e l'interprete MCP del deterministic.
 Quando il piano omette una classe applicabile, Ollama deve scegliere esplicitamente
@@ -46,16 +46,16 @@ hardcoded. I round continuano finché restano azioni valide o viene raggiunto
 
 4. PREFLIGHT E DEBUG
 --------------------
-python .\orchestratorDeterministic.py --target <TARGET> --authorized --preflight-only
-python .\orchestratorAgentic.py --target <TARGET> --authorized --preflight-only
-python .\orchestratorDeterministic.py --list-tools
-python .\orchestratorDeterministic.py --target <TARGET> --cookies "<COOKIE_HEADER>" --authorized --tool zap --mode deep --tool-timeout 480
-python .\orchestratorDeterministic.py --target <TARGET> --cookies "<COOKIE_HEADER>" --authorized --tool sqlmap --tool-url <URL> --method GET --parameters "id,query" --tool-timeout 180
-python .\orchestratorDeterministic.py --target <TARGET> --authorized --tool jwt --jwt-token "<JWT>"
-python .\orchestratorDeterministic.py --target <TARGET> --cookies "<COOKIE_HEADER>" --authorized --tool exposure --mode balanced
-python .\orchestratorDeterministic.py --target <TARGET> --cookies "<COOKIE_HEADER>" --authorized --tool browser --mode balanced
-python .\orchestratorDeterministic.py --target <TARGET> --cookies "<COOKIE_HEADER>" --authorized --tool workflow --mode balanced
-python .\orchestratorDeterministic.py --target <TARGET> --cookies "<PRIMARY_COOKIE>" --secondary-cookies "<SECOND_ACCOUNT_COOKIE>" --authorized --tool authorization --mode balanced
+<PYTHON> ./orchestratorDeterministic.py --target <TARGET> --authorized --preflight-only
+<PYTHON> ./orchestratorAgentic.py --target <TARGET> --authorized --preflight-only
+<PYTHON> ./orchestratorDeterministic.py --list-tools
+<PYTHON> ./orchestratorDeterministic.py --target <TARGET> --cookies "<COOKIE_HEADER>" --authorized --tool zap --mode deep --tool-timeout 480
+<PYTHON> ./orchestratorDeterministic.py --target <TARGET> --cookies "<COOKIE_HEADER>" --authorized --tool sqlmap --tool-url <URL> --method GET --parameters "id,query" --tool-timeout 180
+<PYTHON> ./orchestratorDeterministic.py --target <TARGET> --authorized --tool jwt --jwt-token "<JWT>"
+<PYTHON> ./orchestratorDeterministic.py --target <TARGET> --cookies "<COOKIE_HEADER>" --authorized --tool exposure --mode balanced
+<PYTHON> ./orchestratorDeterministic.py --target <TARGET> --cookies "<COOKIE_HEADER>" --authorized --tool browser --mode balanced
+<PYTHON> ./orchestratorDeterministic.py --target <TARGET> --cookies "<COOKIE_HEADER>" --authorized --tool workflow --mode balanced
+<PYTHON> ./orchestratorDeterministic.py --target <TARGET> --cookies "<PRIMARY_COOKIE>" --secondary-cookies "<SECOND_ACCOUNT_COOKIE>" --authorized --tool authorization --mode balanced
 
 5. PROFILI
 ----------
@@ -76,7 +76,7 @@ Nei laboratori locali vengono abilitati automaticamente.
 ---------
 nuclei -update
 nuclei -update-templates
-nuclei -tl -silent -nc -disable-update-check | Measure-Object -Line
+nuclei -tl -silent -nc -disable-update-check | wc -l
 
 Le pipeline passano a Nuclei request contract GET/POST same-origin e
 non distruttivi. Le fasi statiche per esposizioni, misconfigurazioni e
@@ -95,9 +95,9 @@ fornita, una seconda identità autenticata senza eseguire operazioni mutative.
 
 8. REPORT
 ---------
-Deterministic: .\reports\SecOps_Assessment_<timestamp>.pdf/.html/.json
-Agentic:       .\reports\SecOps_Agentic_Assessment_<timestamp>.pdf/.html/.json
+Deterministic: ./reports/SecOps_Assessment_<timestamp>.pdf/.html/.json
+Agentic:       ./reports/SecOps_Agentic_Assessment_<timestamp>.pdf/.html/.json
 
 NOTA SHELL
 ----------
-In PowerShell il backtick (`) continua un comando sulla riga successiva.
+In zsh/bash usa \ alla fine della riga per continuare un comando.

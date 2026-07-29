@@ -4,6 +4,7 @@ import argparse
 import ipaddress
 import csv
 import json
+from difflib import SequenceMatcher
 import os
 import re
 import shutil
@@ -436,6 +437,7 @@ def _parse_csv(output_file: Path, target_url: str) -> list[dict[str, Any]]:
                 "references": [reference] if reference else [],
                 "technical_details": f"Nikto CSV message; method={method or 'not specified'}; reference={reference or 'not supplied'}.",
                 "evidence": message,
+                "parser_sources": ["csv"],
             })
     return findings
 
@@ -498,6 +500,7 @@ def _parse_text_findings(log_text: str, target_url: str) -> list[dict[str, Any]]
             "method": "GET",
             "technical_details": "Parsed from Nikto console output.",
             "evidence": message,
+            "parser_sources": ["console"],
         })
     return findings
 
@@ -690,6 +693,13 @@ def _run_native_nikto_scan(
             "minimum_clean_requests": NIKTO_SCAN_PROFILES[_normalize_scan_profile(scan_profile)]["minimum_clean_requests"],
             "csv_findings": len(csv_findings),
             "console_findings": len(console_findings),
+            "raw_parsed_findings": len(csv_findings) + len(console_findings),
+            "cross_source_duplicates_removed": len(csv_findings) + len(console_findings) - len(findings),
+            "nikto_reported_items": int(metrics.get("items_reported") or 0),
+            "parser_count_consistent": (
+                int(metrics.get("items_reported") or 0) == 0
+                or len(findings) == int(metrics.get("items_reported") or 0)
+            ),
             "safe_tuning": NIKTO_SCAN_PROFILES[_normalize_scan_profile(scan_profile)]["tuning"],
             "plugins": NIKTO_SCAN_PROFILES[_normalize_scan_profile(scan_profile)]["plugins_label"],
             "cgi_dirs": NIKTO_SCAN_PROFILES[_normalize_scan_profile(scan_profile)]["cgi_dirs"],
@@ -938,20 +948,98 @@ def _nikto_scan_metrics(log_text: str) -> dict[str, Any]:
     return metrics
 
 
+def _canonical_nikto_url(value: Any) -> tuple[str, str, str]:
+    """Normalize a finding URL for cross-parser comparison."""
+    text = str(value or "").strip()
+    try:
+        parsed = urlparse(text)
+    except ValueError:
+        return ("", "", text.rstrip("/").lower())
+    path = re.sub(r"/{2,}", "/", parsed.path or "/")
+    if path != "/":
+        path = path.rstrip("/")
+    return (parsed.scheme.lower(), parsed.netloc.lower(), path.lower())
+
+
+def _canonical_nikto_message(finding: dict[str, Any]) -> str:
+    """Return a stable message fingerprint shared by CSV and console parsers."""
+    value = str(
+        finding.get("evidence")
+        or finding.get("description")
+        or finding.get("alert")
+        or ""
+    ).strip()
+    value = re.sub(r"^nikto reported:\s*", "", value, flags=re.I)
+    value = re.sub(r"^https?://[^\s:]+(?::\d+)?/[^:]*:\s*", "", value, flags=re.I)
+    value = re.sub(r"^/[^:]*:\s*", "", value)
+    value = re.sub(r"\s+see:\s+\S+.*$", "", value, flags=re.I)
+    value = re.sub(r"https?://\S+", "", value, flags=re.I)
+    value = value.lower()
+    value = re.sub(r"[^a-z0-9]+", " ", value)
+    return " ".join(value.split())
+
+
+def _nikto_findings_equivalent(left: dict[str, Any], right: dict[str, Any]) -> bool:
+    if _canonical_nikto_url(left.get("url")) != _canonical_nikto_url(right.get("url")):
+        return False
+    left_message = _canonical_nikto_message(left)
+    right_message = _canonical_nikto_message(right)
+    if not left_message or not right_message:
+        return False
+    if left_message == right_message:
+        return True
+    return SequenceMatcher(None, left_message, right_message).ratio() >= 0.92
+
+
+def _enrich_nikto_finding(primary: dict[str, Any], secondary: dict[str, Any]) -> None:
+    references: list[str] = []
+    for source in (primary.get("references"), secondary.get("references")):
+        if isinstance(source, list):
+            references.extend(str(item) for item in source if str(item))
+    for source in (primary.get("reference"), secondary.get("reference")):
+        if source:
+            references.append(str(source))
+    unique_references = list(dict.fromkeys(references))
+    if unique_references:
+        primary["references"] = unique_references
+        primary["reference"] = unique_references[0]
+    if not str(primary.get("impact") or "").strip() and secondary.get("impact"):
+        primary["impact"] = secondary["impact"]
+    if not str(primary.get("solution") or "").strip() and secondary.get("solution"):
+        primary["solution"] = secondary["solution"]
+    sources = list(primary.get("parser_sources") or [])
+    sources.extend(secondary.get("parser_sources") or [])
+    primary["parser_sources"] = list(dict.fromkeys(str(item) for item in sources if str(item)))
+
+
 def _merge_nikto_findings(*groups: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Merge CSV and console representations without double-counting findings.
+
+    Findings inside one parser remain distinct. Equivalence is tested only
+    across parser groups, so two different Nikto checks on the same endpoint
+    are preserved while the CSV/console duplicate of each check is collapsed.
+    """
     merged: list[dict[str, Any]] = []
-    seen: set[tuple[str, str, str]] = set()
-    for group in groups:
-        for finding in group:
-            key = (
-                str(finding.get("alert") or "").strip().lower(),
-                str(finding.get("url") or "").strip(),
-                str(finding.get("evidence") or "").strip().lower(),
+    group_indexes: list[int] = []
+    for group_index, group in enumerate(groups):
+        for original in group:
+            finding = dict(original)
+            finding.setdefault(
+                "parser_sources",
+                ["csv" if group_index == 0 else "console" if group_index == 1 else f"source-{group_index}"],
             )
-            if key in seen:
-                continue
-            seen.add(key)
-            merged.append(finding)
+            duplicate_index: int | None = None
+            for index, existing in enumerate(merged):
+                if group_indexes[index] == group_index:
+                    continue
+                if _nikto_findings_equivalent(existing, finding):
+                    duplicate_index = index
+                    break
+            if duplicate_index is None:
+                merged.append(finding)
+                group_indexes.append(group_index)
+            else:
+                _enrich_nikto_finding(merged[duplicate_index], finding)
     return merged
 
 
@@ -1420,6 +1508,13 @@ def _run_docker_nikto(
             "coverage_verified": coverage_verified,
             "csv_findings": len(csv_findings),
             "console_findings": len(console_findings),
+            "raw_parsed_findings": len(csv_findings) + len(console_findings),
+            "cross_source_duplicates_removed": len(csv_findings) + len(console_findings) - len(findings),
+            "nikto_reported_items": int(metrics.get("items_reported") or 0),
+            "parser_count_consistent": (
+                int(metrics.get("items_reported") or 0) == 0
+                or len(findings) == int(metrics.get("items_reported") or 0)
+            ),
             "scan_profile": normalized_profile,
             "minimum_clean_requests": NIKTO_SCAN_PROFILES[normalized_profile]["minimum_clean_requests"],
             "zero_result_verified": zero_result_verified,

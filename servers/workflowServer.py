@@ -201,6 +201,7 @@ def _upload_check(
     file_parameters: list[str],
     timeout: int,
     allow_state_changes: bool,
+    known_urls: list[str] | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     findings: list[dict[str, Any]] = []
     diagnostic: dict[str, Any] = {"applicable": bool(file_parameters)}
@@ -241,10 +242,56 @@ def _upload_check(
     for match in re.findall(r"https?://[^\s'\"<>]+", response.text, re.I):
         if filename.lower() in match.lower():
             candidates.append(html.unescape(match))
+    # Some upload handlers print a relative filesystem/web path as text rather
+    # than as a link (for example ../../uploads/name.html). Preserve only the
+    # same-origin URL interpretation and never read local filesystem paths.
+    path_pattern = re.compile(
+        r"([A-Za-z0-9_./\\-]{0,240}" + re.escape(filename) + r")",
+        re.I,
+    )
+    for match in path_pattern.findall(html.unescape(response.text)):
+        cleaned = match.replace("\\", "/")
+        candidates.append(urljoin(str(response.url), cleaned))
+    base = source_url or target_url
     if filename.lower() in response.text.lower() and not candidates:
-        base = source_url or target_url
-        for prefix in ("uploads/", "upload/", "files/", "media/"):
+        for prefix in ("uploads/", "upload/", "files/", "media/", "attachments/", "images/"):
             candidates.append(urljoin(base, prefix + filename))
+
+    # Reuse the already discovered same-origin surface instead of guessing only
+    # four conventional paths. Directory indexes are fetched read-only and any
+    # link to the generated filename is followed.
+    directory_candidates: list[str] = []
+    for known in known_urls or []:
+        value = str(known or "").strip()
+        if not value or not _same_origin(target_url, value):
+            continue
+        parsed_known = urlparse(value)
+        lowered = parsed_known.path.lower()
+        if any(token in lowered for token in ("upload", "files", "media", "attachment", "image", "document")):
+            directory = value if value.endswith("/") else urljoin(value, "./")
+            directory_candidates.append(directory)
+            candidates.append(urljoin(directory, filename))
+
+    directory_searches: list[dict[str, Any]] = []
+    for directory in list(dict.fromkeys(directory_candidates))[:10]:
+        try:
+            listing = session.get(directory, timeout=(4, timeout), allow_redirects=True)
+        except requests.RequestException as exc:
+            directory_searches.append({"url": directory, "error": f"{type(exc).__name__}: {exc}"})
+            continue
+        discovered_links: list[str] = []
+        for match in re.findall(r"(?:href|src)\s*=\s*['\"]([^'\"]+)['\"]", listing.text, re.I):
+            resolved = urljoin(str(listing.url), html.unescape(match))
+            if filename.lower() in resolved.lower() and _same_origin(target_url, resolved):
+                candidates.append(resolved)
+                discovered_links.append(resolved)
+        directory_searches.append({
+            "url": str(listing.url),
+            "status": listing.status_code,
+            "filename_present": filename.lower() in listing.text.lower(),
+            "matching_links": discovered_links,
+        })
+
     candidates = [value for value in dict.fromkeys(candidates) if _same_origin(target_url, value)]
     retrieved: list[dict[str, Any]] = []
     for candidate in candidates[:8]:
@@ -285,6 +332,8 @@ def _upload_check(
                 "cwe_id": "434",
             })
             break
+    diagnostic["directory_searches"] = directory_searches
+    diagnostic["retrieval_candidates"] = candidates[:20]
     diagnostic["retrieval_attempts"] = retrieved
     if response.status_code < 400 and not findings:
         findings.append({
@@ -448,6 +497,7 @@ def run_workflow_scan(
     enctype: str = "",
     timeout: int = 45,
     allow_state_changes: bool = False,
+    known_urls: list[str] | None = None,
 ) -> dict:
     """Run bounded generic CSRF, upload, authentication and CAPTCHA workflow checks."""
     method = str(method or "GET").upper()
@@ -469,6 +519,7 @@ def run_workflow_scan(
         "parameters": list(parameters or []),
         "file_parameters": file_parameters,
         "token_parameters": token_parameters,
+        "known_url_count": len(known_urls or []),
     }
 
     csrf_findings, csrf_diag = _csrf_check(
@@ -480,7 +531,7 @@ def run_workflow_scan(
 
     upload_findings, upload_diag = _upload_check(
         target_url, source_url, cookies, rows, file_parameters,
-        timeout, allow_state_changes,
+        timeout, allow_state_changes, known_urls,
     )
     findings.extend(upload_findings)
     diagnostics["upload"] = upload_diag
