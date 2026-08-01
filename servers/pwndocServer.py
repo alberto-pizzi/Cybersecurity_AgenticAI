@@ -21,7 +21,20 @@ from reportlab.platypus import KeepTogether, PageBreak, Paragraph, SimpleDocTemp
 
 from utils import REPORTS_DIR, failure, success
 
+
 mcp = FastMCP("SecOps Report Server")
+
+# Report info
+REPORT_TITLE = "SecOps Penetration-Test Report"
+REPORT_VERSION = "1.0"
+AUTHORS = ["Alberto Pizzi", "Tommaso Ciccotti"]
+REPORT_CLASSIFICATION = "Confidential"
+CLIENT_NAME = ""
+
+_MONTHS_EN = {
+    1: "January", 2: "February", 3: "March", 4: "April", 5: "May", 6: "June",
+    7: "July", 8: "August", 9: "September", 10: "October", 11: "November", 12: "December",
+}
 
 RISK_ORDER = {"critical": 5, "high": 4, "medium": 3, "low": 2, "info": 1}
 TOOL_PURPOSES = {
@@ -53,6 +66,24 @@ SECRET_PATTERNS = (
     (re.compile(r"eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]*"), "<redacted-jwt>"),
 )
 
+
+def _format_date_en(dt: datetime) -> str:
+
+    if 10 < dt.day % 100 < 14:  # eccezione: 11, 12, 13
+        suffix = "th"
+
+    last_digit = dt.day % 10
+
+    if last_digit == 1:
+        suffix = "st"
+    elif last_digit == 2:
+        suffix = "nd"
+    elif last_digit == 3:
+        suffix = "rd"
+    else:
+        suffix = "th"
+
+    return f"{_MONTHS_EN[dt.month]} {dt.day}{suffix} {dt.year}"
 
 def _safe_name(value: str) -> str:
     return re.sub(r"[^A-Za-z0-9_.-]+", "_", value.strip()).strip("._")[:120]
@@ -892,7 +923,7 @@ pre{{white-space:pre-wrap;overflow-wrap:anywhere;background:#101821;color:#e5edf
 details{{margin-top:14px}}.section-note{{background:#eaf1f7;border-left:4px solid #527ca3;padding:10px}}
 .count{{font-size:.85rem;background:#dce8f3;border-radius:12px;padding:3px 8px}}
 </style></head><body><main>
-<h1>SecOps Penetration-Test Report</h1>
+<h1>{REPORT_TITLE}</h1>
 <div class="meta"><b>Target:</b> {_esc(payload['target'])}<br><b>Generated:</b> {_esc(payload['generated_at'])}<br><b>Evidence policy:</b> scanner-grounded; missing statements are not fabricated.</div>
 <h2>Executive summary</h2><div class="card">{_esc(payload['executive_summary'])}</div>
 {glance_html}
@@ -927,7 +958,7 @@ def _page_footer(canvas: Any, doc: Any) -> None:
     canvas.saveState()
     canvas.setFont("Helvetica", 7)
     canvas.setFillColor(colors.HexColor("#5B6770"))
-    canvas.drawString(28, 14, "SecOps Penetration-Test Report")
+    canvas.drawString(28, 14, REPORT_TITLE)
     canvas.drawRightString(A4[0] - 28, 14, f"Page {doc.page}")
     canvas.restoreState()
 
@@ -959,11 +990,51 @@ def _build_pdf(path: Path, payload: dict[str, Any]) -> None:
         rightMargin=28,
         topMargin=26,
         bottomMargin=28,
-        title="SecOps Penetration-Test Report",
+        title=REPORT_TITLE,
     )
 
-    story: list[Any] = [
-        Paragraph("SecOps Penetration-Test Report", styles["Title"]),
+    # Cover Style
+    cover_title = ParagraphStyle("CoverTitle", parent=styles["Title"], fontSize=26, leading=32, spaceAfter=6,
+                                 alignment=1)
+    cover_client = ParagraphStyle("CoverClient", parent=styles["Normal"], fontSize=16, alignment=1,
+                                  textColor=colors.HexColor("#173B5E"), spaceAfter=4)
+    cover_meta_label = ParagraphStyle("CoverMetaLabel", parent=styles["Normal"], fontSize=9,
+                                      textColor=colors.HexColor("#5B6770"))
+    cover_meta_value = ParagraphStyle("CoverMetaValue", parent=styles["Normal"], fontSize=11, spaceAfter=10)
+    cover_classification = ParagraphStyle("CoverClass", parent=styles["Normal"], fontSize=11, alignment=1,
+                                          textColor=colors.white, backColor=colors.HexColor("#7A2738"), borderPadding=6)
+
+    cover_flowables = [Spacer(1, 140)]
+
+    if CLIENT_NAME:
+        cover_flowables.append(Paragraph(_p(CLIENT_NAME), cover_client))
+        cover_flowables.append(Spacer(1, 10))
+
+    cover_flowables += [
+        Paragraph(_p(REPORT_TITLE), cover_title),
+        Spacer(1, 60),
+    ]
+
+    meta_rows = [
+        ("Report version", REPORT_VERSION),
+        ("Date", _format_date_en(payload["generated_at"])),
+        ("Authors", ", ".join(AUTHORS) if AUTHORS else "not supplied"),
+        ("Target", payload["target"]),
+        ("Report Classification", REPORT_CLASSIFICATION),
+
+    ]
+    for label, value in meta_rows:
+        cover_flowables.append(Paragraph(_p(label), cover_meta_label))
+        cover_flowables.append(Paragraph(_p(value), cover_meta_value))
+
+    cover_flowables += [
+        Spacer(1, 30),
+        PageBreak(),
+    ]
+
+    story: list[Any] = cover_flowables + [
+
+        Paragraph(REPORT_TITLE, styles["Title"]),
         Paragraph(f"<b>Target:</b> {_p(payload['target'])}", body),
         Paragraph(f"<b>Generated:</b> {_p(payload['generated_at'])}", body),
         Paragraph(
@@ -991,6 +1062,7 @@ def _build_pdf(path: Path, payload: dict[str, Any]) -> None:
             Paragraph(value, header)
             for value in ("#", "Severity", "Finding", "Tool", "Endpoint / parameter")
         ]]
+        # TODO "10" hard coded
         for index, item in enumerate(glance_items[:10], 1):
             glance_data.append([
                 Paragraph(str(index), small),
@@ -1017,6 +1089,7 @@ def _build_pdf(path: Path, payload: dict[str, Any]) -> None:
             ("RIGHTPADDING", (0, 0), (-1, -1), 4),
         ]))
         story.append(glance_table)
+        # TODO "10" hard coded
         if len(glance_items) > 10:
             story.append(Paragraph(
                 f"Only the first 10 of {len(glance_items)} security findings are shown in this summary; full details follow below.",
@@ -1336,7 +1409,7 @@ def generate_report(
     summary = summarize(results, all_findings, coverage, context)
     summary["omitted_human_readable_detail"] = omitted_detail
     payload = {
-        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "generated_at": datetime.now(timezone.utc),
         "target": target_url,
         "reporting_policy": "Scanner-grounded: missing claims are identified, not invented.",
         "executive_summary": _executive_text(summary, findings),
