@@ -752,7 +752,7 @@ def _field(label: str, value: Any, *, pre: bool = False) -> str:
     rendered = f"<pre>{_esc(value)}</pre>" if pre else _esc(value)
     return f"<dt>{_esc(label)}</dt><dd>{rendered}</dd>"
 
-
+# TODO index to be automatized
 def _render_html(payload: dict[str, Any]) -> str:
     summary = payload["summary"]
     risks = summary["risk_counts"]
@@ -770,9 +770,9 @@ def _render_html(payload: dict[str, Any]) -> str:
 
     coverage_rows = "".join(
         "<tr>"
-        f"<td>{_esc(row['profile'])}</td>"
+        f'<td class="no-wrap">{_esc(row['profile'])}</td>'
         f"<td><b>{_esc(row['tool'])}</b><br><small>{_esc(row.get('purpose', ''))}</small></td>"
-        f"<td>{_esc(row['status'])}</td>"
+        f'<td class="no-wrap">{_esc(row['status'])}</td>'
         f"<td>{row['targets']}</td><td>{row.get('confirmed',0)}</td>"
         f"<td>{row.get('candidates',0)}</td><td>{row.get('observations',0)}</td>"
         f"<td>{row['duration_seconds']}</td>"
@@ -849,7 +849,7 @@ def _render_html(payload: dict[str, Any]) -> str:
     ]
     glance_rows = "".join(
         "<tr>"
-        f"<td>{index}</td><td>{_esc(item.get('risk','info')).upper()}</td>"
+        f'<td class="no-wrap">{index}</td><td class="no-wrap">{_esc(item.get('risk','info')).upper()}</td>'
         f"<td><b>{_esc(item.get('alert','Unnamed finding'))}</b></td>"
         f"<td>{_esc(item.get('tool',''))}</td>"
         f"<td>{_esc(item.get('url',''))}<br><small>parameter: {_esc(item.get('parameter') or '-')}</small></td>"
@@ -905,27 +905,61 @@ def _render_html(payload: dict[str, Any]) -> str:
     )
     return f"""<!doctype html><html><head><meta charset="utf-8"><title>SecOps Assessment Report</title>
 <style>
+@page {{
+    size: A4;
+    margin: 10mm 0;
+    background-color: #f4f6f8;
+    @bottom-center {{
+        content: counter(page);
+    }}
+}}
+.toc a::after {{
+    content: leader('.') target-counter(attr(href), page);
+}}
+
+.toc {{
+    break-after: page;
+}}
 body{{font-family:Arial,sans-serif;background:#f4f6f8;color:#17212b;margin:0}}
 main{{max-width:1220px;margin:auto;padding:28px}}
 h1,h2,h3{{color:#173b5e}}h2{{margin-top:32px}}
 .meta,.card,.finding{{background:white;border:1px solid #d7dee5;border-radius:10px;padding:16px;margin:12px 0}}
 .grid{{display:grid;grid-template-columns:repeat(5,1fr);gap:10px}}
 .value{{font-size:2rem;font-weight:700}}
-table{{width:100%;border-collapse:collapse;background:white;font-size:.92rem}}
-th,td{{padding:8px;border:1px solid #cbd5df;vertical-align:top;text-align:left}}
+table{{table-layout:fixed;border-collapse:collapse;background:white;font-size:.92rem}}
+th,td{{padding:8px;border:1px solid #cbd5df;overflow-wrap:anywhere;word-break:break-word}}
 th{{background:#24476b;color:white;position:sticky;top:0}}
+tr th{{white-space:nowrap}}
+.no-wrap{{white-space:nowrap}}
 small{{color:#4f6273}}.finding{{border-left:7px solid #4b86b4}}
 .risk-critical,.risk-high{{border-left-color:#a90000}}.risk-medium{{border-left-color:#d98200}}.risk-low{{border-left-color:#b49b00}}
 .badges b{{display:inline-block;background:#e8eef4;padding:4px 8px;margin:0 6px 6px 0;border-radius:12px;font-size:.82rem}}
-dl{{display:grid;grid-template-columns:190px 1fr;gap:8px 14px}}dt{{font-weight:700}}dd{{margin:0}}
-pre{{white-space:pre-wrap;overflow-wrap:anywhere;background:#101821;color:#e5edf5;padding:12px;border-radius:8px;max-height:520px;overflow:auto}}
+dl{{display:grid;grid-template-columns:190px minmax(0,1fr);gap:8px 14px}}
+dt{{font-weight:700;overflow-wrap:anywhere;min-width:0}}
+dd{{margin:0;overflow-wrap:anywhere;word-break:break-word;min-width:0}}
+pre{{white-space:pre-wrap;overflow-wrap:anywhere;word-break:break-word;background:#101821;color:#e5edf5;padding:12px;border-radius:8px}}
 .quality{{background:#fff8dc;border:1px solid #e1cb73;padding:10px;border-radius:8px}}
 details{{margin-top:14px}}.section-note{{background:#eaf1f7;border-left:4px solid #527ca3;padding:10px}}
 .count{{font-size:.85rem;background:#dce8f3;border-radius:12px;padding:3px 8px}}
+.toc a{{color: black;text-decoration: none;}}
+.toc ul{{list-style: none;padding-left: 0;}}
 </style></head><body><main>
 <h1>{REPORT_TITLE}</h1>
 <div class="meta"><b>Target:</b> {_esc(payload['target'])}<br><b>Generated:</b> {_esc(payload['generated_at'])}<br><b>Evidence policy:</b> scanner-grounded; missing statements are not fabricated.</div>
-<h2>Executive summary</h2><div class="card">{_esc(payload['executive_summary'])}</div>
+
+
+<div class="toc">
+<h1 id="index">Index</h1>
+<ul>
+    <li>
+        <a href="#executive">
+            Executive summary
+        </a>
+    </li>
+</ul>
+</div>
+
+<h2 id="executive">Executive summary</h2><div class="card">{_esc(payload['executive_summary'])}</div>
 {glance_html}
 <div class="grid">{''.join(f'<div class="card"><div class="value">{risks.get(risk,0)}</div><div>{risk.title()}</div></div>' for risk in ('critical','high','medium','low'))}<div class="card"><div class="value">{len(summary['limitations'])}</div><div>Execution limitations</div><div class="value">{len(summary.get('coverage_constraints', []))}</div><div>Coverage constraints</div></div></div>
 
