@@ -394,7 +394,46 @@ def _server_env() -> dict[str, str]:
     return env
 
 
-def _transport(server: Path) -> StdioTransport:
+def _report_docker_transport() -> StdioTransport | None:
+    """Route the 'report' MCP server through its sandboxed WeasyPrint image.
+
+    Mirrors the Nikto Docker fallback: fully transparent, no user action
+    needed. Falls back to native stdio (handled by the caller) whenever the
+    image was never built, was removed, or Docker itself is unavailable.
+    """
+    image = _load_runtime().get("pwndoc_docker_image")
+    if not image or not shutil.which("docker"):
+        return None
+    probe = subprocess.run(
+        ["docker", "image", "inspect", image],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=30,
+        check=False,
+    )
+    if probe.returncode != 0:
+        return None
+    return StdioTransport(
+        command="docker",
+        args=[
+            "run", "-i", "--rm",
+            "-v", f"{ROOT}:/workspace",
+            "-w", "/workspace",
+            "-e", "PYTHONPATH=/workspace",
+            image,
+            "python", "servers/pwndocServer.py",
+        ],
+        keep_alive=False,
+    )
+
+
+def _transport(server: Path, tool_name: str = "") -> StdioTransport:
+    if tool_name == "report":
+        docker_transport = _report_docker_transport()
+        if docker_transport is not None:
+            return docker_transport
     return StdioTransport(
         command=_server_python(),
         args=[str(server)],
@@ -636,7 +675,7 @@ async def call_mcp(server_file: str, tool_name: str, arguments: dict[str, Any], 
         effective_arguments["output_file"] = str(temporary_output)
 
     async def invoke() -> tuple[Any, bool, str]:
-        async with Client(_transport(server)) as client:
+        async with Client(_transport(server, spec.name)) as client:
             return _extract_response(await client.call_tool(tool_name, effective_arguments))
 
     try:
@@ -728,7 +767,7 @@ async def _live_server_check(spec: ToolSpec) -> dict[str, str]:
     server = resolve_server_path(spec.server, spec.tool)
     try:
         async def check() -> list[str]:
-            async with Client(_transport(server)) as client:
+            async with Client(_transport(server, spec.name)) as client:
                 tools = await client.list_tools()
                 return [str(getattr(tool, "name", "")) for tool in tools]
         names = await asyncio.wait_for(check(), timeout=MCP_CONNECT_TIMEOUT)
@@ -819,7 +858,26 @@ def run_preflight_checks(*, include_live: bool = True) -> list[dict[str, str]]:
         checks.append({"level": "ok", "component": spec.name, "cause": "mcp_tool_found", "detail": f"{server.name}: {spec.tool}()"})
         if spec.tool not in _declared_functions(server):
             checks[-1] = {"level": "error" if spec.required else "warning", "component": spec.name, "cause": "mcp_tool_name_mismatch", "detail": f"{server.name} does not declare {spec.tool}()"}
-        if spec.module:
+        if spec.name == "report":
+            docker_image = _load_runtime().get("pwndoc_docker_image", "")
+            docker_ready = bool(docker_image) and shutil.which("docker") and subprocess.run(
+                ["docker", "image", "inspect", docker_image],
+                capture_output=True, timeout=30, check=False,
+            ).returncode == 0
+            if docker_ready:
+                checks.append({
+                    "level": "ok", "component": "report",
+                    "cause": "report_docker_fallback_ready", "detail": docker_image,
+                })
+            else:
+                native_ok = importlib.util.find_spec("weasyprint") is not None
+                checks.append({
+                    "level": "ok" if native_ok else "warning",
+                    "component": "report",
+                    "cause": "python_dependency_found" if native_ok else "missing_python_dependency",
+                    "detail": "weasyprint (Docker fallback unavailable; run initScript.py with Docker present to build it)",
+                })
+        elif spec.module:
             checks.append({
                 "level": "ok" if importlib.util.find_spec(spec.module) else ("error" if spec.required else "warning"),
                 "component": spec.name,

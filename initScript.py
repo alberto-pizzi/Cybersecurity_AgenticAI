@@ -544,6 +544,8 @@ def _nikto_health(perl: Path, script: Path, launcher: Path | None = None) -> tup
 
 
 NIKTO_DOCKER_IMAGE = "ghcr.io/sullo/nikto:latest"
+PWNDOC_DOCKER_IMAGE = "secops/pwndoc-report:local"
+PWNDOC_DOCKERFILE = ROOT / "servers" / "Dockerfile"
 
 
 def _docker_image_ready(image: str) -> bool:
@@ -575,6 +577,38 @@ def _ensure_nikto_docker_image() -> bool:
         print(f"[+] Nikto Docker fallback installed: {NIKTO_DOCKER_IMAGE}")
         return True
     print("[!] Nikto Docker image could not be pulled. Native Perl will be checked as a secondary option.")
+    return False
+
+
+def _ensure_pwndoc_docker_image() -> bool:
+    """Build the sandboxed WeasyPrint/reportlab image used by pwndocServer.py.
+
+    Unlike Nikto's fallback, this image is built locally (there is no public
+    registry image), and it ships no application code: the project tree is
+    bind-mounted at container start so the container always runs whatever
+    pwndocServer.py currently looks like, with no rebuild needed on edits.
+    """
+    if _docker_image_ready(PWNDOC_DOCKER_IMAGE):
+        print(f"[+] PwnDoc report Docker image already available: {PWNDOC_DOCKER_IMAGE}")
+        return True
+    if not shutil.which("docker"):
+        return False
+    if not PWNDOC_DOCKERFILE.is_file():
+        print(f"[!] PwnDoc Dockerfile missing: {PWNDOC_DOCKERFILE}")
+        return False
+    result = run(
+        ["docker", "build", "-t", PWNDOC_DOCKER_IMAGE, "-f", str(PWNDOC_DOCKERFILE), str(ROOT)],
+        required=False,
+        capture=True,
+        timeout=900,
+    )
+    if result.returncode == 0 and _docker_image_ready(PWNDOC_DOCKER_IMAGE):
+        print(f"[+] PwnDoc report Docker image built: {PWNDOC_DOCKER_IMAGE}")
+        return True
+    print(
+        "[!] PwnDoc Docker image build failed; the report tool will fall back to a "
+        "native weasyprint install if one is present (see: brew install pango on macOS)."
+    )
     return False
 
 
@@ -1004,6 +1038,10 @@ def write_runtime_config(status: dict[str, str | None]) -> None:
         "nikto_image": NIKTO_DOCKER_IMAGE,
         "nikto_execution_mode": (
             "docker_official_image" if _docker_image_ready(NIKTO_DOCKER_IMAGE) else "native_perl"
+        ),
+        "pwndoc_docker_image": PWNDOC_DOCKER_IMAGE if _docker_image_ready(PWNDOC_DOCKER_IMAGE) else "",
+        "pwndoc_execution_mode": (
+            "docker_local_image" if _docker_image_ready(PWNDOC_DOCKER_IMAGE) else "native_weasyprint"
         ),
         "nuclei_templates": (
             dict(_NUCLEI_TEMPLATE_STATE)
@@ -1915,6 +1953,8 @@ def main() -> int:
         create_wordlist()
         if not args.skip_scanners:
             install_scanners()
+        if shutil.which("docker"):
+            _ensure_pwndoc_docker_image()
         status = verify_scanners(required=not args.skip_scanners)
         write_runtime_config(status)
         if not args.skip_preflight:

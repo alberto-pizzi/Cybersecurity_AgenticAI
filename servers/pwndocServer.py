@@ -14,6 +14,7 @@ from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 
 import requests
 from fastmcp import FastMCP
+# TODO remote report lab imports
 from reportlab.lib import colors
 from reportlab.lib.pagesizes import A4
 from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
@@ -21,6 +22,7 @@ from reportlab.platypus import KeepTogether, PageBreak, Paragraph, SimpleDocTemp
 
 from utils import REPORTS_DIR, failure, success
 
+from weasyprint import HTML
 
 mcp = FastMCP("SecOps Report Server")
 
@@ -737,6 +739,31 @@ def _executive_text(summary: dict[str, Any], findings: list[dict[str, Any]]) -> 
         "The report preserves scanner evidence and metadata; it does not invent unsupported exploitability claims. Confirmed findings include the exact tested parameter, bounded payload, response evidence, impact, remediation and reproduction steps when supplied by the scanner. Repetitive informational details may be summarized in PDF/HTML while the complete normalized set remains in JSON."
     )
 
+# This method is used for convert html file generated into pdf file with Weasyprint
+def html2pdf(html_path,pdf_path):
+    html_path = Path(html_path).resolve()
+    pdf_path = Path(pdf_path).resolve()
+
+    # NOTE: stdout is reserved (MCP JSON-RPC framing when running under
+    # mcp.run(transport="stdio"); the result JSON line when running via
+    # `--once`). Diagnostic prints go to stderr so they don't corrupt
+    # either channel and are still visible in the console.
+    print("HTML path received:", html_path, file=sys.stderr)
+    print("PDF path received:", pdf_path, file=sys.stderr)
+
+    print("Starting HTML2PDF...", file=sys.stderr)
+
+    if not html_path.exists():
+        raise FileNotFoundError(f"HTML file not found: {html_path}")
+
+    HTML(
+        filename=str(html_path),
+        base_url=str(html_path.parent)
+    ).write_pdf(
+        str(pdf_path)
+    )
+
+    print("Weasyprint: PDF converted into", pdf_path, file=sys.stderr)
 
 def _esc(value: Any) -> str:
     return html.escape(_redact_text(value))
@@ -1466,8 +1493,10 @@ def generate_report(
     except Exception as exc:
         return failure("Report Generator", target_url, f"JSON/HTML report creation failed: {type(exc).__name__}: {exc}", diagnosis="report_serialization_failed")
 
+    # PDF is rendered from the generated HTML via WeasyPrint (html2pdf).
+    # _build_pdf() (ReportLab) is kept in the file but intentionally unused.
     try:
-        _build_pdf(pdf_path, payload)
+        html2pdf(html_path, pdf_path)
     except Exception as exc:
         result = failure("Report Generator", target_url, f"PDF report creation failed: {type(exc).__name__}: {exc}", diagnosis="pdf_generation_failed")
         result.update(json_filename=str(json_path.resolve()), html_filename=str(html_path.resolve()), pdf_filename=None, findings_count=len(findings))
@@ -1514,6 +1543,9 @@ def _once() -> int:
         if not isinstance(arguments, dict):
             raise ValueError("Expected a JSON object on stdin.")
         result = generate_report(**arguments)
+        # generate_report() already renders the PDF via html2pdf() internally;
+        # calling it again here was redundant and, on PDF failure, unsafe
+        # (pdf_filename would be None).
     except Exception as exc:
         result = failure(
             "Report Generator",
