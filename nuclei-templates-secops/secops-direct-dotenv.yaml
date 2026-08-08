@@ -1,0 +1,35 @@
+id: secops-direct-dotenv
+
+info:
+  name: Environment configuration file exposed
+  author: secops-agent
+  severity: high
+  description: A directly supplied URL returned environment-style key/value configuration content.
+  remediation: Remove environment files from the web root and rotate any exposed credentials or tokens.
+  classification:
+    cwe-id: CWE-552
+  metadata:
+    secops-category: vulnerability
+    secops-verification-status: content-verified-environment-file
+    secops-confidence: high
+  tags: secops,dotenv,exposure,config,secret
+
+http:
+  - method: GET
+    path:
+      - "{{BaseURL}}"
+    redirects: false
+    matchers-condition: and
+    matchers:
+      - type: status
+        status:
+          - 200
+      - type: regex
+        part: body
+        regex:
+          - '(?m)^(APP|DB|DATABASE|AWS|AZURE|SECRET|API|MAIL|REDIS|JWT)_[A-Z0-9_]*\s*=\s*.+$'
+      - type: word
+        part: body
+        negative: true
+        words:
+          - "<html"

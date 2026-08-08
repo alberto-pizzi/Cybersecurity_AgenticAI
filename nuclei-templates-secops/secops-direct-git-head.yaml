@@ -1,0 +1,30 @@
+id: secops-direct-git-head
+
+info:
+  name: Git repository metadata exposed
+  author: secops-agent
+  severity: high
+  description: A directly supplied URL returned a Git HEAD reference.
+  remediation: Remove repository metadata from the web root and block access to .git paths.
+  classification:
+    cwe-id: CWE-552
+  metadata:
+    secops-category: vulnerability
+    secops-verification-status: content-verified-git-head
+    secops-confidence: high
+  tags: secops,git,exposure,config
+
+http:
+  - method: GET
+    path:
+      - "{{BaseURL}}"
+    redirects: false
+    matchers-condition: and
+    matchers:
+      - type: status
+        status:
+          - 200
+      - type: regex
+        part: body
+        regex:
+          - '(?m)^ref:\s+refs/heads/[A-Za-z0-9._/-]+\s*$'

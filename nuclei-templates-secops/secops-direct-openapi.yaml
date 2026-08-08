@@ -1,0 +1,31 @@
+id: secops-direct-openapi
+
+info:
+  name: API specification publicly exposed
+  author: secops-agent
+  severity: low
+  description: A directly supplied URL returned an OpenAPI or Swagger specification.
+  remediation: Confirm that public API documentation is intended and remove sensitive examples, internal hosts, and administrative operations.
+  classification:
+    cwe-id: CWE-200
+  metadata:
+    secops-category: candidate
+    secops-verification-status: content-verified-api-specification
+    secops-confidence: high
+  tags: secops,openapi,swagger,exposure,api
+
+http:
+  - method: GET
+    path:
+      - "{{BaseURL}}"
+    redirects: true
+    max-redirects: 2
+    matchers-condition: and
+    matchers:
+      - type: status
+        status:
+          - 200
+      - type: regex
+        part: body
+        regex:
+          - '(?i)("openapi"\s*:\s*"3\.|"swagger"\s*:\s*"2\.|<title>Swagger UI</title>)'

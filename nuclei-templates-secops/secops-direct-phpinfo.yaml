@@ -1,0 +1,31 @@
+id: secops-direct-phpinfo
+
+info:
+  name: PHP diagnostic page exposed
+  author: secops-agent
+  severity: medium
+  description: A directly supplied URL returned phpinfo output and exposed runtime configuration details.
+  remediation: Remove the diagnostic page or restrict it to a trusted administrative network.
+  classification:
+    cwe-id: CWE-200
+  metadata:
+    secops-category: vulnerability
+    secops-verification-status: content-verified-nuclei-template
+    secops-confidence: high
+  tags: secops,php,phpinfo,exposure,misconfig
+
+http:
+  - method: GET
+    path:
+      - "{{BaseURL}}"
+    redirects: true
+    max-redirects: 3
+    matchers-condition: and
+    matchers:
+      - type: status
+        status:
+          - 200
+      - type: regex
+        part: body
+        regex:
+          - '(?i)(<title>phpinfo\(\)</title>|PHP Version</td>|PHP Credits)'

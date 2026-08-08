@@ -1,0 +1,35 @@
+id: secops-direct-source-disclosure
+
+info:
+  name: Backup configuration or source file publicly exposed
+  author: secops-agent
+  severity: high
+  description: A directly supplied URL returned server-side source or configuration content.
+  remediation: Remove backup and source artifacts from the web root, deny access by extension, and rotate exposed credentials.
+  classification:
+    cwe-id: CWE-552
+  metadata:
+    secops-category: vulnerability
+    secops-verification-status: content-verified-nuclei-template
+    secops-confidence: high
+  tags: secops,exposure,backup,config,source
+
+http:
+  - method: GET
+    path:
+      - "{{BaseURL}}"
+    redirects: true
+    max-redirects: 2
+    matchers-condition: and
+    matchers:
+      - type: status
+        status:
+          - 200
+      - type: word
+        part: body
+        words:
+          - "<?php"
+      - type: regex
+        part: body
+        regex:
+          - '(?i)(db_password|database|\$_[A-Z0-9_]+\s*=|password\s*[=:])'

@@ -1,0 +1,31 @@
+id: secops-direct-directory-listing
+
+info:
+  name: Directory listing reachable
+  author: secops-agent
+  severity: low
+  description: A directly supplied directory URL returned an auto-generated directory index.
+  remediation: Disable directory indexing and publish only required resources.
+  classification:
+    cwe-id: CWE-548
+  metadata:
+    secops-category: candidate
+    secops-verification-status: content-verified-directory-index
+    secops-confidence: high
+  tags: secops,exposure,directory-listing,misconfig
+
+http:
+  - method: GET
+    path:
+      - "{{BaseURL}}"
+    redirects: true
+    max-redirects: 3
+    matchers-condition: and
+    matchers:
+      - type: status
+        status:
+          - 200
+      - type: regex
+        part: body
+        regex:
+          - '(?i)(<title>Index of /|<h1>Index of /)'
