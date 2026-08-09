@@ -24,7 +24,7 @@ from urllib.parse import urlparse
 import requests
 from packaging.requirements import Requirement
 
-from utils import canonical_cookie_header, cookie_names, ROOT_DIR, WORDLISTS_DIR, setup_path
+from utils import canonical_cookie_header, ROOT_DIR, WORDLISTS_DIR, setup_path, MCP_SERVER_PORTS, mcp_http_url
 
 ROOT = Path(ROOT_DIR).resolve()
 LOCAL_ROOT = Path.home() / ".local"
@@ -41,19 +41,31 @@ DEFAULT_MODEL = "llama3.1:8b"
 NUCLEI_TEMPLATE_MINIMUM = 1000
 NUCLEI_TEMPLATE_UPDATE_TIMEOUT = 600
 _NUCLEI_TEMPLATE_STATE: dict[str, Any] = {}
-BUILD_ID = "secops-init-resilient-v31.12-coverage-quality-agentic-parity-20260729"
+_NUCLEI_ENGINE_STATE: dict[str, Any] = {}
+_IDOR_FORGE_STATE: dict[str, Any] = {}
+BUILD_ID = "secops-v31.13-streamable-http-fastmcp3-20260809"
+
+FASTMCP_VERSION = "3.4.5"
+FASTMCP_REQUIREMENT = f"fastmcp=={FASTMCP_VERSION}"
+LANGGRAPH_REQUIREMENT = "langgraph==1.2.10"
+COMPATIBILITY_REQUIREMENTS = (
+    "websockets>=15.0.1,<16",
+    "jsonschema-path>=0.4.5,<0.5.0",
+)
 
 PYTHON_PACKAGES = (
-    "fastmcp==2.12.5", "langgraph>=0.6,<2", "requests>=2.32,<3",
+    FASTMCP_REQUIREMENT, LANGGRAPH_REQUIREMENT, *COMPATIBILITY_REQUIREMENTS, "requests>=2.32,<3",
     "beautifulsoup4>=4.13,<5", "zaproxy>=0.5,<0.6",
-    "reportlab>=4.4,<5", "PyJWT>=2.10,<3", "arjun>=2.2,<3",
+    "PyJWT>=2.10,<3", "arjun>=2.2,<3",
     "playwright>=1.54,<2",
 )
-SCANNERS = ("nuclei", "nikto", "ffuf", "dalfox", "commix", "sqlmap", "arjun", "interactsh-client")
+SCANNERS = ("nuclei", "nikto", "ffuf", "dalfox", "commix", "sqlmap", "arjun", "idor-forge", "interactsh-client")
 REPOSITORY_TOOLS = {
     "sqlmap": ("https://github.com/sqlmapproject/sqlmap.git", "sqlmap.py"),
     "commix": ("https://github.com/commixproject/commix.git", "commix.py"),
 }
+IDOR_FORGE_REPOSITORY = "https://github.com/errorfiathck/IDOR-Forge.git"
+IDOR_FORGE_DIR = LOCAL_OPT / "idor-forge"
 RELEASE_TOOLS = {
     "nuclei": ("projectdiscovery/nuclei", "nuclei"),
     "ffuf": ("ffuf/ffuf", "ffuf"),
@@ -100,13 +112,19 @@ def run(
         if stdout.strip():
             print(stdout.strip())
         if stderr.strip():
-            print(stderr.strip(), file=sys.stderr)
+            destination = (
+                sys.stdout
+                if command and Path(command[0]).name.lower().startswith("docker") and result.returncode == 0
+                else sys.stderr
+            )
+            print(stderr.strip(), file=destination)
     if required and result.returncode:
         raise RuntimeError(
             f"Command failed ({result.returncode}): {subprocess.list2cmdline(command)}\n"
             f"{stderr if capture else ''}"
         )
     return result
+
 
 
 def _add_path(path: Path) -> None:
@@ -144,6 +162,17 @@ def configure_path() -> list[str]:
 
 def command_path(name: str) -> str | None:
     configure_path()
+
+    # Prefer executables managed by this initializer. On Windows a tool can be
+    # usable by absolute path even when shutil.which() temporarily misses it.
+    candidate_names = [name]
+    if os.name == "nt" and not Path(name).suffix:
+        candidate_names.extend((f"{name}.exe", f"{name}.bat", f"{name}.cmd"))
+    for candidate_name in candidate_names:
+        candidate = LOCAL_BIN / candidate_name
+        if candidate.is_file():
+            return str(candidate.resolve())
+
     value = shutil.which(name)
     return str(Path(value).resolve()) if value else None
 
@@ -164,9 +193,15 @@ def write_launcher(name: str, command: list[str]) -> Path:
 
 
 def _verify_fastmcp_import() -> tuple[bool, str]:
-    """Verify the exact FastMCP import used by the orchestrators."""
+    """Verify the FastMCP API and exact pinned version used by the project."""
+    probe_code = (
+        "import importlib.metadata as metadata; "
+        "from fastmcp import Client, FastMCP; "
+        f"assert metadata.version('fastmcp') == '{FASTMCP_VERSION}'; "
+        "print(metadata.version('fastmcp'))"
+    )
     probe = run(
-        [sys.executable, "-c", "from fastmcp import Client; from fastmcp.client.transports import StdioTransport"],
+        [sys.executable, "-c", probe_code],
         required=False,
         capture=True,
         show_output=False,
@@ -177,6 +212,36 @@ def _verify_fastmcp_import() -> tuple[bool, str]:
         if part
     )
     return probe.returncode == 0, detail
+
+
+def _purge_fastmcp_package_tree() -> None:
+    """Remove stale FastMCP v2/v3 files before a clean pinned reinstall."""
+    purelib = Path(sysconfig.get_paths()["purelib"])
+    targets = [purelib / "fastmcp", *purelib.glob("fastmcp*.dist-info")]
+    for target in targets:
+        if target.is_dir():
+            shutil.rmtree(target, ignore_errors=False)
+        elif target.exists():
+            target.unlink()
+
+
+def _install_fastmcp_clean() -> None:
+    """Install the pinned stable FastMCP release from a clean package state."""
+    run(
+        [sys.executable, "-m", "pip", "uninstall", "-y", "fastmcp", "fastmcp-slim"],
+        required=False,
+        capture=True,
+        show_output=False,
+        timeout=300,
+    )
+    _purge_fastmcp_package_tree()
+    run(
+        [
+            sys.executable, "-m", "pip", "install", "--no-cache-dir",
+            "--force-reinstall", FASTMCP_REQUIREMENT, *COMPATIBILITY_REQUIREMENTS,
+        ],
+        timeout=1800,
+    )
 
 
 def _missing_python_packages() -> list[str]:
@@ -200,7 +265,7 @@ def _missing_python_packages() -> list[str]:
 
 
 def install_python_packages() -> None:
-    """Install only missing requirements, then repair a stale FastMCP install."""
+    """Install pinned dependencies and keep FastMCP on a clean stable v3 runtime."""
     try:
         importlib.metadata.version("python-owasp-zap-v2.4")
     except importlib.metadata.PackageNotFoundError:
@@ -214,31 +279,10 @@ def install_python_packages() -> None:
             timeout=600,
         )
 
-    missing = _missing_python_packages()
-    if missing:
-        print("[*] Installing missing/incompatible Python packages: " + ", ".join(missing))
-        run([sys.executable, "-m", "pip", "install", *missing], timeout=3600)
-    else:
-        print("[+] Python dependencies already satisfy the pinned requirements; PyPI access skipped.")
-
     healthy, detail = _verify_fastmcp_import()
     if not healthy:
-        print("[!] FastMCP import is stale or inconsistent; forcing a clean pinned reinstall.")
-        fastmcp_pin = next(
-            (package for package in PYTHON_PACKAGES if package.lower().startswith("fastmcp")),
-            "fastmcp==2.12.5",
-        )
-        run(
-            [sys.executable, "-m", "pip", "uninstall", "-y", "fastmcp"],
-            required=False,
-            capture=True,
-            show_output=False,
-            timeout=300,
-        )
-        run(
-            [sys.executable, "-m", "pip", "install", "--no-cache-dir", fastmcp_pin],
-            timeout=1800,
-        )
+        print(f"[*] Installing clean FastMCP {FASTMCP_VERSION} runtime.")
+        _install_fastmcp_clean()
         healthy, detail = _verify_fastmcp_import()
         if not healthy:
             raise RuntimeError(
@@ -247,6 +291,35 @@ def install_python_packages() -> None:
                 f"Diagnostic: {detail[-2500:]}\n"
                 "Recreate the project virtual environment and ensure no local fastmcp.py or mcp.py shadows the package."
             )
+
+    missing = [
+        package for package in _missing_python_packages()
+        if Requirement(package).name.lower() != "fastmcp"
+    ]
+    if missing:
+        print("[*] Installing missing/incompatible Python packages: " + ", ".join(missing))
+        run([sys.executable, "-m", "pip", "install", *missing], timeout=3600)
+    else:
+        print("[+] Python dependencies already satisfy the pinned requirements; PyPI access skipped.")
+
+    check = run(
+        [sys.executable, "-m", "pip", "check"],
+        required=False,
+        capture=True,
+        show_output=False,
+        timeout=120,
+    )
+    if check.returncode:
+        detail = "\n".join(
+            part for part in ((check.stdout or "").strip(), (check.stderr or "").strip())
+            if part
+        )
+        raise RuntimeError(
+            "Python dependency conflicts remain after initialization.\n"
+            f"Interpreter: {sys.executable}\n"
+            f"pip check:\n{detail[-3000:]}"
+        )
+    print("[+] Python dependency graph is consistent (pip check).")
     configure_path()
 
 
@@ -298,10 +371,16 @@ def install_playwright_browser(*, required: bool = False) -> bool:
 
 def clone_or_update(url: str, destination: Path) -> None:
     if not shutil.which("git"):
-        raise RuntimeError("Git is required to install SQLMap, Commix and Nikto.")
+        raise RuntimeError("Git is required to install repository-based tools.")
     if (destination / ".git").is_dir():
-        if run(["git", "-C", str(destination), "pull", "--ff-only"], required=False, capture=True, timeout=600).returncode:
+        fetch = run(
+            ["git", "-C", str(destination), "fetch", "--depth", "1", "origin", "HEAD"],
+            required=False, capture=True, timeout=600,
+        )
+        if fetch.returncode:
             print(f"[!] Keeping the existing {destination.name} checkout.")
+            return
+        run(["git", "-C", str(destination), "reset", "--hard", "FETCH_HEAD"], timeout=120)
         return
     shutil.rmtree(destination, ignore_errors=True)
     destination.parent.mkdir(parents=True, exist_ok=True)
@@ -318,6 +397,81 @@ def install_repository_tool(name: str, repository: str, script_name: str) -> Non
     if not script.is_file():
         raise RuntimeError(f"Missing {script_name} after cloning {name}.")
     write_launcher(name, [sys.executable, str(script)])
+
+
+def _idor_forge_runtime_requirements(requirements: Path) -> list[str]:
+    packages: list[str] = []
+    for raw_line in requirements.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        try:
+            entries = [line]
+            Requirement(line)
+        except Exception:
+            entries = shlex.split(line, comments=True, posix=True)
+            if not entries:
+                continue
+            for entry in entries:
+                Requirement(entry)
+
+        for entry in entries:
+            requirement = Requirement(entry)
+            name = requirement.name.lower().replace("_", "-")
+            if name == "pyqt5":
+                continue  # GUI-only dependency; the MCP wrapper imports core.IDORChecker directly.
+            if name == "matplotlib" and sys.version_info >= (3, 13):
+                entry = "matplotlib>=3.10,<4"
+            if entry not in packages:
+                packages.append(entry)
+
+    if not packages:
+        raise RuntimeError("IDOR-Forge requirements.txt did not contain usable runtime dependencies.")
+    return packages
+
+
+def install_idor_forge() -> dict[str, Any]:
+    global _IDOR_FORGE_STATE
+    clone_or_update(IDOR_FORGE_REPOSITORY, IDOR_FORGE_DIR)
+    entrypoint = IDOR_FORGE_DIR / "IDOR-Forge.py"
+    checker = IDOR_FORGE_DIR / "core" / "IDORChecker.py"
+    requirements = IDOR_FORGE_DIR / "requirements.txt"
+    if not entrypoint.is_file() or not checker.is_file() or not requirements.is_file():
+        raise RuntimeError("The IDOR-Forge checkout is incomplete.")
+
+    venv_dir = IDOR_FORGE_DIR / ".venv"
+    venv_python = venv_dir / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
+    if not venv_python.is_file():
+        run([sys.executable, "-m", "venv", str(venv_dir)], timeout=1200)
+
+    runtime_requirements = _idor_forge_runtime_requirements(requirements)
+    print("[*] IDOR-Forge runtime dependencies: " + ", ".join(runtime_requirements))
+    run(
+        [str(venv_python), "-m", "pip", "install", "--disable-pip-version-check", *runtime_requirements],
+        timeout=3600,
+        cwd=IDOR_FORGE_DIR,
+    )
+    probe = run(
+        [str(venv_python), "-c", "from core.IDORChecker import IDORChecker; print('IDOR-Forge import OK')"],
+        required=False, capture=True, show_output=False, timeout=120, cwd=IDOR_FORGE_DIR,
+        env_overrides={"MPLBACKEND": "Agg"},
+    )
+    if probe.returncode:
+        detail = "\n".join(filter(None, ((probe.stdout or "").strip(), (probe.stderr or "").strip())))
+        raise RuntimeError("IDOR-Forge dependency preflight failed.\n" + detail[-2500:])
+
+    launcher = write_launcher("idor-forge", [str(venv_python), str(entrypoint)])
+    _IDOR_FORGE_STATE = {
+        "repository": IDOR_FORGE_REPOSITORY,
+        "directory": str(IDOR_FORGE_DIR.resolve()),
+        "entrypoint": str(entrypoint.resolve()),
+        "checker": str(checker.resolve()),
+        "python": str(venv_python.resolve()),
+        "launcher": str(launcher.resolve()),
+        "preflight": "ok",
+    }
+    print(f"[+] IDOR-Forge upstream runtime ready: {IDOR_FORGE_DIR}")
+    return dict(_IDOR_FORGE_STATE)
 
 
 def find_perl() -> str | None:
@@ -544,8 +698,9 @@ def _nikto_health(perl: Path, script: Path, launcher: Path | None = None) -> tup
 
 
 NIKTO_DOCKER_IMAGE = "ghcr.io/sullo/nikto:latest"
-PWNDOC_DOCKER_IMAGE = "secops/pwndoc-report:local"
-PWNDOC_DOCKERFILE = ROOT / "servers" / "Dockerfile"
+NUCLEI_DOCKER_IMAGE = "projectdiscovery/nuclei:latest"
+REPORT_DOCKER_IMAGE = "secops/report:local"
+REPORT_DOCKERFILE = ROOT / "servers" / "Dockerfile"
 
 
 def _docker_image_ready(image: str) -> bool:
@@ -580,33 +735,65 @@ def _ensure_nikto_docker_image() -> bool:
     return False
 
 
-def _ensure_pwndoc_docker_image() -> bool:
-    """Build the sandboxed WeasyPrint/reportlab image used by pwndocServer.py.
+def _ensure_nuclei_docker_image() -> tuple[bool, str]:
+    """Install and verify ProjectDiscovery's official Nuclei image."""
+    if not shutil.which("docker"):
+        return False, "Docker is unavailable."
+    if not _docker_image_ready(NUCLEI_DOCKER_IMAGE):
+        pull = run(
+            ["docker", "pull", NUCLEI_DOCKER_IMAGE],
+            required=False,
+            capture=True,
+            timeout=1800,
+        )
+        if pull.returncode != 0 or not _docker_image_ready(NUCLEI_DOCKER_IMAGE):
+            detail = "\n".join(
+                part for part in ((pull.stdout or "").strip(), (pull.stderr or "").strip()) if part
+            )
+            return False, detail[-2000:] or "Docker pull failed."
+    probe = run(
+        ["docker", "run", "--rm", NUCLEI_DOCKER_IMAGE, "-version"],
+        required=False,
+        capture=True,
+        show_output=False,
+        timeout=120,
+    )
+    detail = "\n".join(
+        part for part in ((probe.stdout or "").strip(), (probe.stderr or "").strip()) if part
+    )
+    if probe.returncode == 0:
+        print(f"[+] Nuclei verified through official Docker fallback: {NUCLEI_DOCKER_IMAGE}")
+        return True, detail[-1200:]
+    return False, detail[-2000:] or f"docker run exited with {probe.returncode}."
+
+
+def _ensure_report_docker_image() -> bool:
+    """Build the sandboxed WeasyPrint report image used by reportServer.py.
 
     Unlike Nikto's fallback, this image is built locally (there is no public
     registry image), and it ships no application code: the project tree is
     bind-mounted at container start so the container always runs whatever
-    pwndocServer.py currently looks like, with no rebuild needed on edits.
+    reportServer.py currently looks like, with no rebuild needed on edits.
     """
-    if _docker_image_ready(PWNDOC_DOCKER_IMAGE):
-        print(f"[+] PwnDoc report Docker image already available: {PWNDOC_DOCKER_IMAGE}")
+    if _docker_image_ready(REPORT_DOCKER_IMAGE):
+        print(f"[+] Report Docker image already available: {REPORT_DOCKER_IMAGE}")
         return True
     if not shutil.which("docker"):
         return False
-    if not PWNDOC_DOCKERFILE.is_file():
-        print(f"[!] PwnDoc Dockerfile missing: {PWNDOC_DOCKERFILE}")
+    if not REPORT_DOCKERFILE.is_file():
+        print(f"[!] Report Dockerfile missing: {REPORT_DOCKERFILE}")
         return False
     result = run(
-        ["docker", "build", "-t", PWNDOC_DOCKER_IMAGE, "-f", str(PWNDOC_DOCKERFILE), str(ROOT)],
+        ["docker", "build", "-t", REPORT_DOCKER_IMAGE, "-f", str(REPORT_DOCKERFILE), str(ROOT)],
         required=False,
         capture=True,
         timeout=900,
     )
-    if result.returncode == 0 and _docker_image_ready(PWNDOC_DOCKER_IMAGE):
-        print(f"[+] PwnDoc report Docker image built: {PWNDOC_DOCKER_IMAGE}")
+    if result.returncode == 0 and _docker_image_ready(REPORT_DOCKER_IMAGE):
+        print(f"[+] Report Docker image built: {REPORT_DOCKER_IMAGE}")
         return True
     print(
-        "[!] PwnDoc Docker image build failed; the report tool will fall back to a "
+        "[!] Report Docker image build failed; the report tool will fall back to a "
         "native weasyprint install if one is present (see: brew install pango on macOS)."
     )
     return False
@@ -640,6 +827,31 @@ def _write_nikto_docker_launcher() -> Path:
     print(f"[+] Nikto Docker launcher created: {launcher}")
     return launcher
 
+
+def _write_nuclei_docker_launcher() -> Path:
+    """Create a real launcher path for the existing generic executable preflight."""
+    LOCAL_BIN.mkdir(parents=True, exist_ok=True)
+    if os.name == "nt":
+        launcher = LOCAL_BIN / "nuclei-docker.bat"
+        launcher.write_text(
+            "@echo off\\r\\n"
+            f'docker run --rm --add-host host.docker.internal:host-gateway "{NUCLEI_DOCKER_IMAGE}" %*\\r\\n'
+            "exit /b %ERRORLEVEL%\\r\\n",
+            encoding="utf-8",
+        )
+    else:
+        launcher = LOCAL_BIN / "nuclei-docker"
+        launcher.write_text(
+            "#!/usr/bin/env sh\\n"
+            f'exec docker run --rm --add-host host.docker.internal:host-gateway "{NUCLEI_DOCKER_IMAGE}" "$@"\\n',
+            encoding="utf-8",
+        )
+        launcher.chmod(
+            launcher.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH
+        )
+    configure_path()
+    print(f"[+] Nuclei Docker launcher created: {launcher}")
+    return launcher
 
 def install_nikto() -> None:
     """Prefer the official Docker image; use native Perl when Docker is absent."""
@@ -801,23 +1013,6 @@ def _best_nuclei_template_directory() -> str:
     return str(inventory[0]["directory"]) if inventory and int(inventory[0]["count"]) > 0 else ""
 
 
-def _nuclei_listed_template_count(executable: str) -> tuple[int, str]:
-    probe = run(
-        [executable, "-tl", "-silent", "-nc", "-disable-update-check"],
-        required=False,
-        capture=True,
-        show_output=False,
-        timeout=240,
-    )
-    lines = {
-        line.strip()
-        for line in (probe.stdout or "").splitlines()
-        if line.strip() and not line.lstrip().startswith("[")
-    }
-    detail = "\n".join(part for part in ((probe.stdout or "")[-1000:], (probe.stderr or "")[-1000:]) if part)
-    return len(lines), detail
-
-
 def _install_official_nuclei_template_fallback() -> bool:
     """Merge the official template repository when the Nuclei updater is unavailable."""
     archive = DOWNLOADS / "nuclei-templates-main.zip"
@@ -855,85 +1050,140 @@ def _install_official_nuclei_template_fallback() -> bool:
 
 
 def ensure_nuclei_engine_current() -> dict[str, Any]:
-    """Ask the official Nuclei binary to self-update before refreshing templates."""
+    """Prefer native Nuclei and fall back to the official Docker image."""
+    global _NUCLEI_ENGINE_STATE
     executable = command_path("nuclei")
-    if not executable:
-        raise RuntimeError("Nuclei executable is unavailable.")
-    before = run(
-        [executable, "-version"],
-        required=False,
-        capture=True,
-        show_output=False,
-        timeout=60,
-    )
-    update = run(
-        [executable, "-update"],
-        required=False,
-        capture=True,
-        timeout=NUCLEI_TEMPLATE_UPDATE_TIMEOUT,
-    )
-    after = run(
-        [executable, "-version"],
-        required=False,
-        capture=True,
-        show_output=False,
-        timeout=60,
-    )
-    state = {
-        "update_returncode": update.returncode,
-        "version_before": "\n".join(filter(None, ((before.stdout or "").strip(), (before.stderr or "").strip())))[-1000:],
-        "version_after": "\n".join(filter(None, ((after.stdout or "").strip(), (after.stderr or "").strip())))[-1000:],
-        "update_output_excerpt": "\n".join(filter(None, ((update.stdout or "").strip(), (update.stderr or "").strip())))[-1600:],
-    }
-    if update.returncode == 0:
-        print("[+] Nuclei engine update check completed.")
+    native_error = ""
+
+    if executable:
+        try:
+            before = run(
+                [executable, "-version"], required=False, capture=True,
+                show_output=False, timeout=60,
+            )
+            if before.returncode == 0:
+                update = run(
+                    [executable, "-update"], required=False, capture=True,
+                    timeout=NUCLEI_TEMPLATE_UPDATE_TIMEOUT,
+                )
+                after = run(
+                    [executable, "-version"], required=False, capture=True,
+                    show_output=False, timeout=60,
+                )
+                if after.returncode == 0:
+                    _NUCLEI_ENGINE_STATE = {
+                        "execution_mode": "native",
+                        "executable": executable,
+                        "launcher": executable,
+                        "docker_image": "",
+                        "update_returncode": update.returncode,
+                        "version_before": "\n".join(
+                            part for part in ((before.stdout or "").strip(), (before.stderr or "").strip()) if part
+                        )[-1000:],
+                        "version_after": "\n".join(
+                            part for part in ((after.stdout or "").strip(), (after.stderr or "").strip()) if part
+                        )[-1000:],
+                        "update_output_excerpt": "\n".join(
+                            part for part in ((update.stdout or "").strip(), (update.stderr or "").strip()) if part
+                        )[-1600:],
+                    }
+                    if update.returncode == 0:
+                        print("[+] Nuclei engine update check completed.")
+                    else:
+                        print(
+                            "[!] Nuclei self-update did not complete; the working native executable will be retained.",
+                            file=sys.stderr,
+                        )
+                    return dict(_NUCLEI_ENGINE_STATE)
+                native_error = "\n".join(
+                    part for part in ((after.stdout or "").strip(), (after.stderr or "").strip()) if part
+                ) or f"nuclei -version exited with {after.returncode}"
+            else:
+                native_error = "\n".join(
+                    part for part in ((before.stdout or "").strip(), (before.stderr or "").strip()) if part
+                ) or f"nuclei -version exited with {before.returncode}"
+        except OSError as exc:
+            native_error = f"{type(exc).__name__}: {exc}"
     else:
-        print("[!] Nuclei self-update did not complete; the existing executable will be retained.", file=sys.stderr)
-    return state
+        native_error = "Nuclei native executable is unavailable."
+
+    print(
+        "[!] Native Nuclei is unusable; switching to the official ProjectDiscovery Docker image. "
+        f"Diagnostic: {native_error[-1200:]}",
+        file=sys.stderr,
+    )
+    ready, docker_detail = _ensure_nuclei_docker_image()
+    if not ready:
+        raise RuntimeError(
+            "Nuclei is unavailable both natively and through Docker.\n"
+            f"Native diagnostic: {native_error[-1600:]}\n"
+            f"Docker diagnostic: {docker_detail[-1600:]}"
+        )
+
+    launcher = _write_nuclei_docker_launcher()
+    _NUCLEI_ENGINE_STATE = {
+        "execution_mode": "docker_official_image",
+        "executable": executable or "",
+        "launcher": str(launcher.resolve()),
+        "docker_image": NUCLEI_DOCKER_IMAGE,
+        "update_returncode": None,
+        "version_before": "",
+        "version_after": docker_detail[-1000:],
+        "update_output_excerpt": "Native execution unavailable; official Docker image selected.",
+        "native_diagnostic": native_error[-1600:],
+    }
+    return dict(_NUCLEI_ENGINE_STATE)
+
 
 
 def ensure_nuclei_templates() -> dict[str, Any]:
-    """Install/update the complete official community template pack and report its size."""
+    """Update the host-side official template pack without using nuclei -tl."""
     global _NUCLEI_TEMPLATE_STATE
+    mode = str(_NUCLEI_ENGINE_STATE.get("execution_mode") or "native")
     executable = command_path("nuclei")
-    if not executable:
-        raise RuntimeError("Nuclei executable is unavailable; templates cannot be installed.")
-
-    listed_before, _ = _nuclei_listed_template_count(executable)
     filesystem_before, directories_before = _filesystem_nuclei_template_count()
-    before = max(listed_before, filesystem_before)
-    print(f"[*] Nuclei templates before update: {before}")
+    print(f"[*] Nuclei templates before update: {filesystem_before}")
 
-    update = run(
-        [executable, "-update-templates"],
-        required=False,
-        capture=True,
-        timeout=NUCLEI_TEMPLATE_UPDATE_TIMEOUT,
-    )
-    combined = "\n".join((update.stdout or "", update.stderr or ""))
-    if update.returncode != 0 and "unknown flag" in combined.lower():
-        update = run(
-            [executable, "-ut"],
-            required=False,
-            capture=True,
-            timeout=NUCLEI_TEMPLATE_UPDATE_TIMEOUT,
-        )
-        combined = "\n".join((update.stdout or "", update.stderr or ""))
-
-    listed_after, listed_detail = _nuclei_listed_template_count(executable)
-    filesystem_after, directories_after = _filesystem_nuclei_template_count()
-    after = max(listed_after, filesystem_after)
+    update_returncode = 0
+    combined = ""
     fallback_used = False
+    if mode == "native":
+        if not executable:
+            raise RuntimeError("Nuclei native executable is unavailable; templates cannot be updated.")
+        try:
+            update = run(
+                [executable, "-update-templates"], required=False, capture=True,
+                timeout=NUCLEI_TEMPLATE_UPDATE_TIMEOUT,
+            )
+            combined = "\n".join((update.stdout or "", update.stderr or ""))
+            if update.returncode != 0 and "unknown flag" in combined.lower():
+                update = run(
+                    [executable, "-ut"], required=False, capture=True,
+                    timeout=NUCLEI_TEMPLATE_UPDATE_TIMEOUT,
+                )
+                combined = "\n".join((update.stdout or "", update.stderr or ""))
+            update_returncode = update.returncode
+        except OSError as exc:
+            update_returncode = 1
+            combined = f"{type(exc).__name__}: {exc}"
+    else:
+        fallback_used = _install_official_nuclei_template_fallback()
+        update_returncode = 0 if fallback_used else 1
+        combined = (
+            "Official nuclei-templates repository refreshed directly for Docker execution."
+            if fallback_used else "Official nuclei-templates repository refresh failed."
+        )
 
+    filesystem_after, directories_after = _filesystem_nuclei_template_count()
+    after = filesystem_after
     if after < NUCLEI_TEMPLATE_MINIMUM:
         print(
-            f"[!] Only {after} Nuclei templates were detected; attempting the complete official repository fallback.",
+            f"[!] Only {after} Nuclei templates were detected on disk; attempting the complete official repository fallback.",
             file=sys.stderr,
         )
-        fallback_used = _install_official_nuclei_template_fallback()
-        listed_after, listed_detail = _nuclei_listed_template_count(executable)
+        fallback_used = _install_official_nuclei_template_fallback() or fallback_used
         filesystem_after, directories_after = _filesystem_nuclei_template_count()
-        after = max(listed_after, filesystem_after)
+        after = filesystem_after
 
     if after <= 0:
         raise RuntimeError(
@@ -943,7 +1193,7 @@ def ensure_nuclei_templates() -> dict[str, Any]:
 
     sufficient = after >= NUCLEI_TEMPLATE_MINIMUM
     if sufficient:
-        print(f"[+] Nuclei template inventory ready: {after} templates (complete official pack threshold satisfied).")
+        print(f"[+] Nuclei template inventory ready: {after} templates (filesystem inventory).")
     else:
         print(
             f"[!] Nuclei has {after} templates. Scans can continue, but the expected full-pack threshold "
@@ -953,18 +1203,19 @@ def ensure_nuclei_templates() -> dict[str, Any]:
 
     _NUCLEI_TEMPLATE_STATE = {
         "count": after,
-        "count_before_update": before,
+        "count_before_update": filesystem_before,
         "minimum_expected": NUCLEI_TEMPLATE_MINIMUM,
         "sufficient": sufficient,
-        "update_returncode": update.returncode,
+        "update_returncode": update_returncode,
         "update_output_excerpt": combined[-2000:],
         "fallback_used": fallback_used,
+        "inventory_source": "filesystem",
         "directory": _best_nuclei_template_directory(),
         "directories": directories_after or directories_before,
         "filesystem_candidates": _filesystem_nuclei_template_inventory(),
-        "list_probe_excerpt": listed_detail[-1000:],
     }
     return dict(_NUCLEI_TEMPLATE_STATE)
+
 
 
 def install_scanners() -> None:
@@ -972,13 +1223,24 @@ def install_scanners() -> None:
     ensure_arjun()
     for name, (repository, script) in REPOSITORY_TOOLS.items():
         install_repository_tool(name, repository, script)
+    install_idor_forge()
     install_nikto()
     for name, (repository, hint) in RELEASE_TOOLS.items():
+        docker_launcher = LOCAL_BIN / ("nuclei-docker.bat" if os.name == "nt" else "nuclei-docker")
+        if (
+            name == "nuclei"
+            and not command_path("nuclei")
+            and docker_launcher.is_file()
+            and _docker_image_ready(NUCLEI_DOCKER_IMAGE)
+        ):
+            print(f"[+] Nuclei Docker fallback already configured: {NUCLEI_DOCKER_IMAGE}")
+            continue
         install_release_tool(name, repository, hint)
     nuclei_engine = ensure_nuclei_engine_current()
     nuclei_templates = ensure_nuclei_templates()
     nuclei_templates["engine"] = nuclei_engine
     _NUCLEI_TEMPLATE_STATE.update(nuclei_templates)
+
 
 
 def scanner_status() -> dict[str, str | None]:
@@ -987,6 +1249,22 @@ def scanner_status() -> dict[str, str | None]:
 
 def verify_scanners(required: bool = True) -> dict[str, str | None]:
     status = scanner_status()
+
+    if (
+        _NUCLEI_ENGINE_STATE.get("execution_mode") == "docker_official_image"
+        and _docker_image_ready(NUCLEI_DOCKER_IMAGE)
+    ):
+        launcher_value = str(_NUCLEI_ENGINE_STATE.get("launcher") or "")
+        launcher = Path(launcher_value) if launcher_value else _write_nuclei_docker_launcher()
+        if not launcher.is_file():
+            launcher = _write_nuclei_docker_launcher()
+        status["nuclei"] = str(launcher.resolve())
+        print(f"[+] Nuclei verified through official Docker fallback: {NUCLEI_DOCKER_IMAGE}")
+    elif _NUCLEI_ENGINE_STATE.get("execution_mode") == "native":
+        status["nuclei"] = str(
+            _NUCLEI_ENGINE_STATE.get("executable") or status.get("nuclei") or ""
+        ) or None
+
     if _docker_image_ready(NIKTO_DOCKER_IMAGE):
         if not status.get("nikto"):
             status["nikto"] = str(_write_nikto_docker_launcher())
@@ -998,9 +1276,7 @@ def verify_scanners(required: bool = True) -> dict[str, str | None]:
         detail = "Perl or nikto.pl is missing."
         if perl_value and script.is_file():
             healthy, detail = _nikto_health(
-                Path(perl_value).resolve(),
-                script.resolve(),
-                Path(status["nikto"]),
+                Path(perl_value).resolve(), script.resolve(), Path(status["nikto"])
             )
         if not healthy:
             status["nikto"] = None
@@ -1008,6 +1284,7 @@ def verify_scanners(required: bool = True) -> dict[str, str | None]:
                 f"[!] Nikto native runtime is unusable and Docker fallback is absent: {detail}",
                 file=sys.stderr,
             )
+
     print("\n=== Scanner executables ===")
     for name, path in status.items():
         print(f"{name:20} {'OK: ' + path if path else 'MISSING/UNUSABLE'}")
@@ -1017,8 +1294,16 @@ def verify_scanners(required: bool = True) -> dict[str, str | None]:
     return status
 
 
+
 def write_runtime_config(status: dict[str, str | None]) -> None:
-    directories = configure_path() + [str(Path(path).parent) for path in status.values() if path]
+    status_directories = []
+    for value in status.values():
+        if not value or str(value).startswith("docker:"):
+            continue
+        path = Path(str(value))
+        if path.exists():
+            status_directories.append(str(path.parent))
+    directories = configure_path() + status_directories
     payload = {
         "schema_version": 3,
         "generated_at": datetime.now(timezone.utc).isoformat(),
@@ -1029,6 +1314,21 @@ def write_runtime_config(status: dict[str, str | None]) -> None:
         "machine": platform.machine(),
         "tool_directories": list(dict.fromkeys(directories)),
         "executables": status,
+        "idor_forge": (
+            dict(_IDOR_FORGE_STATE)
+            if _IDOR_FORGE_STATE
+            else {
+                "repository": IDOR_FORGE_REPOSITORY,
+                "directory": str(IDOR_FORGE_DIR),
+                "python": str(IDOR_FORGE_DIR / ".venv" / ("Scripts/python.exe" if os.name == "nt" else "bin/python")),
+            }
+        ),
+        "mcp_transport": "streamable_http",
+        "mcp_http": {
+            "host": "127.0.0.1",
+            "path": "/mcp",
+            "services": {name: mcp_http_url(name) for name in MCP_SERVER_PORTS},
+        },
         "playwright_chromium": {
             "ready": _playwright_chromium_ready()[0],
             "interpreter": sys.executable,
@@ -1039,18 +1339,22 @@ def write_runtime_config(status: dict[str, str | None]) -> None:
         "nikto_execution_mode": (
             "docker_official_image" if _docker_image_ready(NIKTO_DOCKER_IMAGE) else "native_perl"
         ),
-        "pwndoc_docker_image": PWNDOC_DOCKER_IMAGE if _docker_image_ready(PWNDOC_DOCKER_IMAGE) else "",
-        "pwndoc_execution_mode": (
-            "docker_local_image" if _docker_image_ready(PWNDOC_DOCKER_IMAGE) else "native_weasyprint"
+        "nuclei_image": (
+            NUCLEI_DOCKER_IMAGE
+            if _NUCLEI_ENGINE_STATE.get("execution_mode") == "docker_official_image"
+            else ""
+        ),
+        "nuclei_execution_mode": str(_NUCLEI_ENGINE_STATE.get("execution_mode") or "native"),
+        "nuclei_engine": dict(_NUCLEI_ENGINE_STATE),
+        "report_docker_image": REPORT_DOCKER_IMAGE if _docker_image_ready(REPORT_DOCKER_IMAGE) else "",
+        "report_execution_mode": (
+            "docker_local_image" if _docker_image_ready(REPORT_DOCKER_IMAGE) else "native_weasyprint"
         ),
         "nuclei_templates": (
             dict(_NUCLEI_TEMPLATE_STATE)
             if _NUCLEI_TEMPLATE_STATE
             else {
-                "count": max(
-                    _nuclei_listed_template_count(status.get("nuclei") or "nuclei")[0],
-                    _filesystem_nuclei_template_count()[0],
-                ),
+                "count": _filesystem_nuclei_template_count()[0],
                 "directory": _best_nuclei_template_directory(),
                 "directories": _filesystem_nuclei_template_count()[1],
                 "filesystem_candidates": _filesystem_nuclei_template_inventory(),
@@ -1060,6 +1364,7 @@ def write_runtime_config(status: dict[str, str | None]) -> None:
     }
     RUNTIME_FILE.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
     print(f"[+] Runtime scanner configuration written: {RUNTIME_FILE}")
+
 
 
 def create_wordlist() -> None:
@@ -1742,45 +2047,46 @@ def command_reference_text() -> str:
     prefix = ".\\" if os.name == "nt" else "./"
     report_prefix = ".\\reports\\" if os.name == "nt" else "./reports/"
     set_location = (
-        f'Set-Location "{ROOT}"'
+        'Set-Location "<PROJECT_ROOT>"'
         if os.name == "nt"
-        else f'cd {shlex.quote(str(ROOT))}'
+        else 'cd "<PROJECT_ROOT>"'
     )
     count_templates = (
-        "nuclei -tl -silent -nc -disable-update-check | Measure-Object -Line"
+        '(Get-ChildItem "$HOME\\nuclei-templates" -Recurse -File -Include *.yaml,*.yml | Measure-Object).Count'
         if os.name == "nt"
-        else "nuclei -tl -silent -nc -disable-update-check | wc -l"
-    )
-    shell_note = (
-        "In PowerShell il backtick (`) continua un comando sulla riga successiva."
-        if os.name == "nt"
-        else "In zsh/bash usa \\ alla fine della riga per continuare un comando."
+        else r'find "$HOME/nuclei-templates" -type f \( -name "*.yaml" -o -name "*.yml" \) | wc -l'
     )
     p = lambda script: f"{python} {prefix}{script}"
-    return f"""SecOps FastMCP - guida operativa multipiattaforma
-====================================================
+    return f"""SecOps FastMCP - guida operativa
+===============================
 
-AMBIENTE RILEVATO
------------------
-Sistema: {platform.system()} {platform.machine()}
-Python attivo: {sys.executable}
-Radice progetto: {ROOT}
-Apri il terminale nella radice:
+AMBIENTE
+--------
+Apri il terminale nella radice del progetto:
   {set_location}
 
 Usa soltanto target tuoi o esplicitamente autorizzati. Per un target remoto
-aggiungi sempre --authorized e mantieni l'intero Cookie header tra virgolette.
+aggiungi --authorized e mantieni il Cookie header tra virgolette.
 
-1. INIZIALIZZAZIONE E LAB LOCALE
---------------------------------
-{p('initScript.py')} --with-lab --model qwen2.5:7b
+MCP
+---
+Tutti i server FastMCP usano Streamable HTTP su 127.0.0.1 con endpoint /mcp.
+Deterministic e Agentic condividono registry, porte, selector e contratti MCP.
+Non sono previsti trasporti MCP alternativi.
+
+1. INIZIALIZZAZIONE
+------------------
 {p('initScript.py')}
-{p('initScript.py')} --commands-only
+{p('initScript.py')} --with-lab --model qwen2.5:7b
 {p('initScript.py')} --with-lab --run deterministic --mode balanced
 {p('initScript.py')} --with-lab --run agentic --model qwen2.5:7b --mode balanced
+{p('initScript.py')} --commands-only
 
-`initScriptMac.py` rimane disponibile come wrapper compatibile, ma usa lo stesso
-initializer multipiattaforma per evitare divergenze tra Windows e macOS.
+L'initializer installa o verifica gli scanner e aggiorna IDOR-Forge da
+https://github.com/errorfiathck/IDOR-Forge.git in ~/.local/opt/idor-forge.
+Le dipendenze upstream di IDOR-Forge restano nella .venv del repository.
+Percorsi, interprete e launcher vengono salvati in .secops_runtime.json e
+verificati dal preflight.
 
 2. DETERMINISTIC
 ----------------
@@ -1795,71 +2101,65 @@ initializer multipiattaforma per evitare divergenze tra Windows e macOS.
 {p('orchestratorAgentic.py')} --target <TARGET> --cookies "<COOKIE_HEADER>" --auth-only --authorized --model <MODEL> --max-rounds 3 --mode deep --ai-timeout 720
 {p('orchestratorAgentic.py')} --target <TARGET> --cookies "<PRIMARY_COOKIE>" --secondary-cookies "<SECOND_ACCOUNT_COOKIE>" --auth-only --authorized --model <MODEL> --max-rounds 3 --mode deep
 {p('orchestratorAgentic.py')} --target <TARGET> --cookies "<COOKIE_HEADER>" --auth-only --authorized --model <MODEL> --require-ai --max-rounds 2 --mode balanced
-{p('orchestratorAgentic.py')} --target <TARGET> --authorized --model <MODEL> --no-model-pull --mode balanced
 
-L'agentic usa il catalogo, i selector e l'interprete MCP del deterministic.
-Quando il piano omette una classe applicabile, Ollama deve scegliere esplicitamente
-un candidato scoperto per riparare la copertura; non vengono inseriti endpoint
-hardcoded. I round continuano finché restano azioni valide o viene raggiunto
---max-rounds.
+Il planner riceve candidati derivati dalla discovery e li seleziona in base al
+valore informativo atteso. Può differire controlli ridondanti e non usa una
+checklist minima. Ogni azione passa dagli stessi validator del Deterministic.
 
-4. PREFLIGHT E DEBUG
---------------------
+4. PREFLIGHT E TEST
+-------------------
+{p('selftest_v31_13.py')}
 {p('orchestratorDeterministic.py')} --target <TARGET> --authorized --preflight-only
 {p('orchestratorAgentic.py')} --target <TARGET> --authorized --preflight-only
 {p('orchestratorDeterministic.py')} --list-tools
+
+5. TEST MIRATI
+---------------
+ZAP:
 {p('orchestratorDeterministic.py')} --target <TARGET> --cookies "<COOKIE_HEADER>" --authorized --tool zap --mode deep --tool-timeout 480
-{p('orchestratorDeterministic.py')} --target <TARGET> --cookies "<COOKIE_HEADER>" --authorized --tool sqlmap --tool-url <URL> --method GET --parameters "id,query" --tool-timeout 180
+
+SQLMap:
+{p('orchestratorDeterministic.py')} --target <TARGET> --cookies "<COOKIE_HEADER>" --authorized --tool sqlmap --tool-url "<URL>" --method GET --parameters "id,query" --tool-timeout 180
+
+IDOR-Forge:
+{p('orchestratorDeterministic.py')} --target <TARGET> --cookies "<COOKIE_HEADER>" --authorized --tool idor --tool-url "<URL_CON_ID_NUMERICO>" --method GET --parameters "id" --tool-timeout 60
+
+JWT:
 {p('orchestratorDeterministic.py')} --target <TARGET> --authorized --tool jwt --jwt-token "<JWT>"
-{p('orchestratorDeterministic.py')} --target <TARGET> --cookies "<COOKIE_HEADER>" --authorized --tool exposure --mode balanced
+
+Browser / Workflow / Authorization:
 {p('orchestratorDeterministic.py')} --target <TARGET> --cookies "<COOKIE_HEADER>" --authorized --tool browser --mode balanced
 {p('orchestratorDeterministic.py')} --target <TARGET> --cookies "<COOKIE_HEADER>" --authorized --tool workflow --mode balanced
 {p('orchestratorDeterministic.py')} --target <TARGET> --cookies "<PRIMARY_COOKIE>" --secondary-cookies "<SECOND_ACCOUNT_COOKIE>" --authorized --tool authorization --mode balanced
 
-5. PROFILI
-----------
+6. PROFILI E OPZIONI
+--------------------
 fast      controllo rapido e budget ridotti
 balanced  copertura ampia con priorità ai controlli importanti
-deep      più target, richieste e budget per ZAP/Nuclei/strumenti parametrizzati
+deep      più target, richieste e budget per i controlli specialistici
 
-6. OPZIONI INIT
----------------
---with-lab --run --model --mode --skip-scanners --skip-preflight
---skip-browser --require-browser --commands-only --version
+Init: --with-lab --run --model --mode --skip-scanners --skip-preflight
+      --skip-browser --require-browser --commands-only --version
 
-Per un target remoto, i workflow che inviano POST o file di prova restano
-disabilitati salvo consenso esplicito con --authorized --allow-state-changes.
-Nei laboratori locali vengono abilitati automaticamente.
+Per target remoti i workflow che inviano POST o file di prova richiedono anche
+--allow-state-changes. Nel laboratorio locale autorizzato sono abilitati
+automaticamente.
 
 7. NUCLEI
 ---------
+Native mode:
 nuclei -update
 nuclei -update-templates
+
+Official Docker fallback:
+docker run --rm projectdiscovery/nuclei:latest -version
+
 {count_templates}
-
-Le pipeline passano a Nuclei request contract GET/POST same-origin e
-non distruttivi. Le fasi statiche per esposizioni, misconfigurazioni e
-controlli high-impact vengono eseguite prima del DAST, che usa soltanto i
-contratti parametrizzati con priorità maggiore.
-
-7B. COPERTURA WORKFLOW E BROWSER
--------------------------------
-Exposure classifica backup, sorgenti, configurazioni, .git, .env e directory
-listing realmente recuperabili. Session analizza cookie e indicatori di
-unicità/fissazione. Browser usa Chromium per DOM/reflected/stored XSS con
-marker innocui. Workflow esegue controlli limitati su CSRF, upload, login
-throttling e CAPTCHA usando esclusivamente i form scoperti. Authorization
-confronta richieste GET ad alto valore tra identità primaria, anonima e, quando
-fornita, una seconda identità autenticata senza eseguire operazioni mutative.
 
 8. REPORT
 ---------
 Deterministic: {report_prefix}SecOps_Assessment_<timestamp>.pdf/.html/.json
 Agentic:       {report_prefix}SecOps_Agentic_Assessment_<timestamp>.pdf/.html/.json
-
-NOTA SHELL
-----------
-{shell_note}
 """
 
 
@@ -1878,6 +2178,17 @@ def _operator_command(script: str, *arguments: str) -> str:
     """Return a copy/paste-safe command for PowerShell or a POSIX shell."""
     values = [sys.executable, str(ROOT / script), *arguments]
     return subprocess.list2cmdline(values) if os.name == "nt" else shlex.join(values)
+
+
+def _runtime_cookie_for_commands() -> str:
+    """Return the last generated cookie only for the bundled local target."""
+    try:
+        payload = json.loads(RUNTIME_FILE.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return ""
+    if str(payload.get("last_auth_target") or "") != TARGET:
+        return ""
+    return str(payload.get("last_auth_cookie") or "").strip()
 
 
 def print_important_commands(
@@ -1938,6 +2249,8 @@ def main() -> int:
     os.chdir(ROOT)
     setup_path()
     configure_path()
+    cookie = ""
+    commands_printed = False
     try:
         guide_path = write_command_reference()
         if args.commands_only:
@@ -1954,16 +2267,20 @@ def main() -> int:
         if not args.skip_scanners:
             install_scanners()
         if shutil.which("docker"):
-            _ensure_pwndoc_docker_image()
+            _ensure_report_docker_image()
         status = verify_scanners(required=not args.skip_scanners)
         write_runtime_config(status)
-        if not args.skip_preflight:
-            run_preflight()
-        cookie = ""
+
+        # Create/authenticate the bundled lab before the live MCP preflight so the
+        # final copy/paste commands can always contain the current session cookie.
         if args.with_lab:
             cookie = setup_local_lab(args.model)
             update_runtime_auth(cookie)
             print(f"\n[+] Bundled local-lab login created successfully.\n[+] Cookie header: {cookie}")
+
+        if not args.skip_preflight:
+            run_preflight()
+
         if args.run != "none":
             if not cookie:
                 raise RuntimeError("--run requires --with-lab because it needs a generated local-lab session.")
@@ -1972,10 +2289,21 @@ def main() -> int:
             if args.run == "agentic":
                 command += ["--model", args.model, "--max-rounds", "1"]
             return run(command, required=False, timeout=7200, cwd=ROOT).returncode
-        print_important_commands(args.model, args.mode, cookie)
+
+        print_important_commands(args.model, args.mode, cookie or _runtime_cookie_for_commands())
+        commands_printed = True
         return 0
     except Exception as exc:
         print(f"[-] Initialization failed: {type(exc).__name__}: {exc}", file=sys.stderr)
+
+        # Keep the old operator experience: even when a live preflight fails,
+        # print the useful startup commands instead of ending with no next step.
+        if not args.commands_only and not commands_printed:
+            print_important_commands(
+                args.model,
+                args.mode,
+                cookie or _runtime_cookie_for_commands(),
+            )
         return 1
 
 

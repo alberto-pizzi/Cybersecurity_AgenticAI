@@ -1,8 +1,6 @@
 from __future__ import annotations
 
-import argparse
 import json
-import os
 import tempfile
 from pathlib import Path
 from typing import Any
@@ -10,6 +8,8 @@ from typing import Any
 from fastmcp import FastMCP
 
 from utils import failure, partial, run_process, success
+
+from utils import run_mcp_http
 
 mcp = FastMCP("Arjun Scanner")
 
@@ -41,7 +41,7 @@ def _run(target_url: str, cookies: str, output: Path, wordlist: str, budget: int
     command=[
         "arjun", "-u", target_url, "-m", method,
         "-oJ", str(output), "-q", "-t", "2", "-T", "4",
-        "-w", wordlist, "-c", "15", "--ratelimit", "20",
+        "-w", wordlist, "-c", "15", "--rate-limit", "20",
     ]
     if data and method in {"POST", "JSON", "XML"}:
         command.extend(["--include", data])
@@ -108,16 +108,38 @@ def run_arjun_scan(
             "authenticated":bool(cookies),
             "hard_failure":phase.get("status")=="error",
             "phases":[{
-                "name":phase.get("phase"),"status":phase.get("status"),
+                "name":phase.get("phase"),
+                "status":phase.get("status"),
+                "diagnosis":phase.get("diagnosis",""),
+                "return_code":phase.get("return_code"),
                 "parameters":phase.get("phase_parameters",0),
                 "timeout_seconds":phase.get("phase_timeout_seconds"),
+                "command":phase.get("command",[]),
+                "stdout_excerpt":str(phase.get("stdout",""))[-3000:],
+                "stderr_excerpt":str(phase.get("stderr",""))[-3000:],
+                "output_excerpt":str(phase.get("output",""))[-1500:],
             }],
             "scan_profile":f"bounded high-risk hidden-parameter names; method={method}",
             "request_method":method,
             "persistent_data_present":bool(data),
         }
         if phase.get("status")=="error" and not parameters:
-            result=failure("Arjun",target_url,"Arjun failed before returning parameters.")
+            detail = (
+                str(phase.get("stderr") or "").strip()
+                or str(phase.get("stdout") or "").strip()
+                or str(phase.get("output") or "").strip()
+                or "No scanner diagnostic text was returned."
+            )
+            result=failure(
+                "Arjun",
+                target_url,
+                f"Arjun failed before returning parameters. {detail[-1200:]}",
+                return_code=phase.get("return_code"),
+                stdout=str(phase.get("stdout") or ""),
+                stderr=str(phase.get("stderr") or ""),
+                diagnosis=str(phase.get("diagnosis") or "scanner_error"),
+                command=phase.get("command",[]),
+            )
             result.update(common)
             return result
         if phase.get("status")=="partial":
@@ -133,23 +155,5 @@ def run_arjun_scan(
         )
 
 
-def _once() -> int:
-    try:
-        arguments = json.loads(os.sys.stdin.read() or "{}")
-        if not isinstance(arguments, dict):
-            raise ValueError("Expected a JSON object on stdin.")
-        result = run_arjun_scan(**arguments)
-    except Exception as exc:
-        from utils import failure
-        result = failure("Arjun", "", f"One-shot Arjun execution failed: {type(exc).__name__}: {exc}")
-    print(json.dumps(result, ensure_ascii=False, default=str))
-    return 0
-
-
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(add_help=False)
-    parser.add_argument("--once", action="store_true")
-    args, _ = parser.parse_known_args()
-    if args.once:
-        raise SystemExit(_once())
-    mcp.run(transport="stdio")
+    run_mcp_http(mcp, "arjun")

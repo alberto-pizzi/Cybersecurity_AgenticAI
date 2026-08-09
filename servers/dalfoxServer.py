@@ -1,8 +1,5 @@
 from __future__ import annotations
 
-import argparse
-import json
-import os
 import re
 import tempfile
 from pathlib import Path
@@ -13,7 +10,9 @@ from typing import Any
 
 from fastmcp import FastMCP
 
-from utils import failure, partial, read_json_lines, run_process, scanner_session_probe, success
+from utils import partial, read_json_lines, response_excerpt, run_process, scanner_session_probe, success
+
+from utils import run_mcp_http
 
 mcp = FastMCP("Dalfox Scanner")
 
@@ -88,15 +87,6 @@ def _json_findings(path: Path, target_url: str, method: str) -> list[dict[str, A
         })
     return findings
 
-
-
-def _response_excerpt(text: str, marker: str, limit: int = 900) -> str:
-    value = str(text or "")
-    index = value.find(marker)
-    if index < 0:
-        return value[:limit]
-    start = max(0, index - limit // 3)
-    return value[start:start + limit]
 
 
 def _http_retry(method: str, url: str, **kwargs: Any) -> requests.Response:
@@ -215,7 +205,7 @@ def _reflection_probe(
         "exact_unescaped_payload": exact and not encoded,
         "persisted_unescaped_payload": persisted and not encoded,
         "request_data": request_data,
-        "response_excerpt": _response_excerpt(excerpt_source, marker),
+        "response_excerpt": response_excerpt(excerpt_source, marker),
     }
 
 
@@ -461,22 +451,5 @@ def run_dalfox_scan(
         )
 
 
-def _once() -> int:
-    try:
-        arguments = json.loads(os.sys.stdin.read() or "{}")
-        if not isinstance(arguments, dict):
-            raise ValueError("Expected a JSON object on stdin.")
-        result = run_dalfox_scan(**arguments)
-    except Exception as exc:
-        result = failure("Dalfox", "", f"One-shot Dalfox execution failed: {type(exc).__name__}: {exc}")
-    print(json.dumps(result, ensure_ascii=False, default=str))
-    return 0
-
-
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(add_help=False)
-    parser.add_argument("--once", action="store_true")
-    args, _ = parser.parse_known_args()
-    if args.once:
-        raise SystemExit(_once())
-    mcp.run(transport="stdio")
+    run_mcp_http(mcp, "dalfox")

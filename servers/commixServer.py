@@ -1,9 +1,6 @@
 from __future__ import annotations
 
-import argparse
-import json
 import html
-import os
 import re
 import sys
 import time
@@ -16,7 +13,9 @@ from typing import Any
 
 from fastmcp import FastMCP
 
-from utils import ROOT_DIR, failure, partial, run_process, scanner_session_probe, success
+from utils import ROOT_DIR, failure, partial, response_excerpt, run_process, scanner_session_probe, success, trim_process_output
+
+from utils import run_mcp_http
 
 mcp = FastMCP("Commix Scanner")
 
@@ -86,15 +85,6 @@ def _findings(text: str, target_url: str, method: str) -> list[dict[str, Any]]:
 
 CONTROL_PARAMETERS = {"submit", "login", "change", "user_token", "csrf", "button"}
 COMMAND_PARAMETERS = {"ip", "host", "hostname", "cmd", "command", "exec", "target", "domain"}
-
-
-def _response_excerpt(text: str, marker: str, limit: int = 900) -> str:
-    value = str(text or "")
-    index = value.find(marker)
-    if index < 0:
-        return value[:limit]
-    start = max(0, index - limit // 3)
-    return value[start:start + limit]
 
 
 def _command_canary(
@@ -231,7 +221,7 @@ def _command_canary(
             "confirmed": confirmed,
             "marker_absent_from_payload": marker_absent_from_payload,
             "baseline_valid": baseline_valid,
-            "response_excerpt": _response_excerpt(response.text, marker),
+            "response_excerpt": response_excerpt(response.text, marker),
         }
         attempts.append(attempt)
         if confirmed:
@@ -302,14 +292,6 @@ def _canary_finding(
             f"Response excerpt:\n{canary.get('response_excerpt')}"
         ),
     }]
-
-def _trim(result: dict[str, Any], limit: int = 10000) -> dict[str, Any]:
-    for key in ("stdout", "stderr"):
-        value = str(result.get(key, ""))
-        if len(value) > limit:
-            result[key] = value[-limit:]
-            result[f"{key}_truncated"] = True
-    return result
 
 
 @mcp.tool()
@@ -408,7 +390,7 @@ def run_commix_scan(
         )
     if result.get("status") != "success":
         result.update(common)
-        return _trim(result)
+        return trim_process_output(result, 10000)
 
     return success(
         "Commix", target_url,
@@ -422,22 +404,5 @@ def run_commix_scan(
     )
 
 
-def _once() -> int:
-    try:
-        arguments = json.loads(os.sys.stdin.read() or "{}")
-        if not isinstance(arguments, dict):
-            raise ValueError("Expected a JSON object on stdin.")
-        result = run_commix_scan(**arguments)
-    except Exception as exc:
-        result = failure("Commix", "", f"One-shot Commix execution failed: {type(exc).__name__}: {exc}")
-    print(json.dumps(result, ensure_ascii=False, default=str))
-    return 0
-
-
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(add_help=False)
-    parser.add_argument("--once", action="store_true")
-    args, _ = parser.parse_known_args()
-    if args.once:
-        raise SystemExit(_once())
-    mcp.run(transport="stdio")
+    run_mcp_http(mcp, "commix")

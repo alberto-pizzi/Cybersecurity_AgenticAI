@@ -1,103 +1,103 @@
-SecOps FastMCP - guida operativa multipiattaforma
-====================================================
+SecOps FastMCP - guida operativa
+===============================
 
 AMBIENTE
 --------
 Apri il terminale nella radice del progetto:
-  Windows PowerShell: Set-Location "<PROJECT_ROOT>"
-  macOS/Linux:        cd "<PROJECT_ROOT>"
+  Set-Location "<PROJECT_ROOT>"
 
-Nei comandi seguenti, sostituisci <PYTHON> con `python` su Windows oppure
-`python3` su macOS/Linux. Usa soltanto target tuoi o esplicitamente autorizzati.
-Per un target remoto aggiungi sempre --authorized e mantieni l'intero Cookie
-header tra virgolette.
+Usa soltanto target tuoi o esplicitamente autorizzati. Per un target remoto
+aggiungi --authorized e mantieni il Cookie header tra virgolette.
 
-1. INIZIALIZZAZIONE E LAB LOCALE
---------------------------------
-<PYTHON> ./initScript.py --with-lab --model qwen2.5:7b
-<PYTHON> ./initScript.py
-<PYTHON> ./initScript.py --commands-only
-<PYTHON> ./initScript.py --with-lab --run deterministic --mode balanced
-<PYTHON> ./initScript.py --with-lab --run agentic --model qwen2.5:7b --mode balanced
+MCP
+---
+Tutti i server FastMCP usano Streamable HTTP su 127.0.0.1 con endpoint /mcp.
+Deterministic e Agentic condividono registry, porte, selector e contratti MCP.
+Non sono previsti trasporti MCP alternativi.
 
-`initScriptMac.py` rimane disponibile come wrapper compatibile, ma usa lo stesso
-initializer multipiattaforma per evitare divergenze tra Windows e macOS.
+1. INIZIALIZZAZIONE
+------------------
+python .\initScript.py
+python .\initScript.py --with-lab --model qwen2.5:7b
+python .\initScript.py --with-lab --run deterministic --mode balanced
+python .\initScript.py --with-lab --run agentic --model qwen2.5:7b --mode balanced
+python .\initScript.py --commands-only
+
+L'initializer installa o verifica gli scanner e aggiorna IDOR-Forge da
+https://github.com/errorfiathck/IDOR-Forge.git in ~/.local/opt/idor-forge.
+Le dipendenze upstream di IDOR-Forge restano nella .venv del repository.
+Percorsi, interprete e launcher vengono salvati in .secops_runtime.json e
+verificati dal preflight.
 
 2. DETERMINISTIC
 ----------------
-<PYTHON> ./orchestratorDeterministic.py --target <TARGET> --cookies "<COOKIE_HEADER>" --auth-only --authorized --mode balanced
-<PYTHON> ./orchestratorDeterministic.py --target <TARGET> --cookies "<COOKIE_HEADER>" --auth-only --authorized --mode deep
-<PYTHON> ./orchestratorDeterministic.py --target <TARGET> --cookies "<PRIMARY_COOKIE>" --secondary-cookies "<SECOND_ACCOUNT_COOKIE>" --auth-only --authorized --mode deep
-<PYTHON> ./orchestratorDeterministic.py --target <TARGET> --authorized --mode balanced
+python .\orchestratorDeterministic.py --target <TARGET> --cookies "<COOKIE_HEADER>" --auth-only --authorized --mode balanced
+python .\orchestratorDeterministic.py --target <TARGET> --cookies "<COOKIE_HEADER>" --auth-only --authorized --mode deep
+python .\orchestratorDeterministic.py --target <TARGET> --cookies "<PRIMARY_COOKIE>" --secondary-cookies "<SECOND_ACCOUNT_COOKIE>" --auth-only --authorized --mode deep
+python .\orchestratorDeterministic.py --target <TARGET> --authorized --mode balanced
 
 3. AGENTIC
 ----------
-<PYTHON> ./orchestratorAgentic.py --target <TARGET> --cookies "<COOKIE_HEADER>" --auth-only --authorized --model <MODEL> --max-rounds 2 --mode balanced
-<PYTHON> ./orchestratorAgentic.py --target <TARGET> --cookies "<COOKIE_HEADER>" --auth-only --authorized --model <MODEL> --max-rounds 3 --mode deep --ai-timeout 720
-<PYTHON> ./orchestratorAgentic.py --target <TARGET> --cookies "<PRIMARY_COOKIE>" --secondary-cookies "<SECOND_ACCOUNT_COOKIE>" --auth-only --authorized --model <MODEL> --max-rounds 3 --mode deep
-<PYTHON> ./orchestratorAgentic.py --target <TARGET> --cookies "<COOKIE_HEADER>" --auth-only --authorized --model <MODEL> --require-ai --max-rounds 2 --mode balanced
-<PYTHON> ./orchestratorAgentic.py --target <TARGET> --authorized --model <MODEL> --no-model-pull --mode balanced
+python .\orchestratorAgentic.py --target <TARGET> --cookies "<COOKIE_HEADER>" --auth-only --authorized --model <MODEL> --max-rounds 2 --mode balanced
+python .\orchestratorAgentic.py --target <TARGET> --cookies "<COOKIE_HEADER>" --auth-only --authorized --model <MODEL> --max-rounds 3 --mode deep --ai-timeout 720
+python .\orchestratorAgentic.py --target <TARGET> --cookies "<PRIMARY_COOKIE>" --secondary-cookies "<SECOND_ACCOUNT_COOKIE>" --auth-only --authorized --model <MODEL> --max-rounds 3 --mode deep
+python .\orchestratorAgentic.py --target <TARGET> --cookies "<COOKIE_HEADER>" --auth-only --authorized --model <MODEL> --require-ai --max-rounds 2 --mode balanced
 
-L'agentic usa il catalogo, i selector e l'interprete MCP del deterministic.
-Quando il piano omette una classe applicabile, Ollama deve scegliere esplicitamente
-un candidato scoperto per riparare la copertura; non vengono inseriti endpoint
-hardcoded. I round continuano finché restano azioni valide o viene raggiunto
---max-rounds.
+Il planner riceve candidati derivati dalla discovery e li seleziona in base al
+valore informativo atteso. Può differire controlli ridondanti e non usa una
+checklist minima. Ogni azione passa dagli stessi validator del Deterministic.
 
-4. PREFLIGHT E DEBUG
+4. PREFLIGHT E TEST
+-------------------
+python .\selftest_v31_13.py
+python .\orchestratorDeterministic.py --target <TARGET> --authorized --preflight-only
+python .\orchestratorAgentic.py --target <TARGET> --authorized --preflight-only
+python .\orchestratorDeterministic.py --list-tools
+
+5. TEST MIRATI
+---------------
+ZAP:
+python .\orchestratorDeterministic.py --target <TARGET> --cookies "<COOKIE_HEADER>" --authorized --tool zap --mode deep --tool-timeout 480
+
+SQLMap:
+python .\orchestratorDeterministic.py --target <TARGET> --cookies "<COOKIE_HEADER>" --authorized --tool sqlmap --tool-url "<URL>" --method GET --parameters "id,query" --tool-timeout 180
+
+IDOR-Forge:
+python .\orchestratorDeterministic.py --target <TARGET> --cookies "<COOKIE_HEADER>" --authorized --tool idor --tool-url "<URL_CON_ID_NUMERICO>" --method GET --parameters "id" --tool-timeout 60
+
+JWT:
+python .\orchestratorDeterministic.py --target <TARGET> --authorized --tool jwt --jwt-token "<JWT>"
+
+Browser / Workflow / Authorization:
+python .\orchestratorDeterministic.py --target <TARGET> --cookies "<COOKIE_HEADER>" --authorized --tool browser --mode balanced
+python .\orchestratorDeterministic.py --target <TARGET> --cookies "<COOKIE_HEADER>" --authorized --tool workflow --mode balanced
+python .\orchestratorDeterministic.py --target <TARGET> --cookies "<PRIMARY_COOKIE>" --secondary-cookies "<SECOND_ACCOUNT_COOKIE>" --authorized --tool authorization --mode balanced
+
+6. PROFILI E OPZIONI
 --------------------
-<PYTHON> ./orchestratorDeterministic.py --target <TARGET> --authorized --preflight-only
-<PYTHON> ./orchestratorAgentic.py --target <TARGET> --authorized --preflight-only
-<PYTHON> ./orchestratorDeterministic.py --list-tools
-<PYTHON> ./orchestratorDeterministic.py --target <TARGET> --cookies "<COOKIE_HEADER>" --authorized --tool zap --mode deep --tool-timeout 480
-<PYTHON> ./orchestratorDeterministic.py --target <TARGET> --cookies "<COOKIE_HEADER>" --authorized --tool sqlmap --tool-url <URL> --method GET --parameters "id,query" --tool-timeout 180
-<PYTHON> ./orchestratorDeterministic.py --target <TARGET> --authorized --tool jwt --jwt-token "<JWT>"
-<PYTHON> ./orchestratorDeterministic.py --target <TARGET> --cookies "<COOKIE_HEADER>" --authorized --tool exposure --mode balanced
-<PYTHON> ./orchestratorDeterministic.py --target <TARGET> --cookies "<COOKIE_HEADER>" --authorized --tool browser --mode balanced
-<PYTHON> ./orchestratorDeterministic.py --target <TARGET> --cookies "<COOKIE_HEADER>" --authorized --tool workflow --mode balanced
-<PYTHON> ./orchestratorDeterministic.py --target <TARGET> --cookies "<PRIMARY_COOKIE>" --secondary-cookies "<SECOND_ACCOUNT_COOKIE>" --authorized --tool authorization --mode balanced
-
-5. PROFILI
-----------
 fast      controllo rapido e budget ridotti
 balanced  copertura ampia con priorità ai controlli importanti
-deep      più target, richieste e budget per ZAP/Nuclei/strumenti parametrizzati
+deep      più target, richieste e budget per i controlli specialistici
 
-6. OPZIONI INIT
----------------
---with-lab --run --model --mode --skip-scanners --skip-preflight
---skip-browser --require-browser --commands-only --version
+Init: --with-lab --run --model --mode --skip-scanners --skip-preflight
+      --skip-browser --require-browser --commands-only --version
 
-Per un target remoto, i workflow che inviano POST o file di prova restano
-disabilitati salvo consenso esplicito con --authorized --allow-state-changes.
-Nei laboratori locali vengono abilitati automaticamente.
+Per target remoti i workflow che inviano POST o file di prova richiedono anche
+--allow-state-changes. Nel laboratorio locale autorizzato sono abilitati
+automaticamente.
 
 7. NUCLEI
 ---------
+Native mode:
 nuclei -update
 nuclei -update-templates
-nuclei -tl -silent -nc -disable-update-check | wc -l
 
-Le pipeline passano a Nuclei request contract GET/POST same-origin e
-non distruttivi. Le fasi statiche per esposizioni, misconfigurazioni e
-controlli high-impact vengono eseguite prima del DAST, che usa soltanto i
-contratti parametrizzati con priorità maggiore.
+Official Docker fallback:
+docker run --rm projectdiscovery/nuclei:latest -version
 
-7B. COPERTURA WORKFLOW E BROWSER
--------------------------------
-Exposure classifica backup, sorgenti, configurazioni, .git, .env e directory
-listing realmente recuperabili. Session analizza cookie e indicatori di
-unicità/fissazione. Browser usa Chromium per DOM/reflected/stored XSS con
-marker innocui. Workflow esegue controlli limitati su CSRF, upload, login
-throttling e CAPTCHA usando esclusivamente i form scoperti. Authorization
-confronta richieste GET ad alto valore tra identità primaria, anonima e, quando
-fornita, una seconda identità autenticata senza eseguire operazioni mutative.
+(Get-ChildItem "$HOME\nuclei-templates" -Recurse -File -Include *.yaml,*.yml | Measure-Object).Count
 
 8. REPORT
 ---------
-Deterministic: ./reports/SecOps_Assessment_<timestamp>.pdf/.html/.json
-Agentic:       ./reports/SecOps_Agentic_Assessment_<timestamp>.pdf/.html/.json
-
-NOTA SHELL
-----------
-In zsh/bash usa \ alla fine della riga per continuare un comando.
+Deterministic: .\reports\SecOps_Assessment_<timestamp>.pdf/.html/.json
+Agentic:       .\reports\SecOps_Agentic_Assessment_<timestamp>.pdf/.html/.json

@@ -1,19 +1,19 @@
 from __future__ import annotations
 
-import argparse
 import html
 import json
 import re
 import secrets
-import sys
 from difflib import SequenceMatcher
 from typing import Any
-from urllib.parse import parse_qsl, urlencode, urljoin, urlparse
+from urllib.parse import parse_qsl, urljoin, urlparse
 
 import requests
 from fastmcp import FastMCP
 
-from utils import failure, skipped, success
+from utils import skipped, success
+
+from utils import run_mcp_http, same_origin
 
 mcp = FastMCP("Web Workflow Verifier")
 
@@ -25,15 +25,7 @@ STATE_CHANGE_RE = re.compile(
 )
 AUTH_RE = re.compile(r"(?:login|signin|sign-in|authenticate|brute)", re.I)
 CAPTCHA_RE = re.compile(r"(?:captcha|recaptcha|hcaptcha)", re.I)
-SUCCESS_RE = re.compile(r"(?:success|uploaded|saved|updated|created|submitted|thank you|complete)", re.I)
 ERROR_RE = re.compile(r"(?:invalid|error|failed|required|denied|forbidden|incorrect)", re.I)
-
-
-def _same_origin(left: str, right: str) -> bool:
-    a, b = urlparse(left), urlparse(right)
-    return (a.scheme.lower(), a.hostname, a.port or (443 if a.scheme == "https" else 80)) == (
-        b.scheme.lower(), b.hostname, b.port or (443 if b.scheme == "https" else 80)
-    )
 
 
 def _looks_like_login(response: requests.Response) -> bool:
@@ -263,7 +255,7 @@ def _upload_check(
     directory_candidates: list[str] = []
     for known in known_urls or []:
         value = str(known or "").strip()
-        if not value or not _same_origin(target_url, value):
+        if not value or not same_origin(target_url, value):
             continue
         parsed_known = urlparse(value)
         lowered = parsed_known.path.lower()
@@ -282,7 +274,7 @@ def _upload_check(
         discovered_links: list[str] = []
         for match in re.findall(r"(?:href|src)\s*=\s*['\"]([^'\"]+)['\"]", listing.text, re.I):
             resolved = urljoin(str(listing.url), html.unescape(match))
-            if filename.lower() in resolved.lower() and _same_origin(target_url, resolved):
+            if filename.lower() in resolved.lower() and same_origin(target_url, resolved):
                 candidates.append(resolved)
                 discovered_links.append(resolved)
         directory_searches.append({
@@ -292,7 +284,7 @@ def _upload_check(
             "matching_links": discovered_links,
         })
 
-    candidates = [value for value in dict.fromkeys(candidates) if _same_origin(target_url, value)]
+    candidates = [value for value in dict.fromkeys(candidates) if same_origin(target_url, value)]
     retrieved: list[dict[str, Any]] = []
     for candidate in candidates[:8]:
         try:
@@ -559,22 +551,5 @@ def run_workflow_scan(
     )
 
 
-def _once() -> int:
-    try:
-        arguments = json.loads(sys.stdin.read() or "{}")
-        if not isinstance(arguments, dict):
-            raise ValueError("Expected a JSON object on stdin.")
-        result = run_workflow_scan(**arguments)
-    except Exception as exc:
-        result = failure("Web Workflow Verifier", "", f"One-shot workflow scan failed: {type(exc).__name__}: {exc}")
-    print(json.dumps(result, ensure_ascii=False, default=str))
-    return 0
-
-
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(add_help=False)
-    parser.add_argument("--once", action="store_true")
-    args, _ = parser.parse_known_args()
-    if args.once:
-        raise SystemExit(_once())
-    mcp.run(transport="stdio", show_banner=False)
+    run_mcp_http(mcp, "workflow")

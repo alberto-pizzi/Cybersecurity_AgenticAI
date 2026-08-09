@@ -1,6 +1,6 @@
 {
   "schema_version": 3,
-  "generated_at": "2026-07-29T16:59:46.036971+00:00",
+  "generated_at": "2026-08-09T13:42:25.607195+00:00",
   "project_root": "S:\\Cybersecurity_AgenticAI",
   "python_executable": "C:\\Users\\tommy\\AppData\\Local\\Microsoft\\WindowsApps\\PythonSoftwareFoundation.Python.3.13_qbz5n2kfra8p0\\python.exe",
   "platform": "Windows-10-10.0.19045-SP0",
@@ -11,14 +11,48 @@
     "C:\\Users\\tommy\\AppData\\Local\\Microsoft\\WindowsApps\\PythonSoftwareFoundation.Python.3.13_qbz5n2kfra8p0"
   ],
   "executables": {
-    "nuclei": "C:\\Users\\tommy\\.local\\bin\\nuclei.exe",
+    "nuclei": "C:\\Users\\tommy\\.local\\bin\\nuclei-docker.bat",
     "nikto": "C:\\Users\\tommy\\.local\\bin\\nikto.bat",
     "ffuf": "C:\\Users\\tommy\\.local\\bin\\ffuf.exe",
     "dalfox": "C:\\Users\\tommy\\.local\\bin\\dalfox.exe",
     "commix": "C:\\Users\\tommy\\.local\\bin\\commix.bat",
     "sqlmap": "C:\\Users\\tommy\\.local\\bin\\sqlmap.bat",
     "arjun": "C:\\Users\\tommy\\AppData\\Local\\Packages\\PythonSoftwareFoundation.Python.3.13_qbz5n2kfra8p0\\LocalCache\\local-packages\\Python313\\Scripts\\arjun.exe",
+    "idor-forge": "C:\\Users\\tommy\\.local\\bin\\idor-forge.bat",
     "interactsh-client": "C:\\Users\\tommy\\.local\\bin\\interactsh-client.exe"
+  },
+  "idor_forge": {
+    "repository": "https://github.com/errorfiathck/IDOR-Forge.git",
+    "directory": "C:\\Users\\tommy\\.local\\opt\\idor-forge",
+    "entrypoint": "C:\\Users\\tommy\\.local\\opt\\idor-forge\\IDOR-Forge.py",
+    "checker": "C:\\Users\\tommy\\.local\\opt\\idor-forge\\core\\IDORChecker.py",
+    "python": "C:\\Users\\tommy\\.local\\opt\\idor-forge\\.venv\\Scripts\\python.exe",
+    "launcher": "C:\\Users\\tommy\\.local\\bin\\idor-forge.bat",
+    "preflight": "ok"
+  },
+  "mcp_transport": "streamable_http",
+  "mcp_http": {
+    "host": "127.0.0.1",
+    "path": "/mcp",
+    "services": {
+      "ffuf": "http://127.0.0.1:8101/mcp",
+      "zap": "http://127.0.0.1:8103/mcp",
+      "nuclei": "http://127.0.0.1:8104/mcp",
+      "session": "http://127.0.0.1:8105/mcp",
+      "nikto": "http://127.0.0.1:8106/mcp",
+      "arjun": "http://127.0.0.1:8107/mcp",
+      "sqlmap": "http://127.0.0.1:8108/mcp",
+      "dalfox": "http://127.0.0.1:8109/mcp",
+      "commix": "http://127.0.0.1:8110/mcp",
+      "traversal": "http://127.0.0.1:8111/mcp",
+      "idor": "http://127.0.0.1:8112/mcp",
+      "authorization": "http://127.0.0.1:8113/mcp",
+      "browser": "http://127.0.0.1:8114/mcp",
+      "workflow": "http://127.0.0.1:8115/mcp",
+      "jwt": "http://127.0.0.1:8116/mcp",
+      "interactsh": "http://127.0.0.1:8117/mcp",
+      "report": "http://127.0.0.1:8118/mcp"
+    }
   },
   "playwright_chromium": {
     "ready": true,
@@ -28,14 +62,30 @@
   "nikto_script": "C:\\Users\\tommy\\.local\\opt\\nikto\\program\\nikto.pl",
   "nikto_image": "ghcr.io/sullo/nikto:latest",
   "nikto_execution_mode": "docker_official_image",
+  "nuclei_image": "projectdiscovery/nuclei:latest",
+  "nuclei_execution_mode": "docker_official_image",
+  "nuclei_engine": {
+    "execution_mode": "docker_official_image",
+    "executable": "",
+    "launcher": "C:\\Users\\tommy\\.local\\bin\\nuclei-docker.bat",
+    "docker_image": "projectdiscovery/nuclei:latest",
+    "update_returncode": null,
+    "version_before": "",
+    "version_after": "[\u001b[34mINF\u001b[0m] Nuclei Engine Version: v3.11.1\n[\u001b[34mINF\u001b[0m] Nuclei Config Directory: /root/.config/nuclei\n[\u001b[34mINF\u001b[0m] Nuclei Cache Directory: /root/.cache/nuclei\n[\u001b[34mINF\u001b[0m] PDCP Directory: /root/.pdcp",
+    "update_output_excerpt": "Native execution unavailable; official Docker image selected.",
+    "native_diagnostic": "Nuclei native executable is unavailable."
+  },
+  "report_docker_image": "secops/report:local",
+  "report_execution_mode": "docker_local_image",
   "nuclei_templates": {
-    "count": 13412,
-    "count_before_update": 13412,
+    "count": 13573,
+    "count_before_update": 13573,
     "minimum_expected": 1000,
     "sufficient": true,
     "update_returncode": 0,
-    "update_output_excerpt": "\n\n                     __     _\n   ____  __  _______/ /__  (_)\n  / __ \\/ / / / ___/ / _ \\/ /\n / / / / /_/ / /__/ /  __/ /\n/_/ /_/\\__,_/\\___/_/\\___/_/   v3.11.0\n\n\t\tprojectdiscovery.io\n\n[\u001b[34mINF\u001b[0m] No new updates found for nuclei templates\n",
-    "fallback_used": false,
+    "update_output_excerpt": "Official nuclei-templates repository refreshed directly for Docker execution.",
+    "fallback_used": true,
+    "inventory_source": "filesystem",
     "directory": "C:\\Users\\tommy\\nuclei-templates",
     "directories": [
       "C:\\Users\\tommy\\nuclei-templates"
@@ -43,20 +93,24 @@
     "filesystem_candidates": [
       {
         "directory": "C:\\Users\\tommy\\nuclei-templates",
-        "count": 13412
+        "count": 13573
       }
     ],
-    "list_probe_excerpt": "2.yaml\nssl\\c2\\gozi-malware-c2.yaml\nssl\\c2\\havoc-c2.yaml\nssl\\c2\\icedid.yaml\nssl\\c2\\metasploit-c2.yaml\nssl\\c2\\mythic-c2-ssl.yaml\nssl\\c2\\onimai-rat-c2.yaml\nssl\\c2\\orcus-rat-c2.yaml\nssl\\c2\\posh-c2.yaml\nssl\\c2\\quasar-rat-c2.yaml\nssl\\c2\\shadowpad-c2.yaml\nssl\\c2\\sliver-c2.yaml\nssl\\c2\\venomrat.yaml\nssl\\deprecated-tls.yaml\nssl\\detect-ssl-issuer.yaml\nssl\\expired-ssl.yaml\nssl\\fortinet\\fortianalyzer-certificate.yaml\nssl\\fortinet\\fortiauthenticator-certificate.yaml\nssl\\fortinet\\fortiddos-certificate.yaml\nssl\\fortinet\\fortigate-certificate.yaml\nssl\\fortinet\\fortimanager-certificate.yaml\nssl\\fortinet\\fortiswitch-certificate.yaml\nssl\\fortinet\\fortiweb-certificate.yaml\nssl\\fortinet\\fortiwifi-certificate.yaml\nssl\\insecure-cipher-suite-detect.yaml\nssl\\kubernetes-fake-certificate.yaml\nssl\\mismatched-ssl-certificate.yaml\nssl\\revoked-ssl-certificate.yaml\nssl\\self-signed-ssl.yaml\nssl\\ssl-dns-names.yaml\nssl\\tls-version.yaml\nssl\\untrusted-root-certificate.yaml\nssl\\weak-cipher-suites.yaml\nssl\\wildcard-tls.yaml\n",
     "engine": {
-      "update_returncode": 0,
-      "version_before": "[\u001b[34mINF\u001b[0m] Nuclei Engine Version: v3.11.0\n[\u001b[34mINF\u001b[0m] Nuclei Config Directory: C:\\Users\\tommy\\AppData\\Roaming\\nuclei\n[\u001b[34mINF\u001b[0m] Nuclei Cache Directory: C:\\Users\\tommy\\AppData\\Local\\nuclei\n[\u001b[34mINF\u001b[0m] PDCP Directory: C:\\Users\\tommy\\.pdcp",
-      "version_after": "[\u001b[34mINF\u001b[0m] Nuclei Engine Version: v3.11.0\n[\u001b[34mINF\u001b[0m] Nuclei Config Directory: C:\\Users\\tommy\\AppData\\Roaming\\nuclei\n[\u001b[34mINF\u001b[0m] Nuclei Cache Directory: C:\\Users\\tommy\\AppData\\Local\\nuclei\n[\u001b[34mINF\u001b[0m] PDCP Directory: C:\\Users\\tommy\\.pdcp",
-      "update_output_excerpt": "__     _\n   ____  __  _______/ /__  (_)\n  / __ \\/ / / / ___/ / _ \\/ /\n / / / / /_/ / /__/ /  __/ /\n/_/ /_/\\__,_/\\___/_/\\___/_/   v3.11.0\n\n\t\tprojectdiscovery.io\n\n[\u001b[34mINF\u001b[0m] nuclei is already updated to latest version"
+      "execution_mode": "docker_official_image",
+      "executable": "",
+      "launcher": "C:\\Users\\tommy\\.local\\bin\\nuclei-docker.bat",
+      "docker_image": "projectdiscovery/nuclei:latest",
+      "update_returncode": null,
+      "version_before": "",
+      "version_after": "[\u001b[34mINF\u001b[0m] Nuclei Engine Version: v3.11.1\n[\u001b[34mINF\u001b[0m] Nuclei Config Directory: /root/.config/nuclei\n[\u001b[34mINF\u001b[0m] Nuclei Cache Directory: /root/.cache/nuclei\n[\u001b[34mINF\u001b[0m] PDCP Directory: /root/.pdcp",
+      "update_output_excerpt": "Native execution unavailable; official Docker image selected.",
+      "native_diagnostic": "Nuclei native executable is unavailable."
     }
   },
   "last_auth_target": "http://127.0.0.1",
-  "last_auth_cookie": "PHPSESSID=im1s5fphsoqvgdrs9ek86guh27; security=low",
-  "last_auth_generated_at": "2026-07-29T17:00:53.212751+00:00",
+  "last_auth_cookie": "PHPSESSID=1b4uh8m0k1djfipcj070o80bm7; security=low",
+  "last_auth_generated_at": "2026-08-09T13:43:19.603267+00:00",
   "target_profiles": {
     "http://127.0.0.1:80": {
       "target_url": "http://127.0.0.1",

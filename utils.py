@@ -8,7 +8,7 @@ import subprocess
 import time
 from pathlib import Path
 from typing import Any, Iterable
-from urllib.parse import urljoin, urlparse, urlunparse
+from urllib.parse import urljoin, urlparse
 
 import requests
 
@@ -17,6 +17,54 @@ SERVERS_DIR = ROOT_DIR / "servers"
 REPORTS_DIR = ROOT_DIR / "reports"
 WORDLISTS_DIR = ROOT_DIR / "wordlists"
 LOCAL_BIN = Path.home() / ".local" / "bin"
+
+
+# Each FastMCP service is exposed on loopback through Streamable HTTP.
+# Ports are fixed per logical tool so deterministic and agentic orchestration
+# share the same service map and can reuse long-lived server processes.
+MCP_HTTP_HOST = "127.0.0.1"
+MCP_HTTP_PATH = "/mcp"
+MCP_SERVER_PORTS: dict[str, int] = {
+    "ffuf": 8101,
+    "zap": 8103,
+    "nuclei": 8104,
+    "session": 8105,
+    "nikto": 8106,
+    "arjun": 8107,
+    "sqlmap": 8108,
+    "dalfox": 8109,
+    "commix": 8110,
+    "traversal": 8111,
+    "idor": 8112,
+    "authorization": 8113,
+    "browser": 8114,
+    "workflow": 8115,
+    "jwt": 8116,
+    "interactsh": 8117,
+    "report": 8118,
+}
+
+
+def mcp_http_port(tool_name: str) -> int:
+    name = str(tool_name or "").strip().lower()
+    if name not in MCP_SERVER_PORTS:
+        raise KeyError(f"Unknown MCP HTTP service: {tool_name}")
+    return int(MCP_SERVER_PORTS[name])
+
+
+def mcp_http_url(tool_name: str, host: str = MCP_HTTP_HOST) -> str:
+    return f"http://{host}:{mcp_http_port(tool_name)}{MCP_HTTP_PATH}"
+
+
+def run_mcp_http(mcp: Any, tool_name: str) -> None:
+    """Run one FastMCP service over Streamable HTTP.
+
+    The orchestrator normally supplies SECOPS_MCP_PORT. The per-tool default
+    makes each server independently runnable for diagnostics as well.
+    """
+    host = os.getenv("SECOPS_MCP_HOST", MCP_HTTP_HOST).strip() or MCP_HTTP_HOST
+    port = int(os.getenv("SECOPS_MCP_PORT", str(mcp_http_port(tool_name))))
+    mcp.run(transport="http", host=host, port=port)
 
 _FATAL_STARTUP_PATTERNS = (
     r"is not recognized as an internal or external command",
@@ -76,9 +124,6 @@ def canonical_cookie_header(value: str) -> str:
 def cookie_names(value: str) -> list[str]:
     return [name for name, _ in parse_cookie_header(value)]
 
-
-def redact_cookie_header(value: str) -> str:
-    return "; ".join(f"{name}=<redacted>" for name, _ in parse_cookie_header(value))
 
 
 def response_looks_like_login(response: Any) -> bool:
@@ -292,7 +337,27 @@ def normalize_url(url: str) -> str:
 
 def same_origin(left: str, right: str) -> bool:
     a, b = urlparse(left), urlparse(right)
-    return (a.scheme.lower(), a.hostname, a.port) == (b.scheme.lower(), b.hostname, b.port)
+    a_port = a.port or (443 if a.scheme.lower() == "https" else 80)
+    b_port = b.port or (443 if b.scheme.lower() == "https" else 80)
+    return (a.scheme.lower(), a.hostname, a_port) == (b.scheme.lower(), b.hostname, b_port)
+
+
+def response_excerpt(text: str, marker: str = "", limit: int = 900) -> str:
+    value = str(text or "")
+    index = value.find(marker) if marker else -1
+    if index < 0:
+        return value[:limit]
+    start = max(0, index - limit // 3)
+    return value[start:start + limit]
+
+
+def trim_process_output(result: dict[str, Any], limit: int) -> dict[str, Any]:
+    for key in ("stdout", "stderr"):
+        value = str(result.get(key, ""))
+        if len(value) > limit:
+            result[key] = value[-limit:]
+            result[f"{key}_truncated"] = True
+    return result
 
 
 def absolute_url(base: str, candidate: str) -> str:

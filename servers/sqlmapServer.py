@@ -1,8 +1,5 @@
 from __future__ import annotations
 
-import argparse
-import json
-import os
 import re
 import sys
 from pathlib import Path
@@ -13,7 +10,9 @@ import requests
 
 from fastmcp import FastMCP
 
-from utils import ROOT_DIR, failure, partial, run_process, scanner_session_probe, success
+from utils import ROOT_DIR, failure, partial, run_process, scanner_session_probe, success, trim_process_output
+
+from utils import run_mcp_http
 
 mcp = FastMCP("SQLMap Scanner")
 
@@ -119,14 +118,6 @@ def _extract_findings(text: str, target_url: str, method: str) -> list[dict[str,
         "evidence": text[-5000:],
     }]
 
-
-def _trim(result: dict[str, Any], limit: int = 12000) -> dict[str, Any]:
-    for key in ("stdout", "stderr"):
-        value = str(result.get(key, ""))
-        if len(value) > limit:
-            result[key] = value[-limit:]
-            result[f"{key}_truncated"] = True
-    return result
 
 
 
@@ -552,7 +543,7 @@ def run_sqlmap_scan(
         )
     if result.get("status") != "success":
         result.update(common)
-        return _trim(result)
+        return trim_process_output(result, 12000)
 
     return success(
         "SQLMap", target_url,
@@ -566,22 +557,5 @@ def run_sqlmap_scan(
     )
 
 
-def _once() -> int:
-    try:
-        arguments = json.loads(os.sys.stdin.read() or "{}")
-        if not isinstance(arguments, dict):
-            raise ValueError("Expected a JSON object on stdin.")
-        result = run_sqlmap_scan(**arguments)
-    except Exception as exc:
-        result = failure("SQLMap", "", f"One-shot SQLMap execution failed: {type(exc).__name__}: {exc}")
-    print(json.dumps(result, ensure_ascii=False, default=str))
-    return 0
-
-
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(add_help=False)
-    parser.add_argument("--once", action="store_true")
-    args, _ = parser.parse_known_args()
-    if args.once:
-        raise SystemExit(_once())
-    mcp.run(transport="stdio")
+    run_mcp_http(mcp, "sqlmap")

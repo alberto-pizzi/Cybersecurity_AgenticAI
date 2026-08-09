@@ -1,19 +1,16 @@
 from __future__ import annotations
 
-import argparse
-import asyncio
-import json
 import re
 import secrets
 import shutil
-import sys
-import time
 from typing import Any
 from urllib.parse import parse_qsl, quote, urlencode, urlparse, urlunparse
 
 from fastmcp import FastMCP
 
 from utils import failure, parse_cookie_header, skipped, success
+
+from utils import run_mcp_http, same_origin
 
 mcp = FastMCP("Browser XSS and Workflow Verifier")
 
@@ -28,13 +25,6 @@ XSS_NAME_RE = re.compile(
 )
 POSITIVE_SUBMIT_RE = re.compile(r"(?:submit|send|save|post|publish|sign|add|create|update|upload|change)", re.I)
 NEGATIVE_SUBMIT_RE = re.compile(r"(?:clear|delete|remove|reset|cancel|logout|drop|purge)", re.I)
-
-
-def _same_origin(left: str, right: str) -> bool:
-    a, b = urlparse(left), urlparse(right)
-    return (a.scheme.lower(), a.hostname, a.port or (443 if a.scheme == "https" else 80)) == (
-        b.scheme.lower(), b.hostname, b.port or (443 if b.scheme == "https" else 80)
-    )
 
 
 def _mutate_query(url: str, parameter: str, value: str) -> str:
@@ -360,7 +350,7 @@ async def _stored_check(
     if not allow_state_changes or DESTRUCTIVE_RE.search(urlparse(target_url).path):
         diagnostic["reason"] = "state changes not authorized or route excluded"
         return findings, diagnostic
-    start_url = source_url if source_url and _same_origin(target_url, source_url) else target_url
+    start_url = source_url if source_url and same_origin(target_url, source_url) else target_url
 
     ranked: list[tuple[int, str]] = []
     for index, parameter in enumerate(dict.fromkeys(parameters)):
@@ -451,7 +441,7 @@ async def _stored_check(
                 verification_page = await context.new_page()
                 try:
                     for revisit in revisit_urls:
-                        if not _same_origin(target_url, revisit):
+                        if not same_origin(target_url, revisit):
                             continue
                         await _safe_goto(verification_page, revisit, timeout_ms)
                         if await _executed(verification_page, marker):
@@ -531,7 +521,7 @@ async def _run_browser_scan_core(
 
     if not target_url.startswith(("http://", "https://")):
         return failure("Browser XSS and Workflow Verifier", target_url, "target_url must be absolute HTTP/HTTPS.")
-    if source_url and not _same_origin(target_url, source_url):
+    if source_url and not same_origin(target_url, source_url):
         source_url = ""
     parameters = [str(value) for value in (parameters or []) if str(value)]
     fields = [dict(value) for value in (fields or []) if isinstance(value, dict)]
@@ -663,22 +653,5 @@ async def run_browser_scan(
     )
 
 
-def _once() -> int:
-    try:
-        arguments = json.loads(sys.stdin.read() or "{}")
-        if not isinstance(arguments, dict):
-            raise ValueError("Expected a JSON object on stdin.")
-        result = asyncio.run(_run_browser_scan_core(**arguments))
-    except Exception as exc:
-        result = failure("Browser XSS and Workflow Verifier", "", f"One-shot browser scan failed: {type(exc).__name__}: {exc}")
-    print(json.dumps(result, ensure_ascii=False, default=str))
-    return 0
-
-
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(add_help=False)
-    parser.add_argument("--once", action="store_true")
-    args, _ = parser.parse_known_args()
-    if args.once:
-        raise SystemExit(_once())
-    mcp.run(transport="stdio", show_banner=False)
+    run_mcp_http(mcp, "browser")

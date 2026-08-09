@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import argparse
 import ipaddress
 import csv
 import json
@@ -21,11 +20,12 @@ import requests
 
 from fastmcp import FastMCP
 
-from utils import ROOT_DIR, failure, parse_cookie_header, partial, runtime_container_route, success
+from utils import ROOT_DIR, failure, load_runtime_config, parse_cookie_header, partial, runtime_container_route, success
+
+from utils import run_mcp_http
 
 mcp = FastMCP("Nikto Scanner")
 
-RUNTIME_FILE = Path(ROOT_DIR) / ".secops_runtime.json"
 CONNECTION_FAILURE_MARKERS = (
     "unable to connect",
     "connection refused",
@@ -217,30 +217,11 @@ def _nikto_coverage_verified(
     )
 
 
-def _nikto_zero_result_verified(
-    findings: list[dict[str, Any]],
-    metrics: dict[str, Any],
-    structured_report: dict[str, Any],
-    scan_profile: str,
-) -> bool:
-    # This flag describes a *clean zero*.  A run with findings is not a zero,
-    # and a runtime-error line must never make this value true.
-    if findings:
-        return False
-    return _nikto_coverage_verified(metrics, structured_report, scan_profile)
-
-
-def _load_runtime() -> dict[str, Any]:
-    try:
-        value = json.loads(RUNTIME_FILE.read_text(encoding="utf-8"))
-        return value if isinstance(value, dict) else {}
-    except (OSError, json.JSONDecodeError):
-        return {}
 
 
 def _launcher_script() -> Path | None:
     """Extract the real nikto.pl path from the generated Windows launcher."""
-    runtime = _load_runtime()
+    runtime = load_runtime_config()
     configured = runtime.get("executables", {}).get("nikto")
     candidates = [
         Path(configured) if isinstance(configured, str) else None,
@@ -278,7 +259,7 @@ def _find_nikto_script() -> Path | None:
 
 
 def _find_perl() -> Path | None:
-    runtime = _load_runtime()
+    runtime = load_runtime_config()
     configured = runtime.get("executables", {}).get("perl")
     candidates = [
         Path(configured) if isinstance(configured, str) else None,
@@ -573,7 +554,7 @@ def _run_native_nikto_scan(
     Run Nikto through Perl directly.
 
     The generated nikto.bat launcher is intentionally bypassed because nested
-    batch execution on Windows can close or corrupt an MCP STDIO session.
+    batch execution on Windows can produce incomplete native output; the wrapper preserves bounded fallback behaviour.
     """
     started = time.monotonic()
     timeout = max(60, min(int(timeout), 600))
@@ -1696,22 +1677,5 @@ def run_nikto_scan(
 
 
 
-def _once() -> int:
-    try:
-        arguments = json.loads(os.sys.stdin.read() or "{}")
-        if not isinstance(arguments, dict):
-            raise ValueError("Expected a JSON object on stdin.")
-        result = run_nikto_scan(**arguments)
-    except Exception as exc:
-        result = failure("Nikto", "", f"One-shot Nikto execution failed: {type(exc).__name__}: {exc}")
-    print(json.dumps(result, ensure_ascii=False, default=str))
-    return 0
-
-
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(add_help=False)
-    parser.add_argument("--once", action="store_true")
-    args, _ = parser.parse_known_args()
-    if args.once:
-        raise SystemExit(_once())
-    mcp.run(transport="stdio")
+    run_mcp_http(mcp, "nikto")

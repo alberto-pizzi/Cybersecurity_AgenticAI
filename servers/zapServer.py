@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-import argparse
-import sys
 import hashlib
 import json
 import os
@@ -25,9 +23,12 @@ from utils import (
     parse_cookie_header,
     partial,
     runtime_container_route,
+    same_origin,
     success,
     target_runtime_profile,
 )
+
+from utils import run_mcp_http
 
 mcp = FastMCP("OWASP ZAP Scanner")
 
@@ -214,15 +215,6 @@ def _valid_http_url(value: str) -> bool:
     return parsed.scheme in {"http", "https"} and bool(parsed.netloc)
 
 
-def _same_origin(left: str, right: str) -> bool:
-    a, b = urlparse(left), urlparse(right)
-    return (a.scheme.lower(), a.hostname, a.port) == (
-        b.scheme.lower(),
-        b.hostname,
-        b.port,
-    )
-
-
 def _runtime_excluded_query_keys(target_url: str) -> set[str]:
     """Return exact-target query fields that must never be crawled or scanned.
 
@@ -407,7 +399,7 @@ def _select_probe_url(
 
     normalized_candidates: set[str] = set()
     for value in candidates:
-        if not _valid_http_url(value) or not _same_origin(target_url, value):
+        if not _valid_http_url(value) or not same_origin(target_url, value):
             continue
         parsed = urlparse(value)
         blocked = set(STATE_CHANGING_QUERY_KEYS)
@@ -691,7 +683,7 @@ def _validate_session(
     direct_authenticated = (
         direct.status_code < 400
         and not direct_summary["login_detected"]
-        and _same_origin(target_url, direct.url)
+        and same_origin(target_url, direct.url)
     )
     if not direct_authenticated:
         return {
@@ -804,7 +796,7 @@ def _seed_zap_history(
         value = str(value or "")
         if (
             _valid_http_url(value)
-            and _same_origin(target_url, value)
+            and same_origin(target_url, value)
             and _safe_path(value, target_url)
             and value not in unique_urls
         ):
@@ -839,7 +831,7 @@ def _seed_zap_history(
         url = str(case.get("url") or "")
         if (
             not _valid_http_url(url)
-            or not _same_origin(target_url, url)
+            or not same_origin(target_url, url)
             or not _safe_path(url, target_url)
         ):
             continue
@@ -927,7 +919,7 @@ def _targeted_cases(
         if (
             method not in {"GET", "POST"}
             or not _valid_http_url(url)
-            or not _same_origin(target_url, url)
+            or not same_origin(target_url, url)
             or not _safe_path(url, target_url)
         ):
             continue
@@ -2011,8 +2003,8 @@ def _findings(
             continue
         scanner_url = str(alert.get("url") or "")
         if scanner_url and not (
-            _same_origin(zap_target_url, scanner_url)
-            or _same_origin(target_url, scanner_url)
+            same_origin(zap_target_url, scanner_url)
+            or same_origin(target_url, scanner_url)
         ):
             continue
         raw_key = (
@@ -2911,26 +2903,5 @@ def run_zap_scan(
             _remove_cookie_rule(zap)
 
 
-def _once() -> int:
-    try:
-        arguments = json.loads(sys.stdin.read() or "{}")
-        if not isinstance(arguments, dict):
-            raise ValueError("Expected a JSON object on stdin.")
-        result = run_zap_scan(**arguments)
-    except Exception as exc:
-        result = failure(
-            "OWASP ZAP",
-            "",
-            f"One-shot OWASP ZAP execution failed: {type(exc).__name__}: {exc}",
-        )
-    print(json.dumps(result, ensure_ascii=False, default=str))
-    return 0
-
-
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(add_help=False)
-    parser.add_argument("--once", action="store_true")
-    args, _ = parser.parse_known_args()
-    if args.once:
-        raise SystemExit(_once())
-    mcp.run(transport="stdio")
+    run_mcp_http(mcp, "zap")

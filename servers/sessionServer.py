@@ -1,11 +1,8 @@
 from __future__ import annotations
 
-import argparse
-import json
 import math
 import re
 import secrets
-import sys
 from collections import Counter
 from http.cookies import SimpleCookie
 from typing import Any
@@ -15,6 +12,8 @@ import requests
 from fastmcp import FastMCP
 
 from utils import failure, parse_cookie_header, skipped, success
+
+from utils import run_mcp_http, same_origin
 
 mcp = FastMCP("Session Security Analyzer")
 
@@ -40,13 +39,6 @@ def _is_session_cookie_name(name: str) -> bool:
 
 def _session_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return [row for row in rows if _is_session_cookie_name(str(row.get("name") or ""))]
-
-def _same_origin(left: str, right: str) -> bool:
-    a, b = urlparse(left), urlparse(right)
-    return (a.scheme.lower(), a.hostname, a.port or (443 if a.scheme == "https" else 80)) == (
-        b.scheme.lower(), b.hostname, b.port or (443 if b.scheme == "https" else 80)
-    )
-
 
 def _looks_like_login(response: requests.Response) -> bool:
     text = response.text[:60_000].lower()
@@ -171,7 +163,7 @@ def run_session_scan(
 ) -> dict:
     """Analyze cookie flags, bounded anonymous session uniqueness and fixation indicators."""
     selected_probe = probe_url or target_url
-    if not _same_origin(target_url, selected_probe):
+    if not same_origin(target_url, selected_probe):
         selected_probe = target_url
     timeout = max(5, min(int(timeout), 60))
     sample_count = max(3, min(int(sample_count), 10))
@@ -344,22 +336,5 @@ def run_session_scan(
     )
 
 
-def _once() -> int:
-    try:
-        arguments = json.loads(sys.stdin.read() or "{}")
-        if not isinstance(arguments, dict):
-            raise ValueError("Expected a JSON object on stdin.")
-        result = run_session_scan(**arguments)
-    except Exception as exc:
-        result = failure("Session Security Analyzer", "", f"One-shot session analysis failed: {type(exc).__name__}: {exc}")
-    print(json.dumps(result, ensure_ascii=False, default=str))
-    return 0
-
-
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(add_help=False)
-    parser.add_argument("--once", action="store_true")
-    args, _ = parser.parse_known_args()
-    if args.once:
-        raise SystemExit(_once())
-    mcp.run(transport="stdio", show_banner=False)
+    run_mcp_http(mcp, "session")

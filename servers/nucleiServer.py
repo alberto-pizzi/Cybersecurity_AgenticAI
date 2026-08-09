@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import argparse
 import json
 import os
 import re
@@ -15,6 +14,8 @@ import requests
 from fastmcp import FastMCP
 
 from utils import failure, partial, read_json_lines, run_process, success
+
+from utils import run_mcp_http
 
 mcp = FastMCP("Nuclei Scanner")
 
@@ -67,6 +68,151 @@ def _as_list(value: Any) -> list[Any]:
     return value if isinstance(value, list) else [value]
 
 
+def _runtime_nuclei_execution() -> tuple[str, str]:
+    configured = os.environ.get("SECOPS_RUNTIME_CONFIG", "").strip()
+    runtime_path = Path(configured).expanduser() if configured else PROJECT_ROOT / ".secops_runtime.json"
+    try:
+        payload = json.loads(runtime_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return "native", ""
+    mode = str(payload.get("nuclei_execution_mode") or "native").strip()
+    image = str(payload.get("nuclei_image") or "projectdiscovery/nuclei:latest").strip()
+    return mode, image
+
+
+def _docker_target_url(value: str) -> str:
+    parsed = urlparse(str(value or ""))
+    if parsed.hostname not in {"127.0.0.1", "localhost", "::1"}:
+        return value
+    netloc = "host.docker.internal"
+    if parsed.port:
+        netloc += f":{parsed.port}"
+    return parsed._replace(netloc=netloc).geturl()
+
+
+def _canonical_runtime_url(value: str, target_url: str, template_id: str = "") -> str:
+    """Map the Docker-only hostname back to the assessment target for reporting."""
+    runtime = urlparse(str(value or ""))
+    target = urlparse(str(target_url or ""))
+
+    if runtime.hostname == "host.docker.internal" and target.netloc:
+        runtime = runtime._replace(
+            scheme=target.scheme or runtime.scheme,
+            netloc=target.netloc,
+        )
+
+    # Apache directory indexes add sort-only query strings such as ?C=N;O=D.
+    # They identify the same affected directory and should not create duplicate findings.
+    if template_id == "secops-direct-directory-listing" and runtime.query:
+        query_names = {
+            name.lower()
+            for name, _ in parse_qsl(runtime.query, keep_blank_values=True)
+        }
+        if query_names and query_names <= {"c", "n", "m", "s", "d", "o"}:
+            runtime = runtime._replace(query="")
+
+    return runtime.geturl()
+
+
+def _docker_target_text(value: str) -> str:
+    text = str(value or "")
+    text = re.sub(
+        r"(?i)(https?://)(?:127\.0\.0\.1|localhost)(?=[:/\s]|$)",
+        r"\1host.docker.internal",
+        text,
+    )
+    return re.sub(
+        r"(?im)^(Host:\s*)(?:127\.0\.0\.1|localhost)(?=[:\r\n])",
+        r"\1host.docker.internal",
+        text,
+    )
+
+
+def _dockerized_nuclei_command(command: list[str], temp_root: Path, image: str) -> list[str]:
+    """Translate host paths and loopback URLs for the official Nuclei container."""
+    docker_args = ["docker", "run", "--rm", "--add-host", "host.docker.internal:host-gateway"]
+
+    mounts: dict[tuple[str, bool], str] = {}
+
+    def mount_directory(directory: Path, *, read_only: bool) -> str:
+        resolved = directory.resolve()
+        key = (str(resolved), read_only)
+        if key in mounts:
+            return mounts[key]
+        container_dir = f"/secops/mount{len(mounts)}"
+        suffix = ":ro" if read_only else ""
+        docker_args.extend(["-v", f"{resolved}:{container_dir}{suffix}"])
+        mounts[key] = container_dir
+        return container_dir
+
+    translated: list[str] = []
+    index = 1
+    input_index = 0
+    while index < len(command):
+        token = command[index]
+        if token == "-u" and index + 1 < len(command):
+            translated.extend([token, _docker_target_url(command[index + 1])])
+            index += 2
+            continue
+        if token == "-l" and index + 1 < len(command):
+            source = Path(command[index + 1]).expanduser().resolve()
+            input_index += 1
+            rewritten = temp_root / f"input_{input_index}{source.suffix or '.txt'}"
+            try:
+                content = source.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                content = ""
+            rewritten.write_text(_docker_target_text(content), encoding="utf-8")
+            container_dir = mount_directory(temp_root, read_only=True)
+            translated.extend([token, f"{container_dir}/{rewritten.name}"])
+            index += 2
+            continue
+        if token == "-o" and index + 1 < len(command):
+            output = Path(command[index + 1]).expanduser().resolve()
+            output.parent.mkdir(parents=True, exist_ok=True)
+            container_dir = mount_directory(output.parent, read_only=False)
+            translated.extend([token, f"{container_dir}/{output.name}"])
+            index += 2
+            continue
+        if token == "-t" and index + 1 < len(command):
+            template = Path(command[index + 1]).expanduser().resolve()
+            if template.exists():
+                if template.is_dir():
+                    container_path = mount_directory(template, read_only=True)
+                else:
+                    container_dir = mount_directory(template.parent, read_only=True)
+                    container_path = f"{container_dir}/{template.name}"
+                translated.extend([token, container_path])
+            else:
+                translated.extend([token, command[index + 1]])
+            index += 2
+            continue
+        translated.append(token)
+        index += 1
+
+    return [*docker_args, image, *translated]
+
+
+def _run_nuclei_process(
+    tool: str,
+    command: list[str],
+    *,
+    target: str,
+    timeout: int,
+) -> dict[str, Any]:
+    mode, image = _runtime_nuclei_execution()
+    if mode != "docker_official_image":
+        return run_process(tool, command, target=target, timeout=timeout)
+
+    image = image or "projectdiscovery/nuclei:latest"
+    with tempfile.TemporaryDirectory(prefix="nuclei-docker-") as temporary:
+        docker_command = _dockerized_nuclei_command(command, Path(temporary), image)
+        result = run_process(tool, docker_command, target=target, timeout=timeout)
+    result["execution_mode"] = "docker_official_image"
+    result["docker_image"] = image
+    return result
+
+
 def _finding(item: dict[str, Any], target_url: str) -> dict[str, Any]:
     info = item.get("info") if isinstance(item.get("info"), dict) else {}
     classification = info.get("classification") if isinstance(info.get("classification"), dict) else {}
@@ -74,7 +220,8 @@ def _finding(item: dict[str, Any], target_url: str) -> dict[str, Any]:
     extracted = [str(value) for value in _as_list(item.get("extracted-results") or item.get("extracted_results")) if str(value)]
     matcher = str(item.get("matcher-name") or item.get("matcher_name") or "")
     template_id = str(item.get("template-id") or "")
-    matched_at = str(item.get("matched-at") or item.get("host") or target_url)
+    runtime_matched_at = str(item.get("matched-at") or item.get("host") or target_url)
+    matched_at = _canonical_runtime_url(runtime_matched_at, target_url, template_id)
     request = str(item.get("request") or "")[:5000]
     response = str(item.get("response") or "")[:7000]
     severity = str(info.get("severity") or "info").lower()
@@ -106,6 +253,7 @@ def _finding(item: dict[str, Any], target_url: str) -> dict[str, Any]:
         "impact": str(info.get("impact") or "").strip(),
         "solution": str(info.get("remediation") or "").strip(),
         "url": matched_at,
+        "scanner_runtime_url": runtime_matched_at if runtime_matched_at != matched_at else "",
         "method": str(item.get("method") or ""),
         "template_id": template_id,
         "template_url": str(item.get("template-url") or ""),
@@ -121,7 +269,12 @@ def _finding(item: dict[str, Any], target_url: str) -> dict[str, Any]:
         "extracted_results": extracted,
         "technical_details": (
             f"Nuclei matched template {template_id or 'unknown'} at {matched_at}. "
-            f"Protocol={item.get('type') or 'http'}; matcher={matcher or 'unspecified'}; "
+            + (
+                f"Scanner runtime URL={runtime_matched_at}. "
+                if runtime_matched_at != matched_at
+                else ""
+            )
+            + f"Protocol={item.get('type') or 'http'}; matcher={matcher or 'unspecified'}; "
             f"severity={severity}."
         ),
         "evidence": evidence,
@@ -349,7 +502,7 @@ def _runtime_template_directories() -> list[Path]:
         if isinstance(item, dict) and str(item.get("directory") or "").strip():
             values.append(str(item["directory"]))
     executable = str((payload.get("executables") or {}).get("nuclei") or "").strip()
-    if executable:
+    if executable and not executable.startswith("docker:"):
         parent = Path(executable).expanduser().parent
         values.extend((str(parent / "nuclei-templates"), str(parent.parent / "nuclei-templates")))
     return [Path(value).expanduser().resolve() for value in values]
@@ -463,7 +616,7 @@ def _template_inventory() -> dict[str, Any]:
     }
     cli_count = 0
     if filesystem_count < MIN_EXPECTED_TEMPLATE_COUNT:
-        result = run_process(
+        result = _run_nuclei_process(
             "Nuclei template inventory",
             ["nuclei", "-tl", "-silent", "-nc", "-disable-update-check"],
             target="templates",
@@ -669,8 +822,17 @@ def _select_phase_templates(
     return selected
 
 def _attempt_template_refresh() -> dict[str, Any]:
-    """Ask the installed Nuclei engine to restore its official template pack."""
-    result = run_process(
+    """Refresh native templates; Docker mode uses the host pack prepared by initScript.py."""
+    mode, image = _runtime_nuclei_execution()
+    if mode == "docker_official_image":
+        return success(
+            "Nuclei template refresh",
+            "templates",
+            "Docker execution uses the host-side official template pack prepared by initScript.py.",
+            execution_mode=mode,
+            docker_image=image,
+        )
+    result = _run_nuclei_process(
         "Nuclei template refresh",
         ["nuclei", "-update-templates"],
         target="templates",
@@ -678,7 +840,7 @@ def _attempt_template_refresh() -> dict[str, Any]:
     )
     combined = "\n".join((str(result.get("stdout", "")), str(result.get("stderr", ""))))
     if result.get("status") == "error" and "unknown flag" in combined.lower():
-        result = run_process(
+        result = _run_nuclei_process(
             "Nuclei template refresh",
             ["nuclei", "-ut"],
             target="templates",
@@ -723,7 +885,7 @@ def _run_phase(
         output_path: Path | None = None,
         budget: int | None = None,
     ) -> dict[str, Any]:
-        return run_process(
+        return _run_nuclei_process(
             "Nuclei",
             _command(
                 target_url,
@@ -1366,35 +1528,6 @@ def _write_proxify_jsonl(
     return len(records)
 
 
-def _dast_target_urls(
-    target_url: str,
-    request_cases: list[dict[str, Any]] | None,
-    limit: int = 20,
-) -> list[str]:
-    """Select ranked safe same-origin parameterized GET URLs for DAST."""
-    candidates: list[tuple[int, str]] = []
-    seen: set[str] = set()
-    for case in request_cases or []:
-        if not isinstance(case, dict) or str(case.get("method") or "GET").upper() != "GET":
-            continue
-        candidate = str(case.get("url") or case.get("target_url") or "").strip()
-        if not candidate.startswith(("http://", "https://")) or not _same_origin_url(target_url, candidate):
-            continue
-        parsed = urlparse(candidate)
-        if not parse_qsl(parsed.query, keep_blank_values=True):
-            continue
-        path_lower = parsed.path.lower()
-        if any(word in path_lower for word in _STATE_CHANGING_PATH_WORDS):
-            continue
-        names = {name.lower() for name, _ in parse_qsl(parsed.query, keep_blank_values=True)}
-        if names & _STATE_CHANGING_KEYS or candidate in seen:
-            continue
-        seen.add(candidate)
-        candidates.append((_dast_case_score(case), candidate))
-    candidates.sort(key=lambda item: (-item[0], item[1]))
-    return [value for _, value in candidates[: max(1, min(int(limit), 24))]]
-
-
 def _run_nuclei_core(
     target_url: str,
     cookies: str = "",
@@ -1778,26 +1911,5 @@ def run_nuclei_scan(
 
 
 
-def _once() -> int:
-    try:
-        arguments = json.loads(os.sys.stdin.read() or "{}")
-        if not isinstance(arguments, dict):
-            raise ValueError("Expected a JSON object on stdin.")
-        result = _run_nuclei_core(**arguments)
-    except Exception as exc:
-        result = failure(
-            "Nuclei",
-            "",
-            f"One-shot Nuclei execution failed: {type(exc).__name__}: {exc}",
-        )
-    print(json.dumps(result, ensure_ascii=False, default=str))
-    return 0
-
-
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(add_help=False)
-    parser.add_argument("--once", action="store_true")
-    args, _ = parser.parse_known_args()
-    if args.once:
-        raise SystemExit(_once())
-    mcp.run(transport="stdio")
+    run_mcp_http(mcp, "nuclei")

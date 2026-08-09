@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import atexit
 import ast
 import asyncio
 import functools
@@ -10,6 +11,7 @@ import json
 import os
 import re
 import shutil
+import socket
 import subprocess
 import sys
 import sysconfig
@@ -21,7 +23,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from html.parser import HTMLParser
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any, Iterator, TypedDict
 from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 
 warnings.filterwarnings("ignore", message=r".*authlib\.jose.*deprecated.*")
@@ -30,12 +32,13 @@ import requests
 with warnings.catch_warnings():
     warnings.simplefilter("ignore")
     from fastmcp import Client
-    from fastmcp.client.transports import StdioTransport
+
+from langgraph.graph import END, START, StateGraph
 
 from utils import (
     apply_runtime_target_preparation, absolute_url, canonical_cookie_header,
-    cookie_names, normalize_url, ROOT_DIR, same_origin, scanner_session_probe,
-    SERVERS_DIR, target_runtime_profile,
+    cookie_names, load_runtime_config, normalize_url, ROOT_DIR, same_origin, scanner_session_probe,
+    SERVERS_DIR, target_runtime_profile, mcp_http_port, mcp_http_url,
 )
 
 ROOT = Path(ROOT_DIR).resolve()
@@ -51,21 +54,21 @@ MAX_SCRIPT_ASSETS = max(4, int(os.getenv("SECOPS_MAX_SCRIPT_ASSETS", "24")))
 SCANNER_PROGRESS_INTERVAL = max(10, int(os.getenv("SECOPS_PROGRESS_INTERVAL", "30")))
 SCAN_MODES = {
     "fast": {
-        "broad": {"zap": 90, "nuclei": 90, "nikto": 45, "ffuf": 40, "exposure": 25, "session": 20},
+        "broad": {"zap": 90, "nuclei": 90, "nikto": 45, "ffuf": 40, "session": 20},
         "parameter": {"sqlmap": 60, "dalfox": 35, "commix": 40, "traversal": 25, "idor": 12, "authorization": 25, "browser": 35, "workflow": 30},
         "limits": {"sqlmap": 1, "dalfox": 1, "commix": 1, "traversal": 1, "idor": 1, "authorization": 1, "browser": 1, "workflow": 1},
         "arjun": 30,
         "arjun_limit": 1,
     },
     "balanced": {
-        "broad": {"zap": 360, "nuclei": 210, "nikto": 90, "ffuf": 75, "exposure": 45, "session": 35},
+        "broad": {"zap": 360, "nuclei": 210, "nikto": 90, "ffuf": 75, "session": 35},
         "parameter": {"sqlmap": 120, "dalfox": 90, "commix": 75, "traversal": 45, "idor": 20, "authorization": 40, "browser": 75, "workflow": 60},
         "limits": {"sqlmap": 3, "dalfox": 3, "commix": 1, "traversal": 2, "idor": 2, "authorization": 3, "browser": 2, "workflow": 3},
         "arjun": 75,
         "arjun_limit": 2,
     },
     "deep": {
-        "broad": {"zap": 900, "nuclei": 360, "nikto": 180, "ffuf": 120, "exposure": 75, "session": 50},
+        "broad": {"zap": 900, "nuclei": 360, "nikto": 180, "ffuf": 120, "session": 50},
         "parameter": {"sqlmap": 240, "dalfox": 180, "commix": 90, "traversal": 90, "idor": 45, "authorization": 60, "browser": 120, "workflow": 90},
         "limits": {"sqlmap": 5, "dalfox": 4, "commix": 2, "traversal": 3, "idor": 3, "authorization": 5, "browser": 4, "workflow": 5},
         "arjun": 90,
@@ -97,7 +100,6 @@ TIME_LIMIT_DIAGNOSES = {
     "timeout", "time_limit_reached", "timeout_with_partial_results",
     "timeout_with_confirmed_finding", "bounded_partial_scan",
 }
-ONE_SHOT_FALLBACK_TOOLS = {"zap", "nuclei", "nikto", "ffuf", "exposure", "session", "authorization", "browser", "workflow", "arjun", "sqlmap", "dalfox", "commix", "traversal", "idor", "jwt", "interactsh", "report"}
 AUTO_INDEX_PARAMETERS = {"c", "n", "m", "s", "d", "o"}
 OAST_PARAMETER_SCORES = {
     "url": 120, "uri": 115, "host": 115, "hostname": 115, "domain": 110,
@@ -132,12 +134,9 @@ class ToolSpec:
 
 
 BASE_TOOLS = (
-    # FFUF runs first so its high-value paths can be re-crawled and supplied to
-    # every subsequent scanner. Exposure classification is deliberately early
-    # because it is read-only, fast, and turns discovered backup/source files
-    # into actual findings instead of passive header observations.
+    # FFUF runs first so newly discovered paths can be re-crawled and supplied
+    # to the scanners that follow.
     ToolSpec("ffuf", "ffufServer.py", "run_ffuf_fuzz", "ffuf"),
-    ToolSpec("exposure", "exposureServer.py", "run_exposure_scan"),
     ToolSpec("zap", "zapServer.py", "run_zap_scan", module="zapv2"),
     ToolSpec("nuclei", "nucleiServer.py", "run_nuclei_scan", "nuclei"),
     ToolSpec("session", "sessionServer.py", "run_session_scan"),
@@ -149,7 +148,7 @@ PARAMETER_TOOLS = (
     ToolSpec("dalfox", "dalfoxServer.py", "run_dalfox_scan", "dalfox"),
     ToolSpec("commix", "commixServer.py", "run_commix_scan", "commix"),
     ToolSpec("traversal", "traversalServer.py", "run_traversal_scan"),
-    ToolSpec("idor", "idorForgeServer.py", "run_idor_check"),
+    ToolSpec("idor", "idorForgeServer.py", "run_idor_check", "idor-forge"),
 )
 AUTHORIZATION_TOOL = ToolSpec(
     "authorization", "authorizationServer.py", "run_authorization_scan"
@@ -161,12 +160,12 @@ WORKFLOW_TOOLS = (
 OPTIONAL_TOOLS = (
     ToolSpec("jwt", "jwtServer.py", "run_jwt_scan", module="jwt"),
     ToolSpec("interactsh", "interactshServer.py", "run_interactsh_client", "interactsh-client", required=False),
-    ToolSpec("report", "pwndocServer.py", "generate_report", module="reportlab"),
+    ToolSpec("report", "reportServer.py", "generate_report", module="weasyprint"),
 )
 ALL_TOOLS = (*BASE_TOOLS, ARJUN_TOOL, *PARAMETER_TOOLS, AUTHORIZATION_TOOL, *WORKFLOW_TOOLS, *OPTIONAL_TOOLS)
 
 TOOL_SCOPES = {
-    "ffuf": "base", "exposure": "base", "zap": "base", "nuclei": "base",
+    "ffuf": "base", "zap": "base", "nuclei": "base",
     "session": "base", "nikto": "base", "arjun": "url",
     "sqlmap": "parameterized", "dalfox": "parameterized",
     "commix": "parameterized", "traversal": "parameterized",
@@ -175,7 +174,6 @@ TOOL_SCOPES = {
 }
 TOOL_DESCRIPTIONS = {
     "ffuf": "Hidden resource and endpoint discovery with credential-isolated path fuzzing.",
-    "exposure": "Content verification for exposed backups, source files, configuration artifacts and directory indexes.",
     "zap": "Session-aware crawling, passive analysis and prioritized active testing.",
     "nuclei": "Template-based exposure, misconfiguration, known-vulnerability and bounded DAST checks on discovered parameterized URLs.",
     "session": "Cookie flags, bounded session uniqueness and fixation indicators.",
@@ -226,7 +224,7 @@ def broad_tool_order(authenticated: bool) -> tuple[str, ...]:
     orchestrators re-crawl newly discovered resources and seed ZAP with the
     richer request surface instead of scanning only the initial crawl.
     """
-    return ("ffuf", "exposure", "zap", "nuclei", "session", "nikto")
+    return ("ffuf", "zap", "nuclei", "session", "nikto")
 
 
 def tool_execution_rank(tool: str, authenticated: bool) -> int:
@@ -246,13 +244,6 @@ def tool_execution_rank(tool: str, authenticated: bool) -> int:
 # Runtime, server and MCP handling
 # ---------------------------------------------------------------------------
 
-def _load_runtime() -> dict[str, Any]:
-    try:
-        value = json.loads(RUNTIME_FILE.read_text(encoding="utf-8"))
-        return value if isinstance(value, dict) else {}
-    except (OSError, json.JSONDecodeError):
-        return {}
-
 
 def _prepend_path(path: Path) -> None:
     if not path.is_dir():
@@ -266,7 +257,7 @@ def _prepend_path(path: Path) -> None:
 
 def configure_runtime_path() -> list[str]:
     """Recreate the PATH written by initScript.py in every new process."""
-    runtime = _load_runtime()
+    runtime = load_runtime_config()
     candidates: list[Path] = [LOCAL_BIN]
     candidates += [Path(value) for value in runtime.get("tool_directories", []) if isinstance(value, str)]
     executables = runtime.get("executables", {})
@@ -305,7 +296,7 @@ def resolve_executable(name: str) -> str | None:
     found = shutil.which(name)
     if found:
         return str(Path(found).resolve())
-    value = _load_runtime().get("executables", {}).get(name)
+    value = load_runtime_config().get("executables", {}).get(name)
     return str(Path(value).resolve()) if isinstance(value, str) and Path(value).is_file() else None
 
 
@@ -359,7 +350,7 @@ def _server_python() -> str:
     its dependencies are verified.
     """
     current = sys.executable
-    configured = _load_runtime().get("python_executable")
+    configured = load_runtime_config().get("python_executable")
     if not (isinstance(configured, str) and Path(configured).is_file()):
         return current
     if os.path.normcase(configured) == os.path.normcase(current):
@@ -394,53 +385,113 @@ def _server_env() -> dict[str, str]:
     return env
 
 
-def _report_docker_transport() -> StdioTransport | None:
-    """Route the 'report' MCP server through its sandboxed WeasyPrint image.
-
-    Mirrors the Nikto Docker fallback: fully transparent, no user action
-    needed. Falls back to native stdio (handled by the caller) whenever the
-    image was never built, was removed, or Docker itself is unavailable.
-    """
-    image = _load_runtime().get("pwndoc_docker_image")
-    if not image or not shutil.which("docker"):
-        return None
-    probe = subprocess.run(
-        ["docker", "image", "inspect", image],
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-        timeout=30,
-        check=False,
-    )
-    if probe.returncode != 0:
-        return None
-    return StdioTransport(
-        command="docker",
-        args=[
-            "run", "-i", "--rm",
-            "-v", f"{ROOT}:/workspace",
-            "-w", "/workspace",
-            "-e", "PYTHONPATH=/workspace",
-            image,
-            "python", "servers/pwndocServer.py",
-        ],
-        keep_alive=False,
-    )
+_HTTP_SERVER_PROCESSES: dict[str, subprocess.Popen] = {}
+_HTTP_SERVER_LOGS: dict[str, Path] = {}
 
 
-def _transport(server: Path, tool_name: str = "") -> StdioTransport:
-    if tool_name == "report":
-        docker_transport = _report_docker_transport()
-        if docker_transport is not None:
-            return docker_transport
-    return StdioTransport(
-        command=_server_python(),
-        args=[str(server)],
-        env=_server_env(),
-        cwd=str(ROOT),
-        keep_alive=False,
+def _port_open(host: str, port: int, timeout: float = 0.25) -> bool:
+    try:
+        with socket.create_connection((host, int(port)), timeout=timeout):
+            return True
+    except OSError:
+        return False
+
+
+def _http_server_log(spec: ToolSpec) -> Path:
+    directory = ROOT / ".secops_tmp" / "mcp-http"
+    directory.mkdir(parents=True, exist_ok=True)
+    return directory / f"{spec.name}.log"
+
+
+def _stop_owned_http_server(tool_name: str) -> None:
+    process = _HTTP_SERVER_PROCESSES.pop(tool_name, None)
+    if process is not None and process.poll() is None:
+        try:
+            process.terminate()
+            process.wait(timeout=5)
+        except Exception:
+            try:
+                process.kill()
+            except Exception:
+                pass
+
+
+def shutdown_mcp_http_servers() -> None:
+    for tool_name in list(_HTTP_SERVER_PROCESSES):
+        _stop_owned_http_server(tool_name)
+
+
+atexit.register(shutdown_mcp_http_servers)
+
+
+def _server_startup_log(spec: ToolSpec) -> str:
+    path = _HTTP_SERVER_LOGS.get(spec.name)
+    if not path or not path.is_file():
+        return ""
+    try:
+        return path.read_text(encoding="utf-8", errors="replace")[-6000:].strip()
+    except OSError:
+        return ""
+
+
+def _ensure_http_server(spec: ToolSpec, server: Path, *, restart: bool = False) -> str:
+    """Start or reuse the loopback Streamable HTTP service for one MCP tool."""
+    port = mcp_http_port(spec.name)
+    url = mcp_http_url(spec.name)
+    if restart:
+        _stop_owned_http_server(spec.name)
+    if _port_open("127.0.0.1", port):
+        return url
+
+    existing = _HTTP_SERVER_PROCESSES.get(spec.name)
+    if existing is not None and existing.poll() is None:
+        # Process exists but the socket is not ready yet; continue to the wait loop.
+        process = existing
+    else:
+        log_path = _http_server_log(spec)
+        _HTTP_SERVER_LOGS[spec.name] = log_path
+        log_handle = open(log_path, "a", encoding="utf-8", buffering=1)
+        env = _server_env()
+        env.update({
+            "SECOPS_MCP_HOST": "127.0.0.1",
+            "SECOPS_MCP_PORT": str(port),
+        })
+        process = subprocess.Popen(
+            [_server_python(), str(server)],
+            cwd=str(ROOT),
+            env=env,
+            stdout=log_handle,
+            stderr=subprocess.STDOUT,
+            text=True,
+        )
+        log_handle.close()
+        _HTTP_SERVER_PROCESSES[spec.name] = process
+
+    deadline = time.monotonic() + max(3.0, MCP_CONNECT_TIMEOUT)
+    while time.monotonic() < deadline:
+        if _port_open("127.0.0.1", port):
+            return url
+        if process.poll() is not None:
+            detail = _server_startup_log(spec)
+            raise RuntimeError(
+                f"{spec.name} HTTP MCP server exited during startup"
+                + (f": {detail}" if detail else ".")
+            )
+        time.sleep(0.15)
+    detail = _server_startup_log(spec)
+    raise TimeoutError(
+        f"Timed out waiting for {spec.name} MCP HTTP service at {url}"
+        + (f". Server log: {detail}" if detail else "")
     )
+
+
+def _http_transport_failure(exc: BaseException) -> bool:
+    text = f"{type(exc).__name__}: {exc}".lower()
+    return any(token in text for token in (
+        "connection refused", "connecterror", "connectionerror",
+        "server disconnected", "connection closed", "closedresourceerror",
+        "brokenresourceerror", "all connection attempts failed",
+    ))
 
 
 def _extract_response(response: Any) -> tuple[Any, bool, str]:
@@ -550,121 +601,25 @@ def _normalize_result(data: Any, spec: ToolSpec, target: str, elapsed: float, is
     return _normalize_time_limit(result, spec.name, target)
 
 
-def _startup_stderr(server: Path) -> str:
-    """Capture immediate import/startup failures without pretending to speak MCP."""
-    try:
-        process = subprocess.Popen(
-            [_server_python(), str(server)],
-            cwd=str(ROOT), env=_server_env(), stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-            text=True, encoding="utf-8", errors="replace",
-        )
-        time.sleep(0.5)
-        if process.poll() is None:
-            process.terminate()
-        _, stderr = process.communicate(timeout=3)
-        return stderr[-6000:].strip()
-    except Exception as exc:
-        return f"Startup probe failed: {type(exc).__name__}: {exc}"
-
-
-def _transport_failure(exc: BaseException) -> bool:
-    text = f"{type(exc).__name__}: {exc}".lower()
-    return any(token in text for token in (
-        "brokenresourceerror", "closedresourceerror", "connection closed",
-        "end of file", "client failed to connect", "mcp server crashed",
-    ))
-
-
-def _call_server_once(
-    server: Path,
+async def call_mcp(
+    server_file: str,
     tool_name: str,
     arguments: dict[str, Any],
-    timeout_seconds: float,
-    tool: str,
+    timeout_seconds: float = MCP_TOOL_TIMEOUT,
 ) -> dict[str, Any]:
-    """Run a scanner server in an isolated one-shot process after an MCP pipe crash."""
-    process_limit = max(45, int(timeout_seconds) + 30)
-    try:
-        completed = subprocess.run(
-            [_server_python(), str(server), "--once"],
-            cwd=str(ROOT),
-            env=_server_env(),
-            input=json.dumps(arguments, ensure_ascii=False),
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            timeout=process_limit,
-            shell=False,
-        )
-    except subprocess.TimeoutExpired as exc:
-        return {
-            "tool": tool,
-            "status": "partial",
-            "target": str(arguments.get("target_url", "")),
-            "output": (
-                f"{tool} isolated fallback reached its configured process budget. "
-                "No execution failure is implied; coverage is incomplete."
-            ),
-            "vulnerabilities": [],
-            "diagnosis": "time_limit_reached",
-            "timed_out": True,
-            "time_limit_reached": True,
-            "stdout": exc.stdout.decode("utf-8", "replace") if isinstance(exc.stdout, bytes) else (exc.stdout or ""),
-            "stderr": exc.stderr.decode("utf-8", "replace") if isinstance(exc.stderr, bytes) else (exc.stderr or ""),
-        }
-    except OSError as exc:
-        return {
-            "tool": tool,
-            "status": "error",
-            "target": str(arguments.get("target_url", "")),
-            "output": f"Cannot start {tool} isolated fallback: {exc}",
-            "vulnerabilities": [],
-            "diagnosis": "process_start_failed",
-        }
-
-    stdout = (completed.stdout or "").strip()
-    stderr = (completed.stderr or "").strip()
-    try:
-        value = json.loads(stdout)
-    except json.JSONDecodeError:
-        value = {
-            "tool": tool,
-            "status": "error",
-            "target": str(arguments.get("target_url", "")),
-            "output": (
-                f"{tool} isolated fallback returned invalid JSON. "
-                f"Exit code={completed.returncode}; stderr={stderr[-2000:]}"
-            ),
-            "vulnerabilities": [],
-            "diagnosis": "invalid_json_response",
-            "stdout": stdout[-4000:],
-            "stderr": stderr[-4000:],
-        }
-    if not isinstance(value, dict):
-        value = {
-            "tool": tool,
-            "status": "error",
-            "target": str(arguments.get("target_url", "")),
-            "output": f"{tool} isolated fallback returned a non-object JSON value.",
-            "vulnerabilities": [],
-            "diagnosis": "invalid_json_response",
-        }
-    value.setdefault("_meta", {})["transport_fallback"] = "one_shot_subprocess"
-    value.setdefault("_meta", {})["fallback_exit_code"] = completed.returncode
-    if stderr:
-        value.setdefault("_meta", {})["fallback_stderr"] = stderr[-2000:]
-    return value
-
-
-async def call_mcp(server_file: str, tool_name: str, arguments: dict[str, Any], timeout_seconds: float = MCP_TOOL_TIMEOUT) -> dict[str, Any]:
-    spec = next((item for item in ALL_TOOLS if item.server == server_file and item.tool == tool_name), ToolSpec(tool_name, server_file, tool_name))
+    spec = next(
+        (item for item in ALL_TOOLS if item.server == server_file and item.tool == tool_name),
+        ToolSpec(tool_name, server_file, tool_name),
+    )
     server = resolve_server_path(server_file, tool_name)
     target = str(arguments.get("target_url", ""))
     started = time.monotonic()
     if not server.is_file():
-        return {"tool": spec.name, "status": "error", "target": target, "output": f"MCP server not found: {server}", "vulnerabilities": [], "diagnosis": "missing_mcp_server_file"}
+        return {
+            "tool": spec.name, "status": "error", "target": target,
+            "output": f"MCP server not found: {server}", "vulnerabilities": [],
+            "diagnosis": "missing_mcp_server_file",
+        }
 
     effective_arguments = dict(arguments)
     temporary_output: Path | None = None
@@ -674,13 +629,30 @@ async def call_mcp(server_file: str, tool_name: str, arguments: dict[str, Any], 
         temporary_output = temporary_dir / f"nuclei-{uuid.uuid4().hex}.jsonl"
         effective_arguments["output_file"] = str(temporary_output)
 
-    async def invoke() -> tuple[Any, bool, str]:
-        async with Client(_transport(server, spec.name)) as client:
+    async def invoke(url: str) -> tuple[Any, bool, str]:
+        async with Client(url) as client:
             return _extract_response(await client.call_tool(tool_name, effective_arguments))
 
     try:
-        data, is_error, shape = await asyncio.wait_for(invoke(), timeout=timeout_seconds + MCP_CONNECT_TIMEOUT)
-        result = _normalize_result(data, spec, target, time.monotonic() - started, is_error, shape)
+        url = await asyncio.to_thread(_ensure_http_server, spec, server)
+        try:
+            data, is_error, shape = await asyncio.wait_for(
+                invoke(url), timeout=timeout_seconds + MCP_CONNECT_TIMEOUT
+            )
+        except Exception as first_exc:
+            if not _http_transport_failure(first_exc):
+                raise
+            # HTTP servers are persistent. If one dies, restart only the service
+            # owned by this orchestrator and retry the MCP request once.
+            url = await asyncio.to_thread(_ensure_http_server, spec, server, restart=True)
+            data, is_error, shape = await asyncio.wait_for(
+                invoke(url), timeout=timeout_seconds + MCP_CONNECT_TIMEOUT
+            )
+        result = _normalize_result(
+            data, spec, target, time.monotonic() - started, is_error, shape
+        )
+        result.setdefault("_meta", {})["mcp_transport"] = "streamable_http"
+        result.setdefault("_meta", {})["mcp_url"] = url
     except (KeyboardInterrupt, asyncio.CancelledError):
         raise
     except Exception as exc:
@@ -692,7 +664,7 @@ async def call_mcp(server_file: str, tool_name: str, arguments: dict[str, Any], 
                 "status": "partial",
                 "target": target,
                 "output": (
-                    f"{spec.name} reached the orchestrator/MCP time budget. "
+                    f"{spec.name} reached the orchestrator/MCP HTTP time budget. "
                     "Coverage is incomplete; this is not classified as a scanner error."
                 ),
                 "vulnerabilities": [],
@@ -700,34 +672,32 @@ async def call_mcp(server_file: str, tool_name: str, arguments: dict[str, Any], 
                 "timed_out": True,
                 "time_limit_reached": True,
                 "traceback": traceback.format_exc(),
-                "_meta": {"server": str(server), "duration_seconds": round(time.monotonic() - started, 3)},
+                "_meta": {
+                    "server": str(server),
+                    "duration_seconds": round(time.monotonic() - started, 3),
+                    "mcp_transport": "streamable_http",
+                    "mcp_url": mcp_http_url(spec.name),
+                },
             }
-        elif spec.name in ONE_SHOT_FALLBACK_TOOLS and _transport_failure(exc):
-            print(
-                f"    [WARNING] {spec.name} MCP channel closed; retrying in an isolated one-shot process.",
-                file=sys.stderr,
-            )
-            internal_limit = float(effective_arguments.get("timeout", timeout_seconds))
-            result = await asyncio.to_thread(
-                _call_server_once,
-                server,
-                spec.tool,
-                effective_arguments,
-                min(internal_limit, timeout_seconds),
-                spec.name,
-            )
-            result.setdefault("_meta", {})["mcp_failure"] = exception_text
         else:
-            stderr = _startup_stderr(server)
-            message = f"MCP communication failed: {exception_text}"
-            if stderr:
-                message += f" | server stderr: {stderr}"
+            detail = _server_startup_log(spec)
+            message = f"MCP HTTP communication failed: {exception_text}"
+            if detail:
+                message += f" | server log: {detail}"
             result = {
-                "tool": spec.name, "status": "error", "target": target,
-                "output": message, "vulnerabilities": [],
+                "tool": spec.name,
+                "status": "error",
+                "target": target,
+                "output": message,
+                "vulnerabilities": [],
                 "diagnosis": diagnose_error(message),
                 "traceback": traceback.format_exc(),
-                "_meta": {"server": str(server), "duration_seconds": round(time.monotonic() - started, 3)},
+                "_meta": {
+                    "server": str(server),
+                    "duration_seconds": round(time.monotonic() - started, 3),
+                    "mcp_transport": "streamable_http",
+                    "mcp_url": mcp_http_url(spec.name),
+                },
             }
     finally:
         if temporary_output:
@@ -735,7 +705,10 @@ async def call_mcp(server_file: str, tool_name: str, arguments: dict[str, Any], 
 
     result = _normalize_time_limit(result, spec.name, target)
     if result.get("status") == "error":
-        print(f"\n[SCANNER ERROR] {spec.name}: {target}\n  {result.get('output', '')}", file=sys.stderr)
+        print(
+            f"\n[SCANNER ERROR] {spec.name}: {target}\n  {result.get('output', '')}",
+            file=sys.stderr,
+        )
     return result
 
 
@@ -766,22 +739,29 @@ async def call_mcp_with_progress(
 async def _live_server_check(spec: ToolSpec) -> dict[str, str]:
     server = resolve_server_path(spec.server, spec.tool)
     try:
-        async def check() -> list[str]:
-            async with Client(_transport(server, spec.name)) as client:
-                tools = await client.list_tools()
-                return [str(getattr(tool, "name", "")) for tool in tools]
-        names = await asyncio.wait_for(check(), timeout=MCP_CONNECT_TIMEOUT)
+        url = await asyncio.to_thread(_ensure_http_server, spec, server)
+        async with Client(url) as client:
+            tools = await asyncio.wait_for(client.list_tools(), timeout=MCP_CONNECT_TIMEOUT)
+        names = [str(getattr(tool, "name", "")) for tool in tools]
         if spec.tool not in names:
-            return {"level": "error", "component": spec.name, "cause": "mcp_runtime_tool_missing", "detail": f"{server.name} exposed {names!r}"}
-        return {"level": "ok", "component": spec.name, "cause": "mcp_stdio_handshake_ok", "detail": f"{server.name}: {spec.tool}()"}
+            return {
+                "level": "error", "component": spec.name,
+                "cause": "mcp_runtime_tool_missing",
+                "detail": f"{url} exposed {names!r}",
+            }
+        return {
+            "level": "ok", "component": spec.name,
+            "cause": "mcp_http_handshake_ok",
+            "detail": f"{url}: {spec.tool}()",
+        }
     except Exception as exc:
-        stderr = _startup_stderr(server)
-        detail = f"{type(exc).__name__}: {exc}" + (f" | server stderr: {stderr}" if stderr else "")
+        detail = _server_startup_log(spec)
+        message = f"{type(exc).__name__}: {exc}" + (f" | server log: {detail}" if detail else "")
         return {
             "level": "error" if spec.required else "warning",
             "component": spec.name,
-            "cause": "mcp_stdio_handshake_failed",
-            "detail": detail,
+            "cause": "mcp_http_handshake_failed",
+            "detail": message,
         }
 
 
@@ -859,7 +839,7 @@ def run_preflight_checks(*, include_live: bool = True) -> list[dict[str, str]]:
         if spec.tool not in _declared_functions(server):
             checks[-1] = {"level": "error" if spec.required else "warning", "component": spec.name, "cause": "mcp_tool_name_mismatch", "detail": f"{server.name} does not declare {spec.tool}()"}
         if spec.name == "report":
-            docker_image = _load_runtime().get("pwndoc_docker_image", "")
+            docker_image = load_runtime_config().get("report_docker_image", "")
             docker_ready = bool(docker_image) and shutil.which("docker") and subprocess.run(
                 ["docker", "image", "inspect", docker_image],
                 capture_output=True, timeout=30, check=False,
@@ -894,7 +874,7 @@ def run_preflight_checks(*, include_live: bool = True) -> list[dict[str, str]]:
                 "detail": executable or f"Not found: {spec.executable}; runtime={RUNTIME_FILE}",
             })
             if spec.name == "nikto" and executable:
-                runtime = _load_runtime()
+                runtime = load_runtime_config()
                 docker_configured = (
                     runtime.get("nikto_execution_mode") == "docker_official_image"
                     or runtime.get("nikto_image") == "ghcr.io/sullo/nikto:latest"
@@ -938,7 +918,7 @@ def run_preflight_checks(*, include_live: bool = True) -> list[dict[str, str]]:
     if include_live and not any(item["level"] == "error" for item in checks):
         checks.extend(asyncio.run(_run_live_checks()))
     if not any(item["level"] == "error" for item in checks):
-        checks.append({"level": "ok", "component": "mcp", "cause": "preflight_passed", "detail": "All contracts, executables and MCP STDIO handshakes passed."})
+        checks.append({"level": "ok", "component": "mcp", "cause": "preflight_passed", "detail": "All contracts, executables and MCP Streamable HTTP handshakes passed."})
     return checks
 
 
@@ -2967,13 +2947,30 @@ def state_changing_tests_allowed(target: str, explicit: bool = False) -> bool:
     return bool(explicit) or urlparse(target).hostname in {"127.0.0.1", "localhost", "::1"}
 
 
-async def run_pipeline(
-    target: str,
-    profiles: list[dict[str, str]],
-    injection_url: str,
-    allow_state_changes: bool = False,
-    secondary_cookies: str = "",
-) -> dict[str, Any]:
+class DeterministicState(TypedDict, total=False):
+    target: str
+    profiles: list[dict[str, str]]
+    injection_url: str
+    allow_state_changes: bool
+    secondary_cookies: str
+    discovery: dict[str, dict[str, Any]]
+    diagnostics: list[dict[str, Any]]
+    results: dict[str, dict[str, Any]]
+    workflow_state_changes: bool
+    has_authenticated_profile: bool
+    profile_session_state: dict[str, bool]
+    parameter_selection_summary: dict[str, dict[str, list[dict[str, Any]]]]
+    authorization_selection_summary: dict[str, list[dict[str, Any]]]
+    workflow_selection_summary: dict[str, dict[str, list[dict[str, Any]]]]
+    oast_selection_summary: dict[str, list[dict[str, Any]]]
+    assessment_context: dict[str, Any]
+    report_status: dict[str, Any]
+
+
+async def deterministic_discovery_node(state: DeterministicState) -> dict[str, Any]:
+    target = state["target"]
+    profiles = state["profiles"]
+    allow_state_changes = bool(state.get("allow_state_changes", False))
     print("\n[*] Discovery anonima e autenticata...")
     discovery: dict[str, dict[str, Any]] = {}
     diagnostics: list[dict[str, Any]] = []
@@ -2999,6 +2996,20 @@ async def run_pipeline(
         if found.get("authentication_effective") is False:
             print(f"    [WARNING] {name}: {found.get('authentication_note')}", file=sys.stderr)
 
+    return {
+        "discovery": discovery,
+        "diagnostics": diagnostics,
+        "results": results,
+        "workflow_state_changes": workflow_state_changes,
+    }
+
+
+async def deterministic_broad_scan_node(state: DeterministicState) -> dict[str, Any]:
+    target = state["target"]
+    profiles = state["profiles"]
+    discovery = state["discovery"]
+    diagnostics = state["diagnostics"]
+    results = state["results"]
     has_authenticated_profile = any(bool(profile.get("cookies")) for profile in profiles)
 
     # Broad scanners. Arjun is intentionally delayed until crawling and FFUF have produced useful endpoints.
@@ -3072,9 +3083,6 @@ async def run_pipeline(
             }
             if spec.name == "ffuf":
                 arguments["session_probe_url"] = session_probe_url
-            if spec.name == "exposure":
-                arguments["discovered_urls"] = discovery[name].get("urls", [])
-                arguments["max_urls"] = 80 if CURRENT_SCAN_MODE == "deep" else 45 if CURRENT_SCAN_MODE == "balanced" else 20
             if spec.name == "session":
                 arguments["probe_url"] = session_probe_url
                 arguments["sample_count"] = 7 if CURRENT_SCAN_MODE == "deep" else 5 if CURRENT_SCAN_MODE == "balanced" else 3
@@ -3201,6 +3209,23 @@ async def run_pipeline(
             "arjun", target, "No suitable HTML/form endpoint was available for hidden-parameter discovery."
         )
 
+    return {
+        "discovery": discovery,
+        "diagnostics": diagnostics,
+        "results": results,
+        "has_authenticated_profile": has_authenticated_profile,
+        "profile_session_state": profile_session_state,
+    }
+
+
+async def deterministic_parameter_scan_node(state: DeterministicState) -> dict[str, Any]:
+    target = state["target"]
+    profiles = state["profiles"]
+    discovery = state["discovery"]
+    results = state["results"]
+    workflow_state_changes = bool(state.get("workflow_state_changes", False))
+    has_authenticated_profile = bool(state.get("has_authenticated_profile", False))
+    profile_session_state = state.get("profile_session_state", {})
     # Parameter tools are selected independently by vulnerability class.
     parameter_selection_summary: dict[str, dict[str, list[dict[str, Any]]]] = {}
     semaphore = asyncio.Semaphore(1)
@@ -3218,24 +3243,16 @@ async def run_pipeline(
             return make_skipped_result(spec.name, url, skip_reason)
 
         scanner_timeout = PARAMETER_TOOL_TIMEOUTS.get(spec.name, 120)
-        if spec.name == "idor":
-            # IDOR's MCP contract accepts only the request URL, cookies and timeout.
-            arguments: dict[str, Any] = {
-                "target_url": url,
-                "cookies": cookies,
-                "timeout": scanner_timeout,
-            }
-        else:
-            arguments = {
-                "target_url": url,
-                "cookies": cookies,
-                "method": method,
-                "data": str(case.get("data", "")),
-                "parameters": list(case.get("parameters", [])),
-                "timeout": scanner_timeout,
-            }
-            if spec.name == "dalfox":
-                arguments["allow_state_changes"] = workflow_state_changes
+        arguments: dict[str, Any] = {
+            "target_url": url,
+            "cookies": cookies,
+            "method": method,
+            "data": str(case.get("data", "")),
+            "parameters": list(case.get("parameters", [])),
+            "timeout": scanner_timeout,
+        }
+        if spec.name == "dalfox":
+            arguments["allow_state_changes"] = workflow_state_changes
 
         async with semaphore:
             state_refresh = refresh_authenticated_session_state(target, cookies, probe_url) if cookies else {"performed": False, "usable": True}
@@ -3318,6 +3335,19 @@ async def run_pipeline(
                 )
             )
 
+    return {
+        "results": results,
+        "parameter_selection_summary": parameter_selection_summary,
+    }
+
+
+async def deterministic_authorization_node(state: DeterministicState) -> dict[str, Any]:
+    target = state["target"]
+    profiles = state["profiles"]
+    discovery = state["discovery"]
+    results = state["results"]
+    secondary_cookies = str(state.get("secondary_cookies", ""))
+    profile_session_state = state.get("profile_session_state", {})
     # Read-only authorization differentials. A primary authenticated identity is
     # compared against anonymous access and, when supplied, a second identity.
     # This complements the single-parameter IDOR heuristic and remains safe for
@@ -3392,6 +3422,20 @@ async def run_pipeline(
         if not runs:
             log_result(name, "authorization", results[name]["authorization"], target)
 
+    return {
+        "results": results,
+        "authorization_selection_summary": authorization_selection_summary,
+    }
+
+
+async def deterministic_browser_workflow_node(state: DeterministicState) -> dict[str, Any]:
+    target = state["target"]
+    profiles = state["profiles"]
+    discovery = state["discovery"]
+    results = state["results"]
+    workflow_state_changes = bool(state.get("workflow_state_changes", False))
+    has_authenticated_profile = bool(state.get("has_authenticated_profile", False))
+    profile_session_state = state.get("profile_session_state", {})
     # Browser and multi-step workflow checks operate on the same discovery
     # contracts in both orchestrators. They add coverage that response-only
     # scanners cannot provide: DOM/stored XSS, CSRF structure/token enforcement,
@@ -3536,6 +3580,18 @@ async def run_pipeline(
         if not workflow_runs:
             log_result(name, "workflow", results[name]["workflow"], target)
 
+    return {
+        "results": results,
+        "workflow_selection_summary": workflow_selection_summary,
+    }
+
+
+async def deterministic_special_checks_node(state: DeterministicState) -> dict[str, Any]:
+    target = state["target"]
+    profiles = state["profiles"]
+    discovery = state["discovery"]
+    results = state["results"]
+    injection_url = str(state.get("injection_url", ""))
     oast_selection_summary: dict[str, list[dict[str, Any]]] = {}
     for profile in profiles:
         name = profile["name"]
@@ -3616,6 +3672,23 @@ async def run_pipeline(
         if not interactsh_runs:
             log_result(name, "interactsh", interactsh_result, target)
 
+    return {
+        "results": results,
+        "oast_selection_summary": oast_selection_summary,
+    }
+
+
+async def deterministic_report_node(state: DeterministicState) -> dict[str, Any]:
+    target = state["target"]
+    profiles = state["profiles"]
+    discovery = state["discovery"]
+    diagnostics = state["diagnostics"]
+    results = state["results"]
+    secondary_cookies = str(state.get("secondary_cookies", ""))
+    parameter_selection_summary = state.get("parameter_selection_summary", {})
+    oast_selection_summary = state.get("oast_selection_summary", {})
+    workflow_selection_summary = state.get("workflow_selection_summary", {})
+    authorization_selection_summary = state.get("authorization_selection_summary", {})
     context = {
         "profiles": [{"name": profile["name"], "authenticated": bool(profile["cookies"])} for profile in profiles],
         "expected_tools": [spec.name for spec in (*BASE_TOOLS, ARJUN_TOOL, *PARAMETER_TOOLS, AUTHORIZATION_TOOL, *WORKFLOW_TOOLS, OPTIONAL_TOOLS[0], OPTIONAL_TOOLS[1])],
@@ -3636,8 +3709,16 @@ async def run_pipeline(
         "broad_scanner_timeouts": BROAD_SCANNER_TIMEOUTS,
         "scan_mode": CURRENT_SCAN_MODE,
     }
+    context["orchestration"] = {
+        "engine": "langgraph",
+        "mode": "deterministic",
+        "nodes": [
+            "discovery", "broad_scan", "parameter_scan", "authorization",
+            "browser_workflow", "special_checks", "report",
+        ],
+    }
     print("\n[*] Generazione report...")
-    report = await call_mcp("pwndocServer.py", "generate_report", {
+    report = await call_mcp("reportServer.py", "generate_report", {
         "findings_summary": results,
         "target_url": target,
         "assessment_context": context,
@@ -3646,7 +3727,50 @@ async def run_pipeline(
         fallback = write_emergency_json_report(target, results, diagnostics, str(report.get("output", "Report MCP failed.")))
         if fallback:
             report.update(json_filename=fallback, html_filename=str(Path(fallback).with_suffix(".html")), local_json_fallback=True)
-    return {"results": results, "discovery": discovery, "diagnostics": diagnostics, "report_status": report}
+    return {"assessment_context": context, "report_status": report}
+
+
+def build_deterministic_graph() -> Any:
+    graph = StateGraph(DeterministicState)
+    graph.add_node("discovery", deterministic_discovery_node)
+    graph.add_node("broad_scan", deterministic_broad_scan_node)
+    graph.add_node("parameter_scan", deterministic_parameter_scan_node)
+    graph.add_node("authorization", deterministic_authorization_node)
+    graph.add_node("browser_workflow", deterministic_browser_workflow_node)
+    graph.add_node("special_checks", deterministic_special_checks_node)
+    graph.add_node("report", deterministic_report_node)
+    graph.add_edge(START, "discovery")
+    graph.add_edge("discovery", "broad_scan")
+    graph.add_edge("broad_scan", "parameter_scan")
+    graph.add_edge("parameter_scan", "authorization")
+    graph.add_edge("authorization", "browser_workflow")
+    graph.add_edge("browser_workflow", "special_checks")
+    graph.add_edge("special_checks", "report")
+    graph.add_edge("report", END)
+    return graph.compile()
+
+
+async def run_pipeline(
+    target: str,
+    profiles: list[dict[str, str]],
+    injection_url: str,
+    allow_state_changes: bool = False,
+    secondary_cookies: str = "",
+) -> dict[str, Any]:
+    initial: DeterministicState = {
+        "target": target,
+        "profiles": profiles,
+        "injection_url": injection_url,
+        "allow_state_changes": allow_state_changes,
+        "secondary_cookies": secondary_cookies,
+    }
+    final = await build_deterministic_graph().ainvoke(initial)
+    return {
+        "results": final["results"],
+        "discovery": final["discovery"],
+        "diagnostics": final["diagnostics"],
+        "report_status": final["report_status"],
+    }
 
 
 def summarize_results(results: dict[str, Any]) -> tuple[int, int, int]:
@@ -3669,7 +3793,7 @@ def summarize_results(results: dict[str, Any]) -> tuple[int, int, int]:
 def print_security_finding_summary(results: dict[str, Any]) -> None:
     """Print the same semantically deduplicated findings used by the report."""
     try:
-        from servers.pwndocServer import flatten_findings
+        from servers.reportServer import flatten_findings
         rows = flatten_findings(results)
     except Exception:
         rows = []
@@ -3794,18 +3918,13 @@ async def run_single_tool_debug(
     selected_target = target
     arguments: dict[str, Any]
 
-    if tool in {"ffuf", "exposure", "zap", "nuclei", "session", "nikto"}:
+    if tool in {"ffuf", "zap", "nuclei", "session", "nikto"}:
         timeout = timeout_override or BROAD_SCANNER_TIMEOUTS[tool]
         arguments = {"target_url": target, "cookies": cookies, "timeout": timeout}
         if tool == "ffuf":
             arguments["session_probe_url"] = select_session_probe_url(
                 discovery, target
             )
-        elif tool == "exposure":
-            arguments.update({
-                "discovered_urls": discovery.get("urls", []),
-                "max_urls": 80 if mode == "deep" else 45 if mode == "balanced" else 20,
-            })
         elif tool == "session":
             arguments.update({
                 "probe_url": select_session_probe_url(discovery, target),
@@ -3885,26 +4004,16 @@ async def run_single_tool_debug(
                 "diagnosis": "authentication_precheck_failed",
                 "state_refresh": state_refresh,
             }
-        if tool == "idor":
-            arguments = {
-                "target_url": selected_target,
-                "cookies": cookies,
-                "method": effective_method,
-                "data": str(case.get("data") or data),
-                "parameters": list(case.get("parameters") or parameters),
-                "timeout": timeout_override or PARAMETER_TOOL_TIMEOUTS[tool],
-            }
-        else:
-            arguments = {
-                "target_url": selected_target,
-                "cookies": cookies,
-                "method": effective_method,
-                "data": str(case.get("data") or data),
-                "parameters": list(case.get("parameters") or parameters),
-                "timeout": timeout_override or PARAMETER_TOOL_TIMEOUTS[tool],
-            }
-            if tool == "dalfox":
-                arguments["allow_state_changes"] = workflow_state_changes
+        arguments = {
+            "target_url": selected_target,
+            "cookies": cookies,
+            "method": effective_method,
+            "data": str(case.get("data") or data),
+            "parameters": list(case.get("parameters") or parameters),
+            "timeout": timeout_override or PARAMETER_TOOL_TIMEOUTS[tool],
+        }
+        if tool == "dalfox":
+            arguments["allow_state_changes"] = workflow_state_changes
     elif tool == "authorization":
         if not cookies:
             return make_skipped_result(
@@ -4030,7 +4139,7 @@ async def run_single_tool_debug(
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="Deterministic FastMCP web-security orchestrator."
+        description="Deterministic LangGraph + FastMCP web-security orchestrator."
     )
     parser.add_argument("--target")
     parser.add_argument("--cookies", default="")

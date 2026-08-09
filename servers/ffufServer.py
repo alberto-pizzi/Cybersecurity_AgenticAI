@@ -1,8 +1,6 @@
 from __future__ import annotations
 
-import argparse
 import json
-import os
 import re
 import tempfile
 import time
@@ -14,6 +12,8 @@ import requests
 from fastmcp import FastMCP
 
 from utils import WORDLISTS_DIR, failure, partial, run_process, success
+
+from utils import run_mcp_http
 
 mcp = FastMCP("FFUF Scanner")
 
@@ -603,22 +603,5 @@ def run_ffuf_fuzz(target_url: str, cookies: str="", wordlist: str="", timeout: i
         return success("FFUF",target_url,f"FFUF completed. Resources: {len(findings)}.",**common)
 
 
-def _once() -> int:
-    try:
-        arguments = json.loads(os.sys.stdin.read() or "{}")
-        if not isinstance(arguments, dict):
-            raise ValueError("Expected a JSON object on stdin.")
-        result = run_ffuf_fuzz(**arguments)
-    except Exception as exc:
-        result = failure("FFUF", "", f"One-shot FFUF execution failed: {type(exc).__name__}: {exc}")
-    print(json.dumps(result, ensure_ascii=False, default=str))
-    return 0
-
-
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(add_help=False)
-    parser.add_argument("--once", action="store_true")
-    args, _ = parser.parse_known_args()
-    if args.once:
-        raise SystemExit(_once())
-    mcp.run(transport="stdio")
+    run_mcp_http(mcp, "ffuf")

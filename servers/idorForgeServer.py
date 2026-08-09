@@ -1,35 +1,92 @@
 from __future__ import annotations
 
-import argparse
-import sys
 import json
-import hashlib
-import re
-from difflib import SequenceMatcher
-from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
+import os
+import subprocess
+from pathlib import Path
+from urllib.parse import parse_qsl, urlparse
 
-import requests
 from fastmcp import FastMCP
 
-from utils import failure, partial, skipped, success
+from utils import failure, load_runtime_config, partial, run_mcp_http, skipped, success
 
-mcp = FastMCP("IDOR Differential Checker")
+mcp = FastMCP("IDOR-Forge Wrapper")
+
+UPSTREAM_REPOSITORY = "https://github.com/errorfiathck/IDOR-Forge.git"
+RESULT_MARKER = "SECOPS_IDOR_FORGE_RESULT="
 
 
-def mutate_first_numeric_parameter(url: str) -> tuple[str, str] | None:
-    parsed = urlparse(url)
-    pairs = parse_qsl(parsed.query, keep_blank_values=True)
-    for index, (name, value) in enumerate(pairs):
-        if re.fullmatch(r"\d+", value):
-            changed = pairs.copy()
-            changed[index] = (name, str(int(value) + 1))
-            return name, urlunparse(parsed._replace(query=urlencode(changed)))
+def _upstream_runtime() -> tuple[Path, str]:
+    runtime = load_runtime_config().get("idor_forge", {})
+    configured = runtime if isinstance(runtime, dict) else {}
+    root = Path(
+        os.getenv(
+            "SECOPS_IDOR_FORGE_HOME",
+            str(configured.get("directory") or (Path.home() / ".local" / "opt" / "idor-forge")),
+        )
+    ).expanduser()
+    python = str(configured.get("python") or "").strip()
+    if not python:
+        python = str(root / ".venv" / ("Scripts/python.exe" if os.name == "nt" else "bin/python"))
+    return root, python
+
+
+def _numeric_parameter(target_url: str, parameters: list[str] | None) -> tuple[str, str] | None:
+    requested = {str(value) for value in (parameters or []) if str(value)}
+    for name, value in parse_qsl(urlparse(target_url).query, keep_blank_values=True):
+        if value.isdigit() and (not requested or name in requested):
+            return name, str(int(value) + 1)
     return None
 
 
-def _looks_like_login(response: requests.Response) -> bool:
-    text = response.text[:8000].lower()
-    return "login.php" in response.url.lower() or ("type=\"password\"" in text and "login" in text)
+def _run_upstream(root: Path, python: str, config: dict, timeout: int) -> list[dict]:
+    runner = r'''
+import json
+import sys
+from core.IDORChecker import IDORChecker
+
+cfg = json.loads(sys.argv[1])
+checker = IDORChecker(
+    cfg["url"],
+    delay=0,
+    headers=cfg["headers"],
+    timeout=cfg["request_timeout"],
+    verbose=False,
+    max_workers=1,
+    max_retries=1,
+    logger=lambda message: None,
+)
+checker.payload = {}
+checker._generate_payloads = lambda param, values: [
+    {**checker.params, param: str(value)} for value in values
+]
+results = checker.check_idor(
+    cfg["parameter"],
+    cfg["test_values"],
+    method="GET",
+    max_workers=1,
+)
+print("SECOPS_IDOR_FORGE_RESULT=" + json.dumps(results, default=str, separators=(",", ":")))
+'''
+    environment = os.environ.copy()
+    environment["MPLBACKEND"] = "Agg"
+    completed = subprocess.run(
+        [python, "-c", runner, json.dumps(config, separators=(",", ":"))],
+        cwd=root,
+        env=environment,
+        text=True,
+        capture_output=True,
+        timeout=max(5, int(timeout)),
+        check=False,
+    )
+    if completed.returncode:
+        detail = "\n".join(part for part in (completed.stdout, completed.stderr) if part).strip()
+        raise RuntimeError(detail[-3000:] or f"IDOR-Forge exited with code {completed.returncode}")
+    for line in reversed((completed.stdout or "").splitlines()):
+        if line.startswith(RESULT_MARKER):
+            value = json.loads(line[len(RESULT_MARKER):])
+            return value if isinstance(value, list) else []
+    raise RuntimeError("IDOR-Forge completed without returning the expected structured result.")
 
 
 @mcp.tool()
@@ -41,86 +98,89 @@ def run_idor_check(
     data: str = "",
     parameters: list[str] | None = None,
 ) -> dict:
-    """Perform a cautious GET differential check; extra MCP metadata is accepted safely."""
-    if str(method).upper() != "GET":
-        return skipped(
-            "IDOR Differential Checker",
+    """Run the upstream IDOR-Forge engine on one discovered numeric GET reference."""
+    if str(method).upper() != "GET" or str(data or "").strip():
+        return skipped("IDOR-Forge", target_url, "The bounded project contract uses numeric GET object references only.")
+
+    selected = _numeric_parameter(target_url, parameters)
+    if not selected:
+        return skipped("IDOR-Forge", target_url, "No compatible numeric query parameter was available for the IDOR check.")
+    parameter, test_value = selected
+
+    root, python = _upstream_runtime()
+    if not (root / "core" / "IDORChecker.py").is_file() or not Path(python).is_file():
+        return failure(
+            "IDOR-Forge",
             target_url,
-            "The current differential checker supports numeric GET object references only.",
+            "The upstream IDOR-Forge runtime is missing. Run initScript.py to clone and prepare it.",
+            diagnosis="idor_forge_not_installed",
+            upstream_repository=UPSTREAM_REPOSITORY,
         )
-    mutation = mutate_first_numeric_parameter(target_url)
-    if not mutation:
-        return skipped("IDOR Differential Checker", target_url, "No numeric query parameter was available for a differential check.")
-    parameter, mutated_url = mutation
-    session = requests.Session()
-    if cookies:
-        session.headers["Cookie"] = cookies
+
+    config = {
+        "url": target_url,
+        "parameter": parameter,
+        "test_values": [test_value],
+        "headers": {"Cookie": cookies} if cookies else {},
+        "request_timeout": max(3, min(15, int(timeout))),
+    }
     try:
-        original = session.get(target_url, timeout=timeout, allow_redirects=True)
-        mutated = session.get(mutated_url, timeout=timeout, allow_redirects=True)
-    except requests.Timeout as exc:
-        return partial("IDOR Differential Checker", target_url, f"IDOR differential check reached its request time budget: {exc}", diagnosis="time_limit_reached", timed_out=True, vulnerabilities=[])
-    except requests.RequestException as exc:
-        return failure("IDOR Differential Checker", target_url, str(exc), diagnosis="request_failed")
+        rows = _run_upstream(root, python, config, timeout)
+    except subprocess.TimeoutExpired:
+        return partial(
+            "IDOR-Forge",
+            target_url,
+            "IDOR-Forge reached the configured execution time budget.",
+            diagnosis="time_limit_reached",
+            timed_out=True,
+            vulnerabilities=[],
+            upstream_repository=UPSTREAM_REPOSITORY,
+        )
+    except (OSError, RuntimeError, json.JSONDecodeError) as exc:
+        return failure("IDOR-Forge", target_url, str(exc), diagnosis="upstream_execution_failed")
 
-    original_hash = hashlib.sha256(original.content).hexdigest()
-    mutated_hash = hashlib.sha256(mutated.content).hexdigest()
-    similarity = SequenceMatcher(None, original.text[:100_000], mutated.text[:100_000]).ratio()
-    same_status = original.status_code == mutated.status_code == 200
-    changed_content = original_hash != mutated_hash
-    candidate = same_status and changed_content and 0.55 <= similarity < 0.995 and not _looks_like_login(original) and not _looks_like_login(mutated)
-
+    candidates = [row for row in rows if isinstance(row, dict) and bool(row.get("idor_detected"))]
     findings = []
-    if candidate:
+    for row in candidates:
+        comparison = row.get("comparison") if isinstance(row.get("comparison"), dict) else {}
         findings.append({
-            "alert": "Potential IDOR candidate",
+            "alert": "Potential IDOR candidate reported by IDOR-Forge",
             "risk": "medium",
             "category": "candidate",
-            "verification_status": "differential-candidate-needs-two-account-validation",
-            "description": f"Changing numeric parameter '{parameter}' returned HTTP 200 with different content that remained structurally similar to the original response. This is a differential candidate, not proof that another user's object was accessed.",
-            "impact": "If the changed object belongs to another user and no authorization check is enforced, unauthorized data access or modification may be possible.",
-            "solution": "Enforce object-level authorization on every request and manually verify with two accounts that have different permissions.",
-            "url": mutated_url,
-            "original_url": target_url,
-            "mutated_url": mutated_url,
+            "verification_status": "upstream-candidate-needs-two-account-ownership-validation",
+            "description": (
+                f"IDOR-Forge flagged the numeric parameter '{parameter}' after comparing the baseline "
+                "with a bounded mutated object reference. The result is a candidate, not proof that the "
+                "returned object belongs to another user."
+            ),
+            "impact": "If object-level authorization is missing, another user's data or action may become accessible.",
+            "solution": "Enforce object-level authorization on every request and validate ownership with two distinct accounts.",
+            "url": str(row.get("url") or target_url),
             "method": "GET",
             "parameter": parameter,
             "confidence": "low",
             "evidence": (
-                f"original_status={original.status_code}; mutated_status={mutated.status_code}; "
-                f"original_bytes={len(original.content)}; mutated_bytes={len(mutated.content)}; similarity={similarity:.3f}"
+                f"status={row.get('status_code')}; test_value={test_value}; "
+                f"structure_similarity={comparison.get('structure_similarity')}; "
+                f"content_similarity={comparison.get('content_similarity')}; "
+                f"text_similarity={comparison.get('text_similarity')}"
             ),
         })
 
     return success(
-        "IDOR Differential Checker", target_url,
-        f"Differential request completed. Candidate: {candidate}.",
-        vulnerabilities=findings, mutated_url=mutated_url, candidate=candidate,
-        similarity=round(similarity, 4), content_changed=changed_content,
+        "IDOR-Forge",
+        target_url,
+        f"Upstream IDOR-Forge completed a bounded numeric check. Candidates: {len(findings)}.",
+        vulnerabilities=findings,
+        candidate=bool(findings),
+        parameter=parameter,
+        test_value=test_value,
+        upstream_results=rows,
+        upstream_repository=UPSTREAM_REPOSITORY,
+        upstream_directory=str(root),
         authenticated=bool(cookies),
     )
 
 
-def _once() -> int:
-    try:
-        arguments = json.loads(sys.stdin.read() or "{}")
-        if not isinstance(arguments, dict):
-            raise ValueError("Expected a JSON object on stdin.")
-        result = run_idor_check(**arguments)
-    except Exception as exc:
-        result = failure(
-            "IDOR Differential Checker",
-            "",
-            f"One-shot IDOR Differential Checker execution failed: {type(exc).__name__}: {exc}",
-        )
-    print(json.dumps(result, ensure_ascii=False, default=str))
-    return 0
-
-
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(add_help=False)
-    parser.add_argument("--once", action="store_true")
-    args, _ = parser.parse_known_args()
-    if args.once:
-        raise SystemExit(_once())
-    mcp.run(transport="stdio")
+    run_mcp_http(mcp, "idor")

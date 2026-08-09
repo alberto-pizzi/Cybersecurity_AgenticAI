@@ -1,8 +1,5 @@
 from __future__ import annotations
 
-import argparse
-import json
-import os
 import re
 from typing import Any
 from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
@@ -11,6 +8,8 @@ import requests
 from fastmcp import FastMCP
 
 from utils import failure, partial, scanner_session_probe, success
+
+from utils import run_mcp_http
 
 mcp = FastMCP("Path Traversal and LFI Verifier")
 
@@ -193,22 +192,5 @@ def run_traversal_scan(
     )
 
 
-def _once() -> int:
-    try:
-        arguments = json.loads(os.sys.stdin.read() or "{}")
-        if not isinstance(arguments, dict):
-            raise ValueError("Expected a JSON object on stdin.")
-        result = run_traversal_scan.fn(**arguments) if hasattr(run_traversal_scan, "fn") else run_traversal_scan(**arguments)
-    except Exception as exc:
-        result = failure("Path Traversal/LFI", "", f"One-shot execution failed: {type(exc).__name__}: {exc}")
-    print(json.dumps(result, ensure_ascii=False, default=str))
-    return 0
-
-
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(add_help=False)
-    parser.add_argument("--once", action="store_true")
-    args, _ = parser.parse_known_args()
-    if args.once:
-        raise SystemExit(_once())
-    mcp.run(transport="stdio")
+    run_mcp_http(mcp, "traversal")

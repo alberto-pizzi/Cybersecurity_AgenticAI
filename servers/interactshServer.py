@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-import argparse
-import sys
 import json
 import shutil
 import subprocess
@@ -14,6 +12,8 @@ import requests
 from fastmcp import FastMCP
 
 from utils import failure, partial, skipped, success
+
+from utils import run_mcp_http
 
 mcp = FastMCP("Interactsh OAST Client")
 
@@ -176,26 +176,5 @@ def run_interactsh_client(
             _stop(process)
 
 
-def _once() -> int:
-    try:
-        arguments = json.loads(sys.stdin.read() or "{}")
-        if not isinstance(arguments, dict):
-            raise ValueError("Expected a JSON object on stdin.")
-        result = run_interactsh_client(**arguments)
-    except Exception as exc:
-        result = failure(
-            "Interactsh",
-            "",
-            f"One-shot Interactsh execution failed: {type(exc).__name__}: {exc}",
-        )
-    print(json.dumps(result, ensure_ascii=False, default=str))
-    return 0
-
-
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(add_help=False)
-    parser.add_argument("--once", action="store_true")
-    args, _ = parser.parse_known_args()
-    if args.once:
-        raise SystemExit(_once())
-    mcp.run(transport="stdio")
+    run_mcp_http(mcp, "interactsh")

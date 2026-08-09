@@ -1,11 +1,12 @@
 from __future__ import annotations
 
-import argparse
 import sys
 import html
 import json
 import os
 import re
+import shutil
+import subprocess
 from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
@@ -15,9 +16,8 @@ from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 import requests
 from fastmcp import FastMCP
 
-from utils import REPORTS_DIR, failure, success
+from utils import REPORTS_DIR, failure, run_mcp_http, success
 
-from weasyprint import HTML
 
 mcp = FastMCP("SecOps Report Server")
 
@@ -739,10 +739,7 @@ def html2pdf(html_path,pdf_path):
     html_path = Path(html_path).resolve()
     pdf_path = Path(pdf_path).resolve()
 
-    # NOTE: stdout is reserved (MCP JSON-RPC framing when running under
-    # mcp.run(transport="stdio"); the result JSON line when running via
-    # `--once`). Diagnostic prints go to stderr so they don't corrupt
-    # either channel and are still visible in the console.
+    # Keep conversion diagnostics on stderr so the MCP response channel stays clean.
     print("HTML path received:", html_path, file=sys.stderr)
     print("PDF path received:", pdf_path, file=sys.stderr)
 
@@ -751,14 +748,88 @@ def html2pdf(html_path,pdf_path):
     if not html_path.exists():
         raise FileNotFoundError(f"HTML file not found: {html_path}")
 
-    HTML(
-        filename=str(html_path),
-        base_url=str(html_path.parent)
-    ).write_pdf(
-        str(pdf_path)
-    )
+    try:
+        # Import lazily: the MCP HTTP service must still start when WeasyPrint is
+        # intentionally provided only by the local report Docker image.
+        from weasyprint import HTML
 
-    print("Weasyprint: PDF converted into", pdf_path, file=sys.stderr)
+        HTML(
+            filename=str(html_path),
+            base_url=str(html_path.parent)
+        ).write_pdf(
+            str(pdf_path)
+        )
+        print("Weasyprint: PDF converted into", pdf_path, file=sys.stderr)
+        return
+    except (ImportError, OSError) as native_error:
+        docker = shutil.which("docker")
+        image = os.getenv("SECOPS_REPORT_DOCKER_IMAGE", "secops/report:local").strip() or "secops/report:local"
+        if not docker:
+            raise RuntimeError(
+                "WeasyPrint is unavailable natively and Docker is not available for the report fallback."
+            ) from native_error
+
+        inspect = subprocess.run(
+            [docker, "image", "inspect", image],
+            cwd=str(Path(__file__).resolve().parents[1]),
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=60,
+            check=False,
+        )
+        if inspect.returncode != 0:
+            detail = (inspect.stderr or inspect.stdout or "").strip()
+            raise RuntimeError(
+                f"WeasyPrint is unavailable natively and report Docker image {image!r} is not ready. "
+                f"{detail[-1200:]}"
+            ) from native_error
+
+        input_dir = html_path.parent
+        output_dir = pdf_path.parent
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+        command = [docker, "run", "--rm"]
+        if input_dir == output_dir:
+            command += [
+                "-v", f"{input_dir}:/reports",
+                image,
+                "python", "-m", "weasyprint",
+                f"/reports/{html_path.name}",
+                f"/reports/{pdf_path.name}",
+            ]
+        else:
+            command += [
+                "-v", f"{input_dir}:/input:ro",
+                "-v", f"{output_dir}:/output",
+                image,
+                "python", "-m", "weasyprint",
+                f"/input/{html_path.name}",
+                f"/output/{pdf_path.name}",
+            ]
+
+        converted = subprocess.run(
+            command,
+            cwd=str(Path(__file__).resolve().parents[1]),
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=300,
+            check=False,
+        )
+        if converted.returncode != 0 or not pdf_path.is_file():
+            detail = "\n".join(
+                part for part in ((converted.stdout or "").strip(), (converted.stderr or "").strip())
+                if part
+            )
+            raise RuntimeError(
+                f"Report Docker conversion failed with exit code {converted.returncode}. "
+                f"{detail[-2000:]}"
+            ) from native_error
+
+        print("Weasyprint Docker fallback: PDF converted into", pdf_path, file=sys.stderr)
 
 def _esc(value: Any) -> str:
     return html.escape(_redact_text(value))
@@ -1101,29 +1172,5 @@ def generate_report(
     )
 
 
-def _once() -> int:
-    try:
-        arguments = json.loads(sys.stdin.read() or "{}")
-        if not isinstance(arguments, dict):
-            raise ValueError("Expected a JSON object on stdin.")
-        result = generate_report(**arguments)
-        # generate_report() already renders the PDF via html2pdf() internally;
-        # calling it again here was redundant and, on PDF failure, unsafe
-        # (pdf_filename would be None).
-    except Exception as exc:
-        result = failure(
-            "Report Generator",
-            "",
-            f"One-shot Report Generator execution failed: {type(exc).__name__}: {exc}",
-        )
-    print(json.dumps(result, ensure_ascii=False, default=str))
-    return 0
-
-
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(add_help=False)
-    parser.add_argument("--once", action="store_true")
-    args, _ = parser.parse_known_args()
-    if args.once:
-        raise SystemExit(_once())
-    mcp.run(transport="stdio")
+    run_mcp_http(mcp, "report")

@@ -1,10 +1,7 @@
 from __future__ import annotations
 
-import argparse
 import hashlib
-import json
 import re
-import sys
 from difflib import SequenceMatcher
 from typing import Any
 from urllib.parse import parse_qsl, urljoin, urlparse
@@ -13,6 +10,8 @@ import requests
 from fastmcp import FastMCP
 
 from utils import failure, partial, skipped, success
+
+from utils import run_mcp_http, same_origin
 
 mcp = FastMCP("Authorization Differential Verifier")
 
@@ -59,13 +58,6 @@ def _authorization_relevance(target_url: str, parameters: list[str] | None) -> t
         score += 25
     return score, reasons
 
-def _same_origin(left: str, right: str) -> bool:
-    a, b = urlparse(left), urlparse(right)
-    return (a.scheme.lower(), a.hostname, a.port or (443 if a.scheme == "https" else 80)) == (
-        b.scheme.lower(), b.hostname, b.port or (443 if b.scheme == "https" else 80)
-    )
-
-
 def _looks_like_login(response: requests.Response) -> bool:
     text = response.text[:80_000].lower()
     path = urlparse(str(response.url)).path.lower().rstrip("/")
@@ -87,7 +79,7 @@ def _safe_get(url: str, cookies: str, timeout: int) -> tuple[requests.Response |
     current = url
     seen: set[str] = set()
     for _ in range(5):
-        if not _same_origin(url, current):
+        if not same_origin(url, current):
             return None, "cross_origin_blocked"
         response = session.get(current, timeout=(4, timeout), allow_redirects=False)
         if response.status_code not in {301, 302, 303, 307, 308}:
@@ -98,7 +90,7 @@ def _safe_get(url: str, cookies: str, timeout: int) -> tuple[requests.Response |
             response.url = current
             return response, ""
         candidate = urljoin(current, location)
-        if not _same_origin(url, candidate):
+        if not same_origin(url, candidate):
             response.url = current
             return response, "cross_origin_redirect_blocked"
         if DESTRUCTIVE_RE.search(urlparse(candidate).path):
@@ -324,26 +316,5 @@ def run_authorization_scan(
     )
 
 
-def _once() -> int:
-    try:
-        arguments = json.loads(sys.stdin.read() or "{}")
-        if not isinstance(arguments, dict):
-            raise ValueError("Expected a JSON object on stdin.")
-        result = run_authorization_scan(**arguments)
-    except Exception as exc:
-        result = failure(
-            "Authorization Differential Verifier",
-            "",
-            f"One-shot authorization scan failed: {type(exc).__name__}: {exc}",
-        )
-    print(json.dumps(result, ensure_ascii=False, default=str))
-    return 0
-
-
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(add_help=False)
-    parser.add_argument("--once", action="store_true")
-    args, _ = parser.parse_known_args()
-    if args.once:
-        raise SystemExit(_once())
-    mcp.run(transport="stdio", show_banner=False)
+    run_mcp_http(mcp, "authorization")
