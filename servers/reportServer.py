@@ -845,7 +845,77 @@ def _field(label: str, value: Any, *, pre: bool = False) -> str:
     rendered = f"<pre>{_esc(value)}</pre>" if pre else _esc(value)
     return f"<dt>{_esc(label)}</dt><dd>{rendered}</dd>"
 
-# TODO index to be automatized
+# It converts text into html id
+def _slugify(text: str, existing: set[str] = frozenset()) -> str:
+    base = re.sub(r"[^a-z0-9]+", "-", text.strip().lower()).strip("-") or "section"
+    if base not in existing:
+        return base
+    n = 2
+    while f"{base}-{n}" in existing:
+        n += 1
+    return f"{base}-{n}"
+
+# It generates hN tag like manually one
+def _heading(
+    level: int,
+    text: str,
+    toc: list[tuple[int, str, str]],
+    *,
+    in_toc: bool = True,
+    anchor: str | None = None,
+    extra: str = "",
+) -> str:
+    """Render an <hN> heading and, LaTeX-style, register it into `toc` at the
+    moment it is written — writing the heading here is what puts it in the
+    table of contents, in this position, in document order. No separate
+    list to keep in sync by hand.
+
+    `in_toc=False` is the equivalent of LaTeX's starred `\\section*{}`: the
+    heading still gets an anchor (so it can still be linked to), it just
+    doesn't get an index entry. Use it for headings that repeat once per
+    data row (e.g. one <h3> per finding) — there can be hundreds of those,
+    and listing each one would make the index useless for navigation.
+
+    `extra` is raw HTML appended after the escaped title, inside the same
+    tag (e.g. a count badge <span>), without leaking into the TOC label.
+    """
+    slug = anchor or _slugify(text, {a for _, _, a in toc})
+    if in_toc:
+        toc.append((level, text, slug))
+    return f'<h{level} id="{slug}">{_esc(text)}{extra}</h{level}>'
+
+# It takes "toc" list and turn it into nested <ul>
+def _render_toc(toc: list[tuple[int, str, str]]) -> str:
+    """Render registered (level, text, anchor) entries as nested <ul> lists,
+    matching how headings were nested when they were written (h2 under h2,
+    h3 nested one level deeper under the preceding h2, etc.) - the same
+    structure a LaTeX \\tableofcontents would produce from \\section /
+    \\subsection.
+    """
+    def build(entries: list[tuple[int, str, str]]) -> list[dict]:
+        nodes: list[dict] = []
+        i = 0
+        while i < len(entries):
+            level, text, anchor = entries[i]
+            j = i + 1
+            while j < len(entries) and entries[j][0] > level:
+                j += 1
+            nodes.append({"text": text, "anchor": anchor, "children": build(entries[i + 1:j])})
+            i = j
+        return nodes
+
+    def render(nodes: list[dict]) -> str:
+        if not nodes:
+            return ""
+        items = "".join(
+            f'<li><a href="#{n["anchor"]}">{_esc(n["text"])}</a>{render(n["children"])}</li>'
+            for n in nodes
+        )
+        return f"<ul>{items}</ul>"
+
+    return render(build(toc))
+
+
 def _render_html(payload: dict[str, Any]) -> str:
     summary = payload["summary"]
     risks = summary["risk_counts"]
@@ -883,6 +953,8 @@ def _render_html(payload: dict[str, Any]) -> str:
         for row in summary.get("coverage_constraints", [])
     ) or '<tr><td colspan="3">No additional coverage constraints were recorded.</td></tr>'
 
+    toc: list[tuple[int, str, str]] = []
+
     def finding_card(item: dict[str, Any], index: int) -> str:
         notes = item.get("data_quality_notes") or []
         scanner_fields = json.dumps(
@@ -891,9 +963,15 @@ def _render_html(payload: dict[str, Any]) -> str:
             ensure_ascii=False,
             default=str,
         )
+        heading = _heading(
+            3, f"{index}. {item['alert']}", toc,
+            in_toc=False,  # one h3 per finding: too many to list in the index (LaTeX \subsection* equivalent)
+            anchor=f"finding-{index}",
+            extra=f' <span>{_esc(item["risk"]).upper()}</span>',
+        )
         return f"""
 <article class="finding risk-{_esc(item['risk'])}">
-<h3>{index}. {_esc(item['alert'])} <span>{_esc(item['risk']).upper()}</span></h3>
+{heading}
 <div class="badges">
 <b>{_esc(item['verification_status'])}</b>
 <b>confidence: {_esc(item['confidence'])}</b>
@@ -914,27 +992,34 @@ def _render_html(payload: dict[str, Any]) -> str:
 {_field('Reproduction / validation steps', item.get('reproduction'), pre=True)}
 {_field('OWASP classification', item.get('owasp_category'))}
 </dl>
-{('<h4>Identifiers</h4>' + _render_list(item.get('identifiers') or [])) if item.get('identifiers') else ''}
-{('<h4>References</h4>' + _render_list(item.get('references') or [])) if item.get('references') else ''}
+{('<p class="field-label">Identifiers</p>' + _render_list(item.get('identifiers') or [])) if item.get('identifiers') else ''}
+{('<p class="field-label">References</p>' + _render_list(item.get('references') or [])) if item.get('references') else ''}
 {('<div class="quality"><b>Data-quality notes</b>' + _render_list(notes) + '</div>') if notes else ''}
 <details><summary>Additional structured scanner fields</summary><pre>{_esc(scanner_fields)}</pre></details>
 </article>"""
 
-    finding_sections: list[str] = []
+    finding_bodies: dict[str, str] = {}
     global_index = 1
     for category in ("vulnerability", "candidate", "observation", "discovery"):
-        title, explanation = FINDING_SECTION_META[category]
         items = groups[category]
         cards = "".join(
             finding_card(item, index)
             for index, item in enumerate(items, start=global_index)
         )
         global_index += len(items)
-        empty = "<p>No entries in this category.</p>"
-        finding_sections.append(
-            f'<section><h2>{_esc(title)} <span class="count">{len(items)}</span></h2>'
-            f'<p class="section-note">{_esc(explanation)}</p>{cards or empty}</section>'
+        finding_bodies[category] = cards or "<p>No entries in this category.</p>"
+
+    def render_finding_section(category: str) -> str:
+        # Registers its own <h2> into `toc` at render time, so it lands in
+        # the index exactly where it's written below - last, after the
+        # coverage-constraints section.
+        title, explanation = FINDING_SECTION_META[category]
+        heading = _heading(
+            2, title, toc,
+            anchor=f"findings-{category}",
+            extra=f' <span class="count">{len(groups[category])}</span>',
         )
+        return f'<section>{heading}<p class="section-note">{_esc(explanation)}</p>{finding_bodies[category]}</section>'
 
     glance_items = [
         item for item in payload["findings"]
@@ -949,15 +1034,20 @@ def _render_html(payload: dict[str, Any]) -> str:
         "</tr>"
         for index, item in enumerate(glance_items[:12], 1)
     )
-    glance_html = (
-        "<h2>Security findings at a glance</h2>"
-        "<p class='section-note'>Confirmed vulnerabilities and candidates are named here before execution details.</p>"
-        "<table><thead><tr><th>#</th><th>Severity</th><th>Finding</th><th>Tool</th><th>Affected endpoint</th></tr></thead>"
-        f"<tbody>{glance_rows}</tbody></table>"
-        + (f"<p>Only the first 12 of {len(glance_items)} security findings are shown here; all details follow below.</p>" if len(glance_items) > 12 else "")
-        if glance_items else
-        "<h2>Security findings at a glance</h2><p>No confirmed vulnerabilities or validation candidates were recorded.</p>"
-    )
+    def render_glance() -> str:
+        heading = _heading(2, "Security findings at a glance", toc, anchor="glance")
+        if not glance_items:
+            return f"{heading}<p>No confirmed vulnerabilities or validation candidates were recorded.</p>"
+        tail = (
+            f"<p>Only the first 12 of {len(glance_items)} security findings are shown here; all details follow below.</p>"
+            if len(glance_items) > 12 else ""
+        )
+        return (
+            f"{heading}"
+            "<p class='section-note'>Confirmed vulnerabilities and candidates are named here before execution details.</p>"
+            "<table><thead><tr><th>#</th><th>Severity</th><th>Finding</th><th>Tool</th><th>Affected endpoint</th></tr></thead>"
+            f"<tbody>{glance_rows}</tbody></table>{tail}"
+        )
 
     context_value = _redact_value(payload.get("assessment_context") or {})
     context_json = json.dumps(
@@ -989,13 +1079,50 @@ def _render_html(payload: dict[str, Any]) -> str:
             f"<p><b>Planner summary:</b> {_esc(item.get('reasoning_summary',''))}</p>"
             f"<pre>{_esc(json.dumps(item, indent=2, ensure_ascii=False, default=str))}</pre></details>"
         )
-    agentic_audit_html = (
-        "<h2>Agentic planning audit</h2>"
-        "<p class='section-note'>This section records model-selected actions, coverage repair, fallback use and execution outcomes. It contains concise planner summaries, not hidden chain-of-thought.</p>"
-        "<table><thead><tr><th>Round</th><th>Planner</th><th>Eligible</th><th>AI selected</th><th>Executed plan</th><th>Gaps</th><th>Outcomes</th></tr></thead>"
-        f"<tbody>{audit_rows}</tbody></table>{''.join(audit_details)}"
-        if audit_rows else ""
-    )
+    def render_agentic_audit() -> str:
+        if not audit_rows:
+            return ""
+        heading = _heading(2, "Agentic planning audit", toc, anchor="agentic-audit")
+        return (
+            f"{heading}"
+            "<p class='section-note'>This section records model-selected actions, coverage repair, fallback use and execution outcomes. It contains concise planner summaries, not hidden chain-of-thought.</p>"
+            "<table><thead><tr><th>Round</th><th>Planner</th><th>Eligible</th><th>AI selected</th><th>Executed plan</th><th>Gaps</th><th>Outcomes</th></tr></thead>"
+            f"<tbody>{audit_rows}</tbody></table>{''.join(audit_details)}"
+        )
+
+    # Phase 1: render the body. Every _heading()/render_*() call below fires
+    # in the exact order it's written here, appending to `toc` as it goes -
+    # this is what makes the index "automatic": you don't edit a separate
+    # list, you just write (or move) a heading and the index follows.
+    body_html = f"""
+{_heading(2, "Executive summary", toc, anchor="executive")}<div class="card">{_esc(payload['executive_summary'])}</div>
+{render_glance()}
+<div class="grid">{''.join(f'<div class="card"><div class="value">{risks.get(risk,0)}</div><div>{risk.title()}</div></div>' for risk in ('critical','high','medium','low'))}<div class="card"><div class="value">{len(summary['limitations'])}</div><div>Execution limitations</div><div class="value">{len(summary.get('coverage_constraints', []))}</div><div>Coverage constraints</div></div></div>
+
+{detail_cap_note}
+{_heading(2, "Scope and assessment context", toc, anchor="scope")}
+<details><summary>Profiles, discovery counts and configured limits</summary><pre>{_esc(context_json)}</pre></details>
+{render_agentic_audit()}
+
+{_heading(2, "Assessment execution", toc, anchor="execution")}
+<p class="section-note">This section records tools, targets, duration and execution status. It is deliberately separate from security findings.</p>
+<table><thead><tr><th>Profile</th><th>Tool and purpose</th><th>Status</th><th>Targets</th><th>Confirmed</th><th>Candidates</th><th>Info/discovery</th><th>Seconds</th><th>Execution details</th></tr></thead><tbody>{coverage_rows}</tbody></table>
+
+{_heading(2, "Execution limitations", toc, anchor="limitations")}
+<table><thead><tr><th>Run</th><th>Status</th><th>Cause</th><th>Explanation</th></tr></thead><tbody>{limitation_rows}</tbody></table>
+
+{_heading(2, "Coverage constraints and untested classes", toc, anchor="constraints")}
+<p class="section-note">These rows are not scanner failures. They identify security classes that could not be fully validated with the supplied identities, traffic and request contracts.</p>
+<table><thead><tr><th>Area</th><th>Reason</th><th>Recommended next step</th></tr></thead><tbody>{constraint_rows}</tbody></table>
+
+{''.join(render_finding_section(category) for category in ("vulnerability", "candidate", "observation", "discovery"))}
+"""
+    # toc[] is now fully populated -> Phase 2: render the index from it.
+    # (Same reason LaTeX needs two compilation passes: the ToC appears
+    # before the content it points to, so it can only be built after that
+    # content has already been rendered once.)
+    toc_html = _render_toc(toc)
+
     return f"""<!doctype html><html><head><meta charset="utf-8"><title>SecOps Assessment Report</title>
 <style>
 @page {{
@@ -1036,43 +1163,18 @@ details{{margin-top:14px}}.section-note{{background:#eaf1f7;border-left:4px soli
 .count{{font-size:.85rem;background:#dce8f3;border-radius:12px;padding:3px 8px}}
 .toc a{{color: black;text-decoration: none;}}
 .toc ul{{list-style: none;padding-left: 0;}}
+.toc-title{{margin-top:0}}
+.field-label{{font-weight:700;margin:14px 0 6px;color:#173b5e}}
 </style></head><body><main>
 <h1>{REPORT_TITLE}</h1>
 <div class="meta"><b>Target:</b> {_esc(payload['target'])}<br><b>Generated:</b> {_esc(payload['generated_at'])}<br><b>Evidence policy:</b> scanner-grounded; missing statements are not fabricated.</div>
 
 
 <div class="toc">
-<h1 id="index">Index</h1>
-<ul>
-    <li>
-        <a href="#executive">
-            Executive summary
-        </a>
-    </li>
-</ul>
+<h2 class="toc-title" id="index">Index</h2>
+{toc_html}
 </div>
-
-<h2 id="executive">Executive summary</h2><div class="card">{_esc(payload['executive_summary'])}</div>
-{glance_html}
-<div class="grid">{''.join(f'<div class="card"><div class="value">{risks.get(risk,0)}</div><div>{risk.title()}</div></div>' for risk in ('critical','high','medium','low'))}<div class="card"><div class="value">{len(summary['limitations'])}</div><div>Execution limitations</div><div class="value">{len(summary.get('coverage_constraints', []))}</div><div>Coverage constraints</div></div></div>
-
-{detail_cap_note}
-<h2>Scope and assessment context</h2>
-<details><summary>Profiles, discovery counts and configured limits</summary><pre>{_esc(context_json)}</pre></details>
-{agentic_audit_html}
-
-<h2>Assessment execution</h2>
-<p class="section-note">This section records tools, targets, duration and execution status. It is deliberately separate from security findings.</p>
-<table><thead><tr><th>Profile</th><th>Tool and purpose</th><th>Status</th><th>Targets</th><th>Confirmed</th><th>Candidates</th><th>Info/discovery</th><th>Seconds</th><th>Execution details</th></tr></thead><tbody>{coverage_rows}</tbody></table>
-
-<h2>Execution limitations</h2>
-<table><thead><tr><th>Run</th><th>Status</th><th>Cause</th><th>Explanation</th></tr></thead><tbody>{limitation_rows}</tbody></table>
-
-<h2>Coverage constraints and untested classes</h2>
-<p class="section-note">These rows are not scanner failures. They identify security classes that could not be fully validated with the supplied identities, traffic and request contracts.</p>
-<table><thead><tr><th>Area</th><th>Reason</th><th>Recommended next step</th></tr></thead><tbody>{constraint_rows}</tbody></table>
-
-{''.join(finding_sections)}
+{body_html}
 </main></body></html>"""
 
 
