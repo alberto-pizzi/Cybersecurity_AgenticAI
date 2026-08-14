@@ -1040,16 +1040,26 @@ def _render_html(payload: dict[str, Any], *, for_pdf: bool = False) -> str:
 
     coverage_rows = "".join(
         "<tr>"
+        f'<td class="no-wrap">{index}</td>'
         f'<td class="no-wrap">{_esc(row['profile'])}</td>'
         f"<td><b>{_esc(row['tool'])}</b><br><small>{_esc(row.get('purpose', ''))}</small></td>"
         f'<td class="no-wrap">{_esc(row['status'])}</td>'
         f"<td>{row['targets']}</td><td>{row.get('confirmed',0)}</td>"
         f"<td>{row.get('candidates',0)}</td><td>{row.get('observations',0)}</td>"
         f"<td>{row['duration_seconds']}</td>"
-        f"<td>{_esc(row['details'])}</td>"
         "</tr>"
-        for row in payload["coverage"]
+        for index, row in enumerate(payload["coverage"], start=1)
     ) or '<tr><td colspan="9">No execution data.</td></tr>'
+
+    execution_detail_items = "".join(
+        f"<li>{_esc(row['details'])}</li>"
+        for row in payload["coverage"]
+    )
+    execution_details_html = (
+        f"<ol>{execution_detail_items}</ol>"
+        if execution_detail_items
+        else "<p>No execution details recorded.</p>"
+    )
 
     limitation_rows = "".join(
         f"<tr><td>{_esc(row['path'])}</td><td>{_esc(row['status'])}</td><td>{_esc(row['cause'])}</td><td>{_esc(row['explanation'])}</td></tr>"
@@ -1215,7 +1225,11 @@ def _render_html(payload: dict[str, Any], *, for_pdf: bool = False) -> str:
 
 {_heading(2, "Assessment execution", toc, anchor="execution")}
 <p class="section-note">This section records tools, targets, duration and execution status. It is deliberately separate from security findings.</p>
-<table><thead><tr><th>Profile</th><th>Tool and purpose</th><th>Status</th><th>Targets</th><th>Confirmed</th><th>Candidates</th><th>Info/discovery</th><th>Seconds</th><th>Execution details</th></tr></thead><tbody>{coverage_rows}</tbody></table>
+<table><thead><tr><th>#</th><th>Profile</th><th>Tool and purpose</th><th>Status</th><th>Targets</th><th>Confirmed</th><th>Candidates</th><th>Info/discovery</th><th>Seconds</th></tr></thead><tbody>{coverage_rows}</tbody></table>
+
+{_heading(3, "Execution details", toc, anchor="execution-details")}
+<p class="section-note">Raw execution output per row, numbered to match the table above.</p>
+{execution_details_html}
 
 {_heading(2, "Execution limitations", toc, anchor="limitations")}
 <table><thead><tr><th>Run</th><th>Status</th><th>Cause</th><th>Explanation</th></tr></thead><tbody>{limitation_rows}</tbody></table>
@@ -1277,6 +1291,7 @@ details{{margin-top:14px}}.section-note{{background:#eaf1f7;border-left:4px soli
 .toc ul{{list-style: none;padding-left: 0;}}
 .toc ul ul{{padding-left: 22px;}}
 .toc-title{{margin-top:0}}
+ol li::marker{{font-weight:bold;}}
 .field-label{{font-weight:700;margin:14px 0 6px;color:#173b5e}}
 </style></head><body><main>
 <h1>{REPORT_TITLE}</h1>
