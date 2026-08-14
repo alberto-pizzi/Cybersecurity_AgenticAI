@@ -128,69 +128,124 @@ def _docker_target_text(value: str) -> str:
     )
 
 
-def _dockerized_nuclei_command(command: list[str], temp_root: Path, image: str) -> list[str]:
-    """Translate host paths and loopback URLs for the official Nuclei container."""
-    docker_args = ["docker", "run", "--rm", "--add-host", "host.docker.internal:host-gateway"]
-
-    mounts: dict[tuple[str, bool], str] = {}
-
-    def mount_directory(directory: Path, *, read_only: bool) -> str:
-        resolved = directory.resolve()
-        key = (str(resolved), read_only)
-        if key in mounts:
-            return mounts[key]
-        container_dir = f"/secops/mount{len(mounts)}"
-        suffix = ":ro" if read_only else ""
-        docker_args.extend(["-v", f"{resolved}:{container_dir}{suffix}"])
-        mounts[key] = container_dir
-        return container_dir
-
-    translated: list[str] = []
+def _translate_nuclei_args(
+    command: list[str],
+    map_path: Any,
+    rewrite_input: Any,
+) -> list[str]:
+    """Translate host paths/loopback URLs while preserving Nuclei arguments."""
+    translated = [command[0]]
     index = 1
-    input_index = 0
     while index < len(command):
         token = command[index]
         if token == "-u" and index + 1 < len(command):
             translated.extend([token, _docker_target_url(command[index + 1])])
             index += 2
-            continue
-        if token == "-l" and index + 1 < len(command):
+        elif token == "-l" and index + 1 < len(command):
+            source = rewrite_input(Path(command[index + 1]).expanduser().resolve())
+            translated.extend([token, map_path(source, False)])
+            index += 2
+        elif token in {"-o", "-t"} and index + 1 < len(command):
             source = Path(command[index + 1]).expanduser().resolve()
-            input_index += 1
-            rewritten = temp_root / f"input_{input_index}{source.suffix or '.txt'}"
-            try:
-                content = source.read_text(encoding="utf-8", errors="replace")
-            except OSError:
-                content = ""
-            rewritten.write_text(_docker_target_text(content), encoding="utf-8")
-            container_dir = mount_directory(temp_root, read_only=True)
-            translated.extend([token, f"{container_dir}/{rewritten.name}"])
+            if token == "-o":
+                source.parent.mkdir(parents=True, exist_ok=True)
+            translated.extend([token, map_path(source, token == "-t")])
             index += 2
-            continue
-        if token == "-o" and index + 1 < len(command):
-            output = Path(command[index + 1]).expanduser().resolve()
-            output.parent.mkdir(parents=True, exist_ok=True)
-            container_dir = mount_directory(output.parent, read_only=False)
-            translated.extend([token, f"{container_dir}/{output.name}"])
-            index += 2
-            continue
-        if token == "-t" and index + 1 < len(command):
-            template = Path(command[index + 1]).expanduser().resolve()
-            if template.exists():
-                if template.is_dir():
-                    container_path = mount_directory(template, read_only=True)
-                else:
-                    container_dir = mount_directory(template.parent, read_only=True)
-                    container_path = f"{container_dir}/{template.name}"
-                translated.extend([token, container_path])
-            else:
-                translated.extend([token, command[index + 1]])
-            index += 2
-            continue
-        translated.append(token)
-        index += 1
+        else:
+            translated.append(token)
+            index += 1
+    return translated
 
-    return [*docker_args, image, *translated]
+
+def _dockerized_nuclei_command(command: list[str], temp_root: Path, image: str) -> list[str]:
+    """Build the compatibility one-shot Docker command."""
+    docker_args = ["docker", "run", "--rm", "--add-host", "host.docker.internal:host-gateway"]
+    mounts: dict[tuple[str, bool], str] = {}
+
+    def map_path(source: Path, read_only: bool) -> str:
+        directory = source if source.is_dir() else source.parent
+        key = (str(directory.resolve()), read_only)
+        if key not in mounts:
+            mount = f"/secops/mount{len(mounts)}"
+            docker_args.extend(["-v", f"{directory.resolve()}:{mount}{':ro' if read_only else ''}"])
+            mounts[key] = mount
+        mount = mounts[key]
+        return mount if source.is_dir() else f"{mount}/{source.name}"
+
+    counter = 0
+    def rewrite_input(source: Path) -> Path:
+        nonlocal counter
+        counter += 1
+        rewritten = temp_root / f"input_{counter}{source.suffix or '.txt'}"
+        try:
+            content = source.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            content = ""
+        rewritten.write_text(_docker_target_text(content), encoding="utf-8")
+        return rewritten
+
+    return [*docker_args, image, *_translate_nuclei_args(command, map_path, rewrite_input)]
+
+
+class _DockerNucleiSession:
+    """Reuse one official Nuclei container for every phase of one MCP scan."""
+    def __init__(self, image: str, work_dir: Path, template_dir: Path | None) -> None:
+        self.image = image or "projectdiscovery/nuclei:latest"
+        self.work_dir = work_dir.resolve()
+        self.name = f"secops-nuclei-{os.getpid()}-{time.time_ns()}"
+        self.exec_count = 0
+        self._input_count = 0
+        self._inputs: list[Path] = []
+        self._mounts = [(self.work_dir, "/secops/work")]
+        for root, target in ((template_dir, "/secops/templates"), (CUSTOM_TEMPLATE_DIR, "/secops/custom")):
+            if root and root.resolve().is_dir() and root.resolve() != self.work_dir:
+                self._mounts.append((root.resolve(), target))
+
+    def _map_path(self, source: Path, read_only: bool) -> str:
+        source = source.resolve()
+        for root, target in self._mounts:
+            try:
+                relative = source.relative_to(root)
+            except ValueError:
+                continue
+            suffix = relative.as_posix()
+            return target if suffix in {"", "."} else f"{target}/{suffix}"
+        raise ValueError(f"Path outside persistent Nuclei mounts: {source}")
+
+    def _rewrite_input(self, source: Path) -> Path:
+        self._input_count += 1
+        rewritten = self.work_dir / f".nuclei-docker-{self._input_count}{source.suffix or '.txt'}"
+        try:
+            content = source.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            content = ""
+        rewritten.write_text(_docker_target_text(content), encoding="utf-8")
+        self._inputs.append(rewritten)
+        return rewritten
+
+    def start(self, target: str) -> bool:
+        command = ["docker", "create", "--name", self.name, "--add-host", "host.docker.internal:host-gateway"]
+        for root, mount in self._mounts:
+            command.extend(["-v", f"{root}:{mount}{'' if root == self.work_dir else ':ro'}"])
+        command.extend(["--entrypoint", "/bin/sh", self.image, "-c", "while :; do sleep 3600; done"])
+        if run_process("Nuclei Docker session", command, target=target, timeout=30).get("status") != "success":
+            return False
+        return run_process("Nuclei Docker session", ["docker", "start", self.name], target=target, timeout=30).get("status") == "success"
+
+    def run(self, tool: str, command: list[str], *, target: str, timeout: int) -> dict[str, Any]:
+        try:
+            translated = _translate_nuclei_args(command, self._map_path, self._rewrite_input)
+        except (OSError, ValueError) as exc:
+            return failure(tool, target, f"Cannot prepare persistent Nuclei command: {exc}", diagnosis="nuclei_persistent_path_error")
+        self.exec_count += 1
+        result = run_process(tool, ["docker", "exec", self.name, *translated], target=target, timeout=timeout)
+        result.update(execution_mode="docker_official_image_persistent", docker_image=self.image, docker_exec_index=self.exec_count)
+        return result
+
+    def close(self, target: str) -> None:
+        for path in self._inputs:
+            path.unlink(missing_ok=True)
+        run_process("Nuclei Docker session", ["docker", "rm", "-f", self.name], target=target, timeout=20)
 
 
 def _run_nuclei_process(
@@ -199,19 +254,20 @@ def _run_nuclei_process(
     *,
     target: str,
     timeout: int,
+    docker_session: _DockerNucleiSession | None = None,
 ) -> dict[str, Any]:
     mode, image = _runtime_nuclei_execution()
     if mode != "docker_official_image":
         return run_process(tool, command, target=target, timeout=timeout)
-
+    if docker_session is not None:
+        result = docker_session.run(tool, command, target=target, timeout=timeout)
+        if result.get("diagnosis") != "nuclei_persistent_path_error":
+            return result
     image = image or "projectdiscovery/nuclei:latest"
     with tempfile.TemporaryDirectory(prefix="nuclei-docker-") as temporary:
-        docker_command = _dockerized_nuclei_command(command, Path(temporary), image)
-        result = run_process(tool, docker_command, target=target, timeout=timeout)
-    result["execution_mode"] = "docker_official_image"
-    result["docker_image"] = image
+        result = run_process(tool, _dockerized_nuclei_command(command, Path(temporary), image), target=target, timeout=timeout)
+    result.update(execution_mode="docker_official_image", docker_image=image)
     return result
-
 
 def _finding(item: dict[str, Any], target_url: str) -> dict[str, Any]:
     info = item.get("info") if isinstance(item.get("info"), dict) else {}
@@ -877,6 +933,7 @@ def _run_phase(
     payload_concurrency: int = 8,
     enable_global_matchers: bool = False,
     global_matcher_template_count: int = 0,
+    docker_session: _DockerNucleiSession | None = None,
 ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     def execute(
         *,
@@ -913,6 +970,7 @@ def _run_phase(
             ),
             target=target_url,
             timeout=budget if budget is not None else timeout,
+            docker_session=docker_session,
         )
 
     def result_text(result: dict[str, Any]) -> str:
@@ -1648,6 +1706,13 @@ def _run_nuclei_core(
 
     phases: list[dict[str, Any]] = []
     all_items: list[dict[str, Any]] = []
+    docker_session: _DockerNucleiSession | None = None
+    mode, image = _runtime_nuclei_execution()
+    if mode == "docker_official_image":
+        candidate = _DockerNucleiSession(image, work_dir, Path(template_dir) if template_dir else None)
+        if candidate.start(target_url):
+            docker_session = candidate
+
     try:
         for phase_path, definition in zip(phase_paths, definitions):
             is_dast = bool(definition.get("dast"))
@@ -1713,6 +1778,7 @@ def _run_nuclei_core(
                 payload_concurrency=payload_concurrency,
                 enable_global_matchers=bool(global_matcher_template_count),
                 global_matcher_template_count=global_matcher_template_count,
+                docker_session=docker_session,
                 **definition,
             )
 
@@ -1749,6 +1815,7 @@ def _run_nuclei_core(
                     payload_concurrency=payload_concurrency,
                     enable_global_matchers=bool(global_matcher_template_count),
                     global_matcher_template_count=global_matcher_template_count,
+                    docker_session=docker_session,
                     **definition,
                 )
                 fallback_phase["request_log_fallback"] = True
@@ -1839,6 +1906,10 @@ def _run_nuclei_core(
             "template_selection_strategy": "exact-files-from-local-metadata-catalog",
             "template_inventory": inventory,
             "template_refresh": refresh_result,
+            "docker_session": {
+                "mode": "persistent_container",
+                "exec_count": docker_session.exec_count,
+            } if docker_session is not None else {},
             "hard_failure": bool(hard_failures),
             "output_file": str(combined_path) if output_file else "",
         }
@@ -1875,6 +1946,8 @@ def _run_nuclei_core(
             **common,
         )
     finally:
+        if docker_session is not None:
+            docker_session.close(target_url)
         for phase_path in phase_paths:
             phase_path.unlink(missing_ok=True)
         target_list.unlink(missing_ok=True)
