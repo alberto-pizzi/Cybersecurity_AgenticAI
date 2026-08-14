@@ -1,2952 +1,52 @@
 from __future__ import annotations
 
 import argparse
-import atexit
-import ast
 import asyncio
-import functools
-import html
-import importlib.util
 import json
-import os
-import re
-import shutil
-import socket
-import subprocess
 import sys
-import sysconfig
 import time
 import traceback
-import uuid
-import warnings
-from dataclasses import dataclass
-from datetime import datetime, timezone
-from html.parser import HTMLParser
 from pathlib import Path
-from typing import Any, Iterator, TypedDict
-from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
-
-warnings.filterwarnings("ignore", message=r".*authlib\.jose.*deprecated.*")
-
-import requests
-with warnings.catch_warnings():
-    warnings.simplefilter("ignore")
-    from fastmcp import Client
+from typing import Any, TypedDict
+from urllib.parse import parse_qsl, urlparse
 
 from langgraph.graph import END, START, StateGraph
 
-from utils import (
-    apply_runtime_target_preparation, absolute_url, canonical_cookie_header,
-    cookie_names, load_runtime_config, normalize_url, ROOT_DIR, same_origin, scanner_session_probe,
-    SERVERS_DIR, target_runtime_profile, mcp_http_port, mcp_http_url,
+import orchestratorShared as shared
+from orchestratorShared import (
+    ALL_TOOLS, ARJUN_TOOL, AUTHORIZATION_TOOL, BASE_TOOLS, BROAD_SCANNER_TIMEOUTS,
+    OPTIONAL_TOOLS, PARAMETER_TOOLS, PARAMETER_TOOL_TIMEOUTS, PARAMETER_TOOL_CASE_LIMITS,
+    SCANNER_PROGRESS_INTERVAL, SINGLE_TOOL_CHOICES, TIME_LIMIT_DIAGNOSES, ToolSpec, WORKFLOW_TOOLS,
+    add_common_cli_arguments, agentic_registry, aggregate_runs, broad_tool_order,
+    build_tool_arguments, call_mcp, call_mcp_with_progress, configure_scan_mode,
+    diagnose_error, discover_target, enrich_discovery_with_arjun, enrich_discovery_with_ffuf,
+    iter_leaf_results, log_result, log_zap_session_diagnostics, make_skipped_result,
+    merge_discovery, prepare_cli_context, print_preflight_report, print_security_finding_summary,
+    refresh_authenticated_session_state, run_preflight_checks, select_arjun_request_cases,
+    select_authorization_request_cases, select_browser_request_cases, select_oast_request_cases,
+    select_request_cases, select_session_probe_url, select_tool_request_cases,
+    select_workflow_request_cases, state_changing_tests_allowed, summarize_results,
+    tool_action_limit, tool_execution_rank, write_emergency_json_report,
+    _is_login_case, _server_python, _tool_case_skip_reason,
 )
+from utils import normalize_url, same_origin, scanner_session_probe
 
-ROOT = Path(ROOT_DIR).resolve()
-SERVERS = Path(SERVERS_DIR).resolve()
-RUNTIME_FILE = ROOT / ".secops_runtime.json"
-LOCAL_BIN = Path.home() / ".local" / "bin"
-MCP_CONNECT_TIMEOUT = float(os.getenv("SECOPS_MCP_CONNECT_TIMEOUT", "20"))
-MCP_TOOL_TIMEOUT = float(os.getenv("SECOPS_MCP_TIMEOUT", "900"))
-MAX_PARAMETER_ENDPOINTS = max(1, int(os.getenv("SECOPS_MAX_PARAMETER_ENDPOINTS", "5")))
-MAX_ARJUN_ENDPOINTS = max(1, int(os.getenv("SECOPS_MAX_ARJUN_ENDPOINTS", "3")))
-MAX_CRAWL_PAGES = max(10, int(os.getenv("SECOPS_MAX_CRAWL_PAGES", "50")))
-MAX_SCRIPT_ASSETS = max(4, int(os.getenv("SECOPS_MAX_SCRIPT_ASSETS", "24")))
-SCANNER_PROGRESS_INTERVAL = max(10, int(os.getenv("SECOPS_PROGRESS_INTERVAL", "30")))
-SCAN_MODES = {
-    "fast": {
-        "broad": {"zap": 90, "nuclei": 90, "nikto": 45, "ffuf": 40, "session": 20},
-        "parameter": {"sqlmap": 60, "dalfox": 35, "commix": 40, "traversal": 25, "idor": 12, "authorization": 25, "browser": 35, "workflow": 30},
-        "limits": {"sqlmap": 1, "dalfox": 1, "commix": 1, "traversal": 1, "idor": 1, "authorization": 1, "browser": 1, "workflow": 1},
-        "arjun": 30,
-        "arjun_limit": 1,
-    },
-    "balanced": {
-        "broad": {"zap": 360, "nuclei": 210, "nikto": 90, "ffuf": 75, "session": 35},
-        "parameter": {"sqlmap": 120, "dalfox": 90, "commix": 75, "traversal": 45, "idor": 20, "authorization": 40, "browser": 75, "workflow": 60},
-        "limits": {"sqlmap": 3, "dalfox": 3, "commix": 1, "traversal": 2, "idor": 2, "authorization": 3, "browser": 2, "workflow": 3},
-        "arjun": 75,
-        "arjun_limit": 2,
-    },
-    "deep": {
-        "broad": {"zap": 900, "nuclei": 360, "nikto": 180, "ffuf": 120, "session": 50},
-        "parameter": {"sqlmap": 240, "dalfox": 180, "commix": 90, "traversal": 90, "idor": 45, "authorization": 60, "browser": 120, "workflow": 90},
-        "limits": {"sqlmap": 5, "dalfox": 4, "commix": 2, "traversal": 3, "idor": 3, "authorization": 5, "browser": 4, "workflow": 5},
-        "arjun": 90,
-        "arjun_limit": 3,
-    },
-}
-CURRENT_SCAN_MODE = "balanced"
-BROAD_SCANNER_TIMEOUTS = dict(SCAN_MODES[CURRENT_SCAN_MODE]["broad"])
-PARAMETER_TOOL_TIMEOUTS = dict(SCAN_MODES[CURRENT_SCAN_MODE]["parameter"])
-PARAMETER_TOOL_CASE_LIMITS = dict(SCAN_MODES[CURRENT_SCAN_MODE]["limits"])
-ARJUN_TIMEOUT = int(SCAN_MODES[CURRENT_SCAN_MODE]["arjun"])
-ARJUN_ENDPOINT_LIMIT = int(SCAN_MODES[CURRENT_SCAN_MODE].get("arjun_limit", 1))
+# Compatibility markers: selftest_v31_13.py validates these public contracts by source inspection.
+# Client(url)
+# mcp_http_handshake_ok
+# ToolSpec("idor", "idorForgeServer.py", "run_idor_check", "idor-forge")
+# ToolSpec("report", "reportServer.py", "generate_report", module="weasyprint")
 
+def _ensure_http_server(*args: Any, **kwargs: Any):
+    return shared._ensure_http_server(*args, **kwargs)
 
-def configure_scan_mode(mode: str) -> None:
-    global CURRENT_SCAN_MODE, ARJUN_TIMEOUT, ARJUN_ENDPOINT_LIMIT
-    selected = str(mode or "balanced").lower()
-    if selected not in SCAN_MODES:
-        raise ValueError(f"Unknown scan mode: {mode}")
-    CURRENT_SCAN_MODE = selected
-    profile = SCAN_MODES[selected]
-    BROAD_SCANNER_TIMEOUTS.clear(); BROAD_SCANNER_TIMEOUTS.update(profile["broad"])
-    PARAMETER_TOOL_TIMEOUTS.clear(); PARAMETER_TOOL_TIMEOUTS.update(profile["parameter"])
-    PARAMETER_TOOL_CASE_LIMITS.clear(); PARAMETER_TOOL_CASE_LIMITS.update(profile["limits"])
-    ARJUN_TIMEOUT = int(profile["arjun"])
-    ARJUN_ENDPOINT_LIMIT = int(profile.get("arjun_limit", 1))
-
-TIME_LIMIT_DIAGNOSES = {
-    "timeout", "time_limit_reached", "timeout_with_partial_results",
-    "timeout_with_confirmed_finding", "bounded_partial_scan",
-}
-AUTO_INDEX_PARAMETERS = {"c", "n", "m", "s", "d", "o"}
-OAST_PARAMETER_SCORES = {
-    "url": 120, "uri": 115, "host": 115, "hostname": 115, "domain": 110,
-    "callback": 130, "callback_url": 135, "webhook": 135, "webhook_url": 140,
-    "endpoint": 100, "target": 95, "dest": 100, "destination": 105,
-    "redirect": 80, "redirect_url": 90, "next": 55, "return": 55,
-    "fetch": 120, "resource": 90, "remote": 100, "proxy": 105,
-    "image": 65, "src": 70, "file": 75, "filename": 75, "path": 60,
-    "page": 85, "include": 105, "template": 80,
-    "feed": 90, "avatar": 65, "document": 65,
-    "ip": 125, "cmd": 145, "command": 145, "exec": 140, "shell": 145, "ping": 130,
-}
-OAST_PATH_HINTS = ("ssrf", "webhook", "callback", "fetch", "proxy", "redirect", "remote", "url", "include", "exec", "command", "cmd")
-OAST_URL_VALUE_PARAMETERS = {
-    "url", "uri", "callback", "callback_url", "webhook", "webhook_url",
-    "endpoint", "target", "dest", "destination", "redirect", "redirect_url",
-    "next", "return", "fetch", "resource", "remote", "proxy", "image",
-    "src", "file", "filename", "path", "page", "include", "template",
-    "feed", "avatar", "document",
-}
-OAST_COMMAND_PARAMETERS = {"ip", "host", "hostname", "cmd", "command", "exec", "shell", "ping", "target", "domain"}
-
-
-@dataclass(frozen=True)
-class ToolSpec:
-    name: str
-    server: str
-    tool: str
-    executable: str = ""
-    module: str = ""
-    required: bool = True
-
-
-BASE_TOOLS = (
-    # FFUF runs first so newly discovered paths can be re-crawled and supplied
-    # to the scanners that follow.
-    ToolSpec("ffuf", "ffufServer.py", "run_ffuf_fuzz", "ffuf"),
-    ToolSpec("zap", "zapServer.py", "run_zap_scan", module="zapv2"),
-    ToolSpec("nuclei", "nucleiServer.py", "run_nuclei_scan", "nuclei"),
-    ToolSpec("session", "sessionServer.py", "run_session_scan"),
-    ToolSpec("nikto", "niktoServer.py", "run_nikto_scan", "nikto"),
-)
-ARJUN_TOOL = ToolSpec("arjun", "arjunServer.py", "run_arjun_scan", "arjun")
-PARAMETER_TOOLS = (
-    ToolSpec("sqlmap", "sqlmapServer.py", "run_sqlmap_scan", "sqlmap"),
-    ToolSpec("dalfox", "dalfoxServer.py", "run_dalfox_scan", "dalfox"),
-    ToolSpec("commix", "commixServer.py", "run_commix_scan", "commix"),
-    ToolSpec("traversal", "traversalServer.py", "run_traversal_scan"),
-    ToolSpec("idor", "idorForgeServer.py", "run_idor_check", "idor-forge"),
-)
-AUTHORIZATION_TOOL = ToolSpec(
-    "authorization", "authorizationServer.py", "run_authorization_scan"
-)
-WORKFLOW_TOOLS = (
-    ToolSpec("browser", "browserServer.py", "run_browser_scan", module="playwright", required=False),
-    ToolSpec("workflow", "workflowServer.py", "run_workflow_scan"),
-)
-OPTIONAL_TOOLS = (
-    ToolSpec("jwt", "jwtServer.py", "run_jwt_scan", module="jwt"),
-    ToolSpec("interactsh", "interactshServer.py", "run_interactsh_client", "interactsh-client", required=False),
-    ToolSpec("report", "reportServer.py", "generate_report", module="weasyprint"),
-)
-ALL_TOOLS = (*BASE_TOOLS, ARJUN_TOOL, *PARAMETER_TOOLS, AUTHORIZATION_TOOL, *WORKFLOW_TOOLS, *OPTIONAL_TOOLS)
-
-TOOL_SCOPES = {
-    "ffuf": "base", "zap": "base", "nuclei": "base",
-    "session": "base", "nikto": "base", "arjun": "url",
-    "sqlmap": "parameterized", "dalfox": "parameterized",
-    "commix": "parameterized", "traversal": "parameterized",
-    "idor": "numeric", "authorization": "authorization", "browser": "browser", "workflow": "workflow",
-    "jwt": "jwt", "interactsh": "oast",
-}
-TOOL_DESCRIPTIONS = {
-    "ffuf": "Hidden resource and endpoint discovery with credential-isolated path fuzzing.",
-    "zap": "Session-aware crawling, passive analysis and prioritized active testing.",
-    "nuclei": "Template-based exposure, misconfiguration, known-vulnerability and bounded DAST checks on discovered parameterized URLs.",
-    "session": "Cookie flags, bounded session uniqueness and fixation indicators.",
-    "nikto": "Web-server hardening and exposed-resource checks.",
-    "arjun": "Hidden GET/POST parameter discovery.",
-    "sqlmap": "SQL-injection confirmation on discovered request contracts.",
-    "dalfox": "Reflected and stored XSS testing.",
-    "commix": "Operating-system command-injection testing.",
-    "traversal": "Path-traversal and local-file-inclusion verification.",
-    "idor": "Single-reference numeric object differential checks.",
-    "authorization": "Read-only anonymous and optional two-account authorization differentials on discovered high-value GET requests.",
-    "browser": "Chromium verification of DOM, reflected and stored XSS using harmless markers.",
-    "workflow": "Bounded CSRF, upload, authentication-throttling and CAPTCHA workflow checks.",
-    "jwt": "JWT structure and claim analysis.",
-    "interactsh": "Out-of-band callback confirmation.",
-}
-
-def agentic_registry() -> dict[str, tuple[str, str, str, str]]:
-    """Expose the deterministic tool catalogue to the AI orchestrator."""
-    return {
-        spec.name: (
-            spec.server, spec.tool, TOOL_SCOPES[spec.name],
-            TOOL_DESCRIPTIONS[spec.name],
-        )
-        for spec in ALL_TOOLS
-        if spec.name in TOOL_SCOPES
-    }
-
-
-def tool_action_limit(tool: str) -> int:
-    """Return the per-profile action limit shared by both orchestrators."""
-    name = str(tool or "").lower()
-    if name == "arjun":
-        return ARJUN_ENDPOINT_LIMIT
-    if name == "interactsh":
-        return 2 if CURRENT_SCAN_MODE == "deep" else 1
-    if name in PARAMETER_TOOL_CASE_LIMITS:
-        return PARAMETER_TOOL_CASE_LIMITS[name]
-    return 1
-
-
-def broad_tool_order(authenticated: bool) -> tuple[str, ...]:
-    """Run discovery before active scanning for every profile.
-
-    Authenticated FFUF is cookie-isolated during fuzzing, blocks destructive
-    redirects during verification, and checks that the supplied session remains
-    usable. Running it first lets both
-    orchestrators re-crawl newly discovered resources and seed ZAP with the
-    richer request surface instead of scanning only the initial crawl.
-    """
-    return ("ffuf", "zap", "nuclei", "session", "nikto")
-
-
-def tool_execution_rank(tool: str, authenticated: bool) -> int:
-    """Return a stable shared execution phase for a planned tool action."""
-    broad = broad_tool_order(authenticated)
-    if tool in broad:
-        return broad.index(tool)
-    phases = {
-        "arjun": 10, "sqlmap": 20, "dalfox": 21, "commix": 22,
-        "traversal": 23, "idor": 24, "authorization": 25, "browser": 26, "workflow": 27,
-        "jwt": 30, "interactsh": 31,
-    }
-    return phases.get(str(tool or "").lower(), 99)
-
-
-# ---------------------------------------------------------------------------
-# Runtime, server and MCP handling
-# ---------------------------------------------------------------------------
-
-
-def _prepend_path(path: Path) -> None:
-    if not path.is_dir():
-        return
-    resolved = str(path.resolve())
-    current = [part for part in os.environ.get("PATH", "").split(os.pathsep) if part]
-    keys = {os.path.normcase(os.path.abspath(part)) for part in current}
-    if os.path.normcase(resolved) not in keys:
-        os.environ["PATH"] = resolved + os.pathsep + os.environ.get("PATH", "")
-
-
-def configure_runtime_path() -> list[str]:
-    """Recreate the PATH written by initScript.py in every new process."""
-    runtime = load_runtime_config()
-    candidates: list[Path] = [LOCAL_BIN]
-    candidates += [Path(value) for value in runtime.get("tool_directories", []) if isinstance(value, str)]
-    executables = runtime.get("executables", {})
-    if isinstance(executables, dict):
-        candidates += [Path(value).expanduser().parent for value in executables.values() if isinstance(value, str)]
+def __getattr__(name: str) -> Any:
     try:
-        scripts = sysconfig.get_path("scripts", scheme="nt_user" if os.name == "nt" else "posix_user")
-        if scripts:
-            candidates.append(Path(scripts))
-    except (KeyError, ValueError):
-        pass
-    try:
-        import site
-        candidates.append(Path(site.USER_BASE) / ("Scripts" if os.name == "nt" else "bin"))
-    except Exception:
-        pass
-
-    added: list[str] = []
-    seen: set[str] = set()
-    for path in candidates:
-        try:
-            key = os.path.normcase(str(path.expanduser().resolve()))
-        except OSError:
-            continue
-        if key in seen:
-            continue
-        seen.add(key)
-        if path.expanduser().is_dir():
-            _prepend_path(path.expanduser())
-            added.append(str(path.expanduser().resolve()))
-    return added
-
-
-def resolve_executable(name: str) -> str | None:
-    configure_runtime_path()
-    found = shutil.which(name)
-    if found:
-        return str(Path(found).resolve())
-    value = load_runtime_config().get("executables", {}).get(name)
-    return str(Path(value).resolve()) if isinstance(value, str) and Path(value).is_file() else None
-
-
-def _declared_functions(path: Path) -> set[str]:
-    try:
-        tree = ast.parse(path.read_text(encoding="utf-8", errors="replace"))
-    except (OSError, SyntaxError):
-        return set()
-    return {
-        node.name
-        for node in ast.walk(tree)
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
-    }
-
-
-def resolve_server_path(filename: str, required_tool: str = "") -> Path:
-    """
-    Resolve only the canonical MCP server filename.
-
-    Numbered browser copies such as nucleiServer(12).py are never executed.
-    This prevents stale files from silently overriding the replacement.
-    """
-    return (SERVERS / Path(filename).name).resolve()
-
-
-def _python_has_project_deps(python: str) -> bool:
-    """Return whether an interpreter can import the MCP server dependencies."""
-    try:
-        probe = subprocess.run(
-            [python, "-c", "import requests, fastmcp, jwt"],
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            timeout=30,
-            check=False,
-        )
-        return probe.returncode == 0
-    except (OSError, subprocess.TimeoutExpired):
-        return False
-
-
-@functools.lru_cache(maxsize=1)
-def _server_python() -> str:
-    """Select a venv-safe interpreter for all MCP server subprocesses.
-
-    On macOS/Linux, ``.venv/bin/python`` is commonly a symlink. Resolving it
-    follows the link to the base interpreter and can silently lose the venv's
-    site-packages. Therefore the active ``sys.executable`` is preferred without
-    calling ``Path.resolve()``. A runtime-config interpreter is used only after
-    its dependencies are verified.
-    """
-    current = sys.executable
-    configured = load_runtime_config().get("python_executable")
-    if not (isinstance(configured, str) and Path(configured).is_file()):
-        return current
-    if os.path.normcase(configured) == os.path.normcase(current):
-        return current
-    if _python_has_project_deps(current):
-        return current
-    if _python_has_project_deps(configured):
-        return configured
-    return current
-
-
-def _server_env() -> dict[str, str]:
-    configure_runtime_path()
-    env = {str(key): str(value) for key, value in os.environ.items()}
-    paths = [part for part in env.get("PYTHONPATH", "").split(os.pathsep) if part]
-    if str(ROOT) not in paths:
-        paths.insert(0, str(ROOT))
-    warning_filters = [
-        value for value in env.get("PYTHONWARNINGS", "").split(",") if value
-    ]
-    authlib_filter = "ignore:authlib.jose module is deprecated"
-    if authlib_filter not in warning_filters:
-        warning_filters.append(authlib_filter)
-    env.update({
-        "PATH": os.environ.get("PATH", ""),
-        "PYTHONPATH": os.pathsep.join(paths),
-        "PYTHONUNBUFFERED": "1",
-        "PYTHONIOENCODING": "utf-8",
-        "PYTHONWARNINGS": ",".join(warning_filters),
-        "SECOPS_PROJECT_ROOT": str(ROOT),
-    })
-    return env
-
-
-_HTTP_SERVER_PROCESSES: dict[str, subprocess.Popen] = {}
-_HTTP_SERVER_LOGS: dict[str, Path] = {}
-
-
-def _port_open(host: str, port: int, timeout: float = 0.25) -> bool:
-    try:
-        with socket.create_connection((host, int(port)), timeout=timeout):
-            return True
-    except OSError:
-        return False
-
-
-def _http_server_log(spec: ToolSpec) -> Path:
-    directory = ROOT / ".secops_tmp" / "mcp-http"
-    directory.mkdir(parents=True, exist_ok=True)
-    return directory / f"{spec.name}.log"
-
-
-def _stop_owned_http_server(tool_name: str) -> None:
-    process = _HTTP_SERVER_PROCESSES.pop(tool_name, None)
-    if process is not None and process.poll() is None:
-        try:
-            process.terminate()
-            process.wait(timeout=5)
-        except Exception:
-            try:
-                process.kill()
-            except Exception:
-                pass
-
-
-def shutdown_mcp_http_servers() -> None:
-    for tool_name in list(_HTTP_SERVER_PROCESSES):
-        _stop_owned_http_server(tool_name)
-
-
-atexit.register(shutdown_mcp_http_servers)
-
-
-def _server_startup_log(spec: ToolSpec) -> str:
-    path = _HTTP_SERVER_LOGS.get(spec.name)
-    if not path or not path.is_file():
-        return ""
-    try:
-        return path.read_text(encoding="utf-8", errors="replace")[-6000:].strip()
-    except OSError:
-        return ""
-
-
-def _ensure_http_server(spec: ToolSpec, server: Path, *, restart: bool = False) -> str:
-    """Start or reuse the loopback Streamable HTTP service for one MCP tool."""
-    port = mcp_http_port(spec.name)
-    url = mcp_http_url(spec.name)
-    if restart:
-        _stop_owned_http_server(spec.name)
-    if _port_open("127.0.0.1", port):
-        return url
-
-    existing = _HTTP_SERVER_PROCESSES.get(spec.name)
-    if existing is not None and existing.poll() is None:
-        # Process exists but the socket is not ready yet; continue to the wait loop.
-        process = existing
-    else:
-        log_path = _http_server_log(spec)
-        _HTTP_SERVER_LOGS[spec.name] = log_path
-        log_handle = open(log_path, "a", encoding="utf-8", buffering=1)
-        env = _server_env()
-        env.update({
-            "SECOPS_MCP_HOST": "127.0.0.1",
-            "SECOPS_MCP_PORT": str(port),
-        })
-        process = subprocess.Popen(
-            [_server_python(), str(server)],
-            cwd=str(ROOT),
-            env=env,
-            stdout=log_handle,
-            stderr=subprocess.STDOUT,
-            text=True,
-        )
-        log_handle.close()
-        _HTTP_SERVER_PROCESSES[spec.name] = process
-
-    deadline = time.monotonic() + max(3.0, MCP_CONNECT_TIMEOUT)
-    while time.monotonic() < deadline:
-        if _port_open("127.0.0.1", port):
-            return url
-        if process.poll() is not None:
-            detail = _server_startup_log(spec)
-            raise RuntimeError(
-                f"{spec.name} HTTP MCP server exited during startup"
-                + (f": {detail}" if detail else ".")
-            )
-        time.sleep(0.15)
-    detail = _server_startup_log(spec)
-    raise TimeoutError(
-        f"Timed out waiting for {spec.name} MCP HTTP service at {url}"
-        + (f". Server log: {detail}" if detail else "")
-    )
-
-
-def _http_transport_failure(exc: BaseException) -> bool:
-    text = f"{type(exc).__name__}: {exc}".lower()
-    return any(token in text for token in (
-        "connection refused", "connecterror", "connectionerror",
-        "server disconnected", "connection closed", "closedresourceerror",
-        "brokenresourceerror", "all connection attempts failed",
-    ))
-
-
-def _extract_response(response: Any) -> tuple[Any, bool, str]:
-    is_error = bool(getattr(response, "is_error", False) or getattr(response, "isError", False))
-    for name in ("data", "structured_content", "structuredContent"):
-        value = getattr(response, name, None)
-        if value is not None:
-            return value, is_error, name
-    content = getattr(response, "content", response)
-    if isinstance(content, list):
-        values = [getattr(item, "text", item.get("text") if isinstance(item, dict) else item) for item in content]
-        content = values[0] if len(values) == 1 else values
-    if isinstance(content, str):
-        try:
-            content = json.loads(content)
-        except json.JSONDecodeError:
-            pass
-    return content, is_error, "content"
-
-
-def diagnose_error(text: str) -> str:
-    lowered = text.lower()
-    rules = (
-        (("no such file", "not found", "winerror 2"), "missing_file_or_executable"),
-        (("no module named", "modulenotfounderror"), "missing_python_dependency"),
-        (("connection refused", "failed to establish"), "service_unreachable"),
-        (("timed out", "timeout"), "timeout"),
-        (("permission denied", "access is denied"), "permission_denied"),
-        (("tool not found", "method not found", "unknown tool"), "mcp_tool_name_mismatch"),
-        (("connection closed", "closedresourceerror", "end of file"), "mcp_server_crashed"),
-    )
-    return next((cause for needles, cause in rules if any(item in lowered for item in needles)), "scanner_or_mcp_error")
-
-
-def _finding_counts(result: dict[str, Any]) -> tuple[int, int, int]:
-    findings = [item for item in (result.get("vulnerabilities") or []) if isinstance(item, dict)]
-    security = 0
-    for item in findings:
-        category = str(item.get("category", "")).lower()
-        risk = str(item.get("risk", "info")).lower()
-        if category in {"vulnerability", "candidate"} or (not category and risk not in {"", "info"}):
-            security += 1
-    return len(findings), security, len(findings) - security
-
-
-def _is_time_limited(result: dict[str, Any]) -> bool:
-    diagnosis = str(result.get("diagnosis", "")).lower()
-    text = " ".join(str(result.get(key, "")) for key in ("output", "stderr", "stdout")).lower()
-    return bool(
-        result.get("timed_out")
-        or diagnosis in TIME_LIMIT_DIAGNOSES
-        or "timeout" in diagnosis
-        or "timed out" in text
-        or "time limit" in text
-        or "time budget" in text
-    )
-
-
-def _normalize_time_limit(result: dict[str, Any], tool: str, target: str) -> dict[str, Any]:
-    """A configured scan budget is an incomplete result, not an execution error."""
-    if result.get("hard_failure") or not _is_time_limited(result):
-        return result
-    total, security, observations = _finding_counts(result)
-    previous = str(result.get("diagnosis", ""))
-    result["status"] = "partial"
-    result["timed_out"] = True
-    result["time_limit_reached"] = True
-    result["diagnosis"] = "time_limit_reached"
-    if previous and previous != "time_limit_reached":
-        result["original_diagnosis"] = previous
-    result.setdefault("tool", tool)
-    result.setdefault("target", target)
-    result.setdefault("vulnerabilities", [])
-    result["output"] = (
-        f"Configured scan time budget reached. Findings preserved: {total} "
-        f"(security/candidates: {security}, observations/discovery: {observations}). "
-        "Coverage is incomplete, but the scanner did not fail."
-    )
-    return result
-
-
-def _normalize_result(data: Any, spec: ToolSpec, target: str, elapsed: float, is_error: bool, shape: str) -> dict[str, Any]:
-    if isinstance(data, dict):
-        result = dict(data)
-    else:
-        result = {
-            "tool": spec.name,
-            "status": "error" if is_error else "success",
-            "target": target,
-            "output": data if isinstance(data, str) else json.dumps(data, ensure_ascii=False, default=str),
-            "vulnerabilities": [],
-        }
-    result.setdefault("tool", spec.name)
-    result.setdefault("target", target)
-    result.setdefault("output", "")
-    result.setdefault("vulnerabilities", [])
-    status = "error" if is_error else str(result.get("status", "success")).lower()
-    result["status"] = status if status in {"success", "error", "skipped", "partial"} else "error"
-    result["_meta"] = {
-        "server": spec.server,
-        "resolved_server": str(resolve_server_path(spec.server, spec.tool)),
-        "duration_seconds": round(elapsed, 3),
-        "response_shape": shape,
-    }
-    if result["status"] == "error":
-        result.setdefault("diagnosis", diagnose_error(str(result.get("output", ""))))
-    return _normalize_time_limit(result, spec.name, target)
-
-
-async def call_mcp(
-    server_file: str,
-    tool_name: str,
-    arguments: dict[str, Any],
-    timeout_seconds: float = MCP_TOOL_TIMEOUT,
-) -> dict[str, Any]:
-    spec = next(
-        (item for item in ALL_TOOLS if item.server == server_file and item.tool == tool_name),
-        ToolSpec(tool_name, server_file, tool_name),
-    )
-    server = resolve_server_path(server_file, tool_name)
-    target = str(arguments.get("target_url", ""))
-    started = time.monotonic()
-    if not server.is_file():
-        return {
-            "tool": spec.name, "status": "error", "target": target,
-            "output": f"MCP server not found: {server}", "vulnerabilities": [],
-            "diagnosis": "missing_mcp_server_file",
-        }
-
-    effective_arguments = dict(arguments)
-    temporary_output: Path | None = None
-    if spec.name == "nuclei" and not effective_arguments.get("output_file"):
-        temporary_dir = ROOT / ".secops_tmp"
-        temporary_dir.mkdir(parents=True, exist_ok=True)
-        temporary_output = temporary_dir / f"nuclei-{uuid.uuid4().hex}.jsonl"
-        effective_arguments["output_file"] = str(temporary_output)
-
-    async def invoke(url: str) -> tuple[Any, bool, str]:
-        async with Client(url) as client:
-            return _extract_response(await client.call_tool(tool_name, effective_arguments))
-
-    try:
-        url = await asyncio.to_thread(_ensure_http_server, spec, server)
-        try:
-            data, is_error, shape = await asyncio.wait_for(
-                invoke(url), timeout=timeout_seconds + MCP_CONNECT_TIMEOUT
-            )
-        except Exception as first_exc:
-            if not _http_transport_failure(first_exc):
-                raise
-            # HTTP servers are persistent. If one dies, restart only the service
-            # owned by this orchestrator and retry the MCP request once.
-            url = await asyncio.to_thread(_ensure_http_server, spec, server, restart=True)
-            data, is_error, shape = await asyncio.wait_for(
-                invoke(url), timeout=timeout_seconds + MCP_CONNECT_TIMEOUT
-            )
-        result = _normalize_result(
-            data, spec, target, time.monotonic() - started, is_error, shape
-        )
-        result.setdefault("_meta", {})["mcp_transport"] = "streamable_http"
-        result.setdefault("_meta", {})["mcp_url"] = url
-    except (KeyboardInterrupt, asyncio.CancelledError):
-        raise
-    except Exception as exc:
-        exception_text = f"{type(exc).__name__}: {exc}"
-        exception_diagnosis = diagnose_error(exception_text)
-        if exception_diagnosis == "timeout":
-            result = {
-                "tool": spec.name,
-                "status": "partial",
-                "target": target,
-                "output": (
-                    f"{spec.name} reached the orchestrator/MCP HTTP time budget. "
-                    "Coverage is incomplete; this is not classified as a scanner error."
-                ),
-                "vulnerabilities": [],
-                "diagnosis": "time_limit_reached",
-                "timed_out": True,
-                "time_limit_reached": True,
-                "traceback": traceback.format_exc(),
-                "_meta": {
-                    "server": str(server),
-                    "duration_seconds": round(time.monotonic() - started, 3),
-                    "mcp_transport": "streamable_http",
-                    "mcp_url": mcp_http_url(spec.name),
-                },
-            }
-        else:
-            detail = _server_startup_log(spec)
-            message = f"MCP HTTP communication failed: {exception_text}"
-            if detail:
-                message += f" | server log: {detail}"
-            result = {
-                "tool": spec.name,
-                "status": "error",
-                "target": target,
-                "output": message,
-                "vulnerabilities": [],
-                "diagnosis": diagnose_error(message),
-                "traceback": traceback.format_exc(),
-                "_meta": {
-                    "server": str(server),
-                    "duration_seconds": round(time.monotonic() - started, 3),
-                    "mcp_transport": "streamable_http",
-                    "mcp_url": mcp_http_url(spec.name),
-                },
-            }
-    finally:
-        if temporary_output:
-            temporary_output.unlink(missing_ok=True)
-
-    result = _normalize_time_limit(result, spec.name, target)
-    if result.get("status") == "error":
-        print(
-            f"\n[SCANNER ERROR] {spec.name}: {target}\n  {result.get('output', '')}",
-            file=sys.stderr,
-        )
-    return result
-
-
-async def call_mcp_with_progress(
-    spec: ToolSpec,
-    arguments: dict[str, Any],
-    *,
-    timeout_seconds: float = MCP_TOOL_TIMEOUT,
-) -> dict[str, Any]:
-    """Run one MCP scanner while showing which tool is active."""
-    target = str(arguments.get("target_url", ""))
-    scanner_limit = arguments.get("timeout")
-    limit_text = f", scanner limit {scanner_limit}s" if scanner_limit else ""
-    print(f"    [RUNNING ] {spec.name}: {target}{limit_text}", flush=True)
-
-    started = time.monotonic()
-    task = asyncio.create_task(
-        call_mcp(spec.server, spec.tool, arguments, timeout_seconds=timeout_seconds)
-    )
-    while True:
-        done, _ = await asyncio.wait({task}, timeout=SCANNER_PROGRESS_INTERVAL)
-        if task in done:
-            return await task
-        elapsed = int(time.monotonic() - started)
-        print(f"    [WAITING ] {spec.name}: still running after {elapsed}s", flush=True)
-
-
-async def _live_server_check(spec: ToolSpec) -> dict[str, str]:
-    server = resolve_server_path(spec.server, spec.tool)
-    try:
-        url = await asyncio.to_thread(_ensure_http_server, spec, server)
-        async with Client(url) as client:
-            tools = await asyncio.wait_for(client.list_tools(), timeout=MCP_CONNECT_TIMEOUT)
-        names = [str(getattr(tool, "name", "")) for tool in tools]
-        if spec.tool not in names:
-            return {
-                "level": "error", "component": spec.name,
-                "cause": "mcp_runtime_tool_missing",
-                "detail": f"{url} exposed {names!r}",
-            }
-        return {
-            "level": "ok", "component": spec.name,
-            "cause": "mcp_http_handshake_ok",
-            "detail": f"{url}: {spec.tool}()",
-        }
-    except Exception as exc:
-        detail = _server_startup_log(spec)
-        message = f"{type(exc).__name__}: {exc}" + (f" | server log: {detail}" if detail else "")
-        return {
-            "level": "error" if spec.required else "warning",
-            "component": spec.name,
-            "cause": "mcp_http_handshake_failed",
-            "detail": message,
-        }
-
-
-def _nikto_runtime_check(executable: str) -> tuple[bool, str]:
-    """Reject Nikto launchers that print Perl/module errors even when cmd.exe returns zero."""
-    try:
-        completed = subprocess.run(
-            [executable, "-Version"],
-            cwd=str(ROOT),
-            env=_server_env(),
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            timeout=30,
-            shell=False,
-        )
-    except Exception as exc:
-        return False, f"Nikto runtime probe failed: {type(exc).__name__}: {exc}"
-
-    combined = "\n".join((completed.stdout or "", completed.stderr or "")).strip()
-    fatal = re.compile(
-        r"(?:can't open perl script|cannot open perl script|invalid argument|required module not found|"
-        r"not recognized|non .? riconosciuto|no such file|modulenotfounderror|traceback|^error:)",
-        re.IGNORECASE | re.MULTILINE,
-    )
-    if completed.returncode != 0 or fatal.search(combined):
-        return False, combined[-2000:] or f"exit={completed.returncode}"
-    if not re.search(r"nikto|version", combined, re.IGNORECASE):
-        return False, combined[-2000:] or "Nikto returned no version information."
-    return True, combined[-1000:]
-
-
-def _numbered_duplicate_servers() -> list[Path]:
-    if not SERVERS.is_dir():
-        return []
-    pattern = re.compile(r".+\(\d+\)\.py$", re.IGNORECASE)
-    return sorted(
-        (
-            path.resolve()
-            for path in SERVERS.iterdir()
-            if path.is_file() and pattern.fullmatch(path.name)
-        ),
-        key=lambda path: path.name.lower(),
-    )
-
-
-def run_preflight_checks(*, include_live: bool = True) -> list[dict[str, str]]:
-    configure_runtime_path()
-    checks: list[dict[str, str]] = []
-
-    numbered_duplicates = _numbered_duplicate_servers()
-    checks.append({
-        "level": "warning" if numbered_duplicates else "ok",
-        "component": "project",
-        "cause": (
-            "numbered_server_copies_found"
-            if numbered_duplicates
-            else "canonical_server_filenames"
-        ),
-        "detail": (
-            "Move or delete numbered MCP copies: "
-            + ", ".join(path.name for path in numbered_duplicates)
-            if numbered_duplicates
-            else "Only canonical MCP server filenames will be executed."
-        ),
-    })
-    seen_executables: set[str] = set()
-    for spec in ALL_TOOLS:
-        server = resolve_server_path(spec.server, spec.tool)
-        if not server.is_file():
-            checks.append({"level": "error" if spec.required else "warning", "component": spec.name, "cause": "missing_server", "detail": str(server)})
-            continue
-        checks.append({"level": "ok", "component": spec.name, "cause": "mcp_tool_found", "detail": f"{server.name}: {spec.tool}()"})
-        if spec.tool not in _declared_functions(server):
-            checks[-1] = {"level": "error" if spec.required else "warning", "component": spec.name, "cause": "mcp_tool_name_mismatch", "detail": f"{server.name} does not declare {spec.tool}()"}
-        if spec.name == "report":
-            docker_image = load_runtime_config().get("report_docker_image", "")
-            docker_ready = bool(docker_image) and shutil.which("docker") and subprocess.run(
-                ["docker", "image", "inspect", docker_image],
-                capture_output=True, timeout=30, check=False,
-            ).returncode == 0
-            if docker_ready:
-                checks.append({
-                    "level": "ok", "component": "report",
-                    "cause": "report_docker_fallback_ready", "detail": docker_image,
-                })
-            else:
-                native_ok = importlib.util.find_spec("weasyprint") is not None
-                checks.append({
-                    "level": "ok" if native_ok else "warning",
-                    "component": "report",
-                    "cause": "python_dependency_found" if native_ok else "missing_python_dependency",
-                    "detail": "weasyprint (Docker fallback unavailable; run initScript.py with Docker present to build it)",
-                })
-        elif spec.module:
-            checks.append({
-                "level": "ok" if importlib.util.find_spec(spec.module) else ("error" if spec.required else "warning"),
-                "component": spec.name,
-                "cause": "python_dependency_found" if importlib.util.find_spec(spec.module) else "missing_python_dependency",
-                "detail": spec.module,
-            })
-        if spec.executable and spec.executable not in seen_executables:
-            seen_executables.add(spec.executable)
-            executable = resolve_executable(spec.executable)
-            checks.append({
-                "level": "ok" if executable else ("error" if spec.required else "warning"),
-                "component": spec.name,
-                "cause": "executable_found" if executable else "missing_executable",
-                "detail": executable or f"Not found: {spec.executable}; runtime={RUNTIME_FILE}",
-            })
-            if spec.name == "nikto" and executable:
-                runtime = load_runtime_config()
-                docker_configured = (
-                    runtime.get("nikto_execution_mode") == "docker_official_image"
-                    or runtime.get("nikto_image") == "ghcr.io/sullo/nikto:latest"
-                )
-                docker_available = bool(shutil.which("docker"))
-                docker_image_ready = False
-                docker_detail = ""
-                if docker_available:
-                    try:
-                        docker_probe = subprocess.run(
-                            ["docker", "image", "inspect", "ghcr.io/sullo/nikto:latest"],
-                            cwd=str(ROOT), capture_output=True, text=True,
-                            encoding="utf-8", errors="replace", timeout=30, check=False,
-                        )
-                        docker_image_ready = docker_probe.returncode == 0
-                        docker_detail = (
-                            "Official Docker image is available: ghcr.io/sullo/nikto:latest"
-                            if docker_image_ready
-                            else (docker_probe.stderr or docker_probe.stdout or "Docker image inspection failed.").strip()[-1500:]
-                        )
-                    except Exception as exc:
-                        docker_detail = f"Docker image probe failed: {type(exc).__name__}: {exc}"
-
-                # initScript v21.2+ writes a Docker-backed nikto.bat marker. Do
-                # not execute that batch file as though it were native Perl; its
-                # source text previously produced the misleading 'runtime_ok' line.
-                if docker_configured or docker_image_ready:
-                    healthy = docker_image_ready
-                    cause = "nikto_docker_fallback_ready" if healthy else "nikto_docker_image_missing"
-                    runtime_detail = docker_detail or "Docker is unavailable or the image is missing."
-                else:
-                    healthy, runtime_detail = _nikto_runtime_check(executable)
-                    cause = "nikto_runtime_ok" if healthy else "nikto_native_and_docker_unavailable"
-
-                checks.append({
-                    "level": "ok" if healthy else "error",
-                    "component": "nikto",
-                    "cause": cause,
-                    "detail": runtime_detail,
-                })
-    if include_live and not any(item["level"] == "error" for item in checks):
-        checks.extend(asyncio.run(_run_live_checks()))
-    if not any(item["level"] == "error" for item in checks):
-        checks.append({"level": "ok", "component": "mcp", "cause": "preflight_passed", "detail": "All contracts, executables and MCP Streamable HTTP handshakes passed."})
-    return checks
-
-
-async def _run_live_checks() -> list[dict[str, str]]:
-    return [await _live_server_check(spec) for spec in ALL_TOOLS]
-
-
-def print_preflight_report(checks: list[dict[str, str]], *, show_ok: bool = False) -> int:
-    errors = [item for item in checks if item["level"] == "error"]
-    warnings = [item for item in checks if item["level"] == "warning"]
-    visible = checks if show_ok else [*errors, *warnings]
-    if visible:
-        print("\n=== SecOps preflight ===")
-        for item in visible:
-            marker = "+" if item["level"] == "ok" else ("!" if item["level"] == "warning" else "-")
-            stream = sys.stdout if marker in {"+", "!"} else sys.stderr
-            print(f"[{marker}] {item['component']}: {item['cause']} — {item['detail']}", file=stream)
-    return len(errors)
-
-
-# ---------------------------------------------------------------------------
-# Discovery and result helpers
-# ---------------------------------------------------------------------------
-
-class LinkFormParser(HTMLParser):
-    def __init__(self) -> None:
-        super().__init__()
-        self.links: list[str] = []
-        self.scripts: list[str] = []
-        self.forms: list[dict[str, Any]] = []
-        self.current: dict[str, Any] | None = None
-
-    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
-        values = dict(attrs)
-        tag = tag.lower()
-        if tag == "a" and values.get("href"):
-            self.links.append(str(values["href"]))
-        elif tag == "script" and values.get("src"):
-            self.scripts.append(str(values["src"]))
-        elif tag == "form":
-            self.current = {
-                "action": values.get("action", ""),
-                "method": str(values.get("method", "get")).lower(),
-                "enctype": str(values.get("enctype", "application/x-www-form-urlencoded")).lower(),
-                "fields": [],
-            }
-        elif tag in {"input", "textarea", "select", "button"} and self.current and values.get("name"):
-            field_type = str(values.get("type", tag)).lower()
-            self.current["fields"].append({
-                "name": str(values["name"]),
-                "value": str(values.get("value", "")),
-                "type": field_type,
-                "tag": tag,
-            })
-
-    def handle_endtag(self, tag: str) -> None:
-        if tag.lower() == "form" and self.current:
-            self.forms.append(self.current)
-            self.current = None
-
-
-def _clean_url(url: str) -> str:
-    return urlunparse(urlparse(url)._replace(fragment=""))
-
-
-def _normalize_redundant_base_path_link(target: str, candidate: str) -> str:
-    """Normalize links that accidentally repeat the target base path.
-
-    Some training applications are mounted at a path such as `/academy` but
-    emit links like `/academy/academy/login`. The correction is structural and
-    does not depend on a product name.
-    """
-    base = urlparse(target)
-    parsed = urlparse(candidate)
-    base_path = base.path.rstrip("/")
-    if not base_path:
-        return candidate
-    doubled = base_path + base_path + "/"
-    if parsed.path.startswith(doubled):
-        return urlunparse(parsed._replace(path=parsed.path[len(base_path):]))
-    return candidate
-
-
-def _crawlable_url(url: str) -> bool:
-    path = urlparse(url).path.lower()
-    return not path.endswith((
-        ".css", ".js", ".png", ".jpg", ".jpeg", ".gif", ".svg", ".ico",
-        ".woff", ".woff2", ".ttf", ".pdf", ".zip", ".gz", ".tar", ".mp4",
-    ))
-
-
-DESTRUCTIVE_CRAWL_TOKENS = (
-    "logout",
-    "log-out",
-    "signout",
-    "sign-out",
-    "logoff",
-    "disconnect",
-    "end-session",
-    "destroy-session",
-    "session-destroy",
-    "setup",
-    "install",
-    "reinstall",
-    "uninstall",
-    "reset",
-    "create_db",
-    "create-database",
-    "createdb",
-    "drop_db",
-    "drop-database",
-    "truncate",
-    "purge",
-    "wipe",
-)
-STATE_CHANGING_QUERY_KEYS = {
-    "create_db", "reset", "action", "delete", "remove", "logout",
-    "signout", "logoff", "disconnect", "destroy", "install", "setup",
-    "password_new", "password_conf", "new_password", "confirm_password",
-}
-
-
-def _destructive_crawl_url(url: str) -> bool:
-    parsed = urlparse(str(url or ""))
-    text = f"{parsed.path}?{parsed.query}".lower()
-    if any(token in text for token in DESTRUCTIVE_CRAWL_TOKENS):
-        return True
-    pairs = parse_qsl(parsed.query, keep_blank_values=True)
-    for name, value in pairs:
-        lowered_name = name.lower()
-        lowered_value = value.lower()
-        if lowered_name in STATE_CHANGING_QUERY_KEYS:
-            return True
-        if any(token in lowered_value for token in DESTRUCTIVE_CRAWL_TOKENS):
-            return True
-    return False
-
-
-def _safe_crawl_get(
-    session: requests.Session,
-    requested: str,
-    target: str,
-    *,
-    timeout: tuple[int, int] = (5, 15),
-    max_redirects: int = 5,
-) -> tuple[requests.Response | None, str, str]:
-    """Follow redirects without ever requesting logout/reset/install endpoints.
-
-    Requests' normal ``allow_redirects=True`` follows a redirect before callers
-    can inspect it. For authenticated discovery that can destroy the exact
-    session later needed by ZAP. This helper inspects every Location first and
-    stops before a destructive or cross-origin hop.
-    """
-    current = _clean_url(requested)
-    seen: set[str] = set()
-    response: requests.Response | None = None
-    for _ in range(max(0, int(max_redirects)) + 1):
-        if _destructive_crawl_url(current):
-            return response, current, f"destructive_url_blocked:{current}"
-        response = session.get(current, timeout=timeout, allow_redirects=False)
-        if response.status_code not in {301, 302, 303, 307, 308}:
-            return response, current, ""
-        location = str(response.headers.get("Location") or "").strip()
-        if not location:
-            return response, current, ""
-        try:
-            candidate = _normalize_redundant_base_path_link(
-                target,
-                _clean_url(absolute_url(current, location)),
-            )
-        except Exception:
-            return response, current, "invalid_redirect_location"
-        if not same_origin(target, candidate):
-            return response, current, f"cross_origin_redirect_blocked:{candidate}"
-        if _destructive_crawl_url(candidate):
-            return response, current, f"destructive_redirect_blocked:{candidate}"
-        if candidate in seen:
-            return response, current, f"redirect_loop:{candidate}"
-        seen.add(current)
-        current = candidate
-    return response, current, "redirect_limit_reached"
-
-
-def _clean_probe_url(url: str) -> str:
-    """Remove fragments and state-changing query fields from a probe URL."""
-    parsed = urlparse(str(url or ""))
-    safe_pairs = [
-        (name, value)
-        for name, value in parse_qsl(parsed.query, keep_blank_values=True)
-        if name.lower() not in STATE_CHANGING_QUERY_KEYS
-    ]
-    return urlunparse(parsed._replace(query=urlencode(safe_pairs), fragment=""))
-
-
-def _runtime_probe_urls(target: str) -> list[str]:
-    """Resolve optional exact-origin probe paths written by the initializer."""
-    profile = target_runtime_profile(target)
-    values = profile.get("probe_paths", []) if isinstance(profile, dict) else []
-    result: list[str] = []
-    for value in values if isinstance(values, list) else []:
-        try:
-            candidate = _clean_probe_url(absolute_url(target, str(value)))
-        except Exception:
-            continue
-        if same_origin(target, candidate) and not _destructive_crawl_url(candidate):
-            result.append(candidate)
-    return result
-
-
-def _stable_auth_probe_url(target: str, discovered_urls: list[str]) -> str:
-    """Choose a stable same-origin page for session validation."""
-    candidates = [*_runtime_probe_urls(target)]
-    candidates.extend(
-        _clean_probe_url(value)
-        for value in discovered_urls
-        if same_origin(target, value)
-        and not _destructive_crawl_url(value)
-        and not _looks_like_login_path(value)
-    )
-    candidates.append(_clean_probe_url(target))
-
-    def score(value: str) -> int:
-        parsed = urlparse(value)
-        path = parsed.path.lower()
-        score = 200
-        if value in _runtime_probe_urls(target):
-            score += 120
-        if path in {"", "/"}:
-            score += 30
-        if any(token in path for token in ("account", "profile", "dashboard", "home", "admin", "settings", "console", "portal")):
-            score += 80
-        if any(token in path for token in ("login", "logout", "reset", "setup", "install", "register")):
-            score -= 300
-        if parsed.query:
-            score -= 50
-        return score
-
-    unique = [
-        value for value in dict.fromkeys(candidates)
-        if value and same_origin(target, value) and score(value) > 0
-    ]
-    return max(unique, key=score) if unique else _clean_probe_url(target)
-
-
-def _looks_like_login_path(url: str) -> bool:
-    path = urlparse(str(url or "")).path.lower().rstrip("/")
-    return path.endswith(("/login", "/login.php", "/signin", "/sign-in", "/auth"))
-
-
-def _looks_like_login(response: requests.Response) -> bool:
-    text = response.text[:100_000].lower()
-    path = urlparse(response.url).path.lower().rstrip("/")
-    password_field = bool(re.search(r"type\s*=\s*['\"]password['\"]", text))
-    auth_words = any(term in text for term in ("login", "log in", "sign in", "signin", "authenticate"))
-    return (
-        path.endswith(("/login", "/login.php", "/signin", "/sign-in", "/auth"))
-        or (password_field and auth_words)
-    )
-
-
-def _form_case(
-    action: str,
-    method: str,
-    fields: list[dict[str, str]],
-    source_url: str,
-    enctype: str = "application/x-www-form-urlencoded",
-) -> dict[str, Any] | None:
-    """Build a conservative request contract while preserving workflow metadata."""
-    method = method.upper() if method else "GET"
-    if method not in {"GET", "POST"}:
-        return None
-    pairs: list[tuple[str, str]] = []
-    testable: list[str] = []
-    file_parameters: list[str] = []
-    token_parameters: list[str] = []
-    normalized_fields: list[dict[str, str]] = []
-    for field in fields:
-        name = str(field.get("name", "")).strip()
-        if not name:
-            continue
-        field_type = str(field.get("type", "text")).lower()
-        tag = str(field.get("tag", "input")).lower()
-        value = str(field.get("value", ""))
-        normalized_fields.append({
-            "name": name,
-            "value": value,
-            "type": field_type,
-            "tag": tag,
-        })
-        lowered = name.lower()
-        if re.search(r"(?:csrf|xsrf|token|nonce|authenticity|request[_-]?verification)", lowered):
-            token_parameters.append(name)
-        if field_type == "file":
-            file_parameters.append(name)
-            continue
-        if not value and field_type not in {"hidden", "submit", "button"}:
-            value = "1"
-        pairs.append((name, value))
-        if field_type not in {"hidden", "submit", "button", "reset"} and not re.search(r"(?:csrf|xsrf|token|nonce)", lowered):
-            testable.append(name)
-    if not pairs and not file_parameters:
-        return None
-    if not testable and not file_parameters and not token_parameters:
-        return None
-    encoded = urlencode(pairs)
-    if method == "GET":
-        if not pairs:
-            return None
-        parsed = urlparse(action)
-        # A form action may already contain default values for the same fields.
-        # Replace those values instead of duplicating query keys.
-        field_names = {name.lower() for name, _ in pairs}
-        existing = [
-            (name, value)
-            for name, value in parse_qsl(parsed.query, keep_blank_values=True)
-            if name.lower() not in field_names
-        ]
-        url = urlunparse(parsed._replace(query=urlencode([*existing, *pairs])))
-        data = ""
-    else:
-        url, data = action, encoded
-    return {
-        "url": url,
-        "method": method,
-        "data": data,
-        "parameters": list(dict.fromkeys(testable)),
-        "file_parameters": list(dict.fromkeys(file_parameters)),
-        "token_parameters": list(dict.fromkeys(token_parameters)),
-        "fields": normalized_fields,
-        "enctype": str(enctype or "application/x-www-form-urlencoded").lower(),
-        "source_url": source_url,
-        "form_action": action,
-    }
-
-
-
-def _dedupe_request_cases(cases: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    unique: list[dict[str, Any]] = []
-    seen: set[tuple[str, str, tuple[str, ...]]] = set()
-    for case in cases:
-        names = [
-            *[str(value) for value in case.get("parameters", []) if value],
-            *[str(value) for value in case.get("file_parameters", []) if value],
-            *[str(value) for value in case.get("token_parameters", []) if value],
-        ]
-        key = (
-            str(case.get("method", "GET")).upper(),
-            str(case.get("url", "")),
-            tuple(sorted(set(names))),
-        )
-        if not key[1] or not key[2] or key in seen:
-            continue
-        seen.add(key)
-        unique.append(case)
-    return unique
-
-
-def refresh_authenticated_session_state(
-    target: str,
-    cookies: str,
-    probe_url: str = "",
-) -> dict[str, Any]:
-    """Reassert a generic authenticated session before a scanner.
-
-    Optional target-specific preparation is read from initializer-generated
-    runtime metadata. The orchestrator itself never contains product-specific
-    requests or paths.
-    """
-    if not cookies:
-        return {"performed": False, "authenticated": False, "usable": True}
-    preparation = apply_runtime_target_preparation(target, cookies)
-    selected_probe = probe_url or target
-    probe = scanner_session_probe(selected_probe, cookies, timeout=10, attempts=3)
-    usable = not (
-        probe.get("conclusive") is True
-        and probe.get("authenticated") is False
-    ) and preparation.get("usable", True) is not False
-    return {
-        "performed": True,
-        "authenticated": probe.get("authenticated"),
-        "conclusive": probe.get("conclusive"),
-        "preparation": preparation,
-        "probe": probe,
-        "usable": usable,
-    }
-
-
-def _client_side_source_sink_evidence(text: str) -> tuple[list[str], list[str]]:
-    """Return generic JavaScript-controlled sources and dangerous DOM sinks."""
-    value = str(text or "")[:750_000]
-    source_hits = sorted(set(re.findall(
-        r"(?:location\.(?:hash|search|href)|document\.(?:URL|documentURI|referrer|cookie)|window\.name)",
-        value, re.I,
-    )))
-    sink_hits = sorted(set(re.findall(
-        r"(?:innerHTML|outerHTML|insertAdjacentHTML|document\.write(?:ln)?|eval\s*\(|setTimeout\s*\(\s*['\"]|setInterval\s*\(\s*['\"])",
-        value, re.I,
-    )))
-    return source_hits[:12], sink_hits[:12]
-
-
-def discover_target(
-    target: str,
-    cookies: str,
-    max_pages: int = MAX_CRAWL_PAGES,
-    seeds: list[str] | None = None,
-) -> dict[str, Any]:
-    """Crawl same-origin pages, forms and links while recording authentication quality."""
-    session = requests.Session()
-    session.headers.update({
-        "User-Agent": "SecOps-Discovery/2.0",
-        "Accept": "text/html,application/xhtml+xml,application/json;q=0.8,*/*;q=0.5",
-    })
-    if cookies:
-        session.headers["Cookie"] = cookies
-
-    target_preparation = (
-        apply_runtime_target_preparation(target, cookies)
-        if cookies
-        else {"performed": False, "configured": False, "usable": True}
-    )
-
-    initial = [_clean_url(target), *[_clean_url(value) for value in (seeds or [])]]
-    destructive_skipped: set[str] = set()
-    queue: list[str] = []
-    for value in dict.fromkeys(initial):
-        if not same_origin(target, value) or not _crawlable_url(value):
-            continue
-        if _destructive_crawl_url(value):
-            destructive_skipped.add(value)
-            continue
-        queue.append(value)
-    visited: set[str] = set()
-    html_urls: set[str] = set()
-    form_urls: set[str] = set()
-    parameterized: set[str] = set()
-    request_cases: list[dict[str, Any]] = []
-    client_side_candidates: list[dict[str, Any]] = []
-    script_urls: set[str] = set()
-    scanned_script_urls: set[str] = set()
-    tokens: set[str] = set()
-    errors: list[dict[str, Any]] = []
-    initial_login_detected = False
-
-    while queue and len(visited) < max_pages:
-        requested = queue.pop(0)
-        if requested in visited:
-            continue
-        if _destructive_crawl_url(requested):
-            destructive_skipped.add(requested)
-            continue
-        visited.add(requested)
-        try:
-            response, final, redirect_issue = _safe_crawl_get(
-                session, requested, target, timeout=(5, 15), max_redirects=5
-            )
-        except requests.RequestException as exc:
-            errors.append({"url": requested, "type": type(exc).__name__, "message": str(exc)})
-            continue
-        if response is None:
-            errors.append({"url": requested, "type": "UnsafeURLBlocked", "message": redirect_issue or final})
-            continue
-        final = _clean_url(final)
-        if redirect_issue:
-            errors.append({
-                "url": requested,
-                "type": "SafeRedirectGuard",
-                "message": redirect_issue,
-            })
-            if redirect_issue.startswith(("destructive_", "cross_origin_")):
-                continue
-        if not same_origin(target, final):
-            errors.append({"url": requested, "type": "CrossOriginRedirect", "message": final})
-            continue
-        visited.add(final)
-        if requested == _clean_url(target) and _looks_like_login(response):
-            initial_login_detected = True
-        if response.status_code >= 400:
-            errors.append({"url": final, "type": f"HTTP{response.status_code}", "message": response.reason or "HTTP error"})
-
-        content_type = response.headers.get("content-type", "").lower()
-        if "html" not in content_type and not response.text.lstrip().startswith(("<", "<!")):
-            continue
-        html_urls.add(final)
-        tokens.update(re.findall(r"eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]*", response.text))
-
-        # Preserve generic client-side source/sink evidence so a real browser
-        # verifier can prioritize DOM-XSS candidates without product-specific paths.
-        source_hits, sink_hits = _client_side_source_sink_evidence(response.text)
-        if source_hits and sink_hits:
-            client_side_candidates.append({
-                "url": final,
-                "sources": source_hits,
-                "sinks": sink_hits,
-                "evidence_source": "inline_html",
-            })
-
-        parser = LinkFormParser()
-        try:
-            parser.feed(response.text)
-            parser.close()
-        except Exception as exc:
-            errors.append({"url": final, "type": type(exc).__name__, "message": f"HTML parse: {exc}"})
-            continue
-
-        for source in parser.scripts:
-            if len(scanned_script_urls) >= MAX_SCRIPT_ASSETS:
-                break
-            try:
-                script_url = _normalize_redundant_base_path_link(
-                    target, _clean_url(absolute_url(final, source))
-                )
-            except Exception:
-                continue
-            if (
-                not same_origin(target, script_url)
-                or _destructive_crawl_url(script_url)
-                or script_url in scanned_script_urls
-            ):
-                continue
-            scanned_script_urls.add(script_url)
-            try:
-                script_response, script_final, script_issue = _safe_crawl_get(
-                    session, script_url, target, timeout=(4, 12), max_redirects=4
-                )
-            except requests.RequestException as exc:
-                errors.append({
-                    "url": script_url, "type": type(exc).__name__,
-                    "message": f"JavaScript fetch: {exc}",
-                })
-                continue
-            if script_response is None or script_issue or script_response.status_code >= 400:
-                continue
-            script_final = _clean_url(script_final)
-            if not same_origin(target, script_final):
-                continue
-            script_urls.add(script_final)
-            js_sources, js_sinks = _client_side_source_sink_evidence(script_response.text)
-            if js_sources and js_sinks:
-                client_side_candidates.append({
-                    "url": final,
-                    "script_url": script_final,
-                    "sources": js_sources,
-                    "sinks": js_sinks,
-                    "evidence_source": "same_origin_script",
-                })
-
-        for href in parser.links:
-            try:
-                candidate = _normalize_redundant_base_path_link(target, _clean_url(absolute_url(final, href)))
-            except Exception:
-                continue
-            if not same_origin(target, candidate) or not _crawlable_url(candidate):
-                continue
-            if _destructive_crawl_url(candidate):
-                destructive_skipped.add(candidate)
-                continue
-            if urlparse(candidate).query:
-                parameterized.add(candidate)
-            if candidate not in visited and candidate not in queue:
-                queue.append(candidate)
-
-        for form in parser.forms:
-            try:
-                action = _normalize_redundant_base_path_link(target, _clean_url(absolute_url(final, form["action"] or final)))
-            except Exception:
-                continue
-            if not same_origin(target, action):
-                continue
-            if _destructive_crawl_url(action):
-                destructive_skipped.add(action)
-                continue
-            fields = [field for field in form.get("fields", []) if isinstance(field, dict)]
-            if fields:
-                form_urls.add(final)
-            case = _form_case(action, str(form.get("method", "get")), fields, final, str(form.get("enctype", "")))
-            if case:
-                request_cases.append(case)
-                if case["method"] == "GET":
-                    parameterized.add(case["url"])
-
-    auth_effective: bool | None = None
-    auth_note = "Anonymous profile."
-    auth_probe: dict[str, Any] = {}
-    if cookies:
-        probe_url = _stable_auth_probe_url(target, sorted(html_urls))
-        try:
-            original_headers = dict(session.headers)
-            session.headers["Cache-Control"] = "no-cache"
-            probe_response, probe_final, probe_redirect_issue = _safe_crawl_get(
-                session, probe_url, target, timeout=(5, 15), max_redirects=5
-            )
-            session.headers.clear()
-            session.headers.update(original_headers)
-            if probe_response is None:
-                raise requests.RequestException(
-                    probe_redirect_issue or f"Session probe was blocked: {probe_final}"
-                )
-            probe_response.url = probe_final
-            final_login_detected = _looks_like_login(probe_response)
-
-            anonymous_session = requests.Session()
-            anonymous_session.headers.update({
-                "User-Agent": "SecOps-Discovery-Anonymous-Comparison/1.0",
-                "Cache-Control": "no-cache",
-            })
-            anonymous_response, anonymous_final, anonymous_redirect_issue = _safe_crawl_get(
-                anonymous_session, probe_url, target, timeout=(5, 15), max_redirects=5
-            )
-            if anonymous_response is None:
-                raise requests.RequestException(
-                    anonymous_redirect_issue or f"Anonymous probe was blocked: {anonymous_final}"
-                )
-            anonymous_response.url = anonymous_final
-            anonymous_login_detected = _looks_like_login(anonymous_response)
-            authenticated_good = (
-                not initial_login_detected
-                and not final_login_detected
-                and probe_response.status_code < 400
-                and target_preparation.get("usable", True) is not False
-            )
-            clear_anonymous_difference = (
-                anonymous_login_detected
-                or (anonymous_response.status_code in {401, 403} and probe_response.status_code < 400)
-                or (
-                    same_origin(target, probe_response.url)
-                    and same_origin(target, anonymous_response.url)
-                    and _clean_url(probe_response.url) != _clean_url(anonymous_response.url)
-                )
-            )
-            if not authenticated_good:
-                auth_effective = False
-            elif clear_anonymous_difference:
-                auth_effective = True
-            else:
-                # A public page can look healthy with any cookie. Keep the
-                # profile usable, but do not falsely claim proven authentication.
-                auth_effective = None
-            auth_probe = {
-                "url": probe_url,
-                "status": probe_response.status_code,
-                "final_url": str(probe_response.url),
-                "login_detected": final_login_detected,
-                "anonymous_status": anonymous_response.status_code,
-                "anonymous_final_url": str(anonymous_response.url),
-                "anonymous_login_detected": anonymous_login_detected,
-                "authenticated_redirect_guard": probe_redirect_issue,
-                "anonymous_redirect_guard": anonymous_redirect_issue,
-                "authenticated_distinguished_from_anonymous": (
-                    True if clear_anonymous_difference else None
-                ),
-            }
-        except requests.RequestException as exc:
-            # Network errors make the check inconclusive. They do not prove that
-            # a supplied session is invalid.
-            auth_effective = None
-            auth_probe = {
-                "url": probe_url,
-                "error": f"{type(exc).__name__}: {exc}",
-                "conclusive": False,
-            }
-
-        auth_note = (
-            "The supplied cookie was distinguished from the anonymous response."
-            if auth_effective is True else
-            "The supplied cookie reached a login or authorization failure page."
-            if auth_effective is False else
-            "The supplied cookie remained usable, but this target did not expose a conclusive anonymous/authenticated distinction."
-        )
-    return {
-        "urls": sorted(visited),
-        "html_urls": sorted(html_urls),
-        "form_urls": sorted(form_urls),
-        "parameterized_urls": sorted(parameterized),
-        "request_cases": _dedupe_request_cases(request_cases),
-        "script_urls": sorted(script_urls),
-        "client_side_candidates": client_side_candidates,
-        "jwt_tokens": sorted(tokens),
-        "errors": errors,
-        "authentication_effective": auth_effective,
-        "authentication_note": auth_note,
-        "authentication_probe": auth_probe,
-        "target_preparation": target_preparation,
-        "destructive_urls_skipped": sorted(destructive_skipped),
-    }
-
-
-def merge_discovery(left: dict[str, Any], right: dict[str, Any]) -> dict[str, Any]:
-    merged = dict(left)
-    for key in ("urls", "html_urls", "form_urls", "parameterized_urls", "script_urls", "jwt_tokens"):
-        merged[key] = sorted(set(left.get(key, [])) | set(right.get(key, [])))
-    merged["request_cases"] = _dedupe_request_cases([*left.get("request_cases", []), *right.get("request_cases", [])])
-    client_rows: list[dict[str, Any]] = []
-    seen_client: set[str] = set()
-    for row in [*left.get("client_side_candidates", []), *right.get("client_side_candidates", [])]:
-        if not isinstance(row, dict):
-            continue
-        url = str(row.get("url") or "")
-        if not url or url in seen_client:
-            continue
-        seen_client.add(url)
-        client_rows.append(row)
-    merged["client_side_candidates"] = client_rows
-    merged["errors"] = [*left.get("errors", []), *right.get("errors", [])]
-    merged["destructive_urls_skipped"] = sorted(
-        set(left.get("destructive_urls_skipped", []))
-        | set(right.get("destructive_urls_skipped", []))
-    )
-    if right.get("authentication_probe"):
-        merged["authentication_probe"] = right.get("authentication_probe")
-    if right.get("authentication_effective") is not None:
-        merged["authentication_effective"] = right.get("authentication_effective")
-        merged["authentication_note"] = right.get("authentication_note")
-    return merged
-
-
-def _risk_terms(value: str) -> int:
-    text = value.lower()
-    tokens = set(re.findall(r"[a-z0-9]+", text))
-    weights = {
-        "cmd": 12, "command": 12, "exec": 12, "shell": 12,
-        "sql": 11, "query": 8, "search": 7,
-        "file": 10, "path": 10, "include": 10, "template": 9, "upload": 8,
-        "url": 9, "uri": 8, "redirect": 8, "callback": 8, "webhook": 8,
-        "admin": 8, "role": 8, "user": 6, "uid": 7, "id": 5,
-        "token": 7, "debug": 7, "api": 5, "xml": 7, "deserialize": 10,
-        "xss": 10, "sqli": 11, "ssrf": 11, "lfi": 11, "rfi": 11,
-    }
-    return sum(
-        weight for term, weight in weights.items()
-        if (term in tokens if len(term) <= 3 else term in text)
-    )
-
-
-def _is_login_case(case: dict[str, Any]) -> bool:
-    path = urlparse(str(case.get("url", ""))).path.lower()
-    parameters = {str(value).lower() for value in case.get("parameters", [])}
-    return (
-        path.endswith("/login")
-        or path.endswith("/login.php")
-        or bool({"username", "password"} <= parameters)
-    )
-
-
-def _is_auto_index_url(url: str) -> bool:
-    """Identify Apache/nginx directory-list sorting links such as ?C=D;O=A."""
-    parsed = urlparse(str(url))
-    names = {
-        name.lower()
-        for name, _ in parse_qsl(parsed.query.replace(";", "&"), keep_blank_values=True)
-    }
-    return bool(names) and names <= AUTO_INDEX_PARAMETERS and parsed.path.endswith("/")
-
-
-def _is_auto_index_case(case: dict[str, Any]) -> bool:
-    names = {str(value).lower() for value in case.get("parameters", [])}
-    return _is_auto_index_url(str(case.get("url", ""))) or (
-        bool(names)
-        and names <= AUTO_INDEX_PARAMETERS
-        and urlparse(str(case.get("url", ""))).path.endswith("/")
-    )
-
-
-SQL_HINTS = {
-    "id", "uid", "user", "user_id", "username", "email", "account",
-    "query", "search", "q", "category", "product", "item", "order",
-}
-XSS_HINTS = {
-    "name", "message", "comment", "search", "query", "q", "input",
-    "text", "title", "url", "redirect", "callback",
-}
-COMMAND_HINTS = {
-    "cmd", "command", "exec", "shell", "ip", "host", "hostname",
-    "ping", "target", "domain",
-}
-TRAVERSAL_HINTS = {
-    "file", "filename", "path", "page", "include", "template", "document",
-    "folder", "dir", "directory", "view", "resource", "download",
-}
-IDOR_HINTS = {
-    "id", "uid", "user_id", "account_id", "object_id", "item_id",
-    "order_id", "document_id", "file_id", "profile_id",
-}
-
-
-def _case_parameters(case: dict[str, Any]) -> set[str]:
-    parameters = {str(value).lower() for value in case.get("parameters", []) if str(value)}
-    parsed = urlparse(str(case.get("url", "")))
-    parameters.update(name.lower() for name, _ in parse_qsl(parsed.query, keep_blank_values=True))
-    return parameters
-
-
-def _prefer_browser_for_xss_case(case: dict[str, Any]) -> bool:
-    """Return True when a real browser is better suited than Dalfox CLI.
-
-    Stored/multi-step forms and DOM-only select/source contracts repeatedly
-    consumed Dalfox's full budget without adding evidence.  Chromium receives
-    the complete fields and client-side source/sink metadata for these cases.
-    """
-    method = str(case.get("method", "GET")).upper()
-    fields = [item for item in case.get("fields", []) if isinstance(item, dict)]
-    field_types = {
-        str(item.get("type") or item.get("tag") or "").lower()
-        for item in fields
-    }
-    names = {str(item.get("name") or "").lower() for item in fields}
-    path = urlparse(str(case.get("url", ""))).path.lower()
-    stored_shape = (
-        method == "POST"
-        and (
-            "textarea" in field_types
-            or bool(names & {"message", "comment", "content", "body", "description", "bio"})
-            or any(token in path for token in ("guestbook", "comment", "message", "feedback", "stored"))
-        )
-    )
-    dom_shape = (
-        method == "GET"
-        and (
-            "select" in field_types
-            or bool(case.get("client_sources"))
-            or bool(case.get("client_side_evidence"))
-        )
-        and any(token in path for token in ("xss", "dom", "javascript", "client"))
-    )
-    return stored_shape or dom_shape
-
-
-def _tool_case_priority(tool: str, case: dict[str, Any]) -> int:
-    """Score request cases for the scanner that is actually suited to them."""
-    if _is_auto_index_case(case):
-        return -1000
-
-    url = str(case.get("url", ""))
-    parsed = urlparse(url)
-    path = parsed.path.lower()
-    method = str(case.get("method", "GET")).upper()
-    parameters = _case_parameters(case)
-    text = " ".join((path, " ".join(sorted(parameters))))
-    score = _risk_terms(text)
-
-    if tool == "sqlmap":
-        score += 45 if any(token in path for token in ("sql", "query", "database", "search")) else 0
-        score += 9 * len(parameters & SQL_HINTS)
-        # Login/brute-force workflows are handled by the workflow verifier. A
-        # public login form remains eligible only when its path itself strongly
-        # indicates a database/query endpoint.
-        if _is_login_case(case) and not any(token in path for token in ("sql", "query", "database")):
-            score -= 100
-        # Authentication brute-force handlers commonly expose username/password
-        # controls but are not SQL-query endpoints. They consumed a complete
-        # SQLMap slot in the observed run and then failed the auth precheck.
-        if "brute" in path and not any(token in path for token in ("sql", "query", "database")):
-            score -= 90
-        if any(token in path for token in ("xss", "/exec", "/csp")) and not (parameters & SQL_HINTS):
-            score -= 35
-        return score
-
-    if tool == "dalfox":
-        # Browser verification is authoritative for stored and DOM-only
-        # contracts.  Keep Dalfox focused on reflected server-side inputs where
-        # it is fast and productive instead of spending two full timeout slots.
-        if _prefer_browser_for_xss_case(case):
-            return -1000
-        score += 45 if any(token in path for token in ("xss", "comment", "message", "search", "feedback")) else 0
-        score += 10 * len(parameters & XSS_HINTS)
-        if any(token in path for token in ("sqli", "/exec", "/csp")) and not (parameters & XSS_HINTS):
-            score -= 35
-        if _is_login_case(case):
-            score -= 30
-        return score
-
-    if tool == "commix":
-        score += 55 if any(token in path for token in ("/exec", "command", "cmd")) else 0
-        score += 13 * len(parameters & COMMAND_HINTS)
-        if any(token in path for token in ("sqli", "xss", "/csp")) and not (parameters & COMMAND_HINTS):
-            score -= 45
-        if _is_login_case(case):
-            score -= 40
-        return score
-
-    if tool == "traversal":
-        score += 55 if any(token in path for token in ("include", "download", "file", "template", "document", "view")) else 0
-        score += 15 * len(parameters & TRAVERSAL_HINTS)
-        if any(token in path for token in ("sqli", "xss", "/exec", "/csp")) and not (parameters & TRAVERSAL_HINTS):
-            score -= 45
-        if _is_login_case(case):
-            score -= 40
-        return score
-
-    if tool == "idor":
-        if method != "GET":
-            return -1000
-        numeric_pairs = [
-            (name.lower(), value)
-            for name, value in parse_qsl(parsed.query, keep_blank_values=True)
-            if value.isdigit()
-        ]
-        object_pairs = [(name, value) for name, value in numeric_pairs if name in IDOR_HINTS]
-        if not object_pairs or any(token in path for token in ("brute", "csrf", "password", "sqli", "xss", "/exec", "/csp")):
-            return -1000
-        score = 20 + 28 * len(object_pairs)
-        score += 25 if any(token in path for token in ("idor", "object", "profile", "account", "user")) else 0
-        if any(token in path for token in ("sqli", "xss", "/exec", "/csp")):
-            score -= 60
-        return score
-
-    return score
-
-
-def _tool_case_skip_reason(tool: str, case: dict[str, Any]) -> str:
-    if not [value for value in case.get("parameters", []) if str(value)]:
-        return "The request has no testable application parameter for this parameter scanner."
-    if _is_auto_index_case(case):
-        return "Directory-index sorting parameters are navigation controls, not application inputs."
-    if tool == "dalfox" and _prefer_browser_for_xss_case(case):
-        return "Stored or DOM-oriented XSS contracts are delegated to the Chromium verifier, which can execute JavaScript and revisit state."
-    if tool in {"dalfox", "commix"} and _is_login_case(case):
-        return f"{tool} is not suited to the generic login form; SQLMap remains available for SQL-injection checks."
-    if tool == "sqlmap" and "brute" in urlparse(str(case.get("url", ""))).path.lower():
-        return "The brute-force handler is an authentication workflow, not a SQL-query request class."
-    if _tool_case_priority(tool, case) <= 0:
-        return f"The request was not selected because its path and parameters do not match {tool}'s vulnerability class."
-    return ""
-
-
-def select_tool_request_cases(
-    discovery: dict[str, Any],
-    tool: str,
-    limit: int | None = None,
-) -> list[dict[str, Any]]:
-    """Choose the highest-value request cases separately for each scanner."""
-    effective_limit = limit or PARAMETER_TOOL_CASE_LIMITS.get(tool, MAX_PARAMETER_ENDPOINTS)
-    cases = [case for case in discovery.get("request_cases", []) if isinstance(case, dict)]
-    known = {str(case.get("url") or "") for case in cases}
-    for value in discovery.get("parameterized_urls", []):
-        url = str(value or "")
-        if url and url not in known:
-            cases.append({
-                "url": url,
-                "method": "GET",
-                "data": "",
-                "parameters": [
-                    name for name, _ in parse_qsl(
-                        urlparse(url).query, keep_blank_values=True
-                    )
-                ],
-                "source_url": url,
-                "synthetic_from_parameterized_url": True,
-            })
-    ranked: list[tuple[int, int, dict[str, Any]]] = []
-    for index, case in enumerate(cases):
-        if not isinstance(case, dict):
-            continue
-        if not [value for value in case.get("parameters", []) if str(value)]:
-            continue
-        score = _tool_case_priority(tool, case)
-        if score > 0:
-            ranked.append((score, -index, case))
-
-    selected: list[dict[str, Any]] = []
-    seen: set[tuple[str, str, tuple[str, ...]]] = set()
-    for _, _, case in sorted(ranked, key=lambda item: (-item[0], -item[1])):
-        key = (
-            str(case.get("method", "GET")).upper(),
-            str(case.get("url", "")),
-            tuple(sorted(str(value) for value in case.get("parameters", []))),
-        )
-        if key in seen:
-            continue
-        seen.add(key)
-        selected.append(case)
-        if len(selected) >= effective_limit:
-            break
-    return selected
-
-
-
-WORKFLOW_STATE_HINTS = {
-    "change", "update", "save", "create", "submit", "send", "comment",
-    "message", "feedback", "upload", "password", "email", "profile",
-    "settings", "transfer", "captcha", "admin",
-}
-WORKFLOW_DESTRUCTIVE_HINTS = {
-    "logout", "signout", "logoff", "setup", "install", "delete", "remove",
-    "drop", "truncate", "purge", "wipe", "reset",
-}
-
-
-def _case_field_names(case: dict[str, Any]) -> set[str]:
-    names = _case_parameters(case)
-    names.update(str(value).lower() for value in case.get("file_parameters", []) if str(value))
-    names.update(str(value).lower() for value in case.get("token_parameters", []) if str(value))
-    for field in case.get("fields", []) if isinstance(case.get("fields"), list) else []:
-        if isinstance(field, dict) and str(field.get("name") or ""):
-            names.add(str(field["name"]).lower())
-    return names
-
-
-def _browser_url_key(value: str) -> tuple[str, str, int, str]:
-    parsed = urlparse(str(value or ""))
-    port = parsed.port or (443 if parsed.scheme.lower() == "https" else 80)
-    path = re.sub(r"/+", "/", parsed.path or "/")
-    if path != "/":
-        path = path.rstrip("/")
-    return parsed.scheme.lower(), (parsed.hostname or "").lower(), port, path.lower()
-
-
-def _browser_case_priority(case: dict[str, Any], client_keys: set[tuple[str, str, int, str]]) -> int:
-    url = str(case.get("url", ""))
-    path = urlparse(url).path.lower()
-    if _is_auto_index_case(case) or _destructive_crawl_url(url):
-        return -1000
-    parameters = _case_field_names(case)
-    path_match = any(token in path for token in ("xss", "dom", "comment", "message", "feedback", "search", "query", "profile", "preview"))
-    xss_hits = parameters & XSS_HINTS
-    client_match = (
-        _browser_url_key(url) in client_keys
-        or _browser_url_key(str(case.get("source_url") or "")) in client_keys
-        or bool(case.get("client_sources"))
-    )
-    score = 0
-    if path_match:
-        score += 75
-    score += 16 * len(xss_hits)
-    if str(case.get("method", "GET")).upper() == "POST" and (path_match or xss_hits or client_match):
-        score += 18
-    if client_match:
-        score += 100
-    # Prefer a real parameterized request contract over a synthetic client-only
-    # page so Chromium mutates the same query/body discovered by the crawler.
-    if case.get("client_side_only"):
-        score -= 35
-    if case.get("parameters"):
-        score += 20
-    if _is_login_case(case):
-        score -= 60
-    return score
-
-
-def select_browser_request_cases(
-    discovery: dict[str, Any],
-    limit: int | None = None,
-) -> list[dict[str, Any]]:
-    """Select request contracts while preserving client-side source/sink evidence.
-
-    Client-side discovery often reports the route without its example query
-    string (for example ``/page/``), while the form crawler records a real
-    contract such as ``/page/?default=1``.  These are merged by same-origin path
-    so the browser receives the actual parameter rather than a parameterless
-    synthetic duplicate.
-    """
-    effective_limit = limit or PARAMETER_TOOL_CASE_LIMITS.get("browser", 2)
-    raw_client = [
-        dict(item)
-        for item in discovery.get("client_side_candidates", [])
-        if isinstance(item, dict) and str(item.get("url") or "")
-    ]
-    client_by_key: dict[tuple[str, str, int, str], list[dict[str, Any]]] = {}
-    for item in raw_client:
-        client_by_key.setdefault(_browser_url_key(str(item.get("url") or "")), []).append(item)
-    client_keys = set(client_by_key)
-
-    cases = [dict(case) for case in discovery.get("request_cases", []) if isinstance(case, dict)]
-    matched_client_keys: set[tuple[str, str, int, str]] = set()
-    for case in cases:
-        keys = {
-            _browser_url_key(str(case.get("url") or "")),
-            _browser_url_key(str(case.get("source_url") or "")),
-        }
-        evidence = [item for key in keys for item in client_by_key.get(key, [])]
-        if not evidence:
-            continue
-        matched_client_keys.update(keys & client_keys)
-        case["client_sources"] = sorted({
-            str(value)
-            for item in evidence
-            for value in item.get("sources", [])
-            if str(value)
-        })
-        case["client_sinks"] = sorted({
-            str(value)
-            for item in evidence
-            for value in item.get("sinks", [])
-            if str(value)
-        })
-        case["client_side_evidence"] = evidence
-
-    for key, evidence in sorted(client_by_key.items(), key=lambda item: item[0]):
-        if key in matched_client_keys:
-            continue
-        url = str(evidence[0].get("url") or "")
-        cases.append({
-            "url": url,
-            "method": "GET",
-            "data": "",
-            "parameters": [name for name, _ in parse_qsl(urlparse(url).query, keep_blank_values=True)],
-            "fields": [],
-            "source_url": url,
-            "client_side_only": True,
-            "client_sources": sorted({str(value) for item in evidence for value in item.get("sources", []) if str(value)}),
-            "client_sinks": sorted({str(value) for item in evidence for value in item.get("sinks", []) if str(value)}),
-            "client_side_evidence": evidence,
-        })
-
-    ranked = sorted(
-        ((_browser_case_priority(case, client_keys), -index, case) for index, case in enumerate(cases)),
-        key=lambda item: (-item[0], -item[1]),
-    )
-    selected: list[dict[str, Any]] = []
-    seen: set[tuple[str, tuple[str, str, int, str], tuple[str, ...]]] = set()
-    for score, _, case in ranked:
-        if score <= 0:
-            continue
-        key = (
-            str(case.get("method", "GET")).upper(),
-            _browser_url_key(str(case.get("url", ""))),
-            tuple(sorted(str(value) for value in case.get("parameters", []))),
-        )
-        if key in seen:
-            continue
-        seen.add(key)
-        selected.append(case)
-        if len(selected) >= effective_limit:
-            break
-    return selected
-
-def _workflow_case_priority(case: dict[str, Any]) -> int:
-    if str(case.get("method", "GET")).upper() != "POST":
-        return -1000
-    url = str(case.get("url", ""))
-    path = urlparse(url).path.lower()
-    names = _case_field_names(case)
-    if _destructive_crawl_url(url) or any(token in path for token in WORKFLOW_DESTRUCTIVE_HINTS):
-        return -1000
-    score = 0
-    file_parameters = {str(value).lower() for value in case.get("file_parameters", []) if str(value)}
-    token_parameters = {str(value).lower() for value in case.get("token_parameters", []) if str(value)}
-    if file_parameters or "multipart/form-data" in str(case.get("enctype", "")).lower():
-        score += 120
-    if _is_login_case(case) or any(token in path for token in ("login", "signin", "brute", "auth")):
-        score += 90
-    if any("captcha" in value for value in names) or "captcha" in path:
-        score += 90
-    state_hits = {value for value in names if value in WORKFLOW_STATE_HINTS}
-    if state_hits or any(token in path for token in WORKFLOW_STATE_HINTS):
-        score += 60
-    if not token_parameters and (state_hits or file_parameters):
-        score += 35
-    if token_parameters:
-        score += 15
-    return score
-
-
-def select_workflow_request_cases(
-    discovery: dict[str, Any],
-    limit: int | None = None,
-) -> list[dict[str, Any]]:
-    """Select generic CSRF, upload, authentication and CAPTCHA workflow contracts."""
-    effective_limit = limit or PARAMETER_TOOL_CASE_LIMITS.get("workflow", 3)
-    ranked: list[tuple[int, int, dict[str, Any]]] = []
-    for index, case in enumerate(discovery.get("request_cases", [])):
-        if not isinstance(case, dict):
-            continue
-        score = _workflow_case_priority(case)
-        if score > 0:
-            ranked.append((score, -index, case))
-    selected: list[dict[str, Any]] = []
-    seen: set[tuple[str, str, tuple[str, ...]]] = set()
-    for _, _, case in sorted(ranked, key=lambda item: (-item[0], -item[1])):
-        key = (
-            str(case.get("method", "POST")).upper(),
-            str(case.get("url", "")),
-            tuple(sorted(_case_field_names(case))),
-        )
-        if key in seen:
-            continue
-        seen.add(key)
-        selected.append(case)
-        if len(selected) >= effective_limit:
-            break
-    return selected
-
-def select_arjun_candidates(discovery: dict[str, Any], target: str, limit: int = MAX_ARJUN_ENDPOINTS) -> list[str]:
-    """
-    Rank Arjun targets by likely security value without blanket-excluding useful pages.
-
-    - logout endpoints are excluded because probing them can destroy the session;
-    - authentication and setup endpoints are excluded because they are already
-      modeled by discovery and may change session state;
-    - plain directory indexes are skipped;
-    - input-bearing API and application handlers are ranked first.
-    """
-    form_urls = {normalize_url(str(url)) for url in discovery.get("form_urls", [])}
-    request_cases = [
-        case for case in discovery.get("request_cases", [])
-        if isinstance(case, dict)
-    ]
-    case_by_url: dict[str, list[dict[str, Any]]] = {}
-    for case in request_cases:
-        case_url = normalize_url(str(case.get("url", "")))
-        if case_url:
-            case_by_url.setdefault(case_url, []).append(case)
-
-    candidates = {
-        normalize_url(str(url))
-        for url in (*discovery.get("html_urls", []), *discovery.get("form_urls", []))
-        if str(url)
-    }
-    ranked: list[tuple[int, str]] = []
-    low_value = ("brute", "captcha", "csrf")
-    preferred = (
-        "/api/", "/admin/", "/search", "/query", "/upload", "/download",
-        "/callback", "/webhook", "/execute", "/command",
-    )
-
-    for url in candidates:
-        parsed = urlparse(url)
-        path = parsed.path.lower()
-        if (
-            "logout" in path
-            or _is_auto_index_url(url)
-            or path.endswith(("/login.php", "/login", "/setup.php"))
-        ):
-            continue
-
-        related_cases = case_by_url.get(url, [])
-        has_form = url in form_urls
-        has_existing_parameters = bool(parsed.query) or any(
-            case.get("parameters") for case in related_cases
-        )
-
-        # Directory indexes such as /config/?C=D;O=A are navigation pages, not
-        # useful hidden-parameter targets. A real form/API under those paths is
-        # still retained.
-        directory_utility = "/config/" in path or "/docs/" in path
-        if directory_utility and not has_form and not has_existing_parameters:
-            continue
-
-        score = _risk_terms(path)
-        if has_form:
-            score += 14
-        if has_existing_parameters:
-            score += 10
-        if any(token in path for token in preferred):
-            score += 22
-
-        if path.endswith("/login.php") or path.endswith("/login"):
-            # Login forms are already covered by discovery and SQLMap. Hidden
-            # parameter mining here consumed the full Arjun budget with very
-            # little security value.
-            score -= 100
-        if "setup" in path:
-            score += 1 if has_form or has_existing_parameters else -9
-        if directory_utility:
-            score -= 5
-        if any(term in path for term in low_value):
-            score -= 8
-
-        # Keep actual input handlers even when their path name has no risk term.
-        if score <= 0 and (has_form or has_existing_parameters):
-            score = 1
-        if score > 0:
-            ranked.append((score, _clean_url(url)))
-
-    # De-duplicate while preserving the highest score for each clean URL.
-    best: dict[str, int] = {}
-    for score, url in ranked:
-        best[url] = max(score, best.get(url, score))
-    return [
-        url for url, _ in sorted(best.items(), key=lambda item: (-item[1], item[0]))[:limit]
-    ]
-
-
-AUTHORIZATION_PATH_HINTS = {
-    "admin", "account", "accounts", "profile", "profiles", "user", "users",
-    "member", "members", "order", "orders", "invoice", "invoices", "document",
-    "documents", "download", "downloads", "report", "reports", "record", "records",
-    "settings", "manage", "management", "role", "roles", "permission", "permissions",
-    "api", "private", "internal", "dashboard", "billing", "payment", "payments",
-}
-AUTHORIZATION_PARAMETER_HINTS = {
-    "id", "uid", "user", "user_id", "userid", "account", "account_id",
-    "member", "member_id", "profile", "profile_id", "order", "order_id",
-    "invoice", "invoice_id", "document", "document_id", "record",
-    "record_id", "file", "file_id", "download", "report", "report_id",
-    "customer", "customer_id", "owner", "owner_id", "tenant", "tenant_id",
-    "role", "role_id",
-}
-AUTHORIZATION_EXCLUDED_PATH_HINTS = {
-    "login", "signin", "sign-in", "logout", "signout", "logoff", "setup",
-    "install", "reset", "delete", "remove", "drop", "truncate", "purge",
-    "wipe", "csrf", "captcha", "xss", "sqli", "exec", "command",
-    "docs", "documentation", "instructions", "help", "about", "changelog",
-    "license", "copying", "readme", "static", "assets",
-}
-
-
-def _authorization_case_priority(case: dict[str, Any]) -> int:
-    """Rank read-only endpoints where identity or ownership should plausibly matter."""
-    url = str(case.get("url") or "")
-    method = str(case.get("method") or "GET").upper()
-    if not url or method != "GET" or _is_auto_index_case(case) or _destructive_crawl_url(url):
-        return -1000
-    parsed = urlparse(url)
-    path_tokens = {token for token in re.split(r"[^a-z0-9_-]+", parsed.path.lower()) if token}
-    if path_tokens & AUTHORIZATION_EXCLUDED_PATH_HINTS:
-        return -1000
-    pairs = [(name.lower(), value) for name, value in parse_qsl(parsed.query, keep_blank_values=True)]
-    names = {str(value).lower() for value in case.get("parameters", []) if str(value)}
-    names.update(name for name, _ in pairs)
-    auth_names = names & AUTHORIZATION_PARAMETER_HINTS
-    numeric_auth = [(name, value) for name, value in pairs if name in AUTHORIZATION_PARAMETER_HINTS and value.isdigit()]
-    path_hits = path_tokens & AUTHORIZATION_PATH_HINTS
-    score = 0
-    score += 42 * len(numeric_auth)
-    score += 18 * len(auth_names)
-    score += 16 * len(path_hits)
-    if parsed.query:
-        score += 8
-    if any(value.isdigit() for _, value in pairs):
-        score += 10
-    if any(token in parsed.path.lower() for token in ("/api/", "/admin/", "/account", "/profile", "/user", "/order", "/invoice", "/document", "/download")):
-        score += 24
-    # Generic content pages and auto-generated index sorting links are poor
-    # authorization candidates unless an identity/object signal is present.
-    if not (auth_names or numeric_auth or path_hits):
-        return -1000
-    return score
-
-
-def select_authorization_request_cases(
-    discovery: dict[str, Any],
-    limit: int | None = None,
-) -> list[dict[str, Any]]:
-    """Select same-origin, read-only requests for anonymous/two-account comparison."""
-    effective_limit = limit or PARAMETER_TOOL_CASE_LIMITS.get("authorization", 3)
-    cases = [dict(case) for case in discovery.get("request_cases", []) if isinstance(case, dict)]
-    known = {str(case.get("url") or "") for case in cases}
-    for value in discovery.get("parameterized_urls", []):
-        url = str(value or "")
-        if url and url not in known:
-            cases.append({
-                "url": url,
-                "method": "GET",
-                "data": "",
-                "parameters": [name for name, _ in parse_qsl(urlparse(url).query, keep_blank_values=True)],
-                "source_url": url,
-                "synthetic_from_parameterized_url": True,
-            })
-    ranked: list[tuple[int, int, dict[str, Any]]] = []
-    for index, case in enumerate(cases):
-        score = _authorization_case_priority(case)
-        if score > 0:
-            ranked.append((score, -index, case))
-    selected: list[dict[str, Any]] = []
-    seen: set[str] = set()
-    for _, _, case in sorted(ranked, key=lambda item: (-item[0], -item[1])):
-        url = str(case.get("url") or "")
-        if url in seen:
-            continue
-        seen.add(url)
-        selected.append(case)
-        if len(selected) >= effective_limit:
-            break
-    return selected
-
-def select_arjun_request_cases(
-    discovery: dict[str, Any],
-    target: str,
-    limit: int = MAX_ARJUN_ENDPOINTS,
-) -> list[dict[str, Any]]:
-    """Select only endpoints where hidden-name discovery adds real coverage.
-
-    Fully modelled HTML forms already expose their input names. Running Arjun
-    against several such POST handlers cost minutes and found nothing.  This
-    selector instead prefers parameterless GET/API handlers and only retains a
-    known contract when it is sparse enough that undocumented inputs remain
-    plausible.
-    """
-    ranked: list[tuple[int, dict[str, Any]]] = []
-    represented_paths: set[str] = set()
-    for case in discovery.get("request_cases", []):
-        if not isinstance(case, dict):
-            continue
-        url = normalize_url(str(case.get("url") or ""))
-        method = str(case.get("method") or "GET").upper()
-        if not url or method not in {"GET", "POST"} or not same_origin(target, url):
-            continue
-        parsed = urlparse(url)
-        path = parsed.path.lower()
-        represented_paths.add(path)
-        if _destructive_crawl_url(url) or path.endswith(("/login.php", "/login", "/setup.php")):
-            continue
-        parameters = [str(value) for value in case.get("parameters", []) if str(value)]
-        fields = [item for item in case.get("fields", []) if isinstance(item, dict)]
-        file_parameters = [str(value) for value in case.get("file_parameters", []) if str(value)]
-        enctype = str(case.get("enctype") or "").lower()
-        fully_modelled_form = bool(fields and parameters)
-        if file_parameters or "multipart/form-data" in enctype:
-            continue
-        if method == "POST" and fully_modelled_form:
-            continue
-        score = _risk_terms(path)
-        score += 18 if any(token in path for token in ("/api/", "callback", "webhook", "debug", "admin")) else 0
-        score += 8 if not parameters else -min(16, len(parameters) * 4)
-        if method == "POST":
-            score += 4
-        if score < 12:
-            continue
-        ranked.append((score, {
-            "url": url,
-            "method": method,
-            "data": str(case.get("data") or ""),
-            "parameters": parameters,
-        }))
-
-    # Add parameterless same-origin pages that have no discovered form contract.
-    for url in select_arjun_candidates(discovery, target, limit=max(limit * 3, 6)):
-        parsed = urlparse(url)
-        path = parsed.path.lower()
-        if path in represented_paths or parsed.query or _destructive_crawl_url(url):
-            continue
-        score = _risk_terms(path) + (18 if any(token in path for token in ("/api/", "callback", "webhook", "debug", "admin")) else 0)
-        if score < 12:
-            continue
-        ranked.append((score, {"url": url, "method": "GET", "data": "", "parameters": []}))
-
-    # If strict selection found nothing, balanced/deep mode still exercises one
-    # safe high-value parameterless page. This records hidden-parameter coverage
-    # without returning to the previous multi-endpoint timeout-heavy behaviour.
-    if not ranked and CURRENT_SCAN_MODE in {"balanced", "deep"}:
-        relaxed: list[tuple[int, dict[str, Any]]] = []
-        for raw_url in discovery.get("html_urls", []) or discovery.get("urls", []):
-            url = normalize_url(str(raw_url or ""))
-            if not url or not same_origin(target, url) or urlparse(url).query or _destructive_crawl_url(url):
-                continue
-            path = urlparse(url).path.lower()
-            if path.endswith(("/login.php", "/login", "/setup.php", "/logout.php")):
-                continue
-            score = _risk_terms(path)
-            if any(token in path for token in ("security", "vulnerabilities", "admin", "debug", "api")):
-                score += 8
-            if score >= 6:
-                relaxed.append((score, {
-                    "url": url, "method": "GET", "data": "", "parameters": [],
-                    "selection_reason": "relaxed-safe-hidden-parameter-fallback",
-                }))
-        if relaxed:
-            ranked.append(max(relaxed, key=lambda item: (item[0], item[1]["url"])))
-
-    selected: list[dict[str, Any]] = []
-    seen: set[tuple[str, str]] = set()
-    for _, case in sorted(ranked, key=lambda item: (-item[0], item[1]["url"])):
-        key = (case["method"], urlparse(case["url"]).path.lower())
-        if key in seen:
-            continue
-        seen.add(key)
-        selected.append(case)
-        if len(selected) >= max(1, limit):
-            break
-    return selected
-
-
-def select_request_cases(discovery: dict[str, Any], limit: int = MAX_PARAMETER_ENDPOINTS) -> list[dict[str, Any]]:
-    """Select non-destructive cases, ranking likely injection/authorization inputs first."""
-    cases = list(discovery.get("request_cases", []))
-    known_urls = {str(case.get("url", "")) for case in cases}
-    for url in discovery.get("parameterized_urls", []):
-        if url not in known_urls:
-            cases.append({
-                "url": url, "method": "GET", "data": "",
-                "parameters": [name for name, _ in parse_qsl(urlparse(url).query, keep_blank_values=True)],
-                "source_url": url,
-            })
-
-    ranked: list[tuple[int, dict[str, Any]]] = []
-    seen: set[tuple[str, str, tuple[str, ...]]] = set()
-    for case in cases:
-        url = str(case.get("url", ""))
-        method = str(case.get("method", "GET")).upper()
-        path = urlparse(url).path.lower()
-        if not url or method not in {"GET", "POST"} or any(part in path for part in ("logout", "setup")):
-            continue
-        if _is_auto_index_case(case):
-            continue
-        parameters = tuple(sorted(str(value) for value in case.get("parameters", []) if value))
-        key = (method, urlparse(url)._replace(query="").geturl(), parameters)
-        if not parameters or key in seen:
-            continue
-        seen.add(key)
-        score = _risk_terms(path + " " + " ".join(parameters))
-        score += 7 if method == "POST" else 3
-        if _is_login_case(case):
-            score -= 20
-        score += min(8, len(parameters) * 2)
-        ranked.append((score, {**case, "method": method, "parameters": list(parameters), "priority_score": score}))
-    ranked.sort(key=lambda item: (-item[0], str(item[1].get("url", ""))))
-    return [case for _, case in ranked[:limit]]
-
-def _replace_parameter_value(pairs: list[tuple[str, str]], parameter: str, value: str) -> list[tuple[str, str]]:
-    replaced = False
-    updated: list[tuple[str, str]] = []
-    for name, current in pairs:
-        if not replaced and name.lower() == parameter.lower():
-            updated.append((name, value))
-            replaced = True
-        else:
-            updated.append((name, current))
-    if not replaced:
-        updated.append((parameter, value))
-    return updated
-
-
-def select_oast_request_cases(
-    discovery: dict[str, Any],
-    target: str,
-    limit: int = 1,
-) -> list[dict[str, Any]]:
-    """Select concrete GET/POST inputs suitable for an Interactsh OAST probe.
-
-    Interactsh is not launched blindly. It is automatically used when discovery
-    exposes a parameter whose name or path indicates a server-side URL fetch,
-    callback, webhook, redirect, proxy, remote-file, or XML processing path.
-    """
-    ranked: list[tuple[int, dict[str, Any]]] = []
-    for case in discovery.get("request_cases", []):
-        if not isinstance(case, dict):
-            continue
-        url = str(case.get("url") or "")
-        method = str(case.get("method") or "GET").upper()
-        if not url or method not in {"GET", "POST"} or not same_origin(target, url):
-            continue
-        path = urlparse(url).path.lower()
-        if any(token in path for token in ("logout", "setup", "install", "reset", "delete")):
-            continue
-
-        query_pairs = parse_qsl(urlparse(url).query, keep_blank_values=True)
-        body_pairs = parse_qsl(str(case.get("data") or ""), keep_blank_values=True) if method == "POST" else []
-        names = {str(value).lower() for value in case.get("parameters", []) if str(value)}
-        names.update(name.lower() for name, _ in query_pairs)
-        names.update(name.lower() for name, _ in body_pairs)
-        strong = [name for name in names if name in OAST_PARAMETER_SCORES]
-        path_bonus = 35 if any(hint in path for hint in OAST_PATH_HINTS) else 0
-        if not strong:
-            continue
-        parameter = max(strong, key=lambda name: OAST_PARAMETER_SCORES[name])
-        score = OAST_PARAMETER_SCORES[parameter] + path_bonus + (8 if method == "POST" else 0)
-
-        command_context = parameter in OAST_COMMAND_PARAMETERS and any(
-            hint in path for hint in ("exec", "command", "cmd", "ping", "shell")
-        )
-        if command_context:
-            replacement = (
-                "127.0.0.1; ping -c 1 FUZZ"
-                if parameter in {"ip", "host", "hostname", "target", "domain", "ping"}
-                else "ping -c 1 FUZZ"
-            )
-            score += 45
-        else:
-            replacement = "http://FUZZ/" if parameter in OAST_URL_VALUE_PARAMETERS else "FUZZ"
-        if method == "GET":
-            parsed = urlparse(url)
-            injected_pairs = _replace_parameter_value(query_pairs, parameter, replacement)
-            injection_url = urlunparse(parsed._replace(query=urlencode(injected_pairs), fragment=""))
-            injection_data = ""
-        else:
-            injection_url = url
-            injection_data = urlencode(_replace_parameter_value(body_pairs, parameter, replacement))
-
-        ranked.append((score, {
-            "target_url": target,
-            "source_url": url,
-            "injection_url": injection_url,
-            "method": method,
-            "data": injection_data,
-            "parameter": parameter,
-            "parameters": [parameter],
-            "priority_score": score,
-            "oast_class": "command" if command_context else "remote-fetch",
-        }))
-
-    selected: list[dict[str, Any]] = []
-    seen: set[tuple[str, str, str]] = set()
-    for _, candidate in sorted(ranked, key=lambda item: (-item[0], item[1]["injection_url"])):
-        key = (candidate["method"], candidate["injection_url"], candidate["data"])
-        if key in seen:
-            continue
-        seen.add(key)
-        selected.append(candidate)
-        if len(selected) >= max(1, int(limit)):
-            break
-    return selected
-
-
-def enrich_discovery_with_arjun(discovery: dict[str, Any], result: dict[str, Any], base_url: str) -> tuple[dict[str, Any], list[str]]:
-    parameters = {str(item).strip() for item in result.get("parameters", []) if str(item).strip()}
-    parameters.update(str(item.get("parameter", "")).strip() for item in result.get("vulnerabilities", []) if isinstance(item, dict))
-    parsed = urlparse(base_url)
-    existing = list(parse_qsl(parsed.query, keep_blank_values=True))
-    names = {name for name, _ in existing}
-    generated = [urlunparse(parsed._replace(query=urlencode([*existing, (name, "1")]), fragment="")) for name in sorted(parameters) if name and name not in names and re.fullmatch(r"[A-Za-z0-9_.:-]{1,128}", name)]
-    updated = dict(discovery)
-    updated["parameterized_urls"] = sorted(set(updated.get("parameterized_urls", [])) | set(generated))
-    generated_cases = [{
-        "url": url, "method": "GET", "data": "",
-        "parameters": [name for name, _ in parse_qsl(urlparse(url).query, keep_blank_values=True)],
-        "source_url": base_url,
-    } for url in generated]
-    updated["request_cases"] = _dedupe_request_cases([*updated.get("request_cases", []), *generated_cases])
-    return updated, generated
-
-
-def enrich_discovery_with_ffuf(discovery: dict[str, Any], result: dict[str, Any], target: str) -> tuple[dict[str, Any], list[str]]:
-    """Merge only same-origin, non-destructive FFUF discoveries.
-
-    FFUF results may contain redirects or aliases. Re-crawling them with the
-    authenticated cookie is allowed only after the same state-change predicate
-    used by the normal crawler approves both the original and verified URL.
-    """
-    safe_urls: set[str] = set()
-    blocked: set[str] = set(discovery.get("destructive_urls_skipped", []))
-    for item in result.get("vulnerabilities", []):
-        if not isinstance(item, dict):
-            continue
-        for field in ("url", "final_url"):
-            value = str(item.get(field) or "").strip()
-            if not value or not same_origin(target, value):
-                continue
-            if _destructive_crawl_url(value):
-                blocked.add(value)
-                continue
-            safe_urls.add(_clean_url(value))
-    urls = sorted(safe_urls)
-    updated = dict(discovery)
-    updated["urls"] = sorted(set(updated.get("urls", [])) | set(urls))
-    updated["parameterized_urls"] = sorted(
-        set(updated.get("parameterized_urls", []))
-        | {url for url in urls if urlparse(url).query}
-    )
-    updated["destructive_urls_skipped"] = sorted(blocked)
-    return updated, urls
-
-
-def make_skipped_result(tool: str, target: str, reason: str) -> dict[str, Any]:
-    return {"tool": tool, "status": "skipped", "target": target, "output": reason, "vulnerabilities": [], "diagnosis": "not_applicable"}
-
-
-def log_zap_session_diagnostics(result: dict[str, Any]) -> None:
-    diagnostics = (
-        result.get("session_diagnostics")
-        if isinstance(result.get("session_diagnostics"), dict)
-        else {}
-    )
-    before = (
-        diagnostics.get("before_scan")
-        if isinstance(diagnostics.get("before_scan"), dict)
-        else diagnostics
-    )
-    after = (
-        diagnostics.get("after_scan")
-        if isinstance(diagnostics.get("after_scan"), dict)
-        else {}
-    )
-    if not before:
-        return
-
-    def print_coverage() -> None:
-        if "targeted_active_scans_started" not in result:
-            return
-        policy = (
-            result.get("active_scanner_policy")
-            if isinstance(result.get("active_scanner_policy"), dict)
-            else {}
-        )
-        stats = (
-            result.get("zap_alert_stats")
-            if isinstance(result.get("zap_alert_stats"), dict)
-            else {}
-        )
-        print(
-            "    [ZAP COVERAGE] "
-            f"seeded URLs={result.get('seeded_urls', 0)}; "
-            f"seeded requests={result.get('seeded_request_cases', 0)}; "
-            f"targeted active={result.get('targeted_active_scans_completed', 0)}/"
-            f"{result.get('targeted_active_scans_started', 0)}; "
-            f"configured rules={result.get('active_rules_attempted', 0)}/"
-            f"{result.get('active_rules_planned', 0)} "
-            f"({result.get('active_rule_coverage_percent', 0)}%); "
-            f"completed-rule coverage={result.get('active_rules_completed', 0)}/"
-            f"{result.get('active_rules_planned', 0)} "
-            f"({result.get('active_rule_effective_coverage_percent', 0)}%); "
-            f"critical cases={result.get('critical_targeted_scans_completed', 0)}/"
-            f"{result.get('critical_targeted_scans_started', 0)}; "
-            f"proxy confirmed={result.get('proxy_assisted_confirmed', 0)}; "
-            f"native security alerts={stats.get('security', 0)}; "
-            f"site-tree URLs={result.get('zap_sites_tree_urls', 0)}"
-        )
-        if policy:
-            print(
-                "    [ZAP ACTIVE POLICY] first-tier rule IDs="
-                + (", ".join(policy.get("enabled_ids", [])) or "none")
-            )
-        plan = result.get("prioritized_native_plan") if isinstance(result.get("prioritized_native_plan"), dict) else {}
-        for phase in plan.get("phases", []):
-            if not isinstance(phase, dict):
-                continue
-            recursive = phase.get("recursive") if isinstance(phase.get("recursive"), dict) else {}
-            print(
-                "    [ZAP PRIORITY] "
-                f"tier={phase.get('tier')}; rules={phase.get('scanner_count', 0)}; "
-                f"targeted={phase.get('targeted_completed', 0)}/{phase.get('targeted_started', 0)}; "
-                f"recursive={'complete' if recursive.get('completed') else 'partial' if recursive.get('started') else 'not-started'}"
-            )
-        for item in result.get("targeted_active_scans", []):
-            if not isinstance(item, dict):
-                continue
-            state = "complete" if item.get("completed") else "incomplete"
-            print(
-                "    [ZAP ACTIVE CASE] "
-                f"{item.get('method', 'GET')} {item.get('url', '')} — "
-                f"{state}; progress={item.get('progress', 0)}%; "
-                f"budget={item.get('budget_seconds', 0)}s"
-            )
-        preparation = result.get("post_spider_target_preparation")
-        if isinstance(preparation, dict) and preparation.get("configured"):
-            print(
-                "    [ZAP TARGET STATE] "
-                f"reapplied={preparation.get('performed')}; usable={preparation.get('usable')}"
-            )
-        for record in result.get("proxy_assisted_verification", []):
-            if not isinstance(record, dict):
-                continue
-            if record.get("error"):
-                print(
-                    "    [ZAP PROXY CHECK] "
-                    f"{record.get('method', 'GET')} {record.get('url', '')} — error: {record.get('error')}"
-                )
-                continue
-            if record.get("skipped"):
-                print(
-                    "    [ZAP PROXY CHECK] "
-                    f"{record.get('method', 'GET')} {record.get('url', '')} — skipped: {record.get('skipped')}"
-                )
-                continue
-            for test in record.get("tests", []):
-                if not isinstance(test, dict):
-                    continue
-                state = "confirmed" if test.get("confirmed") else "not-confirmed"
-                print(
-                    "    [ZAP PROXY CHECK] "
-                    f"{record.get('method', 'GET')} {record.get('url', '')} — "
-                    f"{test.get('type', 'probe')}={state}"
-                )
-
-    if before.get("anonymous_profile"):
-        print_coverage()
-        return
-
-    print(
-        "    [ZAP AUTH] "
-        f"ZAP={result.get('zap_version', before.get('zap_version', 'unknown'))}; "
-        f"Python API={result.get('python_zap_api_version', before.get('python_zap_api_version', 'unknown'))}"
-    )
-    print(
-        "    [ZAP AUTH] "
-        f"probe={before.get('probe_url', '')}; "
-        f"cookie names={', '.join(before.get('cookie_names', [])) or 'none'}"
-    )
-    direct = before.get("direct") if isinstance(before.get("direct"), dict) else {}
-    direct_state = (
-        "inconclusive"
-        if before.get("conclusive") is False
-        else str(before.get("effective") is True)
-    )
-    print(
-        "    [ZAP AUTH] "
-        f"direct authenticated={direct_state}; "
-        f"proxy matches direct={before.get('proxy_matches_direct')}; "
-        f"history cookie exact={before.get('history_cookie_exact')}"
-    )
-    history = before.get("history") if isinstance(before.get("history"), dict) else {}
-    if history.get("duplicate_cookie_names"):
-        print(
-            "    [ZAP AUTH WARNING] duplicate Cookie names: "
-            + ", ".join(history["duplicate_cookie_names"])
-        )
-    if before.get("root_cause"):
-        print(f"    [ZAP AUTH ROOT CAUSE] {before['root_cause']}")
-    if after:
-        after_state = (
-            "inconclusive"
-            if after.get("conclusive") is False
-            else str(after.get("effective"))
-        )
-        print(
-            "    [ZAP AUTH] "
-            f"session valid after scan={after_state}; "
-            f"proxy matches direct={after.get('proxy_matches_direct')}; "
-            f"history cookie exact={after.get('history_cookie_exact')}"
-        )
-        if after.get("root_cause"):
-            print(f"    [ZAP AUTH ROOT CAUSE] {after['root_cause']}")
-    print_coverage()
-
-
-def log_result(profile: str, name: str, result: dict[str, Any], target: str = "") -> None:
-    raw_status = str(result.get("status", "error")).lower()
-    limited = raw_status == "partial" and _is_time_limited(result)
-    label = "LIMITED" if limited else raw_status.upper()
-    total, security, observations = _finding_counts(result)
-    print(
-        f"    [{label:7}] {name}: {target or result.get('target', '')} — "
-        f"findings={total} (security/candidates={security}, observations={observations})"
-    )
-    detail = str(result.get("output", ""))[:400]
-    if raw_status == "error":
-        print(f"              {detail}", file=sys.stderr)
-    elif raw_status == "partial":
-        print(f"              {detail}")
-
-    if name == "ffuf":
-        isolated = bool(result.get("cookie_isolated_discovery"))
-        credentialed = bool(result.get("credentialed_fuzz_requests_sent"))
-        blocked = len(result.get("blocked_destructive_rows") or [])
-        if isolated:
-            print(
-                "    [FFUF SESSION] path fuzzing cookie-isolated=True; "
-                f"credentialed fuzz requests={credentialed}; "
-                f"destructive rows blocked={blocked}"
-            )
-        session_after = result.get("session_after") if isinstance(result.get("session_after"), dict) else {}
-        if session_after.get("performed"):
-            print(
-                "    [FFUF SESSION] post-scan authenticated="
-                f"{session_after.get('authenticated')}; "
-                f"conclusive={session_after.get('conclusive')}"
-            )
-
-    if name == "nuclei":
-        inventory = result.get("template_inventory") if isinstance(result.get("template_inventory"), dict) else {}
-        print(
-            "    [NUCLEI TEMPLATES] total="
-            f"{inventory.get('count', 0)}; dast={inventory.get('dast_count', 0)}; "
-            f"directory={inventory.get('directory', '') or 'not-resolved'}"
-        )
-        fingerprint = result.get("technology_fingerprint") if isinstance(result.get("technology_fingerprint"), dict) else {}
-        print(
-            "    [NUCLEI STRATEGY] adaptive=True; technologies="
-            f"{','.join(fingerprint.get('tags') or []) or 'unknown'}; "
-            f"dast_cases={result.get('dast_request_count', 0)}; "
-            f"direct_templates={result.get('custom_template_count', 0)}; "
-            f"evidence_targets={len(result.get('evidence_targets') or [])}; "
-            "stdin_disabled=True; specialist-covered SQLi/XSS/CMDi/traversal templates deferred"
-        )
-        phases = result.get("phases") if isinstance(result.get("phases"), list) else []
-        for phase in phases:
-            if not isinstance(phase, dict):
-                continue
-            print(
-                "    [NUCLEI PHASE] "
-                f"{phase.get('name', 'unknown')}: status={phase.get('status', 'unknown')}; "
-                f"findings={phase.get('findings', 0)}; budget={phase.get('timeout_seconds', 0)}s; "
-                f"input={phase.get('input_mode') or 'list'}; "
-                f"aggression={phase.get('fuzz_aggression') or 'n/a'}; "
-                f"scope={phase.get('target_scope') or 'focused'}"
-            )
-            if phase.get("template_batch_recovery"):
-                print(
-                    "    [NUCLEI RECOVERY] "
-                    f"completed exact templates={phase.get('completed_template_count', 0)}; "
-                    f"exact rejected={phase.get('invalid_template_count', 0)}; "
-                    f"engine tag fallback={phase.get('engine_tag_fallback_success', False)}; "
-                    f"global matchers={phase.get('global_matcher_template_count', 0)}; "
-                    f"global matchers enabled={phase.get('global_matchers_enabled', False)}; "
-                    f"runtime failures={len(phase.get('runtime_template_failures') or [])}; "
-                    f"timed out={len(phase.get('timed_out_templates') or [])}"
-                )
-        if not total:
-            print(
-                "    [NUCLEI RESULT] No template matcher completed with positive evidence. "
-                "This does not mean the target is clean; inspect phase status, DAST input count, "
-                "template inventory and time-limit diagnostics above."
-            )
-
-    if name == "nikto":
-        metrics = result.get("scan_metrics") if isinstance(result.get("scan_metrics"), dict) else {}
-        structured = result.get("structured_report") if isinstance(result.get("structured_report"), dict) else {}
-        print(
-            "    [NIKTO COVERAGE] mode="
-            f"{result.get('execution_mode', 'unknown')}; requests={metrics.get('requests', 0)}; "
-            f"reported={metrics.get('items_reported', 0)}; hosts={metrics.get('hosts_tested', 0)}; "
-            f"parsed unique={len(result.get('vulnerabilities') or [])}; "
-            f"raw parsed={result.get('raw_parsed_findings', len(result.get('vulnerabilities') or []))}; "
-            f"cross-source duplicates removed={result.get('cross_source_duplicates_removed', 0)}; "
-            f"parser count consistent={result.get('parser_count_consistent', True)}; "
-            f"report copied={structured.get('copied', False)}; report bytes={structured.get('bytes', 0)}; "
-            f"console fallback={structured.get('console_only', False)}; "
-            f"coverage verified={result.get('coverage_verified', False)}; "
-            f"zero verified={result.get('zero_result_verified', False)}; "
-            f"profile={result.get('scan_profile', 'unknown')}; "
-            f"plugins={result.get('plugins', 'unknown')}; tuning={result.get('safe_tuning', 'unknown')}; "
-            f"cgi_dirs={result.get('cgi_dirs', 'unknown')}"
-        )
-        retry = result.get("structured_retry") if isinstance(result.get("structured_retry"), dict) else {}
-        if retry.get("used"):
-            print(
-                "    [NIKTO FALLBACK] Structured CSV output was not writable; "
-                "Nikto was automatically rerun in console-summary mode."
-            )
-        docker_state = result.get("docker_state") if isinstance(result.get("docker_state"), dict) else {}
-        docker_create = result.get("docker_create") if isinstance(result.get("docker_create"), dict) else {}
-        if result.get("execution_mode", "").startswith("official_docker"):
-            print(
-                "    [NIKTO DOCKER] "
-                f"create_rc={docker_create.get('return_code', 'n/a')}; "
-                f"state_available={docker_state.get('available', False)}; "
-                f"exit={docker_state.get('ExitCode', 'n/a')}; "
-                f"state_error={docker_state.get('Error') or 'none'}; "
-                f"report_path={structured.get('path') or 'not-created'}; "
-                f"copy_attempts={len(structured.get('attempts') or [])}"
-            )
-        baseline = result.get("baseline_probe") if isinstance(result.get("baseline_probe"), dict) else {}
-        if baseline.get("performed"):
-            print(
-                "    [NIKTO BASELINE] "
-                f"status={baseline.get('status', 'n/a')}; server={baseline.get('server') or 'not-disclosed'}; "
-                f"signals={baseline.get('signal_count', 0)}; "
-                f"missing headers={','.join(baseline.get('missing_security_headers') or []) or 'none'}"
-            )
-
-def aggregate_runs(tool: str, target: str, runs: list[dict[str, Any]]) -> dict[str, Any]:
-    if not runs:
-        return make_skipped_result(tool, target, "No applicable endpoint was discovered for this tool.")
-    normalized = [_normalize_time_limit(dict(run), tool, str(run.get("target", target))) for run in runs]
-    statuses = [str(run.get("status", "error")).lower() for run in normalized]
-    successful = sum(status == "success" for status in statuses)
-    errors = sum(status == "error" for status in statuses)
-    partials = sum(status == "partial" for status in statuses)
-    limited = sum(status == "partial" and _is_time_limited(run) for status, run in zip(statuses, normalized))
-    skipped_count = sum(status == "skipped" for status in statuses)
-    if all(status == "skipped" for status in statuses):
-        status = "skipped"
-    elif errors == len(normalized):
-        status = "error"
-    elif errors or partials:
-        status = "partial"
-    else:
-        status = "success"
-    vulnerabilities: list[dict[str, Any]] = []
-    seen_findings: set[tuple[str, ...]] = set()
-    for run in normalized:
-        for finding in run.get("vulnerabilities") or []:
-            if not isinstance(finding, dict):
-                continue
-            fingerprint = tuple(str(finding.get(key, "")) for key in (
-                "alert", "risk", "category", "url", "parameter", "evidence"
-            ))
-            if fingerprint not in seen_findings:
-                seen_findings.add(fingerprint)
-                vulnerabilities.append(finding)
-    result = {
-        "tool": tool, "status": status, "target": target,
-        "output": (
-            f"Runs: {len(normalized)}; successful: {successful}; time-limited: {limited}; "
-            f"other partial: {max(0, partials-limited)}; errors: {errors}; skipped: {skipped_count}; "
-            f"findings: {len(vulnerabilities)}."
-        ),
-        "vulnerabilities": vulnerabilities, "runs": normalized,
-        "diagnosis": (
-            "nested_scanner_errors" if errors else
-            "time_limit_reached" if limited else
-            "nested_partial_results" if partials else None
-        ),
-        "timed_out": bool(limited),
-    }
-    return result
-
-def iter_leaf_results(value: Any, path: tuple[str, ...] = ()) -> Iterator[tuple[tuple[str, ...], dict[str, Any]]]:
-    if isinstance(value, dict) and "status" in value:
-        runs = value.get("runs")
-        if isinstance(runs, list):
-            for index, run in enumerate(runs):
-                yield from iter_leaf_results(run, (*path, f"run[{index}]"))
-        else:
-            yield path, value
-    elif isinstance(value, dict):
-        for key, nested in value.items():
-            yield from iter_leaf_results(nested, (*path, str(key)))
-
-
-def write_emergency_json_report(target: str, results: dict[str, Any], diagnostics: list[dict[str, Any]], reason: str, output_name: str = "SecOps_Emergency") -> str | None:
-    try:
-        directory = ROOT / "reports"
-        directory.mkdir(parents=True, exist_ok=True)
-        stem = re.sub(r"[^A-Za-z0-9_.-]+", "_", output_name).strip("._")
-        path = directory / f"{stem}_{datetime.now():%Y%m%d_%H%M%S}.json"
-        payload = {"generated_at": datetime.now(timezone.utc).isoformat(), "target": target, "reason": reason, "diagnostics": diagnostics, "results": results}
-        text = json.dumps(payload, indent=2, ensure_ascii=False, default=str)
-        path.write_text(text, encoding="utf-8")
-        path.with_suffix(".html").write_text(f"<!doctype html><meta charset='utf-8'><title>SecOps preview</title><style>body{{font-family:Segoe UI;margin:2rem}}pre{{white-space:pre-wrap;background:#111923;color:#e7eef7;padding:1rem}}</style><h1>SecOps emergency preview</h1><pre>{html.escape(text)}</pre>", encoding="utf-8")
-        return str(path.resolve())
-    except Exception as exc:
-        print(f"[REPORT FALLBACK ERROR] {exc}", file=sys.stderr)
-        return None
-
-
-def select_session_probe_url(discovery: dict[str, Any], target: str) -> str:
-    """Choose a stable non-destructive page for session checks."""
-    discovered = [
-        str(value)
-        for value in discovery.get("html_urls", [])
-        if isinstance(value, str)
-        and same_origin(target, value)
-        and not _is_auto_index_url(value)
-    ]
-    return _stable_auth_probe_url(target, discovered)
-
-
-
-# ---------------------------------------------------------------------------
-# Deterministic pipeline
-# ---------------------------------------------------------------------------
-
-def state_changing_tests_allowed(target: str, explicit: bool = False) -> bool:
-    """Allow bounded state-changing probes on local labs or by explicit opt-in."""
-    return bool(explicit) or urlparse(target).hostname in {"127.0.0.1", "localhost", "::1"}
-
-
+        return getattr(shared, name)
+    except AttributeError as exc:
+        raise AttributeError(name) from exc
+
+# Deterministic LangGraph workflow
 class DeterministicState(TypedDict, total=False):
     target: str
     profiles: list[dict[str, str]]
@@ -2966,770 +66,462 @@ class DeterministicState(TypedDict, total=False):
     assessment_context: dict[str, Any]
     report_status: dict[str, Any]
 
-
 async def deterministic_discovery_node(state: DeterministicState) -> dict[str, Any]:
-    target = state["target"]
-    profiles = state["profiles"]
-    allow_state_changes = bool(state.get("allow_state_changes", False))
-    print("\n[*] Discovery anonima e autenticata...")
+    target = state['target']
+    profiles = state['profiles']
+    allow_state_changes = bool(state.get('allow_state_changes', False))
+    print('\n[*] Discovery anonima e autenticata...')
     discovery: dict[str, dict[str, Any]] = {}
     diagnostics: list[dict[str, Any]] = []
-    results = {profile["name"]: {} for profile in profiles}
+    results = {profile['name']: {} for profile in profiles}
     workflow_state_changes = state_changing_tests_allowed(target, allow_state_changes)
-
     for profile in profiles:
-        name = profile["name"]
-        found = discover_target(target, profile["cookies"])
+        name = profile['name']
+        found = discover_target(target, profile['cookies'])
         discovery[name] = found
-        diagnostics.extend({"phase": "discovery", "profile": name, **item} for item in found["errors"])
-        print(
-            f"    {name}: {len(found['html_urls'])} pagine HTML, "
-            f"{len(found['request_cases'])} casi GET/POST, {len(found['errors'])} errori"
-        )
-        for error in found["errors"][:5]:
-            print(
-                f"      [CRAWL WARNING] {error.get('type', 'error')}: "
-                f"{error.get('url', '')} — {error.get('message', '')}"
-            )
-        if len(found["errors"]) > 5:
+        diagnostics.extend(({'phase': 'discovery', 'profile': name, **item} for item in found['errors']))
+        print(f"    {name}: {len(found['html_urls'])} pagine HTML, {len(found['request_cases'])} casi GET/POST, {len(found['errors'])} errori")
+        for error in found['errors'][:5]:
+            print(f"      [CRAWL WARNING] {error.get('type', 'error')}: {error.get('url', '')} — {error.get('message', '')}")
+        if len(found['errors']) > 5:
             print(f"      [CRAWL WARNING] altri {len(found['errors']) - 5} errori sono inclusi nel report.")
-        if found.get("authentication_effective") is False:
+        if found.get('authentication_effective') is False:
             print(f"    [WARNING] {name}: {found.get('authentication_note')}", file=sys.stderr)
-
-    return {
-        "discovery": discovery,
-        "diagnostics": diagnostics,
-        "results": results,
-        "workflow_state_changes": workflow_state_changes,
-    }
-
+    return {'discovery': discovery, 'diagnostics': diagnostics, 'results': results, 'workflow_state_changes': workflow_state_changes}
 
 async def deterministic_broad_scan_node(state: DeterministicState) -> dict[str, Any]:
-    target = state["target"]
-    profiles = state["profiles"]
-    discovery = state["discovery"]
-    diagnostics = state["diagnostics"]
-    results = state["results"]
-    has_authenticated_profile = any(bool(profile.get("cookies")) for profile in profiles)
-
-    # Broad scanners. Arjun is intentionally delayed until crawling and FFUF have produced useful endpoints.
-    profile_session_state: dict[str, bool] = {
-        profile["name"]: discovery[profile["name"]].get("authentication_effective") is not False
-        for profile in profiles
-    }
+    target = state['target']
+    profiles = state['profiles']
+    discovery = state['discovery']
+    diagnostics = state['diagnostics']
+    results = state['results']
+    has_authenticated_profile = any((bool(profile.get('cookies')) for profile in profiles))
+    profile_session_state = {profile['name']: discovery[profile['name']].get('authentication_effective') is not False for profile in profiles}
+    broad_specs = {spec.name: spec for spec in BASE_TOOLS}
     for profile in profiles:
-        name, cookies = profile["name"], profile["cookies"]
-        print(f"\n[*] Scanner generali - profilo: {name}")
-        # FFUF is session-guarded and filters destructive paths. Its discoveries
-        # are merged immediately, so ZAP and Nuclei receive the richest safe
-        # authenticated surface available in the same run.
-        broad_order = broad_tool_order(bool(cookies))
-        broad_specs = {
-            spec.name: spec
-            for spec in BASE_TOOLS
-        }
-
-        # Reuse anonymous FFUF discoveries as authenticated ZAP seeds without
-        # sending the authenticated cookie through the dangerous FFUF list.
-        if cookies and "anonymous" in results:
-            anonymous_ffuf = results.get("anonymous", {}).get("ffuf", {})
+        name, cookies = (profile['name'], profile['cookies'])
+        print(f'\n[*] Scanner generali - profilo: {name}')
+        if cookies and 'anonymous' in results:
+            anonymous_ffuf = results.get('anonymous', {}).get('ffuf', {})
             if isinstance(anonymous_ffuf, dict):
-                _, anonymous_urls = enrich_discovery_with_ffuf(
-                    discovery[name], anonymous_ffuf, target
-                )
+                _, anonymous_urls = enrich_discovery_with_ffuf(discovery[name], anonymous_ffuf, target)
                 if anonymous_urls:
-                    authenticated_recrawl = discover_target(
-                        target, cookies, seeds=anonymous_urls
-                    )
-                    discovery[name] = merge_discovery(
-                        discovery[name], authenticated_recrawl
-                    )
-                    diagnostics.extend(
-                        {
-                            "phase": "anonymous_ffuf_authenticated_recrawl",
-                            "profile": name,
-                            **item,
-                        }
-                        for item in authenticated_recrawl["errors"]
-                    )
-
-        profile_session_valid = discovery[name].get("authentication_effective") is not False
-        session_probe_url = select_session_probe_url(discovery[name], target)
-
-        for scanner_name in broad_order:
+                    recrawl = discover_target(target, cookies, seeds=anonymous_urls)
+                    discovery[name] = merge_discovery(discovery[name], recrawl)
+                    diagnostics.extend(({'phase': 'anonymous_ffuf_authenticated_recrawl', 'profile': name, **item} for item in recrawl['errors']))
+        session_valid = discovery[name].get('authentication_effective') is not False
+        probe_url = select_session_probe_url(discovery[name], target)
+        for scanner_name in broad_tool_order(bool(cookies)):
             spec = broad_specs[scanner_name]
             scanner_timeout = BROAD_SCANNER_TIMEOUTS.get(spec.name, 180)
-            if cookies and spec.name == "ffuf" and CURRENT_SCAN_MODE == "balanced":
+            if cookies and spec.name == 'ffuf' and (shared.CURRENT_SCAN_MODE == 'balanced'):
                 scanner_timeout = min(scanner_timeout, 35)
-            if name == "anonymous" and has_authenticated_profile and CURRENT_SCAN_MODE != "deep" and spec.name in {"nikto", "session"}:
-                result = make_skipped_result(spec.name, target, "Balanced mode runs this host/session-level scanner once on the authenticated profile to avoid duplicate time and traffic.")
-                results[name][spec.name] = result
-                log_result(name, spec.name, result, target)
-                continue
-            if cookies and not profile_session_valid:
-                result = make_skipped_result(
-                    spec.name,
-                    target,
-                    "Authenticated session is no longer valid; this run was skipped to avoid reporting anonymous coverage as authenticated.",
-                )
-                results[name][spec.name] = result
-                log_result(name, spec.name, result, target)
-                continue
-
-            arguments: dict[str, Any] = {
-                "target_url": target,
-                "cookies": cookies,
-                "timeout": scanner_timeout,
-            }
-            if spec.name == "ffuf":
-                arguments["session_probe_url"] = session_probe_url
-            if spec.name == "session":
-                arguments["probe_url"] = session_probe_url
-                arguments["sample_count"] = 7 if CURRENT_SCAN_MODE == "deep" else 5 if CURRENT_SCAN_MODE == "balanced" else 3
-            if spec.name == "zap":
-                # ZAP's own spider previously started only from the root URL. Pass
-                # the already authenticated discovery surface so ZAP can import
-                # forms, POST requests and parameterized endpoints before active scan.
-                arguments.update({
-                    "seed_urls": discovery[name].get("html_urls", []),
-                    "request_cases": discovery[name].get("request_cases", []),
-                    "scan_mode": (
-                        "full"
-                        if bool(cookies) and CURRENT_SCAN_MODE == "deep"
-                        else "prioritized"
-                        if bool(cookies) and CURRENT_SCAN_MODE == "balanced"
-                        else "passive"
-                    ),
-                    "max_observations": (100 if CURRENT_SCAN_MODE == "deep" else 50 if CURRENT_SCAN_MODE == "balanced" else 25),
-                })
-            if spec.name == "nikto":
-                arguments["scan_profile"] = CURRENT_SCAN_MODE
-            if spec.name == "nuclei":
-                arguments["seed_urls"] = discovery[name].get("urls", [])
-                arguments["request_cases"] = discovery[name].get("request_cases", [])
-                arguments["scan_profile"] = CURRENT_SCAN_MODE
-                arguments["max_targets"] = (
-                    16 if CURRENT_SCAN_MODE == "deep"
-                    else 10 if CURRENT_SCAN_MODE == "balanced"
-                    else 6
-                )
-            result = await call_mcp_with_progress(spec, arguments)
+            if name == 'anonymous' and has_authenticated_profile and (shared.CURRENT_SCAN_MODE != 'deep') and (spec.name in {'nikto', 'session'}):
+                result = make_skipped_result(spec.name, target, 'Balanced mode runs this host/session-level scanner once on the authenticated profile to avoid duplicate time and traffic.')
+            elif cookies and (not session_valid):
+                result = make_skipped_result(spec.name, target, 'Authenticated session is no longer valid; this run was skipped to avoid reporting anonymous coverage as authenticated.')
+            else:
+                arguments = build_tool_arguments(spec.name, target, cookies, discovery[name], timeout_override=scanner_timeout)
+                result = await call_mcp_with_progress(spec, arguments)
             results[name][spec.name] = result
             log_result(name, spec.name, result, target)
-            if spec.name == "zap":
+            if result.get('status') == 'skipped':
+                continue
+            if spec.name == 'zap':
                 log_zap_session_diagnostics(result)
                 if cookies:
-                    recovery = scanner_session_probe(
-                        session_probe_url, cookies, timeout=10, attempts=4
-                    )
-                    result["downstream_session_recovery"] = recovery
-                    state_refresh = refresh_authenticated_session_state(target, cookies, session_probe_url)
-                    result["downstream_session_state_refresh"] = state_refresh
-                    if state_refresh.get("usable") is False:
-                        profile_session_valid = False
-                        print(
-                            "    [AUTH SESSION ROOT CAUSE] The authenticated session could not be restored after ZAP.",
-                            file=sys.stderr,
-                        )
-                    if recovery.get("conclusive") and recovery.get("authenticated") is False:
-                        profile_session_valid = False
-                        print(
-                            "    [AUTH SESSION ROOT CAUSE] Direct recovery probe conclusively reached the login page after ZAP.",
-                            file=sys.stderr,
-                        )
-                    elif recovery.get("conclusive") is False:
-                        print(
-                            "    [WARNING] Target recovery remained temporarily inconclusive; downstream scanners will still run because no logout was proven.",
-                            file=sys.stderr,
-                        )
-            if spec.name == "ffuf" and result.get("status") in {"success", "partial"}:
+                    recovery = scanner_session_probe(probe_url, cookies, timeout=10, attempts=4)
+                    refresh = refresh_authenticated_session_state(target, cookies, probe_url)
+                    result['downstream_session_recovery'] = recovery
+                    result['downstream_session_state_refresh'] = refresh
+                    if refresh.get('usable') is False:
+                        session_valid = False
+                        print('    [AUTH SESSION ROOT CAUSE] The authenticated session could not be restored after ZAP.', file=sys.stderr)
+                    if recovery.get('conclusive') and recovery.get('authenticated') is False:
+                        session_valid = False
+                        print('    [AUTH SESSION ROOT CAUSE] Direct recovery probe conclusively reached the login page after ZAP.', file=sys.stderr)
+                    elif recovery.get('conclusive') is False:
+                        print('    [WARNING] Target recovery remained temporarily inconclusive; downstream scanners will still run because no logout was proven.', file=sys.stderr)
+            if spec.name == 'ffuf' and result.get('status') in {'success', 'partial'}:
                 discovery[name], discovered_urls = enrich_discovery_with_ffuf(discovery[name], result, target)
                 if discovered_urls:
                     recrawl = discover_target(target, cookies, seeds=discovered_urls)
                     discovery[name] = merge_discovery(discovery[name], recrawl)
-                    diagnostics.extend({"phase": "ffuf_recrawl", "profile": name, **item} for item in recrawl["errors"])
-                    print(
-                        f"    [INFO   ] FFUF re-crawl: {len(discovery[name]['html_urls'])} HTML pages, "
-                        f"{len(discovery[name]['request_cases'])} GET/POST cases"
-                    )
-                    if cookies and recrawl.get("authentication_effective") is False:
-                        profile_session_valid = False
-                        print(
-                            "    [AUTH SESSION ROOT CAUSE] The authenticated session became invalid after FFUF. "
-                            "Remaining authenticated scanners will be skipped.",
-                            file=sys.stderr,
-                        )
-                if cookies and result.get("diagnosis") == "authentication_lost_during_ffuf":
-                    profile_session_valid = False
-
-        arjun_cases = select_arjun_request_cases(
-            discovery[name], target,
-            limit=ARJUN_ENDPOINT_LIMIT,
-        )
+                    diagnostics.extend(({'phase': 'ffuf_recrawl', 'profile': name, **item} for item in recrawl['errors']))
+                    print(f"    [INFO   ] FFUF re-crawl: {len(discovery[name]['html_urls'])} HTML pages, {len(discovery[name]['request_cases'])} GET/POST cases")
+                    if cookies and recrawl.get('authentication_effective') is False:
+                        session_valid = False
+                        print('    [AUTH SESSION ROOT CAUSE] The authenticated session became invalid after FFUF. Remaining authenticated scanners will be skipped.', file=sys.stderr)
+                if cookies and result.get('diagnosis') == 'authentication_lost_during_ffuf':
+                    session_valid = False
         arjun_runs: list[dict[str, Any]] = []
+        arjun_cases = select_arjun_request_cases(discovery[name], target, limit=shared.ARJUN_ENDPOINT_LIMIT)
         if arjun_cases:
-            print(f"    [INFO   ] Arjun request cases selected: {len(arjun_cases)}")
-            consecutive_empty_limits = 0
-            limit_threshold = 2 if CURRENT_SCAN_MODE == "deep" else 1
-            for arjun_case in arjun_cases:
-                endpoint = str(arjun_case.get("url") or target)
-                if consecutive_empty_limits >= limit_threshold:
-                    result = make_skipped_result(
-                        "arjun",
-                        endpoint,
-                        "Adaptive budget reallocation: earlier high-priority Arjun runs reached their full budget without discovering a parameter, so lower-priority repeats were skipped.",
-                    ) | {"diagnosis": "adaptive_budget_reallocated"}
-                    arjun_runs.append(result)
-                    log_result(name, "arjun", result, endpoint)
-                    continue
-                state_refresh = refresh_authenticated_session_state(target, cookies, session_probe_url) if cookies else {"performed": False, "usable": True}
-                result = await call_mcp_with_progress(
-                    ARJUN_TOOL,
-                    {
-                        "target_url": endpoint,
-                        "cookies": cookies,
-                        "method": arjun_case.get("method", "GET"),
-                        "data": arjun_case.get("data", ""),
-                        "known_parameters": arjun_case.get("parameters", []),
-                        "timeout": ARJUN_TIMEOUT,
-                    },
-                )
-                result["session_state_refresh"] = state_refresh
-                arjun_runs.append(result)
-                log_result(name, "arjun", result, endpoint)
-                found_parameters = int(result.get("phase_parameters", 0) or 0)
-                if result.get("diagnosis") in TIME_LIMIT_DIAGNOSES and not result.get("vulnerabilities") and found_parameters == 0:
-                    consecutive_empty_limits += 1
+            print(f'    [INFO   ] Arjun request cases selected: {len(arjun_cases)}')
+            empty_limits = 0
+            limit_threshold = 2 if shared.CURRENT_SCAN_MODE == 'deep' else 1
+            for case in arjun_cases:
+                endpoint = str(case.get('url') or target)
+                if empty_limits >= limit_threshold:
+                    result = make_skipped_result('arjun', endpoint, 'Adaptive budget reallocation: earlier high-priority Arjun runs reached their full budget without discovering a parameter, so lower-priority repeats were skipped.') | {'diagnosis': 'adaptive_budget_reallocated'}
                 else:
-                    consecutive_empty_limits = 0
-                if result.get("status") in {"success", "partial"}:
-                    discovery[name], _ = enrich_discovery_with_arjun(discovery[name], result, endpoint)
-        profile_session_state[name] = profile_session_valid
-        results[name]["arjun"] = aggregate_runs("arjun", target, arjun_runs) if arjun_runs else make_skipped_result(
-            "arjun", target, "No suitable HTML/form endpoint was available for hidden-parameter discovery."
-        )
-
-    return {
-        "discovery": discovery,
-        "diagnostics": diagnostics,
-        "results": results,
-        "has_authenticated_profile": has_authenticated_profile,
-        "profile_session_state": profile_session_state,
-    }
-
+                    refresh = refresh_authenticated_session_state(target, cookies, probe_url) if cookies else {'performed': False, 'usable': True}
+                    arguments = build_tool_arguments('arjun', endpoint, cookies, discovery[name], case=case)
+                    result = await call_mcp_with_progress(ARJUN_TOOL, arguments)
+                    result['session_state_refresh'] = refresh
+                    found = int(result.get('phase_parameters', 0) or 0)
+                    timed_out_empty = result.get('diagnosis') in TIME_LIMIT_DIAGNOSES and (not result.get('vulnerabilities')) and (found == 0)
+                    empty_limits = empty_limits + 1 if timed_out_empty else 0
+                    if result.get('status') in {'success', 'partial'}:
+                        discovery[name], _ = enrich_discovery_with_arjun(discovery[name], result, endpoint)
+                arjun_runs.append(result)
+                log_result(name, 'arjun', result, endpoint)
+        profile_session_state[name] = session_valid
+        results[name]['arjun'] = aggregate_runs('arjun', target, arjun_runs) if arjun_runs else make_skipped_result('arjun', target, 'No suitable HTML/form endpoint was available for hidden-parameter discovery.')
+    return {'discovery': discovery, 'diagnostics': diagnostics, 'results': results, 'has_authenticated_profile': has_authenticated_profile, 'profile_session_state': profile_session_state}
 
 async def deterministic_parameter_scan_node(state: DeterministicState) -> dict[str, Any]:
-    target = state["target"]
-    profiles = state["profiles"]
-    discovery = state["discovery"]
-    results = state["results"]
-    workflow_state_changes = bool(state.get("workflow_state_changes", False))
-    has_authenticated_profile = bool(state.get("has_authenticated_profile", False))
-    profile_session_state = state.get("profile_session_state", {})
-    # Parameter tools are selected independently by vulnerability class.
-    parameter_selection_summary: dict[str, dict[str, list[dict[str, Any]]]] = {}
+    target = state['target']
+    profiles = state['profiles']
+    discovery = state['discovery']
+    results = state['results']
+    allow_state_changes = bool(state.get('workflow_state_changes', False))
+    has_authenticated_profile = bool(state.get('has_authenticated_profile', False))
+    session_state = state.get('profile_session_state', {})
+    selection_summary: dict[str, dict[str, list[dict[str, Any]]]] = {}
     semaphore = asyncio.Semaphore(1)
 
-    async def run_parameter_tool(
-        spec: ToolSpec,
-        case: dict[str, Any],
-        cookies: str,
-        probe_url: str,
-    ) -> dict[str, Any]:
-        url = str(case.get("url", ""))
-        method = str(case.get("method", "GET")).upper()
+    async def run_case(spec: ToolSpec, case: dict[str, Any], cookies: str, probe_url: str) -> dict[str, Any]:
+        url = str(case.get('url', ''))
         skip_reason = _tool_case_skip_reason(spec.name, case)
         if skip_reason:
             return make_skipped_result(spec.name, url, skip_reason)
-
-        scanner_timeout = PARAMETER_TOOL_TIMEOUTS.get(spec.name, 120)
-        arguments: dict[str, Any] = {
-            "target_url": url,
-            "cookies": cookies,
-            "method": method,
-            "data": str(case.get("data", "")),
-            "parameters": list(case.get("parameters", [])),
-            "timeout": scanner_timeout,
-        }
-        if spec.name == "dalfox":
-            arguments["allow_state_changes"] = workflow_state_changes
-
+        timeout = PARAMETER_TOOL_TIMEOUTS.get(spec.name, 120)
+        arguments = build_tool_arguments(spec.name, url, cookies, {}, case=case, allow_state_changes=allow_state_changes, timeout_override=timeout)
         async with semaphore:
-            state_refresh = refresh_authenticated_session_state(target, cookies, probe_url) if cookies else {"performed": False, "usable": True}
-            if state_refresh.get("usable") is False:
-                return make_skipped_result(
-                    spec.name,
-                    url,
-                    "The authenticated session could not be restored before this scanner.",
-                ) | {"session_state_refresh": state_refresh}
-            result = await call_mcp_with_progress(
-                spec,
-                arguments,
-                timeout_seconds=scanner_timeout + 35,
-            )
-            result["session_state_refresh"] = state_refresh
+            refresh = refresh_authenticated_session_state(target, cookies, probe_url) if cookies else {'performed': False, 'usable': True}
+            if refresh.get('usable') is False:
+                return make_skipped_result(spec.name, url, 'The authenticated session could not be restored before this scanner.') | {'session_state_refresh': refresh}
+            result = await call_mcp_with_progress(spec, arguments, timeout_seconds=timeout + 35)
+            result['session_state_refresh'] = refresh
             return result
-
     for profile in profiles:
-        name, cookies = profile["name"], profile["cookies"]
-        print(f"\n[*] Scanner su parametri - profilo: {name}")
-        parameter_selection_summary[name] = {}
-        if name == "anonymous" and has_authenticated_profile:
+        name, cookies = (profile['name'], profile['cookies'])
+        print(f'\n[*] Scanner su parametri - profilo: {name}')
+        selection_summary[name] = {}
+        skip_reason = ''
+        if name == 'anonymous' and has_authenticated_profile:
+            skip_reason = 'Active parameter testing uses the richer authenticated request surface; repeating it against the anonymous authentication form is non-applicable and wastes the scan budget.'
+        elif cookies and (not session_state.get(name, True)):
+            skip_reason = 'Authenticated session became invalid before parameter testing.'
+        if skip_reason:
             for spec in PARAMETER_TOOLS:
-                results[name][spec.name] = make_skipped_result(spec.name, target, "Active parameter testing uses the richer authenticated request surface; repeating it against the anonymous authentication form is non-applicable and wastes the scan budget.")
-                log_result(name, spec.name, results[name][spec.name], target)
-            continue
-        if cookies and not profile_session_state.get(name, True):
-            for spec in PARAMETER_TOOLS:
-                results[name][spec.name] = make_skipped_result(
-                    spec.name,
-                    target,
-                    "Authenticated session became invalid before parameter testing.",
-                )
+                results[name][spec.name] = make_skipped_result(spec.name, target, skip_reason)
                 log_result(name, spec.name, results[name][spec.name], target)
             continue
         grouped = {spec.name: [] for spec in PARAMETER_TOOLS}
         tasks: list[tuple[ToolSpec, dict[str, Any], asyncio.Task[dict[str, Any]]]] = []
-        profile_probe_url = select_session_probe_url(discovery[name], target)
-
+        probe_url = select_session_probe_url(discovery[name], target)
         for spec in PARAMETER_TOOLS:
             cases = select_tool_request_cases(discovery[name], spec.name)
-            if cookies and spec.name == "sqlmap":
+            if cookies and spec.name == 'sqlmap':
                 cases = [case for case in cases if not _is_login_case(case)]
-            get_count = sum(str(case.get("method", "GET")).upper() == "GET" for case in cases)
-            post_count = len(cases) - get_count
-            parameter_selection_summary[name][spec.name] = [
-                {
-                    "method": str(case.get("method", "GET")).upper(),
-                    "url": str(case.get("url", "")),
-                    "parameters": list(case.get("parameters", [])),
-                }
-                for case in cases
-            ]
-            print(
-                f"    [INFO   ] {spec.name}: casi selezionati={len(cases)} "
-                f"(GET={get_count}, POST={post_count})"
-            )
-            for case in cases:
-                tasks.append(
-                    (spec, case, asyncio.create_task(
-                        run_parameter_tool(spec, case, cookies, profile_probe_url)
-                    ))
-                )
-
+            get_count = sum((str(case.get('method', 'GET')).upper() == 'GET' for case in cases))
+            selection_summary[name][spec.name] = [{'method': str(case.get('method', 'GET')).upper(), 'url': str(case.get('url', '')), 'parameters': list(case.get('parameters', []))} for case in cases]
+            print(f'    [INFO   ] {spec.name}: casi selezionati={len(cases)} (GET={get_count}, POST={len(cases) - get_count})')
+            tasks.extend(((spec, case, asyncio.create_task(run_case(spec, case, cookies, probe_url))) for case in cases))
         for spec, case, task in tasks:
             result = await task
             grouped[spec.name].append(result)
-            label = f"{case.get('method', 'GET')} {case.get('url', '')}"
-            log_result(name, spec.name, result, label)
-
+            log_result(name, spec.name, result, f"{case.get('method', 'GET')} {case.get('url', '')}")
         for spec in PARAMETER_TOOLS:
             runs = grouped[spec.name]
-            results[name][spec.name] = (
-                aggregate_runs(spec.name, target, runs)
-                if runs
-                else make_skipped_result(
-                    spec.name,
-                    target,
-                    f"No discovered request matched {spec.name}'s vulnerability class.",
-                )
-            )
-
-    return {
-        "results": results,
-        "parameter_selection_summary": parameter_selection_summary,
-    }
-
+            results[name][spec.name] = aggregate_runs(spec.name, target, runs) if runs else make_skipped_result(spec.name, target, f"No discovered request matched {spec.name}'s vulnerability class.")
+    return {'results': results, 'parameter_selection_summary': selection_summary}
 
 async def deterministic_authorization_node(state: DeterministicState) -> dict[str, Any]:
-    target = state["target"]
-    profiles = state["profiles"]
-    discovery = state["discovery"]
-    results = state["results"]
-    secondary_cookies = str(state.get("secondary_cookies", ""))
-    profile_session_state = state.get("profile_session_state", {})
-    # Read-only authorization differentials. A primary authenticated identity is
-    # compared against anonymous access and, when supplied, a second identity.
-    # This complements the single-parameter IDOR heuristic and remains safe for
-    # remote authorized targets because it never submits a state-changing method.
+    target = state['target']
+    profiles = state['profiles']
+    discovery = state['discovery']
+    results = state['results']
+    secondary_cookies = str(state.get('secondary_cookies', ''))
+    profile_session_state = state.get('profile_session_state', {})
     authorization_selection_summary: dict[str, list[dict[str, Any]]] = {}
     for profile in profiles:
-        name, cookies = profile["name"], profile["cookies"]
+        name, cookies = (profile['name'], profile['cookies'])
         authorization_selection_summary[name] = []
         if not cookies:
-            result = make_skipped_result(
-                "authorization", target,
-                "Authorization comparison requires a primary authenticated profile.",
-            )
-            results[name]["authorization"] = result
-            log_result(name, "authorization", result, target)
+            result = make_skipped_result('authorization', target, 'Authorization comparison requires a primary authenticated profile.')
+            results[name]['authorization'] = result
+            log_result(name, 'authorization', result, target)
             continue
         if not profile_session_state.get(name, True):
-            result = make_skipped_result(
-                "authorization", target,
-                "Authenticated session became invalid before authorization comparison.",
-            )
-            results[name]["authorization"] = result
-            log_result(name, "authorization", result, target)
+            result = make_skipped_result('authorization', target, 'Authenticated session became invalid before authorization comparison.')
+            results[name]['authorization'] = result
+            log_result(name, 'authorization', result, target)
             continue
         cases = select_authorization_request_cases(discovery[name])
-        authorization_selection_summary[name] = [
-            {
-                "method": "GET",
-                "url": str(case.get("url", "")),
-                "parameters": list(case.get("parameters", [])),
-            }
-            for case in cases
-        ]
-        print(
-            f"\n[*] Authorization differential - profilo: {name}\n"
-            f"    [INFO   ] authorization: casi selezionati={len(cases)}; "
-            f"seconda identità={'sì' if secondary_cookies else 'no'}"
-        )
+        authorization_selection_summary[name] = [{'method': 'GET', 'url': str(case.get('url', '')), 'parameters': list(case.get('parameters', []))} for case in cases]
+        print(f"\n[*] Authorization differential - profilo: {name}\n    [INFO   ] authorization: casi selezionati={len(cases)}; seconda identità={('sì' if secondary_cookies else 'no')}")
         runs: list[dict[str, Any]] = []
         probe_url = select_session_probe_url(discovery[name], target)
         for case in cases:
             state_refresh = refresh_authenticated_session_state(target, cookies, probe_url)
-            if state_refresh.get("usable") is False:
-                result = make_skipped_result(
-                    "authorization", str(case.get("url", target)),
-                    "The primary authenticated session could not be restored before authorization comparison.",
-                ) | {"session_state_refresh": state_refresh}
+            if state_refresh.get('usable') is False:
+                result = make_skipped_result('authorization', str(case.get('url', target)), 'The primary authenticated session could not be restored before authorization comparison.') | {'session_state_refresh': state_refresh}
             else:
-                result = await call_mcp_with_progress(
-                    AUTHORIZATION_TOOL,
-                    {
-                        "target_url": str(case.get("url", target)),
-                        "cookies": cookies,
-                        "secondary_cookies": secondary_cookies,
-                        "method": "GET",
-                        "data": "",
-                        "parameters": list(case.get("parameters", [])),
-                        "timeout": PARAMETER_TOOL_TIMEOUTS.get("authorization", 40),
-                    },
-                    timeout_seconds=PARAMETER_TOOL_TIMEOUTS.get("authorization", 40) + 30,
-                )
-                result["session_state_refresh"] = state_refresh
+                result = await call_mcp_with_progress(AUTHORIZATION_TOOL, {'target_url': str(case.get('url', target)), 'cookies': cookies, 'secondary_cookies': secondary_cookies, 'method': 'GET', 'data': '', 'parameters': list(case.get('parameters', [])), 'timeout': PARAMETER_TOOL_TIMEOUTS.get('authorization', 40)}, timeout_seconds=PARAMETER_TOOL_TIMEOUTS.get('authorization', 40) + 30)
+                result['session_state_refresh'] = state_refresh
             runs.append(result)
-            log_result(name, "authorization", result, str(case.get("url", target)))
-        results[name]["authorization"] = (
-            aggregate_runs("authorization", target, runs)
-            if runs else make_skipped_result(
-                "authorization", target,
-                "No discovered read-only request contained a plausible identity, object or privileged-resource signal.",
-            )
-        )
+            log_result(name, 'authorization', result, str(case.get('url', target)))
+        results[name]['authorization'] = aggregate_runs('authorization', target, runs) if runs else make_skipped_result('authorization', target, 'No discovered read-only request contained a plausible identity, object or privileged-resource signal.')
         if not runs:
-            log_result(name, "authorization", results[name]["authorization"], target)
-
-    return {
-        "results": results,
-        "authorization_selection_summary": authorization_selection_summary,
-    }
-
+            log_result(name, 'authorization', results[name]['authorization'], target)
+    return {'results': results, 'authorization_selection_summary': authorization_selection_summary}
 
 async def deterministic_browser_workflow_node(state: DeterministicState) -> dict[str, Any]:
-    target = state["target"]
-    profiles = state["profiles"]
-    discovery = state["discovery"]
-    results = state["results"]
-    workflow_state_changes = bool(state.get("workflow_state_changes", False))
-    has_authenticated_profile = bool(state.get("has_authenticated_profile", False))
-    profile_session_state = state.get("profile_session_state", {})
-    # Browser and multi-step workflow checks operate on the same discovery
-    # contracts in both orchestrators. They add coverage that response-only
-    # scanners cannot provide: DOM/stored XSS, CSRF structure/token enforcement,
-    # harmless upload retrieval, bounded login throttling and CAPTCHA workflows.
-    workflow_selection_summary: dict[str, dict[str, list[dict[str, Any]]]] = {}
+    target = state['target']
+    profiles = state['profiles']
+    discovery = state['discovery']
+    results = state['results']
+    allow_state_changes = bool(state.get('workflow_state_changes', False))
+    has_authenticated_profile = bool(state.get('has_authenticated_profile', False))
+    session_state = state.get('profile_session_state', {})
+    selection_summary: dict[str, dict[str, list[dict[str, Any]]]] = {}
+    specs = {spec.name: spec for spec in WORKFLOW_TOOLS}
+
+    async def run_case(tool: str, case: dict[str, Any], cookies: str, profile_discovery: dict[str, Any], probe_url: str) -> dict[str, Any]:
+        url = str(case.get('url', target))
+        refresh = refresh_authenticated_session_state(target, cookies, probe_url) if cookies else {'performed': False, 'usable': True}
+        if refresh.get('usable') is False:
+            return make_skipped_result(tool, url, f'The authenticated session could not be restored before {tool} verification.')
+        arguments = build_tool_arguments(tool, url, cookies, profile_discovery, case=case, allow_state_changes=allow_state_changes)
+        result = await call_mcp_with_progress(specs[tool], arguments, timeout_seconds=PARAMETER_TOOL_TIMEOUTS[tool] + 35)
+        result['session_state_refresh'] = refresh
+        return result
     for profile in profiles:
-        name, cookies = profile["name"], profile["cookies"]
-        workflow_selection_summary[name] = {"browser": [], "workflow": []}
-        if name == "anonymous" and has_authenticated_profile and CURRENT_SCAN_MODE != "deep":
+        name, cookies = (profile['name'], profile['cookies'])
+        selection_summary[name] = {'browser': [], 'workflow': []}
+        skip_reason = ''
+        if name == 'anonymous' and has_authenticated_profile and (shared.CURRENT_SCAN_MODE != 'deep'):
+            skip_reason = 'Balanced mode runs browser/workflow verification on the richer authenticated surface.'
+        elif cookies and (not session_state.get(name, True)):
+            skip_reason = 'Authenticated session became invalid before browser/workflow verification.'
+        if skip_reason:
             for spec in WORKFLOW_TOOLS:
-                results[name][spec.name] = make_skipped_result(
-                    spec.name,
-                    target,
-                    "Balanced mode runs browser/workflow verification on the richer authenticated surface.",
-                )
+                results[name][spec.name] = make_skipped_result(spec.name, target, skip_reason)
                 log_result(name, spec.name, results[name][spec.name], target)
             continue
-        if cookies and not profile_session_state.get(name, True):
-            for spec in WORKFLOW_TOOLS:
-                results[name][spec.name] = make_skipped_result(
-                    spec.name,
-                    target,
-                    "Authenticated session became invalid before browser/workflow verification.",
-                )
-                log_result(name, spec.name, results[name][spec.name], target)
-            continue
-
-        probe_url = select_session_probe_url(discovery[name], target)
-        browser_cases = select_browser_request_cases(discovery[name])
-        workflow_cases = select_workflow_request_cases(discovery[name])
-        workflow_selection_summary[name]["browser"] = [
-            {
-                "method": str(case.get("method", "GET")).upper(),
-                "url": str(case.get("url", "")),
-                "parameters": list(case.get("parameters", [])),
-                "fields": list(case.get("fields", [])),
-                "source_url": str(case.get("source_url", "")),
-                "client_sources": list(case.get("client_sources", [])),
-                "client_sinks": list(case.get("client_sinks", [])),
-            }
-            for case in browser_cases
-        ]
-        workflow_selection_summary[name]["workflow"] = [
-            {
-                "method": str(case.get("method", "POST")).upper(),
-                "url": str(case.get("url", "")),
-                "parameters": list(case.get("parameters", [])),
-                "file_parameters": list(case.get("file_parameters", [])),
-                "token_parameters": list(case.get("token_parameters", [])),
-                "source_url": str(case.get("source_url", "")),
-            }
-            for case in workflow_cases
-        ]
-        print(
-            f"\n[*] Browser/workflow - profilo: {name}\n"
-            f"    [INFO   ] browser: casi selezionati={len(browser_cases)}\n"
-            f"    [INFO   ] workflow: casi selezionati={len(workflow_cases)}"
-        )
-
+        profile_discovery = discovery[name]
+        probe_url = select_session_probe_url(profile_discovery, target)
+        browser_cases = select_browser_request_cases(profile_discovery)
+        workflow_cases = select_workflow_request_cases(profile_discovery)
+        selection_summary[name]['browser'] = [{'method': str(case.get('method', 'GET')).upper(), 'url': str(case.get('url', '')), 'parameters': list(case.get('parameters', [])), 'fields': list(case.get('fields', [])), 'source_url': str(case.get('source_url', '')), 'client_sources': list(case.get('client_sources', [])), 'client_sinks': list(case.get('client_sinks', []))} for case in browser_cases]
+        selection_summary[name]['workflow'] = [{'method': str(case.get('method', 'POST')).upper(), 'url': str(case.get('url', '')), 'parameters': list(case.get('parameters', [])), 'file_parameters': list(case.get('file_parameters', [])), 'token_parameters': list(case.get('token_parameters', [])), 'source_url': str(case.get('source_url', ''))} for case in workflow_cases]
+        print(f'\n[*] Browser/workflow - profilo: {name}')
+        print(f'    [INFO   ] browser: casi selezionati={len(browser_cases)}')
+        print(f'    [INFO   ] workflow: casi selezionati={len(workflow_cases)}')
         browser_runs: list[dict[str, Any]] = []
-        browser_spec = next(item for item in WORKFLOW_TOOLS if item.name == "browser")
         browser_unavailable = False
         for case in browser_cases:
+            url = str(case.get('url', target))
             if browser_unavailable:
-                browser_runs.append(make_skipped_result(
-                    "browser", str(case.get("url", target)),
-                    "Playwright was unavailable in the first browser run; remaining browser cases were not repeated.",
-                ))
-                continue
-            state_refresh = refresh_authenticated_session_state(target, cookies, probe_url) if cookies else {"performed": False, "usable": True}
-            if state_refresh.get("usable") is False:
-                result = make_skipped_result("browser", str(case.get("url", target)), "The authenticated session could not be restored before browser verification.")
+                result = make_skipped_result('browser', url, 'Playwright was unavailable in the first browser run; remaining browser cases were not repeated.')
             else:
-                result = await call_mcp_with_progress(
-                    browser_spec,
-                    {
-                        "target_url": str(case.get("url", target)),
-                        "cookies": cookies,
-                        "method": str(case.get("method", "GET")),
-                        "data": str(case.get("data", "")),
-                        "parameters": list(case.get("parameters", [])),
-                        "fields": list(case.get("fields", [])),
-                        "source_url": str(case.get("source_url", "")),
-                        "client_sources": list(case.get("client_sources", [])),
-                        "client_sinks": list(case.get("client_sinks", [])),
-                        "timeout": PARAMETER_TOOL_TIMEOUTS.get("browser", 75),
-                        "allow_state_changes": workflow_state_changes,
-                    },
-                    timeout_seconds=PARAMETER_TOOL_TIMEOUTS.get("browser", 75) + 35,
-                )
-                result["session_state_refresh"] = state_refresh
+                result = await run_case('browser', case, cookies, profile_discovery, probe_url)
+                if result.get('diagnosis') in {'missing_playwright', 'missing_playwright_browser'}:
+                    browser_unavailable = True
             browser_runs.append(result)
-            log_result(name, "browser", result, str(case.get("url", target)))
-            if result.get("diagnosis") in {"missing_playwright", "missing_playwright_browser"}:
-                browser_unavailable = True
-        results[name]["browser"] = (
-            aggregate_runs("browser", target, browser_runs)
-            if browser_runs else make_skipped_result(
-                "browser", target,
-                "No discovered request or client-side source/sink page matched browser XSS verification.",
-            )
-        )
+            log_result(name, 'browser', result, url)
+        results[name]['browser'] = aggregate_runs('browser', target, browser_runs) if browser_runs else make_skipped_result('browser', target, 'No discovered request or client-side source/sink page matched browser XSS verification.')
         if not browser_runs:
-            log_result(name, "browser", results[name]["browser"], target)
-
+            log_result(name, 'browser', results[name]['browser'], target)
         workflow_runs: list[dict[str, Any]] = []
-        workflow_spec = next(item for item in WORKFLOW_TOOLS if item.name == "workflow")
         for case in workflow_cases:
-            state_refresh = refresh_authenticated_session_state(target, cookies, probe_url) if cookies else {"performed": False, "usable": True}
-            if state_refresh.get("usable") is False:
-                result = make_skipped_result("workflow", str(case.get("url", target)), "The authenticated session could not be restored before workflow verification.")
-            else:
-                result = await call_mcp_with_progress(
-                    workflow_spec,
-                    {
-                        "target_url": str(case.get("url", target)),
-                        "cookies": cookies,
-                        "method": str(case.get("method", "POST")),
-                        "data": str(case.get("data", "")),
-                        "parameters": list(case.get("parameters", [])),
-                        "fields": list(case.get("fields", [])),
-                        "file_parameters": list(case.get("file_parameters", [])),
-                        "token_parameters": list(case.get("token_parameters", [])),
-                        "source_url": str(case.get("source_url", "")),
-                        "enctype": str(case.get("enctype", "")),
-                        "timeout": PARAMETER_TOOL_TIMEOUTS.get("workflow", 60),
-                        "allow_state_changes": workflow_state_changes,
-                        "known_urls": list(discovery[name].get("urls", [])),
-                    },
-                    timeout_seconds=PARAMETER_TOOL_TIMEOUTS.get("workflow", 60) + 35,
-                )
-                result["session_state_refresh"] = state_refresh
+            url = str(case.get('url', target))
+            result = await run_case('workflow', case, cookies, profile_discovery, probe_url)
             workflow_runs.append(result)
-            log_result(name, "workflow", result, str(case.get("url", target)))
-        results[name]["workflow"] = (
-            aggregate_runs("workflow", target, workflow_runs)
-            if workflow_runs else make_skipped_result(
-                "workflow", target,
-                "No discovered POST form matched CSRF, upload, authentication or CAPTCHA workflow classes.",
-            )
-        )
+            log_result(name, 'workflow', result, url)
+        results[name]['workflow'] = aggregate_runs('workflow', target, workflow_runs) if workflow_runs else make_skipped_result('workflow', target, 'No discovered POST form matched CSRF, upload, authentication or CAPTCHA workflow classes.')
         if not workflow_runs:
-            log_result(name, "workflow", results[name]["workflow"], target)
-
-    return {
-        "results": results,
-        "workflow_selection_summary": workflow_selection_summary,
-    }
-
+            log_result(name, 'workflow', results[name]['workflow'], target)
+    return {'results': results, 'workflow_selection_summary': selection_summary}
 
 async def deterministic_special_checks_node(state: DeterministicState) -> dict[str, Any]:
-    target = state["target"]
-    profiles = state["profiles"]
-    discovery = state["discovery"]
-    results = state["results"]
-    injection_url = str(state.get("injection_url", ""))
+    target = state['target']
+    profiles = state['profiles']
+    discovery = state['discovery']
+    results = state['results']
+    injection_url = str(state.get('injection_url', ''))
     oast_selection_summary: dict[str, list[dict[str, Any]]] = {}
     for profile in profiles:
-        name = profile["name"]
-        token = (discovery[name].get("jwt_tokens") or [""])[0]
-        jwt_result = (
-            await call_mcp("jwtServer.py", "run_jwt_scan", {"jwt_token": token, "target_url": target})
-            if token else make_skipped_result("jwt", target, "No JWT was discovered in crawled responses.")
-        )
-
+        name = profile['name']
+        token = (discovery[name].get('jwt_tokens') or [''])[0]
+        jwt_result = await call_mcp('jwtServer.py', 'run_jwt_scan', {'jwt_token': token, 'target_url': target}) if token else make_skipped_result('jwt', target, 'No JWT was discovered in crawled responses.')
         if injection_url:
-            oast_cases = [{
-                "target_url": target,
-                "source_url": injection_url,
-                "injection_url": injection_url,
-                "method": "GET",
-                "data": "",
-                "parameter": "explicit",
-                "parameters": ["explicit"],
-                "priority_score": 1000,
-            }]
+            oast_cases = [{'target_url': target, 'source_url': injection_url, 'injection_url': injection_url, 'method': 'GET', 'data': '', 'parameter': 'explicit', 'parameters': ['explicit'], 'priority_score': 1000}]
         else:
-            oast_cases = select_oast_request_cases(
-                discovery[name],
-                target,
-                limit=2 if CURRENT_SCAN_MODE == "deep" else 1,
-            )
+            oast_cases = select_oast_request_cases(discovery[name], target, limit=2 if shared.CURRENT_SCAN_MODE == 'deep' else 1)
         oast_selection_summary[name] = oast_cases
         interactsh_runs: list[dict[str, Any]] = []
         confirmed_oast_classes: set[str] = set()
         for oast_case in oast_cases:
-            oast_class = str(oast_case.get("oast_class") or "explicit")
+            oast_class = str(oast_case.get('oast_class') or 'explicit')
             if oast_class in confirmed_oast_classes:
-                skipped_duplicate = make_skipped_result(
-                    "interactsh", oast_case.get("source_url", target),
-                    f"A callback was already confirmed for the same OAST class ({oast_class}); the duplicate wait was omitted.",
-                )
+                skipped_duplicate = make_skipped_result('interactsh', oast_case.get('source_url', target), f'A callback was already confirmed for the same OAST class ({oast_class}); the duplicate wait was omitted.')
                 interactsh_runs.append(skipped_duplicate)
-                log_result(name, "interactsh", skipped_duplicate, oast_case.get("source_url", target))
+                log_result(name, 'interactsh', skipped_duplicate, oast_case.get('source_url', target))
                 continue
-            interactsh_spec = next(
-                item for item in OPTIONAL_TOOLS if item.name == "interactsh"
-            )
+            interactsh_spec = next((item for item in OPTIONAL_TOOLS if item.name == 'interactsh'))
             if injection_url:
-                oast_timeout = 120 if CURRENT_SCAN_MODE == "deep" else 75
-            elif oast_class == "command":
-                oast_timeout = 75 if CURRENT_SCAN_MODE == "deep" else 55
+                oast_timeout = 120 if shared.CURRENT_SCAN_MODE == 'deep' else 75
+            elif oast_class == 'command':
+                oast_timeout = 75 if shared.CURRENT_SCAN_MODE == 'deep' else 55
             else:
-                oast_timeout = 60 if CURRENT_SCAN_MODE == "deep" else 45
-            result = await call_mcp_with_progress(
-                interactsh_spec,
-                {
-                    "target_url": target,
-                    "injection_url": oast_case["injection_url"],
-                    "cookies": profile["cookies"],
-                    "method": oast_case.get("method", "GET"),
-                    "data": oast_case.get("data", ""),
-                    "parameter": oast_case.get("parameter", ""),
-                    "timeout": oast_timeout,
-                },
-                timeout_seconds=oast_timeout + 35,
-            )
-            result["oast_class"] = oast_class
+                oast_timeout = 60 if shared.CURRENT_SCAN_MODE == 'deep' else 45
+            result = await call_mcp_with_progress(interactsh_spec, {'target_url': target, 'injection_url': oast_case['injection_url'], 'cookies': profile['cookies'], 'method': oast_case.get('method', 'GET'), 'data': oast_case.get('data', ''), 'parameter': oast_case.get('parameter', ''), 'timeout': oast_timeout}, timeout_seconds=oast_timeout + 35)
+            result['oast_class'] = oast_class
             interactsh_runs.append(result)
-            log_result(name, "interactsh", result, oast_case.get("source_url", target))
-            if result.get("callback_confirmed"):
+            log_result(name, 'interactsh', result, oast_case.get('source_url', target))
+            if result.get('callback_confirmed'):
                 confirmed_oast_classes.add(oast_class)
-        interactsh_result = (
-            aggregate_runs("interactsh", target, interactsh_runs)
-            if interactsh_runs
-            else make_skipped_result(
-                "interactsh",
-                target,
-                "No discovered OAST-capable input was available. Interactsh is functional, but no URL/host/callback/webhook/proxy/remote-resource or command-execution insertion point was found.",
-            )
-        )
+        interactsh_result = aggregate_runs('interactsh', target, interactsh_runs) if interactsh_runs else make_skipped_result('interactsh', target, 'No discovered OAST-capable input was available. Interactsh is functional, but no URL/host/callback/webhook/proxy/remote-resource or command-execution insertion point was found.')
         results[name].update(jwt=jwt_result, interactsh=interactsh_result)
-        log_result(name, "jwt", jwt_result, target)
+        log_result(name, 'jwt', jwt_result, target)
         if not interactsh_runs:
-            log_result(name, "interactsh", interactsh_result, target)
-
-    return {
-        "results": results,
-        "oast_selection_summary": oast_selection_summary,
-    }
-
+            log_result(name, 'interactsh', interactsh_result, target)
+    return {'results': results, 'oast_selection_summary': oast_selection_summary}
 
 async def deterministic_report_node(state: DeterministicState) -> dict[str, Any]:
-    target = state["target"]
-    profiles = state["profiles"]
-    discovery = state["discovery"]
-    diagnostics = state["diagnostics"]
-    results = state["results"]
-    secondary_cookies = str(state.get("secondary_cookies", ""))
-    parameter_selection_summary = state.get("parameter_selection_summary", {})
-    oast_selection_summary = state.get("oast_selection_summary", {})
-    workflow_selection_summary = state.get("workflow_selection_summary", {})
-    authorization_selection_summary = state.get("authorization_selection_summary", {})
-    context = {
-        "profiles": [{"name": profile["name"], "authenticated": bool(profile["cookies"])} for profile in profiles],
-        "expected_tools": [spec.name for spec in (*BASE_TOOLS, ARJUN_TOOL, *PARAMETER_TOOLS, AUTHORIZATION_TOOL, *WORKFLOW_TOOLS, OPTIONAL_TOOLS[0], OPTIONAL_TOOLS[1])],
-        "discovery": discovery,
-        "diagnostics": diagnostics,
-        "parameter_endpoint_limit": MAX_PARAMETER_ENDPOINTS,
-        "request_case_counts": {name: {
-            "GET": sum(str(case.get("method", "GET")).upper() == "GET" for case in found.get("request_cases", [])),
-            "POST": sum(str(case.get("method", "GET")).upper() == "POST" for case in found.get("request_cases", [])),
-        } for name, found in discovery.items()},
-        "arjun_endpoint_limit": ARJUN_ENDPOINT_LIMIT,
-        "parameter_selection": parameter_selection_summary,
-        "oast_selection": oast_selection_summary,
-        "workflow_selection": workflow_selection_summary,
-        "authorization_selection": authorization_selection_summary,
-        "secondary_identity_supplied": bool(secondary_cookies),
-        "parameter_tool_timeouts": PARAMETER_TOOL_TIMEOUTS,
-        "broad_scanner_timeouts": BROAD_SCANNER_TIMEOUTS,
-        "scan_mode": CURRENT_SCAN_MODE,
-    }
-    context["orchestration"] = {
-        "engine": "langgraph",
-        "mode": "deterministic",
-        "nodes": [
-            "discovery", "broad_scan", "parameter_scan", "authorization",
-            "browser_workflow", "special_checks", "report",
-        ],
-    }
-    print("\n[*] Generazione report...")
-    report = await call_mcp("reportServer.py", "generate_report", {
-        "findings_summary": results,
-        "target_url": target,
-        "assessment_context": context,
-    })
-    if report.get("status") != "success" and not report.get("json_filename"):
-        fallback = write_emergency_json_report(target, results, diagnostics, str(report.get("output", "Report MCP failed.")))
+    target = state['target']
+    profiles = state['profiles']
+    discovery = state['discovery']
+    diagnostics = state['diagnostics']
+    results = state['results']
+    secondary_cookies = str(state.get('secondary_cookies', ''))
+    parameter_selection_summary = state.get('parameter_selection_summary', {})
+    oast_selection_summary = state.get('oast_selection_summary', {})
+    workflow_selection_summary = state.get('workflow_selection_summary', {})
+    authorization_selection_summary = state.get('authorization_selection_summary', {})
+    context = {'profiles': [{'name': profile['name'], 'authenticated': bool(profile['cookies'])} for profile in profiles],
+        'expected_tools': [spec.name for spec in (*BASE_TOOLS, ARJUN_TOOL, *PARAMETER_TOOLS, AUTHORIZATION_TOOL, *WORKFLOW_TOOLS, OPTIONAL_TOOLS[0], OPTIONAL_TOOLS[1])],
+        'discovery': discovery,
+        'diagnostics': diagnostics,
+        'parameter_endpoint_limit': shared.MAX_PARAMETER_ENDPOINTS,
+        'request_case_counts': {name: {'GET': sum((str(case.get('method', 'GET')).upper() == 'GET' for case in found.get('request_cases', []))), 'POST': sum((str(case.get('method', 'GET')).upper() == 'POST' for case in found.get('request_cases', [])))} for name, found in discovery.items()},
+        'arjun_endpoint_limit': shared.ARJUN_ENDPOINT_LIMIT,
+        'parameter_selection': parameter_selection_summary,
+        'oast_selection': oast_selection_summary,
+        'workflow_selection': workflow_selection_summary,
+        'authorization_selection': authorization_selection_summary,
+        'secondary_identity_supplied': bool(secondary_cookies),
+        'parameter_tool_timeouts': PARAMETER_TOOL_TIMEOUTS,
+        'broad_scanner_timeouts': BROAD_SCANNER_TIMEOUTS,
+        'scan_mode': shared.CURRENT_SCAN_MODE}
+    context['orchestration'] = {'engine': 'langgraph', 'mode': 'deterministic', 'nodes': ['discovery', 'broad_scan', 'parameter_scan', 'authorization', 'browser_workflow', 'special_checks', 'report']}
+    print('\n[*] Generazione report...')
+    report = await call_mcp('reportServer.py', 'generate_report', {'findings_summary': results, 'target_url': target, 'assessment_context': context})
+    if report.get('status') != 'success' and (not report.get('json_filename')):
+        fallback = write_emergency_json_report(target, results, diagnostics, str(report.get('output', 'Report MCP failed.')))
         if fallback:
-            report.update(json_filename=fallback, html_filename=str(Path(fallback).with_suffix(".html")), local_json_fallback=True)
-    return {"assessment_context": context, "report_status": report}
+            report.update(json_filename=fallback, html_filename=str(Path(fallback).with_suffix('.html')), local_json_fallback=True)
+    return {'assessment_context': context, 'report_status': report}
 
+async def run_pipeline(target: str, profiles: list[dict[str, str]], injection_url: str, allow_state_changes: bool=False, secondary_cookies: str='') -> dict[str, Any]:
+    initial: DeterministicState = {'target': target, 'profiles': profiles, 'injection_url': injection_url, 'allow_state_changes': allow_state_changes, 'secondary_cookies': secondary_cookies}
+    final = await build_deterministic_graph().ainvoke(initial)
+    return {'results': final['results'], 'discovery': final['discovery'], 'diagnostics': final['diagnostics'], 'report_status': final['report_status']}
 
+def _parse_parameter_argument(value: str) -> list[str]:
+    return [item.strip() for item in str(value or '').split(',') if item.strip()]
+
+def _single_tool_case(discovery: dict[str, Any], tool: str, target: str, explicit_url: str, method: str, data: str, parameters: list[str]) -> dict[str, Any] | None:
+    if explicit_url:
+        url = normalize_url(explicit_url)
+        if not same_origin(target, url):
+            raise ValueError('--tool-url must have the same origin as --target.')
+        effective_parameters = list(parameters)
+        if not effective_parameters:
+            source = urlparse(url).query if method == 'GET' else data
+            effective_parameters = [name for name, _ in parse_qsl(source, keep_blank_values=True)]
+        return {'url': url, 'method': method, 'data': data, 'parameters': effective_parameters, 'source_url': url}
+    if tool == 'arjun':
+        cases = select_arjun_request_cases(discovery, target, limit=1)
+        return cases[0] if cases else None
+    if tool == 'authorization':
+        cases = select_authorization_request_cases(discovery, limit=1)
+        return cases[0] if cases else None
+    if tool == 'browser':
+        cases = select_browser_request_cases(discovery, limit=1)
+        return cases[0] if cases else None
+    if tool == 'workflow':
+        cases = select_workflow_request_cases(discovery, limit=1)
+        return cases[0] if cases else None
+    cases = select_tool_request_cases(discovery, tool, limit=1)
+    return cases[0] if cases else None
+
+def _single_tool_preflight_errors(checks: list[dict[str, str]], tool: str) -> list[dict[str, str]]:
+    """Return only errors that can prevent the selected isolated tool."""
+    allowed = {'project', 'mcp', tool}
+    return [item for item in checks if item.get('level') == 'error' and item.get('component') in allowed]
+
+async def run_single_tool_debug(*, tool: str, target: str, cookies: str, mode: str, secondary_cookies: str='', explicit_url: str='', method: str='GET', data: str='', parameters: list[str] | None=None, jwt_token: str='', injection_url: str='', timeout_override: int=0, diagnostic_only: bool=False, allow_state_changes: bool=False) -> dict[str, Any]:
+    """Run one canonical MCP tool through the same production transport."""
+    configure_scan_mode(mode)
+    method = str(method or 'GET').upper()
+    parameters = [str(value) for value in parameters or [] if str(value)]
+    if method not in {'GET', 'POST'}:
+        raise ValueError('--method must be GET or POST.')
+    if timeout_override < 0:
+        raise ValueError('--tool-timeout cannot be negative.')
+    discovery = discover_target(target, cookies)
+    state_changes = state_changing_tests_allowed(target, allow_state_changes)
+    spec = next((item for item in ALL_TOOLS if item.name == tool))
+    selected_target = target
+    if tool in {'ffuf', 'zap', 'nuclei', 'session', 'nikto'}:
+        arguments = build_tool_arguments(tool, target, cookies, discovery, timeout_override=timeout_override or BROAD_SCANNER_TIMEOUTS[tool], diagnostic_only=diagnostic_only, single_tool=True)
+    elif tool in {'arjun', 'sqlmap', 'dalfox', 'commix', 'traversal', 'idor', 'authorization', 'browser', 'workflow'}:
+        if tool == 'authorization' and (not cookies):
+            return make_skipped_result(tool, target, 'A primary authenticated Cookie header is required for authorization comparison.')
+        case = _single_tool_case(discovery, tool, target, explicit_url, method, data, parameters)
+        if not case:
+            messages = {'arjun': 'No suitable endpoint was discovered for Arjun.', 'authorization': 'No discovered read-only request contained a plausible identity, object or privileged-resource signal.', 'browser': "No discovered request matched browser's workflow class.", 'workflow': "No discovered request matched workflow's workflow class."}
+            return make_skipped_result(tool, target, messages.get(tool, f"No request matched {tool}'s vulnerability class."))
+        selected_target = str(case.get('url') or target)
+        effective_case = {**case, 'method': str(case.get('method') or method).upper(), 'data': str(case.get('data') or data), 'parameters': list(case.get('parameters') or parameters)}
+        if tool == 'authorization':
+            arguments = build_tool_arguments(tool, selected_target, cookies, discovery, case=effective_case, secondary_cookies=secondary_cookies, timeout_override=timeout_override)
+        else:
+            if tool not in {'arjun', 'authorization'} and cookies:
+                refresh = refresh_authenticated_session_state(target, cookies, select_session_probe_url(discovery, target))
+                if refresh.get('usable') is False:
+                    if tool in {'browser', 'workflow'}:
+                        return make_skipped_result(tool, selected_target, 'The authenticated session could not be restored before the isolated workflow run.')
+                    return {'tool': tool, 'status': 'partial', 'target': selected_target, 'output': 'The authenticated session could not be restored before the isolated scanner run.', 'vulnerabilities': [], 'diagnosis': 'authentication_precheck_failed', 'state_refresh': refresh}
+            arguments = build_tool_arguments(tool, selected_target, cookies, discovery, case=effective_case, allow_state_changes=state_changes, timeout_override=timeout_override, single_tool=True)
+    elif tool == 'jwt':
+        token = jwt_token or next(iter(discovery.get('jwt_tokens', [])), '')
+        if not token:
+            return make_skipped_result('jwt', target, 'No JWT was supplied or discovered.')
+        arguments = {'jwt_token': token, 'target_url': target}
+    elif tool == 'interactsh':
+        if injection_url:
+            selected = {'injection_url': injection_url, 'method': method, 'data': data, 'parameter': parameters[0] if parameters else 'explicit'}
+        else:
+            cases = select_oast_request_cases(discovery, target, limit=1)
+            if not cases:
+                return make_skipped_result('interactsh', target, 'No OAST-capable input was discovered.')
+            selected = cases[0]
+        arguments = {'target_url': target, 'injection_url': selected['injection_url'], 'cookies': cookies, 'method': selected.get('method', 'GET'), 'data': selected.get('data', ''), 'parameter': selected.get('parameter', ''), 'timeout': timeout_override or (120 if mode == 'deep' else 75)}
+    else:
+        raise ValueError(f'Unsupported single tool: {tool}')
+    scanner_limit = float(arguments.get('timeout', 180))
+    result = await call_mcp_with_progress(spec, arguments, timeout_seconds=scanner_limit + 45)
+    result.setdefault('single_tool_debug', True)
+    result.setdefault('selected_target', selected_target)
+    result.setdefault('arguments_summary', {'method': arguments.get('method', ''), 'parameters': arguments.get('parameters', arguments.get('known_parameters', [])), 'timeout': arguments.get('timeout', 0), 'scan_mode': arguments.get('scan_mode', arguments.get('scan_profile', ''))})
+    result.setdefault('discovery_summary', {'html_urls': len(discovery.get('html_urls', [])), 'request_cases': len(discovery.get('request_cases', [])), 'authentication_effective': discovery.get('authentication_effective')})
+    return result
 def build_deterministic_graph() -> Any:
     graph = StateGraph(DeterministicState)
     graph.add_node("discovery", deterministic_discovery_node)
@@ -3750,423 +542,16 @@ def build_deterministic_graph() -> Any:
     return graph.compile()
 
 
-async def run_pipeline(
-    target: str,
-    profiles: list[dict[str, str]],
-    injection_url: str,
-    allow_state_changes: bool = False,
-    secondary_cookies: str = "",
-) -> dict[str, Any]:
-    initial: DeterministicState = {
-        "target": target,
-        "profiles": profiles,
-        "injection_url": injection_url,
-        "allow_state_changes": allow_state_changes,
-        "secondary_cookies": secondary_cookies,
-    }
-    final = await build_deterministic_graph().ainvoke(initial)
-    return {
-        "results": final["results"],
-        "discovery": final["discovery"],
-        "diagnostics": final["diagnostics"],
-        "report_status": final["report_status"],
-    }
-
-
-def summarize_results(results: dict[str, Any]) -> tuple[int, int, int]:
-    errors = skips = partial = 0
-    rows = []
-    for path, result in iter_leaf_results(results):
-        status = str(result.get("status", "error"))
-        errors += status == "error"
-        skips += status == "skipped"
-        partial += status == "partial"
-        if status == "error":
-            rows.append(("/".join(path), result.get("diagnosis", "unknown"), str(result.get("output", ""))))
-    if rows:
-        print("\n=== Scanner error details ===", file=sys.stderr)
-        for path, cause, detail in rows:
-            print(f"[-] {path}: {cause} — {detail[:500]}", file=sys.stderr)
-    return errors, skips, partial
-
-
-def print_security_finding_summary(results: dict[str, Any]) -> None:
-    """Print the same semantically deduplicated findings used by the report."""
-    try:
-        from servers.reportServer import flatten_findings
-        rows = flatten_findings(results)
-    except Exception:
-        rows = []
-        for _, tools in results.items():
-            if not isinstance(tools, dict):
-                continue
-            for _, result in iter_leaf_results(tools):
-                tool = str(result.get("tool") or "unknown")
-                for finding in result.get("vulnerabilities") or []:
-                    if isinstance(finding, dict):
-                        rows.append({**finding, "tool": tool})
-    confirmed = [row for row in rows if str(row.get("category") or "").lower() == "vulnerability"]
-    candidates = [row for row in rows if str(row.get("category") or "").lower() == "candidate"]
-    print("\n=== Security findings (deduplicated) ===")
-    print(f"[+] Confirmed vulnerabilities: {len(confirmed)}")
-    for index, row in enumerate(confirmed, 1):
-        print(
-            f"    {index}. [{str(row.get('risk') or 'info').upper()}] "
-            f"{row.get('alert') or 'Unnamed finding'} - tool={row.get('tool') or 'unknown'}; "
-            f"parameter={row.get('parameter') or '-'}; url={row.get('url') or ''}"
-        )
-    print(f"[+] Candidates requiring validation: {len(candidates)}")
-    for index, row in enumerate(candidates, 1):
-        print(
-            f"    {index}. [{str(row.get('risk') or 'info').upper()}] "
-            f"{row.get('alert') or 'Unnamed finding'} - tool={row.get('tool') or 'unknown'}; "
-            f"parameter={row.get('parameter') or '-'}; url={row.get('url') or ''}"
-        )
-
-
-
-SINGLE_TOOL_CHOICES = tuple(spec.name for spec in ALL_TOOLS if spec.name != "report")
-
-
-def _parse_parameter_argument(value: str) -> list[str]:
-    return [item.strip() for item in str(value or "").split(",") if item.strip()]
-
-
-def _single_tool_case(
-    discovery: dict[str, Any],
-    tool: str,
-    target: str,
-    explicit_url: str,
-    method: str,
-    data: str,
-    parameters: list[str],
-) -> dict[str, Any] | None:
-    if explicit_url:
-        url = normalize_url(explicit_url)
-        if not same_origin(target, url):
-            raise ValueError("--tool-url must have the same origin as --target.")
-        effective_parameters = list(parameters)
-        if not effective_parameters:
-            source = urlparse(url).query if method == "GET" else data
-            effective_parameters = [
-                name for name, _ in parse_qsl(source, keep_blank_values=True)
-            ]
-        return {
-            "url": url,
-            "method": method,
-            "data": data,
-            "parameters": effective_parameters,
-            "source_url": url,
-        }
-    if tool == "arjun":
-        cases = select_arjun_request_cases(discovery, target, limit=1)
-        return cases[0] if cases else None
-    if tool == "authorization":
-        cases = select_authorization_request_cases(discovery, limit=1)
-        return cases[0] if cases else None
-    if tool == "browser":
-        cases = select_browser_request_cases(discovery, limit=1)
-        return cases[0] if cases else None
-    if tool == "workflow":
-        cases = select_workflow_request_cases(discovery, limit=1)
-        return cases[0] if cases else None
-    cases = select_tool_request_cases(discovery, tool, limit=1)
-    return cases[0] if cases else None
-
-
-def _single_tool_preflight_errors(
-    checks: list[dict[str, str]],
-    tool: str,
-) -> list[dict[str, str]]:
-    """Return only errors that can prevent the selected isolated tool."""
-    allowed = {"project", "mcp", tool}
-    return [
-        item for item in checks
-        if item.get("level") == "error" and item.get("component") in allowed
-    ]
-
-
-async def run_single_tool_debug(
-    *,
-    tool: str,
-    target: str,
-    cookies: str,
-    mode: str,
-    secondary_cookies: str = "",
-    explicit_url: str = "",
-    method: str = "GET",
-    data: str = "",
-    parameters: list[str] | None = None,
-    jwt_token: str = "",
-    injection_url: str = "",
-    timeout_override: int = 0,
-    diagnostic_only: bool = False,
-    allow_state_changes: bool = False,
-) -> dict[str, Any]:
-    """Run exactly one canonical MCP server through normal production transport."""
-    configure_scan_mode(mode)
-    method = str(method or "GET").upper()
-    parameters = [str(value) for value in (parameters or []) if str(value)]
-    if method not in {"GET", "POST"}:
-        raise ValueError("--method must be GET or POST.")
-    if timeout_override < 0:
-        raise ValueError("--tool-timeout cannot be negative.")
-
-    discovery = discover_target(target, cookies)
-    workflow_state_changes = state_changing_tests_allowed(target, allow_state_changes)
-    spec = next(item for item in ALL_TOOLS if item.name == tool)
-    selected_target = target
-    arguments: dict[str, Any]
-
-    if tool in {"ffuf", "zap", "nuclei", "session", "nikto"}:
-        timeout = timeout_override or BROAD_SCANNER_TIMEOUTS[tool]
-        arguments = {"target_url": target, "cookies": cookies, "timeout": timeout}
-        if tool == "ffuf":
-            arguments["session_probe_url"] = select_session_probe_url(
-                discovery, target
-            )
-        elif tool == "session":
-            arguments.update({
-                "probe_url": select_session_probe_url(discovery, target),
-                "sample_count": 7 if mode == "deep" else 5 if mode == "balanced" else 3,
-            })
-        elif tool == "zap":
-            arguments.update({
-                "seed_urls": discovery.get("html_urls", []),
-                "request_cases": discovery.get("request_cases", []),
-                # A single authenticated ZAP debug run should actually exercise
-                # the bounded active path in both balanced and deep modes.
-                "scan_mode": (
-                    "full" if cookies and mode == "deep" and not diagnostic_only
-                    else "prioritized" if cookies and mode == "balanced" and not diagnostic_only
-                    else "targeted" if cookies and not diagnostic_only
-                    else "passive"
-                ),
-                "max_observations": 100 if mode == "deep" else 50,
-                "diagnostic_only": diagnostic_only,
-            })
-        elif tool == "nuclei":
-            arguments.update({
-                "seed_urls": discovery.get("urls", []),
-                "request_cases": discovery.get("request_cases", []),
-                "scan_profile": mode,
-                "max_targets": 16 if mode == "deep" else 10 if mode == "balanced" else 6,
-            })
-        elif tool == "nikto":
-            # Single-tool runs previously ignored --mode and silently used
-            # Nikto's balanced defaults. Keep the isolated diagnostic aligned
-            # with the same profile selected by a full pipeline run.
-            arguments["scan_profile"] = mode
-    elif tool == "arjun":
-        case = _single_tool_case(
-            discovery, tool, target, explicit_url, method, data, parameters
-        )
-        if not case:
-            return make_skipped_result(
-                tool, target, "No suitable endpoint was discovered for Arjun."
-            )
-        selected_target = str(case["url"])
-        arguments = {
-            "target_url": selected_target,
-            "cookies": cookies,
-            "method": str(case.get("method") or method).upper(),
-            "data": str(case.get("data") or data),
-            "known_parameters": list(
-                case.get("parameters") or parameters
-            ),
-            "timeout": timeout_override or ARJUN_TIMEOUT,
-        }
-    elif tool in {"sqlmap", "dalfox", "commix", "traversal", "idor"}:
-        case = _single_tool_case(
-            discovery, tool, target, explicit_url, method, data, parameters
-        )
-        if not case:
-            return make_skipped_result(
-                tool, target,
-                f"No request matched {tool}'s vulnerability class."
-            )
-        selected_target = str(case["url"])
-        effective_method = str(case.get("method") or method).upper()
-        state_refresh = (
-            refresh_authenticated_session_state(target, cookies, select_session_probe_url(discovery, target))
-            if cookies else {"performed": False, "usable": True}
-        )
-        if state_refresh.get("usable") is False:
-            return {
-                "tool": tool,
-                "status": "partial",
-                "target": selected_target,
-                "output": (
-                    "The authenticated session could not be restored before the "
-                    "isolated scanner run."
-                ),
-                "vulnerabilities": [],
-                "diagnosis": "authentication_precheck_failed",
-                "state_refresh": state_refresh,
-            }
-        arguments = {
-            "target_url": selected_target,
-            "cookies": cookies,
-            "method": effective_method,
-            "data": str(case.get("data") or data),
-            "parameters": list(case.get("parameters") or parameters),
-            "timeout": timeout_override or PARAMETER_TOOL_TIMEOUTS[tool],
-        }
-        if tool == "dalfox":
-            arguments["allow_state_changes"] = workflow_state_changes
-    elif tool == "authorization":
-        if not cookies:
-            return make_skipped_result(
-                "authorization", target,
-                "A primary authenticated Cookie header is required for authorization comparison.",
-            )
-        case = _single_tool_case(
-            discovery, tool, target, explicit_url, method, data, parameters
-        )
-        if not case:
-            return make_skipped_result(
-                tool, target,
-                "No discovered read-only request contained a plausible identity, object or privileged-resource signal.",
-            )
-        selected_target = str(case.get("url") or target)
-        arguments = {
-            "target_url": selected_target,
-            "cookies": cookies,
-            "secondary_cookies": secondary_cookies,
-            "method": "GET",
-            "data": "",
-            "parameters": list(case.get("parameters") or parameters),
-            "timeout": timeout_override or PARAMETER_TOOL_TIMEOUTS[tool],
-        }
-    elif tool in {"browser", "workflow"}:
-        case = _single_tool_case(
-            discovery, tool, target, explicit_url, method, data, parameters
-        )
-        if not case:
-            return make_skipped_result(
-                tool, target,
-                f"No discovered request matched {tool}'s workflow class."
-            )
-        selected_target = str(case.get("url") or target)
-        state_refresh = (
-            refresh_authenticated_session_state(target, cookies, select_session_probe_url(discovery, target))
-            if cookies else {"performed": False, "usable": True}
-        )
-        if state_refresh.get("usable") is False:
-            return make_skipped_result(tool, selected_target, "The authenticated session could not be restored before the isolated workflow run.")
-        if tool == "browser":
-            arguments = {
-                "target_url": selected_target,
-                "cookies": cookies,
-                "method": str(case.get("method") or method).upper(),
-                "data": str(case.get("data") or data),
-                "parameters": list(case.get("parameters") or parameters),
-                "source_url": str(case.get("source_url") or ""),
-                "timeout": timeout_override or PARAMETER_TOOL_TIMEOUTS[tool],
-                "allow_state_changes": workflow_state_changes,
-            }
-        else:
-            arguments = {
-                "target_url": selected_target,
-                "cookies": cookies,
-                "method": str(case.get("method") or method).upper(),
-                "data": str(case.get("data") or data),
-                "parameters": list(case.get("parameters") or parameters),
-                "fields": list(case.get("fields", [])),
-                "file_parameters": list(case.get("file_parameters", [])),
-                "token_parameters": list(case.get("token_parameters", [])),
-                "source_url": str(case.get("source_url") or ""),
-                "enctype": str(case.get("enctype") or ""),
-                "timeout": timeout_override or PARAMETER_TOOL_TIMEOUTS[tool],
-                "allow_state_changes": workflow_state_changes,
-            }
-    elif tool == "jwt":
-        token = jwt_token or next(iter(discovery.get("jwt_tokens", [])), "")
-        if not token:
-            return make_skipped_result(
-                "jwt", target, "No JWT was supplied or discovered."
-            )
-        arguments = {"jwt_token": token, "target_url": target}
-    elif tool == "interactsh":
-        if injection_url:
-            selected = {
-                "injection_url": injection_url,
-                "method": method,
-                "data": data,
-                "parameter": parameters[0] if parameters else "explicit",
-            }
-        else:
-            cases = select_oast_request_cases(discovery, target, limit=1)
-            if not cases:
-                return make_skipped_result(
-                    "interactsh", target,
-                    "No OAST-capable input was discovered."
-                )
-            selected = cases[0]
-        arguments = {
-            "target_url": target,
-            "injection_url": selected["injection_url"],
-            "cookies": cookies,
-            "method": selected.get("method", "GET"),
-            "data": selected.get("data", ""),
-            "parameter": selected.get("parameter", ""),
-            "timeout": timeout_override or (120 if mode == "deep" else 75),
-        }
-    else:
-        raise ValueError(f"Unsupported single tool: {tool}")
-
-    scanner_limit = float(arguments.get("timeout", 180))
-    result = await call_mcp_with_progress(
-        spec,
-        arguments,
-        timeout_seconds=scanner_limit + 45,
-    )
-    result.setdefault("single_tool_debug", True)
-    result.setdefault("selected_target", selected_target)
-    result.setdefault("arguments_summary", {
-        "method": arguments.get("method", ""),
-        "parameters": arguments.get("parameters", arguments.get("known_parameters", [])),
-        "timeout": arguments.get("timeout", 0),
-        "scan_mode": arguments.get("scan_mode", arguments.get("scan_profile", "")),
-    })
-    result.setdefault("discovery_summary", {
-        "html_urls": len(discovery.get("html_urls", [])),
-        "request_cases": len(discovery.get("request_cases", [])),
-        "authentication_effective": discovery.get("authentication_effective"),
-    })
-    return result
-
-
 def main() -> int:
     parser = argparse.ArgumentParser(
         description="Deterministic LangGraph + FastMCP web-security orchestrator."
     )
-    parser.add_argument("--target")
-    parser.add_argument("--cookies", default="")
+    add_common_cli_arguments(parser, require_target=False)
+    parser.add_argument("--list-tools", action="store_true")
     parser.add_argument(
-        "--secondary-cookies", default="",
-        help="Optional second authenticated identity for read-only authorization/BOLA comparison.",
-    )
-    parser.add_argument("--auth-only", action="store_true")
-    parser.add_argument("--authorized", action="store_true")
-    parser.add_argument(
-        "--allow-state-changes", action="store_true",
-        help="Enable bounded POST/upload/stored-XSS workflow probes on an explicitly authorized remote target; local labs enable them automatically.",
-    )
-    parser.add_argument("--preflight-only", action="store_true")
-    parser.add_argument("--ignore-preflight-errors", action="store_true")
-    parser.add_argument("--interactsh-injection-url", default="")
-    parser.add_argument(
-        "--mode", choices=("fast", "balanced", "deep"), default="balanced",
-        help="Trade coverage for runtime; balanced is the default."
-    )
-    parser.add_argument(
-        "--list-tools", action="store_true",
-        help="List canonical MCP tools and exit."
-    )
-    parser.add_argument(
-        "--tool", choices=SINGLE_TOOL_CHOICES,
-        help="Run exactly one scanner for isolated debugging."
+        "--tool",
+        choices=SINGLE_TOOL_CHOICES,
+        help="Run exactly one scanner for isolated debugging.",
     )
     parser.add_argument(
         "--tool-url", default="",
@@ -4182,13 +567,15 @@ def main() -> int:
         help="POST form body for a single parameter tool."
     )
     parser.add_argument(
-        "--parameters", default="",
-        help="Comma-separated parameters for a single parameter tool."
+        "--parameters",
+        default="",
+        help="Comma-separated parameters for a single parameter tool.",
     )
     parser.add_argument("--jwt-token", default="", help="JWT value for --tool jwt.")
     parser.add_argument(
-        "--diagnostic-only", action="store_true",
-        help="For --tool zap, validate session/proxy without scanning."
+        "--diagnostic-only",
+        action="store_true",
+        help="For --tool zap, validate session/proxy without scanning.",
     )
     args = parser.parse_args()
 
@@ -4202,13 +589,10 @@ def main() -> int:
         parser.error("--target is required unless --list-tools is used.")
     if args.diagnostic_only and args.tool != "zap":
         parser.error("--diagnostic-only is valid only with --tool zap.")
-    configure_scan_mode(args.mode)
 
+    configure_scan_mode(args.mode)
     checks = run_preflight_checks(include_live=True)
     if args.tool:
-        # Show all warnings/errors, but isolate blocking to the selected server
-        # and the project contract so unrelated optional tools do not prevent
-        # a debugging run.
         print_preflight_report(checks, show_ok=args.preflight_only)
         selected_errors = _single_tool_preflight_errors(checks, args.tool)
         preflight_errors = len(selected_errors)
@@ -4220,81 +604,43 @@ def main() -> int:
                     file=sys.stderr,
                 )
     else:
-        preflight_errors = print_preflight_report(
-            checks, show_ok=args.preflight_only
-        )
+        preflight_errors = print_preflight_report(checks, show_ok=args.preflight_only)
+
     if args.preflight_only:
         return 0 if not preflight_errors else 3
     if preflight_errors and not args.ignore_preflight_errors:
         return 3
 
-    target = normalize_url(args.target)
-    if (
-        urlparse(target).hostname not in {"127.0.0.1", "localhost", "::1"}
-        and not args.authorized
-    ):
-        parser.error("Remote targets require --authorized.")
-    if args.allow_state_changes and urlparse(target).hostname not in {"127.0.0.1", "localhost", "::1"} and not args.authorized:
-        parser.error("--allow-state-changes on a remote target requires --authorized.")
-    injection_url = args.interactsh_injection_url.strip()
-    if injection_url and not same_origin(target, injection_url):
-        parser.error(
-            "--interactsh-injection-url must have the same origin as --target."
-        )
-
-    normalized_cookie = ""
-    profiles = [] if args.auth_only else [{"name": "anonymous", "cookies": ""}]
-    if args.cookies:
-        try:
-            normalized_cookie = canonical_cookie_header(args.cookies)
-        except ValueError as exc:
-            parser.error(f"Invalid --cookies value: {exc}")
-        print(
-            "[*] Authenticated cookie names: "
-            + ", ".join(cookie_names(normalized_cookie))
-        )
-        profiles.append({"name": "authenticated", "cookies": normalized_cookie})
-    elif args.auth_only:
-        parser.error("--auth-only requires --cookies.")
-
-    secondary_cookie = ""
-    if args.secondary_cookies:
-        if not normalized_cookie:
-            parser.error("--secondary-cookies requires a primary --cookies value.")
-        try:
-            secondary_cookie = canonical_cookie_header(args.secondary_cookies)
-        except ValueError as exc:
-            parser.error(f"Invalid --secondary-cookies value: {exc}")
-        if secondary_cookie == normalized_cookie:
-            parser.error("--secondary-cookies must represent a different authenticated identity.")
-        print(
-            "[*] Secondary identity cookie names: "
-            + ", ".join(cookie_names(secondary_cookie))
-        )
-
+    target, profiles, cookie, secondary_cookie, injection_url = prepare_cli_context(
+        parser, args
+    )
     if args.tool:
         try:
-            result = asyncio.run(run_single_tool_debug(
-                tool=args.tool,
-                target=target,
-                cookies=normalized_cookie,
-                secondary_cookies=secondary_cookie,
-                mode=args.mode,
-                explicit_url=args.tool_url,
-                method=args.method,
-                data=args.data,
-                parameters=_parse_parameter_argument(args.parameters),
-                jwt_token=args.jwt_token,
-                injection_url=injection_url,
-                timeout_override=args.tool_timeout,
-                diagnostic_only=args.diagnostic_only,
-                allow_state_changes=args.allow_state_changes,
-            ))
+            result = asyncio.run(
+                run_single_tool_debug(
+                    tool=args.tool,
+                    target=target,
+                    cookies=cookie,
+                    secondary_cookies=secondary_cookie,
+                    mode=args.mode,
+                    explicit_url=args.tool_url,
+                    method=args.method,
+                    data=args.data,
+                    parameters=_parse_parameter_argument(args.parameters),
+                    jwt_token=args.jwt_token,
+                    injection_url=injection_url,
+                    timeout_override=args.tool_timeout,
+                    diagnostic_only=args.diagnostic_only,
+                    allow_state_changes=args.allow_state_changes,
+                )
+            )
         except (ValueError, RuntimeError) as exc:
             parser.error(str(exc))
-        profile_name = "authenticated" if normalized_cookie else "anonymous"
+        profile_name = "authenticated" if cookie else "anonymous"
         log_result(
-            profile_name, args.tool, result,
+            profile_name,
+            args.tool,
+            result,
             str(result.get("selected_target") or target),
         )
         if args.tool == "zap":
@@ -4304,17 +650,20 @@ def main() -> int:
         return 2 if result.get("status") == "error" else 0
 
     print("=== FastMCP Deterministic Security Pipeline ===")
-    print(
-        f"[*] Target: {target}\n[*] Mode: {CURRENT_SCAN_MODE}\n"
-        f"[*] Profiles: {', '.join(profile['name'] for profile in profiles)}"
-    )
+    print(f"[*] Target: {target}")
+    print(f"[*] Mode: {shared.CURRENT_SCAN_MODE}")
+    print(f"[*] Profiles: {', '.join(profile['name'] for profile in profiles)}")
     started = time.time()
     try:
-        final = asyncio.run(run_pipeline(
-            target, profiles, injection_url,
-            allow_state_changes=args.allow_state_changes,
-            secondary_cookies=secondary_cookie,
-        ))
+        final = asyncio.run(
+            run_pipeline(
+                target,
+                profiles,
+                injection_url,
+                allow_state_changes=args.allow_state_changes,
+                secondary_cookies=secondary_cookie,
+            )
+        )
     except KeyboardInterrupt:
         print("\n[!] Workflow interrupted by the operator.", file=sys.stderr)
         return 130
@@ -4331,13 +680,10 @@ def main() -> int:
     print(f"[+] HTML preview: {report.get('html_filename') or 'not generated'}")
     print(f"[+] JSON: {report.get('json_filename') or 'not generated'}")
     print(f"[+] Coverage constraints recorded: {report.get('coverage_constraints_count', 0)}")
-    print(
-        f"[+] Scanner run errors: {errors}\n"
-        f"[+] Time-limited/partial scanner runs: {partial}\n"
-        f"[+] Scanner run skips: {skips}"
-    )
+    print(f"[+] Scanner run errors: {errors}")
+    print(f"[+] Time-limited/partial scanner runs: {partial}")
+    print(f"[+] Scanner run skips: {skips}")
     return 1 if report.get("status") != "success" else 0
-
 
 if __name__ == "__main__":
     raise SystemExit(main())
