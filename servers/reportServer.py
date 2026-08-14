@@ -1040,10 +1040,10 @@ def _render_html(payload: dict[str, Any], *, for_pdf: bool = False) -> str:
 
     coverage_rows = "".join(
         "<tr>"
-        f'<td class="no-wrap">{index}</td>'
-        f'<td class="no-wrap">{_esc(row['profile'])}</td>'
+        f'<td class="idx">{index}</td>'
+        f"<td>{_esc(row['profile'])}</td>"
         f"<td><b>{_esc(row['tool'])}</b><br><small>{_esc(row.get('purpose', ''))}</small></td>"
-        f'<td class="no-wrap">{_esc(row['status'])}</td>'
+        f"<td>{_esc(row['status'])}</td>"
         f"<td>{row['targets']}</td><td>{row.get('confirmed',0)}</td>"
         f"<td>{row.get('candidates',0)}</td><td>{row.get('observations',0)}</td>"
         f"<td>{row['duration_seconds']}</td>"
@@ -1144,7 +1144,7 @@ def _render_html(payload: dict[str, Any], *, for_pdf: bool = False) -> str:
     ]
     glance_rows = "".join(
         "<tr>"
-        f'<td class="no-wrap">{index}</td><td class="no-wrap">{_esc(item.get('risk','info')).upper()}</td>'
+        f'<td class="idx">{index}</td><td class="no-wrap">{_esc(item.get('risk','info')).upper()}</td>'
         f"<td><b>{_esc(item.get('alert','Unnamed finding'))}</b></td>"
         f"<td>{_esc(item.get('tool',''))}</td>"
         f"<td>{_esc(item.get('url',''))}<br><small>parameter: {_esc(item.get('parameter') or '-')}</small></td>"
@@ -1162,7 +1162,7 @@ def _render_html(payload: dict[str, Any], *, for_pdf: bool = False) -> str:
         return (
             f"{heading}"
             "<p class='section-note'>Confirmed vulnerabilities and candidates are named here before execution details.</p>"
-            "<table><thead><tr><th>#</th><th>Severity</th><th>Finding</th><th>Tool</th><th>Affected endpoint</th></tr></thead>"
+            "<table><thead><tr><th class=\"idx\">#</th><th>Severity</th><th>Finding</th><th>Tool</th><th>Affected endpoint</th></tr></thead>"
             f"<tbody>{glance_rows}</tbody></table>{tail}"
         )
 
@@ -1225,7 +1225,7 @@ def _render_html(payload: dict[str, Any], *, for_pdf: bool = False) -> str:
 
 {_heading(2, "Assessment execution", toc, anchor="execution")}
 <p class="section-note">This section records tools, targets, duration and execution status. It is deliberately separate from security findings.</p>
-<table><thead><tr><th>#</th><th>Profile</th><th>Tool and purpose</th><th>Status</th><th>Targets</th><th>Confirmed</th><th>Candidates</th><th>Info/discovery</th><th>Seconds</th></tr></thead><tbody>{coverage_rows}</tbody></table>
+<table><colgroup><col style="width:2%"><col style="width:10%"><col style="width:26%"><col style="width:10%"><col style="width:8%"><col style="width:10%"><col style="width:11%"><col style="width:15%"><col style="width:8%"></colgroup><thead><tr><th>#</th><th>Profile</th><th>Tool and purpose</th><th>Status</th><th>Targets</th><th>Confirmed</th><th>Candidates</th><th>Info/discovery</th><th>Seconds</th></tr></thead><tbody>{coverage_rows}</tbody></table>
 
 {_heading(3, "Execution details", toc, anchor="execution-details")}
 <p class="section-note">Raw execution output per row, numbered to match the table above.</p>
@@ -1269,11 +1269,11 @@ h1,h2,h3{{color:#173b5e}}h2{{margin-top:32px}}
 .meta,.card,.finding{{background:white;border:1px solid #d7dee5;border-radius:10px;padding:16px;margin:12px 0}}
 .grid{{display:grid;grid-template-columns:repeat(5,1fr);gap:10px}}
 .value{{font-size:2rem;font-weight:700}}
-table{{table-layout:fixed;border-collapse:collapse;background:white;font-size:.92rem}}
-th,td{{padding:8px;border:1px solid #cbd5df;overflow-wrap:anywhere;word-break:break-word}}
-th{{background:#24476b;color:white;position:sticky;top:0}}
-tr th{{white-space:nowrap}}
+table{{table-layout:auto;width:100%;border-collapse:collapse;background:white;font-size:.74rem}}
+th,td{{padding:5px 6px;border:1px solid #cbd5df;overflow-wrap:anywhere;word-break:break-word}}
+th{{background:#24476b;color:white;position:sticky;top:0;white-space:nowrap}}
 .no-wrap{{white-space:nowrap}}
+.idx{{white-space:nowrap;width:1%;text-align:center}}
 small{{color:#4f6273}}.finding{{border-left:7px solid #4b86b4}}
 .risk-critical,.risk-high{{border-left-color:#a90000}}.risk-medium{{border-left-color:#d98200}}.risk-low{{border-left-color:#b49b00}}
 .badges{{display: flex;flex-wrap: wrap;gap: 6px;justify-content: center;align-items: center;}}
