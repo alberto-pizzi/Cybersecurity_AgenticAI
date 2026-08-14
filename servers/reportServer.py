@@ -26,7 +26,7 @@ REPORT_TITLE = "SecOps Penetration-Test Report"
 REPORT_VERSION = "1.0"
 AUTHORS = ["Alberto Pizzi", "Tommaso Ciccotti"]
 REPORT_CLASSIFICATION = "Confidential"
-CLIENT_NAME = ""
+CLIENT_NAME = "CLIENT NAME"
 
 _MONTHS_EN = {
     1: "January", 2: "February", 3: "March", 4: "April", 5: "May", 6: "June",
@@ -1070,7 +1070,54 @@ def _render_html(payload: dict[str, Any], *, for_pdf: bool = False) -> str:
         for row in summary.get("coverage_constraints", [])
     ) or '<tr><td colspan="3">No additional coverage constraints were recorded.</td></tr>'
 
+    context_value = _redact_value(payload.get("assessment_context") or {})
+
     toc: list[tuple[int, str, str]] = []
+
+    # --- Cover page -----------------------------------------------------
+    generated_at = payload.get("generated_at")
+    generated_display = _format_date_en(generated_at) if isinstance(generated_at, datetime) else _esc(generated_at)
+
+    profiles = context_value.get("profiles") if isinstance(context_value, dict) else None
+    authenticated = any(isinstance(p, dict) and p.get("authenticated") for p in (profiles or []))
+    assessment_type = payload.get("assessment_type") or (
+        "Authenticated Web Application Penetration Test" if authenticated else "Web Application Penetration Test"
+    )
+
+    client_display = payload.get("client_name") or payload["target"]
+    assessor_display = payload.get("assessor") or "SecOps Automated Assessment Platform"
+    report_version = payload.get("report_version") or "n/a"
+    report_id = payload.get("report_id") or "n/a"
+
+    assessment_start = payload.get("assessment_start") or ""
+    assessment_end = payload.get("assessment_end") or ""
+    if assessment_start and assessment_end and assessment_start != assessment_end:
+        assessment_dates = f"{assessment_start} \u2013 {assessment_end}"
+    else:
+        assessment_dates = assessment_start or assessment_end or generated_display
+
+    cover_rows: list[tuple[str, str]] = [
+        ("Client", _esc(CLIENT_NAME)),
+        ("Target", _esc(client_display)),
+        ("Assessor / team", _esc(assessor_display)),
+        ("Assessment date(s)", _esc(assessment_dates)),
+        ("Report issue date", generated_display),
+        ("Report version / ID", _esc(f"{report_version} / {report_id}")),
+    ]
+
+    cover_html = (
+        '<section class="cover">'
+        f'<div class="cover-classification">{_esc(REPORT_CLASSIFICATION)}</div>'
+        '<div class="cover-body">'
+        '<div class="cover-kicker">Security Assessment Report</div>'
+        f'<h1 class="cover-title">{_esc(REPORT_TITLE)}</h1>'
+        f'<div class="cover-subtitle">{_esc(assessment_type)}</div>'
+        "</div>"
+        '<table class="cover-meta">'
+        + "".join(f"<tr><th>{_esc(label)}</th><td>{value}</td></tr>" for label, value in cover_rows)
+        + "</table>"
+        "</section>"
+    )
 
     def finding_card(item: dict[str, Any], index: int) -> str:
         notes = item.get("data_quality_notes") or []
@@ -1166,7 +1213,6 @@ def _render_html(payload: dict[str, Any], *, for_pdf: bool = False) -> str:
             f"<tbody>{glance_rows}</tbody></table>{tail}"
         )
 
-    context_value = _redact_value(payload.get("assessment_context") or {})
     context_json = json.dumps(
         context_value,
         indent=2,
@@ -1293,10 +1339,17 @@ details{{margin-top:14px}}.section-note{{background:#eaf1f7;border-left:4px soli
 .toc-title{{margin-top:0}}
 ol li::marker{{font-weight:bold;}}
 .field-label{{font-weight:700;margin:14px 0 6px;color:#173b5e}}
+.cover{{break-after:page;min-height:250mm;display:flex;flex-direction:column;justify-content:space-between;background:white;border:1px solid #d7dee5;border-radius:10px;padding:40px;margin:0 0 12px}}
+.cover-classification{{align-self:flex-end;background:#8a1f1f;color:white;font-weight:700;letter-spacing:.08em;text-transform:uppercase;font-size:.85rem;padding:6px 14px;border-radius:4px}}
+.cover-body{{margin-top:70px}}
+.cover-kicker{{color:#4b86b4;font-weight:700;letter-spacing:.12em;text-transform:uppercase;font-size:.95rem;margin-bottom:14px}}
+.cover-title{{font-size:2.6rem;line-height:1.15;margin:0 0 14px;max-width:80%}}
+.cover-subtitle{{font-size:1.3rem;color:#4f6273;font-weight:600}}
+.cover-meta{{table-layout:auto;width:auto;font-size:.9rem;margin-top:50px}}
+.cover-meta th{{background:none;color:#4f6273;text-align:left;white-space:nowrap;border:none;border-top:1px solid #d7dee5;padding:10px 24px 10px 0}}
+.cover-meta td{{border:none;border-top:1px solid #d7dee5;padding:10px 0;font-weight:600;overflow-wrap:anywhere;word-break:break-word}}
 </style></head><body><main>
-<h1>{REPORT_TITLE}</h1>
-<div class="meta"><b>Target:</b> {_esc(payload['target'])}<br><b>Generated:</b> {_esc(payload['generated_at'])}<br><b>Evidence policy:</b> scanner-grounded; missing statements are not fabricated.</div>
-
+{cover_html}
 
 <div class="toc">
 <h2 class="toc-title" id="index">Index</h2>
@@ -1317,8 +1370,20 @@ def generate_report(
     target_url: str,
     output_name: str = "",
     assessment_context: dict | str | None = None,
+    client_name: str = "",
+    assessor: str = "",
+    assessment_type: str = "",
+    assessment_start: str = "",
+    assessment_end: str = "",
+    report_version: str = "1.0",
 ) -> dict:
-    """Generate scanner-grounded JSON, HTML and PDF penetration-test reports."""
+    """Generate scanner-grounded JSON, HTML and PDF penetration-test reports.
+
+    client_name, assessor, assessment_type, assessment_start/end and
+    report_version are optional cover-page fields. Any left blank fall back
+    to a neutral, non-fabricated default (e.g. target for client_name) -
+    see _render_html's cover section.
+    """
     try:
         results = _as_dict(findings_summary)
         context = _as_dict(assessment_context)
@@ -1351,6 +1416,13 @@ def generate_report(
         "findings_by_category": _finding_groups(findings),
         "assessment_context": _redact_value(context),
         "results": _redact_value(results),
+        "client_name": client_name,
+        "assessor": assessor,
+        "assessment_type": assessment_type,
+        "assessment_start": assessment_start,
+        "assessment_end": assessment_end,
+        "report_version": report_version,
+        "report_id": base,
     }
 
     try:
