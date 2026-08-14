@@ -845,7 +845,7 @@ def _field(label: str, value: Any, *, pre: bool = False) -> str:
     rendered = f"<pre>{_esc(value)}</pre>" if pre else _esc(value)
     return f"<dt>{_esc(label)}</dt><dd>{rendered}</dd>"
 
-# It converts text into html id
+
 def _slugify(text: str, existing: set[str] = frozenset()) -> str:
     base = re.sub(r"[^a-z0-9]+", "-", text.strip().lower()).strip("-") or "section"
     if base not in existing:
@@ -855,7 +855,7 @@ def _slugify(text: str, existing: set[str] = frozenset()) -> str:
         n += 1
     return f"{base}-{n}"
 
-# It generates hN tag like manually one
+
 def _heading(
     level: int,
     text: str,
@@ -884,7 +884,7 @@ def _heading(
         toc.append((level, text, slug))
     return f'<h{level} id="{slug}">{_esc(text)}{extra}</h{level}>'
 
-# It takes "toc" list and turn it into nested <ul>
+
 def _render_toc(toc: list[tuple[int, str, str]]) -> str:
     """Render registered (level, text, anchor) entries as nested <ul> lists,
     matching how headings were nested when they were written (h2 under h2,
@@ -915,8 +915,115 @@ def _render_toc(toc: list[tuple[int, str, str]]) -> str:
 
     return render(build(toc))
 
+# Schematic data summary of long json
+def _context_summary_html(context: dict[str, Any], toc: list[tuple[int, str, str]]) -> str:
 
-def _render_html(payload: dict[str, Any]) -> str:
+    if not isinstance(context, dict) or not context:
+        return "<p>No assessment context was supplied.</p>"
+
+    def dl(rows: list[tuple[str, str]]) -> str:
+        return "<dl>" + "".join(f"<dt>{_esc(l)}</dt><dd>{v}</dd>" for l, v in rows) + "</dl>"
+
+    parts: list[str] = []
+
+    # --- Run configuration --------------------------------------------
+    run_rows: list[tuple[str, str]] = []
+    if context.get("scan_mode"):
+        run_rows.append(("Scan mode", _esc(context["scan_mode"])))
+    orchestration = context.get("orchestration") if isinstance(context.get("orchestration"), dict) else {}
+    if orchestration.get("engine"):
+        run_rows.append(("Orchestration engine", _esc(orchestration["engine"])))
+    if orchestration.get("mode"):
+        run_rows.append(("Orchestration mode", _esc(orchestration["mode"])))
+    if orchestration.get("nodes"):
+        run_rows.append(("Pipeline phases", _esc(" -> ".join(str(n) for n in orchestration["nodes"]))))
+    if context.get("secondary_identity_supplied") is not None:
+        run_rows.append((
+            "Secondary identity supplied",
+            "Yes" if context["secondary_identity_supplied"]
+            else "No - authorization/BOLA differentials could not be tested",
+        ))
+    if context.get("expected_tools"):
+        run_rows.append(("Expected tools", _esc(", ".join(str(t) for t in context["expected_tools"]))))
+    if run_rows:
+        parts.append(_heading(3, "Run configuration", toc) + dl(run_rows))
+
+    # --- Configured limits and timeouts --------------------------------
+    limit_rows: list[tuple[str, str]] = []
+    if context.get("parameter_endpoint_limit") is not None:
+        limit_rows.append(("Endpoints tested per parameter-driven tool", _esc(context["parameter_endpoint_limit"])))
+    if context.get("arjun_endpoint_limit") is not None:
+        limit_rows.append(("Endpoints tested for hidden-parameter discovery (Arjun)", _esc(context["arjun_endpoint_limit"])))
+    for key, label in (
+        ("broad_scanner_timeouts", "Broad-scanner timeouts"),
+        ("parameter_tool_timeouts", "Parameter-driven tool timeouts"),
+    ):
+        timeouts = context.get(key)
+        if isinstance(timeouts, dict) and timeouts:
+            limit_rows.append((label, _esc(", ".join(f"{tool}: {seconds}s" for tool, seconds in timeouts.items()))))
+    if limit_rows:
+        parts.append(_heading(3, "Configured limits", toc) + dl(limit_rows))
+
+    # --- Per-profile discovery summary ---------------------------------
+    profiles_meta = {
+        str(row.get("name")): row
+        for row in (context.get("profiles") or [])
+        if isinstance(row, dict) and row.get("name")
+    }
+    discovery = context.get("discovery") if isinstance(context.get("discovery"), dict) else {}
+    profile_cards: list[str] = []
+    for profile_name, data in discovery.items():
+        if not isinstance(data, dict):
+            continue
+        meta = profiles_meta.get(profile_name, {})
+        auth_label = "authenticated" if meta.get("authenticated") else "anonymous"
+        rows: list[tuple[str, str]] = [("Profile", f"{_esc(profile_name)} ({auth_label})")]
+
+        auth_effective = data.get("authentication_effective")
+        if auth_effective is not None:
+            rows.append((
+                "Authentication verified",
+                "Yes - distinguished from the anonymous response" if auth_effective
+                else "No - could not be confirmed",
+            ))
+        prep = data.get("target_preparation") if isinstance(data.get("target_preparation"), dict) else {}
+        if prep:
+            status = "performed and usable" if prep.get("usable") else ("performed" if prep.get("performed") else "not required")
+            rows.append(("Target preparation", _esc(status)))
+
+        counts = [
+            f"{label}: {len(data[key])}"
+            for key, label in (
+                ("urls", "URLs discovered"),
+                ("html_urls", "HTML pages"),
+                ("form_urls", "Forms"),
+                ("parameterized_urls", "Parameterized endpoints"),
+                ("request_cases", "Normalized request cases"),
+                ("client_side_candidates", "Client-side sink candidates"),
+                ("jwt_tokens", "JWTs discovered"),
+                ("errors", "Discovery errors"),
+            )
+            if isinstance(data.get(key), list)
+        ]
+        if counts:
+            rows.append(("Discovered surface", _esc(" | ".join(counts))))
+
+        skipped = data.get("destructive_urls_skipped")
+        if isinstance(skipped, list) and skipped:
+            rows.append((
+                f"Destructive URLs deliberately skipped ({len(skipped)})",
+                _render_list([str(u) for u in skipped]),
+            ))
+
+        profile_cards.append(f'<div class="card">{dl(rows)}</div>')
+
+    if profile_cards:
+        parts.append(_heading(3, "Discovery summary", toc) + "".join(profile_cards))
+
+    return "".join(parts) or "<p>No assessment context was supplied.</p>"
+
+
+def _render_html(payload: dict[str, Any], *, for_pdf: bool = False) -> str:
     summary = payload["summary"]
     risks = summary["risk_counts"]
     omitted = payload["summary"].get("omitted_human_readable_detail", {})
@@ -1101,7 +1208,9 @@ def _render_html(payload: dict[str, Any]) -> str:
 
 {detail_cap_note}
 {_heading(2, "Scope and assessment context", toc, anchor="scope")}
-<details><summary>Profiles, discovery counts and configured limits</summary><pre>{_esc(context_json)}</pre></details>
+{_context_summary_html(context_value, toc)}
+{"" if for_pdf else f'<details><summary>Raw assessment context (JSON)</summary><pre>{_esc(context_json)}</pre></details>'}
+{'<p class="section-note">The full technical context (discovered URLs, normalized request cases, client-side sink candidates) is available in the attached JSON report.</p>' if for_pdf else ""}
 {render_agentic_audit()}
 
 {_heading(2, "Assessment execution", toc, anchor="execution")}
@@ -1163,6 +1272,7 @@ details{{margin-top:14px}}.section-note{{background:#eaf1f7;border-left:4px soli
 .count{{font-size:.85rem;background:#dce8f3;border-radius:12px;padding:3px 8px}}
 .toc a{{color: black;text-decoration: none;}}
 .toc ul{{list-style: none;padding-left: 0;}}
+.toc ul ul{{padding-left: 22px;}}
 .toc-title{{margin-top:0}}
 .field-label{{font-weight:700;margin:14px 0 6px;color:#173b5e}}
 </style></head><body><main>
@@ -1231,13 +1341,21 @@ def generate_report(
     except Exception as exc:
         return failure("Report Generator", target_url, f"JSON/HTML report creation failed: {type(exc).__name__}: {exc}", diagnosis="report_serialization_failed")
 
-    # PDF is rendered from the generated HTML via WeasyPrint (html2pdf).
+    # The PDF is rendered from a separate, PDF-only HTML render (for_pdf=True):
+    # same content, minus sections that only make sense in an interactive
+    # browser (e.g. the raw JSON context dump, which WeasyPrint can't
+    # collapse into a <details> the way a browser does). The full HTML
+    # served to the user (html_path, written above) is unaffected.
+    pdf_source_path = html_path.with_name(f"{html_path.stem}.pdf-source.html")
     try:
-        html2pdf(html_path, pdf_path)
+        pdf_source_path.write_text(_render_html(payload, for_pdf=True), encoding="utf-8")
+        html2pdf(pdf_source_path, pdf_path)
     except Exception as exc:
         result = failure("Report Generator", target_url, f"PDF report creation failed: {type(exc).__name__}: {exc}", diagnosis="pdf_generation_failed")
         result.update(json_filename=str(json_path.resolve()), html_filename=str(html_path.resolve()), pdf_filename=None, findings_count=len(findings))
         return result
+    finally:
+        pdf_source_path.unlink(missing_ok=True)
 
     pwndoc_url = os.getenv("PWNDOC_URL", "").rstrip("/")
     pwndoc_status = "not_configured"
