@@ -1080,10 +1080,10 @@ def _render_html(payload: dict[str, Any], *, for_pdf: bool = False) -> str:
 <article class="finding risk-{_esc(item['risk'])}">
 {heading}
 <div class="badges">
-<b>{_esc(item['verification_status'])}</b>
-<b>confidence: {_esc(item['confidence'])}</b>
-<b>profiles: {_esc(', '.join(item.get('profiles') or [item['profile']]))}</b>
-<b>tool: {_esc(item['tool'])}</b>
+<b><span class="cat">Status</span><span class="val">{_esc(item['verification_status'])}</span></b>
+<b><span class="cat">Confidence</span><span class="val">{_esc(item['confidence'])}</span></b>
+<b><span class="cat">Profiles</span><span class="val">{_esc(', '.join(item.get('profiles') or [item['profile']]))}</span></b>
+<b><span class="cat">Tool</span><span class="val">{_esc(item['tool'])}</span></b>
 </div>
 <dl>
 {_field('Affected URL', item.get('url'))}
@@ -1262,7 +1262,10 @@ tr th{{white-space:nowrap}}
 .no-wrap{{white-space:nowrap}}
 small{{color:#4f6273}}.finding{{border-left:7px solid #4b86b4}}
 .risk-critical,.risk-high{{border-left-color:#a90000}}.risk-medium{{border-left-color:#d98200}}.risk-low{{border-left-color:#b49b00}}
-.badges b{{display:inline-block;background:#e8eef4;padding:4px 8px;margin:0 6px 6px 0;border-radius:12px;font-size:.82rem}}
+.badges{{display: flex;flex-wrap: wrap;gap: 6px;justify-content: center;align-items: center;}}
+.badges b{{display: inline-flex;align-items: stretch;overflow: hidden;border-radius: 12px;font-size: .82rem;font-weight: normal;box-shadow: 0 0 0 1px #d3dde5;margin: 5px}}
+.badges .cat{{background: #3b5b7a;color: #fff;font-weight: 600;padding: 4px 8px;text-transform: uppercase;letter-spacing: .03em;font-size: .72rem;display: flex;align-items: center;}}
+.badges .val {{background: #e8eef4;color: #1f2d3a;padding: 4px 8px;display: flex;align-items: center;}}
 dl{{display:grid;grid-template-columns:190px minmax(0,1fr);gap:8px 14px}}
 dt{{font-weight:700;overflow-wrap:anywhere;min-width:0}}
 dd{{margin:0;overflow-wrap:anywhere;word-break:break-word;min-width:0}}
