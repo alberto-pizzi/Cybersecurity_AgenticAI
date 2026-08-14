@@ -1196,21 +1196,17 @@ def _render_html(payload: dict[str, Any], *, for_pdf: bool = False) -> str:
         f"<td>{_esc(item.get('tool',''))}</td>"
         f"<td>{_esc(item.get('url',''))}<br><small>parameter: {_esc(item.get('parameter') or '-')}</small></td>"
         "</tr>"
-        for index, item in enumerate(glance_items[:12], 1)
+        for index, item in enumerate(glance_items, 1)
     )
     def render_glance() -> str:
         heading = _heading(2, "Security findings at a glance", toc, anchor="glance")
         if not glance_items:
             return f"{heading}<p>No confirmed vulnerabilities or validation candidates were recorded.</p>"
-        tail = (
-            f"<p>Only the first 12 of {len(glance_items)} security findings are shown here; all details follow below.</p>"
-            if len(glance_items) > 12 else ""
-        )
         return (
             f"{heading}"
             "<p class='section-note'>Confirmed vulnerabilities and candidates are named here before execution details.</p>"
             "<table><thead><tr><th class=\"idx\">#</th><th>Severity</th><th>Finding</th><th>Tool</th><th>Affected endpoint</th></tr></thead>"
-            f"<tbody>{glance_rows}</tbody></table>{tail}"
+            f"<tbody>{glance_rows}</tbody></table>"
         )
 
     context_json = json.dumps(
