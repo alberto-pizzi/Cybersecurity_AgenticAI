@@ -63,6 +63,27 @@ SECRET_PATTERNS = (
     (re.compile(r"eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]*"), "<redacted-jwt>"),
 )
 
+# Static, engagement-independent boilerplate for the professional-report
+# front matter (risk-rating legend and methodology narrative). These do not
+# describe any specific target or finding, so they carry no risk of
+# contradicting the scanner-grounded reporting policy above.
+SEVERITY_DEFINITIONS = [
+    ("Critical", "#a90000", "Immediate, severe threat to confidentiality, integrity or availability that is trivial to exploit (e.g. unauthenticated remote code execution, full data-store compromise). Requires emergency remediation, typically within 24-48 hours."),
+    ("High", "#a90000", "Significant security impact that is straightforward to exploit or that undermines a core security control (e.g. confirmed SQL injection, authentication bypass). Requires urgent remediation, typically within one to two weeks."),
+    ("Medium", "#d98200", "Meaningful weakness with a more constrained impact or exploitability (e.g. reflected XSS, missing authorization checks on non-critical functions). Should be remediated within the next release cycle."),
+    ("Low", "#b49b00", "Limited security impact, often requiring specific preconditions or giving only marginal advantage to an attacker (e.g. verbose error messages, minor information disclosure). Should be scheduled for remediation."),
+    ("Info", "#4b86b4", "Observations, hardening opportunities or discovered attack surface that do not constitute a confirmed vulnerability but support defense-in-depth and future testing."),
+]
+
+METHODOLOGY_PHASES = [
+    ("Planning and scoping", "Target, credentials, testing profiles (anonymous and/or authenticated) and safety boundaries were agreed before execution; destructive actions were excluded by default."),
+    ("Reconnaissance and discovery", "Passive and active crawling enumerated reachable URLs, forms, parameters, request contracts, JWTs and client-side sinks. See “Scope and assessment context” for the discovered surface."),
+    ("Automated vulnerability scanning", "Adaptive, fingerprint-driven and signature-based scanners assessed the discovered surface for known vulnerabilities, misconfigurations and exposures. See “Assessment execution” for the tools used and their purpose."),
+    ("Targeted validation", "Findings capable of automated confirmation were re-tested with bounded, evidence-producing checks (for example SQL injection, XSS, command injection, path traversal) to separate confirmed vulnerabilities from candidates requiring manual review."),
+    ("Coverage and manual-review triggers", "Classes that automated tooling cannot conclusively confirm (for example business-logic authorization or IDOR without a second identity) are flagged as coverage constraints for manual follow-up rather than reported as confirmed."),
+    ("Reporting", "Results were normalized, de-duplicated across corroborating tools and compiled into this scanner-grounded report, distinguishing confirmed vulnerabilities from candidates, observations and discovery."),
+]
+
 
 def _format_date_en(dt: datetime) -> str:
 
@@ -1023,6 +1044,102 @@ def _context_summary_html(context: dict[str, Any], toc: list[tuple[int, str, str
     return "".join(parts) or "<p>No assessment context was supplied.</p>"
 
 
+def _render_disclaimer(client_display: str, assessment_dates: str) -> str:
+    """Confidentiality / legal-notice front matter, standard on professional
+    pentest reports. Engagement-specific values (client, target, dates) are
+    interpolated; the surrounding text is fixed boilerplate.
+    """
+    return (
+        '<section class="disclaimer">'
+        "<h2>Confidentiality and disclaimer</h2>"
+        f"<p>This report is classified <b>{_esc(REPORT_CLASSIFICATION)}</b> and is provided solely for the use of "
+        f"{_esc(CLIENT_NAME)} in evaluating the security of {_esc(client_display)}. It contains details of security "
+        "vulnerabilities and must not be distributed, copied or disclosed to any party not explicitly authorized by "
+        "the recipient.</p>"
+        f"<p>Testing was performed during {_esc(assessment_dates)} against the scope and identities described in this "
+        "report. This document reflects the security posture of the target as observed at that time; systems, code "
+        "and configuration can change afterward, and no assessment - automated or manual - can guarantee the absence "
+        "of vulnerabilities outside the scope, techniques and time actually exercised.</p>"
+        "<p>Findings are grounded in evidence produced by the tools used during this engagement; where evidence was "
+        "insufficient to confirm exploitability, the finding is reported as a candidate or observation rather than a "
+        "confirmed vulnerability (see “Methodology” and “Risk rating methodology”). This report "
+        "does not constitute legal advice, a compliance certification, or a warranty of fitness for any particular "
+        "purpose.</p>"
+        "</section>"
+    )
+
+
+def _render_severity_legend(toc: list[tuple[int, str, str]]) -> str:
+    heading = _heading(2, "Risk rating methodology", toc, anchor="risk-rating")
+    rows = "".join(
+        f'<tr><td class="no-wrap"><span class="legend-swatch" style="background:{color}"></span><b>{_esc(name)}</b></td>'
+        f"<td>{_esc(desc)}</td></tr>"
+        for name, color, desc in SEVERITY_DEFINITIONS
+    )
+    return (
+        f"{heading}"
+        '<p class="section-note">Severity is the risk rating supplied by the originating scanner for each finding, '
+        "escalated to a confirmed vulnerability only when the tool-specific evidence rule described in "
+        "“Methodology” is satisfied. The definitions below describe what each rating means for "
+        "prioritization; they are not recalculated per finding.</p>"
+        f"<table><thead><tr><th>Rating</th><th>Definition and expected remediation priority</th></tr></thead>"
+        f"<tbody>{rows}</tbody></table>"
+    )
+
+
+def _render_methodology(toc: list[tuple[int, str, str]]) -> str:
+    heading = _heading(2, "Methodology", toc, anchor="methodology")
+    phase_items = "".join(
+        f"<li><b>{_esc(name)}</b> — {_esc(desc)}</li>" for name, desc in METHODOLOGY_PHASES
+    )
+    return (
+        f"{heading}"
+        '<p class="section-note">This assessment followed a staged methodology consistent with industry practice for '
+        "web-application penetration testing (comparable in intent to the OWASP Testing Guide and PTES). Each stage "
+        "is described below; the tools used in each stage and their individual results are recorded in "
+        "“Assessment execution”.</p>"
+        f"<ol>{phase_items}</ol>"
+    )
+
+
+def _render_conclusion(summary: dict[str, Any], findings: list[dict[str, Any]], toc: list[tuple[int, str, str]]) -> str:
+    risks = summary.get("risk_counts", {})
+    confirmed = sum(item["category"] == "vulnerability" for item in findings)
+    candidates = sum(item["category"] == "candidate" for item in findings)
+    if risks.get("critical") or risks.get("high"):
+        posture = (
+            "at least one Critical or High severity finding was confirmed. This should be treated as the immediate "
+            "remediation priority before the affected functionality is exposed to untrusted users."
+        )
+    elif confirmed or candidates:
+        posture = (
+            "no Critical or High severity finding was confirmed, but Medium/Low findings and candidates requiring "
+            "manual validation remain and should be tracked to closure."
+        )
+    else:
+        posture = (
+            "no confirmed vulnerability was identified within the tested scope and constraints described in this "
+            "report; this reflects the scope actually exercised, not a guarantee of overall security."
+        )
+    next_steps = [
+        "Remediate confirmed vulnerabilities in order of severity, validating each fix against the reproduction steps recorded in this report.",
+        "Manually review every candidate finding and coverage constraint listed above; automated tooling could not confirm or rule these out on its own.",
+        "Re-run this assessment, or the specific affected checks, after remediation to confirm closure before a fix is considered complete.",
+    ]
+    if summary.get("coverage_constraints"):
+        next_steps.insert(
+            1,
+            "Address the coverage constraints above (for example by supplying a second authenticated identity) so the classes they describe can be tested directly.",
+        )
+    heading = _heading(2, "Conclusion and recommendations", toc, anchor="conclusion")
+    return (
+        f"{heading}"
+        f'<div class="card">Based on the findings in this report, {_esc(posture)}</div>'
+        '<p class="field-label">Recommended next steps</p>'
+        f"<ol>{''.join(f'<li>{_esc(step)}</li>' for step in next_steps)}</ol>"
+    )
+
+
 def _render_html(payload: dict[str, Any], *, for_pdf: bool = False) -> str:
     summary = payload["summary"]
     risks = summary["risk_counts"]
@@ -1255,14 +1372,17 @@ def _render_html(payload: dict[str, Any], *, for_pdf: bool = False) -> str:
     # list, you just write (or move) a heading and the index follows.
     body_html = f"""
 {_heading(2, "Executive summary", toc, anchor="executive")}<div class="card">{_esc(payload['executive_summary'])}</div>
-{render_glance()}
 <div class="grid">{''.join(f'<div class="card"><div class="value">{risks.get(risk,0)}</div><div>{risk.title()}</div></div>' for risk in ('critical','high','medium','low'))}<div class="card"><div class="value">{len(summary['limitations'])}</div><div>Execution limitations</div><div class="value">{len(summary.get('coverage_constraints', []))}</div><div>Coverage constraints</div></div></div>
+
+{_render_severity_legend(toc)}
+{render_glance()}
 
 {detail_cap_note}
 {_heading(2, "Scope and assessment context", toc, anchor="scope")}
 {_context_summary_html(context_value, toc)}
 {"" if for_pdf else f'<details><summary>Raw assessment context (JSON)</summary><pre>{_esc(context_json)}</pre></details>'}
 {'<p class="section-note">The full technical context (discovered URLs, normalized request cases, client-side sink candidates) is available in the attached JSON report.</p>' if for_pdf else ""}
+{_render_methodology(toc)}
 {render_agentic_audit()}
 
 {_heading(2, "Assessment execution", toc, anchor="execution")}
@@ -1281,12 +1401,16 @@ def _render_html(payload: dict[str, Any], *, for_pdf: bool = False) -> str:
 <table><thead><tr><th>Area</th><th>Reason</th><th>Recommended next step</th></tr></thead><tbody>{constraint_rows}</tbody></table>
 
 {''.join(render_finding_section(category) for category in ("vulnerability", "candidate", "observation", "discovery"))}
+
+{_render_conclusion(summary, payload["findings"], toc)}
 """
     # toc[] is now fully populated -> Phase 2: render the index from it.
     # (Same reason LaTeX needs two compilation passes: the ToC appears
     # before the content it points to, so it can only be built after that
     # content has already been rendered once.)
     toc_html = _render_toc(toc)
+
+    disclaimer_html = _render_disclaimer(client_display, assessment_dates)
 
     return f"""<!doctype html><html><head><meta charset="utf-8"><title>SecOps Assessment Report</title>
 <style>
@@ -1344,8 +1468,13 @@ ol li::marker{{font-weight:bold;}}
 .cover-meta{{table-layout:auto;width:auto;font-size:.9rem;margin-top:50px}}
 .cover-meta th{{background:none;color:#4f6273;text-align:left;white-space:nowrap;border:none;border-top:1px solid #d7dee5;padding:10px 24px 10px 0}}
 .cover-meta td{{border:none;border-top:1px solid #d7dee5;padding:10px 0;font-weight:600;overflow-wrap:anywhere;word-break:break-word}}
+.disclaimer{{background:#fff8f8;border:1px solid #e3b8b8;border-radius:10px;padding:28px 32px;margin:0 0 12px;break-after:page}}
+.disclaimer h2{{margin-top:0}}
+.disclaimer p{{line-height:1.55}}
+.legend-swatch{{display:inline-block;width:10px;height:10px;border-radius:2px;margin-right:6px}}
 </style></head><body><main>
 {cover_html}
+{disclaimer_html}
 
 <div class="toc">
 <h2 class="toc-title" id="index">Index</h2>
