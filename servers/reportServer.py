@@ -1457,6 +1457,7 @@ details{{margin-top:14px}}.section-note{{background:#eaf1f7;border-left:4px soli
 .toc ul{{list-style: none;padding-left: 0;}}
 .toc ul ul{{padding-left: 22px;}}
 .toc-title{{margin-top:0}}
+.toc>ul>li>a{{font-weight:bold}}
 ol li::marker{{font-weight:bold;}}
 .field-label{{font-weight:700;margin:14px 0 6px;color:#173b5e}}
 .cover{{break-after:page;min-height:250mm;display:flex;flex-direction:column;justify-content:space-between;background:white;border:1px solid #d7dee5;border-radius:10px;padding:40px;margin:0 0 12px}}
