@@ -1045,7 +1045,12 @@ def _context_summary_html(context: dict[str, Any], toc: list[tuple[int, str, str
 
 
 def _render_document_control(payload: dict[str, Any], generated_display: str) -> str:
-
+    """Report-identity front matter (who prepared it, with what tooling, under
+    what reference/version). Mirrors the "Document Control" block and the
+    tester-identity fields industry report templates and evaluation
+    checklists (e.g. the PCI DSS Penetration Testing Guidance report
+    evaluation tool) expect readers to be able to find at a glance.
+    """
     rows: list[tuple[str, str]] = [
         ("Document reference", _esc(payload.get("report_id") or "n/a")),
         ("Engagement report version", _esc(payload.get("report_version") or "n/a")),
@@ -1065,7 +1070,12 @@ def _render_document_control(payload: dict[str, Any], generated_display: str) ->
 
 
 def _render_priority_actions(findings: list[dict[str, Any]], toc: list[tuple[int, str, str]]) -> str:
-
+    """Actionable remediation shortlist, drawn only from confirmed
+    vulnerabilities/candidates that actually carry a scanner-supplied
+    remediation ('solution'). Order follows the incoming list, which
+    flatten_findings already sorts vulnerability-before-candidate and by
+    descending risk, so the shortlist is priority-ordered for free.
+    """
     seen: set[tuple[str, str]] = set()
     items: list[str] = []
     for item in findings:
@@ -1080,7 +1090,6 @@ def _render_priority_actions(findings: list[dict[str, Any]], toc: list[tuple[int
             f"<li><b>[{_esc(item['risk']).upper()}] {_esc(item['alert'])}</b>{target}"
             f"<br>{_esc(item['solution'])}</li>"
         )
-        # TODO this limit is ok?
         if len(items) >= 10:
             break
     if not items:
@@ -1191,6 +1200,209 @@ def _render_conclusion(summary: dict[str, Any], findings: list[dict[str, Any]], 
     )
 
 
+def _overall_risk_rating(findings: list[dict[str, Any]]) -> tuple[str, str, str]:
+    """Single top-line verdict for management, derived only from confirmed
+    vulnerabilities (primary signal) and candidates (secondary signal) -
+    never from observations/discovery, which carry no confirmed risk.
+    """
+    confirmed = Counter(item["risk"] for item in findings if item.get("category") == "vulnerability")
+    candidates = Counter(item["risk"] for item in findings if item.get("category") == "candidate")
+    if confirmed.get("critical"):
+        return ("CRITICAL", "#7a0000", "At least one confirmed critical-severity vulnerability was found within the tested scope.")
+    if confirmed.get("high"):
+        return ("HIGH", "#a90000", "At least one confirmed high-severity vulnerability was found within the tested scope.")
+    if confirmed.get("medium") or candidates.get("critical") or candidates.get("high"):
+        return ("MEDIUM", "#d98200", "Confirmed medium-severity findings and/or high-impact candidates requiring manual validation were found.")
+    if confirmed.get("low") or candidates:
+        return ("LOW", "#b49b00", "Only low-severity confirmed findings and/or lower-impact candidates requiring manual validation were found.")
+    return ("INFORMATIONAL", "#4b86b4", "No confirmed vulnerability or candidate requiring manual validation was found within the tested scope and constraints described in this report.")
+
+
+def _render_overall_risk_banner(rating: str, color: str, explanation: str, toc: list[tuple[int, str, str]]) -> str:
+    heading = _heading(2, "Overall risk rating", toc, anchor="overall-risk")
+    return (
+        f"{heading}"
+        f'<div class="risk-banner" style="border-left-color:{color}">'
+        f'<span class="risk-banner-label" style="background:{color}">{_esc(rating)}</span>'
+        f"<span>{_esc(explanation)}</span>"
+        "</div>"
+    )
+
+
+def _render_pipeline_diagram(nodes: list[Any]) -> str:
+    """Assessment phase flow, built only from the orchestration node order
+    actually recorded in the assessment context - not a generic diagram.
+    """
+    labels = [str(node).strip() for node in (nodes or []) if str(node).strip()]
+    if not labels:
+        return ""
+    chips: list[str] = []
+    for index, label in enumerate(labels):
+        chips.append(f'<span class="flow-step">{_esc(label)}</span>')
+        if index < len(labels) - 1:
+            chips.append('<span class="flow-arrow">&#8594;</span>')
+    return f'<div class="flow">{"".join(chips)}</div>'
+
+
+def _svg_severity_chart(risks: dict[str, int]) -> str:
+    """Horizontal bar chart of findings-by-severity, hand-built as inline
+    SVG (no external plotting library, no network fetch) so it renders
+    identically in-browser and through WeasyPrint's PDF pipeline.
+    """
+    levels = (
+        ("Critical", "critical", "#7a0000"),
+        ("High", "high", "#a90000"),
+        ("Medium", "medium", "#d98200"),
+        ("Low", "low", "#b49b00"),
+        ("Info", "info", "#4b86b4"),
+    )
+    values = [(label, color, int(risks.get(key, 0) or 0)) for label, key, color in levels]
+    max_value = max((v for _, _, v in values), default=0) or 1
+    width, row_h, gap, label_w, pad, track_w = 640, 26, 10, 70, 10, 460
+    height = pad * 2 + len(values) * (row_h + gap) - gap
+    bars: list[str] = [f'<rect x="0" y="0" width="{width}" height="{height}" fill="white"/>']
+    y = pad
+    for label, color, value in values:
+        bar_w = max(2, round(track_w * value / max_value)) if value else 2
+        bars.append(f'<text x="0" y="{y + row_h * 0.68:.1f}" font-size="12" fill="#17212b" font-family="Arial,sans-serif">{_esc(label)}</text>')
+        bars.append(f'<rect x="{label_w}" y="{y}" width="{bar_w}" height="{row_h - 6}" rx="4" fill="{color}" opacity="{1 if value else 0.25}"/>')
+        bars.append(f'<text x="{label_w + bar_w + 8}" y="{y + row_h * 0.68:.1f}" font-size="12" fill="#17212b" font-family="Arial,sans-serif">{value}</text>')
+        y += row_h + gap
+    body = "".join(bars)
+    return f'<svg viewBox="0 0 {width} {height}" width="100%" height="{height}" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Findings by severity">{body}</svg>'
+
+
+def _render_visualizations(context_value: dict[str, Any], risks: dict[str, int], toc: list[tuple[int, str, str]]) -> str:
+    orchestration = context_value.get("orchestration") if isinstance(context_value, dict) else {}
+    nodes = orchestration.get("nodes") if isinstance(orchestration, dict) else None
+    pipeline_html = _render_pipeline_diagram(nodes if isinstance(nodes, list) else [])
+    heading = _heading(2, "Assessment visualizations", toc, anchor="visualizations")
+    parts = [heading]
+    if pipeline_html:
+        parts.append(
+            '<p class="field-label">Assessment pipeline (phases actually executed, in order)</p>' + pipeline_html
+        )
+    parts.append('<p class="field-label">Findings by severity</p>')
+    parts.append(f'<div class="card">{_svg_severity_chart(risks)}</div>')
+    return "".join(parts)
+
+
+def _render_chaining_potential(findings: list[dict[str, Any]], toc: list[tuple[int, str, str]]) -> str:
+    """Surfaces hosts/endpoints carrying more than one distinct confirmed or
+    candidate finding - the real-world precondition for an attacker to chain
+    vulnerabilities together. This platform verifies each finding
+    independently and does not attempt automated exploitation chaining, so
+    this section deliberately stops short of claiming a verified attack
+    path (that would violate the scanner-grounded reporting policy); it
+    flags concentration points for a human tester to chain manually.
+    """
+    by_host: dict[str, list[dict[str, Any]]] = {}
+    for item in findings:
+        if item.get("category") not in {"vulnerability", "candidate"}:
+            continue
+        url = str(item.get("canonical_url") or item.get("url") or "").strip()
+        if not url:
+            continue
+        host = urlparse(url).netloc or url
+        by_host.setdefault(host, []).append(item)
+
+    concentrations = {
+        host: items for host, items in by_host.items()
+        if len({_finding_family(item) for item in items}) > 1
+    }
+    heading = _heading(2, "Exploitation chaining potential", toc, anchor="chaining")
+    intro = (
+        '<p class="section-note">This automated platform confirms each finding independently and does not attempt '
+        "to chain vulnerabilities together (for example, using an injection flaw to reach an administrative "
+        "interface). Hosts below carry more than one distinct confirmed or candidate finding, which is the "
+        "real-world precondition for a human attacker to combine them into a multi-step compromise. Listing a host "
+        "here is not a claim that any chain was demonstrated or that one exists.</p>"
+    )
+    if not concentrations:
+        return f"{heading}{intro}<p>No host in this report carries more than one distinct confirmed or candidate finding.</p>"
+    items_html = "".join(
+        f"<li><b>{_esc(host)}</b> — {len(items)} finding(s) across distinct issue types: "
+        f"{_esc(', '.join(sorted({_finding_family(item) for item in items})))}.</li>"
+        for host, items in sorted(concentrations.items(), key=lambda kv: -len(kv[1]))
+    )
+    return f"{heading}{intro}<ul>{items_html}</ul>"
+
+
+def _artifact_cleanup_hint(row: dict[str, Any]) -> str | None:
+    verification = str(row.get("verification_status") or "").lower()
+    alert = str(row.get("alert") or "").lower()
+    if "upload-accepted" in verification or "file upload" in alert:
+        return (
+            "Locate and remove the harmless probe file the platform uploaded (filenames are prefixed "
+            "“secops_probe_” and contain a SECOPS_UPLOAD_ marker string) and confirm the upload handler "
+            "no longer serves it."
+        )
+    if "stored" in verification or "stored xss" in alert:
+        return (
+            "Locate and remove the stored payload (a SECOPS_XSS_-prefixed marker) that the platform's stored-XSS "
+            "check left in application data."
+        )
+    if "command execution" in alert or "command injection" in alert:
+        return (
+            "Review command history/logs for the SECOPS_CMD_-prefixed canary strings used to confirm this finding; "
+            "the platform issued no destructive commands."
+        )
+    return None
+
+
+def _render_cleanup(findings: list[dict[str, Any]], toc: list[tuple[int, str, str]]) -> str:
+    heading = _heading(2, "Post-assessment cleanup", toc, anchor="cleanup")
+    intro = (
+        '<p class="section-note">Every active probe used by this platform is tagged with an identifiable '
+        '“SECOPS_” prefix - uploaded filenames such as <code>secops_probe_&lt;hex&gt;.html</code>, stored '
+        'markers such as <code>SECOPS_XSS_...</code>, command-injection canaries such as <code>SECOPS_CMD_...</code>, '
+        'and throttling-check usernames such as <code>secops_invalid_...</code> - so they can be found and removed. '
+        "No destructive actions, persistent backdoors, or new privileged accounts were created by this "
+        "assessment.</p>"
+    )
+    artifacts = [
+        (item, hint)
+        for item in findings
+        if item.get("category") in {"vulnerability", "candidate"}
+        for hint in [_artifact_cleanup_hint(item)]
+        if hint
+    ]
+    if not artifacts:
+        return (
+            f"{heading}{intro}"
+            "<p>No finding in this report indicates a persisted server-side artifact (such as an accepted upload or "
+            'a stored payload). As a precaution, search server logs and storage for the "SECOPS_" prefix before '
+            "closing out this engagement.</p>"
+        )
+    items_html = "".join(
+        f"<li><b>{_esc(item['alert'])}</b>{' — ' + _esc(item['url']) if item.get('url') else ''}<br>{_esc(hint)}</li>"
+        for item, hint in artifacts
+    )
+    return f"{heading}{intro}<ol>{items_html}</ol>"
+
+
+def _render_qualifications(toc: list[tuple[int, str, str]]) -> str:
+    heading = _heading(2, "Assessor and platform qualifications", toc, anchor="qualifications")
+    tool_list = ", ".join(sorted(TOOL_PURPOSES))
+    return (
+        f"{heading}"
+        "<p>This assessment was produced by an automated platform rather than performed manually end-to-end by a "
+        "certified individual tester. Industry guidance on tester qualifications - certifications (for example "
+        "OSCP, GWAPT, CREST), organizational independence from the tested environment, and documented past "
+        "experience - is written for human testers and does not map directly onto automated tooling; no such "
+        "credentials are claimed here on behalf of the platform or its authors.</p>"
+        "<p>The platform's authority instead rests on three verifiable properties of this report: the use of "
+        f"actively maintained, industry-standard scanners ({_esc(tool_list)}), each restricted to the documented "
+        "purpose listed in “Assessment execution”; deterministic, tool-specific evidence rules applied "
+        "before any finding is escalated to a confirmed vulnerability (see “Risk rating "
+        "methodology”); and explicit disclosure, rather than omission, of what the automated run could not "
+        "verify (see “Coverage constraints and untested classes”).</p>"
+        f"<p>The platform is developed and maintained by {_esc(', '.join(AUTHORS))}.</p>"
+        "<p>Findings marked as candidates, and every coverage constraint listed in this report, require review by a "
+        "qualified human penetration tester before being treated as conclusive.</p>"
+    )
+
+
 def _render_html(payload: dict[str, Any], *, for_pdf: bool = False) -> str:
     summary = payload["summary"]
     risks = summary["risk_counts"]
@@ -1239,6 +1451,7 @@ def _render_html(payload: dict[str, Any], *, for_pdf: bool = False) -> str:
     ) or '<tr><td colspan="3">No additional coverage constraints were recorded.</td></tr>'
 
     context_value = _redact_value(payload.get("assessment_context") or {})
+    overall_rating, overall_color, overall_explanation = _overall_risk_rating(payload["findings"])
 
     toc: list[tuple[int, str, str]] = []
 
@@ -1275,7 +1488,10 @@ def _render_html(payload: dict[str, Any], *, for_pdf: bool = False) -> str:
 
     cover_html = (
         '<section class="cover">'
+        '<div class="cover-badges">'
         f'<div class="cover-classification">{_esc(REPORT_CLASSIFICATION)}</div>'
+        f'<div class="cover-risk-badge" style="background:{overall_color}">Overall risk: {_esc(overall_rating)}</div>'
+        "</div>"
         '<div class="cover-body">'
         '<div class="cover-kicker">Security Assessment Report</div>'
         f'<h1 class="cover-title">{_esc(REPORT_TITLE)}</h1>'
@@ -1426,6 +1642,7 @@ def _render_html(payload: dict[str, Any], *, for_pdf: bool = False) -> str:
 <div class="grid">{''.join(f'<div class="card"><div class="value">{risks.get(risk,0)}</div><div>{risk.title()}</div></div>' for risk in ('critical','high','medium','low'))}<div class="card"><div class="value">{len(summary['limitations'])}</div><div>Execution limitations</div><div class="value">{len(summary.get('coverage_constraints', []))}</div><div>Coverage constraints</div></div></div>
 
 {_render_severity_legend(toc)}
+{_render_overall_risk_banner(overall_rating, overall_color, overall_explanation, toc)}
 {_render_priority_actions(payload["findings"], toc)}
 {render_glance()}
 
@@ -1435,6 +1652,8 @@ def _render_html(payload: dict[str, Any], *, for_pdf: bool = False) -> str:
 {"" if for_pdf else f'<details><summary>Raw assessment context (JSON)</summary><pre>{_esc(context_json)}</pre></details>'}
 {'<p class="section-note">The full technical context (discovered URLs, normalized request cases, client-side sink candidates) is available in the attached JSON report.</p>' if for_pdf else ""}
 {_render_methodology(toc)}
+{_render_qualifications(toc)}
+{_render_visualizations(context_value, risks, toc)}
 {render_agentic_audit()}
 
 {_heading(2, "Assessment execution", toc, anchor="execution")}
@@ -1452,7 +1671,11 @@ def _render_html(payload: dict[str, Any], *, for_pdf: bool = False) -> str:
 <p class="section-note">These rows are not scanner failures. They identify security classes that could not be fully validated with the supplied identities, traffic and request contracts.</p>
 <table><thead><tr><th>Area</th><th>Reason</th><th>Recommended next step</th></tr></thead><tbody>{constraint_rows}</tbody></table>
 
+{_render_chaining_potential(payload["findings"], toc)}
+
 {''.join(render_finding_section(category) for category in ("vulnerability", "candidate", "observation", "discovery"))}
+
+{_render_cleanup(payload["findings"], toc)}
 
 {_render_conclusion(summary, payload["findings"], toc)}
 """
@@ -1514,8 +1737,17 @@ details{{margin-top:14px}}.section-note{{background:#eaf1f7;border-left:4px soli
 ol li::marker{{font-weight:bold;}}
 .field-label{{font-weight:700;margin:14px 0 6px;color:#173b5e}}
 .cover{{break-after:page;min-height:250mm;display:flex;flex-direction:column;justify-content:space-between;background:white;border:1px solid #d7dee5;border-radius:10px;padding:40px;margin:0 0 12px}}
-.cover-classification{{align-self:flex-end;background:#8a1f1f;color:white;font-weight:700;letter-spacing:.08em;text-transform:uppercase;font-size:.85rem;padding:6px 14px;border-radius:4px}}
+.cover-badges{{align-self:flex-end;display:flex;flex-direction:column;align-items:flex-end;gap:8px}}
+.cover-classification{{background:#8a1f1f;color:white;font-weight:700;letter-spacing:.08em;text-transform:uppercase;font-size:.85rem;padding:6px 14px;border-radius:4px}}
+.cover-risk-badge{{color:white;font-weight:700;letter-spacing:.05em;text-transform:uppercase;font-size:.85rem;padding:6px 14px;border-radius:4px}}
+.cover-badges div{{margin-bottom:2px}}
 .cover-body{{margin-top:70px}}
+.risk-banner{{display:flex;align-items:center;gap:16px;background:white;border:1px solid #d7dee5;border-left:10px solid #4b86b4;border-radius:10px;padding:16px 20px;margin:12px 0}}
+.risk-banner-label{{color:white;font-weight:800;font-size:1.3rem;padding:8px 18px;border-radius:8px;letter-spacing:.04em;white-space:nowrap}}
+.flow{{display:flex;flex-wrap:wrap;align-items:center;gap:8px;margin:14px 0}}
+.flow-step{{background:#24476b;color:#fff;padding:8px 14px;border-radius:8px;font-size:.82rem;white-space:nowrap}}
+.flow-arrow{{color:#4b86b4;font-weight:700;font-size:1.1rem}}
+.flow span{{margin-bottom:2px}}
 .cover-kicker{{color:#4b86b4;font-weight:700;letter-spacing:.12em;text-transform:uppercase;font-size:.95rem;margin-bottom:14px}}
 .cover-title{{font-size:2.6rem;line-height:1.15;margin:0 0 14px;max-width:80%}}
 .cover-subtitle{{font-size:1.3rem;color:#4f6273;font-weight:600}}
@@ -1583,6 +1815,7 @@ def generate_report(
     coverage = build_coverage(results, context)
     summary = summarize(results, all_findings, coverage, context)
     summary["omitted_human_readable_detail"] = omitted_detail
+
     payload = {
         "generated_at": datetime.now(timezone.utc),
         "target": target_url,
