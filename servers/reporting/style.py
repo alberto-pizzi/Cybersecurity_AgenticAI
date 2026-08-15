@@ -4,7 +4,7 @@ changes never require touching the HTML assembly in html_report.py.
 
 from __future__ import annotations
 
-
+# Returns the report's full embedded stylesheet as a CSS string
 def report_css() -> str:
     return """
 @page {

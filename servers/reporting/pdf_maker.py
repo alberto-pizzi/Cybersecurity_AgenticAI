@@ -13,7 +13,7 @@ from pathlib import Path
 
 from utils import ROOT_DIR
 
-
+# Converts an HTML report to PDF via native WeasyPrint, falling back to the report Docker image
 def html2pdf(html_path, pdf_path):
     html_path = Path(html_path).resolve()
     pdf_path = Path(pdf_path).resolve()

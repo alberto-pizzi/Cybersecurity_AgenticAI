@@ -18,18 +18,18 @@ from .findings import _finding_family
 from .text_utils import _esc
 from .toc import _heading
 
-# Schematic data summary of long json
+# Renders a schematic summary of the assessment context (run config, limits, discovery)
 def _context_summary_html(context: dict[str, Any], toc: list[tuple[int, str, str]]) -> str:
-
     if not isinstance(context, dict) or not context:
         return "<p>No assessment context was supplied.</p>"
 
+    # Renders a list of label/value pairs as a <dl>
     def dl(rows: list[tuple[str, str]]) -> str:
         return "<dl>" + "".join(f"<dt>{_esc(l)}</dt><dd>{v}</dd>" for l, v in rows) + "</dl>"
 
     parts: list[str] = []
 
-    # --- Run configuration --------------------------------------------
+    # Run configuration
     run_rows: list[tuple[str, str]] = []
     if context.get("scan_mode"):
         run_rows.append(("Scan mode", _esc(context["scan_mode"])))
@@ -51,7 +51,7 @@ def _context_summary_html(context: dict[str, Any], toc: list[tuple[int, str, str
     if run_rows:
         parts.append(_heading(3, "Run configuration", toc) + dl(run_rows))
 
-    # --- Configured limits and timeouts --------------------------------
+    # Configured limits and timeouts
     limit_rows: list[tuple[str, str]] = []
     if context.get("parameter_endpoint_limit") is not None:
         limit_rows.append(("Endpoints tested per parameter-driven tool", _esc(context["parameter_endpoint_limit"])))
@@ -67,7 +67,7 @@ def _context_summary_html(context: dict[str, Any], toc: list[tuple[int, str, str
     if limit_rows:
         parts.append(_heading(3, "Configured limits", toc) + dl(limit_rows))
 
-    # --- Per-profile discovery summary ---------------------------------
+    # Per-profile discovery summary
     profiles_meta = {
         str(row.get("name")): row
         for row in (context.get("profiles") or [])
@@ -127,12 +127,7 @@ def _context_summary_html(context: dict[str, Any], toc: list[tuple[int, str, str
 
 
 def _render_document_control(payload: dict[str, Any], generated_display: str) -> str:
-    """Report-identity front matter (who prepared it, with what tooling, under
-    what reference/version). Mirrors the "Document Control" block and the
-    tester-identity fields industry report templates and evaluation
-    checklists (e.g. the PCI DSS Penetration Testing Guidance report
-    evaluation tool) expect readers to be able to find at a glance.
-    """
+    """Renders the "Document control" front-matter section (report identity/versioning)."""
     rows: list[tuple[str, str]] = [
         ("Document reference", _esc(payload.get("report_id") or "n/a")),
         ("Engagement report version", _esc(payload.get("report_version") or "n/a")),
@@ -152,12 +147,7 @@ def _render_document_control(payload: dict[str, Any], generated_display: str) ->
 
 
 def _render_priority_actions(findings: list[dict[str, Any]], toc: list[tuple[int, str, str]]) -> str:
-    """Actionable remediation shortlist, drawn only from confirmed
-    vulnerabilities/candidates that actually carry a scanner-supplied
-    remediation ('solution'). Order follows the incoming list, which
-    flatten_findings already sorts vulnerability-before-candidate and by
-    descending risk, so the shortlist is priority-ordered for free.
-    """
+    """Renders a priority-ordered shortlist of findings that carry remediation guidance."""
     seen: set[tuple[str, str]] = set()
     items: list[str] = []
     for item in findings:
@@ -172,6 +162,7 @@ def _render_priority_actions(findings: list[dict[str, Any]], toc: list[tuple[int
             f"<li><b>[{_esc(item['risk']).upper()}] {_esc(item['alert'])}</b>{target}"
             f"<br>{_esc(item['solution'])}</li>"
         )
+        # TODO this limit is ok?
         if len(items) >= 10:
             break
     if not items:
@@ -187,10 +178,7 @@ def _render_priority_actions(findings: list[dict[str, Any]], toc: list[tuple[int
 
 
 def _render_disclaimer(client_display: str, assessment_dates: str) -> str:
-    """Confidentiality / legal-notice front matter, standard on professional
-    pentest reports. Engagement-specific values (client, target, dates) are
-    interpolated; the surrounding text is fixed boilerplate.
-    """
+    """Renders the confidentiality/legal-disclaimer front-matter section."""
     return (
         '<section class="disclaimer">'
         "<h2>Confidentiality and disclaimer</h2>"
@@ -211,6 +199,7 @@ def _render_disclaimer(client_display: str, assessment_dates: str) -> str:
     )
 
 
+# Renders the "Risk rating methodology" severity-definitions table
 def _render_severity_legend(toc: list[tuple[int, str, str]]) -> str:
     heading = _heading(2, "Risk rating methodology", toc, anchor="risk-rating")
     rows = "".join(
@@ -232,6 +221,7 @@ def _render_severity_legend(toc: list[tuple[int, str, str]]) -> str:
 
 
 def _render_methodology(toc: list[tuple[int, str, str]]) -> str:
+    """Renders the "Methodology" section listing the assessment's staged phases."""
     heading = _heading(2, "Methodology", toc, anchor="methodology")
     phase_items = "".join(
         f"<li><b>{_esc(name)}</b> — {_esc(desc)}</li>" for name, desc in METHODOLOGY_PHASES
@@ -245,7 +235,7 @@ def _render_methodology(toc: list[tuple[int, str, str]]) -> str:
         f"<ol>{phase_items}</ol>"
     )
 
-
+# Renders the closing "Conclusion and recommendations" section
 def _render_conclusion(summary: dict[str, Any], findings: list[dict[str, Any]], toc: list[tuple[int, str, str]]) -> str:
     risks = summary.get("risk_counts", {})
     confirmed = sum(item["category"] == "vulnerability" for item in findings)
@@ -283,12 +273,8 @@ def _render_conclusion(summary: dict[str, Any], findings: list[dict[str, Any]], 
         f"<ol>{''.join(f'<li>{_esc(step)}</li>' for step in next_steps)}</ol>"
     )
 
-
+# Derives the single top-line risk verdict from confirmed vulnerabilities and candidates
 def _overall_risk_rating(findings: list[dict[str, Any]]) -> tuple[str, str, str]:
-    """Single top-line verdict for management, derived only from confirmed
-    vulnerabilities (primary signal) and candidates (secondary signal) -
-    never from observations/discovery, which carry no confirmed risk.
-    """
     confirmed = Counter(item["risk"] for item in findings if item.get("category") == "vulnerability")
     candidates = Counter(item["risk"] for item in findings if item.get("category") == "candidate")
     if confirmed.get("critical"):
@@ -301,7 +287,7 @@ def _overall_risk_rating(findings: list[dict[str, Any]]) -> tuple[str, str, str]
         return ("LOW", "#b49b00", "Only low-severity confirmed findings and/or lower-impact candidates requiring manual validation were found.")
     return ("INFORMATIONAL", "#4b86b4", "No confirmed vulnerability or candidate requiring manual validation was found within the tested scope and constraints described in this report.")
 
-
+# Renders the top-line overall-risk-rating banner
 def _render_overall_risk_banner(rating: str, color: str, explanation: str, toc: list[tuple[int, str, str]]) -> str:
     heading = _heading(2, "Overall risk rating", toc, anchor="overall-risk")
     return (
@@ -312,7 +298,7 @@ def _render_overall_risk_banner(rating: str, color: str, explanation: str, toc: 
         "</div>"
     )
 
-
+# Renders the "Assessment visualizations" section (pipeline diagram + severity chart)
 def _render_visualizations(context_value: dict[str, Any], risks: dict[str, int], toc: list[tuple[int, str, str]]) -> str:
     orchestration = context_value.get("orchestration") if isinstance(context_value, dict) else {}
     nodes = orchestration.get("nodes") if isinstance(orchestration, dict) else None
@@ -327,16 +313,8 @@ def _render_visualizations(context_value: dict[str, Any], risks: dict[str, int],
     parts.append(f'<div class="card">{_svg_severity_chart(risks)}</div>')
     return "".join(parts)
 
-
+# Flags hosts carrying more than one distinct finding as manual exploitation-chaining candidates
 def _render_chaining_potential(findings: list[dict[str, Any]], toc: list[tuple[int, str, str]]) -> str:
-    """Surfaces hosts/endpoints carrying more than one distinct confirmed or
-    candidate finding - the real-world precondition for an attacker to chain
-    vulnerabilities together. This platform verifies each finding
-    independently and does not attempt automated exploitation chaining, so
-    this section deliberately stops short of claiming a verified attack
-    path (that would violate the scanner-grounded reporting policy); it
-    flags concentration points for a human tester to chain manually.
-    """
     by_host: dict[str, list[dict[str, Any]]] = {}
     for item in findings:
         if item.get("category") not in {"vulnerability", "candidate"}:
@@ -368,7 +346,7 @@ def _render_chaining_potential(findings: list[dict[str, Any]], toc: list[tuple[i
     )
     return f"{heading}{intro}<ul>{items_html}</ul>"
 
-
+# Returns a cleanup instruction for a finding that left a probe artifact, or None
 def _artifact_cleanup_hint(row: dict[str, Any]) -> str | None:
     verification = str(row.get("verification_status") or "").lower()
     alert = str(row.get("alert") or "").lower()
@@ -390,7 +368,7 @@ def _artifact_cleanup_hint(row: dict[str, Any]) -> str | None:
         )
     return None
 
-
+# Renders the "Post-assessment cleanup" section listing artifacts to remove
 def _render_cleanup(findings: list[dict[str, Any]], toc: list[tuple[int, str, str]]) -> str:
     heading = _heading(2, "Post-assessment cleanup", toc, anchor="cleanup")
     intro = (
@@ -421,7 +399,7 @@ def _render_cleanup(findings: list[dict[str, Any]], toc: list[tuple[int, str, st
     )
     return f"{heading}{intro}<ol>{items_html}</ol>"
 
-
+# Renders the "Assessor and platform qualifications" section
 def _render_qualifications(toc: list[tuple[int, str, str]]) -> str:
     heading = _heading(2, "Assessor and platform qualifications", toc, anchor="qualifications")
     tool_list = ", ".join(sorted(TOOL_PURPOSES))
@@ -443,7 +421,7 @@ def _render_qualifications(toc: list[tuple[int, str, str]]) -> str:
         "qualified human penetration tester before being treated as conclusive.</p>"
     )
 
-
+# Renders the report's cover page (title, classification/risk badges, engagement meta)
 def _render_cover(
     payload: dict[str, Any],
     *,
@@ -465,10 +443,7 @@ def _render_cover(
         ("Report issue date", generated_display),
         ("Report version / ID", _esc(f"{report_version} / {report_id}")),
     ]
-    # NOTE: cover-badges is positioned via `position:absolute` (see the report
-    # stylesheet), deliberately out of the `.cover` flex flow — WeasyPrint's
-    # flexbox support is unreliable for `align-self` on a nested flex item, so
-    # it is removed from flex layout entirely rather than patched.
+    # cover-badges is deliberately position:absolute (WeasyPrint flexbox align-self is unreliable).
     return (
         '<section class="cover">'
         '<div class="cover-badges">'
@@ -486,7 +461,7 @@ def _render_cover(
         "</section>"
     )
 
-
+# Renders the "Executive summary" section: narrative plus the risk-count stat grid
 def _render_executive_summary(payload: dict[str, Any], summary: dict[str, Any], toc: list[tuple[int, str, str]]) -> str:
     risks = summary["risk_counts"]
     heading = _heading(2, "Executive summary", toc, anchor="executive")
@@ -502,7 +477,7 @@ def _render_executive_summary(payload: dict[str, Any], summary: dict[str, Any], 
         "</div></div>"
     )
 
-
+# Renders a note about omitted repetitive detail, or "" if nothing was omitted
 def _render_detail_cap_note(omitted: dict[str, int]) -> str:
     if not any(omitted.values()):
         return ""
@@ -514,7 +489,7 @@ def _render_detail_cap_note(omitted: dict[str, int]) -> str:
         "</p>"
     )
 
-
+# Renders the "Scope and assessment context" section, with a raw JSON dump outside PDF mode
 def _render_scope_section(context_value: dict[str, Any], toc: list[tuple[int, str, str]], *, for_pdf: bool) -> str:
     heading = _heading(2, "Scope and assessment context", toc, anchor="scope")
     context_summary = _context_summary_html(context_value, toc)
@@ -530,7 +505,7 @@ def _render_scope_section(context_value: dict[str, Any], toc: list[tuple[int, st
         pdf_note = ""
     return f"{heading}{context_summary}{json_block}{pdf_note}"
 
-
+# Renders the "Agentic planning audit" section from planner-round data, or "" if none
 def _render_agentic_audit(context_value: dict[str, Any], toc: list[tuple[int, str, str]]) -> str:
     planner_audit = context_value.get("planner_audit", []) if isinstance(context_value, dict) else []
     audit_rows = ""

@@ -9,16 +9,8 @@ from typing import Any
 
 from .text_utils import _esc
 
-
+# Renders the executed orchestration phases as an arrow-connected step flow
 def _render_pipeline_diagram(nodes: list[Any]) -> str:
-    """Assessment phase flow, built only from the orchestration node order
-    actually recorded in the assessment context - not a generic diagram.
-
-    Each item bundles its leading arrow (if any) and its step pill inside a
-    single `.flow-item` wrapper, so the two can never be split onto
-    different lines when the row wraps - only whole items wrap, never an
-    arrow away from the step it points to.
-    """
     labels = [str(node).strip() for node in (nodes or []) if str(node).strip()]
     if not labels:
         return ""
@@ -28,12 +20,8 @@ def _render_pipeline_diagram(nodes: list[Any]) -> str:
         items.append(f'<span class="flow-item">{arrow}<span class="flow-step">{_esc(label)}</span></span>')
     return f'<div class="flow">{"".join(items)}</div>'
 
-
+# Renders a hand-built inline-SVG horizontal bar chart of findings by severity
 def _svg_severity_chart(risks: dict[str, int]) -> str:
-    """Horizontal bar chart of findings-by-severity, hand-built as inline
-    SVG (no external plotting library, no network fetch) so it renders
-    identically in-browser and through WeasyPrint's PDF pipeline.
-    """
     levels = (
         ("Critical", "critical", "#7a0000"),
         ("High", "high", "#a90000"),

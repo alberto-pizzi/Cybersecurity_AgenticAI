@@ -49,10 +49,7 @@ SECRET_PATTERNS = (
     (re.compile(r"eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]*"), "<redacted-jwt>"),
 )
 
-# Static, engagement-independent boilerplate for the professional-report
-# front matter (risk-rating legend and methodology narrative). These do not
-# describe any specific target or finding, so they carry no risk of
-# contradicting the scanner-grounded reporting policy above.
+# Static front-matter boilerplate (risk-rating legend and methodology narrative).
 SEVERITY_DEFINITIONS = [
     ("Critical", "#a90000", "Immediate, severe threat to confidentiality, integrity or availability that is trivial to exploit (e.g. unauthenticated remote code execution, full data-store compromise). Requires emergency remediation, typically within 24-48 hours."),
     ("High", "#a90000", "Significant security impact that is straightforward to exploit or that undermines a core security control (e.g. confirmed SQL injection, authentication bypass). Requires urgent remediation, typically within one to two weeks."),

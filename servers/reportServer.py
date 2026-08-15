@@ -13,7 +13,7 @@ from utils import REPORTS_DIR, failure, run_mcp_http, success
 from reporting.coverage import _executive_text, build_coverage, summarize
 from reporting.findings import _finding_groups, _human_readable_findings, flatten_findings
 from reporting.html_report import _render_html
-from reporting.pdf import html2pdf
+from reporting.pdf_maker import html2pdf
 from reporting.text_utils import _as_dict, _redact_value, _safe_name
 
 

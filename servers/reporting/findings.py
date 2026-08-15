@@ -11,7 +11,7 @@ from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 from .constants import AUTO_INDEX_QUERY_KEYS, RISK_ORDER
 from .text_utils import _redact_text, _redact_value
 
-
+# Walks the nested results tree, yielding each leaf (or run) result with its path
 def _iter_leaf_results(value: Any, path: tuple[str, ...] = ()) -> Iterator[tuple[tuple[str, ...], dict[str, Any]]]:
     if isinstance(value, dict) and "status" in value:
         runs = value.get("runs")
@@ -26,20 +26,20 @@ def _iter_leaf_results(value: Any, path: tuple[str, ...] = ()) -> Iterator[tuple
         for key, child in value.items():
             yield from _iter_leaf_results(child, (*path, str(key)))
 
-
+# Resolves a finding's category, defaulting by risk when not explicit
 def _category(finding: dict[str, Any]) -> str:
     explicit = str(finding.get("category") or "").lower()
     if explicit in {"vulnerability", "candidate", "discovery", "observation"}:
         return explicit
     return "observation" if str(finding.get("risk") or "info").lower() == "info" else "candidate"
 
-
+# Extracts and deduplicates a finding's reference URLs/citations
 def _references(raw: dict[str, Any]) -> list[str]:
     value = raw.get("references") or raw.get("reference") or []
     values = value if isinstance(value, list) else [value]
     return list(dict.fromkeys(_redact_text(item).strip() for item in values if str(item).strip()))
 
-
+# Builds the "Identifiers" list (CWE, CVE, CVSS, template/plugin IDs) for a finding
 def _identifier_lines(raw: dict[str, Any]) -> list[str]:
     values: list[str] = []
     for key, label in (
@@ -60,7 +60,7 @@ def _identifier_lines(raw: dict[str, Any]) -> list[str]:
             values.append(f"{label}: {', '.join(_redact_text(item) for item in items)}")
     return list(dict.fromkeys(values))
 
-
+# Returns the scanner-supplied verification status, or a category-based default
 def _verification_status(raw: dict[str, Any], category: str) -> str:
     explicit = str(raw.get("verification_status") or "").strip()
     if explicit:
@@ -72,7 +72,7 @@ def _verification_status(raw: dict[str, Any], category: str) -> str:
         "observation": "observation",
     }.get(category, "unspecified")
 
-
+# Converts one raw scanner finding into the report's normalized finding schema
 def _normalize_finding(raw: dict[str, Any], profile: str, tool: str) -> dict[str, Any]:
     risk = str(raw.get("risk") or "info").lower()
     category = _category(raw)
@@ -145,7 +145,7 @@ def _normalize_finding(raw: dict[str, Any], profile: str, tool: str) -> dict[str
         "scanner_fields": preserved,
     }
 
-
+# Normalizes a URL (scheme/host case, trailing slash, auto-index query args) for comparison
 def _canonical_finding_url(value: str) -> str:
     parsed = urlparse(str(value or ""))
     pairs = parse_qsl(parsed.query, keep_blank_values=True)
@@ -155,14 +155,8 @@ def _canonical_finding_url(value: str) -> str:
         path = path.rstrip("/")
     return urlunparse((parsed.scheme.lower(), parsed.netloc.lower(), path, "", query, ""))
 
-
+# Normalizes a finding URL by route and parameter names, ignoring test values, for dedup matching
 def _finding_route_key(value: str) -> str:
-    """Normalize a finding URL by route and parameter names, not test values.
-
-    Corroborating scanners often use different payload values for the same
-    endpoint/parameter.  Using the raw query string made those confirmations
-    appear as separate vulnerabilities (and also split repeated LFI examples).
-    """
     parsed = urlparse(str(value or ""))
     pairs = parse_qsl(parsed.query, keep_blank_values=True)
     names = sorted({name.lower() for name, _ in pairs if name})
@@ -175,7 +169,7 @@ def _finding_route_key(value: str) -> str:
         path = path.rstrip("/")
     return urlunparse((parsed.scheme.lower(), parsed.netloc.lower(), path, "", query, ""))
 
-
+# Classifies a finding into a coarse vulnerability family for dedup/chaining grouping
 def _finding_family(row: dict[str, Any]) -> str:
     alert = str(row.get("alert") or "").lower()
     verification = str(row.get("verification_status") or "").lower()
@@ -216,13 +210,13 @@ def _finding_family(row: dict[str, Any]) -> str:
     normalized = re.sub(r"\s+in parameter ['\"][^'\"]+['\"]$", "", alert)
     return normalized
 
-
+# Scores a finding row so the strongest corroborating duplicate wins a merge
 def _finding_strength(row: dict[str, Any]) -> tuple[int, int, int, int]:
     category_score = {"vulnerability": 3, "candidate": 2, "observation": 1, "discovery": 0}.get(str(row.get("category") or ""), 0)
     confidence_score = {"high": 3, "medium": 2, "low": 1}.get(str(row.get("confidence") or "").lower(), 0)
     return (category_score, RISK_ORDER.get(str(row.get("risk") or "info"), 0), confidence_score, len(str(row.get("evidence") or "")))
 
-
+# Merges a corroborating duplicate finding into the existing row in place
 def _merge_finding_rows(existing: dict[str, Any], row: dict[str, Any], profile: str, tool: str) -> None:
     profiles = existing.setdefault("profiles", [])
     if profile not in profiles:
@@ -309,7 +303,7 @@ def flatten_findings(results: dict[str, Any]) -> list[dict[str, Any]]:
         reverse=True,
     )
 
-
+# Splits a findings list into per-category lists (vulnerability/candidate/observation/discovery)
 def _finding_groups(findings: list[dict[str, Any]]) -> dict[str, list[dict[str, Any]]]:
     return {
         "vulnerability": [item for item in findings if item.get("category") == "vulnerability"],
@@ -318,9 +312,8 @@ def _finding_groups(findings: list[dict[str, Any]]) -> dict[str, list[dict[str, 
         "discovery": [item for item in findings if item.get("category") == "discovery"],
     }
 
-
+# Bound HTML-only structured detail while preserving complete JSON data.
 def _truncate_human_value(value: Any, *, string_limit: int = 1400, list_limit: int = 25) -> Any:
-    """Bound HTML-only structured detail while preserving complete JSON data."""
     if isinstance(value, dict):
         return {
             str(key): _truncate_human_value(child, string_limit=string_limit, list_limit=list_limit)

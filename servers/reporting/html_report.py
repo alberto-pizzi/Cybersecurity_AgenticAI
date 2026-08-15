@@ -1,11 +1,5 @@
-"""Assembles the full HTML report from a generated report payload.
-
-This module intentionally contains no section-specific markup of its own:
-it derives the handful of cover/disclaimer facts that are shared across
-sections, then stitches the document together purely by calling the
-rendering functions defined elsewhere in this package, in the order they
-should appear. Each call registers its own heading(s) into `toc`, so the
-table of contents follows document order automatically (see toc.py).
+"""Assembles the full HTML report by calling the rendering functions
+defined elsewhere in this package, in document order.
 """
 
 from __future__ import annotations
@@ -14,7 +8,7 @@ from datetime import datetime
 from typing import Any
 
 from .coverage import _render_constraints, _render_execution, _render_limitations
-from .css import report_css
+from .style import report_css
 from .finding_cards import _render_findings, _render_glance
 from .findings import _finding_groups
 from .sections import (
@@ -39,7 +33,7 @@ from .sections import (
 from .text_utils import _esc, _format_date_en, _redact_value
 from .toc import _render_toc
 
-
+# Renders the complete report as an HTML document string
 def _render_html(payload: dict[str, Any], *, for_pdf: bool = False) -> str:
     summary = payload["summary"]
     risks = summary["risk_counts"]
@@ -49,7 +43,7 @@ def _render_html(payload: dict[str, Any], *, for_pdf: bool = False) -> str:
 
     toc: list[tuple[int, str, str]] = []
 
-    # --- Facts shared between the cover page and the disclaimer ---------
+    # Facts shared between the cover page and the disclaimer
     generated_at = payload.get("generated_at")
     generated_display = _format_date_en(generated_at) if isinstance(generated_at, datetime) else _esc(generated_at)
 
@@ -79,11 +73,7 @@ def _render_html(payload: dict[str, Any], *, for_pdf: bool = False) -> str:
     doc_control_html = _render_document_control(payload, generated_display)
     disclaimer_html = _render_disclaimer(client_display, assessment_dates)
 
-    # Phase 1: render the body. Every rendering call below fires in the exact
-    # order it's written here, appending to `toc` as it goes - this is what
-    # makes the index "automatic": you don't edit a separate list, you just
-    # write (or move) a section call and the index follows (LaTeX-style, see
-    # toc.py).
+    # Each call below appends its heading(s) into `toc` as it renders.
     body_html = f"""
 {_render_executive_summary(payload, summary, toc)}
 
@@ -113,10 +103,7 @@ def _render_html(payload: dict[str, Any], *, for_pdf: bool = False) -> str:
 
 {_render_conclusion(summary, payload["findings"], toc)}
 """
-    # toc[] is now fully populated -> Phase 2: render the index from it.
-    # (Same reason LaTeX needs two compilation passes: the ToC appears
-    # before the content it points to, so it can only be built after that
-    # content has already been rendered once.)
+    # toc is now fully populated - render the index from it.
     toc_html = _render_toc(toc)
 
     return f"""<!doctype html><html><head><meta charset="utf-8"><title>SecOps Assessment Report</title>

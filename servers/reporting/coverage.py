@@ -13,7 +13,7 @@ from .findings import _category, _iter_leaf_results
 from .text_utils import _esc, _redact_text
 from .toc import _heading
 
-
+# Reclassifies a raw tool result's status, catching disguised failures/timeouts
 def _effective_status(result: dict[str, Any]) -> tuple[str, str]:
     status = str(result.get("status") or "unknown").lower()
     diagnosis = str(result.get("diagnosis") or "").lower()
@@ -33,7 +33,7 @@ def _effective_status(result: dict[str, Any]) -> tuple[str, str]:
         return "error", "Result claimed success, but process output contains a launcher or dependency failure."
     return status, ""
 
-
+# Computes a tool result's total duration in seconds, summing sub-runs
 def _duration(result: dict[str, Any]) -> float:
     if isinstance(result.get("runs"), list):
         return sum(_duration(run) for run in result["runs"] if isinstance(run, dict))
@@ -44,7 +44,7 @@ def _duration(result: dict[str, Any]) -> float:
     except (TypeError, ValueError):
         return 0.0
 
-
+# Finds and consolidates a tool's result(s) into a single result dict
 def _tool_result(tools: dict[str, Any], tool: str) -> dict[str, Any] | None:
     exact = tools.get(tool)
     if isinstance(exact, dict):
@@ -73,7 +73,7 @@ def _tool_result(tools: dict[str, Any], tool: str) -> dict[str, Any] | None:
         "runs": matches,
     }
 
-
+# Builds the per-profile/per-tool coverage table from raw scan results
 def build_coverage(results: dict[str, Any], context: dict[str, Any]) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     expected = context.get("expected_tools") if isinstance(context.get("expected_tools"), list) else list(TOOL_PURPOSES)
@@ -118,21 +118,13 @@ def build_coverage(results: dict[str, Any], context: dict[str, Any]) -> list[dic
             })
     return rows
 
-
+# Flags meaningful untested classes (e.g. BOLA without a second identity), separate from scanner failures
 def _coverage_constraints(
     results: dict[str, Any],
     findings: list[dict[str, Any]],
     coverage: list[dict[str, Any]],
     context: dict[str, Any],
 ) -> list[dict[str, str]]:
-    """Describe meaningful untested classes separately from scanner failures.
-
-    A successful or deliberately skipped tool run can still leave a class of
-    behaviour unverified (for example, BOLA without a second identity).  These
-    rows must not be mixed with execution errors, but they should be visible in
-    PDF/HTML/JSON so that a clean execution summary is not mistaken for total
-    security coverage.
-    """
     constraints: list[dict[str, str]] = []
 
     def add(area: str, reason: str, next_step: str) -> None:
@@ -219,7 +211,7 @@ def _coverage_constraints(
 
     return constraints
 
-
+# Aggregates risk counts, execution limitations and coverage constraints into the report summary
 def summarize(results: dict[str, Any], findings: list[dict[str, Any]], coverage: list[dict[str, Any]], context: dict[str, Any]) -> dict[str, Any]:
     limitations: list[dict[str, Any]] = []
     for path, result in _iter_leaf_results(results):
@@ -246,7 +238,7 @@ def summarize(results: dict[str, Any], findings: list[dict[str, Any]], coverage:
         "discovery": discovery,
     }
 
-
+# Writes the executive-summary paragraph from finding/limitation/constraint counts
 def _executive_text(summary: dict[str, Any], findings: list[dict[str, Any]]) -> str:
     confirmed = sum(item["category"] == "vulnerability" for item in findings)
     candidates = sum(item["category"] == "candidate" for item in findings)
@@ -259,7 +251,7 @@ def _executive_text(summary: dict[str, Any], findings: list[dict[str, Any]]) -> 
         "The report preserves scanner evidence and metadata; it does not invent unsupported exploitability claims. Confirmed findings include the exact tested parameter, bounded payload, response evidence, impact, remediation and reproduction steps when supplied by the scanner. Repetitive informational details may be summarized in PDF/HTML while the complete normalized set remains in JSON."
     )
 
-
+# Renders the "Assessment execution" section: the coverage table plus per-row execution details
 def _render_execution(coverage: list[dict[str, Any]], toc: list[tuple[int, str, str]]) -> str:
     heading = _heading(2, "Assessment execution", toc, anchor="execution")
     rows = "".join(
@@ -288,7 +280,7 @@ def _render_execution(coverage: list[dict[str, Any]], toc: list[tuple[int, str, 
         f'{details_heading}<p class="section-note">Raw execution output per row, numbered to match the table above.</p>{details_html}'
     )
 
-
+# Renders the "Execution limitations" table section
 def _render_limitations(summary: dict[str, Any], toc: list[tuple[int, str, str]]) -> str:
     heading = _heading(2, "Execution limitations", toc, anchor="limitations")
     rows = "".join(
@@ -301,7 +293,7 @@ def _render_limitations(summary: dict[str, Any], toc: list[tuple[int, str, str]]
         f"<tbody>{rows}</tbody></table>"
     )
 
-
+# Renders the "Coverage constraints and untested classes" table section
 def _render_constraints(summary: dict[str, Any], toc: list[tuple[int, str, str]]) -> str:
     heading = _heading(2, "Coverage constraints and untested classes", toc, anchor="constraints")
     rows = "".join(

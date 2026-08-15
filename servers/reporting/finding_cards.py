@@ -12,7 +12,7 @@ from .fields import _field, _render_list, _snippet_field
 from .text_utils import _esc
 from .toc import _heading
 
-
+# Renders a single finding as its full <article> card (fields, snippets, references)
 def _finding_card(item: dict[str, Any], index: int, toc: list[tuple[int, str, str]]) -> str:
     notes = item.get("data_quality_notes") or []
     heading = _heading(
@@ -53,12 +53,8 @@ def _finding_card(item: dict[str, Any], index: int, toc: list[tuple[int, str, st
 {('<div class="quality"><b>Data-quality notes</b>' + _render_list(notes) + '</div>') if notes else ''}
 </article>"""
 
-
+# Renders the four finding-category sections in order, with globally numbered cards
 def _render_findings(groups: dict[str, list[dict[str, Any]]], toc: list[tuple[int, str, str]]) -> str:
-    """Renders the four finding-category sections in order (vulnerability,
-    candidate, observation, discovery), each with its own heading, note and
-    cards - findings are numbered globally across categories.
-    """
     global_index = 1
     sections: list[str] = []
     for category in ("vulnerability", "candidate", "observation", "discovery"):
@@ -68,9 +64,6 @@ def _render_findings(groups: dict[str, list[dict[str, Any]]], toc: list[tuple[in
             for index, item in enumerate(items, start=global_index)
         )
         global_index += len(items)
-        # Registers its own <h2> into `toc` at render time, so it lands in
-        # the index exactly where it's written here - after chaining potential,
-        # before cleanup.
         title, explanation = FINDING_SECTION_META[category]
         heading = _heading(
             2, title, toc,
@@ -81,7 +74,7 @@ def _render_findings(groups: dict[str, list[dict[str, Any]]], toc: list[tuple[in
         sections.append(f'<section>{heading}<p class="section-note">{_esc(explanation)}</p>{body}</section>')
     return "".join(sections)
 
-
+# Renders the "Security findings at a glance" summary table
 def _render_glance(findings: list[dict[str, Any]], toc: list[tuple[int, str, str]]) -> str:
     glance_items = [
         item for item in findings
