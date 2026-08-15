@@ -860,23 +860,30 @@ def _render_list(values: list[str]) -> str:
     return "" if not values else "<ul>" + "".join(f"<li>{_esc(value)}</li>" for value in values) + "</ul>"
 
 
+def _field(label: str, value: Any) -> str:
+    if value in (None, "", [], {}):
+        return ""
+    return f"<dt>{_esc(label)}</dt><dd>{_esc(value)}</dd>"
+
+
 _MAX_SNIPPET_CHARS = 3000
 
 
-def _field(label: str, value: Any, *, pre: bool = False) -> str:
+def _snippet_field(label: str, value: Any) -> str:
+    """Render a code/evidence snippet as its own full-width block (label stacked
+    above the <pre>), deliberately outside the `<dl>` grid. WeasyPrint's CSS Grid
+    support gets dramatically slower once spanning items are mixed into a grid
+    (see the flexbox note on .cover-badges below for the same class of issue), so
+    this uses plain block flow instead - the same pattern already used for the
+    Identifiers/References lists.
+    """
     if value in (None, "", [], {}):
         return ""
-    if pre:
-        # Evidence blocks are proof of a specific finding, not a dump of everything the
-        # scanner saw - cap them so one verbose response body doesn't bury the report.
-        text = _redact_text(value)
-        omitted = len(text) - _MAX_SNIPPET_CHARS
-        if omitted > 0:
-            text = f"{text[:_MAX_SNIPPET_CHARS]}\n… [{omitted} further characters omitted for readability]"
-        rendered = f"<pre>{html.escape(text)}</pre>"
-    else:
-        rendered = _esc(value)
-    return f"<dt>{_esc(label)}</dt><dd>{rendered}</dd>"
+    text = _redact_text(value)
+    omitted = len(text) - _MAX_SNIPPET_CHARS
+    if omitted > 0:
+        text = f"{text[:_MAX_SNIPPET_CHARS]}\n… [{omitted} further characters omitted for readability]"
+    return f'<p class="field-label">{_esc(label)}</p><pre>{html.escape(text)}</pre>'
 
 
 def _slugify(text: str, existing: set[str] = frozenset()) -> str:
@@ -1550,11 +1557,15 @@ def _render_html(payload: dict[str, Any], *, for_pdf: bool = False) -> str:
 {_field('Description', item.get('description'))}
 {_field('Why the evidence confirms or suggests the issue', item.get('technical_details'))}
 {_field('Attack preconditions', item.get('attack_preconditions'))}
-{_field('Payload / test input', item.get('payload') or '; '.join(item.get('payloads') or []), pre=True)}
-{_field('Evidence', item.get('evidence'), pre=True)}
+</dl>
+{_snippet_field('Payload / test input', item.get('payload') or '; '.join(item.get('payloads') or []))}
+{_snippet_field('Evidence', item.get('evidence'))}
+<dl>
 {_field('Security impact', item.get('impact'))}
 {_field('Recommended remediation', item.get('solution'))}
-{_field('Reproduction / validation steps', item.get('reproduction'), pre=True)}
+</dl>
+{_snippet_field('Reproduction / validation steps', item.get('reproduction'))}
+<dl>
 {_field('OWASP classification', item.get('owasp_category'))}
 </dl>
 {('<p class="field-label">Identifiers</p>' + _render_list(item.get('identifiers') or [])) if item.get('identifiers') else ''}
@@ -1738,7 +1749,7 @@ small{{color:#4f6273}}.finding{{border-left:7px solid #4b86b4}}
 .badges b{{display: inline-flex;align-items: stretch;overflow: hidden;border-radius: 12px;font-size: .82rem;font-weight: normal;box-shadow: 0 0 0 1px #d3dde5;margin: 5px}}
 .badges .cat{{background: #3b5b7a;color: #fff;font-weight: 600;padding: 4px 8px;text-transform: uppercase;letter-spacing: .03em;font-size: .72rem;display: flex;align-items: center;}}
 .badges .val {{background: #e8eef4;color: #1f2d3a;padding: 4px 8px;display: flex;align-items: center;}}
-dl{{display:grid;grid-template-columns:190px minmax(0,1fr);gap:8px 14px}}
+dl{{display:grid;grid-template-columns:190px minmax(0,1fr);gap:8px 14px;margin:0}}
 dt{{font-weight:700;overflow-wrap:anywhere;min-width:0}}
 dd{{margin:0;overflow-wrap:anywhere;word-break:break-word;min-width:0}}
 pre{{white-space:pre-wrap;overflow-wrap:anywhere;word-break:break-word;background:#101821;color:#e5edf5;padding:12px;border-radius:8px}}
