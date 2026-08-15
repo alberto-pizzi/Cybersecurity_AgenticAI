@@ -1132,7 +1132,8 @@ def _render_disclaimer(client_display: str, assessment_dates: str) -> str:
 def _render_severity_legend(toc: list[tuple[int, str, str]]) -> str:
     heading = _heading(2, "Risk rating methodology", toc, anchor="risk-rating")
     rows = "".join(
-        f'<tr><td class="no-wrap"><span class="legend-swatch" style="background:{color}"></span><b>{_esc(name)}</b></td>'
+        f'<tr><td><span class="rating-chip"><span class="legend-swatch" style="background:{color}"></span>'
+        f"<b>{_esc(name)}</b></span></td>"
         f"<td>{_esc(desc)}</td></tr>"
         for name, color, desc in SEVERITY_DEFINITIONS
     )
@@ -1142,7 +1143,8 @@ def _render_severity_legend(toc: list[tuple[int, str, str]]) -> str:
         "escalated to a confirmed vulnerability only when the tool-specific evidence rule described in "
         "“Methodology” is satisfied. The definitions below describe what each rating means for "
         "prioritization; they are not recalculated per finding.</p>"
-        f"<table><thead><tr><th>Rating</th><th>Definition and expected remediation priority</th></tr></thead>"
+        '<table class="rating-table"><colgroup><col class="rating-col"><col></colgroup>'
+        f"<thead><tr><th>Rating</th><th>Definition and expected remediation priority</th></tr></thead>"
         f"<tbody>{rows}</tbody></table>"
     )
 
@@ -1224,7 +1226,7 @@ def _render_overall_risk_banner(rating: str, color: str, explanation: str, toc: 
         f"{heading}"
         f'<div class="risk-banner" style="border-left-color:{color}">'
         f'<span class="risk-banner-label" style="background:{color}">{_esc(rating)}</span>'
-        f"<span>{_esc(explanation)}</span>"
+        f'<div class="risk-banner-text">{_esc(explanation)}</div>'
         "</div>"
     )
 
@@ -1502,6 +1504,10 @@ def _render_html(payload: dict[str, Any], *, for_pdf: bool = False) -> str:
         + "</table>"
         "</section>"
     )
+    # NOTE: cover-badges is positioned via `position:absolute` (see CSS below),
+    # deliberately out of the `.cover` flex flow — WeasyPrint's flexbox support
+    # is unreliable for `align-self` on a nested flex item, so it is removed
+    # from flex layout entirely rather than patched.
 
     def finding_card(item: dict[str, Any], index: int) -> str:
         notes = item.get("data_quality_notes") or []
@@ -1736,18 +1742,21 @@ details{{margin-top:14px}}.section-note{{background:#eaf1f7;border-left:4px soli
 .toc>ul>li>a{{font-weight:bold}}
 ol li::marker{{font-weight:bold;}}
 .field-label{{font-weight:700;margin:14px 0 6px;color:#173b5e}}
-.cover{{break-after:page;min-height:250mm;display:flex;flex-direction:column;justify-content:space-between;background:white;border:1px solid #d7dee5;border-radius:10px;padding:40px;margin:0 0 12px}}
-.cover-badges{{align-self:flex-end;display:flex;flex-direction:column;align-items:flex-end;gap:8px}}
-.cover-classification{{background:#8a1f1f;color:white;font-weight:700;letter-spacing:.08em;text-transform:uppercase;font-size:.85rem;padding:6px 14px;border-radius:4px}}
-.cover-risk-badge{{color:white;font-weight:700;letter-spacing:.05em;text-transform:uppercase;font-size:.85rem;padding:6px 14px;border-radius:4px}}
+.cover{{position:relative;break-after:page;min-height:250mm;display:flex;flex-direction:column;justify-content:space-between;background:white;border:1px solid #d7dee5;border-radius:10px;padding:40px;margin:0 0 12px}}
+.cover-badges{{position:absolute;top:0;right:0;display:flex;flex-direction:column;align-items:flex-end;gap:8px;max-width:60%}}
+.cover-classification{{background:#8a1f1f;color:white;font-weight:700;letter-spacing:.08em;text-transform:uppercase;font-size:.85rem;padding:6px 14px;border-radius:4px;white-space:nowrap}}
+.cover-risk-badge{{color:white;font-weight:700;letter-spacing:.05em;text-transform:uppercase;font-size:.85rem;padding:6px 14px;border-radius:4px;white-space:nowrap}}
 .cover-badges div{{margin-bottom:2px}}
 .cover-body{{margin-top:70px}}
 .risk-banner{{display:flex;align-items:center;gap:16px;background:white;border:1px solid #d7dee5;border-left:10px solid #4b86b4;border-radius:10px;padding:16px 20px;margin:12px 0}}
-.risk-banner-label{{color:white;font-weight:800;font-size:1.3rem;padding:8px 18px;border-radius:8px;letter-spacing:.04em;white-space:nowrap}}
-.flow{{display:flex;flex-wrap:wrap;align-items:center;gap:8px;margin:14px 0}}
-.flow-step{{background:#24476b;color:#fff;padding:8px 14px;border-radius:8px;font-size:.82rem;white-space:nowrap}}
-.flow-arrow{{color:#4b86b4;font-weight:700;font-size:1.1rem}}
-.flow span{{margin-bottom:2px}}
+.risk-banner-label{{flex:0 0 auto;color:white;font-weight:800;font-size:1.3rem;padding:8px 18px;border-radius:8px;letter-spacing:.04em;white-space:nowrap}}
+.risk-banner-text{{flex:1 1 auto;min-width:0}}
+.flow{{margin:14px 0;line-height:2.6}}
+.flow-step{{display:inline-block;vertical-align:middle;background:#24476b;color:#fff;padding:8px 14px;border-radius:8px;font-size:.82rem;white-space:nowrap;margin:0 6px 8px 0}}
+.flow-arrow{{display:inline-block;vertical-align:middle;color:#4b86b4;font-weight:700;font-size:1.1rem;margin:0 6px 8px 0}}
+.rating-table{{table-layout:fixed}}
+.rating-col{{width:150px}}
+.rating-chip{{display:inline-flex;align-items:center;gap:6px;white-space:nowrap}}
 .cover-kicker{{color:#4b86b4;font-weight:700;letter-spacing:.12em;text-transform:uppercase;font-size:.95rem;margin-bottom:14px}}
 .cover-title{{font-size:2.6rem;line-height:1.15;margin:0 0 14px;max-width:80%}}
 .cover-subtitle{{font-size:1.3rem;color:#4f6273;font-weight:600}}
@@ -1760,7 +1769,7 @@ ol li::marker{{font-weight:bold;}}
 .disclaimer{{background:#fff8f8;border:1px solid #e3b8b8;border-radius:10px;padding:28px 32px;margin:0 0 12px;break-after:page}}
 .disclaimer h2{{margin-top:0}}
 .disclaimer p{{line-height:1.55}}
-.legend-swatch{{display:inline-block;width:10px;height:10px;border-radius:2px;margin-right:6px}}
+.legend-swatch{{display:inline-block;flex:0 0 auto;width:10px;height:10px;border-radius:2px}}
 </style></head><body><main>
 {cover_html}
 {doc_control_html}
