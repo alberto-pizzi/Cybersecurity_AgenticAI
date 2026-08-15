@@ -1090,6 +1090,7 @@ def _render_priority_actions(findings: list[dict[str, Any]], toc: list[tuple[int
             f"<li><b>[{_esc(item['risk']).upper()}] {_esc(item['alert'])}</b>{target}"
             f"<br>{_esc(item['solution'])}</li>"
         )
+        # TODO this limit is ok?
         if len(items) >= 10:
             break
     if not items:
@@ -1234,16 +1235,20 @@ def _render_overall_risk_banner(rating: str, color: str, explanation: str, toc: 
 def _render_pipeline_diagram(nodes: list[Any]) -> str:
     """Assessment phase flow, built only from the orchestration node order
     actually recorded in the assessment context - not a generic diagram.
+
+    Each item bundles its leading arrow (if any) and its step pill inside a
+    single `.flow-item` wrapper, so the two can never be split onto
+    different lines when the row wraps - only whole items wrap, never an
+    arrow away from the step it points to.
     """
     labels = [str(node).strip() for node in (nodes or []) if str(node).strip()]
     if not labels:
         return ""
-    chips: list[str] = []
+    items: list[str] = []
     for index, label in enumerate(labels):
-        chips.append(f'<span class="flow-step">{_esc(label)}</span>')
-        if index < len(labels) - 1:
-            chips.append('<span class="flow-arrow">&#8594;</span>')
-    return f'<div class="flow">{"".join(chips)}</div>'
+        arrow = '<span class="flow-arrow">&#8594;</span>' if index > 0 else ""
+        items.append(f'<span class="flow-item">{arrow}<span class="flow-step">{_esc(label)}</span></span>')
+    return f'<div class="flow">{"".join(items)}</div>'
 
 
 def _svg_severity_chart(risks: dict[str, int]) -> str:
@@ -1743,20 +1748,21 @@ details{{margin-top:14px}}.section-note{{background:#eaf1f7;border-left:4px soli
 ol li::marker{{font-weight:bold;}}
 .field-label{{font-weight:700;margin:14px 0 6px;color:#173b5e}}
 .cover{{position:relative;break-after:page;min-height:250mm;display:flex;flex-direction:column;justify-content:space-between;background:white;border:1px solid #d7dee5;border-radius:10px;padding:40px;margin:0 0 12px}}
-.cover-badges{{position:absolute;top:0;right:0;display:flex;flex-direction:column;align-items:flex-end;gap:8px;max-width:60%}}
+.cover-badges{{position:absolute;top:0;right:0;display:flex;flex-direction:column;align-items:flex-end;gap:8px;max-width:60%;break-inside:avoid-page;page-break-inside:avoid}}
 .cover-classification{{background:#8a1f1f;color:white;font-weight:700;letter-spacing:.08em;text-transform:uppercase;font-size:.85rem;padding:6px 14px;border-radius:4px;white-space:nowrap}}
 .cover-risk-badge{{color:white;font-weight:700;letter-spacing:.05em;text-transform:uppercase;font-size:.85rem;padding:6px 14px;border-radius:4px;white-space:nowrap}}
 .cover-badges div{{margin-bottom:2px}}
 .cover-body{{margin-top:70px}}
-.risk-banner{{display:flex;align-items:center;gap:16px;background:white;border:1px solid #d7dee5;border-left:10px solid #4b86b4;border-radius:10px;padding:16px 20px;margin:12px 0}}
-.risk-banner-label{{flex:0 0 auto;color:white;font-weight:800;font-size:1.3rem;padding:8px 18px;border-radius:8px;letter-spacing:.04em;white-space:nowrap}}
-.risk-banner-text{{flex:1 1 auto;min-width:0}}
+.risk-banner{{box-sizing:border-box;break-inside:avoid-page;page-break-inside:avoid;display:table;width:100%;background:white;border:1px solid #d7dee5;border-left:10px solid #4b86b4;border-radius:10px;padding:16px 20px;margin:12px 0}}
+.risk-banner-label{{display:table-cell;vertical-align:middle;white-space:nowrap;color:white;font-weight:800;font-size:1.3rem;padding:8px 18px;border-radius:8px;letter-spacing:.04em}}
+.risk-banner-text{{display:table-cell;vertical-align:middle;width:100%;padding-left:16px}}
 .flow{{margin:14px 0;line-height:2.6}}
-.flow-step{{display:inline-block;vertical-align:middle;background:#24476b;color:#fff;padding:8px 14px;border-radius:8px;font-size:.82rem;white-space:nowrap;margin:0 6px 8px 0}}
-.flow-arrow{{display:inline-block;vertical-align:middle;color:#4b86b4;font-weight:700;font-size:1.1rem;margin:0 6px 8px 0}}
+.flow-item{{display:inline-block;vertical-align:middle;white-space:nowrap;margin:0 0 8px}}
+.flow-step{{display:inline-block;vertical-align:middle;background:#24476b;color:#fff;padding:8px 14px;border-radius:8px;font-size:.82rem;white-space:nowrap}}
+.flow-arrow{{display:inline-block;vertical-align:middle;color:#4b86b4;font-weight:700;font-size:1.1rem;margin:0 6px}}
 .rating-table{{table-layout:fixed}}
 .rating-col{{width:150px}}
-.rating-chip{{display:inline-flex;align-items:center;gap:6px;white-space:nowrap}}
+.rating-chip{{display:inline-flex;align-items:center;gap:6px;white-space:nowrap;break-inside:avoid-page;page-break-inside:avoid}}
 .cover-kicker{{color:#4b86b4;font-weight:700;letter-spacing:.12em;text-transform:uppercase;font-size:.95rem;margin-bottom:14px}}
 .cover-title{{font-size:2.6rem;line-height:1.15;margin:0 0 14px;max-width:80%}}
 .cover-subtitle{{font-size:1.3rem;color:#4f6273;font-weight:600}}
