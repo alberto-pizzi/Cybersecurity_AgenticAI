@@ -1425,8 +1425,8 @@ def _render_html(payload: dict[str, Any], *, for_pdf: bool = False) -> str:
 {_heading(2, "Executive summary", toc, anchor="executive")}<div class="card">{_esc(payload['executive_summary'])}</div>
 <div class="grid">{''.join(f'<div class="card"><div class="value">{risks.get(risk,0)}</div><div>{risk.title()}</div></div>' for risk in ('critical','high','medium','low'))}<div class="card"><div class="value">{len(summary['limitations'])}</div><div>Execution limitations</div><div class="value">{len(summary.get('coverage_constraints', []))}</div><div>Coverage constraints</div></div></div>
 
-{_render_priority_actions(payload["findings"], toc)}
 {_render_severity_legend(toc)}
+{_render_priority_actions(payload["findings"], toc)}
 {render_glance()}
 
 {detail_cap_note}
