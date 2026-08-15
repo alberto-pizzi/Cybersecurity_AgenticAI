@@ -860,10 +860,22 @@ def _render_list(values: list[str]) -> str:
     return "" if not values else "<ul>" + "".join(f"<li>{_esc(value)}</li>" for value in values) + "</ul>"
 
 
+_MAX_SNIPPET_CHARS = 3000
+
+
 def _field(label: str, value: Any, *, pre: bool = False) -> str:
     if value in (None, "", [], {}):
         return ""
-    rendered = f"<pre>{_esc(value)}</pre>" if pre else _esc(value)
+    if pre:
+        # Evidence blocks are proof of a specific finding, not a dump of everything the
+        # scanner saw - cap them so one verbose response body doesn't bury the report.
+        text = _redact_text(value)
+        omitted = len(text) - _MAX_SNIPPET_CHARS
+        if omitted > 0:
+            text = f"{text[:_MAX_SNIPPET_CHARS]}\n… [{omitted} further characters omitted for readability]"
+        rendered = f"<pre>{html.escape(text)}</pre>"
+    else:
+        rendered = _esc(value)
     return f"<dt>{_esc(label)}</dt><dd>{rendered}</dd>"
 
 
@@ -1516,12 +1528,6 @@ def _render_html(payload: dict[str, Any], *, for_pdf: bool = False) -> str:
 
     def finding_card(item: dict[str, Any], index: int) -> str:
         notes = item.get("data_quality_notes") or []
-        scanner_fields = json.dumps(
-            item.get("scanner_fields") or {},
-            indent=2,
-            ensure_ascii=False,
-            default=str,
-        )
         heading = _heading(
             3, f"{index}. {item['alert']}", toc,
             in_toc=False,  # one h3 per finding: too many to list in the index (LaTeX \subsection* equivalent)
@@ -1554,7 +1560,6 @@ def _render_html(payload: dict[str, Any], *, for_pdf: bool = False) -> str:
 {('<p class="field-label">Identifiers</p>' + _render_list(item.get('identifiers') or [])) if item.get('identifiers') else ''}
 {('<p class="field-label">References</p>' + _render_list(item.get('references') or [])) if item.get('references') else ''}
 {('<div class="quality"><b>Data-quality notes</b>' + _render_list(notes) + '</div>') if notes else ''}
-<details><summary>Additional structured scanner fields</summary><pre>{_esc(scanner_fields)}</pre></details>
 </article>"""
 
     finding_bodies: dict[str, str] = {}
