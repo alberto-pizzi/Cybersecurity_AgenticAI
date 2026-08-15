@@ -1044,6 +1044,57 @@ def _context_summary_html(context: dict[str, Any], toc: list[tuple[int, str, str
     return "".join(parts) or "<p>No assessment context was supplied.</p>"
 
 
+def _render_document_control(payload: dict[str, Any], generated_display: str) -> str:
+
+    rows: list[tuple[str, str]] = [
+        ("Document reference", _esc(payload.get("report_id") or "n/a")),
+        ("Engagement report version", _esc(payload.get("report_version") or "n/a")),
+        ("Report template version", _esc(REPORT_VERSION)),
+        ("Classification", _esc(REPORT_CLASSIFICATION)),
+        ("Prepared by", _esc(payload.get("assessor") or "SecOps Automated Assessment Platform")),
+        ("Platform authors", _esc(", ".join(AUTHORS))),
+        ("Client / distribution", _esc(payload.get("client_name") or CLIENT_NAME)),
+        ("Date issued", generated_display),
+    ]
+    return (
+        '<section class="doc-control">'
+        "<h2>Document control</h2>"
+        "<dl>" + "".join(f"<dt>{label}</dt><dd>{value}</dd>" for label, value in rows) + "</dl>"
+        "</section>"
+    )
+
+
+def _render_priority_actions(findings: list[dict[str, Any]], toc: list[tuple[int, str, str]]) -> str:
+
+    seen: set[tuple[str, str]] = set()
+    items: list[str] = []
+    for item in findings:
+        if item.get("category") not in {"vulnerability", "candidate"} or not item.get("solution"):
+            continue
+        key = (str(item.get("solution")), str(item.get("canonical_url") or item.get("url") or ""))
+        if key in seen:
+            continue
+        seen.add(key)
+        target = f" — {_esc(item['url'])}" if item.get("url") else ""
+        items.append(
+            f"<li><b>[{_esc(item['risk']).upper()}] {_esc(item['alert'])}</b>{target}"
+            f"<br>{_esc(item['solution'])}</li>"
+        )
+        # TODO this limit is ok?
+        if len(items) >= 10:
+            break
+    if not items:
+        return ""
+    heading = _heading(2, "Priority remediation actions", toc, anchor="priority-actions")
+    return (
+        f"{heading}"
+        '<p class="section-note">Drawn directly from the confirmed vulnerabilities and candidates below that carry '
+        "scanner-supplied remediation guidance, in the same priority order as the detailed findings sections. This "
+        "shortlist does not replace the full findings detail.</p>"
+        f"<ol>{''.join(items)}</ol>"
+    )
+
+
 def _render_disclaimer(client_display: str, assessment_dates: str) -> str:
     """Confidentiality / legal-notice front matter, standard on professional
     pentest reports. Engagement-specific values (client, target, dates) are
@@ -1374,6 +1425,7 @@ def _render_html(payload: dict[str, Any], *, for_pdf: bool = False) -> str:
 {_heading(2, "Executive summary", toc, anchor="executive")}<div class="card">{_esc(payload['executive_summary'])}</div>
 <div class="grid">{''.join(f'<div class="card"><div class="value">{risks.get(risk,0)}</div><div>{risk.title()}</div></div>' for risk in ('critical','high','medium','low'))}<div class="card"><div class="value">{len(summary['limitations'])}</div><div>Execution limitations</div><div class="value">{len(summary.get('coverage_constraints', []))}</div><div>Coverage constraints</div></div></div>
 
+{_render_priority_actions(payload["findings"], toc)}
 {_render_severity_legend(toc)}
 {render_glance()}
 
@@ -1411,6 +1463,7 @@ def _render_html(payload: dict[str, Any], *, for_pdf: bool = False) -> str:
     toc_html = _render_toc(toc)
 
     disclaimer_html = _render_disclaimer(client_display, assessment_dates)
+    doc_control_html = _render_document_control(payload, generated_display)
 
     return f"""<!doctype html><html><head><meta charset="utf-8"><title>SecOps Assessment Report</title>
 <style>
@@ -1469,12 +1522,16 @@ ol li::marker{{font-weight:bold;}}
 .cover-meta{{table-layout:auto;width:auto;font-size:.9rem;margin-top:50px}}
 .cover-meta th{{background:none;color:#4f6273;text-align:left;white-space:nowrap;border:none;border-top:1px solid #d7dee5;padding:10px 24px 10px 0}}
 .cover-meta td{{border:none;border-top:1px solid #d7dee5;padding:10px 0;font-weight:600;overflow-wrap:anywhere;word-break:break-word}}
+.doc-control{{background:white;border:1px solid #d7dee5;border-radius:10px;padding:24px 32px;margin:0 0 12px}}
+.doc-control h2{{margin-top:0}}
+.doc-control dl{{grid-template-columns:220px minmax(0,1fr)}}
 .disclaimer{{background:#fff8f8;border:1px solid #e3b8b8;border-radius:10px;padding:28px 32px;margin:0 0 12px;break-after:page}}
 .disclaimer h2{{margin-top:0}}
 .disclaimer p{{line-height:1.55}}
 .legend-swatch{{display:inline-block;width:10px;height:10px;border-radius:2px;margin-right:6px}}
 </style></head><body><main>
 {cover_html}
+{doc_control_html}
 {disclaimer_html}
 
 <div class="toc">
