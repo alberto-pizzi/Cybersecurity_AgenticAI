@@ -16,12 +16,14 @@ from scannerCommon import service
 
 mcp, _serve = service("Interactsh OAST Client", "interactsh")
 
+# Read lines from scanner output or runtime state for downstream processing.
 def _read_lines(path: Path) -> list[str]:
     try:
         return [line.strip() for line in path.read_text(encoding="utf-8", errors="replace").splitlines() if line.strip()]
     except OSError:
         return []
 
+# Stop the Interactsh client process cleanly after polling or timeout.
 def _stop(process: subprocess.Popen[str]) -> None:
     if process.poll() is not None:
         return
@@ -32,12 +34,13 @@ def _stop(process: subprocess.Popen[str]) -> None:
         process.kill()
         process.wait(timeout=5)
 
+# Run a bounded GET or POST OAST check using a literal ``FUZZ`` placeholder.
 @mcp.tool()
 def run_interactsh_client(
     target_url: str = "", injection_url: str = "", cookies: str = "", method: str = "GET",
     data: str = "", parameter: str = "", timeout: int = 90,
 ) -> dict:
-    """Run a bounded GET or POST OAST check using a literal ``FUZZ`` placeholder."""
+
     method = str(method or "GET").upper()
     if method not in {"GET", "POST"}:
         return skipped("Interactsh", target_url, f"Unsupported OAST HTTP method: {method}.")
@@ -58,6 +61,7 @@ def run_interactsh_client(
         command = [
             executable, "-n", "1", "-pi", "1", "-json", "-v", "-duc", "-ps", "-psf", str(payload_file), "-o", str(event_file),
         ]
+        # Start one temporary Interactsh client and keep its correlation state isolated to this check.
         process = subprocess.Popen(
             command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding="utf-8", errors="replace",
         )
@@ -108,6 +112,7 @@ def run_interactsh_client(
                 )
 
             events: list[dict] = []
+            # Poll callback output until a matching interaction arrives or the bounded deadline expires.
             deadline = started + timeout
             while time.monotonic() < deadline:
                 for line in _read_lines(event_file):

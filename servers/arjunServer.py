@@ -16,6 +16,7 @@ PRIORITY_PARAMETERS = (
 )
 HIGH_RISK_NAMES = {"cmd","command","exec","shell","file","filename","path","include","template","url","uri","redirect","callback","webhook","role","admin","user_id","id","xml"}
 
+# Collect parameters for use by later scanner phases.
 def collect_parameters(value: Any) -> list[str]:
     found=[]
     if isinstance(value,list): found.extend(str(item) for item in value if isinstance(item,(str,int,float)))
@@ -23,9 +24,11 @@ def collect_parameters(value: Any) -> list[str]:
         for nested in value.values(): found.extend(collect_parameters(nested))
     return found
 
+# Load Arjun JSON output and tolerate missing or malformed result files.
 def _load(path: Path) -> list[str]:
     return sorted(set(unique_strings(collect_parameters(read_json(path, {})))))
 
+# Invoke Arjun with the discovered request contract and a bounded timeout.
 def _run(target_url: str, cookies: str, output: Path, wordlist: str, budget: int, name: str, method: str = "GET", data: str = "") -> tuple[dict[str,Any],list[str]]:
     method = method.upper()
     command=[
@@ -41,6 +44,7 @@ def _run(target_url: str, cookies: str, output: Path, wordlist: str, budget: int
     result.update(phase=name,phase_parameters=len(parameters),phase_timeout_seconds=budget)
     return result,parameters
 
+# Convert scanner evidence into a normalized security finding.
 def _finding(target_url: str, parameter: str, method: str = "GET") -> dict[str,Any]:
     high=parameter.lower() in HIGH_RISK_NAMES
     return {
@@ -55,12 +59,13 @@ def _finding(target_url: str, parameter: str, method: str = "GET") -> dict[str,A
         "evidence": f"Parameter name returned by Arjun: {parameter}",
     }
 
+# Discover hidden GET or POST parameters using the actual request method.
 @mcp.tool()
 def run_arjun_scan(
     target_url: str, cookies: str = "", method: str = "GET", data: str = "",
     known_parameters: list[str] | None = None, timeout: int = 60,
 ) -> dict:
-    """Discover hidden GET or POST parameters using the actual request method."""
+
     method = str(method or "GET").upper()
     if method not in {"GET", "POST", "JSON", "XML"}:
         return failure("Arjun", target_url, "method must be GET, POST, JSON, or XML.")

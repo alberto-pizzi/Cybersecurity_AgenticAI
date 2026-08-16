@@ -189,7 +189,7 @@ async def deterministic_parameter_scan_node(state: DeterministicState) -> dict[s
     has_authenticated_profile = bool(state.get('has_authenticated_profile', False))
     session_state = state.get('profile_session_state', {})
     selection_summary: dict[str, dict[str, list[dict[str, Any]]]] = {}
-    semaphore = asyncio.Semaphore(1)
+    semaphore = asyncio.Semaphore(2 if shared.CURRENT_SCAN_MODE == 'deep' else 1)
 
     async def run_case(spec: ToolSpec, case: dict[str, Any], cookies: str, probe_url: str) -> dict[str, Any]:
         url = str(case.get('url', ''))
@@ -652,6 +652,8 @@ def main() -> int:
     print("=== FastMCP Deterministic Security Pipeline ===")
     print(f"[*] Target: {target}")
     print(f"[*] Mode: {shared.CURRENT_SCAN_MODE}")
+    if shared.CURRENT_SCAN_MODE == 'deep':
+        print("[*] Deep profile: coverage-max-20m-v1 (broader request classes, bounded ZAP/Nuclei breadth, 2-way specialist concurrency)")
     print(f"[*] Profiles: {', '.join(profile['name'] for profile in profiles)}")
     started = time.time()
     try:

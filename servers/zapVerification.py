@@ -11,9 +11,9 @@ from utils import same_origin
 
 CONTROL = {"submit", "login", "change", "user_token", "csrf", "button", "btnsign"}
 
-
+# Keep distinct vulnerability variants so one DVWA case cannot hide another.
 def _case_class(path: str, method: str, params: set[str]) -> tuple[str, int]:
-    """Keep distinct vulnerability variants so one DVWA case cannot hide another."""
+
     if "sqli_blind" in path:
         return "sqli_blind", 540
     if "sqli" in path:
@@ -34,9 +34,9 @@ def _case_class(path: str, method: str, params: set[str]) -> tuple[str, int]:
         return "xss_reflected", 500
     return "other", 100
 
-
+# Pick diverse high-value request contracts without collapsing blind/DOM variants.
 def select_cases(target_url: str, request_cases: list[dict[str, Any]] | None, limit: int) -> list[dict[str, Any]]:
-    """Pick diverse high-value request contracts without collapsing blind/DOM variants."""
+
     ranked: list[tuple[int, str, dict[str, Any]]] = []
     for case in request_cases or []:
         if not isinstance(case, dict):
@@ -74,7 +74,7 @@ def select_cases(target_url: str, request_cases: list[dict[str, Any]] | None, li
             break
     return selected
 
-
+# Convert scanner evidence into a normalized security finding.
 def _finding(alert: str, risk: str, url: str, method: str, parameter: str, status: str, evidence: str, payloads: list[str], cwe: str, solution: str, impact: str) -> dict[str, Any]:
     return {
         "alert": alert, "risk": risk, "category": "vulnerability", "verification_status": status,
@@ -84,18 +84,20 @@ def _finding(alert: str, risk: str, url: str, method: str, parameter: str, statu
         "plugin_id": "secops-zap-proxy-verifier", "detection_method": "bounded requests routed through the ZAP proxy",
     }
 
-
+# Keep the project's high-value response checks, but let ZAP perform the actual active scanning.
 def verify_cases(cases: list[dict[str, Any]], target_url: str, zap_target_url: str, zap_url: str, cookies: str, deadline: float) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-    """Keep the project's high-value response checks, but let ZAP perform the actual active scanning."""
+
     findings: list[dict[str, Any]] = []
     diagnostics: list[dict[str, Any]] = []
 
+    # Translate internal scanner URLs back to the externally reported target form.
     def translate(url: str) -> str:
         src, dst, cur = urlparse(target_url), urlparse(zap_target_url), urlparse(url)
         if (cur.scheme, cur.hostname, cur.port) == (src.scheme, src.hostname, src.port):
             return cur._replace(scheme=dst.scheme, netloc=dst.netloc).geturl()
         return url
 
+    # Verify each selected class with bounded proxy requests and class-specific response evidence.
     for case in cases:
         if time.monotonic() + 4 >= deadline:
             diagnostics.append({"url": str(case.get("url") or ""), "skipped": "proxy verification budget exhausted"})
@@ -106,6 +108,7 @@ def verify_cases(cases: list[dict[str, Any]], target_url: str, zap_target_url: s
         headers = {"Cookie": cookies, "Cache-Control": "no-cache"} if cookies else {"Cache-Control": "no-cache"}
         proxies = {"http": zap_url, "https": zap_url}
 
+        # Send one bounded HTTP request for the current verification attempt.
         def send(req_url: str = url, req_method: str = method, req_data: str = data) -> requests.Response:
             return requests.request(req_method, translate(req_url), data=req_data if req_method != "GET" else None, headers=headers, proxies=proxies, timeout=(3, 10), allow_redirects=True)
 
@@ -136,7 +139,6 @@ def verify_cases(cases: list[dict[str, Any]], target_url: str, zap_target_url: s
                         [true_payload, false_payload, quote_payload], "89", "Use parameterized queries and strict server-side type validation.",
                         "An attacker may alter database queries and access or modify application data.",
                     ))
-
 
             if "xss" in path and params:
                 p = next((v for v in params if v.lower() in {"name", "q", "search", "query", "message", "mtxmessage", "comment", "content"}), params[0])

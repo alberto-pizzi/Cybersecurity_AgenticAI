@@ -25,17 +25,15 @@ PRIORITY_PATHS = (
 )
 SENSITIVE_NAMES = {".env", ".git", "backup", "config", "debug", "server-status", "setup.php", "phpinfo.php", "admin", "administrator"}
 
-# These paths can mutate or invalidate an authenticated application session.
-# They remain discoverable anonymously but are removed from authenticated FFUF
-# wordlists before the scanner starts.
 DESTRUCTIVE_AUTH_PATH_TOKENS = {
     "logout", "log-out", "signout", "sign-out", "logoff", "disconnect",
     "end-session", "destroy-session", "session-destroy", "setup", "install", "reinstall", "uninstall", "reset",
     "create_db", "create-database", "createdb", "drop_db", "drop-database", "truncate", "purge", "wipe",
 }
 
+# Reject destructive path/query aliases before an authenticated request.
 def _destructive_authenticated_word(value: str) -> bool:
-    """Reject destructive path/query aliases before an authenticated request."""
+
     raw = unquote(str(value or "")).strip().lower()
     if not raw:
         return False
@@ -50,6 +48,7 @@ def _destructive_authenticated_word(value: str) -> bool:
         return True
     return any(marker in comparable for marker in DESTRUCTIVE_AUTH_PATH_TOKENS)
 
+# Probe session and capture bounded evidence for verification.
 def _session_probe(url: str, cookies: str, attempts: int = 3) -> dict[str, Any]:
     if not url or not cookies:
         return {"performed": False, "authenticated": None, "conclusive": True}
@@ -88,10 +87,12 @@ def _session_probe(url: str, cookies: str, attempts: int = 3) -> dict[str, Any]:
         "errors": errors, "error": errors[-1] if errors else "request failed",
     }
 
+# Read json from scanner output or runtime state for downstream processing.
 def _read_json(path: Path) -> list[dict[str, Any]]:
     value = read_json(path, {})
     return [item for item in value.get("results", []) if isinstance(item, dict)] if isinstance(value, dict) else []
 
+# Run one FFUF discovery phase and parse its JSON result file.
 def _run_phase(target_url: str, cookies: str, wordlist: Path, output: Path, budget: int, name: str) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     command = ["ffuf", "-u", f"{target_url.rstrip('/')}/FUZZ", "-w", str(wordlist), "-of", "json", "-o", str(output), "-ac", "-t", "30", "-timeout", "4", "-maxtime", str(max(10,budget)), "-noninteractive"]
     if cookies: command.extend(["-b", cookies])
@@ -102,14 +103,11 @@ def _run_phase(target_url: str, cookies: str, wordlist: Path, output: Path, budg
     result.update(phase=name, phase_findings=len(rows), phase_timeout_seconds=budget)
     return result, rows
 
+# Follow only same-origin, non-destructive redirects.
 def _safe_verification_get(
     url: str, cookies: str, *, max_redirects: int = 4,
 ) -> tuple[requests.Response | None, str, str]:
-    """Follow only same-origin, non-destructive redirects.
 
-    This prevents a benign-looking FFUF result from redirecting the supplied
-    authenticated session through logout/setup/reset handlers.
-    """
     origin = urlparse(url)
     origin_key = (
         origin.scheme.lower(), origin.hostname or "", origin.port or (443 if origin.scheme.lower() == "https" else 80),
@@ -144,16 +142,13 @@ def _safe_verification_get(
         current = candidate
     return response, current, "redirect_limit_reached"
 
+# Verify result and return evidence-backed scanner results.
 def _verification_result(category: str, risk: str, alert: str, status: str, description: str, *, impact: str = "", solution: str = "", confidence: str = "high", final_url: str = "", final_status: int = 0, evidence: str = "") -> dict[str, Any]:
     return {"category": category, "risk": risk, "alert": alert, "verification_status": status, "description": description, "impact": impact, "solution": solution, "confidence": confidence, "final_url": final_url, "final_status": final_status, "evidence": evidence}
 
+# Verify a sensitive-looking FFUF path before classifying it.
 def _verify(url: str, cookies: str) -> dict[str, Any]:
-    """
-    Verify a sensitive-looking FFUF path before classifying it.
 
-    Redirects to login pages, 401/403 responses, and failed verification are not
-    reported as exposed medium-severity resources.
-    """
     original_path = urlparse(url).path.lower()
     try:
         response, safe_final_url, redirect_guard = _safe_verification_get(
@@ -187,6 +182,7 @@ def _verify(url: str, cookies: str) -> dict[str, Any]:
             final_url=final_url, final_status=response.status_code, evidence=evidence,
         )
 
+    # Classify the verified response only when content or access-control evidence supports it.
     login_page = (
         final_path.endswith("/login")
         or final_path.endswith("/login.php")
@@ -286,6 +282,7 @@ def _verify(url: str, cookies: str) -> dict[str, Any]:
         confidence='medium', final_url=final_url, final_status=response.status_code, evidence=evidence,
     )
 
+# Convert scanner evidence into a normalized security finding.
 def _finding(item: dict[str, Any], cookies: str, verify: bool) -> dict[str, Any]:
     url = str(item.get("url", ""))
     status = int(item.get("status") or 0)
@@ -340,9 +337,10 @@ def _finding(item: dict[str, Any], cookies: str, verify: bool) -> dict[str, Any]
         "redirect_location": item.get("redirectlocation", ""), "confidence": "high", "evidence": base_evidence,
     }
 
+# Check high-value paths first, then use the compact project wordlist with the remaining budget.
 @mcp.tool()
 def run_ffuf_fuzz(target_url: str, cookies: str="", wordlist: str="", timeout: int=120, session_probe_url: str="") -> dict:
-    """Check high-value paths first, then use the compact project wordlist with the remaining budget."""
+
     timeout = max(30, min(int(timeout), 180))
     general = Path(wordlist) if wordlist else WORDLISTS_DIR/"common.txt"
     if not general.exists(): return failure("FFUF", target_url, f"Wordlist not found: {general}", diagnosis="missing_wordlist")
@@ -373,10 +371,7 @@ def run_ffuf_fuzz(target_url: str, cookies: str="", wordlist: str="", timeout: i
                 diagnosis="authentication_precheck_failed", timed_out=False, vulnerabilities=[], authenticated=True,
                 session_before=session_before, destructive_paths_excluded=sorted(DESTRUCTIVE_AUTH_PATH_TOKENS),
             )
-        # Path fuzzing is deliberately cookie-isolated for authenticated
-        # profiles. This makes it impossible for a guessed logout alias to
-        # invalidate the live session required by ZAP. Safe results are then
-        # verified and re-crawled with the cookie by guarded code.
+
         fuzz_cookies = ""
         phases=[]; rows=[]
         for name,wl,budget in (("high_value_paths",priority,priority_budget),("compact_general_discovery",filtered,general_budget)):

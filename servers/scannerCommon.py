@@ -12,21 +12,24 @@ from fastmcp import FastMCP
 
 from utils import ROOT_DIR, run_mcp_http, runtime_container_route
 
+# Create a FastMCP service and its direct-run entrypoint.
 def service(label: str, key: str) -> tuple[FastMCP, Callable[[], None]]:
-    """Create a FastMCP service and its direct-run entrypoint."""
+
     mcp = FastMCP(label)
     return mcp, lambda: run_mcp_http(mcp, key)
 
+# Normalize strings while preserving first-seen order.
 def unique_strings(values: Iterable[Any] | None) -> list[str]:
-    """Normalize strings while preserving first-seen order."""
+
     return list(dict.fromkeys(str(value).strip() for value in (values or []) if str(value).strip()))
 
+# Shared login-page detector with per-scanner compatibility knobs.
 def looks_like_login(
     response: requests.Response, *,
     text_limit: int = 100_000, paths: tuple[str, ...] = ("/login", "/login.php", "/signin", "/sign-in", "/auth"),
     words: tuple[str, ...] = ("login", "log in", "sign in", "authenticate"), strip_trailing_slash: bool = True,
 ) -> bool:
-    """Shared login-page detector with per-scanner compatibility knobs."""
+
     text = response.text[:text_limit].lower()
     path = urlparse(str(response.url)).path.lower()
     if strip_trailing_slash:
@@ -36,11 +39,13 @@ def looks_like_login(
 
 CONTROL_PARAMETERS = {"submit", "login", "change", "user_token", "csrf", "button"}
 
+# Filter control parameters to keep only values safe and relevant to the current scan.
 def filter_control_parameters(values: Iterable[Any] | None) -> list[str]:
     return [value for value in unique_strings(values) if value.lower() not in CONTROL_PARAMETERS]
 
+# Find an initializer-managed Python scanner without depending on PATH.
 def find_repo_script(tool: str, filename: str) -> Path | None:
-    """Find an initializer-managed Python scanner without depending on PATH."""
+
     import re
     candidates = [Path.home() / ".local" / "opt" / tool / filename, Path(ROOT_DIR) / "tools" / tool / filename]
     launcher = Path.home() / ".local" / "bin" / f"{tool}.bat"
@@ -52,6 +57,7 @@ def find_repo_script(tool: str, filename: str) -> Path | None:
             candidates.insert(0, Path(match.group(1) or match.group(2)))
     return next((path.resolve() for path in candidates if path.is_file()), None)
 
+# Append method, cookie and body arguments shared by scanner CLI wrappers.
 def extend_request_cli(command: list[str], data: str, parameters: Iterable[Any] | None, cookies: str) -> None:
     if data:
         command.extend(["--data", data])
@@ -61,14 +67,16 @@ def extend_request_cli(command: list[str], data: str, parameters: Iterable[Any] 
     if cookies:
         command.extend(["--cookie", cookies])
 
+# Combine process stdout, stderr and diagnostics into one searchable text block.
 def process_text(result: dict[str, Any]) -> str:
     return "\n".join(str(result.get(key, "")) for key in ("stdout", "stderr", "output"))
 
+# Replace one query/form parameter without changing the rest of the request.
 def mutate_parameter(
     url: str, method: str, data: str, parameter: str, value: str, *, case_insensitive: bool = False, clear_fragment: bool = False,
     append_if_missing: bool = True, replace_all: bool = False,
 ) -> tuple[str, str]:
-    """Replace one query/form parameter without changing the rest of the request."""
+
     method = method.upper()
     parsed = urlparse(url)
     source = parsed.query if method == "GET" else data
@@ -89,10 +97,11 @@ def mutate_parameter(
         return urlunparse(parsed._replace(query=encoded, fragment=fragment)), ""
     return url, encoded
 
+# Retry transient transport failures and re-raise the last Requests error.
 def request_retry(
     method: str, url: str, *, attempts: int = 3, backoff: float = 0.7, **kwargs: Any,
 ) -> requests.Response:
-    """Retry transient transport failures and re-raise the last Requests error."""
+
     last: requests.RequestException | None = None
     for attempt in range(max(1, int(attempts))):
         try:
@@ -106,13 +115,9 @@ def request_retry(
     assert last is not None
     raise last
 
-
+# Translate a localhost target for an official scanner container.
 def docker_target(url: str) -> tuple[str, list[str], str]:
-    """Translate a localhost target for an official scanner container.
 
-    Prefer the initializer-declared lab network/alias; fall back to Docker
-    Desktop's host gateway only when no exact runtime route is available.
-    """
     import os
     import sys
 
@@ -121,8 +126,7 @@ def docker_target(url: str) -> tuple[str, list[str], str]:
         return url, [], "same_target"
     route = runtime_container_route(url)
     if not route:
-        # Target profiles are bound to the initialized root path, while scanner
-        # inputs usually contain child endpoints. Container routing is origin-wide.
+
         origin = urlunparse(parsed._replace(path="", params="", query="", fragment=""))
         route = runtime_container_route(origin)
     alias, network = str(route.get("alias") or ""), str(route.get("network") or "")
@@ -134,22 +138,18 @@ def docker_target(url: str) -> tuple[str, list[str], str]:
     args = [] if os.name == "nt" or sys.platform == "darwin" else ["--add-host", "host.docker.internal:host-gateway"]
     return urlunparse(parsed._replace(netloc=netloc)), args, "host_gateway"
 
+# Return a unique, recognizable name for a short-lived scanner container.
 def docker_container_name(prefix: str) -> str:
-    """Return a unique, recognizable name for a short-lived scanner container."""
+
     import os
     import re
     import uuid
     safe = re.sub(r"[^a-z0-9-]+", "-", str(prefix or "scanner").lower()).strip("-") or "scanner"
     return f"secops-{safe}-{os.getpid()}-{uuid.uuid4().hex[:8]}"
 
-
+# Best-effort cleanup after a docker CLI timeout.
 def cleanup_docker_container(name: str) -> bool:
-    """Best-effort cleanup after a docker CLI timeout.
 
-    Killing the local ``docker`` client does not necessarily stop the container
-    that the daemon already started, so scanner wrappers explicitly remove their
-    named container in ``finally`` blocks.
-    """
     if not str(name or "").strip():
         return False
     import shutil
@@ -167,15 +167,16 @@ def cleanup_docker_container(name: str) -> bool:
     except (OSError, subprocess.SubprocessError):
         return False
 
-
+# Read json from scanner output or runtime state for downstream processing.
 def read_json(path: Path, default: Any = None) -> Any:
     try:
         return json.loads(path.read_text(encoding="utf-8", errors="replace"))
     except (OSError, json.JSONDecodeError):
         return default
 
+# Load a JSON runtime config, honoring the optional environment override.
 def load_config(default_path: Path, env_name: str = "SECOPS_RUNTIME_CONFIG") -> dict[str, Any]:
-    """Load a JSON runtime config, honoring the optional environment override."""
+
     import os
     configured = os.environ.get(env_name, "").strip()
     value = read_json(Path(configured).expanduser() if configured else default_path, {})

@@ -28,6 +28,7 @@ AUTH_RE = re.compile(r"(?:login|signin|sign-in|authenticate|brute)", re.I)
 CAPTCHA_RE = re.compile(r"(?:captcha|recaptcha|hcaptcha)", re.I)
 ERROR_RE = re.compile(r"(?:invalid|error|failed|required|denied|forbidden|incorrect)", re.I)
 
+# Normalize field rows from the discovered request contract for workflow testing.
 def _field_rows(fields: list[dict[str, Any]] | None) -> list[dict[str, str]]:
     rows: list[dict[str, str]] = []
     for field in fields or []:
@@ -42,6 +43,7 @@ def _field_rows(fields: list[dict[str, Any]] | None) -> list[dict[str, str]]:
         })
     return rows
 
+# Normalize pairs from case from the discovered request contract for workflow testing.
 def _pairs_from_case(data: str, fields: list[dict[str, str]]) -> list[tuple[str, str]]:
     pairs = list(parse_qsl(str(data or ""), keep_blank_values=True))
     if pairs:
@@ -56,6 +58,7 @@ def _pairs_from_case(data: str, fields: list[dict[str, str]]) -> list[tuple[str,
         result.append((field["name"], value))
     return result
 
+# Create an authenticated requests session for bounded workflow checks.
 def _session(cookies: str) -> requests.Session:
     session = requests.Session()
     session.headers.update({
@@ -66,6 +69,7 @@ def _session(cookies: str) -> requests.Session:
         session.headers["Cookie"] = cookies
     return session
 
+# Check whether state-changing requests enforce the discovered anti-CSRF token.
 def _csrf_check(
     target_url: str, source_url: str, cookies: str, data: str,
     fields: list[dict[str, str]], token_parameters: list[str], timeout: int, allow_state_changes: bool,
@@ -144,6 +148,7 @@ def _csrf_check(
         })
     return findings, diagnostic
 
+# Exercise a bounded file-upload workflow and verify whether uploaded content becomes web-accessible.
 def _upload_check(
     target_url: str, source_url: str, cookies: str, fields: list[dict[str, str]],
     file_parameters: list[str], timeout: int, allow_state_changes: bool, known_urls: list[str] | None = None,
@@ -153,6 +158,7 @@ def _upload_check(
     if not file_parameters or not allow_state_changes or DESTRUCTIVE_RE.search(urlparse(target_url).path):
         return findings, diagnostic
 
+    # Upload a uniquely named harmless marker so later same-origin retrieval is unambiguous.
     marker = "SECOPS_UPLOAD_" + secrets.token_hex(8)
     filename = f"secops_probe_{secrets.token_hex(4)}.html"
     content = f"<!doctype html><html><body>{marker}</body></html>".encode("utf-8")
@@ -183,9 +189,7 @@ def _upload_check(
     for match in re.findall(r"https?://[^\s'\"<>]+", response.text, re.I):
         if filename.lower() in match.lower():
             candidates.append(html.unescape(match))
-    # Some upload handlers print a relative filesystem/web path as text rather
-    # than as a link (for example ../../uploads/name.html). Preserve only the
-    # same-origin URL interpretation and never read local filesystem paths.
+
     path_pattern = re.compile(
         r"([A-Za-z0-9_./\\-]{0,240}" + re.escape(filename) + r")", re.I,
     )
@@ -197,9 +201,6 @@ def _upload_check(
         for prefix in ("uploads/", "upload/", "files/", "media/", "attachments/", "images/"):
             candidates.append(urljoin(base, prefix + filename))
 
-    # Reuse the already discovered same-origin surface instead of guessing only
-    # four conventional paths. Directory indexes are fetched read-only and any
-    # link to the generated filename is followed.
     directory_candidates: list[str] = []
     for known in known_urls or []:
         value = str(known or "").strip()
@@ -230,6 +231,7 @@ def _upload_check(
             "filename_present": filename.lower() in listing.text.lower(), "matching_links": discovered_links,
         })
 
+    # Verify candidate URLs and report exposure only when the uploaded marker is retrieved.
     candidates = [value for value in dict.fromkeys(candidates) if same_origin(target_url, value)]
     retrieved: list[dict[str, Any]] = []
     for candidate in candidates[:8]:
@@ -276,8 +278,9 @@ def _upload_check(
         })
     return findings, diagnostic
 
+# Run bounded authentication attempts to detect missing throttling or challenge behavior.
 def _authentication_check(
-    target_url: str, fields: list[dict[str, str]], timeout: int,
+    target_url: str, fields: list[dict[str, str]], timeout: int, method: str = "POST",
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     findings: list[dict[str, Any]] = []
     names = {field["name"].lower(): field for field in fields}
@@ -303,7 +306,10 @@ def _authentication_check(
         if password_name:
             payload[password_name] = secrets.token_urlsafe(12)
         try:
-            response = session.post(target_url, data=payload, timeout=(4, timeout), allow_redirects=True)
+            if str(method or "POST").upper() == "GET":
+                response = session.get(target_url, params=payload, timeout=(4, timeout), allow_redirects=True)
+            else:
+                response = session.post(target_url, data=payload, timeout=(4, timeout), allow_redirects=True)
         except requests.RequestException as exc:
             attempts.append({"error": f"{type(exc).__name__}: {exc}"})
             break
@@ -327,11 +333,12 @@ def _authentication_check(
             "description": "Three invalid authentication attempts completed without an HTTP 429 response, Retry-After header, visible lockout or CAPTCHA challenge.",
             "impact": "A missing or weak rate limit can make credential guessing and password spraying more practical. Three attempts are insufficient to prove that no longer-window control exists.",
             "solution": "Apply account- and source-aware throttling, progressive delays, monitoring and MFA for sensitive accounts.",
-            "url": target_url, "method": "POST", "evidence": json.dumps(attempts, ensure_ascii=False),
+            "url": target_url, "method": str(method or "POST").upper(), "evidence": json.dumps(attempts, ensure_ascii=False),
             "owasp_category": "A07:2021 Identification and Authentication Failures", "cwe_id": "307",
         })
     return findings, diagnostic
 
+# Inspect the CAPTCHA workflow for recognizable challenge fields and bypass indicators.
 def _captcha_check(
     target_url: str, cookies: str, data: str, fields: list[dict[str, str]], timeout: int, allow_state_changes: bool,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
@@ -377,6 +384,7 @@ def _captcha_check(
         })
     return findings, diagnostic
 
+# Run bounded generic CSRF, upload, authentication and CAPTCHA workflow checks.
 @mcp.tool()
 def run_workflow_scan(
     target_url: str, cookies: str = "", method: str = "GET", data: str = "",
@@ -385,14 +393,24 @@ def run_workflow_scan(
     source_url: str = "", enctype: str = "", timeout: int = 45, allow_state_changes: bool = False,
     known_urls: list[str] | None = None,
 ) -> dict:
-    """Run bounded generic CSRF, upload, authentication and CAPTCHA workflow checks."""
+
     method = str(method or "GET").upper()
     rows = _field_rows(fields)
+    if not rows and parameters:
+        rows = [
+            {
+                "name": str(name),
+                "type": "password" if "pass" in str(name).lower() else "text",
+                "value": "",
+            }
+            for name in parameters
+            if str(name)
+        ]
     file_parameters = [str(value) for value in (file_parameters or []) if str(value)]
     token_parameters = [str(value) for value in (token_parameters or []) if str(value)]
     timeout = max(5, min(int(timeout), 90))
-    if method != "POST":
-        return skipped("Web Workflow Verifier", target_url, "The current workflow checks require a discovered POST form contract.")
+    if method not in {"GET", "POST"}:
+        return skipped("Web Workflow Verifier", target_url, "The current workflow checks require a discovered GET/POST form contract.")
     if DESTRUCTIVE_RE.search(urlparse(target_url).path):
         return skipped("Web Workflow Verifier", target_url, "Destructive setup, deletion, reset or logout workflows are deliberately excluded.")
 
@@ -403,27 +421,30 @@ def run_workflow_scan(
         "token_parameters": token_parameters, "known_url_count": len(known_urls or []),
     }
 
-    csrf_findings, csrf_diag = _csrf_check(
-        target_url, source_url, cookies, data, rows, token_parameters, timeout, allow_state_changes,
-    )
+    if method == "POST":
+        csrf_findings, csrf_diag = _csrf_check(
+            target_url, source_url, cookies, data, rows, token_parameters, timeout, allow_state_changes,
+        )
+        upload_findings, upload_diag = _upload_check(
+            target_url, source_url, cookies, rows, file_parameters, timeout, allow_state_changes, known_urls,
+        )
+        captcha_findings, captcha_diag = _captcha_check(
+            target_url, cookies, data, rows, timeout, allow_state_changes,
+        )
+    else:
+        csrf_findings, csrf_diag = [], {"applicable": False, "reason": "GET authentication workflow"}
+        upload_findings, upload_diag = [], {"applicable": False, "reason": "GET authentication workflow"}
+        captcha_findings, captcha_diag = [], {"applicable": False, "reason": "GET authentication workflow"}
     findings.extend(csrf_findings)
-    diagnostics["csrf"] = csrf_diag
-
-    upload_findings, upload_diag = _upload_check(
-        target_url, source_url, cookies, rows, file_parameters, timeout, allow_state_changes, known_urls,
-    )
     findings.extend(upload_findings)
+    findings.extend(captcha_findings)
+    diagnostics["csrf"] = csrf_diag
     diagnostics["upload"] = upload_diag
+    diagnostics["captcha"] = captcha_diag
 
-    auth_findings, auth_diag = _authentication_check(target_url, rows, timeout)
+    auth_findings, auth_diag = _authentication_check(target_url, rows, timeout, method)
     findings.extend(auth_findings)
     diagnostics["authentication"] = auth_diag
-
-    captcha_findings, captcha_diag = _captcha_check(
-        target_url, cookies, data, rows, timeout, allow_state_changes,
-    )
-    findings.extend(captcha_findings)
-    diagnostics["captcha"] = captcha_diag
 
     applicable = any(bool(value.get("applicable")) for value in (csrf_diag, upload_diag, auth_diag, captcha_diag))
     if not applicable:

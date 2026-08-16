@@ -447,8 +447,10 @@ def _nikto_health(perl: Path, script: Path, launcher: Path | None=None) -> tuple
     return (True, details[-1])
 NIKTO_DOCKER_IMAGE = 'ghcr.io/sullo/nikto:latest'
 NUCLEI_DOCKER_IMAGE = 'projectdiscovery/nuclei:latest'
+REPORT_DOCKER_SOURCE_IMAGE = 'albertopizzi2002/reportingpdf:v1.0'
+# Keep the historical local tag because reportServer.py is intentionally unchanged.
+# The tag now aliases the registry image above; nothing is built from a project Dockerfile.
 REPORT_DOCKER_IMAGE = 'secops/report:local'
-REPORT_DOCKERFILE = ROOT / 'servers' / 'Dockerfile'
 
 def _docker_image_ready(image: str) -> bool:
     if not shutil.which('docker'):
@@ -489,26 +491,40 @@ def _ensure_nuclei_docker_image() -> tuple[bool, str]:
     return (False, detail[-2000:] or f'docker run exited with {probe.returncode}.')
 
 def _ensure_report_docker_image() -> bool:
-    """Build the sandboxed WeasyPrint report image used by reportServer.py.
+    """Pull the shared report image and expose it under reportServer's existing tag.
 
-    Unlike Nikto's fallback, this image is built locally (there is no public
-    registry image), and it ships no application code: the project tree is
-    bind-mounted at container start so the container always runs whatever
-    reportServer.py currently looks like, with no rebuild needed on edits.
+    reportServer.py is intentionally not modified. Its historical Docker fallback
+    expects ``secops/report:local``, so the externally maintained registry image is
+    tagged with that local alias after pulling. No project Dockerfile is required.
     """
-    if _docker_image_ready(REPORT_DOCKER_IMAGE):
-        print(f'[+] Report Docker image already available: {REPORT_DOCKER_IMAGE}')
-        return True
-    if not shutil.which('docker'):
+    ready, detail = _pull_docker_image(REPORT_DOCKER_SOURCE_IMAGE)
+    if not ready:
+        print(f'[!] Report Docker image could not be pulled: {REPORT_DOCKER_SOURCE_IMAGE}\n{detail[-1600:]}')
         return False
-    if not REPORT_DOCKERFILE.is_file():
-        print(f'[!] Report Dockerfile missing: {REPORT_DOCKERFILE}')
+
+    tagged = run(
+        ['docker', 'tag', REPORT_DOCKER_SOURCE_IMAGE, REPORT_DOCKER_IMAGE],
+        required=False, capture=True, show_output=False, timeout=120,
+    )
+    if tagged.returncode != 0 or not _docker_image_ready(REPORT_DOCKER_IMAGE):
+        print('[!] Report Docker image was pulled but the local compatibility tag could not be created.')
         return False
-    result = run(['docker', 'build', '-t', REPORT_DOCKER_IMAGE, '-f', str(REPORT_DOCKERFILE), str(ROOT)], required=False, capture=True, timeout=900)
-    if result.returncode == 0 and _docker_image_ready(REPORT_DOCKER_IMAGE):
-        print(f'[+] Report Docker image built: {REPORT_DOCKER_IMAGE}')
+
+    # Probe the exact invocation shape used by the unchanged reportServer.py.
+    probe = run(
+        ['docker', 'run', '--rm', REPORT_DOCKER_IMAGE, 'python', '-m', 'weasyprint', '--info'],
+        required=False, capture=True, show_output=False, timeout=120,
+    )
+    if probe.returncode == 0:
+        print(f'[+] Report Docker image ready: {REPORT_DOCKER_SOURCE_IMAGE} -> {REPORT_DOCKER_IMAGE}')
         return True
-    print('[!] Report Docker image build failed; the report tool will fall back to a native weasyprint install if one is present (see: brew install pango on macOS).')
+
+    detail = _process_output(probe, 1800)
+    print(
+        '[!] The shared report image was pulled, but it is not compatible with the '
+        'unchanged reportServer.py Docker invocation. Native WeasyPrint remains the fallback.\n'
+        + detail
+    )
     return False
 
 def _write_docker_launcher(name: str, image: str, extra_args: tuple[str, ...]=()) -> Path:
@@ -805,7 +821,7 @@ def write_runtime_config(status: dict[str, str | None]) -> None:
         if path.exists():
             status_directories.append(str(path.parent))
     directories = configure_path() + status_directories
-    payload = {'schema_version': 3, 'generated_at': datetime.now(timezone.utc).isoformat(), 'project_root': str(ROOT), 'python_executable': sys.executable, 'platform': platform.platform(), 'machine': platform.machine(), 'tool_directories': list(dict.fromkeys(directories)), 'executables': status, 'idor_forge': dict(_IDOR_FORGE_STATE) if _IDOR_FORGE_STATE else {'repository': IDOR_FORGE_REPOSITORY, 'directory': str(IDOR_FORGE_DIR), 'python': str(IDOR_FORGE_DIR / '.venv' / ('Scripts/python.exe' if os.name == 'nt' else 'bin/python'))}, 'mcp_transport': 'streamable_http', 'mcp_http': {'host': '127.0.0.1', 'path': '/mcp', 'services': {name: mcp_http_url(name) for name in MCP_SERVER_PORTS}}, 'playwright_chromium': {'ready': _playwright_chromium_ready()[0], 'interpreter': sys.executable}, 'nikto_perl': str(Path(find_perl()).resolve()) if find_perl() else '', 'nikto_script': str((LOCAL_OPT / 'nikto' / 'program' / 'nikto.pl').resolve()), 'nikto_image': NIKTO_DOCKER_IMAGE, 'nikto_execution_mode': 'docker_official_image' if _docker_image_ready(NIKTO_DOCKER_IMAGE) else 'native_perl', 'nuclei_image': NUCLEI_DOCKER_IMAGE if _NUCLEI_ENGINE_STATE.get('execution_mode') == 'docker_official_image' else '', 'nuclei_execution_mode': str(_NUCLEI_ENGINE_STATE.get('execution_mode') or 'native'), 'nuclei_engine': dict(_NUCLEI_ENGINE_STATE), 'report_docker_image': REPORT_DOCKER_IMAGE if _docker_image_ready(REPORT_DOCKER_IMAGE) else '', 'report_execution_mode': 'docker_local_image' if _docker_image_ready(REPORT_DOCKER_IMAGE) else 'native_weasyprint', 'nuclei_templates': dict(_NUCLEI_TEMPLATE_STATE) if _NUCLEI_TEMPLATE_STATE else {'count': _filesystem_nuclei_template_count()[0], 'directory': _best_nuclei_template_directory(), 'directories': _filesystem_nuclei_template_count()[1], 'filesystem_candidates': _filesystem_nuclei_template_inventory(), 'minimum_expected': NUCLEI_TEMPLATE_MINIMUM}}
+    payload = {'schema_version': 3, 'generated_at': datetime.now(timezone.utc).isoformat(), 'project_root': str(ROOT), 'python_executable': sys.executable, 'platform': platform.platform(), 'machine': platform.machine(), 'tool_directories': list(dict.fromkeys(directories)), 'executables': status, 'idor_forge': dict(_IDOR_FORGE_STATE) if _IDOR_FORGE_STATE else {'repository': IDOR_FORGE_REPOSITORY, 'directory': str(IDOR_FORGE_DIR), 'python': str(IDOR_FORGE_DIR / '.venv' / ('Scripts/python.exe' if os.name == 'nt' else 'bin/python'))}, 'mcp_transport': 'streamable_http', 'mcp_http': {'host': '127.0.0.1', 'path': '/mcp', 'services': {name: mcp_http_url(name) for name in MCP_SERVER_PORTS}}, 'playwright_chromium': {'ready': _playwright_chromium_ready()[0], 'interpreter': sys.executable}, 'nikto_perl': str(Path(find_perl()).resolve()) if find_perl() else '', 'nikto_script': str((LOCAL_OPT / 'nikto' / 'program' / 'nikto.pl').resolve()), 'nikto_image': NIKTO_DOCKER_IMAGE, 'nikto_execution_mode': 'docker_official_image' if _docker_image_ready(NIKTO_DOCKER_IMAGE) else 'native_perl', 'nuclei_image': NUCLEI_DOCKER_IMAGE if _NUCLEI_ENGINE_STATE.get('execution_mode') == 'docker_official_image' else '', 'nuclei_execution_mode': str(_NUCLEI_ENGINE_STATE.get('execution_mode') or 'native'), 'nuclei_engine': dict(_NUCLEI_ENGINE_STATE), 'report_docker_image': REPORT_DOCKER_IMAGE if _docker_image_ready(REPORT_DOCKER_IMAGE) else '', 'report_docker_source_image': REPORT_DOCKER_SOURCE_IMAGE, 'report_execution_mode': 'docker_registry_alias' if _docker_image_ready(REPORT_DOCKER_IMAGE) else 'native_weasyprint', 'nuclei_templates': dict(_NUCLEI_TEMPLATE_STATE) if _NUCLEI_TEMPLATE_STATE else {'count': _filesystem_nuclei_template_count()[0], 'directory': _best_nuclei_template_directory(), 'directories': _filesystem_nuclei_template_count()[1], 'filesystem_candidates': _filesystem_nuclei_template_inventory(), 'minimum_expected': NUCLEI_TEMPLATE_MINIMUM}}
     RUNTIME_FILE.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding='utf-8')
     print(f'[+] Runtime scanner configuration written: {RUNTIME_FILE}')
 

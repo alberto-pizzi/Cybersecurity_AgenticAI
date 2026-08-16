@@ -18,17 +18,17 @@ NIKTO_IMAGE = "ghcr.io/sullo/nikto:latest"
 PROFILES: dict[str, dict[str, Any]] = {
     "fast": {"tuning": "123b", "cgi": "none", "display": "VP", "minimum": 20},
     "balanced": {"tuning": "x6", "cgi": "none", "display": "VP", "minimum": 80},
-    "deep": {"tuning": "x6", "cgi": "all", "display": "VP", "minimum": 200},
+    "deep": {"tuning": "x6", "cgi": "/cgi-bin/ /cgi/", "display": "VP", "minimum": 200},
 }
 
-
+# Validate the scan profile and return its bounded execution settings.
 def _profile(value: str) -> tuple[str, dict[str, Any]]:
     name = str(value or "balanced").strip().lower()
     if name not in PROFILES:
         name = "balanced"
     return name, PROFILES[name]
 
-
+# Process cookie args for authenticated scanner requests and session analysis.
 def _cookie_args(cookies: str) -> list[str]:
     if not str(cookies or "").strip():
         return ["-nocookies"]
@@ -39,11 +39,11 @@ def _cookie_args(cookies: str) -> list[str]:
         encoded.append(f'"{name}={value}"')
     return ["-Option", f"STATIC-COOKIE={';'.join(encoded)};"]
 
-
+# Redact sensitive cookie values from Nikto command and diagnostic metadata.
 def _redact(command: list[str]) -> list[str]:
     return ["STATIC-COOKIE=<redacted>" if str(v).startswith("STATIC-COOKIE=") else str(v) for v in command]
 
-
+# Collect a lightweight HTTP baseline used to validate Nikto coverage and server metadata.
 def _baseline(target_url: str, cookies: str) -> dict[str, Any]:
     headers = {"Cookie": cookies, "Cache-Control": "no-cache"} if cookies else {"Cache-Control": "no-cache"}
     try:
@@ -59,19 +59,52 @@ def _baseline(target_url: str, cookies: str) -> dict[str, Any]:
         "server": server, "missing_security_headers": missing, "signal_count": len(missing) + bool(server),
     }
 
+NEGATIVE_INFORMATION_PATTERNS = (
+    "no cgi directories found",
+    "no web server found",
+    "no interesting",
+)
 
+# Keep version numbers intact while shortening long Nikto messages.
+def _title(message: str) -> str:
+
+    value = re.sub(r"\s+", " ", str(message or "")).strip()
+    if not value:
+        return "Nikto web-server finding"
+    first = re.split(r"(?<=[.!?])\s+", value, maxsplit=1)[0].strip()
+    return first[:140] or "Nikto web-server finding"
+
+# Map scanner evidence to the normalized severity used by reporting and deduplication.
 def _risk(message: str) -> str:
     low = message.lower()
-    if any(v in low for v in ("shellshock", "remote code", "command execution", "sql injection", "file upload")):
+    if any(value in low for value in NEGATIVE_INFORMATION_PATTERNS):
+        return "info"
+    if any(value in low for value in ("shellshock", "remote code", "command execution", "sql injection", "file upload")):
         return "high"
-    if any(v in low for v in ("x-frame-options", "x-content-type-options", "content-security-policy", "referrer-policy", "information disclosure", "directory indexing", "allowed http methods")):
+    if any(value in low for value in (
+        "x-frame-options", "x-content-type-options", "content-security-policy", "referrer-policy",
+        "information disclosure", "directory indexing", "allowed http methods",
+    )):
         return "low"
-    return "medium" if any(v in low for v in ("outdated", "vulnerable", "exposed", "found", "retrieved")) else "info"
+    if any(value in low for value in (
+        "outdated", "vulnerable", "exposed", "retrieved", "file found", "default file",
+        "admin login", "phpinfo", "backup", "gitignore", "source code",
+    )):
+        return "medium"
+    return "info"
 
-
+# Map the detected issue to concise remediation guidance for the normalized finding.
 def _guidance(message: str) -> tuple[str, str]:
     low = message.lower()
-    if "header" in low or any(v in low for v in ("x-frame-options", "content-security-policy", "referrer-policy")):
+    if any(value in low for value in NEGATIVE_INFORMATION_PATTERNS):
+        return (
+            "This is a scanner status/inventory message and does not establish a security weakness.",
+            "No remediation is required for this informational result.",
+        )
+    if "header" in low or any(value in low for value in (
+        "x-frame-options", "content-security-policy", "referrer-policy",
+        "strict-transport-security", "permissions-policy",
+    )):
         return "Missing or weak response headers can reduce browser-side hardening.", "Configure the indicated security header with an application-appropriate policy."
     if "directory" in low or "file" in low:
         return "Exposed server paths or files may disclose sensitive implementation details or data.", "Remove unnecessary public files and restrict access to sensitive paths."
@@ -79,7 +112,25 @@ def _guidance(message: str) -> tuple[str, str]:
         return "Version disclosure or outdated components can help attackers select known exploits.", "Update supported server components and reduce unnecessary version disclosure."
     return "The reported server behaviour may increase attack surface depending on deployment context.", "Review the affected endpoint and apply the remediation recommended by the upstream Nikto finding."
 
+# Convert one Nikto record into a normalized candidate or observation.
+def _finding(message: str, target_url: str, method: str, uri: str = "", reference: str = "", source: str = "csv") -> dict[str, Any]:
+    risk = _risk(message)
+    impact, solution = _guidance(message)
+    url = uri if uri.startswith(("http://", "https://")) else urljoin(target_url.rstrip("/") + "/", uri.lstrip("/"))
+    return {
+        "alert": _title(message), "risk": risk, "category": "observation" if risk == "info" else "candidate",
+        "verification_status": "hardening-observation" if risk == "info" else ("nikto-structured-candidate" if source == "csv" else "nikto-console-candidate"),
+        "confidence": "medium", "description": f"Nikto reported: {message}", "impact": impact, "solution": solution,
+        "url": url or target_url, "method": method or "GET", "reference": reference,
+        "references": [reference] if reference else [],
+        "technical_details": (
+            f"Parsed from Nikto's official CSV report; method={method or 'not specified'}."
+            if source == "csv" else "Parsed from Nikto console output because no usable CSV findings were available."
+        ),
+        "evidence": message, "parser_sources": [source],
+    }
 
+# Parse csv into normalized data used by the scanner wrapper.
 def _parse_csv(path: Path, target_url: str) -> list[dict[str, Any]]:
     findings: list[dict[str, Any]] = []
     if not path.is_file():
@@ -89,59 +140,80 @@ def _parse_csv(path: Path, target_url: str) -> list[dict[str, Any]]:
             if len(row) < 7 or not row or row[0].strip().lower().startswith(("nikto", "host")):
                 continue
             reference, method, uri, message = row[3].strip(), row[4].strip(), row[5].strip(), row[6].strip()
-            if not message:
-                continue
-            risk = _risk(message); impact, solution = _guidance(message)
-            url = uri if uri.startswith(("http://", "https://")) else urljoin(target_url.rstrip("/") + "/", uri.lstrip("/"))
-            findings.append({
-                "alert": message.split(".", 1)[0].strip()[:140] or "Nikto web-server finding", "risk": risk,
-                "category": "observation" if risk == "info" else "candidate",
-                "verification_status": "hardening-observation" if risk == "info" else "nikto-structured-candidate",
-                "confidence": "medium", "description": f"Nikto reported: {message}", "impact": impact, "solution": solution,
-                "url": url or target_url, "method": method, "reference": reference, "references": [reference] if reference else [],
-                "technical_details": f"Parsed from Nikto's official CSV report; method={method or 'not specified'}.",
-                "evidence": message, "parser_sources": ["csv"],
-            })
+            if message and not any(value in message.lower() for value in NEGATIVE_INFORMATION_PATTERNS):
+                findings.append(_finding(message, target_url, method, uri, reference, "csv"))
     return findings
 
-
+# Parse console into normalized data used by the scanner wrapper.
 def _parse_console(text: str, target_url: str) -> list[dict[str, Any]]:
-    findings = []
+    findings: list[dict[str, Any]] = []
     for raw in str(text or "").splitlines():
         line = raw.strip()
         if not line.startswith("+"):
             continue
         message = line.lstrip("+ ").strip()
         low = message.lower()
-        if not message or any(low.startswith(v) for v in ("target ip:", "target hostname:", "target port:", "start time:", "end time:", "server:", "error:")):
+        if not message or any(low.startswith(value) for value in (
+            "target ip:", "target hostname:", "target port:", "start time:", "end time:", "server:", "error:",
+        )) or any(value in low for value in NEGATIVE_INFORMATION_PATTERNS):
             continue
-        if any(v in low for v in ("host(s) tested", "item(s) reported", "requests:", "unknown option", "permission denied", "unable to connect", "connection refused")):
+        if any(value in low for value in (
+            "host(s) tested", "item(s) reported", "requests:", "unknown option",
+            "permission denied", "unable to connect", "connection refused",
+        )):
             continue
         uri_match = re.match(r"(/[^: ]*)\s*:\s*(.*)", message)
         uri, description = (uri_match.group(1), uri_match.group(2)) if uri_match else ("", message)
-        risk = _risk(description); impact, solution = _guidance(description)
-        findings.append({
-            "alert": description.split(".", 1)[0][:140] or "Nikto finding", "risk": risk,
-            "category": "observation" if risk == "info" else "candidate", "verification_status": "nikto-console-candidate",
-            "confidence": "medium", "description": f"Nikto reported: {description}", "impact": impact, "solution": solution,
-            "url": urljoin(target_url.rstrip("/") + "/", uri.lstrip("/")) if uri else target_url, "method": "GET",
-            "technical_details": "Parsed from Nikto console output.", "evidence": message, "parser_sources": ["console"],
-        })
+        findings.append(_finding(description, target_url, "GET", uri, source="console"))
     return findings
 
+# Collapse only known Nikto wording aliases that describe the same issue.
+def _semantic_issue_family(text: str) -> str:
 
-def _dedupe(groups: list[list[dict[str, Any]]]) -> tuple[list[dict[str, Any]], int]:
-    result, seen, raw = [], set(), 0
-    for group in groups:
-        raw += len(group)
-        for item in group:
-            key = (str(item.get("url") or ""), str(item.get("alert") or "").lower(), str(item.get("method") or ""))
-            if key not in seen:
-                seen.add(key); result.append(item)
-    return result, raw - len(result)
+    low = re.sub(r"\s+", " ", str(text or "")).strip().lower()
+    header_aliases = {
+        "x-content-type-options": "missing-header:x-content-type-options",
+        "content-security-policy": "missing-header:content-security-policy",
+        "referrer-policy": "missing-header:referrer-policy",
+        "strict-transport-security": "missing-header:strict-transport-security",
+        "permissions-policy": "missing-header:permissions-policy",
+        "x-frame-options": "missing-header:x-frame-options",
+    }
+    if any(token in low for token in ("not set", "missing", "not defined")):
+        for token, family in header_aliases.items():
+            if token in low:
+                return family
+    return ""
 
+# Build a semantic deduplication key for equivalent Nikto wording variants.
+def _semantic_key(item: dict[str, Any]) -> tuple[str, str, str]:
+    evidence = re.sub(r"\s+", " ", str(item.get("evidence") or item.get("description") or "")).strip().lower()
+    evidence = re.sub(r"^/[^:\s]*\s*:\s*", "", evidence)
+    family = _semantic_issue_family(evidence)
+    return str(item.get("url") or "").rstrip("/"), str(item.get("method") or "GET").upper(), family or evidence
 
+# Remove duplicate scanner results while preserving distinct evidence and affected targets.
+def _dedupe(findings: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], int]:
+    result: list[dict[str, Any]] = []
+    positions: dict[tuple[str, str, str], int] = {}
+    for item in findings:
+        key = _semantic_key(item)
+        if key not in positions:
+            positions[key] = len(result)
+            result.append(item)
+            continue
+        current = result[positions[key]]
+        current["parser_sources"] = list(dict.fromkeys([
+            *current.get("parser_sources", []), *item.get("parser_sources", []),
+        ]))
+        current["references"] = list(dict.fromkeys([
+            *current.get("references", []), *item.get("references", []),
+        ]))
+    return result, len(findings) - len(result)
+
+# Calculate parser and coverage metrics used to validate the scanner result quality.
 def _metrics(text: str) -> dict[str, int]:
+    # Normalize one CSV field value while tolerating missing or malformed rows.
     def value(pattern: str) -> int:
         match = re.search(pattern, text, re.I)
         return int(match.group(1)) if match else 0
@@ -150,7 +222,7 @@ def _metrics(text: str) -> dict[str, int]:
         "hosts_tested": value(r"(\d+)\s+host\(s\) tested"), "errors": value(r"(\d+)\s+error\(s\)"),
     }
 
-
+# Build the upstream command for the current scan configuration.
 def _command(target_url: str, cookies: str, profile: dict[str, Any], timeout: int, work: Path, force_docker: bool = False) -> tuple[list[str], Path, str]:
     runtime = load_runtime_config()
     report = work / "nikto.csv"
@@ -177,7 +249,7 @@ def _command(target_url: str, cookies: str, profile: dict[str, Any], timeout: in
         return [perl, script, *common], report, "official_native_perl"
     return ["nikto", *common], report, "official_native_cli"
 
-
+# Run Nikto and guarantee cleanup of any named Docker container on exit.
 def _execute(command: list[str], target_url: str, timeout: int) -> dict[str, Any]:
     container_name = ""
     if command and Path(command[0]).name.lower() in {"docker", "docker.exe"} and "--name" in command:
@@ -190,14 +262,13 @@ def _execute(command: list[str], target_url: str, timeout: int) -> dict[str, Any
         if container_name:
             cleanup_docker_container(container_name)
 
-
+# Run the official Nikto scanner and consume its structured CSV report.
 @mcp.tool()
 def run_nikto_scan(target_url: str, cookies: str = "", timeout: int = 180, scan_profile: str = "balanced") -> dict:
-    """Run the official Nikto scanner and consume its structured CSV report."""
+
     timeout = max(60, min(int(timeout), 600))
     scan_profile, profile = _profile(scan_profile)
-    # The Python probe is diagnostic only. A temporarily busy target must not prevent
-    # the official scanner (or its Docker fallback) from getting its own chance to run.
+
     baseline = _baseline(target_url, cookies)
     try:
         parse_cookie_header(cookies)
@@ -219,18 +290,29 @@ def run_nikto_scan(target_url: str, cookies: str = "", timeout: int = 180, scan_
                 result, command, fallback_used = retry, docker_command, True
         text = "\n".join(str(result.get(k, "")) for k in ("stdout", "stderr", "output"))
         csv_findings = _parse_csv(report, target_url)
-        console_findings = _parse_console(text, target_url)
-        findings, duplicates = _dedupe([csv_findings, console_findings])
+        console_findings = [] if csv_findings else _parse_console(text, target_url)
+        primary = csv_findings or console_findings
+        findings, duplicates = _dedupe(primary)
+        parser_source = "csv" if csv_findings else "console"
         metrics = _metrics(text)
         report_bytes = report.stat().st_size if report.is_file() else 0
+        parsed_source_count = len(primary)
+        declared_count = metrics["items_reported"]
+        parser_count_consistent = declared_count <= 0 or declared_count == parsed_source_count
         coverage_verified = result.get("status") == "success" and (metrics["requests"] > 0 or report_bytes > 0)
         common = {
             "vulnerabilities": findings, "execution_mode": mode, "scan_profile": scan_profile, "plugins": "official-default",
             "safe_tuning": profile["tuning"], "cgi_dirs": profile["cgi"], "baseline_probe": baseline, "scan_metrics": metrics,
-            "raw_parsed_findings": len(csv_findings) + len(console_findings), "cross_source_duplicates_removed": duplicates,
-            "parser_count_consistent": True, "coverage_verified": coverage_verified, "zero_result_verified": coverage_verified and not findings,
-            "structured_report": {"copied": report.is_file(), "bytes": report_bytes, "console_only": not report.is_file(), "path": str(report) if report.is_file() else "", "attempts": []},
-            "structured_retry": {"used": fallback_used, "reason": "native_to_official_docker" if fallback_used else ""}, "docker_create": {"return_code": result.get("return_code")},
+            "raw_parsed_findings": parsed_source_count, "cross_source_duplicates_removed": 0, "duplicates_removed": duplicates,
+            "parser_source": parser_source, "console_fallback": not bool(csv_findings),
+            "parser_count_consistent": parser_count_consistent, "coverage_verified": coverage_verified,
+            "zero_result_verified": coverage_verified and not findings,
+            "structured_report": {
+                "copied": report.is_file(), "bytes": report_bytes, "console_only": not bool(csv_findings),
+                "path": "", "ephemeral": True, "parsed": bool(csv_findings), "attempts": [],
+            },
+            "structured_retry": {"used": fallback_used, "reason": "native_to_official_docker" if fallback_used else ""},
+            "docker_create": {"return_code": result.get("return_code")},
             "docker_state": {"available": mode == "official_docker_image", "ExitCode": result.get("return_code"), "Error": ""},
             "command": _redact(list(result.get("command") or command)), "duration_seconds": result.get("duration_seconds"),
             "stdout": str(result.get("stdout", ""))[-12000:], "stderr": str(result.get("stderr", ""))[-12000:],
@@ -241,7 +323,6 @@ def run_nikto_scan(target_url: str, cookies: str = "", timeout: int = 180, scan_
             out = failure("Nikto", target_url, str(result.get("output") or "Nikto execution failed."), diagnosis=str(result.get("diagnosis") or "nikto_execution_failed"))
             out.update(common); return trim_process_output(out, 12000)
         return success("Nikto", target_url, f"Official Nikto scan completed. Findings: {len(findings)}; requests={metrics['requests']}; profile={scan_profile}.", timed_out=False, time_limit_reached=False, **common)
-
 
 if __name__ == "__main__":
     _serve()

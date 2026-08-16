@@ -32,6 +32,7 @@ AUTHZ_PARAMETER_RE = re.compile(
     re.I,
 )
 
+# Score request contracts so authorization-sensitive endpoints are checked first.
 def _authorization_relevance(target_url: str, parameters: list[str] | None) -> tuple[int, list[str]]:
     parsed = urlparse(target_url)
     reasons: list[str] = []
@@ -54,6 +55,7 @@ def _authorization_relevance(target_url: str, parameters: list[str] | None) -> t
         score += 25
     return score, reasons
 
+# Issue a read-only GET for one identity while keeping the request bounded and same-origin.
 def _safe_get(url: str, cookies: str, timeout: int) -> tuple[requests.Response | None, str]:
     session = requests.Session()
     session.headers.update({
@@ -93,6 +95,7 @@ def _safe_get(url: str, cookies: str, timeout: int) -> tuple[requests.Response |
     response.url = current
     return response, "redirect_limit"
 
+# Build a compact summary used for differential checks and execution diagnostics.
 def _summary(response: requests.Response | None, guard: str) -> dict[str, Any]:
     if response is None:
         return {"available": False, "guard": guard}
@@ -104,6 +107,7 @@ def _summary(response: requests.Response | None, guard: str) -> dict[str, Any]:
         "content_type": str(response.headers.get("Content-Type") or ""),
     }
 
+# Measure response similarity to support bounded authorization and differential checks.
 def _similarity(left: requests.Response, right: requests.Response) -> float:
     if left.content == right.content:
         return 1.0
@@ -113,6 +117,7 @@ def _similarity(left: requests.Response, right: requests.Response) -> float:
         return 1.0
     return SequenceMatcher(None, left_text, right_text).ratio()
 
+# Compare access to determine whether the expected access behavior is present.
 def _matching_access(
     primary: requests.Response, alternate: requests.Response,
 ) -> tuple[bool, float, float]:
@@ -131,6 +136,7 @@ def _matching_access(
     )
     return accepted, similarity, length_ratio
 
+# Convert scanner evidence into a normalized security finding.
 def _finding(
     target_url: str, alternate_label: str, primary: requests.Response, alternate: requests.Response,
     similarity: float, length_ratio: float,
@@ -170,12 +176,13 @@ def _finding(
         "owasp_category": "A01:2021 Broken Access Control", "cwe_id": "639" if not anonymous else "862",
     }
 
+# Compare a read-only GET under primary, secondary and anonymous identities.
 @mcp.tool()
 def run_authorization_scan(
     target_url: str, cookies: str = "", secondary_cookies: str = "", method: str = "GET",
     data: str = "", parameters: list[str] | None = None, timeout: int = 30,
 ) -> dict:
-    """Compare a read-only GET under primary, secondary and anonymous identities."""
+
     method = str(method or "GET").upper()
     if method != "GET":
         return skipped(

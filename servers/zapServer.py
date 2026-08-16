@@ -25,12 +25,12 @@ mcp, _serve = service("OWASP ZAP Scanner", "zap")
 COOKIE_RULE_NAME = "secops-auth-cookie"
 DESTRUCTIVE_PATH_WORDS = ("logout", "reset", "delete", "destroy", "setup", "security")
 
-
+# Check whether a discovered URL is an in-scope HTTP target suitable for ZAP.
 def _valid_url(value: str) -> bool:
     parsed = urlparse(str(value or ""))
     return parsed.scheme in {"http", "https"} and bool(parsed.netloc)
 
-
+# List Docker networks so ZAP can reach containerized local targets reliably.
 def _docker_networks(container: str) -> set[str]:
     if not shutil.which("docker"):
         return set()
@@ -44,7 +44,7 @@ def _docker_networks(container: str) -> set[str]:
     except Exception:
         return set()
 
-
+# Translate the external target into the address reachable from the ZAP container.
 def _zap_target(target_url: str) -> tuple[str, dict[str, Any]]:
     parsed = urlparse(target_url)
     details: dict[str, Any] = {"external_target": target_url, "translated": False, "mode": "unchanged"}
@@ -65,21 +65,21 @@ def _zap_target(target_url: str) -> tuple[str, dict[str, Any]]:
     details.update(translated=True, mode="docker_desktop_host_gateway", zap_target=internal, container_alias="host.docker.internal")
     return internal, details
 
-
+# Translate internal scanner URLs back to the externally reported target form.
 def _translate(url: str, external_base: str, internal_base: str) -> str:
     cur, ext, internal = urlparse(str(url or "")), urlparse(external_base), urlparse(internal_base)
     if (cur.scheme.lower(), cur.hostname, cur.port) == (ext.scheme.lower(), ext.hostname, ext.port):
         return urlunparse(cur._replace(scheme=internal.scheme, netloc=internal.netloc))
     return url
 
-
+# Rewrite ZAP-internal URLs back to the externally reported target origin.
 def _externalize(url: str, internal_base: str, external_base: str) -> str:
     cur, internal, ext = urlparse(str(url or "")), urlparse(internal_base), urlparse(external_base)
     if (cur.scheme.lower(), cur.hostname, cur.port) == (internal.scheme.lower(), internal.hostname, internal.port):
         return urlunparse(cur._replace(scheme=ext.scheme, netloc=ext.netloc))
     return url
 
-
+# Create the official ZAP API client for the configured daemon endpoint.
 def _client(zap_url: str, api_key: str) -> tuple[ZAPv2, str]:
     try:
         import zapv2
@@ -92,14 +92,14 @@ def _client(zap_url: str, api_key: str) -> tuple[ZAPv2, str]:
     except TypeError:
         return ZAPv2(**kwargs), version
 
-
+# Process remove cookie rule for authenticated scanner requests and session analysis.
 def _remove_cookie_rule(zap: ZAPv2) -> None:
     try:
         zap.replacer.remove_rule(COOKIE_RULE_NAME)
     except Exception:
         pass
 
-
+# Configure cookie so the upstream scanner follows the requested scope and session.
 def _configure_cookie(zap: ZAPv2, cookies: str) -> dict[str, Any]:
     _remove_cookie_rule(zap)
     if not cookies:
@@ -113,7 +113,7 @@ def _configure_cookie(zap: ZAPv2, cookies: str) -> dict[str, Any]:
     except Exception as exc:
         return {"supported": False, "configured": False, "reason": f"{type(exc).__name__}: {exc}"}
 
-
+# Configure http sessions so the upstream scanner follows the requested scope and session.
 def _configure_http_sessions(zap: ZAPv2, target: str, cookie_pairs: list[tuple[str, str]]) -> dict[str, Any]:
     if not cookie_pairs:
         return {"supported": True, "configured": False, "anonymous_profile": True}
@@ -136,7 +136,7 @@ def _configure_http_sessions(zap: ZAPv2, target: str, cookie_pairs: list[tuple[s
     except Exception as exc:
         return {"supported": False, "configured": False, "reason": f"{type(exc).__name__}: {exc}"}
 
-
+# Read installed ZAP active scanner metadata for targeted rule selection.
 def _scanner_inventory(zap: ZAPv2) -> list[dict[str, Any]]:
     try:
         value = zap.ascan.scanners
@@ -145,17 +145,17 @@ def _scanner_inventory(zap: ZAPv2) -> list[dict[str, Any]]:
     except Exception:
         return []
 
-
+# Resolve one ZAP active rule identifier from its metadata.
 def _scanner_id(item: dict[str, Any]) -> str:
     return str(item.get("id") or item.get("pluginId") or item.get("pluginid") or "").strip()
 
-
+# Resolve a readable ZAP scanner name for coverage diagnostics.
 def _scanner_name(item: dict[str, Any]) -> str:
     return str(item.get("name") or item.get("pluginName") or item.get("description") or "").strip()
 
-
+# Classify installed ZAP rules using the official scanner inventory.
 def _rule_tags(scanner_id: str, scanner_name: str) -> set[str]:
-    """Classify installed ZAP rules using the official scanner inventory."""
+
     text = scanner_name.lower()
     tags: set[str] = set()
     if "sql injection" in text or scanner_id in {"40018", "40019", "40020", "40021", "40022", "40027"}:
@@ -168,7 +168,7 @@ def _rule_tags(scanner_id: str, scanner_name: str) -> set[str]:
         tags.add("traversal")
     return tags
 
-
+# Select the active ZAP rule family appropriate for one vulnerability request case.
 def _rules_for_case(case: dict[str, Any], scanners: list[dict[str, Any]]) -> list[str]:
     case_class = str(case.get("zap_case_class") or "other")
     matched = [sid for item in scanners if (sid := _scanner_id(item)) and case_class in _rule_tags(sid, _scanner_name(item))]
@@ -183,13 +183,80 @@ def _rules_for_case(case: dict[str, Any], scanners: list[dict[str, Any]]) -> lis
     installed = {_scanner_id(item) for item in scanners}
     return [sid for sid in fallback if sid in installed]
 
+# Curated injection rule union for generic deep GET request contracts.
+def _deep_generic_rules(scanners: list[dict[str, Any]]) -> list[str]:
 
+    allowed = {"sqli", "sqli_blind", "xss_reflected", "command", "traversal"}
+    matched: list[str] = []
+    for item in scanners:
+        sid = _scanner_id(item)
+        if sid and (_rule_tags(sid, _scanner_name(item)) & allowed):
+            matched.append(sid)
+    return list(dict.fromkeys(matched))
+
+# Build the native active-scan plan without repeating identical rule families.
 def _native_plan(targeted: list[dict[str, Any]], case_rules: dict[str, list[str]], scan_mode: str) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[str]]:
-    deferred = [case for case in targeted if scan_mode == "prioritized" and case.get("zap_case_class") == "xss_stored"]
-    native = [case for case in targeted if case not in deferred and case_rules.get(str(case.get("url") or ""))]
+
+    deferred: list[dict[str, Any]] = []
+    eligible: list[dict[str, Any]] = []
+    for case in targeted:
+        rules = case_rules.get(str(case.get("url") or ""), [])
+        if not rules:
+            continue
+        if scan_mode == "prioritized" and case.get("zap_case_class") == "xss_stored":
+            item = dict(case)
+            item["zap_defer_reason"] = (
+                "persistent XSS native rule deferred to the dedicated browser verifier; "
+                "the ZAP rule re-spiders the application and can starve later scanners"
+            )
+            deferred.append(item)
+        else:
+            eligible.append(case)
+
+    if scan_mode != "prioritized":
+        native = eligible
+    else:
+        priority = {"xss_reflected": 0, "sqli_blind": 1, "command": 2, "traversal": 3, "sqli": 4}
+        native, representative = [], {}
+        for case in sorted(eligible, key=lambda value: priority.get(str(value.get("zap_case_class") or ""), 9)):
+            signature = tuple(sorted(case_rules.get(str(case.get("url") or ""), [])))
+            if signature in representative:
+                item = dict(case)
+                item["zap_defer_reason"] = f"same installed ZAP active-rule set already covered by {representative[signature].get('url', '')}; endpoint remains proxy/specialist verified"
+                deferred.append(item)
+                continue
+            representative[signature] = case
+            native.append(case)
+
     rule_ids = sorted({sid for case in native for sid in case_rules.get(str(case.get("url") or ""), [])})
     return native, deferred, rule_ids
 
+# Count prioritized cases covered either by a completed native scan or a confirmed proxy verifier.
+def _effective_targeted_count(targeted_results: list[dict[str, Any]], proxy_diagnostics: list[dict[str, Any]]) -> int:
+
+    proxy_type_for_class = {
+        "xss_reflected": "xss", "xss_stored": "xss", "sqli": "sqli", "sqli_blind": "sqli",
+        "command": "command_injection", "traversal": "traversal",
+    }
+    proxy_confirmed: set[tuple[str, str]] = set()
+    for record in proxy_diagnostics:
+        if not isinstance(record, dict):
+            continue
+        record_url = str(record.get("url") or "")
+        for test in record.get("tests") or []:
+            if isinstance(test, dict) and test.get("confirmed"):
+                proxy_confirmed.add((record_url, str(test.get("type") or "")))
+    covered = 0
+    for item in targeted_results:
+        if not item.get("started", True):
+            continue
+        case_class = str(item.get("case_class") or "")
+        test_type = proxy_type_for_class.get(case_class, "")
+        if item.get("completed") or (test_type and (str(item.get("url") or ""), test_type) in proxy_confirmed):
+            covered += 1
+    return covered
+
+# Configure active rules so the upstream scanner follows the requested scope and session.
 def _configure_active_rules(zap: ZAPv2, scanner_ids: list[str], strength: str) -> list[str]:
     errors: list[str] = []
     try:
@@ -208,7 +275,7 @@ def _configure_active_rules(zap: ZAPv2, scanner_ids: list[str], strength: str) -
                 errors.append(f"strength {scanner_id}: {type(exc).__name__}: {exc}")
     return errors
 
-
+# Stop active scans cleanly so later scanner phases are not affected.
 def _stop_active_scans(zap: ZAPv2, scan_ids: list[str]) -> dict[str, Any]:
     stopped, errors = [], []
     for scan_id in dict.fromkeys(v for v in scan_ids if v):
@@ -222,9 +289,9 @@ def _stop_active_scans(zap: ZAPv2, scan_ids: list[str]) -> dict[str, Any]:
         errors.append(f"stop_all_scans: {type(exc).__name__}: {exc}")
     return {"stopped_scan_ids": stopped, "errors": errors}
 
-
+# Wait for the application after ZAP load; transport failure is not logout.
 def _wait_target_recovery(url: str, cookies: str, seconds: int = 20) -> dict[str, Any]:
-    """Wait for the application after ZAP load; transport failure is not logout."""
+
     deadline, attempts, errors = time.monotonic() + max(3, seconds), 0, []
     while time.monotonic() < deadline:
         attempts += 1
@@ -237,7 +304,7 @@ def _wait_target_recovery(url: str, cookies: str, seconds: int = 20) -> dict[str
         time.sleep(1)
     return {"recovered": False, "attempts": attempts, "conclusive": False, "transient_error": True, "errors": errors[-5:]}
 
-
+# Configure context so the upstream scanner follows the requested scope and session.
 def _configure_context(zap: ZAPv2, target: str) -> dict[str, Any]:
     name = f"secops-{int(time.time())}"
     context_id = str(zap.context.new_context(name))
@@ -263,11 +330,11 @@ def _configure_context(zap: ZAPv2, target: str) -> dict[str, Any]:
     except Exception: pass
     return {"context_name": name, "context_id": context_id, "include_regex": include, "excluded_regexes": excluded}
 
-
+# Perform safe with bounded behavior that preserves target and session safety.
 def _safe(url: str, target: str) -> bool:
     return same_origin(url, target) and not any(token in urlparse(url).path.lower() for token in DESTRUCTIVE_PATH_WORDS)
 
-
+# Replay one request through ZAP so proxy history and verifier evidence share the same session.
 def _proxy_request(zap_url: str, url: str, cookies: str, method: str = "GET", data: str = "") -> requests.Response:
     headers = {"Cache-Control": "no-cache"}
     if cookies:
@@ -277,19 +344,19 @@ def _proxy_request(zap_url: str, url: str, cookies: str, method: str = "GET", da
         proxies={"http": zap_url, "https": zap_url}, timeout=(3, 12), allow_redirects=True,
     )
 
-
+# Probe url and capture bounded evidence for verification.
 def _probe_url(target: str, seeds: list[str] | None, cases: list[dict[str, Any]] | None) -> str:
     candidates = [*(seeds or []), *(str(c.get("url") or "") for c in (cases or []) if isinstance(c, dict)), target]
     return next((u for u in candidates if _valid_url(u) and _safe(u, target) and "/login" not in urlparse(u).path.lower()), target)
 
-
+# Build a compact response summary used for differential checks and execution diagnostics.
 def _response_summary(response: requests.Response) -> dict[str, Any]:
     return {
         "status": response.status_code, "final_url": str(response.url), "login_detected": response_looks_like_login(response),
         "bytes": len(response.content), "sha256": hashlib.sha256(response.content).hexdigest(),
     }
 
-
+# Process history cookie diagnostics for authenticated scanner requests and session analysis.
 def _history_cookie_diagnostics(zap: ZAPv2, probe_url: str, pairs: list[tuple[str, str]]) -> dict[str, Any]:
     expected = {name.lower(): value for name, value in pairs}
     try:
@@ -318,7 +385,7 @@ def _history_cookie_diagnostics(zap: ZAPv2, probe_url: str, pairs: list[tuple[st
     return {"supported": True, "message_found": False, "cookie_header_present": False, "exact_values_match": False,
             "expected_cookie_names": sorted(expected), "observed_cookie_names": [], "duplicate_cookie_names": [], "unexpected_cookie_names": []}
 
-
+# Verify that the authenticated session remains usable before or after active scanning.
 def _validate_session(zap: ZAPv2, zap_url: str, external_probe: str, internal_probe: str, cookies: str, pairs: list[tuple[str, str]]) -> dict[str, Any]:
     if not cookies:
         return {"effective": True, "conclusive": True, "anonymous_profile": True, "probe_url": external_probe, "cookie_names": []}
@@ -356,7 +423,7 @@ def _validate_session(zap: ZAPv2, zap_url: str, external_probe: str, internal_pr
     )
     return result
 
-
+# Seed ZAP history and site tree with discovered in-scope URLs and request contracts.
 def _seed(zap_url: str, external: str, internal: str, cookies: str, seeds: list[str] | None, cases: list[dict[str, Any]] | None, deadline: float) -> dict[str, Any]:
     seeded_urls = seeded_cases = 0
     errors: list[str] = []
@@ -390,7 +457,7 @@ def _seed(zap_url: str, external: str, internal: str, cookies: str, seeds: list[
             errors.append(f"{method} {url}: {type(exc).__name__}: {exc}")
     return {"seeded_urls": seeded_urls, "seeded_request_cases": seeded_cases, "seed_errors": errors[:20]}
 
-
+# Poll one ZAP active scan until completion or its bounded deadline.
 def _wait(status_fn, scan_id: str, deadline: float, interval: float = 1.5) -> tuple[bool, int]:
     progress = 0
     while time.monotonic() < deadline:
@@ -403,7 +470,7 @@ def _wait(status_fn, scan_id: str, deadline: float, interval: float = 1.5) -> tu
         time.sleep(interval)
     return False, progress
 
-
+# Wait for passive to complete while respecting the configured deadline.
 def _wait_passive(zap: ZAPv2, deadline: float) -> tuple[bool, int]:
     remaining = 0
     while time.monotonic() < deadline:
@@ -416,8 +483,10 @@ def _wait_passive(zap: ZAPv2, deadline: float) -> tuple[bool, int]:
         time.sleep(1)
     return False, remaining
 
-
+# Run active scan through ZAP while enforcing the configured rule set and time budget.
 def _active_scan(zap: ZAPv2, case: dict[str, Any], external: str, internal: str, deadline: float, scanner_ids: list[str], strength: str) -> dict[str, Any]:
+    started_at = time.monotonic()
+    assigned_budget = max(0.0, deadline - started_at)
     url, method, data = str(case.get("url") or ""), str(case.get("method") or "GET").upper(), str(case.get("data") or "")
     scan_url = _translate(url, external, internal)
     case_class = str(case.get("zap_case_class") or "other")
@@ -434,11 +503,11 @@ def _active_scan(zap: ZAPv2, case: dict[str, Any], external: str, internal: str,
         if not completed:
             try: zap.ascan.stop(scan_id)
             except Exception: pass
-        return {"url": url, "scan_url": scan_url, "method": method, "scan_id": scan_id, "started": True, "completed": completed, "progress": progress, "parameters": list(case.get("parameters", [])), "case_class": case_class, "scanner_ids": scanner_ids, "configure_errors": configure_errors}
+        return {"url": url, "scan_url": scan_url, "method": method, "scan_id": scan_id, "started": True, "completed": completed, "progress": progress, "parameters": list(case.get("parameters", [])), "case_class": case_class, "scanner_ids": scanner_ids, "configure_errors": configure_errors, "budget_seconds": round(assigned_budget, 1), "elapsed_seconds": round(time.monotonic() - started_at, 2)}
     except Exception as exc:
-        return {"url": url, "scan_url": scan_url, "method": method, "started": False, "completed": False, "progress": 0, "case_class": case_class, "scanner_ids": scanner_ids, "configure_errors": configure_errors, "error": f"{type(exc).__name__}: {exc}"}
+        return {"url": url, "scan_url": scan_url, "method": method, "started": False, "completed": False, "progress": 0, "case_class": case_class, "scanner_ids": scanner_ids, "configure_errors": configure_errors, "budget_seconds": round(assigned_budget, 1), "elapsed_seconds": round(time.monotonic() - started_at, 2), "error": f"{type(exc).__name__}: {exc}"}
 
-
+# Run recursive scan through ZAP while enforcing the configured rule set and time budget.
 def _recursive_scan(zap: ZAPv2, target: str, context_id: str, deadline: float) -> dict[str, Any]:
     try:
         try:
@@ -454,11 +523,11 @@ def _recursive_scan(zap: ZAPv2, target: str, context_id: str, deadline: float) -
     except Exception as exc:
         return {"started": False, "completed": False, "progress": 0, "error": f"{type(exc).__name__}: {exc}"}
 
-
+# Map scanner evidence to the normalized severity used by reporting and deduplication.
 def _risk(value: Any) -> str:
     return {"0": "info", "1": "low", "2": "medium", "3": "high", "4": "critical"}.get(str(value), str(value or "info").lower())
 
-
+# Normalize ZAP alerts into candidates and observations used by the shared report pipeline.
 def _findings(zap: ZAPv2, internal: str, external: str, max_observations: int) -> tuple[list[dict[str, Any]], dict[str, int]]:
     raw = zap.core.alerts(baseurl=internal) or []
     security: list[dict[str, Any]] = []
@@ -493,20 +562,20 @@ def _findings(zap: ZAPv2, internal: str, external: str, max_observations: int) -
     observations = observations[:max_observations]
     return [*security, *observations], {"raw": len(raw), "security": len(security), "observations": len(observations), "returned": len(security) + len(observations), "suppressed": suppressed}
 
-
+# Drive ZAP through its official Python/JSON API; keep only project-specific verification outside ZAP.
 @mcp.tool()
 def run_zap_scan(
     target_url: str, cookies: str = "", zap_url: str = "http://127.0.0.1:8080", timeout: int = 360,
     api_key: str = "", seed_urls: list[str] | None = None, request_cases: list[dict[str, Any]] | None = None,
     diagnostic_only: bool = False, scan_mode: str = "targeted", max_observations: int = 40,
 ) -> dict:
-    """Drive ZAP through its official Python/JSON API; keep only project-specific verification outside ZAP."""
+
     if not _valid_url(target_url) or not _valid_url(zap_url):
         return failure("OWASP ZAP", target_url, "target_url and zap_url must be valid HTTP/HTTPS URLs.")
     scan_mode = str(scan_mode or "targeted").lower()
     if scan_mode not in {"passive", "targeted", "prioritized", "full"}:
         return failure("OWASP ZAP", target_url, "scan_mode must be passive, targeted, prioritized, or full.")
-    timeout, max_observations = max(45, int(timeout)), max(5, min(int(max_observations), 100))
+    timeout, max_observations = max(45, int(timeout)), max(5, min(int(max_observations), 150))
     try:
         cookies = canonical_cookie_header(cookies)
         parse_cookie_header(cookies)
@@ -547,6 +616,7 @@ def run_zap_scan(
             try: _proxy_request(zap_url, internal_probe, cookies)
             except requests.RequestException: pass
         http_sessions = _configure_http_sessions(zap, internal, parse_cookie_header(cookies))
+        # Validate authentication and seed ZAP before any active rule is allowed to mutate requests.
         before = _validate_session(zap, zap_url, probe, internal_probe, cookies, parse_cookie_header(cookies))
         before.update(replacer=replacer, http_sessions=http_sessions, zap_version=zap_version, python_zap_api_version=py_version)
         injection_ready = not cookies or replacer.get("configured") or http_sessions.get("configured")
@@ -582,13 +652,28 @@ def run_zap_scan(
                 except Exception: pass
 
         post_prepare = apply_runtime_target_preparation(target_url, cookies) if cookies else {"performed": False, "configured": False, "usable": True}
-        case_limit = 12 if scan_mode == "full" else 8 if scan_mode == "prioritized" else 6
+        case_limit = 10 if scan_mode == "full" else 8 if scan_mode == "prioritized" else 6
         targeted = [] if scan_mode == "passive" else select_cases(target_url, request_cases, case_limit)
         case_rules = {str(case.get("url") or ""): _rules_for_case(case, scanners) for case in targeted}
-        # Persistent XSS re-spiders the application. Keep that native rule for
-        # full/deep, while balanced/prioritized still runs proxy verification.
+        if scan_mode == "full":
+
+            generic_rules = _deep_generic_rules(scanners)
+            generic_used = 0
+            for case in targeted:
+                if generic_used >= 3:
+                    break
+                if str(case.get("zap_case_class") or "") != "other":
+                    continue
+                if str(case.get("method") or "GET").upper() != "GET":
+                    continue
+                if generic_rules:
+                    case["zap_case_class"] = "generic"
+                    case_rules[str(case.get("url") or "")] = generic_rules
+                    generic_used += 1
+
+        # Build a bounded native plan that maximizes rule-family coverage without redundant scans.
         native_cases, deferred_native, priority_rule_ids = _native_plan(targeted, case_rules, scan_mode)
-        if scan_mode != "full":
+        if scan_mode != "passive":
             active_policy["planned_rule_ids"] = priority_rule_ids
             active_policy["planned_rule_count"] = len(priority_rule_ids)
             planned_rules = len(priority_rule_ids)
@@ -602,12 +687,10 @@ def run_zap_scan(
         targeted_results: list[dict[str, Any]] = []
         if scan_mode != "passive":
             reserve = 50 if cookies else 30
-            active_deadline = min(deadline - reserve, time.monotonic() + max(55, timeout * (0.42 if scan_mode == "prioritized" else 0.58)))
+            active_deadline = min(deadline - reserve, time.monotonic() + max(90, timeout * (0.50 if scan_mode == "prioritized" else 0.58)))
             strength = "HIGH" if scan_mode in {"prioritized", "full"} else "MEDIUM"
-            # The reflected-XSS rule is consistently the slowest targeted rule on
-            # authenticated DVWA. Run expensive cases first and reserve a small
-            # per-case slice so fast SQLi/CMDi checks cannot consume its budget.
-            class_budget = {"xss_reflected": 55.0, "sqli_blind": 32.0, "sqli": 32.0, "command": 26.0, "traversal": 30.0}
+
+            class_budget = {"xss_reflected": 90.0, "xss_stored": 100.0, "sqli_blind": 45.0, "sqli": 45.0, "command": 35.0, "traversal": 35.0, "generic": 30.0}
             ordered_cases = list(native_cases)
             if scan_mode == "prioritized":
                 ordered_cases.sort(key=lambda c: 0 if c.get("zap_case_class") == "xss_reflected" else 1)
@@ -616,18 +699,21 @@ def run_zap_scan(
                 if now + 10 >= active_deadline:
                     break
                 remaining = ordered_cases[index + 1:]
-                reserve_after = sum(min(class_budget.get(str(item.get("zap_case_class") or ""), 22.0), 32.0) for item in remaining)
+                reserve_after = sum(class_budget.get(str(item.get("zap_case_class") or ""), 25.0) for item in remaining)
                 available = max(10.0, active_deadline - now - reserve_after)
-                preferred = class_budget.get(str(case.get("zap_case_class") or ""), 28.0)
-                per_case = min(75.0 if scan_mode == "full" else 55.0, max(20.0, min(preferred, available)))
+                preferred = class_budget.get(str(case.get("zap_case_class") or ""), 30.0)
+                per_case_cap = 100.0 if scan_mode == "full" else 90.0 if scan_mode == "prioritized" else 55.0
+                per_case = min(per_case_cap, max(20.0, min(preferred, available)))
                 targeted_results.append(_active_scan(zap, case, target_url, internal, min(active_deadline, now + per_case), case_rules.get(str(case.get("url") or ""), []), strength))
 
-        recursive = {"started": False, "completed": True, "progress": 100, "skipped": True}
-        if scan_mode == "full" and time.monotonic() + 35 < deadline - 35:
-            try: zap.ascan.enable_all_scanners()
-            except Exception: pass
-            recursive = _recursive_scan(zap, internal, context["context_id"], deadline - 35)
-            recursive["skipped"] = False
+        recursive = {
+            "started": False, "completed": True, "progress": 100, "skipped": True,
+            "reason": (
+                "recursive all-rule active scan disabled: deep uses all bounded high-value families, stored XSS, "
+                "a curated generic GET pass and full passive/site-tree coverage without monopolising the target"
+                if scan_mode == "full" else "not requested"
+            ),
+        }
 
         cleanup = _stop_active_scans(zap, [str(v.get("scan_id") or "") for v in targeted_results])
         try: zap.ascan.enable_all_scanners()
@@ -639,6 +725,7 @@ def run_zap_scan(
         phase = "session_postcheck"
         _configure_cookie(zap, cookies)
         after = _validate_session(zap, zap_url, probe, internal_probe, cookies, parse_cookie_header(cookies))
+        # Normalize native alerts and verifier evidence while keeping coverage diagnostics separate.
         findings, stats = _findings(zap, internal, target_url, max_observations)
         existing = {(str(v.get("alert") or "").lower(), str(v.get("url") or ""), str(v.get("parameter") or "").lower()) for v in findings}
         for item in proxy_findings:
@@ -653,9 +740,17 @@ def run_zap_scan(
         started_targets = sum(bool(v.get("started", True)) for v in targeted_results)
         completed_targets = sum(bool(v.get("completed")) for v in targeted_results if v.get("started", True))
         all_targeted_completed = completed_targets == started_targets
+
+        effective_completed_targets = _effective_targeted_count(targeted_results, proxy_diagnostics)
+        effective_targeted_complete = effective_completed_targets == started_targets
+
         recursive_completed = bool(recursive.get("completed"))
         timed_out = time.monotonic() >= deadline - 1
-        coverage_complete = all_targeted_completed and recursive_completed and spider_completed and passive_completed
+        native_coverage_complete = all_targeted_completed and recursive_completed and spider_completed and passive_completed
+        bounded_coverage_complete = (
+            (effective_targeted_complete if scan_mode == "prioritized" else all_targeted_completed)
+            and recursive_completed and spider_completed and passive_completed
+        )
         attempted_ids = sorted({sid for v in targeted_results if v.get("started", True) for sid in v.get("scanner_ids", [])})
         completed_ids = sorted({sid for v in targeted_results if v.get("completed") for sid in v.get("scanner_ids", [])})
         if recursive.get("started") and scan_mode == "full":
@@ -672,7 +767,8 @@ def run_zap_scan(
             "completed_rule_ids": completed_ids, "completed_rule_count": completed_rules,
             "unattempted_rule_ids": sorted(set(active_policy["planned_rule_ids"]) - set(attempted_ids)), "rule_coverage_percent": coverage,
             "effective_rule_coverage_percent": effective_coverage, "critical_targeted_started": started_targets,
-            "critical_targeted_completed": completed_targets, "coverage_complete": coverage_complete, "scan_mode": scan_mode,
+            "critical_targeted_completed": completed_targets, "effective_targeted_completed": effective_completed_targets,
+            "coverage_complete": bounded_coverage_complete, "native_coverage_complete": native_coverage_complete, "scan_mode": scan_mode,
         }
         common = {
             "vulnerabilities": findings, "zap_alert_stats": stats, "scan_mode": scan_mode, "zap_version": zap_version,
@@ -682,7 +778,9 @@ def run_zap_scan(
             "session_diagnostics": {"before_scan": before, "after_scan": after}, "context": context,
             **seed_summary, "spider_scan_id": spider_id, "spider_completed": spider_completed, "spider_progress": spider_progress,
             "targeted_active_scans": targeted_results, "targeted_active_scans_started": started_targets,
-            "targeted_active_scans_completed": completed_targets, "native_active_coverage_incomplete": not coverage_complete,
+            "targeted_active_scans_completed": completed_targets, "effective_targeted_scans_completed": effective_completed_targets,
+            "effective_targeted_scans_started": started_targets, "native_active_coverage_incomplete": not native_coverage_complete,
+            "bounded_prioritized_coverage_complete": bounded_coverage_complete,
             "active_scanner_policy": active_policy, "prioritized_native_plan": native_plan, "active_rules_planned": planned_rules,
             "active_rules_attempted": attempted_rules, "active_rules_completed": completed_rules, "active_rule_coverage_percent": coverage,
             "active_rule_effective_coverage_percent": effective_coverage, "critical_targeted_scans_started": started_targets,
@@ -693,14 +791,14 @@ def run_zap_scan(
             "active_scan_cleanup": cleanup, "target_recovery": recovery,
             "session_postcheck_inconclusive": after.get("conclusive") is False, "zap_sites_tree_urls": len(site_urls),
             "destructive_paths_excluded": list(DESTRUCTIVE_PATH_WORDS),
-            "deferred_native_active_cases": [{"url": str(case.get("url") or ""), "case_class": str(case.get("zap_case_class") or ""), "reason": "persistent XSS native rule deferred to full/deep; proxy verification still executed"} for case in deferred_native],
-            "scan_scope": "Crawler/request traffic is seeded through ZAP. Native spider, passive scan and active scan are driven by the official ZAP API; project-specific response verification is reported separately.",
+            "deferred_native_active_cases": [{"url": str(case.get("url") or ""), "case_class": str(case.get("zap_case_class") or ""), "reason": str(case.get("zap_defer_reason") or "native active case deferred; proxy verification still executed")} for case in deferred_native],
+            "scan_scope": "Crawler/request traffic is seeded through ZAP. Passive analysis and bounded request-family active scans use the official ZAP API; recursive all-rule active scanning is avoided to preserve downstream target availability. Project-specific response verification is reported separately.",
         }
         if cookies and after.get("conclusive") and after.get("effective") is False:
             return partial("OWASP ZAP", target_url, f"ZAP preserved {len(findings)} findings, but the authenticated session was not valid at final verification.", diagnosis="authentication_lost_during_scan", timed_out=False, time_limit_reached=False, **common)
-        if timed_out or not coverage_complete:
-            return partial("OWASP ZAP", target_url, f"ZAP preserved {len(findings)} findings with incomplete bounded coverage. Targeted scans={completed_targets}/{started_targets}; site-tree URLs={len(site_urls)}.", diagnosis="time_limit_reached" if timed_out else "active_coverage_incomplete", timed_out=timed_out, time_limit_reached=timed_out, time_limit_phase=phase if timed_out else "", **common)
-        return success("OWASP ZAP", target_url, f"ZAP API scan completed. Findings: {len(findings)}; targeted scans={completed_targets}/{started_targets}; site-tree URLs={len(site_urls)}.", timed_out=False, time_limit_reached=False, **common)
+        if timed_out or not bounded_coverage_complete:
+            return partial("OWASP ZAP", target_url, f"ZAP preserved {len(findings)} findings with incomplete bounded coverage. Native targeted scans={completed_targets}/{started_targets}; effective native/proxy coverage={effective_completed_targets}/{started_targets}; site-tree URLs={len(site_urls)}.", diagnosis="time_limit_reached" if timed_out else "active_coverage_incomplete", timed_out=timed_out, time_limit_reached=timed_out, time_limit_phase=phase if timed_out else "", **common)
+        return success("OWASP ZAP", target_url, f"ZAP API scan completed. Findings: {len(findings)}; native targeted scans={completed_targets}/{started_targets}; effective native/proxy coverage={effective_completed_targets}/{started_targets}; site-tree URLs={len(site_urls)}.", timed_out=False, time_limit_reached=False, **common)
     except requests.RequestException as exc:
         result = failure("OWASP ZAP", target_url, f"ZAP HTTP operation failed: {type(exc).__name__}: {exc}", diagnosis="zap_http_operation_failed")
         result.update(duration_seconds=round(time.monotonic() - started, 3), phase=phase, session_diagnostics={"before_scan": before, "after_scan": after})
@@ -715,7 +813,6 @@ def run_zap_scan(
     finally:
         if zap is not None:
             _remove_cookie_rule(zap)
-
 
 if __name__ == "__main__":
     _serve()

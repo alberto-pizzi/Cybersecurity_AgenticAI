@@ -15,6 +15,7 @@ mcp, _serve = service("IDOR-Forge Wrapper", "idor")
 UPSTREAM_REPOSITORY = "https://github.com/errorfiathck/IDOR-Forge.git"
 RESULT_MARKER = "SECOPS_IDOR_FORGE_RESULT="
 
+# Locate the installed upstream IDOR-Forge runtime and executable entry point.
 def _upstream_runtime() -> tuple[Path, str]:
     runtime = load_runtime_config().get("idor_forge", {})
     configured = runtime if isinstance(runtime, dict) else {}
@@ -28,6 +29,7 @@ def _upstream_runtime() -> tuple[Path, str]:
         python = str(root / ".venv" / ("Scripts/python.exe" if os.name == "nt" else "bin/python"))
     return root, python
 
+# Find one numeric GET reference suitable for a bounded IDOR differential check.
 def _numeric_parameter(target_url: str, parameters: list[str] | None) -> tuple[str, str] | None:
     requested = {str(value) for value in (parameters or []) if str(value)}
     for name, value in parse_qsl(urlparse(target_url).query, keep_blank_values=True):
@@ -35,6 +37,7 @@ def _numeric_parameter(target_url: str, parameters: list[str] | None) -> tuple[s
             return name, str(int(value) + 1)
     return None
 
+# Invoke upstream IDOR-Forge and normalize its output for the current request.
 def _run_upstream(root: Path, python: str, config: dict, timeout: int) -> list[dict]:
     runner = r'''
 import json
@@ -79,11 +82,12 @@ print("SECOPS_IDOR_FORGE_RESULT=" + json.dumps(results, default=str, separators=
             return value if isinstance(value, list) else []
     raise RuntimeError("IDOR-Forge completed without returning the expected structured result.")
 
+# Run the upstream IDOR-Forge engine on one discovered numeric GET reference.
 @mcp.tool()
 def run_idor_check(
     target_url: str, cookies: str = "", timeout: int = 20, method: str = "GET", data: str = "", parameters: list[str] | None = None,
 ) -> dict:
-    """Run the upstream IDOR-Forge engine on one discovered numeric GET reference."""
+
     if str(method).upper() != "GET" or str(data or "").strip():
         return skipped("IDOR-Forge", target_url, "The bounded project contract uses numeric GET object references only.")
 

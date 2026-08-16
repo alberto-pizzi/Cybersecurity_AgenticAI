@@ -24,6 +24,7 @@ XSS_NAME_RE = re.compile(
 POSITIVE_SUBMIT_RE = re.compile(r"(?:submit|send|save|post|publish|sign|add|create|update|upload|change)", re.I)
 NEGATIVE_SUBMIT_RE = re.compile(r"(?:clear|delete|remove|reset|cancel|logout|drop|purge)", re.I)
 
+# Process browser cookies for authenticated scanner requests and session analysis.
 def _browser_cookies(target_url: str, cookies: str) -> list[dict[str, Any]]:
     parsed = urlparse(target_url)
     rows: list[dict[str, Any]] = []
@@ -34,11 +35,13 @@ def _browser_cookies(target_url: str, cookies: str) -> list[dict[str, Any]]:
         })
     return rows
 
+# Create a short unique marker used to prove harmless browser-side execution.
 def _short_marker(prefix: str = "S") -> str:
     return prefix[:1].upper() + secrets.token_hex(4).upper()
 
+# Return harmless execution markers, shortest first when a field is bounded.
 def _payload_candidates(marker: str, maxlength: int = 0) -> list[str]:
-    """Return harmless execution markers, shortest first when a field is bounded."""
+
     candidates = [
         f"<svg/onload=document.body.id='{marker}'>", f"<img src=x onerror=document.body.id='{marker}'>",
         (
@@ -52,8 +55,9 @@ def _payload_candidates(marker: str, maxlength: int = 0) -> list[str]:
         unique = [value for value in unique if len(value) <= maxlength]
     return unique
 
+# Include context-breaking variants needed by select/attribute/script sinks.
 def _query_payload_candidates(marker: str) -> list[str]:
-    """Include context-breaking variants needed by select/attribute/script sinks."""
+
     base = f"<svg/onload=document.body.id='{marker}'>"
     return list(dict.fromkeys([
         base, f"</option></select>{base}",
@@ -61,6 +65,7 @@ def _query_payload_candidates(marker: str) -> list[str]:
         f"</script>{base}", f"';document.body.id='{marker}';//", f'";document.body.id="{marker}";//',
     ]))
 
+# Check whether the browser executed the injected marker in the current page context.
 async def _executed(page: Any, marker: str) -> bool:
     try:
         value = await page.evaluate(
@@ -78,12 +83,14 @@ async def _executed(page: Any, marker: str) -> bool:
     except Exception:
         return False
 
+# Check whether a payload is reflected in page content without claiming execution.
 async def _reflection_present(page: Any, marker: str) -> bool:
     try:
         return marker in str(await page.content())
     except Exception:
         return False
 
+# Perform goto with bounded behavior that preserves target and session safety.
 async def _safe_goto(page: Any, url: str, timeout_ms: int) -> tuple[bool, str]:
     try:
         response = await page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
@@ -92,6 +99,7 @@ async def _safe_goto(page: Any, url: str, timeout_ms: int) -> tuple[bool, str]:
     except Exception as exc:
         return False, f"{type(exc).__name__}: {exc}"
 
+# Test query parameters with harmless browser payloads and record execution or reflection.
 async def _query_checks(
     page: Any, target_url: str, parameters: list[str], timeout_ms: int,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
@@ -138,6 +146,7 @@ async def _query_checks(
                 break
     return findings, attempts
 
+# Inspect client-side source and URL sinks for DOM-XSS execution opportunities.
 async def _client_source_checks(
     page: Any, target_url: str, timeout_ms: int, client_sources: list[str], client_sinks: list[str],
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
@@ -203,12 +212,14 @@ async def _client_source_checks(
             break
     return findings, attempts
 
+# Normalize field metadata from the discovered request contract for workflow testing.
 def _field_metadata(fields: list[dict[str, Any]], parameter: str) -> dict[str, Any]:
     for item in fields:
         if isinstance(item, dict) and str(item.get("name") or "").lower() == parameter.lower():
             return item
     return {}
 
+# Fill and submit one discovered form with bounded marker payloads.
 async def _submit_form(form: Any) -> tuple[bool, str]:
     submitters = form.locator("input[type=submit], button[type=submit], button:not([type])")
     rows: list[tuple[int, Any, str]] = []
@@ -245,6 +256,7 @@ async def _submit_form(form: Any) -> tuple[bool, str]:
     except Exception as exc:
         return False, f"submit failed: {type(exc).__name__}: {exc}; prior={click_error}"
 
+# Submit a harmless stored-XSS marker and revisit the page to verify later execution.
 async def _stored_check(
     context: Any, page: Any, target_url: str, source_url: str,
     parameters: list[str], fields: list[dict[str, Any]], timeout_ms: int, allow_state_changes: bool,
@@ -256,6 +268,7 @@ async def _stored_check(
         return findings, diagnostic
     start_url = source_url if source_url and same_origin(target_url, source_url) else target_url
 
+    # Rank writable fields so likely persistent-text sinks are tested first.
     ranked: list[tuple[int, str]] = []
     for index, parameter in enumerate(dict.fromkeys(parameters)):
         meta = _field_metadata(fields, parameter)
@@ -305,6 +318,7 @@ async def _stored_check(
                 })
                 continue
 
+            # Submit harmless variants, then revisit in a fresh page to distinguish stored execution.
             for payload_index, payload in enumerate(payloads, start=1):
                 await element.fill(payload)
                 form = element.locator("xpath=ancestor::form[1]")
@@ -376,7 +390,7 @@ async def _stored_check(
                     })
                     diagnostic["confirmed_parameter"] = parameter
                     return findings, diagnostic
-                # Reload the clean form before the next payload variant.
+
                 await _safe_goto(page, start_url, timeout_ms)
         except Exception as exc:
             diagnostic["attempts"].append({"parameter": parameter, "error": f"{type(exc).__name__}: {exc}"})
@@ -384,6 +398,7 @@ async def _stored_check(
         diagnostic["reason"] = "no compatible field could carry a harmless executable marker"
     return findings, diagnostic
 
+# Coordinate Chromium checks for DOM, reflected and stored XSS on one request case.
 async def _run_browser_scan_core(
     target_url: str, cookies: str = "", method: str = "GET", data: str = "",
     parameters: list[str] | None = None, fields: list[dict[str, Any]] | None = None,
@@ -468,7 +483,6 @@ async def _run_browser_scan_core(
             f"Browser verification failed: {type(exc).__name__}: {exc}", diagnosis="browser_runtime_error",
         )
 
-    # Deduplicate multiple payload variants that confirm the same source.
     unique: list[dict[str, Any]] = []
     seen: set[tuple[str, str, str]] = set()
     for item in findings:
@@ -484,6 +498,7 @@ async def _run_browser_scan_core(
         f"Browser verification completed. Findings: {len(unique)}.", vulnerabilities=unique, diagnostics=diagnostics,
     )
 
+# Use async Chromium to verify DOM, reflected and stored XSS with harmless markers.
 @mcp.tool()
 async def run_browser_scan(
     target_url: str, cookies: str = "", method: str = "GET", data: str = "",
@@ -491,7 +506,7 @@ async def run_browser_scan(
     source_url: str = "", client_sources: list[str] | None = None,
     client_sinks: list[str] | None = None, timeout: int = 60, allow_state_changes: bool = False,
 ) -> dict:
-    """Use async Chromium to verify DOM, reflected and stored XSS with harmless markers."""
+
     return await _run_browser_scan_core(
         target_url=target_url, cookies=cookies, method=method, data=data,
         parameters=parameters, fields=fields, source_url=source_url, client_sources=client_sources,

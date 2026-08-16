@@ -91,6 +91,8 @@ def main() -> int:
     args = parser.parse_args()
 
     configure_scan_mode(args.mode)
+    if args.mode == "deep":
+        print("[*] Deep profile: coverage-max-20m-v1 (broader request classes and bounded high-coverage scanner phases)")
     print(f"[*] Runtime platform: {platform.platform()}")
     print(f"[*] MCP server Python: {deterministic_core._server_python()}")
     globals()["CURRENT_SCAN_MODE"] = deterministic_core.CURRENT_SCAN_MODE

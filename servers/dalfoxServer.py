@@ -14,6 +14,7 @@ from scannerCommon import mutate_parameter, process_text, request_retry, service
 
 mcp, _serve = service("Dalfox Scanner", "dalfox")
 
+# Parse Dalfox text output into normalized XSS findings.
 def _text_findings(text: str, target_url: str, method: str) -> list[dict[str, Any]]:
     verified = [line.strip() for line in text.splitlines() if re.search(r"\[V\]|verified", line, re.I)]
     candidates = [line.strip() for line in text.splitlines() if re.search(r"\[POC\]|\[R\]|reflected", line, re.I)]
@@ -42,6 +43,7 @@ def _text_findings(text: str, target_url: str, method: str) -> list[dict[str, An
         })
     return findings
 
+# Parse Dalfox JSON output into normalized XSS findings.
 def _json_findings(path: Path, target_url: str, method: str) -> list[dict[str, Any]]:
     if not path.is_file():
         return []
@@ -69,6 +71,7 @@ def _json_findings(path: Path, target_url: str, method: str) -> list[dict[str, A
         })
     return findings
 
+# Probe reflection and capture bounded evidence for verification.
 def _reflection_probe(
     target_url: str, cookies: str, method: str, data: str, parameters: list[str], allow_state_changes: bool = False,
 ) -> dict[str, Any]:
@@ -77,6 +80,7 @@ def _reflection_probe(
     marker = "SECOPS_XSS_7F31"
     payload = f'<svg id="{marker}" onload="void(0)"></svg>'
     priority = ("mtxmessage", "message", "comment", "body", "text", "description", "txtname", "name", "title", "search", "query", "q")
+    # Score parameter so higher-value targets are processed first.
     def parameter_score(value: str) -> tuple[int, int]:
         lowered = value.lower()
         for index, hint in enumerate(priority):
@@ -149,6 +153,7 @@ def _reflection_probe(
         "request_data": request_data, "response_excerpt": response_excerpt(excerpt_source, marker),
     }
 
+# Convert reflection into a normalized security finding.
 def _reflection_finding(
     target_url: str, method: str, probe: dict[str, Any],
 ) -> list[dict[str, Any]]:
@@ -203,6 +208,7 @@ def _reflection_finding(
         ),
     }]
 
+# Trim scanner diagnostics to a compact excerpt suitable for result metadata.
 def _trim(result: dict[str, Any]) -> dict[str, Any]:
     for key, limit in (("stdout", 8000), ("stderr", 8000)):
         value = str(result.get(key, ""))
@@ -211,22 +217,25 @@ def _trim(result: dict[str, Any]) -> dict[str, Any]:
             result[f"{key}_truncated"] = True
     return result
 
+# Read the current Dalfox scan-mode help used for CLI capability detection.
 def _scan_help(target_url: str) -> str:
     result = run_process(
         "Dalfox", ["dalfox", "scan", "--help"], target=target_url, timeout=10, accepted_codes=(0, 1, 2),
     )
     return process_text(result)
 
+# Read legacy Dalfox URL-mode help used for backward-compatible command building.
 def _legacy_help(target_url: str) -> str:
     result = run_process(
         "Dalfox", ["dalfox", "url", "--help"], target=target_url, timeout=10, accepted_codes=(0, 1, 2),
     )
     return process_text(result)
 
-
+# Check whether the installed Dalfox help advertises a requested CLI option.
 def _supports(help_text: str, flag: str) -> bool:
     return flag in help_text
 
+# Invoke the Dalfox v3 scan interface with the current request and bounded settings.
 def _run_v3(
     target_url: str, cookies: str, method: str, data: str, parameters: list[str], timeout: int, output_file: Path, help_text: str,
 ) -> dict[str, Any]:
@@ -261,12 +270,17 @@ def _run_v3(
     result["dalfox_cli_generation"] = "v3"
     return _trim(result)
 
+# Invoke the legacy Dalfox URL interface with compatibility for the installed binary.
 def _run_v2(
     target_url: str, cookies: str, method: str, data: str, parameters: list[str], timeout: int, help_text: str,
 ) -> dict[str, Any]:
-    # Legacy Dalfox releases changed several option names. Build only flags
-    # advertised by the installed binary instead of carrying version guesses.
-    command = ["dalfox", "url", target_url]
+
+    requires_url_flag = _supports(help_text, "--url")
+    command = ["dalfox", "url"]
+    if requires_url_flag:
+        command.extend(["--url", target_url])
+    else:
+        command.append(target_url)
     if _supports(help_text, "--silence"):
         command.append("--silence")
     if _supports(help_text, "--skip-waf-probe"):
@@ -287,16 +301,19 @@ def _run_v2(
     cookie_flag = "--cookies" if _supports(help_text, "--cookies") else "--cookie" if _supports(help_text, "--cookie") else ""
     if cookies and cookie_flag:
         command.extend([cookie_flag, cookies])
+    if requires_url_flag:
+        command.append(target_url)
     result = run_process("Dalfox", command, target=target_url, timeout=timeout, accepted_codes=(0, 1))
     result["dalfox_cli_generation"] = "v2"
     return _trim(result)
 
+# Run a bounded Dalfox scan with automatic v3/v2 CLI compatibility.
 @mcp.tool()
 def run_dalfox_scan(
     target_url: str, cookies: str = "", method: str = "GET", data: str = "",
     parameters: list[str] | None = None, timeout: int = 120, allow_state_changes: bool = False,
 ) -> dict:
-    """Run a bounded Dalfox scan with automatic v3/v2 CLI compatibility."""
+
     method = method.upper()
     timeout = max(30, min(int(timeout), 300))
     parameters = [str(value) for value in (parameters or []) if str(value)]

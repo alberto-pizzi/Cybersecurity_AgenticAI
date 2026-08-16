@@ -25,7 +25,7 @@ RESULT_MARKERS = ("first name:", "surname:")
 BLIND_TRUE_MARKERS = ("user id exists in the database", "exists in the database")
 BLIND_FALSE_MARKERS = ("user id is missing from the database", "missing from the database")
 
-
+# Send one bounded request used by the lightweight SQL-injection pre-verifier.
 def _send_http(url: str, cookies: str, method: str, data: str) -> requests.Response:
     headers = {"Cache-Control": "no-cache", "User-Agent": "SecOps-SQLi-Verifier/2.0"}
     if cookies:
@@ -35,7 +35,7 @@ def _send_http(url: str, cookies: str, method: str, data: str) -> requests.Respo
         timeout=(4, 16), allow_redirects=True,
     )
 
-
+# Probe summary and capture bounded evidence for verification.
 def _probe_summary(response: requests.Response, needle: str = "") -> dict[str, Any]:
     text = str(response.text or "")
     index = text.lower().find(needle.lower()) if needle else -1
@@ -45,9 +45,9 @@ def _probe_summary(response: requests.Response, needle: str = "") -> dict[str, A
         "excerpt": text[start:start + 700],
     }
 
-
+# Small project-specific confirmation layer; SQLMap remains the authoritative scanner.
 def _quick_sqli_probe(target_url: str, cookies: str, method: str, data: str, parameters: list[str]) -> dict[str, Any]:
-    """Small project-specific confirmation layer; SQLMap remains the authoritative scanner."""
+
     if not parameters:
         return {"performed": False, "candidate": False, "confirmed": False}
     parameter = parameters[0]
@@ -125,7 +125,7 @@ def _quick_sqli_probe(target_url: str, cookies: str, method: str, data: str, par
         "blind_confirmed": repeat_confirmed,
     }
 
-
+# Convert quick-probe evidence into normalized SQL-injection findings.
 def _quick_probe_findings(target_url: str, method: str, probe: dict[str, Any]) -> list[dict[str, Any]]:
     if not probe.get("candidate"):
         return []
@@ -142,13 +142,13 @@ def _quick_probe_findings(target_url: str, method: str, probe: dict[str, Any]) -
         "evidence": f"Boolean true={probe.get('payload_true')}\nBoolean false={probe.get('payload_false')}\nProbe={probe}",
     }]
 
-
+# Reserve an available localhost port for the temporary SQLMap API server.
 def _free_port() -> int:
     with socket.socket() as sock:
         sock.bind(("127.0.0.1", 0))
         return int(sock.getsockname()[1])
 
-
+# Send one JSON request to the temporary SQLMap REST API.
 def _api_request(base: str, auth: tuple[str, str], path: str, *, method: str = "GET", body: Any = None, timeout: float = 10) -> dict[str, Any]:
     response = requests.request(method, f"{base}{path}", auth=auth, json=body, timeout=timeout)
     response.raise_for_status()
@@ -157,7 +157,7 @@ def _api_request(base: str, auth: tuple[str, str], path: str, *, method: str = "
         raise RuntimeError(str(value.get("message") if isinstance(value, dict) else value))
     return value
 
-
+# Start SQLMap API on a free local port and wait until it becomes reachable.
 def _start_api(script, timeout: int) -> tuple[subprocess.Popen[str], str, tuple[str, str], dict[str, Any]]:
     port, username, password = _free_port(), "secops", secrets.token_urlsafe(18)
     command = [sys.executable, str(script), "-s", "-H", "127.0.0.1", "-p", str(port), "--username", username, "--password", password]
@@ -177,10 +177,9 @@ def _start_api(script, timeout: int) -> tuple[subprocess.Popen[str], str, tuple[
     process.terminate()
     raise RuntimeError(f"sqlmap API server did not become ready: {last}")
 
-
+# Read a nested value from SQLMap API data without assuming a fixed response shape.
 def _api_value(value: Any) -> Any:
-    # sqlmap 1.10.x briefly returned structured REST values as Python repr strings.
-    # Accept both the documented structured form and that upstream compatibility form.
+
     if isinstance(value, str) and value.lstrip().startswith(("[", "{")):
         try:
             return ast.literal_eval(value)
@@ -188,7 +187,7 @@ def _api_value(value: Any) -> Any:
             pass
     return value
 
-
+# Convert SQLMap injection techniques into normalized confirmed findings.
 def _technique_findings(data: list[Any], target_url: str, method: str) -> list[dict[str, Any]]:
     findings: list[dict[str, Any]] = []
     for entry in data:
@@ -218,7 +217,7 @@ def _technique_findings(data: list[Any], target_url: str, method: str) -> list[d
             })
     return findings
 
-
+# Create, configure and poll one SQLMap REST API scan to completion or timeout.
 def _api_scan(script, target_url: str, cookies: str, method: str, data: str, parameters: list[str], timeout: int) -> dict[str, Any]:
     process = None
     taskid = ""
@@ -280,13 +279,13 @@ def _api_scan(script, target_url: str, cookies: str, method: str, data: str, par
                 except subprocess.TimeoutExpired:
                     process.kill()
 
-
+# Run SQLMap through its official authenticated REST-JSON API.
 @mcp.tool()
 def run_sqlmap_scan(
     target_url: str, cookies: str = "", method: str = "GET", data: str = "",
     parameters: list[str] | None = None, timeout: int = 180,
 ) -> dict:
-    """Run SQLMap through its official authenticated REST-JSON API."""
+
     method, timeout = method.upper(), max(45, min(int(timeout), 600))
     parameters = filter_control_parameters(parameters)
     session_probe = scanner_session_probe(target_url, cookies, method, data, timeout=4, attempts=1)
@@ -331,7 +330,6 @@ def run_sqlmap_scan(
         out = failure("SQLMap", target_url, f"SQLMap REST task terminated with return code {result.get('returncode')}.", diagnosis="sqlmap_scan_failed")
         out.update(common); return out
     return success("SQLMap", target_url, f"SQLMap REST API completed for {method}. Confirmed SQL injection findings: {len(findings)}.", sql_injection_found=bool(findings), **common)
-
 
 if __name__ == "__main__":
     _serve()

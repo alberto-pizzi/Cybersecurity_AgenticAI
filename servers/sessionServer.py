@@ -27,15 +27,18 @@ NON_SESSION_COOKIE_NAMES = {
     "csrftoken", "csrf", "xsrf-token", "timezone", "tz", "preferences",
 }
 
+# Check whether session cookie name matches the condition required by this scan path.
 def _is_session_cookie_name(name: str) -> bool:
     lowered = str(name or "").strip().lower()
     if not lowered or lowered in NON_SESSION_COOKIE_NAMES:
         return False
     return bool(SESSION_COOKIE_RE.search(lowered))
 
+# Extract session-cookie rows from response metadata for bounded session analysis.
 def _session_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return [row for row in rows if _is_session_cookie_name(str(row.get("name") or ""))]
 
+# Process set cookie headers for authenticated scanner requests and session analysis.
 def _set_cookie_headers(response: requests.Response) -> list[str]:
     raw = getattr(response.raw, "headers", None)
     if raw is not None and hasattr(raw, "get_all"):
@@ -45,6 +48,7 @@ def _set_cookie_headers(response: requests.Response) -> list[str]:
     value = response.headers.get("Set-Cookie")
     return [str(value)] if value else []
 
+# Parse set cookie into normalized data used by the scanner wrapper.
 def _parse_set_cookie(header: str) -> list[dict[str, Any]]:
     cookie = SimpleCookie()
     try:
@@ -60,6 +64,7 @@ def _parse_set_cookie(header: str) -> list[dict[str, Any]]:
         })
     return rows
 
+# Estimate per-character entropy to flag weak or predictable session identifiers.
 def _entropy_per_character(value: str) -> float:
     if not value:
         return 0.0
@@ -67,6 +72,7 @@ def _entropy_per_character(value: str) -> float:
     total = len(value)
     return -sum((count / total) * math.log2(count / total) for count in counts.values())
 
+# Create findings for missing or weak security attributes on session cookies.
 def _cookie_attribute_findings(url: str, rows: list[dict[str, Any]], https: bool) -> list[dict[str, Any]]:
     findings: list[dict[str, Any]] = []
     for row in _session_rows(rows):
@@ -110,24 +116,25 @@ def _cookie_attribute_findings(url: str, rows: list[dict[str, Any]], https: bool
             })
     return findings
 
+# Analyze cookie flags, bounded anonymous session uniqueness and fixation indicators.
 @mcp.tool()
 def run_session_scan(
     target_url: str, cookies: str = "", probe_url: str = "", timeout: int = 30, sample_count: int = 5,
 ) -> dict:
-    """Analyze cookie flags, bounded anonymous session uniqueness and fixation indicators."""
+
     selected_probe = probe_url or target_url
     if not same_origin(target_url, selected_probe):
         selected_probe = target_url
     timeout = max(5, min(int(timeout), 60))
     sample_count = max(3, min(int(sample_count), 10))
-    # Keep a margin for MCP/orchestrator transport and never let one slow HTTP
-    # request consume the scanner's whole wall-clock budget.
+
     deadline = time.monotonic() + max(4.0, timeout - 5.0)
     request_timeout = max(2.0, min(3.0, (timeout - 6.0) / max(5, sample_count + 3)))
     request_cost = 2.0 + request_timeout
     findings: list[dict[str, Any]] = []
     diagnostics: dict[str, Any] = {"probe_url": selected_probe, "sample_count": sample_count, "request_timeout": round(request_timeout, 2)}
 
+    # Evaluate cookie attributes first, then use bounded samples for uniqueness and fixation indicators.
     baseline: requests.Response | None = None
     try:
         baseline = request_retry(
@@ -166,6 +173,7 @@ def run_session_scan(
         except requests.RequestException as exc:
             diagnostics["authenticated_probe_error"] = f"{type(exc).__name__}: {exc}"
 
+    # Sample fresh anonymous sessions to detect obvious reuse, short identifiers or weak entropy.
     samples: dict[str, list[str]] = {}
     for _ in range(sample_count):
         if time.monotonic() + request_cost >= deadline:
@@ -214,8 +222,6 @@ def run_session_scan(
                 "owasp_category": "A07:2021 Identification and Authentication Failures",
             })
 
-    # Bounded anonymous fixation indicator: check whether an arbitrary supplied value is
-    # accepted without rotation. This is not a full fixation proof because no login is performed.
     if supplied_session_names:
         fixation_rows: list[dict[str, Any]] = []
         for name in supplied_session_names[:3]:

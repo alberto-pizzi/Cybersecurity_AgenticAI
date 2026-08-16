@@ -7,6 +7,8 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse, urlunparse
 
+import requests
+
 from scannerCommon import cleanup_docker_container, docker_container_name, docker_target, load_config, service, unique_strings
 from utils import ROOT_DIR, failure, partial, run_process, same_origin, success
 
@@ -14,11 +16,11 @@ mcp, _serve = service("Nuclei Scanner", "nuclei")
 RUNTIME = Path(ROOT_DIR) / ".secops_runtime.json"
 CUSTOM_TEMPLATE_DIR = Path(ROOT_DIR) / "nuclei-templates-secops"
 
-
+# Load the initialized Nuclei runtime and official template inventory.
 def _runtime() -> dict[str, Any]:
     return load_config(RUNTIME)
 
-
+# Validate the scan profile and return its bounded execution settings.
 def _profile(value: str) -> tuple[str, dict[str, int]]:
     name = str(value or "balanced").lower()
     if name not in {"fast", "balanced", "deep"}:
@@ -26,10 +28,10 @@ def _profile(value: str) -> tuple[str, dict[str, int]]:
     return name, {
         "fast": {"c": 4, "bs": 2, "pc": 2, "rl": 20, "timeout": 3},
         "balanced": {"c": 6, "bs": 3, "pc": 3, "rl": 35, "timeout": 4},
-        "deep": {"c": 14, "bs": 6, "pc": 6, "rl": 90, "timeout": 5},
+        "deep": {"c": 10, "bs": 4, "pc": 4, "rl": 60, "timeout": 6},
     }[name]
 
-
+# Score target so higher-value targets are processed first.
 def _target_score(url: str) -> int:
     path = urlparse(url).path.lower()
     score = 20 if urlparse(url).query else 0
@@ -39,7 +41,7 @@ def _target_score(url: str) -> int:
         score += 60
     return score
 
-
+# Select targets to maximize useful coverage within the scan budget.
 def _focused_targets(target_url: str, seeds: list[str] | None, limit: int) -> list[str]:
     candidates = [
         value for value in unique_strings(seeds)
@@ -47,7 +49,249 @@ def _focused_targets(target_url: str, seeds: list[str] | None, limit: int) -> li
     ]
     return [target_url, *sorted(candidates, key=lambda value: (_target_score(value), value), reverse=True)[: max(0, limit - 1)]]
 
+# Select a bounded, high-value subset of the installed official HTTP templates.
+def _balanced_official_templates(root: Path, targets: list[str], limit: int = 32, *, include_low: bool = False, max_requests: int = 6, extra_hints: set[str] | None = None) -> list[Path]:
 
+    bases = [root / "http" / "exposures", root / "http" / "misconfiguration"]
+    if not any(base.is_dir() for base in bases):
+        return []
+    hints = {"config", "backup", "debug", "exposure", "phpinfo", "git", "env", "swagger", "openapi", "directory", "listing", "panel", "admin", "login", "default", "apache", "php", "source"}
+    hints.update(extra_hints or set())
+    for value in targets:
+        hints.update(token for token in re.split(r"[^a-z0-9]+", urlparse(value).path.lower()) if len(token) >= 3 and token not in {"vulnerabilities", "index", "html"})
+    severity_weight = {"critical": 50, "high": 38, "medium": 24, **({"low": 12} if include_low else {})}
+    ranked: list[tuple[int, str, Path]] = []
+    for base in bases:
+        if not base.is_dir():
+            continue
+        for path in base.rglob("*.yaml"):
+            try:
+                with path.open("r", encoding="utf-8", errors="replace") as handle:
+                    head = handle.read(8192).lower()
+            except OSError:
+                continue
+            severity_match = re.search(r"(?m)^\s*severity:\s*(critical|high|medium|low|info)\s*$", head)
+            severity = severity_match.group(1) if severity_match else "info"
+            if severity not in severity_weight:
+                continue
+            tag_match = re.search(r"(?m)^\s*tags:\s*([^\n]+)", head)
+            tags = tag_match.group(1) if tag_match else ""
+            if any(token in tags for token in ("dos", "fuzz", "bruteforce")):
+                continue
+            max_request = re.search(r"(?m)^\s*max-request:\s*(\d+)", head)
+            requests = int(max_request.group(1)) if max_request else 1
+            if requests > max(1, int(max_requests)):
+                continue
+            rel = path.relative_to(root).as_posix().lower()
+            score = severity_weight[severity] + (18 if "/exposures/" in f"/{rel}" else 14)
+            score += 12 if requests <= 2 else 6 if requests <= 5 else 0
+            score += 8 if "verified: true" in head else 0
+            score += min(30, 6 * sum(1 for hint in hints if hint in rel or hint in tags))
+            ranked.append((-score, rel, path))
+    ranked.sort()
+    return [path for _, _, path in ranked[: max(1, int(limit))]]
+
+# Normalize product names so fingerprints and Nuclei metadata can be compared reliably.
+def _product_variants(value: str) -> set[str]:
+    raw = str(value or "").strip().lower().replace("asp.net", "aspnet").replace("node.js", "nodejs")
+    if not raw:
+        return set()
+    aliases = {"apache2": "apache", "httpd": "apache", "nodejs": "node", "microsoftiis": "iis"}
+    compact = re.sub(r"[^a-z0-9]+", "", raw)
+    variants = {aliases.get(compact, compact)} if compact else set()
+    stop = {"api", "app", "application", "client", "community", "enterprise", "framework", "http", "https", "module", "plugin", "server", "service", "web"}
+    for token in re.split(r"[^a-z0-9]+", raw):
+        token = aliases.get(token, token)
+        if len(token) >= 6 and token not in stop:
+            variants.add(token)
+    return variants
+
+# Extract vendor or product identifiers declared by an official Nuclei template.
+def _template_product_identifiers(head: str) -> set[str]:
+    identifiers: set[str] = set()
+    for field in ("vendor", "product"):
+        for match in re.finditer(rf"(?mi)^\s*{field}:\s*[\"']?([^#\r\n\"']+)", head):
+            identifiers.update(_product_variants(match.group(1)))
+    for match in re.finditer(r"cpe:2\.3:[aho]:([^:\s]+):([^:\s]+):", head, re.I):
+        identifiers.update(_product_variants(match.group(1)))
+        identifiers.update(_product_variants(match.group(2)))
+    return identifiers
+
+# Derive explicit product evidence from discovered routes without trusting generated match URLs.
+def _route_product_hints(targets: list[str]) -> set[str]:
+    hints: set[str] = set()
+    signatures = {
+        "wp-admin": "wordpress", "wp-content": "wordpress", "wp-login": "wordpress",
+        "phpmyadmin": "phpmyadmin", "owncloud": "owncloud", "nextcloud": "nextcloud",
+        "jenkins": "jenkins", "grafana": "grafana", "gitlab": "gitlab", "confluence": "confluence",
+        "sharepoint": "sharepoint", "roundcube": "roundcube", "webmin": "webmin",
+    }
+    for value in targets:
+        path = urlparse(value).path.lower()
+        for marker, product in signatures.items():
+            if marker in path:
+                hints.add(product)
+    return hints
+
+# Select a broad official vulnerability set while gating product-specific templates on evidence.
+def _deep_vulnerability_templates(
+    root: Path, targets: list[str], limit: int = 160, *, extra_hints: set[str] | None = None,
+) -> tuple[list[Path], dict[str, int]]:
+
+    bases = [
+        root / "http" / "cves",
+        root / "http" / "vulnerabilities",
+        root / "http" / "exposed-panels",
+        root / "http" / "default-logins",
+    ]
+    stats = {"considered": 0, "product_specific": 0, "product_matched": 0, "product_gated": 0}
+    if not any(base.is_dir() for base in bases):
+        return [], stats
+    hints = {
+        "apache", "httpd", "php", "nginx", "tomcat", "iis", "generic", "web",
+        "config", "backup", "debug", "admin", "login", "upload", "api", "panel",
+    }
+    hints.update(extra_hints or set())
+    product_evidence: set[str] = set()
+    for hint in extra_hints or set():
+        product_evidence.update(_product_variants(hint))
+    product_evidence.update(_route_product_hints(targets))
+    for value in targets:
+        hints.update(
+            token for token in re.split(r"[^a-z0-9]+", urlparse(value).path.lower())
+            if len(token) >= 3 and token not in {"vulnerabilities", "index", "html"}
+        )
+    severity_weight = {"critical": 70, "high": 54, "medium": 34, "low": 16, "info": 4}
+    ranked: list[tuple[int, str, Path]] = []
+    for base in bases:
+        if not base.is_dir():
+            continue
+        category_bonus = 18 if base.name == "cves" else 14 if base.name == "vulnerabilities" else 10 if base.name == "exposed-panels" else 4
+        for path in base.rglob("*.yaml"):
+            try:
+                head = path.read_text(encoding="utf-8", errors="replace")[:16000].lower()
+            except OSError:
+                continue
+            stats["considered"] += 1
+            severity_match = re.search(r"(?m)^\s*severity:\s*(critical|high|medium|low|info)\s*$", head)
+            severity = severity_match.group(1) if severity_match else "info"
+            tag_match = re.search(r"(?m)^\s*tags:\s*([^\n]+)", head)
+            tags = tag_match.group(1) if tag_match else ""
+            if any(token in tags for token in ("dos", "fuzz", "bruteforce", "intrusive")):
+                continue
+            max_request = re.search(r"(?m)^\s*max-?requests?:\s*(\d+)", head)
+            requests = int(max_request.group(1)) if max_request else 1
+            if requests > 8:
+                continue
+
+            # Product-specific CVEs/panels/logins require a detected product or explicit route signature.
+            identifiers = _template_product_identifiers(head)
+            if identifiers:
+                stats["product_specific"] += 1
+                if identifiers.isdisjoint(product_evidence):
+                    stats["product_gated"] += 1
+                    continue
+                stats["product_matched"] += 1
+
+            rel = path.relative_to(root).as_posix().lower()
+            hint_hits = sum(1 for hint in hints if hint and (hint in rel or hint in tags))
+            score = severity_weight[severity] + category_bonus
+            score += 12 if requests <= 2 else 6 if requests <= 5 else 0
+            score += 12 if "verified: true" in head else 0
+            score += min(56, 8 * hint_hits)
+            ranked.append((-score, rel, path))
+    ranked.sort()
+    return [path for _, _, path in ranked[: max(1, int(limit))]], stats
+
+# Collect a few bounded HTTP fingerprints to guide deep official-template selection.
+def _runtime_fingerprint_hints(target_url: str, targets: list[str], cookies: str) -> set[str]:
+
+    hints: set[str] = set()
+    headers = {"Cookie": cookies, "Cache-Control": "no-cache"} if cookies else {"Cache-Control": "no-cache"}
+    vocabulary = {
+        "apache", "nginx", "php", "debian", "ubuntu", "iis", "asp.net", "tomcat",
+        "wordpress", "drupal", "joomla", "laravel", "express", "node", "django",
+        "flask", "spring", "jenkins", "grafana", "gitlab", "swagger", "openapi",
+        "owncloud", "nextcloud", "sharepoint", "confluence", "jira", "sonarqube",
+        "magento", "prestashop", "opencart", "roundcube", "webmin", "keycloak",
+    }
+    for url in unique_strings([target_url, *targets])[:4]:
+        try:
+            response = requests.get(url, headers=headers, timeout=(3, 7), allow_redirects=True)
+        except requests.RequestException:
+            continue
+        text = " ".join((response.headers.get("Server", ""), response.headers.get("X-Powered-By", ""), response.text[:40000])).lower()
+        for token in vocabulary:
+            if token in text:
+                hints.add(token.replace("asp.net", "aspnet"))
+        for value in re.findall(r"[a-z][a-z0-9_.-]{2,24}", " ".join((response.headers.get("Server", ""), response.headers.get("X-Powered-By", ""))).lower()):
+            if value not in {"server", "powered", "by"}:
+                hints.add(value.split("/")[0])
+    return hints
+
+# Extract reliable product and framework hints from Nuclei technology matches.
+def _technology_hints_from_items(items: list[dict[str, Any]]) -> set[str]:
+    vocabulary = {
+        "apache", "httpd", "nginx", "php", "debian", "ubuntu", "iis", "aspnet", "tomcat",
+        "wordpress", "drupal", "joomla", "laravel", "express", "node", "django", "flask",
+        "spring", "jenkins", "grafana", "gitlab", "swagger", "openapi", "mysql", "mariadb",
+        "phpmyadmin", "jquery", "bootstrap", "openssl", "java", "python", "ruby", "rails",
+        "owncloud", "nextcloud", "sharepoint", "confluence", "jira", "sonarqube", "magento",
+        "prestashop", "opencart", "roundcube", "webmin", "keycloak", "elasticsearch", "kibana",
+    }
+    aliases = {"asp.net": "aspnet", "apache2": "apache", "httpd": "apache", "nodejs": "node"}
+    hints: set[str] = set()
+    for item in items:
+        info = item.get("info") if isinstance(item.get("info"), dict) else {}
+        values: list[str] = [
+            str(item.get("template-id") or ""), str(item.get("matcher-name") or ""),
+            str(info.get("name") or ""), str(info.get("tags") or ""),
+        ]
+        extracted = item.get("extracted-results")
+        if isinstance(extracted, list):
+            values.extend(str(value) for value in extracted[:16])
+        text = " ".join(values).lower()
+        for source, target in aliases.items():
+            if source in text:
+                hints.add(target)
+        for token in vocabulary:
+            if token in text:
+                hints.add(token)
+    return hints
+
+# Select official technology-detection templates for deep inventory coverage.
+def _deep_technology_templates(root: Path, targets: list[str], hints: set[str], limit: int = 96) -> list[Path]:
+
+    base = root / "http" / "technologies"
+    if not base.is_dir():
+        return []
+    path_hints = set(hints)
+    for value in targets:
+        path_hints.update(token for token in re.split(r"[^a-z0-9]+", urlparse(value).path.lower()) if len(token) >= 3)
+    generic = {"apache", "php", "nginx", "iis", "tomcat", "wordpress", "drupal", "joomla", "framework", "server", "web"}
+    ranked: list[tuple[int, str, Path]] = []
+    for path in base.rglob("*.yaml"):
+        try:
+            head = path.read_text(encoding="utf-8", errors="replace")[:8000].lower()
+        except OSError:
+            continue
+        rel = path.relative_to(root).as_posix().lower()
+        tag_match = re.search(r"(?m)^\s*tags:\s*([^\n]+)", head)
+        tags = tag_match.group(1) if tag_match else ""
+        if any(token in tags for token in ("dos", "fuzz", "bruteforce")):
+            continue
+        max_request = re.search(r"(?m)^\s*max-?requests?:\s*(\d+)", head)
+        requests_count = int(max_request.group(1)) if max_request else 1
+        if requests_count > 5:
+            continue
+        score = 8 if "verified: true" in head else 0
+        score += min(80, 16 * sum(1 for hint in path_hints if hint and (hint in rel or hint in tags)))
+        score += min(24, 4 * sum(1 for hint in generic if hint in rel or hint in tags))
+        ranked.append((-score, rel, path))
+    ranked.sort()
+    return [path for _, _, path in ranked[: max(1, int(limit))]]
+
+# Select bounded DAST request cases only for vulnerability classes not covered by specialists.
 def _dast_cases(target_url: str, cases: list[dict[str, Any]] | None, limit: int) -> list[dict[str, Any]]:
     ranked: list[tuple[int, dict[str, Any]]] = []
     for case in cases or []:
@@ -62,17 +306,21 @@ def _dast_cases(target_url: str, cases: list[dict[str, Any]] | None, limit: int)
         params = [str(v) for v in case.get("parameters", []) if str(v)]
         if not params and not urlparse(url).query and not str(case.get("data") or ""):
             continue
+
+        parameter_text = " ".join(params).lower()
+        gap_tokens = ("ssrf", "xxe", "ssti", "redirect", "callback", "webhook", "template", "graphql", "url")
+        if not any(token in path or token in parameter_text for token in gap_tokens):
+            continue
         score = 100 + (30 if method == "POST" else 0) + _target_score(url)
-        if any(token in path for token in ("sqli", "xss", "exec", "command", "fi", "include", "ssrf", "xxe")):
-            score += 80
+        score += 80 * sum(1 for token in gap_tokens if token in path or token in parameter_text)
         ranked.append((score, case))
     return [case for _, case in sorted(ranked, key=lambda value: -value[0])[:limit]]
 
-
+# Convert containerize url for reliable scanner routing between the host and container network.
 def _containerize_url(url: str) -> str:
     return docker_target(url)[0]
 
-
+# Convert externalize url for reliable scanner routing between the host and container network.
 def _externalize_url(url: str, target_url: str) -> str:
     parsed, target = urlparse(str(url or "")), urlparse(target_url)
     internal_host = (urlparse(docker_target(target_url)[0]).hostname or "").lower()
@@ -80,7 +328,7 @@ def _externalize_url(url: str, target_url: str) -> str:
         return urlunparse(parsed._replace(scheme=target.scheme, netloc=target.netloc))
     return url
 
-
+# Serialize discovered requests into Proxify JSONL for Nuclei DAST input.
 def _write_proxify_jsonl(path: Path, cases: list[dict[str, Any]], cookies: str, docker: bool) -> int:
     records = []
     for case in cases:
@@ -103,7 +351,7 @@ def _write_proxify_jsonl(path: Path, cases: list[dict[str, Any]], cookies: str, 
     path.write_text("\n".join(records) + ("\n" if records else ""), encoding="utf-8")
     return len(records)
 
-
+# Build the upstream command for the current scan configuration.
 def _command(runtime: dict[str, Any], work: Path, args: list[str], target_url: str = "", container_name: str = "") -> tuple[list[str], bool]:
     mode = str(runtime.get("nuclei_execution_mode") or runtime.get("nuclei_engine", {}).get("execution_mode") or "native")
     if mode != "docker_official_image":
@@ -123,11 +371,11 @@ def _command(runtime: dict[str, Any], work: Path, args: list[str], target_url: s
         command += ["-v", f"{CUSTOM_TEMPLATE_DIR.resolve()}:/secops-templates:ro"]
     return [*command, image, *args], True
 
-
+# Run one bounded Nuclei phase and parse its structured JSONL findings.
 def _run_phase(
     name: str, target_url: str, runtime: dict[str, Any], work: Path, input_path: Path, output_path: Path, timeout: int,
     settings: dict[str, int], cookies: str, *, automatic: bool = False, dast: bool = False, custom: bool = False,
-    broad: bool = False, official_http: bool = False, tags: str = "", exclude_tags: str = "",
+    broad: bool = False, official_http: bool = False, official_templates: list[Path] | None = None, tags: str = "", exclude_tags: str = "", severities: str = "",
 ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     docker = str(runtime.get("nuclei_execution_mode") or runtime.get("nuclei_engine", {}).get("execution_mode") or "native") == "docker_official_image"
     cli_input = f"/work/{input_path.name}" if docker else str(input_path)
@@ -145,22 +393,19 @@ def _run_phase(
         args += ["-im", "jsonl", "-dast", "-fuzzing-mode", "single"]
     if custom:
         args += ["-t", "/secops-templates" if docker else str(CUSTOM_TEMPLATE_DIR)]
+    selected_official = list(official_templates or [])
     if official_http:
         inventory = runtime.get("nuclei_templates") if isinstance(runtime.get("nuclei_templates"), dict) else {}
         root = Path(str(inventory.get("directory") or "")).expanduser()
-        # Use the official repository layout directly instead of combining a
-        # broad http/ tree with protocol/tag filters. This is both cheaper and
-        # compatible with Nuclei versions where filter combinations can fail
-        # before execution.
-        selected = [path for path in (root / "http" / "exposures", root / "http" / "misconfiguration") if path.is_dir()]
-        if selected:
-            for path in selected:
-                template = f"/official-templates/{path.relative_to(root).as_posix()}" if docker else str(path)
-                args += ["-t", template]
-        else:
+        for path in selected_official:
+            template = f"/official-templates/{path.relative_to(root).as_posix()}" if docker else str(path)
+            args += ["-t", template]
+        if not selected_official:
             official_dir = root / "http" if (root / "http").is_dir() else root
             args += ["-t", "/official-templates/http" if docker and (root / "http").is_dir() else "/official-templates" if docker else str(official_dir)]
             tags = tags or "exposure,misconfig,config"
+
+        args += ["-severity", severities or "medium,high,critical", "-ni"]
     if tags:
         args += ["-tags", tags]
     if exclude_tags:
@@ -191,8 +436,8 @@ def _run_phase(
         "phase": name, "status": result.get("status"), "diagnosis": result.get("diagnosis", ""),
         "duration_seconds": result.get("duration_seconds"), "phase_findings": len(items), "phase_timeout_seconds": timeout,
         "automatic_scan": automatic, "dast": dast, "input_mode": "jsonl" if dast else "list",
-        "selected_template_count": 0 if automatic or broad or dast or official_http else len(list(CUSTOM_TEMPLATE_DIR.glob("*.yaml"))),
-        "selected_template_sample": [p.name for p in list(CUSTOM_TEMPLATE_DIR.glob("*.yaml"))[:8]] if custom else [],
+        "selected_template_count": len(selected_official) if official_http else 0 if automatic or broad or dast else len(list(CUSTOM_TEMPLATE_DIR.glob("*.yaml"))),
+        "selected_template_sample": [p.name for p in selected_official[:8]] if official_http else [p.name for p in list(CUSTOM_TEMPLATE_DIR.glob("*.yaml"))[:8]] if custom else [],
         "stderr_excerpt": str(result.get("stderr", ""))[-1200:], "stdout": str(result.get("stdout", ""))[-4000:],
         "stderr": str(result.get("stderr", ""))[-4000:], "command": result.get("command", command),
         "timed_out": result.get("diagnosis") == "timeout",
@@ -200,7 +445,7 @@ def _run_phase(
     }
     return phase, items
 
-
+# Convert one Nuclei template match into a normalized candidate or observation.
 def _finding(item: dict[str, Any], target_url: str) -> dict[str, Any]:
     info = item.get("info") if isinstance(item.get("info"), dict) else {}
     severity = str(info.get("severity") or item.get("severity") or "info").lower()
@@ -217,7 +462,7 @@ def _finding(item: dict[str, Any], target_url: str) -> dict[str, Any]:
         "references": info.get("reference") if isinstance(info.get("reference"), list) else [],
     }
 
-
+# Remove duplicate scanner results while preserving distinct evidence and affected targets.
 def _dedupe(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
     result, seen = [], set()
     for item in items:
@@ -226,14 +471,14 @@ def _dedupe(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
             seen.add(key); result.append(item)
     return result
 
-
+# Orchestrate profile-specific Nuclei phases and use fingerprint results to guide deep template selection.
 @mcp.tool()
 def run_nuclei_scan(
     target_url: str, cookies: str = "", timeout: int = 180, output_file: str = "",
     seed_urls: list[str] | None = None, max_targets: int = 4,
     scan_profile: str = "balanced", request_cases: list[dict[str, Any]] | None = None,
 ) -> dict:
-    """Drive the official Nuclei engine with automatic scan, JSONL output and request-shaped DAST input."""
+
     try:
         scan_profile, settings = _profile(scan_profile)
     except ValueError as exc:
@@ -248,7 +493,7 @@ def run_nuclei_scan(
 
     cap = 4 if scan_profile == "fast" else 6 if scan_profile == "balanced" else 16
     targets = _focused_targets(target_url, seed_urls, max(1, min(int(max_targets), cap)))
-    dast_cases = _dast_cases(target_url, request_cases, 3) if scan_profile == "deep" else []
+    dast_cases = _dast_cases(target_url, request_cases, 4) if scan_profile == "deep" else []
     temporary = tempfile.TemporaryDirectory(prefix="nuclei-api-first-")
     work = Path(temporary.name)
     target_list = work / "targets.txt"
@@ -256,33 +501,122 @@ def run_nuclei_scan(
     target_list.write_text("\n".join(_containerize_url(v) if docker else v for v in targets) + "\n", encoding="utf-8")
     request_log = work / "requests.jsonl"
     dast_count = _write_proxify_jsonl(request_log, dast_cases, cookies, docker) if dast_cases else 0
+    root = Path(str(inventory.get("directory") or "")).expanduser()
+    phases: list[dict[str, Any]] = []
+    all_items: list[dict[str, Any]] = []
+    official_templates: list[Path] = []
+    deep_vulnerability_templates: list[Path] = []
+    deep_technology_templates: list[Path] = []
+    product_gate = {"considered": 0, "product_specific": 0, "product_matched": 0, "product_gated": 0}
+    fingerprint_hints: set[str] = set()
+    official_target_list = target_list
 
-    # Balanced mode deliberately leaves injection fuzzing to the specialist
-    # scanners.  Nuclei covers project evidence plus official exposure/
-    # misconfiguration templates; automatic scan and DAST remain available in
-    # deep mode.  This keeps broad coverage without monopolising the DVWA worker.
-    phases_spec = [("direct_evidence", dict(custom=True))]
-    if scan_profile == "balanced":
-        phases_spec.append(("official_exposure_misconfig", dict(official_http=True)))
-    elif scan_profile == "deep":
-        phases_spec.append(("automatic", dict(automatic=True)))
-        if dast_count:
-            phases_spec.append(("dast", dict(dast=True)))
-        phases_spec.append(("broad_templates", dict(broad=True, exclude_tags="dos")))
+    if scan_profile in {"balanced", "deep"}:
+        official_target_list = work / "official-targets.txt"
+        official_limit = 4 if scan_profile == "balanced" else 6
+        official_targets = targets[: min(official_limit, len(targets))]
+        official_target_list.write_text("\n".join(_containerize_url(v) if docker else v for v in official_targets) + "\n", encoding="utf-8")
 
-    phases, all_items = [], []
-    per_phase = max(20, int(timeout / max(1, len(phases_spec))))
     try:
-        for index, (name, flags) in enumerate(phases_spec):
-            input_path = request_log if flags.get("dast") else target_list
-            output_path = work / f"{index}-{name}.jsonl"
-            phase_budget = min(per_phase, 35) if scan_profile == "balanced" else per_phase
-            phase, items = _run_phase(name, target_url, runtime, work, input_path, output_path, phase_budget, settings, cookies, **flags)
-            phases.append(phase); all_items.extend(items)
+        if scan_profile == "deep":
+            # Fingerprint first so later exposure and vulnerability template ranking is target-aware.
+            fingerprint_hints = _runtime_fingerprint_hints(target_url, targets, cookies)
+            deep_technology_templates = _deep_technology_templates(root, targets, fingerprint_hints, 64)
+            planned_names = ["direct_evidence"]
+            if deep_technology_templates:
+                planned_names.append("official_technology_checks")
+            planned_names += ["official_exposure_misconfig", "official_vulnerability_checks"]
+            if dast_count:
+                planned_names.append("dast_gap_checks")
+            weights = {
+                "direct_evidence": 1.0, "official_technology_checks": 0.6,
+                "official_exposure_misconfig": 1.25, "official_vulnerability_checks": 1.8,
+                "dast_gap_checks": 0.75,
+            }
+            total_weight = sum(weights[name] for name in planned_names)
+            budgets = {name: max(30, int(timeout * weights[name] / total_weight)) for name in planned_names}
+
+            output_path = work / "0-direct_evidence.jsonl"
+            phase, items = _run_phase("direct_evidence", target_url, runtime, work, target_list, output_path, budgets["direct_evidence"], settings, cookies, custom=True)
+            phases.append(phase)
+            all_items.extend(items)
+
+            index = 1
+            if deep_technology_templates:
+                output_path = work / f"{index}-official_technology_checks.jsonl"
+                phase, items = _run_phase(
+                    "official_technology_checks", target_url, runtime, work, official_target_list, output_path,
+                    budgets["official_technology_checks"], settings, cookies, official_http=True,
+                    official_templates=deep_technology_templates, severities="info,low",
+                )
+                phases.append(phase)
+                all_items.extend(items)
+                fingerprint_hints.update(_technology_hints_from_items(items))
+                index += 1
+
+            # Re-rank exposure checks with technology evidence gathered from the completed fingerprint phase.
+            official_templates = _balanced_official_templates(
+                root, targets, 112, include_low=True, max_requests=8, extra_hints=fingerprint_hints,
+            )
+            if official_templates:
+                output_path = work / f"{index}-official_exposure_misconfig.jsonl"
+                phase, items = _run_phase(
+                    "official_exposure_misconfig", target_url, runtime, work, official_target_list, output_path,
+                    budgets["official_exposure_misconfig"], settings, cookies, official_http=True,
+                    official_templates=official_templates, severities="low,medium,high,critical",
+                )
+                phases.append(phase)
+                all_items.extend(items)
+                fingerprint_hints.update(_technology_hints_from_items(items))
+                index += 1
+
+            # Spend the largest deep budget on CVE and vulnerability templates relevant to the detected stack.
+            deep_vulnerability_templates, product_gate = _deep_vulnerability_templates(
+                root, targets, 192, extra_hints=fingerprint_hints,
+            )
+            if deep_vulnerability_templates:
+                output_path = work / f"{index}-official_vulnerability_checks.jsonl"
+                phase, items = _run_phase(
+                    "official_vulnerability_checks", target_url, runtime, work, official_target_list, output_path,
+                    budgets["official_vulnerability_checks"], settings, cookies, official_http=True,
+                    official_templates=deep_vulnerability_templates, severities="low,medium,high,critical",
+                )
+                phases.append(phase)
+                all_items.extend(items)
+                index += 1
+
+            if dast_count:
+                output_path = work / f"{index}-dast_gap_checks.jsonl"
+                phase, items = _run_phase(
+                    "dast_gap_checks", target_url, runtime, work, request_log, output_path,
+                    budgets["dast_gap_checks"], settings, cookies, dast=True,
+                )
+                phases.append(phase)
+                all_items.extend(items)
+        else:
+            phase_specs: list[tuple[str, dict[str, Any], Path]] = [("direct_evidence", {"custom": True}, target_list)]
+            if scan_profile == "balanced":
+                official_templates = _balanced_official_templates(root, targets, 32, include_low=False, max_requests=6)
+                if official_templates:
+                    phase_specs.append((
+                        "official_exposure_misconfig",
+                        {"official_http": True, "official_templates": official_templates, "severities": "medium,high,critical"},
+                        official_target_list,
+                    ))
+            per_phase = max(20, int(timeout / max(1, len(phase_specs))))
+            for index, (name, flags, input_path) in enumerate(phase_specs):
+                phase_budget = 35 if name == "direct_evidence" and scan_profile == "balanced" else min(50, per_phase) if scan_profile == "balanced" else per_phase
+                output_path = work / f"{index}-{name}.jsonl"
+                phase, items = _run_phase(name, target_url, runtime, work, input_path, output_path, phase_budget, settings, cookies, **flags)
+                phases.append(phase)
+                all_items.extend(items)
+
+        # Deduplicate cross-phase matches before producing the final scanner result and coverage metadata.
         all_items = _dedupe(all_items)
         findings = [_finding(item, target_url) for item in all_items]
         if output_file:
-            destination = Path(output_file).expanduser().resolve(); destination.parent.mkdir(parents=True, exist_ok=True)
+            destination = Path(output_file).expanduser().resolve()
+            destination.parent.mkdir(parents=True, exist_ok=True)
             destination.write_text("\n".join(json.dumps(item, ensure_ascii=False, default=str) for item in all_items) + ("\n" if all_items else ""), encoding="utf-8")
         hard = [p for p in phases if p.get("status") == "error"]
         limited = [p for p in phases if p.get("timed_out")]
@@ -295,26 +629,28 @@ def run_nuclei_scan(
         } for p in phases]
         common = {
             "vulnerabilities": findings, "authenticated": bool(cookies), "phases": summary, "scan_profile": scan_profile,
-            "scan_scope": f"Official Nuclei engine + structured JSONL output; profile={scan_profile}; static_targets={len(targets)}; dast_request_cases={dast_count if scan_profile == 'deep' else 0}.",
+            "runtime_fingerprint_hints": sorted(fingerprint_hints),
+            "product_template_gate": product_gate,
+            "scan_scope": f"Official Nuclei engine + structured JSONL output; profile={scan_profile}; static_targets={len(targets)}; bounded_official_templates={len(official_templates) + len(deep_technology_templates) + len(deep_vulnerability_templates)}; product_templates_gated={product_gate.get('product_gated', 0)}; deep_categories=exposure,misconfiguration,technology,cves,vulnerabilities,exposed-panels,default-logins; dast_gap_cases={dast_count if scan_profile == 'deep' else 0}.",
             "focused_targets": targets, "evidence_targets": targets, "custom_template_count": len(list(CUSTOM_TEMPLATE_DIR.glob("*.yaml"))),
             "custom_template_directory": str(CUSTOM_TEMPLATE_DIR), "dast_targets": [str(c.get("url") or "") for c in dast_cases],
             "dast_request_cases": [{"url": c.get("url", ""), "method": c.get("method", "GET"), "parameters": c.get("parameters", [])} for c in dast_cases],
             "dast_request_count": dast_count, "dast_input_mode": "jsonl" if dast_count else "list",
             "dast_template_directory": str(inventory.get("directory") or ""),
-            "technology_fingerprint": {"source": "nuclei-automatic-scan" if scan_profile == "deep" else "nuclei-filtered-official-templates", "tags": []},
+            "technology_fingerprint": {"source": "runtime-and-nuclei-technology-detection", "tags": sorted(fingerprint_hints)},
             "template_catalog_count": int(inventory.get("count") or 0), "template_selection_strategy": "official-nuclei-engine",
             "template_inventory": inventory, "template_refresh": {}, "hard_failure": bool(hard), "output_file": str(output_file or ""),
             "execution_mode": "official_docker_cli" if docker else "official_native_cli",
         }
         if len(hard) == len(phases) and not findings:
             result = failure("Nuclei", target_url, "Every official Nuclei phase failed before producing parseable findings.", diagnosis="nuclei_phases_failed")
-            result.update(common); return result
+            result.update(common)
+            return result
         if hard or limited:
             return partial("Nuclei", target_url, f"Official Nuclei scan ended with incomplete coverage. Findings preserved: {len(findings)}.", diagnosis="time_limit_reached" if limited and not hard else "partial_scan", timed_out=bool(limited), time_limit_reached=bool(limited), **common)
         return success("Nuclei", target_url, f"Official {scan_profile} Nuclei scan completed. Findings: {len(findings)}.", timed_out=False, time_limit_reached=False, **common)
     finally:
         temporary.cleanup()
-
 
 if __name__ == "__main__":
     _serve()

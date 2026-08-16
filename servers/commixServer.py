@@ -15,6 +15,7 @@ from scannerCommon import extend_request_cli, filter_control_parameters, find_re
 
 mcp, _serve = service("Commix Scanner", "commix")
 
+# Parse Commix output into normalized command-injection findings.
 def _findings(text: str, target_url: str, method: str) -> list[dict[str, Any]]:
     positive = r"(?:is vulnerable|appears to be injectable|seems injectable|command injection vulnerability)"
     if not re.search(rf"(?:parameter.+{positive}|{positive}.+parameter)", text, re.I):
@@ -54,15 +55,11 @@ def _findings(text: str, target_url: str, method: str) -> list[dict[str, Any]]:
 
 COMMAND_PARAMETERS = {"ip", "host", "hostname", "cmd", "command", "exec", "target", "domain"}
 
+# Attempt a harmless, bounded response-marker confirmation first.
 def _command_canary(
     target_url: str, cookies: str, method: str, data: str, parameters: list[str], timeout: int = 25,
 ) -> dict[str, Any]:
-    """Attempt a harmless, bounded response-marker confirmation first.
 
-    Network-like parameters use 127.0.0.1 instead of the crawler's placeholder
-    value.  A placeholder such as ``1`` can make ping wait long enough that the
-    appended marker command never executes before the HTTP timeout.
-    """
     candidates = [value for value in parameters if value.lower() in COMMAND_PARAMETERS]
     if not candidates:
         return {"performed": False, "confirmed": False, "reason": "no_command_like_parameter"}
@@ -70,11 +67,8 @@ def _command_canary(
     parameter = candidates[0]
     nonce = uuid.uuid4().hex[:10].upper()
     marker = f"SECOPS_CMD_{nonce}"
-    # The expected marker is intentionally NOT present verbatim in any request
-    # payload.  A simple reflection of the submitted value therefore cannot be
-    # mistaken for command execution.  The shell must join independently
-    # supplied fragments (Unix printf or Windows variable expansion) before the
-    # exact marker can appear in the response.
+
+    # Use transformed markers so simple reflection cannot be mistaken for command execution.
     suffixes = (
         f" & printf 'SECOPS_%s' 'CMD_{nonce}'",
         f" | printf 'SECOPS_%s' 'CMD_{nonce}'",
@@ -99,11 +93,13 @@ def _command_canary(
     attempts: list[dict[str, Any]] = []
     deadline = time.monotonic() + max(8, min(int(timeout), 35))
 
+    # Mutate the selected request parameter with the current harmless verification payload.
     def mutate(value: str) -> tuple[str, str]:
         return mutate_parameter(
             target_url, method, data, parameter, value, case_insensitive=True
         )
 
+    # Send one bounded HTTP request for the current verification attempt.
     def send(value: str) -> requests.Response:
         request_url, request_data = mutate(value)
         remaining = max(3.0, deadline - time.monotonic())
@@ -166,6 +162,7 @@ def _command_canary(
         "verification_method": "non-reflective-transformed-marker-v2",
     }
 
+# Convert a confirmed response-marker canary into a normalized command-injection finding.
 def _canary_finding(
     target_url: str, method: str, canary: dict[str, Any],
 ) -> list[dict[str, Any]]:
@@ -201,12 +198,13 @@ def _canary_finding(
         ),
     }]
 
+# Run Commix directly through Python and preserve bounded results.
 @mcp.tool()
 def run_commix_scan(
     target_url: str, cookies: str = "", method: str = "GET", data: str = "",
     parameters: list[str] | None = None, timeout: int = 150,
 ) -> dict:
-    """Run Commix directly through Python and preserve bounded results."""
+
     method = method.upper()
     timeout = max(45, min(int(timeout), 600))
     parameters = filter_control_parameters(parameters)

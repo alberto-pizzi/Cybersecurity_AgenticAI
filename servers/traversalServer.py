@@ -22,6 +22,7 @@ PROBES = (
     (r"..\..\..\..\Windows\win.ini", re.compile(r"(?im)^\[(?:fonts|extensions|mci extensions)\]"), "Windows win.ini"),
 )
 
+# Send one bounded traversal request while preserving the discovered request contract.
 def _request(url: str, cookies: str, method: str, data: str, read_timeout: float = 7.0) -> requests.Response:
     headers = {"Cache-Control": "no-cache", "User-Agent": "SecOps-Path-Traversal-Verifier/1.0"}
     if cookies:
@@ -31,6 +32,7 @@ def _request(url: str, cookies: str, method: str, data: str, read_timeout: float
         timeout=(3, max(3.0, read_timeout)), allow_redirects=True,
     )
 
+# Extract a compact response excerpt around the marker used for LFI verification.
 def _excerpt(text: str, match: re.Match[str] | None, limit: int = 1000) -> str:
     value = str(text or "")
     if not match:
@@ -38,11 +40,12 @@ def _excerpt(text: str, match: re.Match[str] | None, limit: int = 1000) -> str:
     start = max(0, match.start() - 180)
     return value[start:start + limit]
 
+# Run bounded, read-only path traversal/LFI probes against file-like parameters.
 @mcp.tool()
 def run_traversal_scan(
     target_url: str, cookies: str = "", method: str = "GET", data: str = "", parameters: list[str] | None = None, timeout: int = 30,
 ) -> dict:
-    """Run bounded, read-only path traversal/LFI probes against file-like parameters."""
+
     method = str(method or "GET").upper()
     timeout = max(10, min(int(timeout), 120))
     read_timeout = max(4.0, min(7.0, (timeout - 5.0) / 4.0))
@@ -69,6 +72,7 @@ def run_traversal_scan(
             diagnosis="authentication_precheck_failed", timed_out=False, vulnerabilities=[], session_probe=session_probe,
         )
 
+    # Establish a benign baseline before sending read-only traversal variants.
     baseline: requests.Response | None = None
     baseline_error = ""
     try:
@@ -78,6 +82,7 @@ def run_traversal_scan(
 
     attempts: list[dict[str, Any]] = []
     findings: list[dict[str, Any]] = []
+    # Confirm only known file markers that are absent from the benign response.
     for parameter in candidates[:2]:
         for payload, marker, label in PROBES:
             probe_url, probe_data = mutate_parameter(target_url, method, data, parameter, payload, case_insensitive=True)
@@ -90,8 +95,7 @@ def run_traversal_scan(
                 continue
             baseline_match = marker.search(baseline.text) if baseline is not None else None
             match = marker.search(response.text)
-            # A known operating-system marker in the mutated response is strong evidence
-            # even when the optional baseline probe was temporarily unavailable.
+
             confirmed = bool(match and not baseline_match and response.status_code < 400)
             attempt = {
                 "parameter": parameter, "payload": payload, "source": label,

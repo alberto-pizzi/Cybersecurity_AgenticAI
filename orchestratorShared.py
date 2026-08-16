@@ -41,7 +41,7 @@ MAX_ARJUN_ENDPOINTS = max(1, int(os.getenv('SECOPS_MAX_ARJUN_ENDPOINTS', '3')))
 MAX_CRAWL_PAGES = max(10, int(os.getenv('SECOPS_MAX_CRAWL_PAGES', '50')))
 MAX_SCRIPT_ASSETS = max(4, int(os.getenv('SECOPS_MAX_SCRIPT_ASSETS', '24')))
 SCANNER_PROGRESS_INTERVAL = max(10, int(os.getenv('SECOPS_PROGRESS_INTERVAL', '30')))
-SCAN_MODES = {'fast': {'broad': {'zap': 90, 'nuclei': 90, 'nikto': 45, 'ffuf': 40, 'session': 20}, 'parameter': {'sqlmap': 60, 'dalfox': 35, 'commix': 40, 'traversal': 25, 'idor': 12, 'authorization': 25, 'browser': 35, 'workflow': 30}, 'limits': {'sqlmap': 1, 'dalfox': 1, 'commix': 1, 'traversal': 1, 'idor': 1, 'authorization': 1, 'browser': 1, 'workflow': 1}, 'arjun': 30, 'arjun_limit': 1}, 'balanced': {'broad': {'zap': 360, 'nuclei': 210, 'nikto': 90, 'ffuf': 75, 'session': 35}, 'parameter': {'sqlmap': 120, 'dalfox': 90, 'commix': 75, 'traversal': 45, 'idor': 20, 'authorization': 40, 'browser': 75, 'workflow': 60}, 'limits': {'sqlmap': 3, 'dalfox': 3, 'commix': 1, 'traversal': 2, 'idor': 2, 'authorization': 3, 'browser': 2, 'workflow': 3}, 'arjun': 75, 'arjun_limit': 2}, 'deep': {'broad': {'zap': 900, 'nuclei': 360, 'nikto': 180, 'ffuf': 120, 'session': 50}, 'parameter': {'sqlmap': 240, 'dalfox': 180, 'commix': 90, 'traversal': 90, 'idor': 45, 'authorization': 60, 'browser': 120, 'workflow': 90}, 'limits': {'sqlmap': 5, 'dalfox': 4, 'commix': 2, 'traversal': 3, 'idor': 3, 'authorization': 5, 'browser': 4, 'workflow': 5}, 'arjun': 90, 'arjun_limit': 3}}
+SCAN_MODES = {'fast': {'broad': {'zap': 90, 'nuclei': 90, 'nikto': 45, 'ffuf': 40, 'session': 20}, 'parameter': {'sqlmap': 60, 'dalfox': 35, 'commix': 40, 'traversal': 25, 'idor': 12, 'authorization': 25, 'browser': 35, 'workflow': 30}, 'limits': {'sqlmap': 1, 'dalfox': 1, 'commix': 1, 'traversal': 1, 'idor': 1, 'authorization': 1, 'browser': 1, 'workflow': 1}, 'arjun': 30, 'arjun_limit': 1}, 'balanced': {'broad': {'zap': 360, 'nuclei': 210, 'nikto': 90, 'ffuf': 75, 'session': 35}, 'parameter': {'sqlmap': 120, 'dalfox': 90, 'commix': 75, 'traversal': 45, 'idor': 20, 'authorization': 40, 'browser': 75, 'workflow': 60}, 'limits': {'sqlmap': 3, 'dalfox': 3, 'commix': 1, 'traversal': 2, 'idor': 2, 'authorization': 3, 'browser': 2, 'workflow': 3}, 'arjun': 75, 'arjun_limit': 2}, 'deep': {'broad': {'zap': 420, 'nuclei': 360, 'nikto': 150, 'ffuf': 120, 'session': 60}, 'parameter': {'sqlmap': 180, 'dalfox': 120, 'commix': 90, 'traversal': 75, 'idor': 45, 'authorization': 60, 'browser': 120, 'workflow': 90}, 'limits': {'sqlmap': 6, 'dalfox': 6, 'commix': 3, 'traversal': 5, 'idor': 4, 'authorization': 6, 'browser': 8, 'workflow': 8}, 'arjun': 90, 'arjun_limit': 5}}
 CURRENT_SCAN_MODE = 'balanced'
 BROAD_SCANNER_TIMEOUTS = dict(SCAN_MODES[CURRENT_SCAN_MODE]['broad'])
 PARAMETER_TOOL_TIMEOUTS = dict(SCAN_MODES[CURRENT_SCAN_MODE]['parameter'])
@@ -489,7 +489,7 @@ def run_preflight_checks(*, include_live: bool=True) -> list[dict[str, str]]:
                 checks.append({'level': 'ok', 'component': 'report', 'cause': 'report_docker_fallback_ready', 'detail': docker_image})
             else:
                 native_ok = importlib.util.find_spec('weasyprint') is not None
-                checks.append({'level': 'ok' if native_ok else 'warning', 'component': 'report', 'cause': 'python_dependency_found' if native_ok else 'missing_python_dependency', 'detail': 'weasyprint (Docker fallback unavailable; run initScript.py with Docker present to build it)'})
+                checks.append({'level': 'ok' if native_ok else 'warning', 'component': 'report', 'cause': 'python_dependency_found' if native_ok else 'missing_python_dependency', 'detail': 'weasyprint (Docker fallback unavailable; run initScript.py with Docker present to pull the configured report image)'})
         elif spec.module:
             checks.append({'level': 'ok' if importlib.util.find_spec(spec.module) else 'error' if spec.required else 'warning', 'component': spec.name, 'cause': 'python_dependency_found' if importlib.util.find_spec(spec.module) else 'missing_python_dependency', 'detail': spec.module})
         if spec.executable and spec.executable not in seen_executables:
@@ -1068,6 +1068,8 @@ def _tool_case_skip_reason(tool: str, case: dict[str, Any]) -> str:
     if tool == 'sqlmap' and 'brute' in urlparse(str(case.get('url', ''))).path.lower():
         return 'The brute-force handler is an authentication workflow, not a SQL-query request class.'
     if _tool_case_priority(tool, case) <= 0:
+        if CURRENT_SCAN_MODE == 'deep' and case.get('deep_breadth') and tool in {'sqlmap', 'dalfox'}:
+            return ''
         return f"The request was not selected because its path and parameters do not match {tool}'s vulnerability class."
     return ''
 
@@ -1099,6 +1101,37 @@ def select_tool_request_cases(discovery: dict[str, Any], tool: str, limit: int |
         selected.append(case)
         if len(selected) >= effective_limit:
             break
+
+    # Deep mode deliberately back-fills a small number of safe generic GET
+    # contracts for SQLMap/Dalfox. This increases request-class coverage instead
+    # of merely increasing timeouts on the same obvious endpoints.
+    if CURRENT_SCAN_MODE == 'deep' and tool in {'sqlmap', 'dalfox'} and len(selected) < effective_limit:
+        extra_budget = min(2, effective_limit - len(selected))
+        extras: list[tuple[int, int, dict[str, Any]]] = []
+        for index, case in enumerate(cases):
+            if not isinstance(case, dict):
+                continue
+            method = str(case.get('method', 'GET')).upper()
+            url = str(case.get('url') or '')
+            path = urlparse(url).path.lower()
+            params = [str(value) for value in case.get('parameters', []) if str(value)]
+            if method != 'GET' or not url or not params or _is_auto_index_case(case) or _destructive_crawl_url(url):
+                continue
+            if any(token in path for token in ('logout', 'setup', 'reset', 'delete', 'security.php')):
+                continue
+            if tool == 'sqlmap' and (_is_login_case(case) or 'brute' in path):
+                continue
+            if tool == 'dalfox' and _prefer_browser_for_xss_case(case):
+                continue
+            key = (method, url, tuple(sorted(params)))
+            if key in seen:
+                continue
+            generic_score = _risk_terms(path + ' ' + ' '.join(params)) + min(18, len(params) * 4)
+            extras.append((generic_score, -index, {**case, 'deep_breadth': True, 'selection_reason': f'deep-generic-{tool}-coverage'}))
+        for _, _, case in sorted(extras, key=lambda item: (-item[0], -item[1]))[:extra_budget]:
+            key = (str(case.get('method', 'GET')).upper(), str(case.get('url', '')), tuple(sorted((str(value) for value in case.get('parameters', [])))))
+            seen.add(key)
+            selected.append(case)
     return selected
 WORKFLOW_STATE_HINTS = {'change', 'update', 'save', 'create', 'submit', 'send', 'comment', 'message', 'feedback', 'upload', 'password', 'email', 'profile', 'settings', 'transfer', 'captcha', 'admin'}
 WORKFLOW_DESTRUCTIVE_HINTS = {'logout', 'signout', 'logoff', 'setup', 'install', 'delete', 'remove', 'drop', 'truncate', 'purge', 'wipe', 'reset'}
@@ -1132,6 +1165,11 @@ def _browser_case_priority(case: dict[str, Any], client_keys: set[tuple[str, str
     score = 0
     if path_match:
         score += 75
+    if CURRENT_SCAN_MODE == 'deep':
+        if any(token in path for token in ('csp', 'javascript', 'client', 'redirect', 'callback')):
+            score += 70
+        elif any(token in path for token in ('upload', 'preview')):
+            score += 35
     score += 16 * len(xss_hits)
     if str(case.get('method', 'GET')).upper() == 'POST' and (path_match or xss_hits or client_match):
         score += 18
@@ -1182,6 +1220,31 @@ def select_browser_request_cases(discovery: dict[str, Any], limit: int | None=No
         selected.append(case)
         if len(selected) >= effective_limit:
             break
+    if CURRENT_SCAN_MODE == 'deep' and len(selected) < effective_limit:
+        extras: list[tuple[int, dict[str, Any]]] = []
+        for case in cases:
+            url = str(case.get('url') or '')
+            method = str(case.get('method', 'GET')).upper()
+            if not url or method not in {'GET', 'POST'} or _destructive_crawl_url(url) or _is_auto_index_case(case):
+                continue
+            path = urlparse(url).path.lower()
+            if any(token in path for token in ('logout', 'setup', 'reset', 'delete')):
+                continue
+            params = tuple(sorted(str(value) for value in case.get('parameters', []) if str(value)))
+            key = (method, _browser_url_key(url), params)
+            if key in seen:
+                continue
+            score = _risk_terms(path + ' ' + ' '.join(params))
+            if any(token in path for token in ('csp', 'javascript', 'brute', 'csrf', 'upload', 'redirect', 'callback')):
+                score += 35
+            if case.get('client_sources') or case.get('client_sinks'):
+                score += 50
+            if params:
+                score += 15
+            extras.append((score, {**case, 'selection_reason': 'deep-browser-breadth'}))
+        for _, case in sorted(extras, key=lambda item: (-item[0], str(item[1].get('url') or '')))[:max(0, effective_limit - len(selected))]:
+            selected.append(case)
+            seen.add((str(case.get('method', 'GET')).upper(), _browser_url_key(str(case.get('url', ''))), tuple(sorted(str(value) for value in case.get('parameters', []) if str(value)))))
     return selected
 
 def _workflow_case_priority(case: dict[str, Any]) -> int:
@@ -1220,6 +1283,14 @@ def select_workflow_request_cases(discovery: dict[str, Any], limit: int | None=N
         score = _workflow_case_priority(case)
         if score > 0:
             ranked.append((score, -index, case))
+            continue
+        if CURRENT_SCAN_MODE == 'deep':
+            method = str(case.get('method', 'GET')).upper()
+            path = urlparse(str(case.get('url') or '')).path.lower()
+            names = _case_field_names(case)
+            auth_shape = any(token in path for token in ('brute', 'login', 'signin', 'auth')) or bool({'username', 'password'} <= names)
+            if method == 'GET' and auth_shape and not _destructive_crawl_url(str(case.get('url') or '')):
+                ranked.append((82 + min(12, len(names) * 2), -index, {**case, 'selection_reason': 'deep-get-auth-workflow'}))
     selected: list[dict[str, Any]] = []
     seen: set[tuple[str, str, tuple[str, ...]]] = set()
     for _, _, case in sorted(ranked, key=lambda item: (-item[0], -item[1])):
@@ -1337,6 +1408,26 @@ def select_authorization_request_cases(discovery: dict[str, Any], limit: int | N
         selected.append(case)
         if len(selected) >= effective_limit:
             break
+    if CURRENT_SCAN_MODE == 'deep' and len(selected) < effective_limit:
+        # Anonymous-vs-authenticated comparison still adds useful breadth on
+        # safe read-only parameterized pages even without a second identity.
+        extras: list[tuple[int, dict[str, Any]]] = []
+        for case in cases:
+            url = str(case.get('url') or '')
+            if not url or url in seen or str(case.get('method', 'GET')).upper() != 'GET':
+                continue
+            if _is_auto_index_case(case) or _destructive_crawl_url(url) or _is_login_case(case):
+                continue
+            path = urlparse(url).path.lower()
+            if any(token in path for token in ('logout', 'setup', 'reset', 'delete', 'csrf', 'captcha')):
+                continue
+            if not list(case.get('parameters') or []) and not urlparse(url).query:
+                continue
+            score = _risk_terms(path) + (12 if urlparse(url).query else 0)
+            extras.append((score, {**case, 'selection_reason': 'deep-readonly-auth-breadth'}))
+        for _, case in sorted(extras, key=lambda item: (-item[0], str(item[1].get('url') or '')))[:max(0, min(3, effective_limit - len(selected)))]:
+            seen.add(str(case.get('url') or ''))
+            selected.append(case)
     return selected
 
 def select_arjun_request_cases(discovery: dict[str, Any], target: str, limit: int=MAX_ARJUN_ENDPOINTS) -> list[dict[str, Any]]:
@@ -1381,22 +1472,27 @@ def select_arjun_request_cases(discovery: dict[str, Any], target: str, limit: in
         if score < 12:
             continue
         ranked.append((score, {'url': url, 'method': 'GET', 'data': '', 'parameters': []}))
-    if not ranked and CURRENT_SCAN_MODE in {'balanced', 'deep'}:
+    if CURRENT_SCAN_MODE in {'balanced', 'deep'} and (not ranked or CURRENT_SCAN_MODE == 'deep'):
         relaxed: list[tuple[int, dict[str, Any]]] = []
+        existing_paths = {urlparse(str(item[1].get('url') or '')).path.lower() for item in ranked}
         for raw_url in discovery.get('html_urls', []) or discovery.get('urls', []):
             url = normalize_url(str(raw_url or ''))
             if not url or not same_origin(target, url) or urlparse(url).query or _destructive_crawl_url(url):
                 continue
             path = urlparse(url).path.lower()
-            if path.endswith(('/login.php', '/login', '/setup.php', '/logout.php')):
+            if path in existing_paths or path.endswith(('/login.php', '/login', '/setup.php', '/logout.php')):
                 continue
             score = _risk_terms(path)
-            if any((token in path for token in ('security', 'vulnerabilities', 'admin', 'debug', 'api'))):
+            if any((token in path for token in ('security', 'vulnerabilities', 'admin', 'debug', 'api', 'upload', 'download', 'callback'))):
                 score += 8
-            if score >= 6:
-                relaxed.append((score, {'url': url, 'method': 'GET', 'data': '', 'parameters': [], 'selection_reason': 'relaxed-safe-hidden-parameter-fallback'}))
-        if relaxed:
-            ranked.append(max(relaxed, key=lambda item: (item[0], item[1]['url'])))
+            threshold = 1 if CURRENT_SCAN_MODE == 'deep' else 6
+            if score >= threshold:
+                relaxed.append((score, {'url': url, 'method': 'GET', 'data': '', 'parameters': [], 'selection_reason': 'deep-safe-hidden-parameter-breadth' if CURRENT_SCAN_MODE == 'deep' else 'relaxed-safe-hidden-parameter-fallback'}))
+        relaxed.sort(key=lambda item: (-item[0], item[1]['url']))
+        if CURRENT_SCAN_MODE == 'deep':
+            ranked.extend(relaxed[:max(0, limit - len(ranked))])
+        elif not ranked and relaxed:
+            ranked.append(relaxed[0])
     selected: list[dict[str, Any]] = []
     seen: set[tuple[str, str]] = set()
     for _, case in sorted(ranked, key=lambda item: (-item[0], item[1]['url'])):
@@ -1554,7 +1650,9 @@ def log_zap_session_diagnostics(result: dict[str, Any]) -> None:
             return
         policy = result.get('active_scanner_policy') if isinstance(result.get('active_scanner_policy'), dict) else {}
         stats = result.get('zap_alert_stats') if isinstance(result.get('zap_alert_stats'), dict) else {}
-        print(f"    [ZAP COVERAGE] seeded URLs={result.get('seeded_urls', 0)}; seeded requests={result.get('seeded_request_cases', 0)}; targeted active={result.get('targeted_active_scans_completed', 0)}/{result.get('targeted_active_scans_started', 0)}; configured rules={result.get('active_rules_attempted', 0)}/{result.get('active_rules_planned', 0)} ({result.get('active_rule_coverage_percent', 0)}%); completed-rule coverage={result.get('active_rules_completed', 0)}/{result.get('active_rules_planned', 0)} ({result.get('active_rule_effective_coverage_percent', 0)}%); critical cases={result.get('critical_targeted_scans_completed', 0)}/{result.get('critical_targeted_scans_started', 0)}; proxy confirmed={result.get('proxy_assisted_confirmed', 0)}; native security alerts={stats.get('security', 0)}; site-tree URLs={result.get('zap_sites_tree_urls', 0)}")
+        effective_done = result.get('effective_targeted_scans_completed', result.get('targeted_active_scans_completed', 0))
+        effective_started = result.get('effective_targeted_scans_started', result.get('targeted_active_scans_started', 0))
+        print(f"    [ZAP COVERAGE] seeded URLs={result.get('seeded_urls', 0)}; seeded requests={result.get('seeded_request_cases', 0)}; native targeted={result.get('targeted_active_scans_completed', 0)}/{result.get('targeted_active_scans_started', 0)}; effective native/proxy={effective_done}/{effective_started}; configured rules={result.get('active_rules_attempted', 0)}/{result.get('active_rules_planned', 0)} ({result.get('active_rule_coverage_percent', 0)}%); completed-rule coverage={result.get('active_rules_completed', 0)}/{result.get('active_rules_planned', 0)} ({result.get('active_rule_effective_coverage_percent', 0)}%); proxy confirmed={result.get('proxy_assisted_confirmed', 0)}; native security alerts={stats.get('security', 0)}; site-tree URLs={result.get('zap_sites_tree_urls', 0)}")
         if policy:
             print('    [ZAP ACTIVE POLICY] first-tier rule IDs=' + (', '.join(policy.get('enabled_ids', [])) or 'none'))
         deferred = result.get('deferred_native_active_cases') if isinstance(result.get('deferred_native_active_cases'), list) else []
@@ -1637,7 +1735,7 @@ def log_result(profile: str, name: str, result: dict[str, Any], target: str='') 
         for phase in phases:
             if not isinstance(phase, dict):
                 continue
-            print(f"    [NUCLEI PHASE] {phase.get('name', 'unknown')}: status={phase.get('status', 'unknown')}; findings={phase.get('findings', 0)}; budget={phase.get('timeout_seconds', 0)}s; input={phase.get('input_mode') or 'list'}; aggression={phase.get('fuzz_aggression') or 'n/a'}; scope={phase.get('target_scope') or 'focused'}")
+            print(f"    [NUCLEI PHASE] {phase.get('name', 'unknown')}: status={phase.get('status', 'unknown')}; findings={phase.get('findings', 0)}; templates={phase.get('selected_template_count', 0)}; budget={phase.get('timeout_seconds', 0)}s; input={phase.get('input_mode') or 'list'}; aggression={phase.get('fuzz_aggression') or 'n/a'}; scope={phase.get('target_scope') or 'focused'}")
             if phase.get('template_batch_recovery'):
                 print(f"    [NUCLEI RECOVERY] completed exact templates={phase.get('completed_template_count', 0)}; exact rejected={phase.get('invalid_template_count', 0)}; engine tag fallback={phase.get('engine_tag_fallback_success', False)}; global matchers={phase.get('global_matcher_template_count', 0)}; global matchers enabled={phase.get('global_matchers_enabled', False)}; runtime failures={len(phase.get('runtime_template_failures') or [])}; timed out={len(phase.get('timed_out_templates') or [])}")
         if not total:
@@ -1796,7 +1894,7 @@ def build_tool_arguments(tool: str, target_url: str, cookies: str, discovery: di
                 scan_mode = 'targeted'
             else:
                 scan_mode = 'passive'
-            arguments.update({'seed_urls': discovery.get('html_urls', []), 'request_cases': discovery.get('request_cases', []), 'scan_mode': scan_mode, 'max_observations': 100 if CURRENT_SCAN_MODE == 'deep' else 50 if CURRENT_SCAN_MODE == 'balanced' or single_tool else 25})
+            arguments.update({'seed_urls': discovery.get('html_urls', []), 'request_cases': discovery.get('request_cases', []), 'scan_mode': scan_mode, 'max_observations': 150 if CURRENT_SCAN_MODE == 'deep' else 50 if CURRENT_SCAN_MODE == 'balanced' or single_tool else 25})
             if single_tool:
                 arguments['diagnostic_only'] = diagnostic_only
             elif diagnostic_only:
@@ -1845,12 +1943,52 @@ def summarize_results(results: dict[str, Any]) -> tuple[int, int, int]:
             print(f'[-] {path}: {cause} — {detail[:500]}', file=sys.stderr)
     return (errors, skips, partial)
 
+def _report_flatten_findings_for_summary(results: dict[str, Any]) -> list[dict[str, Any]]:
+    """Load the project report normalizer by file path so terminal counts match the report exactly."""
+    report_path = SERVERS / 'reportServer.py'
+    if not report_path.is_file():
+        raise FileNotFoundError(report_path)
+    module_name = '_secops_report_summary_runtime'
+    module = sys.modules.get(module_name)
+    if module is None:
+        spec = importlib.util.spec_from_file_location(module_name, report_path)
+        if spec is None or spec.loader is None:
+            raise ImportError(f'Cannot load report normalizer from {report_path}')
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[module_name] = module
+        # reportServer.py normally runs as a script from servers/, so any local
+        # helper imports resolve from that directory.  Recreate that import
+        # environment for this read-only normalizer load without changing the
+        # report server itself.
+        added_paths = []
+        for candidate in (str(SERVERS), str(ROOT)):
+            if candidate not in sys.path:
+                sys.path.insert(0, candidate)
+                added_paths.append(candidate)
+        try:
+            spec.loader.exec_module(module)
+        except Exception:
+            sys.modules.pop(module_name, None)
+            raise
+        finally:
+            for candidate in added_paths:
+                try:
+                    sys.path.remove(candidate)
+                except ValueError:
+                    pass
+    flatten = getattr(module, 'flatten_findings', None)
+    if not callable(flatten):
+        raise AttributeError('reportServer.py does not expose flatten_findings()')
+    rows = flatten(results)
+    return [row for row in rows if isinstance(row, dict)]
+
+
 def print_security_finding_summary(results: dict[str, Any]) -> None:
-    """Print the same semantically deduplicated findings used by the report."""
+    """Print the same normalized and semantically deduplicated findings used by the report."""
     try:
-        from servers.reportServer import flatten_findings
-        rows = flatten_findings(results)
-    except Exception:
+        rows = _report_flatten_findings_for_summary(results)
+    except Exception as exc:
+        print(f"[!] Report deduplicator unavailable for terminal summary: {type(exc).__name__}: {exc}", file=sys.stderr)
         rows = []
         for _, tools in results.items():
             if not isinstance(tools, dict):
@@ -1865,8 +2003,13 @@ def print_security_finding_summary(results: dict[str, Any]) -> None:
     print('\n=== Security findings (deduplicated) ===')
     print(f'[+] Confirmed vulnerabilities: {len(confirmed)}')
     for index, row in enumerate(confirmed, 1):
-        print(f"    {index}. [{str(row.get('risk') or 'info').upper()}] {row.get('alert') or 'Unnamed finding'} - tool={row.get('tool') or 'unknown'}; parameter={row.get('parameter') or '-'}; url={row.get('url') or ''}")
+        tools = row.get('tools') if isinstance(row.get('tools'), list) else []
+        tool = ','.join(str(value) for value in tools if str(value)) or str(row.get('tool') or 'unknown')
+        print(f"    {index}. [{str(row.get('risk') or 'info').upper()}] {row.get('alert') or 'Unnamed finding'} - tool={tool}; parameter={row.get('parameter') or '-'}; url={row.get('url') or ''}")
     print(f'[+] Candidates requiring validation: {len(candidates)}')
     for index, row in enumerate(candidates, 1):
-        print(f"    {index}. [{str(row.get('risk') or 'info').upper()}] {row.get('alert') or 'Unnamed finding'} - tool={row.get('tool') or 'unknown'}; parameter={row.get('parameter') or '-'}; url={row.get('url') or ''}")
+        tools = row.get('tools') if isinstance(row.get('tools'), list) else []
+        tool = ','.join(str(value) for value in tools if str(value)) or str(row.get('tool') or 'unknown')
+        print(f"    {index}. [{str(row.get('risk') or 'info').upper()}] {row.get('alert') or 'Unnamed finding'} - tool={tool}; parameter={row.get('parameter') or '-'}; url={row.get('url') or ''}")
+
 SINGLE_TOOL_CHOICES = tuple((spec.name for spec in ALL_TOOLS if spec.name != 'report'))

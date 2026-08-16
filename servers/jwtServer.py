@@ -10,6 +10,7 @@ from scannerCommon import service
 
 mcp, _serve = service("JWT Analyzer", "jwt")
 
+# Inspect discovered JWTs for structural weaknesses without claiming server-side acceptance.
 @mcp.tool()
 def run_jwt_scan(jwt_token: str = "", target_url: str = "") -> dict:
     if not jwt_token:
