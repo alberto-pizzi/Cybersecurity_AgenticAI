@@ -2,16 +2,14 @@ from __future__ import annotations
 
 import re
 from typing import Any
-from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 
 import requests
-from fastmcp import FastMCP
 
-from utils import failure, partial, scanner_session_probe, success
+from utils import partial, scanner_session_probe, success
 
-from utils import run_mcp_http
+from scannerCommon import mutate_parameter, service
 
-mcp = FastMCP("Path Traversal and LFI Verifier")
+mcp, _serve = service("Path Traversal and LFI Verifier", "traversal")
 
 CONTROL_PARAMETERS = {"submit", "button", "change", "login", "user_token", "csrf"}
 PATH_PARAMETERS = {
@@ -24,41 +22,14 @@ PROBES = (
     (r"..\..\..\..\Windows\win.ini", re.compile(r"(?im)^\[(?:fonts|extensions|mci extensions)\]"), "Windows win.ini"),
 )
 
-
-def _mutated_request(target_url: str, method: str, data: str, parameter: str, value: str) -> tuple[str, str]:
-    if method == "GET":
-        parsed = urlparse(target_url)
-        pairs = parse_qsl(parsed.query, keep_blank_values=True)
-        changed, replaced = [], False
-        for name, current in pairs:
-            if not replaced and name.lower() == parameter.lower():
-                changed.append((name, value)); replaced = True
-            else:
-                changed.append((name, current))
-        if not replaced:
-            changed.append((parameter, value))
-        return urlunparse(parsed._replace(query=urlencode(changed))), ""
-    pairs = parse_qsl(data, keep_blank_values=True)
-    changed, replaced = [], False
-    for name, current in pairs:
-        if not replaced and name.lower() == parameter.lower():
-            changed.append((name, value)); replaced = True
-        else:
-            changed.append((name, current))
-    if not replaced:
-        changed.append((parameter, value))
-    return target_url, urlencode(changed)
-
-
-def _request(url: str, cookies: str, method: str, data: str) -> requests.Response:
+def _request(url: str, cookies: str, method: str, data: str, read_timeout: float = 7.0) -> requests.Response:
     headers = {"Cache-Control": "no-cache", "User-Agent": "SecOps-Path-Traversal-Verifier/1.0"}
     if cookies:
         headers["Cookie"] = cookies
     return requests.request(
         method, url, data=data if method != "GET" else None, headers=headers,
-        timeout=(4, 12), allow_redirects=True,
+        timeout=(3, max(3.0, read_timeout)), allow_redirects=True,
     )
-
 
 def _excerpt(text: str, match: re.Match[str] | None, limit: int = 1000) -> str:
     value = str(text or "")
@@ -67,22 +38,17 @@ def _excerpt(text: str, match: re.Match[str] | None, limit: int = 1000) -> str:
     start = max(0, match.start() - 180)
     return value[start:start + limit]
 
-
 @mcp.tool()
 def run_traversal_scan(
-    target_url: str,
-    cookies: str = "",
-    method: str = "GET",
-    data: str = "",
-    parameters: list[str] | None = None,
-    timeout: int = 30,
+    target_url: str, cookies: str = "", method: str = "GET", data: str = "", parameters: list[str] | None = None, timeout: int = 30,
 ) -> dict:
     """Run bounded, read-only path traversal/LFI probes against file-like parameters."""
     method = str(method or "GET").upper()
+    timeout = max(10, min(int(timeout), 120))
+    read_timeout = max(4.0, min(7.0, (timeout - 5.0) / 4.0))
     if method not in {"GET", "POST"}:
         return partial(
-            "Path Traversal/LFI", target_url,
-            f"Unsupported HTTP method for bounded traversal verification: {method}.",
+            "Path Traversal/LFI", target_url, f"Unsupported HTTP method for bounded traversal verification: {method}.",
             diagnosis="unsupported_method", timed_out=False, vulnerabilities=[],
         )
     candidates = [
@@ -91,59 +57,52 @@ def run_traversal_scan(
     ]
     if not candidates:
         return success(
-            "Path Traversal/LFI", target_url,
-            "No file/path/include-style parameter was available for a bounded traversal probe.",
+            "Path Traversal/LFI", target_url, "No file/path/include-style parameter was available for a bounded traversal probe.",
             vulnerabilities=[], applicable=False,
         )
 
-    session_probe = scanner_session_probe(target_url, cookies, method, data)
+    session_probe = scanner_session_probe(target_url, cookies, method, data, timeout=4, attempts=1)
     if cookies and session_probe.get("performed") and session_probe.get("conclusive") and session_probe.get("authenticated") is False:
         return partial(
             "Path Traversal/LFI", target_url,
             "Traversal verification was not started because the authenticated request redirected to a login page.",
-            diagnosis="authentication_precheck_failed", timed_out=False,
-            vulnerabilities=[], session_probe=session_probe,
+            diagnosis="authentication_precheck_failed", timed_out=False, vulnerabilities=[], session_probe=session_probe,
         )
 
+    baseline: requests.Response | None = None
+    baseline_error = ""
     try:
-        baseline = _request(target_url, cookies, method, data)
+        baseline = _request(target_url, cookies, method, data, read_timeout)
     except requests.RequestException as exc:
-        return failure(
-            "Path Traversal/LFI", target_url,
-            f"Baseline request failed: {type(exc).__name__}: {exc}",
-            diagnosis="request_failed",
-        )
+        baseline_error = f"{type(exc).__name__}: {exc}"
 
     attempts: list[dict[str, Any]] = []
     findings: list[dict[str, Any]] = []
     for parameter in candidates[:2]:
         for payload, marker, label in PROBES:
-            probe_url, probe_data = _mutated_request(target_url, method, data, parameter, payload)
+            probe_url, probe_data = mutate_parameter(target_url, method, data, parameter, payload, case_insensitive=True)
             try:
-                response = _request(probe_url, cookies, method, probe_data)
+                response = _request(probe_url, cookies, method, probe_data, read_timeout)
             except requests.RequestException as exc:
                 attempts.append({
-                    "parameter": parameter, "payload": payload, "source": label,
-                    "error": f"{type(exc).__name__}: {exc}",
+                    "parameter": parameter, "payload": payload, "source": label, "error": f"{type(exc).__name__}: {exc}",
                 })
                 continue
-            baseline_match = marker.search(baseline.text)
+            baseline_match = marker.search(baseline.text) if baseline is not None else None
             match = marker.search(response.text)
+            # A known operating-system marker in the mutated response is strong evidence
+            # even when the optional baseline probe was temporarily unavailable.
             confirmed = bool(match and not baseline_match and response.status_code < 400)
             attempt = {
                 "parameter": parameter, "payload": payload, "source": label,
                 "status": response.status_code, "final_url": str(response.url),
-                "response_bytes": len(response.content), "confirmed": confirmed,
-                "response_excerpt": _excerpt(response.text, match),
+                "response_bytes": len(response.content), "confirmed": confirmed, "response_excerpt": _excerpt(response.text, match),
             }
             attempts.append(attempt)
             if confirmed:
                 findings.append({
-                    "alert": f"Local file inclusion/path traversal in parameter '{parameter}'",
-                    "risk": "high",
-                    "category": "vulnerability",
-                    "verification_status": "known-local-file-marker-confirmed",
-                    "confidence": "high",
+                    "alert": f"Local file inclusion/path traversal in parameter '{parameter}'", "risk": "high",
+                    "category": "vulnerability", "verification_status": "known-local-file-marker-confirmed", "confidence": "high",
                     "description": (
                         f"A traversal payload supplied through '{parameter}' returned a marker from {label} "
                         "that was absent from the baseline response."
@@ -159,12 +118,8 @@ def run_traversal_scan(
                         "server-side identifiers, canonicalize paths, enforce an allow-list, and verify that the resolved "
                         "path remains inside the intended directory."
                     ),
-                    "url": target_url,
-                    "method": method,
-                    "parameter": parameter,
-                    "payload": payload,
-                    "cwe_id": "22",
-                    "owasp_category": "A01:2021 Broken Access Control",
+                    "url": target_url, "method": method, "parameter": parameter, "payload": payload,
+                    "cwe_id": "22", "owasp_category": "A01:2021 Broken Access Control",
                     "technical_details": (
                         f"HTTP {response.status_code}; source marker={label}; response bytes={len(response.content)}; "
                         "marker absent from baseline=True."
@@ -183,14 +138,16 @@ def run_traversal_scan(
         if findings:
             break
 
+    common = {
+        "vulnerabilities": findings, "attempts": attempts, "applicable": True,
+        "authenticated": bool(cookies), "session_probe": session_probe,
+        "execution_mode": "bounded_known_file_markers", "request_timeout": round(read_timeout, 2),
+        "baseline_available": baseline is not None, "baseline_error": baseline_error,
+    }
     return success(
-        "Path Traversal/LFI", target_url,
-        f"Bounded traversal verification completed. Confirmed findings: {len(findings)}.",
-        vulnerabilities=findings, attempts=attempts, applicable=True,
-        authenticated=bool(cookies), session_probe=session_probe,
-        execution_mode="bounded_known_file_markers",
+        "Path Traversal/LFI", target_url, f"Bounded traversal verification completed. Confirmed findings: {len(findings)}.",
+        **common,
     )
 
-
 if __name__ == "__main__":
-    run_mcp_http(mcp, "traversal")
+    _serve()

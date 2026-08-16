@@ -9,21 +9,18 @@ from pathlib import Path
 from urllib.parse import quote, quote_plus
 
 import requests
-from fastmcp import FastMCP
 
 from utils import failure, partial, skipped, success
 
-from utils import run_mcp_http
+from scannerCommon import service
 
-mcp = FastMCP("Interactsh OAST Client")
-
+mcp, _serve = service("Interactsh OAST Client", "interactsh")
 
 def _read_lines(path: Path) -> list[str]:
     try:
         return [line.strip() for line in path.read_text(encoding="utf-8", errors="replace").splitlines() if line.strip()]
     except OSError:
         return []
-
 
 def _stop(process: subprocess.Popen[str]) -> None:
     if process.poll() is not None:
@@ -35,16 +32,10 @@ def _stop(process: subprocess.Popen[str]) -> None:
         process.kill()
         process.wait(timeout=5)
 
-
 @mcp.tool()
 def run_interactsh_client(
-    target_url: str = "",
-    injection_url: str = "",
-    cookies: str = "",
-    method: str = "GET",
-    data: str = "",
-    parameter: str = "",
-    timeout: int = 90,
+    target_url: str = "", injection_url: str = "", cookies: str = "", method: str = "GET",
+    data: str = "", parameter: str = "", timeout: int = 90,
 ) -> dict:
     """Run a bounded GET or POST OAST check using a literal ``FUZZ`` placeholder."""
     method = str(method or "GET").upper()
@@ -65,12 +56,10 @@ def run_interactsh_client(
         payload_file = temp / "payload.txt"
         event_file = temp / "events.jsonl"
         command = [
-            executable, "-n", "1", "-pi", "1", "-json", "-v", "-duc",
-            "-ps", "-psf", str(payload_file), "-o", str(event_file),
+            executable, "-n", "1", "-pi", "1", "-json", "-v", "-duc", "-ps", "-psf", str(payload_file), "-o", str(event_file),
         ]
         process = subprocess.Popen(
-            command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
-            encoding="utf-8", errors="replace",
+            command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding="utf-8", errors="replace",
         )
         started = time.monotonic()
         try:
@@ -91,8 +80,7 @@ def run_interactsh_client(
 
             if not payload:
                 return partial(
-                    "Interactsh", target_url,
-                    "Interactsh reached its payload-generation time budget.",
+                    "Interactsh", target_url, "Interactsh reached its payload-generation time budget.",
                     diagnosis="time_limit_reached", timed_out=True, vulnerabilities=[],
                 )
 
@@ -105,21 +93,18 @@ def run_interactsh_client(
                 headers["Content-Type"] = "application/x-www-form-urlencoded"
             try:
                 response = requests.request(
-                    method=method, url=injected_url,
-                    data=injected_data if method == "POST" else None,
+                    method=method, url=injected_url, data=injected_data if method == "POST" else None,
                     headers=headers, timeout=(5, 20), allow_redirects=True,
                 )
                 injection_status = response.status_code
             except requests.Timeout as exc:
                 return partial(
-                    "Interactsh", target_url,
-                    f"OAST injection request reached its time budget: {exc}",
+                    "Interactsh", target_url, f"OAST injection request reached its time budget: {exc}",
                     diagnosis="time_limit_reached", timed_out=True, vulnerabilities=[],
                 )
             except requests.RequestException as exc:
                 return failure(
-                    "Interactsh", target_url, f"OAST injection request failed: {exc}",
-                    diagnosis="injection_request_failed",
+                    "Interactsh", target_url, f"OAST injection request failed: {exc}", diagnosis="injection_request_failed",
                 )
 
             events: list[dict] = []
@@ -140,11 +125,8 @@ def run_interactsh_client(
             if events:
                 protocols = sorted({str(event.get("protocol") or event.get("type") or "unknown") for event in events if isinstance(event, dict)})
                 findings.append({
-                    "alert": "Out-of-band interaction confirmed",
-                    "risk": "high",
-                    "category": "vulnerability",
-                    "verification_status": "callback-confirmed",
-                    "confidence": "high",
+                    "alert": "Out-of-band interaction confirmed", "risk": "high",
+                    "category": "vulnerability", "verification_status": "callback-confirmed", "confidence": "high",
                     "description": (
                         "The selected input caused the target-side processing path to generate "
                         f"an out-of-band callback. Observed protocols: {', '.join(protocols)}."
@@ -157,24 +139,19 @@ def run_interactsh_client(
                         "Trace the consuming code path, restrict outbound access, allow-list destinations, "
                         "disable unsafe parsers or shell execution, and add a regression test."
                     ),
-                    "url": injected_url,
-                    "method": method,
-                    "parameter": parameter,
+                    "url": injected_url, "method": method, "parameter": parameter,
                     "technical_details": f"Interactsh callbacks={len(events)}; protocols={protocols}; parameter={parameter or 'not specified'}." ,
                     "evidence": json.dumps(events[:10], indent=2, ensure_ascii=False, default=str),
                 })
 
             return success(
-                "Interactsh", target_url,
-                f"OAST {method} request completed. HTTP {injection_status}; callbacks: {len(events)}.",
+                "Interactsh", target_url, f"OAST {method} request completed. HTTP {injection_status}; callbacks: {len(events)}.",
                 vulnerabilities=findings, payload=payload, injected_url=injected_url,
                 injected_data=injected_data if method == "POST" else "",
-                method=method, parameter=parameter, interactions=events[:50],
-                applicable=True, callback_confirmed=bool(events),
+                method=method, parameter=parameter, interactions=events[:50], applicable=True, callback_confirmed=bool(events),
             )
         finally:
             _stop(process)
 
-
 if __name__ == "__main__":
-    run_mcp_http(mcp, "interactsh")
+    _serve()

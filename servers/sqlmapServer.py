@@ -1,561 +1,337 @@
 from __future__ import annotations
 
-import re
+import ast
+import secrets
+import socket
+import subprocess
 import sys
-from pathlib import Path
+import time
 from typing import Any
-from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
+from urllib.parse import parse_qsl, urlparse
 
 import requests
 
-from fastmcp import FastMCP
+from utils import failure, partial, scanner_session_probe, success
+from scannerCommon import filter_control_parameters, find_repo_script, mutate_parameter, request_retry, service
 
-from utils import ROOT_DIR, failure, partial, run_process, scanner_session_probe, success, trim_process_output
+mcp, _serve = service("SQLMap Scanner", "sqlmap")
 
-from utils import run_mcp_http
-
-mcp = FastMCP("SQLMap Scanner")
-
-
-def _find_sqlmap_script() -> Path | None:
-    candidates = [
-        Path.home() / ".local" / "opt" / "sqlmap" / "sqlmap.py",
-        Path(ROOT_DIR) / "tools" / "sqlmap" / "sqlmap.py",
-    ]
-    launcher = Path.home() / ".local" / "bin" / "sqlmap.bat"
-    if launcher.is_file():
-        text = launcher.read_text(encoding="utf-8", errors="replace")
-        match = re.search(r'"([^"\r\n]*sqlmap\.py)"|([A-Za-z]:\\[^\r\n]*?sqlmap\.py)', text, re.I)
-        if match:
-            candidates.insert(0, Path(match.group(1) or match.group(2)))
-    for path in candidates:
-        if path.is_file():
-            return path.resolve()
-    return None
-
-
-def _extract_findings(text: str, target_url: str, method: str) -> list[dict[str, Any]]:
-    if not re.search(
-        r"(identified the following injection point|parameter.+is vulnerable|appears to be injectable)",
-        text,
-        re.IGNORECASE,
-    ):
-        return []
-
-    dbms_match = re.search(r"back-end DBMS:\s*(.+)", text, re.I)
-    dbms = dbms_match.group(1).strip() if dbms_match else ""
-    blocks = re.split(r"(?=Parameter:\s*)", text, flags=re.I)
-    findings: list[dict[str, Any]] = []
-    for block in blocks:
-        parameter_match = re.search(r"Parameter:\s*([^\s(]+)(?:\s*\(([^)]+)\))?", block, re.I)
-        if not parameter_match:
-            continue
-        parameter = parameter_match.group(1).strip()
-        place = (parameter_match.group(2) or method).strip().upper()
-        types = [value.strip() for value in re.findall(r"^\s*Type:\s*(.+)$", block, re.I | re.M)]
-        titles = [value.strip() for value in re.findall(r"^\s*Title:\s*(.+)$", block, re.I | re.M)]
-        payloads = [value.strip() for value in re.findall(r"^\s*Payload:\s*(.+)$", block, re.I | re.M)]
-        if not (types or titles or payloads or re.search(r"vulnerable|injectable", block, re.I)):
-            continue
-        technique_text = "; ".join(dict.fromkeys([*types, *titles])) or "SQLMap-confirmed injection technique"
-        evidence_lines = [
-            f"Parameter: {parameter} ({place})",
-            *(f"Type: {value}" for value in types),
-            *(f"Title: {value}" for value in titles),
-            *(f"Payload: {value}" for value in payloads),
-            f"Back-end DBMS: {dbms}" if dbms else "",
-        ]
-        findings.append({
-            "alert": f"SQL injection in parameter '{parameter}'",
-            "risk": "high",
-            "category": "vulnerability",
-            "verification_status": "scanner-confirmed-injection",
-            "description": (
-                f"SQLMap confirmed SQL injection in the {place} parameter '{parameter}' "
-                f"on {method} {target_url}. Confirmed technique information: {technique_text}."
-            ),
-            "impact": (
-                "A successful attacker can alter the database query executed by the application. "
-                "The achievable impact depends on database privileges and the confirmed technique, and may include "
-                "reading or modifying application data, bypassing authentication, or performing database-level actions."
-            ),
-            "solution": (
-                f"Replace dynamic SQL construction for parameter '{parameter}' with parameterized queries, "
-                "validate the expected data type server-side, use a least-privileged database account, and add "
-                "a regression test using the confirmed request path."
-            ),
-            "url": target_url,
-            "parameter": parameter,
-            "parameter_location": place,
-            "method": method,
-            "confidence": "high",
-            "dbms": dbms,
-            "injection_types": types,
-            "injection_titles": titles,
-            "payloads": payloads,
-            "technical_details": f"Parameter={parameter}; location={place}; DBMS={dbms or 'not identified'}; techniques={technique_text}.",
-            "reproduction": "Replay the affected request using one of the SQLMap-confirmed payloads recorded in the evidence and compare the database-dependent response behaviour.",
-            "evidence": "\n".join(line for line in evidence_lines if line),
-        })
-
-    if findings:
-        return findings
-    return [{
-        "alert": "SQL injection reported by SQLMap",
-        "risk": "high",
-        "category": "vulnerability",
-        "verification_status": "scanner-confirmed-injection-parser-limited",
-        "description": (
-            "SQLMap reported an injectable parameter, but the structured parser could not extract the parameter block. "
-            "The exact scanner output is retained as evidence and must be reviewed before remediation."
-        ),
-        "impact": "SQL injection can alter the application's database query; the exact impact must be determined from the retained SQLMap output.",
-        "solution": "Identify the affected parameter in the retained SQLMap output, replace dynamic SQL with parameterized queries, and retest the exact request.",
-        "url": target_url,
-        "method": method,
-        "confidence": "high",
-        "technical_details": f"SQLMap positive marker detected; DBMS={dbms or 'not identified'}; parameter parser did not find a complete block.",
-        "evidence": text[-5000:],
-    }]
-
-
-
-
-CONTROL_PARAMETERS = {"submit", "login", "change", "user_token", "csrf", "button"}
 SQL_ERROR_MARKERS = (
-    "you have an error in your sql syntax", "warning: mysql", "mysql_fetch",
-    "unclosed quotation mark", "quoted string not properly terminated", "sqlstate[",
-    "sqlite error", "postgresql query failed", "ora-01756", "mysqli_sql_exception",
+    "you have an error in your sql syntax", "warning: mysql", "mysql_fetch", "unclosed quotation mark",
+    "quoted string not properly terminated", "sqlstate[", "sqlite error", "postgresql query failed",
+    "ora-01756", "mysqli_sql_exception",
 )
-RESULT_MARKERS = (
-    "first name:", "surname:", "last name:", "user id:", "username:",
-)
-BLIND_TRUE_MARKERS = (
-    "user id exists in the database", "exists in the database",
-)
-BLIND_FALSE_MARKERS = (
-    "user id is missing from the database", "missing from the database",
-)
+RESULT_MARKERS = ("first name:", "surname:")
+BLIND_TRUE_MARKERS = ("user id exists in the database", "exists in the database")
+BLIND_FALSE_MARKERS = ("user id is missing from the database", "missing from the database")
 
 
-def _filtered_parameters(parameters: list[str]) -> list[str]:
-    return [
-        value for value in dict.fromkeys(parameters)
-        if value.lower() not in CONTROL_PARAMETERS
-    ]
-
-
-def _response_excerpt(text: str, needle: str = "", limit: int = 700) -> str:
-    value = str(text or "")
-    index = value.lower().find(str(needle or "").lower()) if needle else -1
-    if index >= 0:
-        start = max(0, index - limit // 3)
-        return value[start:start + limit]
-    return value[:limit]
-
-
-def _mutated_request(
-    target_url: str,
-    method: str,
-    data: str,
-    parameter: str,
-    replacement: str,
-) -> tuple[str, str]:
-    if method == "GET":
-        parsed = urlparse(target_url)
-        pairs = parse_qsl(parsed.query, keep_blank_values=True)
-        changed = [
-            (name, replacement if name == parameter else value)
-            for name, value in pairs
-        ]
-        return urlunparse(parsed._replace(query=urlencode(changed))), ""
-    pairs = parse_qsl(data, keep_blank_values=True)
-    changed = [
-        (name, replacement if name == parameter else value)
-        for name, value in pairs
-    ]
-    return target_url, urlencode(changed)
-
-
-def _send_http(
-    url: str,
-    cookies: str,
-    method: str,
-    data: str,
-) -> requests.Response:
-    import requests as http_requests
+def _send_http(url: str, cookies: str, method: str, data: str) -> requests.Response:
     headers = {"Cache-Control": "no-cache", "User-Agent": "SecOps-SQLi-Verifier/2.0"}
     if cookies:
         headers["Cookie"] = cookies
-    last: requests.RequestException | None = None
-    for attempt in range(3):
-        try:
-            return http_requests.request(
-                method, url, data=data if method != "GET" else None,
-                headers=headers, timeout=(4, 16), allow_redirects=True,
-            )
-        except (http_requests.Timeout, http_requests.ConnectionError) as exc:
-            last = exc
-            if attempt < 2:
-                import time as _time
-                _time.sleep(0.7 * (attempt + 1))
-        except http_requests.RequestException:
-            raise
-    assert last is not None
-    raise last
+    return request_retry(
+        method, url, data=data if method != "GET" else None, headers=headers, attempts=3, backoff=0.7,
+        timeout=(4, 16), allow_redirects=True,
+    )
 
-def _quick_sqli_probe(
-    target_url: str,
-    cookies: str,
-    method: str,
-    data: str,
-    parameters: list[str],
-) -> dict[str, Any]:
+
+def _probe_summary(response: requests.Response, needle: str = "") -> dict[str, Any]:
+    text = str(response.text or "")
+    index = text.lower().find(needle.lower()) if needle else -1
+    start = max(0, index - 220) if index >= 0 else 0
+    return {
+        "status": response.status_code, "bytes": len(response.content), "final_url": str(response.url),
+        "excerpt": text[start:start + 700],
+    }
+
+
+def _quick_sqli_probe(target_url: str, cookies: str, method: str, data: str, parameters: list[str]) -> dict[str, Any]:
+    """Small project-specific confirmation layer; SQLMap remains the authoritative scanner."""
     if not parameters:
         return {"performed": False, "candidate": False, "confirmed": False}
     parameter = parameters[0]
-    if method == "GET":
-        original_pairs = dict(parse_qsl(urlparse(target_url).query, keep_blank_values=True))
-    else:
-        original_pairs = dict(parse_qsl(data, keep_blank_values=True))
-    original = original_pairs.get(parameter, "1") or "1"
+    source = urlparse(target_url).query if method == "GET" else data
+    original = dict(parse_qsl(source, keep_blank_values=True)).get(parameter, "1") or "1"
     payload_pairs = [
         (f"{original}' OR '1'='1' #", f"{original}' AND '1'='2' #"),
         (f"{original}' OR '1'='1' -- -", f"{original}' AND '1'='2' -- -"),
     ]
-    payload_true, payload_false = payload_pairs[0]
     quote_payload = f"{original}'"
     try:
         baseline = _send_http(target_url, cookies, method, data)
-        quote_url, quote_data = _mutated_request(target_url, method, data, parameter, quote_payload)
+        quote_url, quote_data = mutate_parameter(target_url, method, data, parameter, quote_payload, append_if_missing=False, replace_all=True)
         quote_response = _send_http(quote_url, cookies, method, quote_data)
-        selected_responses = None
-        for candidate_true, candidate_false in payload_pairs:
-            true_url, true_data = _mutated_request(target_url, method, data, parameter, candidate_true)
-            false_url, false_data = _mutated_request(target_url, method, data, parameter, candidate_false)
-            candidate_true_response = _send_http(true_url, cookies, method, true_data)
-            candidate_false_response = _send_http(false_url, cookies, method, false_data)
-            low_true = candidate_true_response.text.lower()
-            low_false = candidate_false_response.text.lower()
-            if (
-                low_true != low_false
-                or "user id exists in the database" in low_true
-                or "first name:" in low_true
-            ):
-                payload_true, payload_false = candidate_true, candidate_false
-                selected_responses = (candidate_true_response, candidate_false_response)
+        selected = None
+        for payload_true, payload_false in payload_pairs:
+            true_url, true_data = mutate_parameter(target_url, method, data, parameter, payload_true, append_if_missing=False, replace_all=True)
+            false_url, false_data = mutate_parameter(target_url, method, data, parameter, payload_false, append_if_missing=False, replace_all=True)
+            true_response = _send_http(true_url, cookies, method, true_data)
+            false_response = _send_http(false_url, cookies, method, false_data)
+            low_true, low_false = true_response.text.lower(), false_response.text.lower()
+            selected = (payload_true, payload_false, true_response, false_response)
+            if low_true != low_false or "user id exists in the database" in low_true or "first name:" in low_true:
                 break
-        if selected_responses is None:
-            selected_responses = (candidate_true_response, candidate_false_response)
-        true_response, false_response = selected_responses
+        assert selected is not None
+        payload_true, payload_false, true_response, false_response = selected
     except requests.RequestException as exc:
-        return {
-            "performed": True, "candidate": False, "confirmed": False,
-            "error": f"{type(exc).__name__}: {exc}", "parameter": parameter,
-        }
+        return {"performed": True, "candidate": False, "confirmed": False, "parameter": parameter, "error": f"{type(exc).__name__}: {exc}"}
 
-    baseline_lower = baseline.text.lower()
-    true_lower = true_response.text.lower()
-    false_lower = false_response.text.lower()
-    quote_lower = quote_response.text.lower()
-    error_markers = [
-        marker for marker in SQL_ERROR_MARKERS
-        if marker in quote_lower and marker not in baseline_lower
-    ]
-    marker_counts = {
-        "baseline": sum(baseline_lower.count(marker) for marker in RESULT_MARKERS),
-        "true": sum(true_lower.count(marker) for marker in RESULT_MARKERS),
-        "false": sum(false_lower.count(marker) for marker in RESULT_MARKERS),
-    }
-    true_false_delta = abs(len(true_response.content) - len(false_response.content))
-    blind_true = any(marker in true_lower for marker in BLIND_TRUE_MARKERS)
-    blind_false = any(marker in false_lower for marker in BLIND_FALSE_MARKERS)
-    false_has_true_marker = any(marker in false_lower for marker in BLIND_TRUE_MARKERS)
-    true_has_false_marker = any(marker in true_lower for marker in BLIND_FALSE_MARKERS)
-    blind_marker_polarity = (
-        blind_true and blind_false
-        and not false_has_true_marker
-        and not true_has_false_marker
+    baseline_low, true_low, false_low, quote_low = (r.text.lower() for r in (baseline, true_response, false_response, quote_response))
+    error_markers = [marker for marker in SQL_ERROR_MARKERS if marker in quote_low and marker not in baseline_low]
+    marker_counts = {name: sum(text.count(marker) for marker in RESULT_MARKERS) for name, text in (("baseline", baseline_low), ("true", true_low), ("false", false_low))}
+    blind_polarity = (
+        any(marker in true_low for marker in BLIND_TRUE_MARKERS)
+        and any(marker in false_low for marker in BLIND_FALSE_MARKERS)
+        and not any(marker in false_low for marker in BLIND_TRUE_MARKERS)
+        and not any(marker in true_low for marker in BLIND_FALSE_MARKERS)
     )
-    blind_status_polarity = (
-        true_response.status_code < 400
-        and false_response.status_code >= 400
-        and baseline.status_code == true_response.status_code
-    )
-    blind_same_status = (
-        true_response.status_code == false_response.status_code == 200
-    )
-
-    # Some applications express the false branch with a deliberate 404 while
-    # the baseline and true branch remain HTTP 200.  Requiring both probes to
-    # return 200 caused a confirmed blind differential to fall through to a
-    # long SQLMap run.  Repeat marker/status polarity once before accepting the
-    # bounded verifier so a transient response cannot create a false positive.
-    blind_repeat_confirmed = False
-    if blind_marker_polarity and (blind_same_status or blind_status_polarity):
+    status_polarity = true_response.status_code < 400 <= false_response.status_code and baseline.status_code == true_response.status_code
+    repeat_confirmed = False
+    if blind_polarity or status_polarity:
         try:
-            repeat_true_url, repeat_true_data = _mutated_request(
-                target_url, method, data, parameter, payload_true
-            )
-            repeat_false_url, repeat_false_data = _mutated_request(
-                target_url, method, data, parameter, payload_false
-            )
-            repeat_true = _send_http(
-                repeat_true_url, cookies, method, repeat_true_data
-            )
-            repeat_false = _send_http(
-                repeat_false_url, cookies, method, repeat_false_data
-            )
-            repeat_true_lower = repeat_true.text.lower()
-            repeat_false_lower = repeat_false.text.lower()
-            repeat_marker_polarity = (
-                any(marker in repeat_true_lower for marker in BLIND_TRUE_MARKERS)
-                and any(marker in repeat_false_lower for marker in BLIND_FALSE_MARKERS)
-                and not any(marker in repeat_false_lower for marker in BLIND_TRUE_MARKERS)
-                and not any(marker in repeat_true_lower for marker in BLIND_FALSE_MARKERS)
-            )
-            repeat_status_polarity = (
-                repeat_true.status_code == true_response.status_code
-                and repeat_false.status_code == false_response.status_code
-            )
-            blind_repeat_confirmed = repeat_marker_polarity and repeat_status_polarity
+            true_url, true_data = mutate_parameter(target_url, method, data, parameter, payload_true, append_if_missing=False, replace_all=True)
+            false_url, false_data = mutate_parameter(target_url, method, data, parameter, payload_false, append_if_missing=False, replace_all=True)
+            rt, rf = _send_http(true_url, cookies, method, true_data), _send_http(false_url, cookies, method, false_data)
+            rtl, rfl = rt.text.lower(), rf.text.lower()
+            repeat_confirmed = (
+                blind_polarity
+                and any(marker in rtl for marker in BLIND_TRUE_MARKERS)
+                and any(marker in rfl for marker in BLIND_FALSE_MARKERS)
+            ) or (status_polarity and rt.status_code < 400 <= rf.status_code)
         except requests.RequestException:
-            blind_repeat_confirmed = False
+            pass
 
-    blind_confirmed = blind_repeat_confirmed
+    byte_delta = abs(len(true_response.content) - len(false_response.content))
     boolean_confirmed = (
-        true_response.status_code < 400
-        and false_response.status_code < 400
+        true_response.status_code < 400 and false_response.status_code < 400
         and marker_counts["true"] >= max(2, marker_counts["baseline"] + 1)
         and marker_counts["true"] > marker_counts["false"]
     )
     strong_differential = (
-        true_response.status_code == false_response.status_code == 200
-        and true_false_delta >= 120
-        and true_response.text != false_response.text
-        and marker_counts["true"] > marker_counts["false"]
+        true_response.status_code == false_response.status_code == 200 and byte_delta >= 120
+        and true_response.text != false_response.text and marker_counts["true"] > marker_counts["false"]
     )
-    confirmed = boolean_confirmed or strong_differential or blind_confirmed
-    candidate = confirmed or bool(error_markers)
+    error_differential = bool(error_markers) and byte_delta > 40 and true_response.status_code < 500 and false_response.status_code < 500
+    confirmed = boolean_confirmed or strong_differential or repeat_confirmed or error_differential
     return {
-        "performed": True,
-        "candidate": candidate,
-        "confirmed": confirmed,
-        "parameter": parameter,
-        "payload_true": payload_true,
-        "payload_false": payload_false,
-        "payload_quote": quote_payload,
-        "error_markers": error_markers,
-        "result_marker_counts": marker_counts,
-        "baseline": {
-            "status": baseline.status_code, "bytes": len(baseline.content),
-            "final_url": str(baseline.url),
-        },
-        "true_probe": {
-            "status": true_response.status_code, "bytes": len(true_response.content),
-            "final_url": str(true_response.url),
-            "excerpt": _response_excerpt(true_response.text, "First name"),
-        },
-        "false_probe": {
-            "status": false_response.status_code, "bytes": len(false_response.content),
-            "final_url": str(false_response.url),
-            "excerpt": _response_excerpt(false_response.text),
-        },
-        "quote_probe": {
-            "status": quote_response.status_code, "bytes": len(quote_response.content),
-            "final_url": str(quote_response.url),
-            "excerpt": _response_excerpt(quote_response.text, error_markers[0] if error_markers else ""),
-        },
-        "true_false_byte_delta": true_false_delta,
-        "blind_true_marker": blind_true,
-        "blind_false_marker": blind_false,
-        "blind_marker_polarity": blind_marker_polarity,
-        "blind_status_polarity": blind_status_polarity,
-        "blind_repeat_confirmed": blind_repeat_confirmed,
-        "blind_confirmed": blind_confirmed,
+        "performed": True, "candidate": confirmed or bool(error_markers), "confirmed": confirmed, "parameter": parameter,
+        "payload_true": payload_true, "payload_false": payload_false, "payload_quote": quote_payload,
+        "error_markers": error_markers, "result_marker_counts": marker_counts,
+        "baseline": _probe_summary(baseline), "true_probe": _probe_summary(true_response, "First name"),
+        "false_probe": _probe_summary(false_response), "quote_probe": _probe_summary(quote_response, error_markers[0] if error_markers else ""),
+        "true_false_byte_delta": byte_delta, "error_differential": error_differential, "blind_marker_polarity": blind_polarity,
+        "blind_status_polarity": status_polarity, "blind_repeat_confirmed": repeat_confirmed,
+        "blind_confirmed": repeat_confirmed,
     }
 
 
-def _quick_probe_finding(
-    target_url: str,
-    method: str,
-    probe: dict[str, Any],
-) -> list[dict[str, Any]]:
+def _quick_probe_findings(target_url: str, method: str, probe: dict[str, Any]) -> list[dict[str, Any]]:
     if not probe.get("candidate"):
         return []
-    parameter = str(probe.get("parameter") or "")
-    confirmed = bool(probe.get("confirmed"))
-    evidence = (
-        f"Parameter: {parameter}\n"
-        f"Boolean-true payload: {probe.get('payload_true')}\n"
-        f"Boolean-false payload: {probe.get('payload_false')}\n"
-        f"Result marker counts: {probe.get('result_marker_counts')}\n"
-        f"Baseline: {probe.get('baseline')}\n"
-        f"True probe: {probe.get('true_probe')}\n"
-        f"False probe: {probe.get('false_probe')}\n"
-        f"SQL error markers from quote probe: {probe.get('error_markers')}"
-    )
+    parameter, confirmed = str(probe.get("parameter") or ""), bool(probe.get("confirmed"))
     return [{
-        "alert": (
-            f"Blind SQL injection in parameter '{parameter}'"
-            if confirmed and probe.get("blind_confirmed")
-            else f"SQL injection in parameter '{parameter}'"
-            if confirmed else f"SQL error behaviour in parameter '{parameter}'"
-        ),
-        "risk": "high" if confirmed else "medium",
-        "category": "vulnerability" if confirmed else "candidate",
-        "verification_status": (
-            "blind-boolean-response-marker-confirmed"
-            if confirmed and probe.get("blind_confirmed")
-            else "boolean-response-differential-confirmed"
-            if confirmed else "sql-error-probe-needs-sqlmap-confirmation"
-        ),
-        "confidence": "high" if confirmed else "medium",
-        "description": (
-            "A bounded boolean differential produced multiple database result markers for the true condition and fewer or no results for the false condition. "
-            "This response behaviour confirms that the selected input changes the SQL query logic."
-            if confirmed else
-            "Adding a quote introduced a database error marker that was absent from the baseline response."
-        ),
-        "attack_preconditions": "An attacker must be able to submit the affected HTTP parameter to the vulnerable endpoint. The tested request used the supplied authenticated session.",
-        "impact": "An attacker may alter database queries, enumerate or extract application data, bypass data-selection controls, and potentially modify data depending on database permissions and reachable statements.",
-        "solution": "Replace string-built SQL with parameterized statements, validate the expected parameter type, use a least-privileged database account, and add regression tests for boolean, UNION, error and time-based payloads.",
-        "url": target_url,
-        "method": method,
-        "parameter": parameter,
-        "payloads": [probe.get("payload_true"), probe.get("payload_false"), probe.get("payload_quote")],
-        "cwe_id": "89",
-        "owasp_category": "A03:2021 Injection",
-        "technical_details": "The verifier compared baseline, boolean-true, boolean-false and quote-mutated responses using status, response size, database-result labels and blind true/false markers.",
-        "reproduction": (
-            f"1. Send the original {method} request to {target_url}.\n"
-            f"2. Replace '{parameter}' with: {probe.get('payload_true')}\n"
-            f"3. Repeat with: {probe.get('payload_false')}\n"
-            "4. Compare returned database rows and response sizes; the true condition returns additional records while the false condition does not."
-        ),
-        "evidence": evidence,
+        "alert": f"SQL injection in parameter '{parameter}'" if confirmed else f"SQL error behaviour in parameter '{parameter}'",
+        "risk": "high" if confirmed else "medium", "category": "vulnerability" if confirmed else "candidate",
+        "verification_status": "boolean-response-differential-confirmed" if confirmed else "sql-error-probe-needs-sqlmap-confirmation",
+        "confidence": "high" if confirmed else "medium", "url": target_url, "method": method, "parameter": parameter,
+        "description": "A bounded response differential confirms SQL injection." if confirmed else "A quote probe introduced a database error marker absent from the baseline.",
+        "impact": "The affected input may alter database queries and expose or modify application data.",
+        "solution": "Use parameterized queries, validate expected data types and run regression tests for the affected parameter.",
+        "cwe_id": "89", "owasp_category": "A03:2021 Injection",
+        "evidence": f"Boolean true={probe.get('payload_true')}\nBoolean false={probe.get('payload_false')}\nProbe={probe}",
     }]
+
+
+def _free_port() -> int:
+    with socket.socket() as sock:
+        sock.bind(("127.0.0.1", 0))
+        return int(sock.getsockname()[1])
+
+
+def _api_request(base: str, auth: tuple[str, str], path: str, *, method: str = "GET", body: Any = None, timeout: float = 10) -> dict[str, Any]:
+    response = requests.request(method, f"{base}{path}", auth=auth, json=body, timeout=timeout)
+    response.raise_for_status()
+    value = response.json()
+    if not isinstance(value, dict) or value.get("success") is False:
+        raise RuntimeError(str(value.get("message") if isinstance(value, dict) else value))
+    return value
+
+
+def _start_api(script, timeout: int) -> tuple[subprocess.Popen[str], str, tuple[str, str], dict[str, Any]]:
+    port, username, password = _free_port(), "secops", secrets.token_urlsafe(18)
+    command = [sys.executable, str(script), "-s", "-H", "127.0.0.1", "-p", str(port), "--username", username, "--password", password]
+    process = subprocess.Popen(command, cwd=str(script.parent), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, encoding="utf-8", errors="replace")
+    base, auth, deadline = f"http://127.0.0.1:{port}", (username, password), time.monotonic() + min(15, timeout / 4)
+    last = ""
+    while time.monotonic() < deadline:
+        if process.poll() is not None:
+            last = (process.stdout.read() if process.stdout else "")[-4000:]
+            raise RuntimeError(f"sqlmap API server exited during startup: {last}")
+        try:
+            version = _api_request(base, auth, "/version", timeout=2)
+            return process, base, auth, version
+        except Exception as exc:
+            last = str(exc)
+            time.sleep(0.25)
+    process.terminate()
+    raise RuntimeError(f"sqlmap API server did not become ready: {last}")
+
+
+def _api_value(value: Any) -> Any:
+    # sqlmap 1.10.x briefly returned structured REST values as Python repr strings.
+    # Accept both the documented structured form and that upstream compatibility form.
+    if isinstance(value, str) and value.lstrip().startswith(("[", "{")):
+        try:
+            return ast.literal_eval(value)
+        except (ValueError, SyntaxError):
+            pass
+    return value
+
+
+def _technique_findings(data: list[Any], target_url: str, method: str) -> list[dict[str, Any]]:
+    findings: list[dict[str, Any]] = []
+    for entry in data:
+        if not isinstance(entry, dict) or str(entry.get("type_name") or "").upper() != "TECHNIQUES":
+            continue
+        values = _api_value(entry.get("value"))
+        points = values if isinstance(values, list) else [values]
+        for point in points:
+            if not isinstance(point, dict):
+                continue
+            parameter = str(point.get("parameter") or "unknown")
+            place = str(point.get("place") or method).upper()
+            dbms = str(point.get("dbms") or "")
+            techniques = point.get("data") if isinstance(point.get("data"), list) else []
+            titles = [str(item.get("title") or item.get("technique") or "") for item in techniques if isinstance(item, dict)]
+            payloads = [str(item.get("payload") or "") for item in techniques if isinstance(item, dict) and item.get("payload")]
+            findings.append({
+                "alert": f"SQL injection in parameter '{parameter}'", "risk": "high", "category": "vulnerability",
+                "verification_status": "sqlmap-rest-api-confirmed", "confidence": "high", "url": target_url,
+                "parameter": parameter, "parameter_location": place, "method": method, "dbms": dbms,
+                "injection_titles": titles, "payloads": payloads,
+                "description": f"SQLMap confirmed SQL injection in the {place} parameter '{parameter}' through its official REST API.",
+                "impact": "An attacker may alter database queries and access or modify data according to database privileges.",
+                "solution": "Replace dynamic SQL with parameterized queries, validate input types and use a least-privileged database account.",
+                "technical_details": f"DBMS={dbms or 'not identified'}; techniques={'; '.join(filter(None, titles)) or 'reported by SQLMap'}.",
+                "evidence": "\n".join([f"Parameter: {parameter} ({place})", *(f"Technique: {v}" for v in titles), *(f"Payload: {v}" for v in payloads)]),
+            })
+    return findings
+
+
+def _api_scan(script, target_url: str, cookies: str, method: str, data: str, parameters: list[str], timeout: int) -> dict[str, Any]:
+    process = None
+    taskid = ""
+    started = time.monotonic()
+    try:
+        process, base, auth, version = _start_api(script, timeout)
+        taskid = str(_api_request(base, auth, "/task/new").get("taskid") or "")
+        if not taskid:
+            raise RuntimeError("sqlmap API did not return a task id")
+        options: dict[str, Any] = {
+            "url": target_url, "batch": True, "level": 2, "risk": 1, "technique": "BEUSTQ", "timeSec": 1,
+            "timeout": 4, "retries": 0, "threads": 3, "flushSession": True, "skipWaf": True, "dropSetCookie": True,
+        }
+        if method != "GET":
+            options["method"] = method
+        if data:
+            options["data"] = data
+        if cookies:
+            options["cookie"] = cookies
+        if parameters:
+            options["testParameter"] = ",".join(parameters)
+        _api_request(base, auth, f"/scan/{taskid}/start", method="POST", body=options)
+        deadline = time.monotonic() + timeout
+        timed_out = False
+        status, returncode = "running", None
+        while time.monotonic() < deadline:
+            state = _api_request(base, auth, f"/scan/{taskid}/status", timeout=5)
+            status, returncode = str(state.get("status") or ""), state.get("returncode")
+            if status == "terminated":
+                break
+            time.sleep(1)
+        else:
+            timed_out = True
+            try:
+                _api_request(base, auth, f"/scan/{taskid}/stop", timeout=4)
+            except Exception:
+                try:
+                    _api_request(base, auth, f"/scan/{taskid}/kill", timeout=4)
+                except Exception:
+                    pass
+        data_result = _api_request(base, auth, f"/scan/{taskid}/data", timeout=10)
+        log_result = _api_request(base, auth, f"/scan/{taskid}/log", timeout=10)
+        return {
+            "timed_out": timed_out, "status": status, "returncode": returncode, "data": data_result.get("data") or [], "errors": data_result.get("error") or [],
+            "logs": log_result.get("log") or [], "taskid": taskid, "duration_seconds": round(time.monotonic() - started, 3),
+            "sqlmap_version": version.get("version"), "api_version": version.get("api_version"),
+        }
+    finally:
+        if process is not None:
+            try:
+                if taskid:
+                    _api_request(base, auth, f"/task/{taskid}/delete", timeout=3)
+            except Exception:
+                pass
+            if process.poll() is None:
+                process.terminate()
+                try:
+                    process.wait(timeout=4)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+
 
 @mcp.tool()
 def run_sqlmap_scan(
-    target_url: str,
-    cookies: str = "",
-    method: str = "GET",
-    data: str = "",
-    parameters: list[str] | None = None,
-    timeout: int = 180,
+    target_url: str, cookies: str = "", method: str = "GET", data: str = "",
+    parameters: list[str] | None = None, timeout: int = 180,
 ) -> dict:
-    """Run SQLMap directly through Python instead of the Windows batch launcher."""
-    method = method.upper()
-    timeout = max(45, min(int(timeout), 600))
-    parameters = _filtered_parameters([str(value) for value in (parameters or []) if str(value)])
-    session_probe = scanner_session_probe(target_url, cookies, method, data)
+    """Run SQLMap through its official authenticated REST-JSON API."""
+    method, timeout = method.upper(), max(45, min(int(timeout), 600))
+    parameters = filter_control_parameters(parameters)
+    session_probe = scanner_session_probe(target_url, cookies, method, data, timeout=4, attempts=1)
     if cookies and session_probe.get("performed") and session_probe.get("conclusive") and session_probe.get("authenticated") is False:
-        return partial(
-            "SQLMap", target_url,
-            "SQLMap was not started because the authenticated request redirected to a login page.",
-            diagnosis="authentication_precheck_failed", timed_out=False,
-            vulnerabilities=[], session_probe=session_probe,
-        )
+        return partial("SQLMap", target_url, "SQLMap was not started because the authenticated request redirected to a login page.", diagnosis="authentication_precheck_failed", timed_out=False, vulnerabilities=[], session_probe=session_probe)
+
     quick_probe = _quick_sqli_probe(target_url, cookies, method, data, parameters)
-    quick_findings = _quick_probe_finding(target_url, method, quick_probe)
+    quick_findings = _quick_probe_findings(target_url, method, quick_probe)
     if quick_probe.get("confirmed"):
         return success(
-            "SQLMap", target_url,
-            "The bounded SQL boolean-differential verifier confirmed injection; the slower SQLMap phase was not required.",
-            vulnerabilities=quick_findings,
-            sql_injection_found=True,
-            request_method=method,
-            tested_parameters=parameters,
-            authenticated=bool(cookies),
-            session_probe=session_probe,
-            quick_sqli_probe=quick_probe,
-            execution_mode="direct_boolean_differential",
+            "SQLMap", target_url, "The bounded SQL boolean-differential verifier confirmed injection; the slower SQLMap API phase was not required.",
+            vulnerabilities=quick_findings, sql_injection_found=True, request_method=method, tested_parameters=parameters,
+            authenticated=bool(cookies), session_probe=session_probe, quick_sqli_probe=quick_probe, execution_mode="direct_boolean_differential",
         )
 
-    script = _find_sqlmap_script()
+    script = find_repo_script("sqlmap", "sqlmapapi.py")
     if script is None:
+        message = "sqlmapapi.py was not found under ~/.local/opt/sqlmap. Run initScript.py again."
         if quick_findings:
-            return partial(
-                "SQLMap", target_url,
-                "A SQL-error candidate was preserved, but sqlmap.py was not found for confirmation.",
-                diagnosis="missing_sqlmap_script", timed_out=False,
-                vulnerabilities=quick_findings,
-                session_probe=session_probe,
-                quick_sqli_probe=quick_probe,
-            )
-        return failure(
-            "SQLMap", target_url,
-            "sqlmap.py was not found under ~/.local/opt/sqlmap. Run initScript.py again.",
-            diagnosis="missing_sqlmap_script",
-        )
+            return partial("SQLMap", target_url, message, diagnosis="missing_sqlmap_api", timed_out=False, vulnerabilities=quick_findings, session_probe=session_probe, quick_sqli_probe=quick_probe)
+        return failure("SQLMap", target_url, message, diagnosis="missing_sqlmap_api")
 
-    command = [
-        sys.executable, str(script), "-u", target_url,
-        "--batch", "--level=2", "--risk=1", "--technique=BEUSTQ", "--time-sec=1",
-        "--timeout=4", "--retries=0", "--threads=3",
-        "--flush-session", "--skip-waf", "--answers=follow=N", "--drop-set-cookie",
-    ]
-    if method != "GET":
-        command.append(f"--method={method}")
-    if data:
-        command.extend(["--data", data])
-    if parameters:
-        command.extend(["-p", ",".join(dict.fromkeys(parameters))])
-    if cookies:
-        command.extend(["--cookie", cookies])
+    try:
+        result = _api_scan(script, target_url, cookies, method, data, parameters, timeout)
+    except Exception as exc:
+        if quick_findings:
+            return partial("SQLMap", target_url, f"SQLMap REST API failed after preserving a quick-probe candidate: {type(exc).__name__}: {exc}", diagnosis="sqlmap_api_error", timed_out=False, vulnerabilities=quick_findings, session_probe=session_probe, quick_sqli_probe=quick_probe)
+        return failure("SQLMap", target_url, f"SQLMap REST API failed: {type(exc).__name__}: {exc}", diagnosis="sqlmap_api_error")
 
-    result = run_process(
-        "SQLMap",
-        command,
-        target=target_url,
-        timeout=timeout,
-        cwd=script.parent,
-    )
-    text = "\n".join(str(result.get(key, "")) for key in ("stdout", "stderr", "output"))
-    findings = _extract_findings(text, target_url, method)
-    if not findings:
-        findings = quick_findings
+    findings = _technique_findings(result["data"], target_url, method) or quick_findings
     common = {
-        "vulnerabilities": findings,
-        "request_method": method,
-        "request_data_present": bool(data),
-        "tested_parameters": parameters,
-        "authenticated": bool(cookies),
-        "execution_mode": "direct_python",
-        "sqlmap_script": str(script),
-        "session_probe": session_probe,
-        "quick_sqli_probe": quick_probe,
+        "vulnerabilities": findings, "request_method": method, "request_data_present": bool(data), "tested_parameters": parameters,
+        "authenticated": bool(cookies), "execution_mode": "sqlmap_rest_api", "sqlmap_script": str(script),
+        "sqlmap_version": result.get("sqlmap_version"), "sqlmap_api_version": result.get("api_version"), "sqlmap_task_id": result.get("taskid"),
+        "sqlmap_return_code": result.get("returncode"),
+        "session_probe": session_probe, "quick_sqli_probe": quick_probe, "api_data": result.get("data"), "api_errors": result.get("errors"),
+        "api_logs": result.get("logs"), "duration_seconds": result.get("duration_seconds"),
     }
-
-    if result.get("diagnosis") == "timeout":
-        return partial(
-            "SQLMap", target_url,
-            f"SQLMap reached its configured time budget. Confirmed findings preserved: {len(findings)}.",
-            diagnosis="time_limit_reached",
-            timed_out=True,
-            time_limit_reached=True,
-            duration_seconds=result.get("duration_seconds"),
-            stdout=str(result.get("stdout", ""))[-12000:],
-            stderr=str(result.get("stderr", ""))[-12000:],
-            command=result.get("command", []),
-            **common,
-        )
-    if result.get("status") != "success":
-        result.update(common)
-        return trim_process_output(result, 12000)
-
-    return success(
-        "SQLMap", target_url,
-        f"SQLMap completed for {method}. Confirmed SQL injection findings: {len(findings)}.",
-        sql_injection_found=bool(findings),
-        duration_seconds=result.get("duration_seconds"),
-        command=result.get("command", []),
-        stdout=str(result.get("stdout", ""))[-12000:],
-        stderr=str(result.get("stderr", ""))[-12000:],
-        **common,
-    )
+    if result.get("timed_out"):
+        return partial("SQLMap", target_url, f"SQLMap REST API reached its configured time budget. Findings preserved: {len(findings)}.", diagnosis="time_limit_reached", timed_out=True, time_limit_reached=True, **common)
+    if result.get("returncode") not in (None, 0) and not findings:
+        out = failure("SQLMap", target_url, f"SQLMap REST task terminated with return code {result.get('returncode')}.", diagnosis="sqlmap_scan_failed")
+        out.update(common); return out
+    return success("SQLMap", target_url, f"SQLMap REST API completed for {method}. Confirmed SQL injection findings: {len(findings)}.", sql_injection_found=bool(findings), **common)
 
 
 if __name__ == "__main__":
-    run_mcp_http(mcp, "sqlmap")
+    _serve()

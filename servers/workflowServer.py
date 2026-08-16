@@ -9,13 +9,14 @@ from typing import Any
 from urllib.parse import parse_qsl, urljoin, urlparse
 
 import requests
-from fastmcp import FastMCP
 
 from utils import skipped, success
 
-from utils import run_mcp_http, same_origin
+from utils import same_origin
 
-mcp = FastMCP("Web Workflow Verifier")
+from scannerCommon import looks_like_login, service
+
+mcp, _serve = service("Web Workflow Verifier", "workflow")
 
 TOKEN_RE = re.compile(r"(?:csrf|xsrf|token|nonce|authenticity|request[_-]?verification)", re.I)
 DESTRUCTIVE_RE = re.compile(r"(?:logout|signout|logoff|setup|install|delete|remove|drop|truncate|purge|wipe|reset)", re.I)
@@ -27,15 +28,6 @@ AUTH_RE = re.compile(r"(?:login|signin|sign-in|authenticate|brute)", re.I)
 CAPTCHA_RE = re.compile(r"(?:captcha|recaptcha|hcaptcha)", re.I)
 ERROR_RE = re.compile(r"(?:invalid|error|failed|required|denied|forbidden|incorrect)", re.I)
 
-
-def _looks_like_login(response: requests.Response) -> bool:
-    text = response.text[:80_000].lower()
-    path = urlparse(str(response.url)).path.lower().rstrip("/")
-    return path.endswith(("/login", "/login.php", "/signin", "/auth")) or (
-        ("type=\"password\"" in text or "type='password'" in text) and any(word in text for word in ("login", "sign in", "authenticate"))
-    )
-
-
 def _field_rows(fields: list[dict[str, Any]] | None) -> list[dict[str, str]]:
     rows: list[dict[str, str]] = []
     for field in fields or []:
@@ -45,13 +37,10 @@ def _field_rows(fields: list[dict[str, Any]] | None) -> list[dict[str, str]]:
         if not name:
             continue
         rows.append({
-            "name": name,
-            "value": str(field.get("value") or ""),
-            "type": str(field.get("type") or "text").lower(),
-            "tag": str(field.get("tag") or "input").lower(),
+            "name": name, "value": str(field.get("value") or ""),
+            "type": str(field.get("type") or "text").lower(), "tag": str(field.get("tag") or "input").lower(),
         })
     return rows
-
 
 def _pairs_from_case(data: str, fields: list[dict[str, str]]) -> list[tuple[str, str]]:
     pairs = list(parse_qsl(str(data or ""), keep_blank_values=True))
@@ -67,28 +56,19 @@ def _pairs_from_case(data: str, fields: list[dict[str, str]]) -> list[tuple[str,
         result.append((field["name"], value))
     return result
 
-
 def _session(cookies: str) -> requests.Session:
     session = requests.Session()
     session.headers.update({
         "User-Agent": "SecOps-Workflow-Verifier/1.0",
-        "Accept": "text/html,application/xhtml+xml,application/json,*/*;q=0.5",
-        "Cache-Control": "no-cache",
+        "Accept": "text/html,application/xhtml+xml,application/json,*/*;q=0.5", "Cache-Control": "no-cache",
     })
     if cookies:
         session.headers["Cookie"] = cookies
     return session
 
-
 def _csrf_check(
-    target_url: str,
-    source_url: str,
-    cookies: str,
-    data: str,
-    fields: list[dict[str, str]],
-    token_parameters: list[str],
-    timeout: int,
-    allow_state_changes: bool,
+    target_url: str, source_url: str, cookies: str, data: str,
+    fields: list[dict[str, str]], token_parameters: list[str], timeout: int, allow_state_changes: bool,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     findings: list[dict[str, Any]] = []
     diagnostic: dict[str, Any] = {"applicable": False}
@@ -104,19 +84,13 @@ def _csrf_check(
 
     if not tokens:
         findings.append({
-            "alert": "Potential CSRF protection missing on state-changing form",
-            "risk": "medium",
-            "category": "candidate",
-            "verification_status": "form-structure-candidate",
-            "confidence": "medium",
+            "alert": "Potential CSRF protection missing on state-changing form", "risk": "medium",
+            "category": "candidate", "verification_status": "form-structure-candidate", "confidence": "medium",
             "description": "A state-changing POST form was discovered without a recognized anti-CSRF token field.",
             "impact": "If the server also accepts cross-site requests, an attacker may cause an authenticated user to perform unintended actions.",
             "solution": "Require an unpredictable per-session or per-request CSRF token, validate Origin/Referer where appropriate and use SameSite cookies as defence in depth.",
-            "url": target_url,
-            "method": "POST",
-            "evidence": evidence,
-            "owasp_category": "A01:2021 Broken Access Control",
-            "cwe_id": "352",
+            "url": target_url, "method": "POST",
+            "evidence": evidence, "owasp_category": "A01:2021 Broken Access Control", "cwe_id": "352",
         })
         return findings, diagnostic
 
@@ -132,18 +106,11 @@ def _csrf_check(
     session = _session(cookies)
     try:
         baseline = session.post(
-            target_url,
-            data=original,
-            timeout=(4, timeout),
-            allow_redirects=True,
+            target_url, data=original, timeout=(4, timeout), allow_redirects=True,
             headers={"Referer": source_url or target_url, "Origin": f"{parsed.scheme}://{parsed.netloc}"},
         )
         without_token = session.post(
-            target_url,
-            data=stripped,
-            timeout=(4, timeout),
-            allow_redirects=True,
-            headers={"Sec-Fetch-Site": "cross-site"},
+            target_url, data=stripped, timeout=(4, timeout), allow_redirects=True, headers={"Sec-Fetch-Site": "cross-site"},
         )
     except requests.RequestException as exc:
         diagnostic["error"] = f"{type(exc).__name__}: {exc}"
@@ -152,48 +119,34 @@ def _csrf_check(
     similarity = SequenceMatcher(None, baseline.text[:80_000], without_token.text[:80_000]).ratio()
     accepted = (
         without_token.status_code < 400
-        and not _looks_like_login(without_token)
+        and not looks_like_login(without_token, text_limit=80_000, paths=("/login", "/login.php", "/signin", "/auth"), words=("login", "sign in", "authenticate"))
         and similarity >= 0.88
         and not (ERROR_RE.search(without_token.text[:20_000]) and not ERROR_RE.search(baseline.text[:20_000]))
     )
     diagnostic.update({
-        "baseline_status": baseline.status_code,
-        "without_token_status": without_token.status_code,
-        "response_similarity": round(similarity, 4),
-        "accepted_without_token": accepted,
+        "baseline_status": baseline.status_code, "without_token_status": without_token.status_code,
+        "response_similarity": round(similarity, 4), "accepted_without_token": accepted,
     })
     if accepted:
         findings.append({
-            "alert": "Anti-CSRF token appears unenforced",
-            "risk": "high",
-            "category": "candidate",
-            "verification_status": "token-removal-differential-needs-impact-validation",
+            "alert": "Anti-CSRF token appears unenforced", "risk": "high",
+            "category": "candidate", "verification_status": "token-removal-differential-needs-impact-validation",
             "confidence": "medium",
             "description": "Removing the recognized anti-CSRF token produced a successful response highly similar to the token-bearing request.",
             "impact": "The affected state-changing action may be triggerable cross-site in a victim's authenticated browser.",
             "solution": "Reject missing or invalid CSRF tokens server-side and validate request origin for sensitive actions.",
-            "url": target_url,
-            "method": "POST",
-            "parameter": ", ".join(tokens),
+            "url": target_url, "method": "POST", "parameter": ", ".join(tokens),
             "evidence": (
                 f"baseline_status={baseline.status_code}; without_token_status={without_token.status_code}; "
                 f"similarity={similarity:.4f}; final_url={without_token.url}"
             ),
-            "owasp_category": "A01:2021 Broken Access Control",
-            "cwe_id": "352",
+            "owasp_category": "A01:2021 Broken Access Control", "cwe_id": "352",
         })
     return findings, diagnostic
 
-
 def _upload_check(
-    target_url: str,
-    source_url: str,
-    cookies: str,
-    fields: list[dict[str, str]],
-    file_parameters: list[str],
-    timeout: int,
-    allow_state_changes: bool,
-    known_urls: list[str] | None = None,
+    target_url: str, source_url: str, cookies: str, fields: list[dict[str, str]],
+    file_parameters: list[str], timeout: int, allow_state_changes: bool, known_urls: list[str] | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     findings: list[dict[str, Any]] = []
     diagnostic: dict[str, Any] = {"applicable": bool(file_parameters)}
@@ -215,12 +168,8 @@ def _upload_check(
     session = _session(cookies)
     try:
         response = session.post(
-            target_url,
-            data=form_data,
-            files=files,
-            timeout=(4, timeout),
-            allow_redirects=True,
-            headers={"Referer": source_url or target_url},
+            target_url, data=form_data, files=files, timeout=(4, timeout),
+            allow_redirects=True, headers={"Referer": source_url or target_url},
         )
     except requests.RequestException as exc:
         diagnostic["error"] = f"{type(exc).__name__}: {exc}"
@@ -238,8 +187,7 @@ def _upload_check(
     # than as a link (for example ../../uploads/name.html). Preserve only the
     # same-origin URL interpretation and never read local filesystem paths.
     path_pattern = re.compile(
-        r"([A-Za-z0-9_./\\-]{0,240}" + re.escape(filename) + r")",
-        re.I,
+        r"([A-Za-z0-9_./\\-]{0,240}" + re.escape(filename) + r")", re.I,
     )
     for match in path_pattern.findall(html.unescape(response.text)):
         cleaned = match.replace("\\", "/")
@@ -278,10 +226,8 @@ def _upload_check(
                 candidates.append(resolved)
                 discovered_links.append(resolved)
         directory_searches.append({
-            "url": str(listing.url),
-            "status": listing.status_code,
-            "filename_present": filename.lower() in listing.text.lower(),
-            "matching_links": discovered_links,
+            "url": str(listing.url), "status": listing.status_code,
+            "filename_present": filename.lower() in listing.text.lower(), "matching_links": discovered_links,
         })
 
     candidates = [value for value in dict.fromkeys(candidates) if same_origin(target_url, value)]
@@ -293,19 +239,15 @@ def _upload_check(
             continue
         present = marker in probe.text
         retrieved.append({
-            "url": str(probe.url),
-            "status": probe.status_code,
-            "marker_present": present,
-            "content_type": probe.headers.get("Content-Type", ""),
+            "url": str(probe.url), "status": probe.status_code,
+            "marker_present": present, "content_type": probe.headers.get("Content-Type", ""),
         })
         if present:
             html_served = "html" in str(probe.headers.get("Content-Type") or "").lower()
             findings.append({
                 "alert": "User-controlled HTML file upload is web-accessible" if html_served else "Uploaded user-controlled file is web-accessible",
-                "risk": "high" if html_served else "medium",
-                "category": "candidate",
-                "verification_status": "harmless-upload-and-retrieval-confirmed",
-                "confidence": "high",
+                "risk": "high" if html_served else "medium", "category": "candidate",
+                "verification_status": "harmless-upload-and-retrieval-confirmed", "confidence": "high",
                 "description": "A harmless marker file was accepted by the upload workflow and retrieved from the same web origin.",
                 "impact": (
                     "Serving attacker-controlled HTML from the application origin can enable stored script execution or trusted-origin phishing."
@@ -313,15 +255,12 @@ def _upload_check(
                     "Retrievable arbitrary files may enable content hosting, stored client-side attacks or further exploitation depending on allowed file types and server handling."
                 ),
                 "solution": "Allow-list required file types, validate content, generate server-side names, store uploads outside the web root and serve them with safe content-disposition and content-type headers.",
-                "url": str(probe.url),
-                "method": "POST",
-                "parameter": file_parameters[0],
+                "url": str(probe.url), "method": "POST", "parameter": file_parameters[0],
                 "evidence": (
                     f"upload_status={response.status_code}; upload_final_url={response.url}; filename={filename}; "
                     f"retrieval_status={probe.status_code}; content_type={probe.headers.get('Content-Type', '')}; marker_present=True"
                 ),
-                "owasp_category": "A04:2021 Insecure Design",
-                "cwe_id": "434",
+                "owasp_category": "A04:2021 Insecure Design", "cwe_id": "434",
             })
             break
     diagnostic["directory_searches"] = directory_searches
@@ -329,24 +268,16 @@ def _upload_check(
     diagnostic["retrieval_attempts"] = retrieved
     if response.status_code < 400 and not findings:
         findings.append({
-            "alert": "File upload workflow accepted a harmless HTML probe",
-            "risk": "low",
-            "category": "observation",
-            "verification_status": "upload-accepted-location-not-confirmed",
-            "confidence": "medium",
+            "alert": "File upload workflow accepted a harmless HTML probe", "risk": "low",
+            "category": "observation", "verification_status": "upload-accepted-location-not-confirmed", "confidence": "medium",
             "description": "The upload endpoint accepted the bounded harmless file, but the scanner could not confirm a public retrieval URL.",
-            "url": target_url,
-            "method": "POST",
-            "parameter": file_parameters[0],
+            "url": target_url, "method": "POST", "parameter": file_parameters[0],
             "evidence": f"HTTP {response.status_code}; final_url={response.url}; filename={filename}",
         })
     return findings, diagnostic
 
-
 def _authentication_check(
-    target_url: str,
-    fields: list[dict[str, str]],
-    timeout: int,
+    target_url: str, fields: list[dict[str, str]], timeout: int,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     findings: list[dict[str, Any]] = []
     names = {field["name"].lower(): field for field in fields}
@@ -383,43 +314,26 @@ def _authentication_check(
         throttled = throttled or is_throttled
         challenge = challenge or has_challenge
         attempts.append({
-            "attempt": index + 1,
-            "status": response.status_code,
-            "final_url": str(response.url),
-            "retry_after": retry_after,
-            "throttled": is_throttled,
-            "captcha": has_challenge,
-            "bytes": len(response.content),
+            "attempt": index + 1, "status": response.status_code, "final_url": str(response.url), "retry_after": retry_after,
+            "throttled": is_throttled, "captcha": has_challenge, "bytes": len(response.content),
         })
         if is_throttled or has_challenge:
             break
     diagnostic["attempts"] = attempts
     if len(attempts) >= 3 and not throttled and not challenge:
         findings.append({
-            "alert": "No observable login throttling in bounded test",
-            "risk": "low",
-            "category": "candidate",
-            "verification_status": "three-attempt-bounded-observation",
-            "confidence": "low",
+            "alert": "No observable login throttling in bounded test", "risk": "low",
+            "category": "candidate", "verification_status": "three-attempt-bounded-observation", "confidence": "low",
             "description": "Three invalid authentication attempts completed without an HTTP 429 response, Retry-After header, visible lockout or CAPTCHA challenge.",
             "impact": "A missing or weak rate limit can make credential guessing and password spraying more practical. Three attempts are insufficient to prove that no longer-window control exists.",
             "solution": "Apply account- and source-aware throttling, progressive delays, monitoring and MFA for sensitive accounts.",
-            "url": target_url,
-            "method": "POST",
-            "evidence": json.dumps(attempts, ensure_ascii=False),
-            "owasp_category": "A07:2021 Identification and Authentication Failures",
-            "cwe_id": "307",
+            "url": target_url, "method": "POST", "evidence": json.dumps(attempts, ensure_ascii=False),
+            "owasp_category": "A07:2021 Identification and Authentication Failures", "cwe_id": "307",
         })
     return findings, diagnostic
 
-
 def _captcha_check(
-    target_url: str,
-    cookies: str,
-    data: str,
-    fields: list[dict[str, str]],
-    timeout: int,
-    allow_state_changes: bool,
+    target_url: str, cookies: str, data: str, fields: list[dict[str, str]], timeout: int, allow_state_changes: bool,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     names = [field["name"] for field in fields]
     applicable = bool(CAPTCHA_RE.search(" ".join([urlparse(target_url).path, *names])))
@@ -430,18 +344,12 @@ def _captcha_check(
     captcha_names = [name for name in names if CAPTCHA_RE.search(name)]
     if not captcha_names:
         findings.append({
-            "alert": "CAPTCHA workflow lacks a recognized challenge response field",
-            "risk": "medium",
-            "category": "candidate",
-            "verification_status": "workflow-structure-candidate",
-            "confidence": "low",
+            "alert": "CAPTCHA workflow lacks a recognized challenge response field", "risk": "medium",
+            "category": "candidate", "verification_status": "workflow-structure-candidate", "confidence": "low",
             "description": "A CAPTCHA-related workflow was discovered without a recognized server-submitted challenge response field.",
             "impact": "The anti-automation control may be client-side only or bypassable through a direct request to a later workflow step.",
             "solution": "Validate a single-use challenge response server-side and bind it to the session and protected action.",
-            "url": target_url,
-            "method": "POST",
-            "evidence": f"fields={names}",
-            "owasp_category": "A04:2021 Insecure Design",
+            "url": target_url, "method": "POST", "evidence": f"fields={names}", "owasp_category": "A04:2021 Insecure Design",
         })
         return findings, diagnostic
     if not allow_state_changes:
@@ -454,41 +362,27 @@ def _captcha_check(
     except requests.RequestException as exc:
         diagnostic["error"] = f"{type(exc).__name__}: {exc}"
         return findings, diagnostic
-    accepted = response.status_code < 400 and not _looks_like_login(response) and not ERROR_RE.search(response.text[:30_000])
+    accepted = response.status_code < 400 and not looks_like_login(response, text_limit=80_000, paths=("/login", "/login.php", "/signin", "/auth"), words=("login", "sign in", "authenticate")) and not ERROR_RE.search(response.text[:30_000])
     diagnostic.update({"status": response.status_code, "accepted_without_captcha": accepted})
     if accepted:
         findings.append({
-            "alert": "CAPTCHA response appears unenforced",
-            "risk": "medium",
-            "category": "candidate",
-            "verification_status": "challenge-field-removal-candidate",
-            "confidence": "medium",
+            "alert": "CAPTCHA response appears unenforced", "risk": "medium",
+            "category": "candidate", "verification_status": "challenge-field-removal-candidate", "confidence": "medium",
             "description": "The workflow returned a successful response after recognized CAPTCHA fields were removed.",
             "impact": "Automated abuse may be possible by submitting the protected action directly without solving the challenge.",
             "solution": "Require and validate a single-use CAPTCHA response server-side for every protected action.",
-            "url": target_url,
-            "method": "POST",
-            "parameter": ", ".join(captcha_names),
+            "url": target_url, "method": "POST", "parameter": ", ".join(captcha_names),
             "evidence": f"HTTP {response.status_code}; final_url={response.url}; removed_fields={captcha_names}",
             "owasp_category": "A04:2021 Insecure Design",
         })
     return findings, diagnostic
 
-
 @mcp.tool()
 def run_workflow_scan(
-    target_url: str,
-    cookies: str = "",
-    method: str = "GET",
-    data: str = "",
-    parameters: list[str] | None = None,
-    fields: list[dict[str, Any]] | None = None,
-    file_parameters: list[str] | None = None,
-    token_parameters: list[str] | None = None,
-    source_url: str = "",
-    enctype: str = "",
-    timeout: int = 45,
-    allow_state_changes: bool = False,
+    target_url: str, cookies: str = "", method: str = "GET", data: str = "",
+    parameters: list[str] | None = None, fields: list[dict[str, Any]] | None = None,
+    file_parameters: list[str] | None = None, token_parameters: list[str] | None = None,
+    source_url: str = "", enctype: str = "", timeout: int = 45, allow_state_changes: bool = False,
     known_urls: list[str] | None = None,
 ) -> dict:
     """Run bounded generic CSRF, upload, authentication and CAPTCHA workflow checks."""
@@ -504,26 +398,19 @@ def run_workflow_scan(
 
     findings: list[dict[str, Any]] = []
     diagnostics: dict[str, Any] = {
-        "method": method,
-        "source_url": source_url,
-        "enctype": enctype,
-        "allow_state_changes": bool(allow_state_changes),
-        "parameters": list(parameters or []),
-        "file_parameters": file_parameters,
-        "token_parameters": token_parameters,
-        "known_url_count": len(known_urls or []),
+        "method": method, "source_url": source_url, "enctype": enctype, "allow_state_changes": bool(allow_state_changes),
+        "parameters": list(parameters or []), "file_parameters": file_parameters,
+        "token_parameters": token_parameters, "known_url_count": len(known_urls or []),
     }
 
     csrf_findings, csrf_diag = _csrf_check(
-        target_url, source_url, cookies, data, rows, token_parameters,
-        timeout, allow_state_changes,
+        target_url, source_url, cookies, data, rows, token_parameters, timeout, allow_state_changes,
     )
     findings.extend(csrf_findings)
     diagnostics["csrf"] = csrf_diag
 
     upload_findings, upload_diag = _upload_check(
-        target_url, source_url, cookies, rows, file_parameters,
-        timeout, allow_state_changes, known_urls,
+        target_url, source_url, cookies, rows, file_parameters, timeout, allow_state_changes, known_urls,
     )
     findings.extend(upload_findings)
     diagnostics["upload"] = upload_diag
@@ -543,13 +430,9 @@ def run_workflow_scan(
         return skipped("Web Workflow Verifier", target_url, "The discovered form did not match CSRF, upload, authentication or CAPTCHA workflow classes.")
 
     return success(
-        "Web Workflow Verifier",
-        target_url,
-        f"Bounded workflow checks completed. Findings: {len(findings)}.",
-        vulnerabilities=findings,
-        diagnostics=diagnostics,
+        "Web Workflow Verifier", target_url,
+        f"Bounded workflow checks completed. Findings: {len(findings)}.", vulnerabilities=findings, diagnostics=diagnostics,
     )
 
-
 if __name__ == "__main__":
-    run_mcp_http(mcp, "workflow")
+    _serve()

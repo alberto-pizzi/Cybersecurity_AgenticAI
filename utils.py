@@ -211,6 +211,8 @@ def apply_runtime_target_preparation(target: str, cookies: str) -> dict[str, Any
     })
     outcomes: list[dict[str, Any]] = []
     usable = True
+    conclusive = True
+    transient_errors: list[str] = []
     for item in requests_spec[:8]:
         if not isinstance(item, dict):
             continue
@@ -237,9 +239,19 @@ def apply_runtime_target_preparation(target: str, cookies: str) -> dict[str, Any
                 "final_url": str(response.url), "accepted": ok,
             })
         except requests.RequestException as exc:
-            usable = False
-            outcomes.append({"method": method, "url": url, "error": f"{type(exc).__name__}: {exc}"})
-    return {"performed": bool(outcomes), "configured": True, "usable": usable, "requests": outcomes}
+            # A busy target after an active scanner is not evidence that the
+            # authenticated cookie stopped being valid.  Keep transport
+            # failures explicitly inconclusive so downstream scanners can
+            # retry instead of being skipped as anonymous coverage.
+            conclusive = False
+            error = f"{type(exc).__name__}: {exc}"
+            transient_errors.append(error)
+            outcomes.append({"method": method, "url": url, "error": error, "transient": True})
+    return {
+        "performed": bool(outcomes), "configured": True, "usable": usable,
+        "conclusive": conclusive, "transient_error": bool(transient_errors),
+        "transient_errors": transient_errors[-5:], "requests": outcomes,
+    }
 
 
 def request_with_retries(

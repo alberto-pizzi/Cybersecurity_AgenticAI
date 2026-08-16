@@ -5,48 +5,25 @@ import re
 import sys
 import time
 import uuid
-from pathlib import Path
-from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 
 import requests
 from typing import Any
 
-from fastmcp import FastMCP
+from utils import failure, partial, response_excerpt, run_process, scanner_session_probe, success, trim_process_output
 
-from utils import ROOT_DIR, failure, partial, response_excerpt, run_process, scanner_session_probe, success, trim_process_output
+from scannerCommon import extend_request_cli, filter_control_parameters, find_repo_script, mutate_parameter, process_text, service
 
-from utils import run_mcp_http
-
-mcp = FastMCP("Commix Scanner")
-
-
-def _find_commix_script() -> Path | None:
-    candidates = [
-        Path.home() / ".local" / "opt" / "commix" / "commix.py",
-        Path(ROOT_DIR) / "tools" / "commix" / "commix.py",
-    ]
-    launcher = Path.home() / ".local" / "bin" / "commix.bat"
-    if launcher.is_file():
-        text = launcher.read_text(encoding="utf-8", errors="replace")
-        match = re.search(r'"([^"\r\n]*commix\.py)"|([A-Za-z]:\\[^\r\n]*?commix\.py)', text, re.I)
-        if match:
-            candidates.insert(0, Path(match.group(1) or match.group(2)))
-    for path in candidates:
-        if path.is_file():
-            return path.resolve()
-    return None
-
+mcp, _serve = service("Commix Scanner", "commix")
 
 def _findings(text: str, target_url: str, method: str) -> list[dict[str, Any]]:
-    if not re.search(r"(parameter.+is vulnerable|injectable parameter|command injection vulnerability)", text, re.I):
+    positive = r"(?:is vulnerable|appears to be injectable|seems injectable|command injection vulnerability)"
+    if not re.search(rf"(?:parameter.+{positive}|{positive}.+parameter)", text, re.I):
         return []
     parameter_match = re.search(
-        r"(?:parameter|parameter\s*['\"])(?:\s*[:=]\s*)?['\"]?([A-Za-z0-9_.-]+)['\"]?.{0,80}?(?:vulnerable|injectable)",
-        text,
-        re.I,
+        rf"(?:GET|POST)?\s*parameter\s*['\"]?([A-Za-z0-9_.-]+)['\"]?.{{0,120}}?{positive}", text, re.I,
     )
     if not parameter_match:
-        parameter_match = re.search(r"(?:GET|POST) parameter ['\"]([^'\"]+)['\"]", text, re.I)
+        parameter_match = re.search(r"(?:GET|POST)\s+parameter\s+['\"]([^'\"]+)['\"]", text, re.I)
     parameter = parameter_match.group(1) if parameter_match else ""
     payloads = [value.strip() for value in re.findall(r"(?:payload|Payload)\s*[:=]\s*(.+)", text)]
     technique_lines = [
@@ -55,9 +32,7 @@ def _findings(text: str, target_url: str, method: str) -> list[dict[str, Any]]:
     ]
     return [{
         "alert": (f"OS command injection in parameter '{parameter}'" if parameter else "OS command injection"),
-        "risk": "critical",
-        "category": "vulnerability",
-        "verification_status": "scanner-confirmed-command-injection",
+        "risk": "critical", "category": "vulnerability", "verification_status": "scanner-confirmed-command-injection",
         "description": (
             f"Commix reported that the HTTP {method} parameter '{parameter}' is command-injectable."
             if parameter else
@@ -72,28 +47,15 @@ def _findings(text: str, target_url: str, method: str) -> list[dict[str, Any]]:
             "Remove shell-command construction from untrusted input. Use a safe library API for the required operation, "
             "apply strict allow-list validation, avoid invoking a shell, and run the service with minimal privileges."
         ),
-        "url": target_url,
-        "method": method,
-        "parameter": parameter,
-        "payloads": payloads[:10],
-        "confidence": "high",
+        "url": target_url, "method": method, "parameter": parameter, "payloads": payloads[:10], "confidence": "high",
         "technical_details": f"Commix positive marker; parameter={parameter or 'not extracted'}; method={method}.",
         "evidence": "\n".join(technique_lines[:40]) or text[-5000:],
     }]
 
-
-
-CONTROL_PARAMETERS = {"submit", "login", "change", "user_token", "csrf", "button"}
 COMMAND_PARAMETERS = {"ip", "host", "hostname", "cmd", "command", "exec", "target", "domain"}
 
-
 def _command_canary(
-    target_url: str,
-    cookies: str,
-    method: str,
-    data: str,
-    parameters: list[str],
-    timeout: int = 25,
+    target_url: str, cookies: str, method: str, data: str, parameters: list[str], timeout: int = 25,
 ) -> dict[str, Any]:
     """Attempt a harmless, bounded response-marker confirmation first.
 
@@ -120,8 +82,7 @@ def _command_canary(
         f' & set "SECOPS_PART=CMD_{nonce}" & call echo SECOPS_%%SECOPS_PART%%',
     )
     headers = {
-        "Cache-Control": "no-cache",
-        "User-Agent": "SecOps-Command-Injection-Verifier/3.0",
+        "Cache-Control": "no-cache", "User-Agent": "SecOps-Command-Injection-Verifier/3.0",
     }
     if cookies:
         headers["Cookie"] = cookies
@@ -139,51 +100,24 @@ def _command_canary(
     deadline = time.monotonic() + max(8, min(int(timeout), 35))
 
     def mutate(value: str) -> tuple[str, str]:
-        if method == "GET":
-            parsed = urlparse(target_url)
-            pairs = parse_qsl(parsed.query, keep_blank_values=True)
-            changed: list[tuple[str, str]] = []
-            replaced = False
-            for name, current in pairs:
-                if not replaced and name.lower() == parameter.lower():
-                    changed.append((name, value)); replaced = True
-                else:
-                    changed.append((name, current))
-            if not replaced:
-                changed.append((parameter, value))
-            return urlunparse(parsed._replace(query=urlencode(changed))), ""
-        pairs = parse_qsl(data, keep_blank_values=True)
-        changed = []
-        replaced = False
-        for name, current in pairs:
-            if not replaced and name.lower() == parameter.lower():
-                changed.append((name, value)); replaced = True
-            else:
-                changed.append((name, current))
-        if not replaced:
-            changed.append((parameter, value))
-        return target_url, urlencode(changed)
+        return mutate_parameter(
+            target_url, method, data, parameter, value, case_insensitive=True
+        )
 
     def send(value: str) -> requests.Response:
         request_url, request_data = mutate(value)
         remaining = max(3.0, deadline - time.monotonic())
         return requests.request(
-            method,
-            request_url,
-            data=request_data if method != "GET" else None,
-            headers=headers,
-            timeout=(3, min(10.0, remaining)),
-            allow_redirects=True,
+            method, request_url, data=request_data if method != "GET" else None, headers=headers,
+            timeout=(3, min(10.0, remaining)), allow_redirects=True,
         )
 
     baseline: dict[str, Any] = {}
     try:
         response = send(base_value)
         baseline = {
-            "status": response.status_code,
-            "final_url": str(response.url),
-            "response_bytes": len(response.content),
-            "marker_absent": marker not in html.unescape(response.text),
+            "status": response.status_code, "final_url": str(response.url),
+            "response_bytes": len(response.content), "marker_absent": marker not in html.unescape(response.text),
         }
     except requests.RequestException as exc:
         baseline = {"error": f"{type(exc).__name__}: {exc}", "marker_absent": True}
@@ -212,68 +146,42 @@ def _command_canary(
             and response.status_code < 500
         )
         attempt = {
-            "payload_suffix": command_suffix,
-            "status": response.status_code,
-            "final_url": str(response.url),
-            "request_url": request_url,
-            "request_data": request_data,
-            "response_bytes": len(response.content),
-            "confirmed": confirmed,
-            "marker_absent_from_payload": marker_absent_from_payload,
-            "baseline_valid": baseline_valid,
-            "response_excerpt": response_excerpt(response.text, marker),
+            "payload_suffix": command_suffix, "status": response.status_code,
+            "final_url": str(response.url), "request_url": request_url,
+            "request_data": request_data, "response_bytes": len(response.content),
+            "confirmed": confirmed, "marker_absent_from_payload": marker_absent_from_payload,
+            "baseline_valid": baseline_valid, "response_excerpt": response_excerpt(response.text, marker),
         }
         attempts.append(attempt)
         if confirmed:
             return {
-                "performed": True,
-                "confirmed": True,
-                "parameter": parameter,
-                "marker": marker,
-                "payload_suffix": command_suffix,
-                "base_value": base_value,
-                "baseline": baseline,
-                "attempts": attempts,
-                "verification_method": "non-reflective-transformed-marker-v2",
-                **attempt,
+                "performed": True, "confirmed": True, "parameter": parameter, "marker": marker,
+                "payload_suffix": command_suffix, "base_value": base_value, "baseline": baseline, "attempts": attempts,
+                "verification_method": "non-reflective-transformed-marker-v2", **attempt,
             }
     return {
-        "performed": True,
-        "confirmed": False,
-        "parameter": parameter,
-        "marker": marker,
-        "base_value": base_value,
-        "baseline": baseline,
-        "attempts": attempts,
-        "canary_budget_seconds": max(8, min(int(timeout), 35)),
+        "performed": True, "confirmed": False, "parameter": parameter, "marker": marker,
+        "base_value": base_value, "baseline": baseline,
+        "attempts": attempts, "canary_budget_seconds": max(8, min(int(timeout), 35)),
         "verification_method": "non-reflective-transformed-marker-v2",
     }
 
-
 def _canary_finding(
-    target_url: str,
-    method: str,
-    canary: dict[str, Any],
+    target_url: str, method: str, canary: dict[str, Any],
 ) -> list[dict[str, Any]]:
     if not canary.get("confirmed"):
         return []
     parameter = str(canary.get("parameter") or "")
     return [{
-        "alert": f"OS command injection in parameter '{parameter}'",
-        "risk": "critical",
-        "category": "vulnerability",
-        "verification_status": "unique-response-marker-command-execution-confirmed",
+        "alert": f"OS command injection in parameter '{parameter}'", "risk": "critical",
+        "category": "vulnerability", "verification_status": "unique-response-marker-command-execution-confirmed",
         "confidence": "high",
         "description": "A benign shell transformation appended to the selected input produced a unique server-side marker in the HTTP response. The exact marker was absent from both the baseline response and the submitted payload, so ordinary input reflection cannot explain the result.",
         "attack_preconditions": "An attacker must be able to submit the affected parameter to the command-execution handler.",
         "impact": "The attacker can execute operating-system commands with the web-server account's privileges, read accessible files and secrets, modify application data, and potentially pivot to other services reachable from the container or host.",
         "solution": "Remove shell command construction from untrusted input. Use a dedicated networking or process API, enforce a strict allow-list, avoid invoking a shell, and run the service under a minimally privileged account.",
-        "url": target_url,
-        "method": method,
-        "parameter": parameter,
-        "payload": canary.get("payload_suffix"),
-        "cwe_id": "78",
-        "owasp_category": "A03:2021 Injection",
+        "url": target_url, "method": method, "parameter": parameter, "payload": canary.get("payload_suffix"),
+        "cwe_id": "78", "owasp_category": "A03:2021 Injection",
         "technical_details": (
             f"HTTP {canary.get('status')}; marker={canary.get('marker')}; "
             f"marker absent from payload={canary.get('marker_absent_from_payload')}; "
@@ -293,36 +201,29 @@ def _canary_finding(
         ),
     }]
 
-
 @mcp.tool()
 def run_commix_scan(
-    target_url: str,
-    cookies: str = "",
-    method: str = "GET",
-    data: str = "",
-    parameters: list[str] | None = None,
-    timeout: int = 150,
+    target_url: str, cookies: str = "", method: str = "GET", data: str = "",
+    parameters: list[str] | None = None, timeout: int = 150,
 ) -> dict:
     """Run Commix directly through Python and preserve bounded results."""
     method = method.upper()
     timeout = max(45, min(int(timeout), 600))
-    parameters = [value for value in dict.fromkeys(str(v) for v in (parameters or []) if str(v)) if value.lower() not in CONTROL_PARAMETERS]
-    session_probe = scanner_session_probe(target_url, cookies, method, data)
+    parameters = filter_control_parameters(parameters)
+    session_probe = scanner_session_probe(target_url, cookies, method, data, timeout=4, attempts=1)
     if cookies and session_probe.get("performed") and session_probe.get("conclusive") and session_probe.get("authenticated") is False:
         return partial("Commix", target_url, "Commix was not started because the authenticated request redirected to a login page.", diagnosis="authentication_precheck_failed", timed_out=False, vulnerabilities=[], session_probe=session_probe)
     started = time.monotonic()
     canary = _command_canary(
-        target_url, cookies, method, data, parameters,
-        timeout=max(8, min(35, timeout // 2)),
+        target_url, cookies, method, data, parameters, timeout=max(8, min(35, timeout // 2)),
     )
     canary_findings = _canary_finding(target_url, method, canary)
     if canary_findings:
         return success("Commix", target_url, "The Commix MCP pre-verifier confirmed command execution with a non-reflective transformed marker; the slower full Commix phase was not required.", vulnerabilities=canary_findings, command_injection_found=True, request_method=method, tested_parameters=parameters, authenticated=bool(cookies), session_probe=session_probe, command_canary=canary, execution_mode="direct_canary", confirmation_engine="secops_non_reflective_command_canary")
-    script = _find_commix_script()
+    script = find_repo_script("commix", "commix.py")
     if script is None:
         return failure(
-            "Commix", target_url,
-            "commix.py was not found under ~/.local/opt/commix. Run initScript.py again.",
+            "Commix", target_url, "commix.py was not found under ~/.local/opt/commix. Run initScript.py again.",
             diagnosis="missing_commix_script",
         )
 
@@ -332,77 +233,47 @@ def run_commix_scan(
         return partial(
             "Commix", target_url,
             "The bounded response-marker check was inconclusive and consumed the available scanner budget; the slower Commix phase was not started.",
-            diagnosis="bounded_canary_inconclusive",
-            timed_out=False, vulnerabilities=[], request_method=method,
+            diagnosis="bounded_canary_inconclusive", timed_out=False, vulnerabilities=[], request_method=method,
             tested_parameters=parameters, authenticated=bool(cookies),
-            session_probe=session_probe, command_canary=canary,
-            execution_mode="direct_canary_only",
+            session_probe=session_probe, command_canary=canary, execution_mode="direct_canary_only",
         )
 
     command = [
-        sys.executable, str(script),
-        "--url", target_url,
-        "--batch", "--level", "1",
-        "--timeout", "5", "--retries", "0", "--drop-set-cookie",
+        sys.executable, str(script), "--url", target_url,
+        "--batch", "--ignore-session", "--disable-coloring", "--level", "1", "--timeout", "5", "--retries", "0", "--drop-set-cookie",
         "--time-limit", str(max(15, remaining_budget - 5)),
     ]
-    if data:
-        command.extend(["--data", data])
-    if parameters:
-        command.extend(["-p", ",".join(dict.fromkeys(parameters))])
-    if cookies:
-        command.extend(["--cookie", cookies])
+    extend_request_cli(command, data, parameters, cookies)
 
     result = run_process(
-        "Commix",
-        command,
-        target=target_url,
-        timeout=remaining_budget,
-        accepted_codes=(0, 1),
-        cwd=script.parent,
+        "Commix", command, target=target_url, timeout=remaining_budget, accepted_codes=(0, 1), cwd=script.parent,
     )
-    text = "\n".join(str(result.get(key, "")) for key in ("stdout", "stderr", "output"))
+    text = process_text(result)
     findings = _findings(text, target_url, method)
     common = {
-        "vulnerabilities": findings,
-        "request_method": method,
-        "request_data_present": bool(data),
-        "tested_parameters": parameters,
-        "authenticated": bool(cookies),
-        "execution_mode": "direct_python",
-        "commix_script": str(script),
-        "session_probe": session_probe,
-        "command_canary": canary,
+        "vulnerabilities": findings, "request_method": method, "request_data_present": bool(data), "tested_parameters": parameters,
+        "authenticated": bool(cookies), "execution_mode": "direct_python",
+        "commix_script": str(script), "session_probe": session_probe, "command_canary": canary,
     }
 
     if result.get("diagnosis") == "timeout":
         return partial(
-            "Commix", target_url,
-            f"Commix reached its configured time budget. Findings preserved: {len(findings)}.",
-            diagnosis="time_limit_reached",
-            timed_out=True,
-            time_limit_reached=True,
-            duration_seconds=result.get("duration_seconds"),
-            stdout=str(result.get("stdout", ""))[-10000:],
-            stderr=str(result.get("stderr", ""))[-10000:],
-            command=result.get("command", []),
-            **common,
+            "Commix", target_url, f"Commix reached its configured time budget. Findings preserved: {len(findings)}.",
+            diagnosis="time_limit_reached", timed_out=True,
+            time_limit_reached=True, duration_seconds=result.get("duration_seconds"),
+            stdout=str(result.get("stdout", ""))[-10000:], stderr=str(result.get("stderr", ""))[-10000:],
+            command=result.get("command", []), **common,
         )
     if result.get("status") != "success":
         result.update(common)
         return trim_process_output(result, 10000)
 
     return success(
-        "Commix", target_url,
-        f"Commix completed for {method}. Confirmed command-injection findings: {len(findings)}.",
-        command_injection_found=bool(findings),
-        duration_seconds=result.get("duration_seconds"),
-        command=result.get("command", []),
-        stdout=str(result.get("stdout", ""))[-10000:],
-        stderr=str(result.get("stderr", ""))[-10000:],
-        **common,
+        "Commix", target_url, f"Commix completed for {method}. Confirmed command-injection findings: {len(findings)}.",
+        command_injection_found=bool(findings), duration_seconds=result.get("duration_seconds"),
+        command=result.get("command", []), stdout=str(result.get("stdout", ""))[-10000:],
+        stderr=str(result.get("stderr", ""))[-10000:], **common,
     )
 
-
 if __name__ == "__main__":
-    run_mcp_http(mcp, "commix")
+    _serve()

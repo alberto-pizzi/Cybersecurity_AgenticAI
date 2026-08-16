@@ -4,70 +4,43 @@ import re
 import secrets
 import shutil
 from typing import Any
-from urllib.parse import parse_qsl, quote, urlencode, urlparse, urlunparse
-
-from fastmcp import FastMCP
+from urllib.parse import quote, urlparse
 
 from utils import failure, parse_cookie_header, skipped, success
 
-from utils import run_mcp_http, same_origin
+from utils import same_origin
 
-mcp = FastMCP("Browser XSS and Workflow Verifier")
+from scannerCommon import mutate_parameter, service
+
+mcp, _serve = service("Browser XSS and Workflow Verifier", "browser")
 
 DESTRUCTIVE_RE = re.compile(
-    r"(?:logout|signout|logoff|setup|install|delete|remove|drop|truncate|purge|wipe|reset|clear)",
-    re.I,
+    r"(?:logout|signout|logoff|setup|install|delete|remove|drop|truncate|purge|wipe|reset|clear)", re.I,
 )
 TOKEN_RE = re.compile(r"(?:csrf|xsrf|token|nonce|authenticity|request[_-]?verification)", re.I)
 XSS_NAME_RE = re.compile(
-    r"(?:name|message|comment|search|query|q|text|title|input|html|body|content|url|redirect|default|description|bio|note)",
-    re.I,
+    r"(?:name|message|comment|search|query|q|text|title|input|html|body|content|url|redirect|default|description|bio|note)", re.I,
 )
 POSITIVE_SUBMIT_RE = re.compile(r"(?:submit|send|save|post|publish|sign|add|create|update|upload|change)", re.I)
 NEGATIVE_SUBMIT_RE = re.compile(r"(?:clear|delete|remove|reset|cancel|logout|drop|purge)", re.I)
-
-
-def _mutate_query(url: str, parameter: str, value: str) -> str:
-    parsed = urlparse(url)
-    pairs = parse_qsl(parsed.query, keep_blank_values=True)
-    changed: list[tuple[str, str]] = []
-    replaced = False
-    for name, current in pairs:
-        if not replaced and name.lower() == parameter.lower():
-            changed.append((name, value))
-            replaced = True
-        else:
-            changed.append((name, current))
-    if not replaced:
-        changed.append((parameter, value))
-    return urlunparse(parsed._replace(query=urlencode(changed), fragment=""))
-
 
 def _browser_cookies(target_url: str, cookies: str) -> list[dict[str, Any]]:
     parsed = urlparse(target_url)
     rows: list[dict[str, Any]] = []
     for name, value in parse_cookie_header(cookies):
         rows.append({
-            "name": name,
-            "value": value,
-            "domain": parsed.hostname or "localhost",
-            "path": "/",
-            "httpOnly": False,
-            "secure": parsed.scheme == "https",
-            "sameSite": "Lax",
+            "name": name, "value": value, "domain": parsed.hostname or "localhost", "path": "/",
+            "httpOnly": False, "secure": parsed.scheme == "https", "sameSite": "Lax",
         })
     return rows
-
 
 def _short_marker(prefix: str = "S") -> str:
     return prefix[:1].upper() + secrets.token_hex(4).upper()
 
-
 def _payload_candidates(marker: str, maxlength: int = 0) -> list[str]:
     """Return harmless execution markers, shortest first when a field is bounded."""
     candidates = [
-        f"<svg/onload=document.body.id='{marker}'>",
-        f"<img src=x onerror=document.body.id='{marker}'>",
+        f"<svg/onload=document.body.id='{marker}'>", f"<img src=x onerror=document.body.id='{marker}'>",
         (
             '<img src=x onerror="document.documentElement.setAttribute('
             f"'data-secops-browser-xss','{marker}')\" data-secops-marker=\"{marker}\">"
@@ -79,20 +52,14 @@ def _payload_candidates(marker: str, maxlength: int = 0) -> list[str]:
         unique = [value for value in unique if len(value) <= maxlength]
     return unique
 
-
 def _query_payload_candidates(marker: str) -> list[str]:
     """Include context-breaking variants needed by select/attribute/script sinks."""
     base = f"<svg/onload=document.body.id='{marker}'>"
     return list(dict.fromkeys([
-        base,
-        f"</option></select>{base}",
-        f"'><svg/onload=document.body.id='{marker}'>",
-        f'"><svg/onload=document.body.id="{marker}">',
-        f"</script>{base}",
-        f"';document.body.id='{marker}';//",
-        f'";document.body.id="{marker}";//',
+        base, f"</option></select>{base}",
+        f"'><svg/onload=document.body.id='{marker}'>", f'"><svg/onload=document.body.id="{marker}">',
+        f"</script>{base}", f"';document.body.id='{marker}';//", f'";document.body.id="{marker}";//',
     ]))
-
 
 async def _executed(page: Any, marker: str) -> bool:
     try:
@@ -105,20 +72,17 @@ async def _executed(page: Any, marker: str) -> bool:
             marker,
         )
         return marker in {
-            str((value or {}).get("htmlMarker") or ""),
-            str((value or {}).get("htmlId") or ""),
+            str((value or {}).get("htmlMarker") or ""), str((value or {}).get("htmlId") or ""),
             str((value or {}).get("bodyId") or ""),
         }
     except Exception:
         return False
-
 
 async def _reflection_present(page: Any, marker: str) -> bool:
     try:
         return marker in str(await page.content())
     except Exception:
         return False
-
 
 async def _safe_goto(page: Any, url: str, timeout_ms: int) -> tuple[bool, str]:
     try:
@@ -128,12 +92,8 @@ async def _safe_goto(page: Any, url: str, timeout_ms: int) -> tuple[bool, str]:
     except Exception as exc:
         return False, f"{type(exc).__name__}: {exc}"
 
-
 async def _query_checks(
-    page: Any,
-    target_url: str,
-    parameters: list[str],
-    timeout_ms: int,
+    page: Any, target_url: str, parameters: list[str], timeout_ms: int,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     findings: list[dict[str, Any]] = []
     attempts: list[dict[str, Any]] = []
@@ -143,65 +103,43 @@ async def _query_checks(
         marker = _short_marker("Q")
         variants = _query_payload_candidates(marker)
         for payload_index, payload in enumerate(variants, start=1):
-            mutated = _mutate_query(target_url, parameter, payload)
+            mutated = mutate_parameter(target_url, "GET", "", parameter, payload, case_insensitive=True, clear_fragment=True)[0]
             ok, detail = await _safe_goto(page, mutated, timeout_ms)
             executed = ok and await _executed(page, marker)
             reflected = ok and await _reflection_present(page, marker)
             attempts.append({
-                "mode": "query",
-                "parameter": parameter,
-                "payload_variant": payload_index,
-                "url": mutated,
-                "navigation": detail,
-                "executed": executed,
-                "reflected": reflected,
+                "mode": "query", "parameter": parameter, "payload_variant": payload_index, "url": mutated,
+                "navigation": detail, "executed": executed, "reflected": reflected,
             })
             if executed:
                 findings.append({
-                    "alert": f"Browser-confirmed DOM or reflected XSS in parameter '{parameter}'",
-                    "risk": "high",
-                    "category": "vulnerability",
-                    "verification_status": "playwright-browser-marker-executed",
-                    "confidence": "high",
+                    "alert": f"Browser-confirmed DOM or reflected XSS in parameter '{parameter}'", "risk": "high",
+                    "category": "vulnerability", "verification_status": "playwright-browser-marker-executed", "confidence": "high",
                     "description": "A harmless event-handler payload executed in a real Chromium page context and set the expected DOM marker.",
                     "impact": "Attacker-controlled JavaScript can execute in the application origin and access data or actions available to the victim session.",
                     "solution": "Apply context-aware output encoding, avoid unsafe DOM sinks, sanitize untrusted HTML and use Content Security Policy as defence in depth.",
-                    "url": mutated,
-                    "method": "GET",
-                    "parameter": parameter,
-                    "payload": payload,
+                    "url": mutated, "method": "GET", "parameter": parameter, "payload": payload,
                     "evidence": f"Chromium marker executed=True; marker={marker}; navigation={detail}; payload_variant={payload_index}",
-                    "owasp_category": "A03:2021 Injection",
-                    "cwe_id": "79",
+                    "owasp_category": "A03:2021 Injection", "cwe_id": "79",
                 })
                 break
             if reflected:
                 findings.append({
                     "alert": f"Browser-observed unexecuted HTML reflection in parameter '{parameter}'",
-                    "risk": "medium",
-                    "category": "candidate",
-                    "verification_status": "browser-reflection-without-marker-execution",
-                    "confidence": "medium",
+                    "risk": "medium", "category": "candidate",
+                    "verification_status": "browser-reflection-without-marker-execution", "confidence": "medium",
                     "description": "The marker payload was present in the browser DOM, but its event handler did not execute during the bounded check.",
                     "impact": "The reflection may become exploitable in a different HTML, attribute or script context and needs manual validation.",
                     "solution": "Apply context-aware encoding and review the exact reflection context.",
-                    "url": mutated,
-                    "method": "GET",
-                    "parameter": parameter,
-                    "payload": payload,
+                    "url": mutated, "method": "GET", "parameter": parameter, "payload": payload,
                     "evidence": f"marker_reflected=True; marker_executed=False; navigation={detail}; payload_variant={payload_index}",
                     "owasp_category": "A03:2021 Injection",
                 })
                 break
     return findings, attempts
 
-
 async def _client_source_checks(
-    page: Any,
-    target_url: str,
-    timeout_ms: int,
-    client_sources: list[str],
-    client_sinks: list[str],
+    page: Any, target_url: str, timeout_ms: int, client_sources: list[str], client_sinks: list[str],
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     findings: list[dict[str, Any]] = []
     attempts: list[dict[str, Any]] = []
@@ -220,29 +158,18 @@ async def _client_source_checks(
         except Exception as exc:
             ok, detail, executed = False, f"{type(exc).__name__}: {exc}", False
         attempts.append({
-            "mode": "window.name",
-            "url": base_url,
-            "navigation": detail,
-            "executed": executed,
-            "sinks": sinks,
+            "mode": "window.name", "url": base_url, "navigation": detail, "executed": executed, "sinks": sinks,
         })
         if executed:
             findings.append({
-                "alert": "Browser-confirmed DOM XSS through window.name",
-                "risk": "high",
-                "category": "vulnerability",
-                "verification_status": "playwright-window-name-marker-executed",
-                "confidence": "high",
+                "alert": "Browser-confirmed DOM XSS through window.name", "risk": "high",
+                "category": "vulnerability", "verification_status": "playwright-window-name-marker-executed", "confidence": "high",
                 "description": "JavaScript supplied through window.name executed in Chromium and set a harmless DOM marker.",
                 "impact": "An attacker-controlled browsing context can execute JavaScript in the affected application origin.",
                 "solution": "Never pass window.name or other navigation-controlled values to eval, Function, document.write or HTML sinks. Use strict parsing and safe DOM APIs.",
-                "url": base_url,
-                "method": "GET",
-                "parameter": "window.name",
-                "payload": javascript,
+                "url": base_url, "method": "GET", "parameter": "window.name", "payload": javascript,
                 "evidence": f"marker={marker}; navigation={detail}; discovered_sinks={sinks}",
-                "owasp_category": "A03:2021 Injection",
-                "cwe_id": "79",
+                "owasp_category": "A03:2021 Injection", "cwe_id": "79",
             })
 
     marker = _short_marker("H")
@@ -259,42 +186,28 @@ async def _client_source_checks(
             except Exception:
                 pass
         attempts.append({
-            "mode": "fragment",
-            "payload_variant": payload_index,
-            "url": fragment_url,
-            "navigation": detail,
-            "executed": executed,
-            "sources": sorted(sources),
-            "sinks": sinks,
+            "mode": "fragment", "payload_variant": payload_index, "url": fragment_url, "navigation": detail,
+            "executed": executed, "sources": sorted(sources), "sinks": sinks,
         })
         if executed:
             findings.append({
-                "alert": "Browser-confirmed DOM XSS through URL fragment",
-                "risk": "high",
-                "category": "vulnerability",
-                "verification_status": "playwright-fragment-marker-executed",
-                "confidence": "high",
+                "alert": "Browser-confirmed DOM XSS through URL fragment", "risk": "high",
+                "category": "vulnerability", "verification_status": "playwright-fragment-marker-executed", "confidence": "high",
                 "description": "A harmless payload placed in location.hash executed in Chromium without being sent to the server.",
                 "impact": "An attacker can craft a URL that executes JavaScript in the application origin when opened by a victim.",
                 "solution": "Do not insert location-derived data into HTML or script sinks; use textContent and strict validation.",
-                "url": fragment_url,
-                "method": "GET",
-                "parameter": "location.hash",
-                "payload": payload,
+                "url": fragment_url, "method": "GET", "parameter": "location.hash", "payload": payload,
                 "evidence": f"Chromium marker executed=True; marker={marker}; navigation={detail}; payload_variant={payload_index}",
-                "owasp_category": "A03:2021 Injection",
-                "cwe_id": "79",
+                "owasp_category": "A03:2021 Injection", "cwe_id": "79",
             })
             break
     return findings, attempts
-
 
 def _field_metadata(fields: list[dict[str, Any]], parameter: str) -> dict[str, Any]:
     for item in fields:
         if isinstance(item, dict) and str(item.get("name") or "").lower() == parameter.lower():
             return item
     return {}
-
 
 async def _submit_form(form: Any) -> tuple[bool, str]:
     submitters = form.locator("input[type=submit], button[type=submit], button:not([type])")
@@ -307,9 +220,7 @@ async def _submit_form(form: Any) -> tuple[bool, str]:
         item = submitters.nth(index)
         try:
             label = " ".join(filter(None, [
-                await item.get_attribute("name") or "",
-                await item.get_attribute("value") or "",
-                await item.inner_text() or "",
+                await item.get_attribute("name") or "", await item.get_attribute("value") or "", await item.inner_text() or "",
             ])).strip()
         except Exception:
             continue
@@ -334,16 +245,9 @@ async def _submit_form(form: Any) -> tuple[bool, str]:
     except Exception as exc:
         return False, f"submit failed: {type(exc).__name__}: {exc}; prior={click_error}"
 
-
 async def _stored_check(
-    context: Any,
-    page: Any,
-    target_url: str,
-    source_url: str,
-    parameters: list[str],
-    fields: list[dict[str, Any]],
-    timeout_ms: int,
-    allow_state_changes: bool,
+    context: Any, page: Any, target_url: str, source_url: str,
+    parameters: list[str], fields: list[dict[str, Any]], timeout_ms: int, allow_state_changes: bool,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     diagnostic: dict[str, Any] = {"attempted": False, "attempts": []}
     findings: list[dict[str, Any]] = []
@@ -396,10 +300,8 @@ async def _stored_check(
             payloads = _payload_candidates(marker, maxlength)
             if not payloads:
                 diagnostic["attempts"].append({
-                    "parameter": parameter,
-                    "tag": tag,
-                    "maxlength": maxlength,
-                    "reason": "field length is too short for a harmless executable marker",
+                    "parameter": parameter, "tag": tag,
+                    "maxlength": maxlength, "reason": "field length is too short for a harmless executable marker",
                 })
                 continue
 
@@ -451,38 +353,26 @@ async def _stored_check(
                     await verification_page.close()
 
                 attempt = {
-                    "parameter": parameter,
-                    "tag": tag,
-                    "maxlength": maxlength,
-                    "payload_variant": payload_index,
-                    "payload_length": len(payload),
-                    "submitted": submitted,
-                    "submit_detail": submit_detail,
-                    "marker": marker,
-                    "executed_url": executed_url,
+                    "parameter": parameter, "tag": tag, "maxlength": maxlength, "payload_variant": payload_index,
+                    "payload_length": len(payload), "submitted": submitted,
+                    "submit_detail": submit_detail, "marker": marker, "executed_url": executed_url,
                 }
                 diagnostic["attempted"] = True
                 diagnostic["attempts"].append(attempt)
                 if executed_url:
                     findings.append({
-                        "alert": f"Browser-confirmed stored XSS in parameter '{parameter}'",
-                        "risk": "high",
+                        "alert": f"Browser-confirmed stored XSS in parameter '{parameter}'", "risk": "high",
                         "category": "vulnerability",
-                        "verification_status": "playwright-stored-marker-executed-after-fresh-page-revisit",
-                        "confidence": "high",
+                        "verification_status": "playwright-stored-marker-executed-after-fresh-page-revisit", "confidence": "high",
                         "description": "A harmless payload submitted through the discovered form executed after the page was revisited in a fresh Chromium page.",
                         "impact": "Stored attacker-controlled JavaScript can execute for every user who views the affected content, including privileged users.",
                         "solution": "Encode stored content at every output context, sanitize permitted markup, validate input and apply CSP as defence in depth.",
-                        "url": executed_url,
-                        "method": "POST",
-                        "parameter": parameter,
-                        "payload": payload,
+                        "url": executed_url, "method": "POST", "parameter": parameter, "payload": payload,
                         "evidence": (
                             f"form_source={start_url}; action={target_url}; marker={marker}; "
                             f"executed_after_fresh_page_revisit=True; {submit_detail}"
                         ),
-                        "owasp_category": "A03:2021 Injection",
-                        "cwe_id": "79",
+                        "owasp_category": "A03:2021 Injection", "cwe_id": "79",
                     })
                     diagnostic["confirmed_parameter"] = parameter
                     return findings, diagnostic
@@ -494,27 +384,18 @@ async def _stored_check(
         diagnostic["reason"] = "no compatible field could carry a harmless executable marker"
     return findings, diagnostic
 
-
 async def _run_browser_scan_core(
-    target_url: str,
-    cookies: str = "",
-    method: str = "GET",
-    data: str = "",
-    parameters: list[str] | None = None,
-    fields: list[dict[str, Any]] | None = None,
-    source_url: str = "",
-    client_sources: list[str] | None = None,
-    client_sinks: list[str] | None = None,
-    timeout: int = 60,
-    allow_state_changes: bool = False,
+    target_url: str, cookies: str = "", method: str = "GET", data: str = "",
+    parameters: list[str] | None = None, fields: list[dict[str, Any]] | None = None,
+    source_url: str = "", client_sources: list[str] | None = None,
+    client_sinks: list[str] | None = None, timeout: int = 60, allow_state_changes: bool = False,
 ) -> dict[str, Any]:
     try:
         from playwright.async_api import Error as PlaywrightError
         from playwright.async_api import async_playwright
     except Exception as exc:
         return skipped(
-            "Browser XSS and Workflow Verifier",
-            target_url,
+            "Browser XSS and Workflow Verifier", target_url,
             f"Playwright is not installed or importable: {type(exc).__name__}: {exc}. Run initScript.py to install Chromium support.",
             diagnosis="missing_playwright",
         )
@@ -531,14 +412,9 @@ async def _run_browser_scan_core(
     timeout_ms = timeout * 1000
     findings: list[dict[str, Any]] = []
     diagnostics: dict[str, Any] = {
-        "method": str(method or "GET").upper(),
-        "parameters": parameters,
-        "fields": fields,
-        "source_url": source_url,
-        "client_sources": client_sources,
-        "client_sinks": client_sinks,
-        "allow_state_changes": bool(allow_state_changes),
-        "playwright_api": "async",
+        "method": str(method or "GET").upper(), "parameters": parameters, "fields": fields, "source_url": source_url,
+        "client_sources": client_sources, "client_sinks": client_sinks,
+        "allow_state_changes": bool(allow_state_changes), "playwright_api": "async",
     }
 
     try:
@@ -553,8 +429,7 @@ async def _run_browser_scan_core(
                 ), None)
                 if not system_browser:
                     return skipped(
-                        "Browser XSS and Workflow Verifier",
-                        target_url,
+                        "Browser XSS and Workflow Verifier", target_url,
                         f"Playwright Chromium is not installed: {exc}. Run: python -m playwright install chromium",
                         diagnosis="missing_playwright_browser",
                     )
@@ -578,14 +453,7 @@ async def _run_browser_scan_core(
 
                 if str(method or "GET").upper() == "POST":
                     stored_findings, stored_diag = await _stored_check(
-                        context,
-                        page,
-                        target_url,
-                        source_url,
-                        parameters,
-                        fields,
-                        timeout_ms,
-                        allow_state_changes,
+                        context, page, target_url, source_url, parameters, fields, timeout_ms, allow_state_changes,
                     )
                     findings.extend(stored_findings)
                     diagnostics["stored"] = stored_diag
@@ -596,10 +464,8 @@ async def _run_browser_scan_core(
                 await browser.close()
     except Exception as exc:
         return failure(
-            "Browser XSS and Workflow Verifier",
-            target_url,
-            f"Browser verification failed: {type(exc).__name__}: {exc}",
-            diagnosis="browser_runtime_error",
+            "Browser XSS and Workflow Verifier", target_url,
+            f"Browser verification failed: {type(exc).__name__}: {exc}", diagnosis="browser_runtime_error",
         )
 
     # Deduplicate multiple payload variants that confirm the same source.
@@ -607,51 +473,30 @@ async def _run_browser_scan_core(
     seen: set[tuple[str, str, str]] = set()
     for item in findings:
         key = (
-            str(item.get("verification_status") or ""),
-            str(item.get("parameter") or ""),
+            str(item.get("verification_status") or ""), str(item.get("parameter") or ""),
             urlparse(str(item.get("url") or target_url)).path,
         )
         if key not in seen:
             seen.add(key)
             unique.append(item)
     return success(
-        "Browser XSS and Workflow Verifier",
-        target_url,
-        f"Browser verification completed. Findings: {len(unique)}.",
-        vulnerabilities=unique,
-        diagnostics=diagnostics,
+        "Browser XSS and Workflow Verifier", target_url,
+        f"Browser verification completed. Findings: {len(unique)}.", vulnerabilities=unique, diagnostics=diagnostics,
     )
-
 
 @mcp.tool()
 async def run_browser_scan(
-    target_url: str,
-    cookies: str = "",
-    method: str = "GET",
-    data: str = "",
-    parameters: list[str] | None = None,
-    fields: list[dict[str, Any]] | None = None,
-    source_url: str = "",
-    client_sources: list[str] | None = None,
-    client_sinks: list[str] | None = None,
-    timeout: int = 60,
-    allow_state_changes: bool = False,
+    target_url: str, cookies: str = "", method: str = "GET", data: str = "",
+    parameters: list[str] | None = None, fields: list[dict[str, Any]] | None = None,
+    source_url: str = "", client_sources: list[str] | None = None,
+    client_sinks: list[str] | None = None, timeout: int = 60, allow_state_changes: bool = False,
 ) -> dict:
     """Use async Chromium to verify DOM, reflected and stored XSS with harmless markers."""
     return await _run_browser_scan_core(
-        target_url=target_url,
-        cookies=cookies,
-        method=method,
-        data=data,
-        parameters=parameters,
-        fields=fields,
-        source_url=source_url,
-        client_sources=client_sources,
-        client_sinks=client_sinks,
-        timeout=timeout,
-        allow_state_changes=allow_state_changes,
+        target_url=target_url, cookies=cookies, method=method, data=data,
+        parameters=parameters, fields=fields, source_url=source_url, client_sources=client_sources,
+        client_sinks=client_sinks, timeout=timeout, allow_state_changes=allow_state_changes,
     )
 
-
 if __name__ == "__main__":
-    run_mcp_http(mcp, "browser")
+    _serve()

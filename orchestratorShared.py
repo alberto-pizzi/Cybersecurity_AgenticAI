@@ -24,28 +24,12 @@ from html.parser import HTMLParser
 from pathlib import Path
 from typing import Any, Iterator
 from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
-warnings.filterwarnings("ignore", message=r".*authlib\.jose.*deprecated.*")
+warnings.filterwarnings('ignore', message='.*authlib\\.jose.*deprecated.*')
 import requests
 with warnings.catch_warnings():
-    warnings.simplefilter("ignore")
+    warnings.simplefilter('ignore')
     from fastmcp import Client
-from utils import (
-    apply_runtime_target_preparation,
-    absolute_url,
-    canonical_cookie_header,
-    cookie_names,
-    load_runtime_config,
-    normalize_url,
-    ROOT_DIR,
-    same_origin,
-    scanner_session_probe,
-    SERVERS_DIR,
-    target_runtime_profile,
-    mcp_http_port,
-    mcp_http_url,
-)
-
-# Runtime, tool registry and MCP lifecycle
+from utils import apply_runtime_target_preparation, absolute_url, canonical_cookie_header, cookie_names, load_runtime_config, normalize_url, ROOT_DIR, same_origin, scanner_session_probe, SERVERS_DIR, target_runtime_profile, mcp_http_port, mcp_http_url
 ROOT = Path(ROOT_DIR).resolve()
 SERVERS = Path(SERVERS_DIR).resolve()
 RUNTIME_FILE = ROOT / '.secops_runtime.json'
@@ -57,15 +41,14 @@ MAX_ARJUN_ENDPOINTS = max(1, int(os.getenv('SECOPS_MAX_ARJUN_ENDPOINTS', '3')))
 MAX_CRAWL_PAGES = max(10, int(os.getenv('SECOPS_MAX_CRAWL_PAGES', '50')))
 MAX_SCRIPT_ASSETS = max(4, int(os.getenv('SECOPS_MAX_SCRIPT_ASSETS', '24')))
 SCANNER_PROGRESS_INTERVAL = max(10, int(os.getenv('SECOPS_PROGRESS_INTERVAL', '30')))
-SCAN_MODES = {'fast': {'broad': {'zap': 90, 'nuclei': 90, 'nikto': 45, 'ffuf': 40, 'session': 20}, 'parameter': {'sqlmap': 60, 'dalfox': 35, 'commix': 40, 'traversal': 25, 'idor': 12, 'authorization': 25, 'browser': 35, 'workflow': 30}, 'limits': {'sqlmap': 1, 'dalfox': 1, 'commix': 1, 'traversal': 1, 'idor': 1, 'authorization': 1, 'browser': 1, 'workflow': 1}, 'arjun': 30, 'arjun_limit': 1},
-    'balanced': {'broad': {'zap': 360, 'nuclei': 210, 'nikto': 90, 'ffuf': 75, 'session': 35}, 'parameter': {'sqlmap': 120, 'dalfox': 90, 'commix': 75, 'traversal': 45, 'idor': 20, 'authorization': 40, 'browser': 75, 'workflow': 60}, 'limits': {'sqlmap': 3, 'dalfox': 3, 'commix': 1, 'traversal': 2, 'idor': 2, 'authorization': 3, 'browser': 2, 'workflow': 3}, 'arjun': 75, 'arjun_limit': 2},
-    'deep': {'broad': {'zap': 900, 'nuclei': 360, 'nikto': 180, 'ffuf': 120, 'session': 50}, 'parameter': {'sqlmap': 240, 'dalfox': 180, 'commix': 90, 'traversal': 90, 'idor': 45, 'authorization': 60, 'browser': 120, 'workflow': 90}, 'limits': {'sqlmap': 5, 'dalfox': 4, 'commix': 2, 'traversal': 3, 'idor': 3, 'authorization': 5, 'browser': 4, 'workflow': 5}, 'arjun': 90, 'arjun_limit': 3}}
+SCAN_MODES = {'fast': {'broad': {'zap': 90, 'nuclei': 90, 'nikto': 45, 'ffuf': 40, 'session': 20}, 'parameter': {'sqlmap': 60, 'dalfox': 35, 'commix': 40, 'traversal': 25, 'idor': 12, 'authorization': 25, 'browser': 35, 'workflow': 30}, 'limits': {'sqlmap': 1, 'dalfox': 1, 'commix': 1, 'traversal': 1, 'idor': 1, 'authorization': 1, 'browser': 1, 'workflow': 1}, 'arjun': 30, 'arjun_limit': 1}, 'balanced': {'broad': {'zap': 360, 'nuclei': 210, 'nikto': 90, 'ffuf': 75, 'session': 35}, 'parameter': {'sqlmap': 120, 'dalfox': 90, 'commix': 75, 'traversal': 45, 'idor': 20, 'authorization': 40, 'browser': 75, 'workflow': 60}, 'limits': {'sqlmap': 3, 'dalfox': 3, 'commix': 1, 'traversal': 2, 'idor': 2, 'authorization': 3, 'browser': 2, 'workflow': 3}, 'arjun': 75, 'arjun_limit': 2}, 'deep': {'broad': {'zap': 900, 'nuclei': 360, 'nikto': 180, 'ffuf': 120, 'session': 50}, 'parameter': {'sqlmap': 240, 'dalfox': 180, 'commix': 90, 'traversal': 90, 'idor': 45, 'authorization': 60, 'browser': 120, 'workflow': 90}, 'limits': {'sqlmap': 5, 'dalfox': 4, 'commix': 2, 'traversal': 3, 'idor': 3, 'authorization': 5, 'browser': 4, 'workflow': 5}, 'arjun': 90, 'arjun_limit': 3}}
 CURRENT_SCAN_MODE = 'balanced'
 BROAD_SCANNER_TIMEOUTS = dict(SCAN_MODES[CURRENT_SCAN_MODE]['broad'])
 PARAMETER_TOOL_TIMEOUTS = dict(SCAN_MODES[CURRENT_SCAN_MODE]['parameter'])
 PARAMETER_TOOL_CASE_LIMITS = dict(SCAN_MODES[CURRENT_SCAN_MODE]['limits'])
 ARJUN_TIMEOUT = int(SCAN_MODES[CURRENT_SCAN_MODE]['arjun'])
 ARJUN_ENDPOINT_LIMIT = int(SCAN_MODES[CURRENT_SCAN_MODE].get('arjun_limit', 1))
+
 def configure_scan_mode(mode: str) -> None:
     global CURRENT_SCAN_MODE, ARJUN_TIMEOUT, ARJUN_ENDPOINT_LIMIT
     selected = str(mode or 'balanced').lower()
@@ -83,47 +66,11 @@ def configure_scan_mode(mode: str) -> None:
     ARJUN_ENDPOINT_LIMIT = int(profile.get('arjun_limit', 1))
 TIME_LIMIT_DIAGNOSES = {'timeout', 'time_limit_reached', 'timeout_with_partial_results', 'timeout_with_confirmed_finding', 'bounded_partial_scan'}
 AUTO_INDEX_PARAMETERS = {'c', 'n', 'm', 's', 'd', 'o'}
-OAST_PARAMETER_SCORES = {'url': 120,
-    'uri': 115,
-    'host': 115,
-    'hostname': 115,
-    'domain': 110,
-    'callback': 130,
-    'callback_url': 135,
-    'webhook': 135,
-    'webhook_url': 140,
-    'endpoint': 100,
-    'target': 95,
-    'dest': 100,
-    'destination': 105,
-    'redirect': 80,
-    'redirect_url': 90,
-    'next': 55,
-    'return': 55,
-    'fetch': 120,
-    'resource': 90,
-    'remote': 100,
-    'proxy': 105,
-    'image': 65,
-    'src': 70,
-    'file': 75,
-    'filename': 75,
-    'path': 60,
-    'page': 85,
-    'include': 105,
-    'template': 80,
-    'feed': 90,
-    'avatar': 65,
-    'document': 65,
-    'ip': 125,
-    'cmd': 145,
-    'command': 145,
-    'exec': 140,
-    'shell': 145,
-    'ping': 130}
+OAST_PARAMETER_SCORES = {'url': 120, 'uri': 115, 'host': 115, 'hostname': 115, 'domain': 110, 'callback': 130, 'callback_url': 135, 'webhook': 135, 'webhook_url': 140, 'endpoint': 100, 'target': 95, 'dest': 100, 'destination': 105, 'redirect': 80, 'redirect_url': 90, 'next': 55, 'return': 55, 'fetch': 120, 'resource': 90, 'remote': 100, 'proxy': 105, 'image': 65, 'src': 70, 'file': 75, 'filename': 75, 'path': 60, 'page': 85, 'include': 105, 'template': 80, 'feed': 90, 'avatar': 65, 'document': 65, 'ip': 125, 'cmd': 145, 'command': 145, 'exec': 140, 'shell': 145, 'ping': 130}
 OAST_PATH_HINTS = ('ssrf', 'webhook', 'callback', 'fetch', 'proxy', 'redirect', 'remote', 'url', 'include', 'exec', 'command', 'cmd')
 OAST_URL_VALUE_PARAMETERS = {'url', 'uri', 'callback', 'callback_url', 'webhook', 'webhook_url', 'endpoint', 'target', 'dest', 'destination', 'redirect', 'redirect_url', 'next', 'return', 'fetch', 'resource', 'remote', 'proxy', 'image', 'src', 'file', 'filename', 'path', 'page', 'include', 'template', 'feed', 'avatar', 'document'}
 OAST_COMMAND_PARAMETERS = {'ip', 'host', 'hostname', 'cmd', 'command', 'exec', 'shell', 'ping', 'target', 'domain'}
+
 @dataclass(frozen=True)
 class ToolSpec:
     name: str
@@ -140,22 +87,7 @@ WORKFLOW_TOOLS = (ToolSpec('browser', 'browserServer.py', 'run_browser_scan', mo
 OPTIONAL_TOOLS = (ToolSpec('jwt', 'jwtServer.py', 'run_jwt_scan', module='jwt'), ToolSpec('interactsh', 'interactshServer.py', 'run_interactsh_client', 'interactsh-client', required=False), ToolSpec('report', 'reportServer.py', 'generate_report', module='weasyprint'))
 ALL_TOOLS = (*BASE_TOOLS, ARJUN_TOOL, *PARAMETER_TOOLS, AUTHORIZATION_TOOL, *WORKFLOW_TOOLS, *OPTIONAL_TOOLS)
 TOOL_SCOPES = {'ffuf': 'base', 'zap': 'base', 'nuclei': 'base', 'session': 'base', 'nikto': 'base', 'arjun': 'url', 'sqlmap': 'parameterized', 'dalfox': 'parameterized', 'commix': 'parameterized', 'traversal': 'parameterized', 'idor': 'numeric', 'authorization': 'authorization', 'browser': 'browser', 'workflow': 'workflow', 'jwt': 'jwt', 'interactsh': 'oast'}
-TOOL_DESCRIPTIONS = {'ffuf': 'Hidden resource and endpoint discovery with credential-isolated path fuzzing.',
-    'zap': 'Session-aware crawling, passive analysis and prioritized active testing.',
-    'nuclei': 'Template-based exposure, misconfiguration, known-vulnerability and bounded DAST checks on discovered parameterized URLs.',
-    'session': 'Cookie flags, bounded session uniqueness and fixation indicators.',
-    'nikto': 'Web-server hardening and exposed-resource checks.',
-    'arjun': 'Hidden GET/POST parameter discovery.',
-    'sqlmap': 'SQL-injection confirmation on discovered request contracts.',
-    'dalfox': 'Reflected and stored XSS testing.',
-    'commix': 'Operating-system command-injection testing.',
-    'traversal': 'Path-traversal and local-file-inclusion verification.',
-    'idor': 'Single-reference numeric object differential checks.',
-    'authorization': 'Read-only anonymous and optional two-account authorization differentials on discovered high-value GET requests.',
-    'browser': 'Chromium verification of DOM, reflected and stored XSS using harmless markers.',
-    'workflow': 'Bounded CSRF, upload, authentication-throttling and CAPTCHA workflow checks.',
-    'jwt': 'JWT structure and claim analysis.',
-    'interactsh': 'Out-of-band callback confirmation.'}
+TOOL_DESCRIPTIONS = {'ffuf': 'Hidden resource and endpoint discovery with credential-isolated path fuzzing.', 'zap': 'Session-aware crawling, passive analysis and prioritized active testing.', 'nuclei': 'Template-based exposure, misconfiguration, known-vulnerability and bounded DAST checks on discovered parameterized URLs.', 'session': 'Cookie flags, bounded session uniqueness and fixation indicators.', 'nikto': 'Web-server hardening and exposed-resource checks.', 'arjun': 'Hidden GET/POST parameter discovery.', 'sqlmap': 'SQL-injection confirmation on discovered request contracts.', 'dalfox': 'Reflected and stored XSS testing.', 'commix': 'Operating-system command-injection testing.', 'traversal': 'Path-traversal and local-file-inclusion verification.', 'idor': 'Single-reference numeric object differential checks.', 'authorization': 'Read-only anonymous and optional two-account authorization differentials on discovered high-value GET requests.', 'browser': 'Chromium verification of DOM, reflected and stored XSS using harmless markers.', 'workflow': 'Bounded CSRF, upload, authentication-throttling and CAPTCHA workflow checks.', 'jwt': 'JWT structure and claim analysis.', 'interactsh': 'Out-of-band callback confirmation.'}
 
 def agentic_registry() -> dict[str, tuple[str, str, str, str]]:
     """Expose the deterministic tool catalogue to the AI orchestrator."""
@@ -376,14 +308,15 @@ def _extract_response(response: Any) -> tuple[Any, bool, str]:
 
 def diagnose_error(text: str) -> str:
     lowered = text.lower()
-    rules = ((('no such file', 'not found', 'winerror 2'), 'missing_file_or_executable'),
-        (('no module named', 'modulenotfounderror'), 'missing_python_dependency'),
-        (('connection refused', 'failed to establish'), 'service_unreachable'),
-        (('timed out', 'timeout'), 'timeout'),
-        (('permission denied', 'access is denied'), 'permission_denied'),
-        (('tool not found', 'method not found', 'unknown tool'), 'mcp_tool_name_mismatch'),
-        (('connection closed', 'closedresourceerror', 'end of file'), 'mcp_server_crashed'))
+    rules = ((('no such file', 'not found', 'winerror 2'), 'missing_file_or_executable'), (('no module named', 'modulenotfounderror'), 'missing_python_dependency'), (('connection refused', 'failed to establish'), 'service_unreachable'), (('timed out', 'timeout'), 'timeout'), (('permission denied', 'access is denied'), 'permission_denied'), (('tool not found', 'method not found', 'unknown tool'), 'mcp_tool_name_mismatch'), (('connection closed', 'closedresourceerror', 'end of file'), 'mcp_server_crashed'))
     return next((cause for needles, cause in rules if any((item in lowered for item in needles))), 'scanner_or_mcp_error')
+
+def _result(tool: str, target: str, status: str, output: Any, diagnosis: str='', **extra: Any) -> dict[str, Any]:
+    result = {'tool': tool, 'status': status, 'target': target, 'output': output, 'vulnerabilities': []}
+    if diagnosis:
+        result['diagnosis'] = diagnosis
+    result.update(extra)
+    return result
 
 def _finding_counts(result: dict[str, Any]) -> tuple[int, int, int]:
     findings = [item for item in result.get('vulnerabilities') or [] if isinstance(item, dict)]
@@ -422,7 +355,7 @@ def _normalize_result(data: Any, spec: ToolSpec, target: str, elapsed: float, is
     if isinstance(data, dict):
         result = dict(data)
     else:
-        result = {'tool': spec.name, 'status': 'error' if is_error else 'success', 'target': target, 'output': data if isinstance(data, str) else json.dumps(data, ensure_ascii=False, default=str), 'vulnerabilities': []}
+        result = _result(spec.name, target, 'error' if is_error else 'success', data if isinstance(data, str) else json.dumps(data, ensure_ascii=False, default=str))
     result.setdefault('tool', spec.name)
     result.setdefault('target', target)
     result.setdefault('output', '')
@@ -440,7 +373,7 @@ async def call_mcp(server_file: str, tool_name: str, arguments: dict[str, Any], 
     target = str(arguments.get('target_url', ''))
     started = time.monotonic()
     if not server.is_file():
-        return {'tool': spec.name, 'status': 'error', 'target': target, 'output': f'MCP server not found: {server}', 'vulnerabilities': [], 'diagnosis': 'missing_mcp_server_file'}
+        return _result(spec.name, target, 'error', f'MCP server not found: {server}', 'missing_mcp_server_file')
     effective_arguments = dict(arguments)
     temporary_output: Path | None = None
     if spec.name == 'nuclei' and (not effective_arguments.get('output_file')):
@@ -470,21 +403,13 @@ async def call_mcp(server_file: str, tool_name: str, arguments: dict[str, Any], 
         exception_text = f'{type(exc).__name__}: {exc}'
         exception_diagnosis = diagnose_error(exception_text)
         if exception_diagnosis == 'timeout':
-            result = {'tool': spec.name, 'status': 'partial',
-                'target': target,
-                'output': f'{spec.name} reached the orchestrator/MCP HTTP time budget. Coverage is incomplete; this is not classified as a scanner error.',
-                'vulnerabilities': [],
-                'diagnosis': 'time_limit_reached',
-                'timed_out': True,
-                'time_limit_reached': True,
-                'traceback': traceback.format_exc(),
-                '_meta': {'server': str(server), 'duration_seconds': round(time.monotonic() - started, 3), 'mcp_transport': 'streamable_http', 'mcp_url': mcp_http_url(spec.name)}}
+            result = _result(spec.name, target, 'partial', f'{spec.name} reached the orchestrator/MCP HTTP time budget. Coverage is incomplete; this is not classified as a scanner error.', 'time_limit_reached', timed_out=True, time_limit_reached=True, traceback=traceback.format_exc(), _meta={'server': str(server), 'duration_seconds': round(time.monotonic() - started, 3), 'mcp_transport': 'streamable_http', 'mcp_url': mcp_http_url(spec.name)})
         else:
             detail = _server_startup_log(spec)
             message = f'MCP HTTP communication failed: {exception_text}'
             if detail:
                 message += f' | server log: {detail}'
-            result = {'tool': spec.name, 'status': 'error', 'target': target, 'output': message, 'vulnerabilities': [], 'diagnosis': diagnose_error(message), 'traceback': traceback.format_exc(), '_meta': {'server': str(server), 'duration_seconds': round(time.monotonic() - started, 3), 'mcp_transport': 'streamable_http', 'mcp_url': mcp_http_url(spec.name)}}
+            result = _result(spec.name, target, 'error', message, diagnose_error(message), traceback=traceback.format_exc(), _meta={'server': str(server), 'duration_seconds': round(time.monotonic() - started, 3), 'mcp_transport': 'streamable_http', 'mcp_url': mcp_http_url(spec.name)})
     finally:
         if temporary_output:
             temporary_output.unlink(missing_ok=True)
@@ -824,8 +749,11 @@ def refresh_authenticated_session_state(target: str, cookies: str, probe_url: st
     preparation = apply_runtime_target_preparation(target, cookies)
     selected_probe = probe_url or target
     probe = scanner_session_probe(selected_probe, cookies, timeout=10, attempts=3)
-    usable = not (probe.get('conclusive') is True and probe.get('authenticated') is False) and preparation.get('usable', True) is not False
-    return {'performed': True, 'authenticated': probe.get('authenticated'), 'conclusive': probe.get('conclusive'), 'preparation': preparation, 'probe': probe, 'usable': usable}
+    probe_invalid = probe.get('conclusive') is True and probe.get('authenticated') is False
+    prep_invalid = preparation.get('conclusive', True) is True and preparation.get('usable', True) is False
+    usable = not (probe_invalid or prep_invalid)
+    conclusive = bool(probe_invalid or prep_invalid or probe.get('conclusive') is True)
+    return {'performed': True, 'authenticated': probe.get('authenticated'), 'conclusive': conclusive, 'preparation': preparation, 'probe': probe, 'usable': usable, 'transient_error': bool(probe.get('transient_error') or preparation.get('transient_error'))}
 
 def _client_side_source_sink_evidence(text: str) -> tuple[list[str], list[str]]:
     """Return generic JavaScript-controlled sources and dangerous DOM sinks."""
@@ -992,34 +920,12 @@ def discover_target(target: str, cookies: str, max_pages: int=MAX_CRAWL_PAGES, s
                 auth_effective = True
             else:
                 auth_effective = None
-            auth_probe = {'url': probe_url,
-                'status': probe_response.status_code,
-                'final_url': str(probe_response.url),
-                'login_detected': final_login_detected,
-                'anonymous_status': anonymous_response.status_code,
-                'anonymous_final_url': str(anonymous_response.url),
-                'anonymous_login_detected': anonymous_login_detected,
-                'authenticated_redirect_guard': probe_redirect_issue,
-                'anonymous_redirect_guard': anonymous_redirect_issue,
-                'authenticated_distinguished_from_anonymous': True if clear_anonymous_difference else None}
+            auth_probe = {'url': probe_url, 'status': probe_response.status_code, 'final_url': str(probe_response.url), 'login_detected': final_login_detected, 'anonymous_status': anonymous_response.status_code, 'anonymous_final_url': str(anonymous_response.url), 'anonymous_login_detected': anonymous_login_detected, 'authenticated_redirect_guard': probe_redirect_issue, 'anonymous_redirect_guard': anonymous_redirect_issue, 'authenticated_distinguished_from_anonymous': True if clear_anonymous_difference else None}
         except requests.RequestException as exc:
             auth_effective = None
             auth_probe = {'url': probe_url, 'error': f'{type(exc).__name__}: {exc}', 'conclusive': False}
         auth_note = 'The supplied cookie was distinguished from the anonymous response.' if auth_effective is True else 'The supplied cookie reached a login or authorization failure page.' if auth_effective is False else 'The supplied cookie remained usable, but this target did not expose a conclusive anonymous/authenticated distinction.'
-    return {'urls': sorted(visited),
-        'html_urls': sorted(html_urls),
-        'form_urls': sorted(form_urls),
-        'parameterized_urls': sorted(parameterized),
-        'request_cases': _dedupe_request_cases(request_cases),
-        'script_urls': sorted(script_urls),
-        'client_side_candidates': client_side_candidates,
-        'jwt_tokens': sorted(tokens),
-        'errors': errors,
-        'authentication_effective': auth_effective,
-        'authentication_note': auth_note,
-        'authentication_probe': auth_probe,
-        'target_preparation': target_preparation,
-        'destructive_urls_skipped': sorted(destructive_skipped)}
+    return {'urls': sorted(visited), 'html_urls': sorted(html_urls), 'form_urls': sorted(form_urls), 'parameterized_urls': sorted(parameterized), 'request_cases': _dedupe_request_cases(request_cases), 'script_urls': sorted(script_urls), 'client_side_candidates': client_side_candidates, 'jwt_tokens': sorted(tokens), 'errors': errors, 'authentication_effective': auth_effective, 'authentication_note': auth_note, 'authentication_probe': auth_probe, 'target_preparation': target_preparation, 'destructive_urls_skipped': sorted(destructive_skipped)}
 
 def merge_discovery(left: dict[str, Any], right: dict[str, Any]) -> dict[str, Any]:
     merged = dict(left)
@@ -1634,7 +1540,7 @@ def enrich_discovery_with_ffuf(discovery: dict[str, Any], result: dict[str, Any]
     return (updated, urls)
 
 def make_skipped_result(tool: str, target: str, reason: str) -> dict[str, Any]:
-    return {'tool': tool, 'status': 'skipped', 'target': target, 'output': reason, 'vulnerabilities': [], 'diagnosis': 'not_applicable'}
+    return _result(tool, target, 'skipped', reason, 'not_applicable')
 
 def log_zap_session_diagnostics(result: dict[str, Any]) -> None:
     diagnostics = result.get('session_diagnostics') if isinstance(result.get('session_diagnostics'), dict) else {}
@@ -1648,24 +1554,12 @@ def log_zap_session_diagnostics(result: dict[str, Any]) -> None:
             return
         policy = result.get('active_scanner_policy') if isinstance(result.get('active_scanner_policy'), dict) else {}
         stats = result.get('zap_alert_stats') if isinstance(result.get('zap_alert_stats'), dict) else {}
-        print(f"    [ZAP COVERAGE] seeded URLs={result.get('seeded_urls',
-            0)}; seeded requests={result.get('seeded_request_cases',
-            0)}; targeted active={result.get('targeted_active_scans_completed',
-            0)}/{result.get('targeted_active_scans_started',
-            0)}; configured rules={result.get('active_rules_attempted',
-            0)}/{result.get('active_rules_planned',
-            0)} ({result.get('active_rule_coverage_percent',
-            0)}%); completed-rule coverage={result.get('active_rules_completed',
-            0)}/{result.get('active_rules_planned',
-            0)} ({result.get('active_rule_effective_coverage_percent',
-            0)}%); critical cases={result.get('critical_targeted_scans_completed',
-            0)}/{result.get('critical_targeted_scans_started',
-            0)}; proxy confirmed={result.get('proxy_assisted_confirmed',
-            0)}; native security alerts={stats.get('security',
-            0)}; site-tree URLs={result.get('zap_sites_tree_urls',
-            0)}")
+        print(f"    [ZAP COVERAGE] seeded URLs={result.get('seeded_urls', 0)}; seeded requests={result.get('seeded_request_cases', 0)}; targeted active={result.get('targeted_active_scans_completed', 0)}/{result.get('targeted_active_scans_started', 0)}; configured rules={result.get('active_rules_attempted', 0)}/{result.get('active_rules_planned', 0)} ({result.get('active_rule_coverage_percent', 0)}%); completed-rule coverage={result.get('active_rules_completed', 0)}/{result.get('active_rules_planned', 0)} ({result.get('active_rule_effective_coverage_percent', 0)}%); critical cases={result.get('critical_targeted_scans_completed', 0)}/{result.get('critical_targeted_scans_started', 0)}; proxy confirmed={result.get('proxy_assisted_confirmed', 0)}; native security alerts={stats.get('security', 0)}; site-tree URLs={result.get('zap_sites_tree_urls', 0)}")
         if policy:
             print('    [ZAP ACTIVE POLICY] first-tier rule IDs=' + (', '.join(policy.get('enabled_ids', [])) or 'none'))
+        deferred = result.get('deferred_native_active_cases') if isinstance(result.get('deferred_native_active_cases'), list) else []
+        if deferred:
+            print('    [ZAP ACTIVE POLICY] deferred in balanced/prioritized: ' + ', '.join((str(item.get('case_class') or item.get('url') or '') for item in deferred if isinstance(item, dict))))
         plan = result.get('prioritized_native_plan') if isinstance(result.get('prioritized_native_plan'), dict) else {}
         for phase in plan.get('phases', []):
             if not isinstance(phase, dict):
@@ -1745,34 +1639,13 @@ def log_result(profile: str, name: str, result: dict[str, Any], target: str='') 
                 continue
             print(f"    [NUCLEI PHASE] {phase.get('name', 'unknown')}: status={phase.get('status', 'unknown')}; findings={phase.get('findings', 0)}; budget={phase.get('timeout_seconds', 0)}s; input={phase.get('input_mode') or 'list'}; aggression={phase.get('fuzz_aggression') or 'n/a'}; scope={phase.get('target_scope') or 'focused'}")
             if phase.get('template_batch_recovery'):
-                print(f"    [NUCLEI RECOVERY] completed exact templates={phase.get('completed_template_count',
-                    0)}; exact rejected={phase.get('invalid_template_count',
-                    0)}; engine tag fallback={phase.get('engine_tag_fallback_success',
-                    False)}; global matchers={phase.get('global_matcher_template_count',
-                    0)}; global matchers enabled={phase.get('global_matchers_enabled',
-                    False)}; runtime failures={len(phase.get('runtime_template_failures') or [])}; timed out={len(phase.get('timed_out_templates') or [])}")
+                print(f"    [NUCLEI RECOVERY] completed exact templates={phase.get('completed_template_count', 0)}; exact rejected={phase.get('invalid_template_count', 0)}; engine tag fallback={phase.get('engine_tag_fallback_success', False)}; global matchers={phase.get('global_matcher_template_count', 0)}; global matchers enabled={phase.get('global_matchers_enabled', False)}; runtime failures={len(phase.get('runtime_template_failures') or [])}; timed out={len(phase.get('timed_out_templates') or [])}")
         if not total:
             print('    [NUCLEI RESULT] No template matcher completed with positive evidence. This does not mean the target is clean; inspect phase status, DAST input count, template inventory and time-limit diagnostics above.')
     if name == 'nikto':
         metrics = result.get('scan_metrics') if isinstance(result.get('scan_metrics'), dict) else {}
         structured = result.get('structured_report') if isinstance(result.get('structured_report'), dict) else {}
-        print(f"    [NIKTO COVERAGE] mode={result.get('execution_mode',
-            'unknown')}; requests={metrics.get('requests',
-            0)}; reported={metrics.get('items_reported',
-            0)}; hosts={metrics.get('hosts_tested',
-            0)}; parsed unique={len(result.get('vulnerabilities') or [])}; raw parsed={result.get('raw_parsed_findings',
-            len(result.get('vulnerabilities') or []))}; cross-source duplicates removed={result.get('cross_source_duplicates_removed',
-            0)}; parser count consistent={result.get('parser_count_consistent',
-            True)}; report copied={structured.get('copied',
-            False)}; report bytes={structured.get('bytes',
-            0)}; console fallback={structured.get('console_only',
-            False)}; coverage verified={result.get('coverage_verified',
-            False)}; zero verified={result.get('zero_result_verified',
-            False)}; profile={result.get('scan_profile',
-            'unknown')}; plugins={result.get('plugins',
-            'unknown')}; tuning={result.get('safe_tuning',
-            'unknown')}; cgi_dirs={result.get('cgi_dirs',
-            'unknown')}")
+        print(f"    [NIKTO COVERAGE] mode={result.get('execution_mode', 'unknown')}; requests={metrics.get('requests', 0)}; reported={metrics.get('items_reported', 0)}; hosts={metrics.get('hosts_tested', 0)}; parsed unique={len(result.get('vulnerabilities') or [])}; raw parsed={result.get('raw_parsed_findings', len(result.get('vulnerabilities') or []))}; cross-source duplicates removed={result.get('cross_source_duplicates_removed', 0)}; parser count consistent={result.get('parser_count_consistent', True)}; report copied={structured.get('copied', False)}; report bytes={structured.get('bytes', 0)}; console fallback={structured.get('console_only', False)}; coverage verified={result.get('coverage_verified', False)}; zero verified={result.get('zero_result_verified', False)}; profile={result.get('scan_profile', 'unknown')}; plugins={result.get('plugins', 'unknown')}; tuning={result.get('safe_tuning', 'unknown')}; cgi_dirs={result.get('cgi_dirs', 'unknown')}")
         retry = result.get('structured_retry') if isinstance(result.get('structured_retry'), dict) else {}
         if retry.get('used'):
             print('    [NIKTO FALLBACK] Structured CSV output was not writable; Nikto was automatically rerun in console-summary mode.')

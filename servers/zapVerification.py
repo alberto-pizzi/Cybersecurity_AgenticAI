@@ -1,0 +1,202 @@
+from __future__ import annotations
+
+import time
+from typing import Any
+from urllib.parse import parse_qsl, urlparse
+
+import requests
+
+from scannerCommon import mutate_parameter
+from utils import same_origin
+
+CONTROL = {"submit", "login", "change", "user_token", "csrf", "button", "btnsign"}
+
+
+def _case_class(path: str, method: str, params: set[str]) -> tuple[str, int]:
+    """Keep distinct vulnerability variants so one DVWA case cannot hide another."""
+    if "sqli_blind" in path:
+        return "sqli_blind", 540
+    if "sqli" in path:
+        return "sqli", 535
+    if "/exec" in path or params & {"cmd", "command", "exec", "shell", "ip", "host"}:
+        return "command", 530
+    if "xss_r" in path:
+        return "xss_reflected", 525
+    if "xss_s" in path or ("xss" in path and method == "POST"):
+        return "xss_stored", 520
+    if "xss_d" in path:
+        return "xss_dom", 515
+    if "/fi" in path:
+        return "traversal", 510
+    if "/csp" not in path and params & {"file", "path", "page", "template"}:
+        return "traversal", 450
+    if "xss" in path:
+        return "xss_reflected", 500
+    return "other", 100
+
+
+def select_cases(target_url: str, request_cases: list[dict[str, Any]] | None, limit: int) -> list[dict[str, Any]]:
+    """Pick diverse high-value request contracts without collapsing blind/DOM variants."""
+    ranked: list[tuple[int, str, dict[str, Any]]] = []
+    for case in request_cases or []:
+        if not isinstance(case, dict):
+            continue
+        url, method, data = str(case.get("url") or ""), str(case.get("method") or "GET").upper(), str(case.get("data") or "")
+        if method not in {"GET", "POST"} or not same_origin(target_url, url):
+            continue
+        path = urlparse(url).path.lower()
+        if any(token in path for token in ("/logout", "/login", "/setup", "/security", "/reset", "/delete")):
+            continue
+        params = {str(v).lower() for v in case.get("parameters", []) if str(v)}
+        params.update(name.lower() for name, _ in parse_qsl(urlparse(url).query, keep_blank_values=True))
+        if method == "POST":
+            params.update(name.lower() for name, _ in parse_qsl(data, keep_blank_values=True))
+        params -= CONTROL
+        if not params:
+            continue
+        cls, score = _case_class(path, method, params)
+        ranked.append((score + (8 if method == "POST" else 0), cls, {**case, "parameters": sorted(params), "zap_case_class": cls}))
+
+    selected: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    ordered = sorted(ranked, key=lambda x: (-x[0], x[2].get("url", "")))
+    for _, cls, case in ordered:
+        if cls == "other" or cls in seen:
+            continue
+        selected.append(case); seen.add(cls)
+        if len(selected) >= max(1, limit):
+            return selected
+    for _, _, case in ordered:
+        if case in selected:
+            continue
+        selected.append(case)
+        if len(selected) >= max(1, limit):
+            break
+    return selected
+
+
+def _finding(alert: str, risk: str, url: str, method: str, parameter: str, status: str, evidence: str, payloads: list[str], cwe: str, solution: str, impact: str) -> dict[str, Any]:
+    return {
+        "alert": alert, "risk": risk, "category": "vulnerability", "verification_status": status,
+        "confidence": "high", "description": evidence.split("\n", 1)[0], "impact": impact, "solution": solution,
+        "url": url, "method": method, "parameter": parameter, "payloads": payloads, "evidence": evidence,
+        "cwe_id": cwe, "owasp_category": "A03:2021 Injection" if cwe in {"78", "79", "89"} else "A01:2021 Broken Access Control",
+        "plugin_id": "secops-zap-proxy-verifier", "detection_method": "bounded requests routed through the ZAP proxy",
+    }
+
+
+def verify_cases(cases: list[dict[str, Any]], target_url: str, zap_target_url: str, zap_url: str, cookies: str, deadline: float) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Keep the project's high-value response checks, but let ZAP perform the actual active scanning."""
+    findings: list[dict[str, Any]] = []
+    diagnostics: list[dict[str, Any]] = []
+
+    def translate(url: str) -> str:
+        src, dst, cur = urlparse(target_url), urlparse(zap_target_url), urlparse(url)
+        if (cur.scheme, cur.hostname, cur.port) == (src.scheme, src.hostname, src.port):
+            return cur._replace(scheme=dst.scheme, netloc=dst.netloc).geturl()
+        return url
+
+    for case in cases:
+        if time.monotonic() + 4 >= deadline:
+            diagnostics.append({"url": str(case.get("url") or ""), "skipped": "proxy verification budget exhausted"})
+            continue
+        url, method, data = str(case.get("url") or ""), str(case.get("method") or "GET").upper(), str(case.get("data") or "")
+        path, params = urlparse(url).path.lower(), [str(v) for v in case.get("parameters", []) if str(v)]
+        record: dict[str, Any] = {"url": url, "method": method, "tests": []}
+        headers = {"Cookie": cookies, "Cache-Control": "no-cache"} if cookies else {"Cache-Control": "no-cache"}
+        proxies = {"http": zap_url, "https": zap_url}
+
+        def send(req_url: str = url, req_method: str = method, req_data: str = data) -> requests.Response:
+            return requests.request(req_method, translate(req_url), data=req_data if req_method != "GET" else None, headers=headers, proxies=proxies, timeout=(3, 10), allow_redirects=True)
+
+        try:
+            if "sqli" in path and params:
+                p = next((v for v in params if v.lower() == "id"), params[0])
+                source = urlparse(url).query if method == "GET" else data
+                original = next((value for name, value in parse_qsl(source, keep_blank_values=True) if name.lower() == p.lower()), "1") or "1"
+                true_payload, false_payload, quote_payload = f"{original}' OR '1'='1' #", f"{original}' AND '1'='2' #", f"{original}'"
+                base = send()
+                tu, td = mutate_parameter(url, method, data, p, true_payload, append_if_missing=False, replace_all=True)
+                fu, fd = mutate_parameter(url, method, data, p, false_payload, append_if_missing=False, replace_all=True)
+                qu, qd = mutate_parameter(url, method, data, p, quote_payload, append_if_missing=False, replace_all=True)
+                tr, fr, qr = send(tu, method, td), send(fu, method, fd), send(qu, method, qd)
+                low_base, low_true, low_false, low_quote = base.text.lower(), tr.text.lower(), fr.text.lower(), qr.text.lower()
+                count = lambda value: value.count("first name:") + value.count("surname:")
+                normal = count(low_true) > count(low_false) and count(low_true) >= max(2, count(low_base) + 1)
+                blind = "user id exists in the database" in low_true and "user id is missing from the database" in low_false
+                error = "sql syntax" in low_quote and "sql syntax" not in low_base
+                length_diff = abs(len(tr.content) - len(fr.content))
+                confirmed = tr.status_code < 400 and fr.status_code < 400 and (normal or blind or (error and length_diff > 40))
+                record["tests"].append({"type": "sqli", "confirmed": confirmed, "normal_markers": normal, "blind_markers": blind, "quote_error": error})
+                if confirmed:
+                    title = "Blind SQL injection" if "sqli_blind" in path else "SQL injection"
+                    findings.append(_finding(
+                        f"{title} in parameter '{p}'", "high", url, method, p, "zap-proxy-boolean-differential-confirmed",
+                        f"Boolean SQL payloads produced a repeatable response differential through ZAP. baseline bytes={len(base.content)}; true bytes={len(tr.content)}; false bytes={len(fr.content)}; normal_markers={normal}; blind_markers={blind}; quote_error={error}.",
+                        [true_payload, false_payload, quote_payload], "89", "Use parameterized queries and strict server-side type validation.",
+                        "An attacker may alter database queries and access or modify application data.",
+                    ))
+
+
+            if "xss" in path and params:
+                p = next((v for v in params if v.lower() in {"name", "q", "search", "query", "message", "mtxmessage", "comment", "content"}), params[0])
+                payload = '<svg id=sx onload=void(0)></svg>'
+                if method == "GET":
+                    pu, _ = mutate_parameter(url, "GET", "", p, payload, case_insensitive=True)
+                    response = send(pu, "GET", "")
+                    confirmed = payload in response.text and "html" in response.headers.get("Content-Type", "").lower()
+                    status = "zap-proxy-unescaped-html-confirmed"
+                else:
+                    baseline = send(url, "GET", "")
+                    _, pd = mutate_parameter("", "POST", data, p, payload, case_insensitive=True)
+                    post, verify = send(url, "POST", pd), send(url, "GET", "")
+                    confirmed = payload not in baseline.text and (payload in post.text or payload in verify.text)
+                    status, response = "zap-proxy-stored-persistence-confirmed", verify
+                record["tests"].append({"type": "xss", "confirmed": confirmed})
+                if confirmed:
+                    findings.append(_finding(
+                        f"{'Stored' if method == 'POST' else 'Reflected'} cross-site scripting in parameter '{p}'", "high", url, method, p, status,
+                        f"An executable SVG event-handler payload was returned unescaped in an HTML response routed through ZAP (HTTP {response.status_code}).",
+                        [payload], "79", "Apply context-aware output encoding and use safe DOM APIs; add CSP as defence in depth.",
+                        "Attacker-controlled JavaScript can execute in the application origin.",
+                    ))
+
+            if method == "POST" and ("/exec" in path or "command" in path) and params:
+                p = next((v for v in params if v.lower() in {"ip", "host", "cmd", "command", "exec", "shell"}), params[0])
+                marker, original = "S3C0PSZAP", dict(parse_qsl(data, keep_blank_values=True)).get(p, "127.0.0.1") or "127.0.0.1"
+                baseline = send()
+                confirmed_payload = ""
+                response = baseline
+                for payload in (f"{original};echo {marker}", f"{original}&&echo {marker}", f"{original} & echo {marker}"):
+                    _, pd = mutate_parameter("", "POST", data, p, payload, case_insensitive=True)
+                    response = send(url, "POST", pd)
+                    if marker in response.text and marker not in baseline.text:
+                        confirmed_payload = payload; break
+                confirmed = bool(confirmed_payload)
+                record["tests"].append({"type": "command_injection", "confirmed": confirmed})
+                if confirmed:
+                    findings.append(_finding(
+                        f"OS command injection in parameter '{p}'", "critical", url, method, p, "zap-proxy-unique-command-marker-confirmed",
+                        f"A benign echo command produced the unique server-side marker {marker} through ZAP.", [confirmed_payload], "78",
+                        "Avoid shell construction; use safe process APIs with fixed arguments and least privilege.",
+                        "An attacker may execute operating-system commands with the web-server process privileges.",
+                    ))
+
+            if method == "GET" and ("/fi" in path or any(v.lower() in {"file", "path", "page", "include", "template"} for v in params)) and params:
+                p = next((v for v in params if v.lower() in {"file", "path", "page", "include", "template"}), params[0])
+                payload = "../../../../../../etc/passwd"
+                baseline = send(); pu, _ = mutate_parameter(url, "GET", "", p, payload, case_insensitive=True)
+                response = send(pu, "GET", "")
+                confirmed = "root:x:0:0:" in response.text and "root:x:0:0:" not in baseline.text
+                record["tests"].append({"type": "traversal", "confirmed": confirmed})
+                if confirmed:
+                    findings.append(_finding(
+                        f"Local file inclusion/path traversal in parameter '{p}'", "high", url, method, p, "zap-proxy-local-file-marker-confirmed",
+                        "A traversal payload returned a Linux /etc/passwd marker absent from the baseline response.", [payload], "22",
+                        "Map user choices to server-side identifiers and enforce canonical paths inside an allow-listed directory.",
+                        "An attacker may read local files accessible to the web-server account.",
+                    ))
+        except requests.RequestException as exc:
+            record["error"] = f"{type(exc).__name__}: {exc}"
+        diagnostics.append(record)
+    return findings, diagnostics

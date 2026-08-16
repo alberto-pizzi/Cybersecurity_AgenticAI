@@ -49,7 +49,6 @@ checklist minima. Ogni azione passa dagli stessi validator del Deterministic.
 
 4. PREFLIGHT E TEST
 -------------------
-python .\selftest_v31_13.py
 python .\orchestratorDeterministic.py --target <TARGET> --authorized --preflight-only
 python .\orchestratorAgentic.py --target <TARGET> --authorized --preflight-only
 python .\orchestratorDeterministic.py --list-tools

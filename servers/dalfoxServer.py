@@ -3,19 +3,16 @@ from __future__ import annotations
 import re
 import tempfile
 from pathlib import Path
-from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
+from urllib.parse import parse_qsl, urlencode
 
 import requests
 from typing import Any
 
-from fastmcp import FastMCP
+from utils import parse_cookie_header, partial, read_json_lines, response_excerpt, run_process, scanner_session_probe, success
 
-from utils import partial, read_json_lines, response_excerpt, run_process, scanner_session_probe, success
+from scannerCommon import mutate_parameter, process_text, request_retry, service
 
-from utils import run_mcp_http
-
-mcp = FastMCP("Dalfox Scanner")
-
+mcp, _serve = service("Dalfox Scanner", "dalfox")
 
 def _text_findings(text: str, target_url: str, method: str) -> list[dict[str, Any]]:
     verified = [line.strip() for line in text.splitlines() if re.search(r"\[V\]|verified", line, re.I)]
@@ -23,36 +20,27 @@ def _text_findings(text: str, target_url: str, method: str) -> list[dict[str, An
     findings: list[dict[str, Any]] = []
     if verified:
         findings.append({
-            "alert": "Verified cross-site scripting",
-            "risk": "high",
-            "category": "vulnerability",
-            "verification_status": "dalfox-verified-vector",
+            "alert": "Verified cross-site scripting", "risk": "high",
+            "category": "vulnerability", "verification_status": "dalfox-verified-vector",
             "description": f"Dalfox reported a verified executable XSS vector in an HTTP {method} input.",
             "impact": "The verified vector can execute attacker-controlled JavaScript in a victim browser within the affected origin.",
             "solution": "Apply context-aware output encoding at the affected sink, validate the input server-side, use safe DOM APIs, and add an effective Content Security Policy as defence in depth.",
-            "url": target_url,
-            "method": method,
-            "confidence": "high",
-            "technical_details": "Dalfox text output contained a verified-vector marker.",
+            "url": target_url, "method": method,
+            "confidence": "high", "technical_details": "Dalfox text output contained a verified-vector marker.",
             "evidence": "\n".join(verified[:30]),
         })
     if candidates and not verified:
         findings.append({
-            "alert": "Potential cross-site scripting reflection",
-            "risk": "medium",
-            "category": "candidate",
-            "verification_status": "reflection-or-poc-needs-validation",
+            "alert": "Potential cross-site scripting reflection", "risk": "medium",
+            "category": "candidate", "verification_status": "reflection-or-poc-needs-validation",
             "description": f"Dalfox reported a reflection or proof-of-concept candidate in an HTTP {method} input, but did not mark it as a verified executable vector.",
             "impact": "No browser execution was confirmed. Manual validation is required to determine whether the reflection reaches an executable HTML, attribute, JavaScript, or URL context.",
             "solution": "Review the reflected context, apply context-aware encoding, validate the input, and retest with a browser-based proof of execution.",
-            "url": target_url,
-            "method": method,
-            "confidence": "medium",
+            "url": target_url, "method": method, "confidence": "medium",
             "technical_details": "Dalfox text output contained a POC/reflection marker without a verified-vector marker.",
             "evidence": "\n".join(candidates[:30]),
         })
     return findings
-
 
 def _json_findings(path: Path, target_url: str, method: str) -> list[dict[str, Any]]:
     if not path.is_file():
@@ -65,9 +53,7 @@ def _json_findings(path: Path, target_url: str, method: str) -> list[dict[str, A
         severity = str(item.get("severity", "high" if finding_type == "V" else "medium")).lower()
         category = "vulnerability" if finding_type == "V" else "candidate"
         findings.append({
-            "alert": str(item.get("type_description") or "Cross-site scripting"),
-            "risk": severity,
-            "category": category,
+            "alert": str(item.get("type_description") or "Cross-site scripting"), "risk": severity, "category": category,
             "verification_status": "dalfox-verified-vector" if finding_type == "V" else "reflection-or-ast-candidate",
             "description": (
                 "Dalfox verified an executable XSS vector."
@@ -76,47 +62,18 @@ def _json_findings(path: Path, target_url: str, method: str) -> list[dict[str, A
             ),
             "impact": "Successful XSS can execute attacker-controlled JavaScript in a victim browser session.",
             "solution": "Apply context-aware output encoding at the affected sink, validate the input server-side, use safe DOM APIs, and deploy Content Security Policy as defence in depth.",
-            "url": str(item.get("data") or target_url),
-            "method": str(item.get("method") or method),
-            "parameter": str(item.get("param") or ""),
-            "confidence": "high" if finding_type == "V" else "medium",
-            "inject_type": str(item.get("inject_type") or ""),
-            "payload": str(item.get("payload") or "")[:1500],
-            "evidence": str(item.get("evidence") or item)[:2500],
-            "cwe": str(item.get("cwe") or ""),
+            "url": str(item.get("data") or target_url), "method": str(item.get("method") or method),
+            "parameter": str(item.get("param") or ""), "confidence": "high" if finding_type == "V" else "medium",
+            "inject_type": str(item.get("inject_type") or ""), "payload": str(item.get("payload") or "")[:1500],
+            "evidence": str(item.get("evidence") or item)[:2500], "cwe": str(item.get("cwe") or ""),
         })
     return findings
 
-
-
-def _http_retry(method: str, url: str, **kwargs: Any) -> requests.Response:
-    import requests as http_requests
-    last: requests.RequestException | None = None
-    for attempt in range(3):
-        try:
-            return http_requests.request(method, url, **kwargs)
-        except (http_requests.Timeout, http_requests.ConnectionError) as exc:
-            last = exc
-            if attempt < 2:
-                import time as _time
-                _time.sleep(0.7 * (attempt + 1))
-        except http_requests.RequestException:
-            raise
-    assert last is not None
-    raise last
-
-
 def _reflection_probe(
-    target_url: str,
-    cookies: str,
-    method: str,
-    data: str,
-    parameters: list[str],
-    allow_state_changes: bool = False,
+    target_url: str, cookies: str, method: str, data: str, parameters: list[str], allow_state_changes: bool = False,
 ) -> dict[str, Any]:
     if not parameters:
         return {"performed": False, "reflected": False, "confirmed": False}
-    import requests as http_requests
     marker = "SECOPS_XSS_7F31"
     payload = f'<svg id="{marker}" onload="void(0)"></svg>'
     priority = ("mtxmessage", "message", "comment", "body", "text", "description", "txtname", "name", "title", "search", "query", "q")
@@ -130,32 +87,20 @@ def _reflection_probe(
         return (0, -len(lowered))
     parameter = max(parameters, key=parameter_score)
     headers = {
-        "Cache-Control": "no-cache",
-        "User-Agent": "SecOps-XSS-Verifier/2.0",
-        "Referer": target_url,
+        "Cache-Control": "no-cache", "User-Agent": "SecOps-XSS-Verifier/2.0", "Referer": target_url,
     }
     if cookies:
         headers["Cookie"] = cookies
     if method == "POST" and not allow_state_changes:
         return {
-            "performed": False, "reflected": False, "confirmed": False,
-            "parameter": parameter, "state_change_skipped": True,
+            "performed": False, "reflected": False, "confirmed": False, "parameter": parameter, "state_change_skipped": True,
         }
     try:
         if method == "GET":
-            parsed = urlparse(target_url)
-            pairs = parse_qsl(parsed.query, keep_blank_values=True)
-            changed, replaced = [], False
-            for name, value in pairs:
-                if not replaced and name.lower() == parameter.lower():
-                    changed.append((name, payload)); replaced = True
-                else:
-                    changed.append((name, value))
-            if not replaced:
-                changed.append((parameter, payload))
-            probe_url = urlunparse(parsed._replace(query=urlencode(changed)))
-            request_data = ""
-            response = _http_retry("GET", probe_url, headers=headers, timeout=(4, 16), allow_redirects=True)
+            probe_url, request_data = mutate_parameter(
+                target_url, method, data, parameter, payload, case_insensitive=True
+            )
+            response = request_retry("GET", probe_url, headers=headers, attempts=3, backoff=0.7, timeout=(4, 16), allow_redirects=True)
             follow_up = None
         else:
             pairs = parse_qsl(data, keep_blank_values=True)
@@ -172,12 +117,11 @@ def _reflection_probe(
                 changed.append((parameter, payload))
             probe_url = target_url
             request_data = urlencode(changed)
-            response = _http_retry(
-                method, target_url, data=request_data, headers=headers,
-                timeout=(4, 16), allow_redirects=True,
+            response = request_retry(
+                method, target_url, data=request_data, headers=headers, attempts=3, backoff=0.7, timeout=(4, 16), allow_redirects=True,
             )
-            follow_up = _http_retry(
-                "GET", target_url, headers=headers, timeout=(4, 16), allow_redirects=True
+            follow_up = request_retry(
+                "GET", target_url, headers=headers, attempts=3, backoff=0.7, timeout=(4, 16), allow_redirects=True
             )
     except requests.RequestException as exc:
         return {
@@ -198,21 +142,15 @@ def _reflection_probe(
     excerpt_source = follow_body if persisted else body
     return {
         "performed": True, "reflected": reflected, "confirmed": confirmed,
-        "stored_confirmed": persisted and confirmed,
-        "parameter": parameter, "marker": marker, "payload": payload,
+        "stored_confirmed": persisted and confirmed, "parameter": parameter, "marker": marker, "payload": payload,
         "status": response.status_code, "final_url": str(response.url),
         "content_type": content_type, "response_bytes": len(response.content),
-        "exact_unescaped_payload": exact and not encoded,
-        "persisted_unescaped_payload": persisted and not encoded,
-        "request_data": request_data,
-        "response_excerpt": response_excerpt(excerpt_source, marker),
+        "exact_unescaped_payload": exact and not encoded, "persisted_unescaped_payload": persisted and not encoded,
+        "request_data": request_data, "response_excerpt": response_excerpt(excerpt_source, marker),
     }
 
-
 def _reflection_finding(
-    target_url: str,
-    method: str,
-    probe: dict[str, Any],
+    target_url: str, method: str, probe: dict[str, Any],
 ) -> list[dict[str, Any]]:
     if not probe.get("reflected"):
         return []
@@ -225,8 +163,7 @@ def _reflection_finding(
             else f"Reflected cross-site scripting in parameter '{parameter}'"
             if confirmed else f"Reflected input candidate in parameter '{parameter}'"
         ),
-        "risk": "high" if confirmed else "medium",
-        "category": "vulnerability" if confirmed else "candidate",
+        "risk": "high" if confirmed else "medium", "category": "vulnerability" if confirmed else "candidate",
         "verification_status": (
             "stored-persistence-unescaped-executable-html-confirmed"
             if confirmed and probe.get("stored_confirmed")
@@ -246,12 +183,8 @@ def _reflection_finding(
         "attack_preconditions": "A victim must follow or submit a request containing the crafted parameter while viewing the response in a browser.",
         "impact": "An attacker can execute JavaScript in the application's origin, access DOM data available to the page, perform authenticated actions as the victim, and alter displayed content.",
         "solution": "Apply context-aware output encoding at every sink, validate input according to business requirements, use safe DOM APIs, and deploy a restrictive Content Security Policy as defence in depth.",
-        "url": target_url,
-        "method": method,
-        "parameter": parameter,
-        "payload": probe.get("payload"),
-        "cwe_id": "79",
-        "owasp_category": "A03:2021 Injection",
+        "url": target_url, "method": method, "parameter": parameter, "payload": probe.get("payload"),
+        "cwe_id": "79", "owasp_category": "A03:2021 Injection",
         "technical_details": (
             f"HTTP {probe.get('status')}; content type={probe.get('content_type')}; "
             f"exact unescaped payload={probe.get('exact_unescaped_payload')}; "
@@ -270,15 +203,6 @@ def _reflection_finding(
         ),
     }]
 
-
-def _looks_like_v3_cli_error(result: dict[str, Any]) -> bool:
-    text = "\n".join(str(result.get(key, "")) for key in ("stdout", "stderr", "output")).lower()
-    return int(result.get("return_code") or 0) == 2 and any(token in text for token in (
-        "unexpected argument", "unrecognized", "unknown command", "found argument 'url'",
-        "invalid value", "usage:",
-    ))
-
-
 def _trim(result: dict[str, Any]) -> dict[str, Any]:
     for key, limit in (("stdout", 8000), ("stderr", 8000)):
         value = str(result.get(key, ""))
@@ -287,84 +211,96 @@ def _trim(result: dict[str, Any]) -> dict[str, Any]:
             result[f"{key}_truncated"] = True
     return result
 
+def _scan_help(target_url: str) -> str:
+    result = run_process(
+        "Dalfox", ["dalfox", "scan", "--help"], target=target_url, timeout=10, accepted_codes=(0, 1, 2),
+    )
+    return process_text(result)
+
+def _legacy_help(target_url: str) -> str:
+    result = run_process(
+        "Dalfox", ["dalfox", "url", "--help"], target=target_url, timeout=10, accepted_codes=(0, 1, 2),
+    )
+    return process_text(result)
+
+
+def _supports(help_text: str, flag: str) -> bool:
+    return flag in help_text
 
 def _run_v3(
-    target_url: str,
-    cookies: str,
-    method: str,
-    data: str,
-    parameters: list[str],
-    timeout: int,
-    output_file: Path,
+    target_url: str, cookies: str, method: str, data: str, parameters: list[str], timeout: int, output_file: Path, help_text: str,
 ) -> dict[str, Any]:
-    scan_timeout = max(15, min(30, timeout - 10))
-    command = [
-        "dalfox", "scan", target_url,
-        "--format", "jsonl",
-        "--output", str(output_file),
-        "--no-color", "--silence",
-        "--skip-mining",
-        "--workers", "15",
-        "--max-payloads-per-param", "12",
-        "--timeout", "3",
-        "--scan-timeout", str(scan_timeout),
-    ]
+    command = ["dalfox", "scan", target_url, "--format", "jsonl", "--output", str(output_file), "--no-color", "--silence"]
+    optional = (("--skip-mining", None), ("--workers", "15"), ("--max-payloads-per-param", "12"), ("--timeout", "3"))
+    for flag, value in optional:
+        if _supports(help_text, flag):
+            command.append(flag)
+            if value is not None:
+                command.append(value)
+    if _supports(help_text, "--scan-timeout"):
+        command.extend(["--scan-timeout", str(max(15, min(30, timeout - 10)))])
+
     location = "query" if method == "GET" else "body"
     for parameter in dict.fromkeys(parameters):
-        command.extend(["-p", f"{parameter}:{location}"])
-    if method != "GET":
-        command.extend(["-X", method])
-    if data:
-        command.extend(["-d", data])
-    if cookies:
-        command.extend(["--cookies", cookies])
-    result = run_process("Dalfox", command, target=target_url, timeout=timeout, accepted_codes=(0, 1))
-    result["dalfox_cli_generation"] = "v3"
-    return _trim(result)
-
-
-def _run_v2(
-    target_url: str,
-    cookies: str,
-    method: str,
-    data: str,
-    parameters: list[str],
-    timeout: int,
-) -> dict[str, Any]:
-    command = [
-        "dalfox", "url", target_url,
-        "--silence", "--skip-bav",
-        "--worker", "10",
-        "--timeout", "5",
-    ]
+        command.extend(["--param", f"{parameter}:{location}"])
     if method != "GET":
         command.extend(["--method", method])
     if data:
         command.extend(["--data", data])
-    for parameter in dict.fromkeys(parameters):
-        command.extend(["-p", parameter])
     if cookies:
-        command.extend(["--cookie", cookies])
+        try:
+            cookie_pairs = parse_cookie_header(cookies)
+        except ValueError:
+            cookie_pairs = []
+        if cookie_pairs:
+            for name, value in cookie_pairs:
+                command.extend(["--cookies", f"{name}={value}"])
+        else:
+            command.extend(["--cookies", cookies])
+    result = run_process("Dalfox", command, target=target_url, timeout=timeout, accepted_codes=(0, 1))
+    result["dalfox_cli_generation"] = "v3"
+    return _trim(result)
+
+def _run_v2(
+    target_url: str, cookies: str, method: str, data: str, parameters: list[str], timeout: int, help_text: str,
+) -> dict[str, Any]:
+    # Legacy Dalfox releases changed several option names. Build only flags
+    # advertised by the installed binary instead of carrying version guesses.
+    command = ["dalfox", "url", target_url]
+    if _supports(help_text, "--silence"):
+        command.append("--silence")
+    if _supports(help_text, "--skip-waf-probe"):
+        command.append("--skip-waf-probe")
+    worker_flag = "--workers" if _supports(help_text, "--workers") else "--worker" if _supports(help_text, "--worker") else ""
+    if worker_flag:
+        command.extend([worker_flag, "10"])
+    if _supports(help_text, "--timeout"):
+        command.extend(["--timeout", "5"])
+    if method != "GET" and _supports(help_text, "--method"):
+        command.extend(["--method", method])
+    if data and _supports(help_text, "--data"):
+        command.extend(["--data", data])
+    param_flag = "--param" if _supports(help_text, "--param") else "-p" if re.search(r"(?m)(?:^|\s)-p(?:[ ,=\s]|$)", help_text) else ""
+    if param_flag:
+        for parameter in dict.fromkeys(parameters):
+            command.extend([param_flag, parameter])
+    cookie_flag = "--cookies" if _supports(help_text, "--cookies") else "--cookie" if _supports(help_text, "--cookie") else ""
+    if cookies and cookie_flag:
+        command.extend([cookie_flag, cookies])
     result = run_process("Dalfox", command, target=target_url, timeout=timeout, accepted_codes=(0, 1))
     result["dalfox_cli_generation"] = "v2"
     return _trim(result)
 
-
 @mcp.tool()
 def run_dalfox_scan(
-    target_url: str,
-    cookies: str = "",
-    method: str = "GET",
-    data: str = "",
-    parameters: list[str] | None = None,
-    timeout: int = 120,
-    allow_state_changes: bool = False,
+    target_url: str, cookies: str = "", method: str = "GET", data: str = "",
+    parameters: list[str] | None = None, timeout: int = 120, allow_state_changes: bool = False,
 ) -> dict:
     """Run a bounded Dalfox scan with automatic v3/v2 CLI compatibility."""
     method = method.upper()
     timeout = max(30, min(int(timeout), 300))
     parameters = [str(value) for value in (parameters or []) if str(value)]
-    session_probe = scanner_session_probe(target_url, cookies, method, data)
+    session_probe = scanner_session_probe(target_url, cookies, method, data, timeout=4, attempts=1)
     if cookies and session_probe.get("performed") and session_probe.get("conclusive") and session_probe.get("authenticated") is False:
         return partial("Dalfox", target_url, "Dalfox was not started because the authenticated request redirected to a login page.", diagnosis="authentication_precheck_failed", timed_out=False, vulnerabilities=[], session_probe=session_probe)
     reflection_probe = _reflection_probe(target_url, cookies, method, data, parameters, allow_state_changes)
@@ -375,35 +311,32 @@ def run_dalfox_scan(
             ("The bounded verifier confirmed stored XSS persistence; the slower Dalfox phase was not required."
              if reflection_probe.get("stored_confirmed") else
              "The bounded response verifier confirmed unescaped executable reflected XSS; the slower Dalfox phase was not required."),
-            vulnerabilities=reflection_findings,
-            xss_found=True,
-            request_method=method,
-            tested_parameters=parameters,
-            authenticated=bool(cookies),
-            session_probe=session_probe,
-            reflection_probe=reflection_probe,
-            execution_mode="direct_unescaped_html_probe",
+            vulnerabilities=reflection_findings, xss_found=True, request_method=method, tested_parameters=parameters,
+            authenticated=bool(cookies), session_probe=session_probe,
+            reflection_probe=reflection_probe, execution_mode="direct_unescaped_html_probe",
         )
     common = {
-        "request_method": method,
-        "request_data_present": bool(data),
-        "tested_parameters": parameters,
-        "authenticated": bool(cookies),
-        "session_probe": session_probe,
-        "reflection_probe": reflection_probe,
+        "request_method": method, "request_data_present": bool(data),
+        "tested_parameters": parameters, "authenticated": bool(cookies),
+        "session_probe": session_probe, "reflection_probe": reflection_probe,
     }
 
     with tempfile.TemporaryDirectory(prefix="dalfox-") as temporary_directory:
         output_file = Path(temporary_directory) / "dalfox.jsonl"
-        result = _run_v3(target_url, cookies, method, data, parameters, timeout, output_file)
-        if _looks_like_v3_cli_error(result):
+        help_text = _scan_help(target_url)
+        use_v3 = all(_supports(help_text, flag) for flag in ("--format", "--output", "--param", "--cookies"))
+        legacy_help = "" if use_v3 else _legacy_help(target_url)
+        result = (
+            _run_v3(target_url, cookies, method, data, parameters, timeout, output_file, help_text)
+            if use_v3 else _run_v2(target_url, cookies, method, data, parameters, timeout, legacy_help)
+        )
+        if result.get("dalfox_cli_generation") == "v3" and int(result.get("return_code") or 0) == 2:
             output_file.unlink(missing_ok=True)
             previous = {
-                "stdout": result.get("stdout", ""),
-                "stderr": result.get("stderr", ""),
-                "return_code": result.get("return_code"),
+                "stdout": result.get("stdout", ""), "stderr": result.get("stderr", ""),
+                "return_code": result.get("return_code"), "command": result.get("command", []),
             }
-            result = _run_v2(target_url, cookies, method, data, parameters, timeout)
+            result = _run_v2(target_url, cookies, method, data, parameters, timeout, _legacy_help(target_url))
             result["compatibility_retry"] = previous
 
         text = "\n".join(str(result.get(key, "")) for key in ("stdout", "stderr", "output"))
@@ -419,16 +352,10 @@ def run_dalfox_scan(
 
         if result.get("diagnosis") == "timeout":
             return partial(
-                "Dalfox", target_url,
-                f"Dalfox reached its configured time budget. Findings preserved: {len(findings)}.",
-                diagnosis="time_limit_reached",
-                timed_out=True,
-                time_limit_reached=True,
-                duration_seconds=result.get("duration_seconds"),
-                stdout=result.get("stdout", ""),
-                stderr=result.get("stderr", ""),
-                command=result.get("command", []),
-                **common,
+                "Dalfox", target_url, f"Dalfox reached its configured time budget. Findings preserved: {len(findings)}.",
+                diagnosis="time_limit_reached", timed_out=True,
+                time_limit_reached=True, duration_seconds=result.get("duration_seconds"),
+                stdout=result.get("stdout", ""), stderr=result.get("stderr", ""), command=result.get("command", []), **common,
             )
         if result.get("status") != "success":
             result.update(common)
@@ -442,14 +369,10 @@ def run_dalfox_scan(
             return result
 
         return success(
-            "Dalfox", target_url,
-            f"Dalfox completed for {method}. Findings: {len(findings)}.",
+            "Dalfox", target_url, f"Dalfox completed for {method}. Findings: {len(findings)}.",
             xss_found=any(item.get("category") == "vulnerability" for item in findings),
-            duration_seconds=result.get("duration_seconds"),
-            command=result.get("command", []),
-            **common,
+            duration_seconds=result.get("duration_seconds"), command=result.get("command", []), **common,
         )
 
-
 if __name__ == "__main__":
-    run_mcp_http(mcp, "dalfox")
+    _serve()

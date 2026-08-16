@@ -3,14 +3,12 @@ from __future__ import annotations
 from datetime import datetime, timezone
 
 import jwt
-from fastmcp import FastMCP
 
 from utils import failure, skipped, success
 
-from utils import run_mcp_http
+from scannerCommon import service
 
-mcp = FastMCP("JWT Analyzer")
-
+mcp, _serve = service("JWT Analyzer", "jwt")
 
 @mcp.tool()
 def run_jwt_scan(jwt_token: str = "", target_url: str = "") -> dict:
@@ -26,10 +24,8 @@ def run_jwt_scan(jwt_token: str = "", target_url: str = "") -> dict:
     algorithm = str(header.get("alg", "")).lower()
     if algorithm == "none":
         findings.append({
-            "alert": "Unsigned JWT algorithm",
-            "risk": "critical",
-            "category": "candidate",
-            "verification_status": "token-structure-only",
+            "alert": "Unsigned JWT algorithm", "risk": "critical",
+            "category": "candidate", "verification_status": "token-structure-only",
             "description": "The observed token declares alg=none. This is unsafe only if the target accepts unsigned tokens; this analyzer did not submit a modified token to the server.",
             "impact": "A verifier that accepts this token may allow attackers to forge arbitrary identities and claims.",
             "solution": "Reject unsigned tokens and enforce an explicit server-side algorithm allow-list.",
@@ -37,10 +33,8 @@ def run_jwt_scan(jwt_token: str = "", target_url: str = "") -> dict:
         })
     if "exp" not in payload:
         findings.append({
-            "alert": "JWT without expiration",
-            "risk": "medium",
-            "category": "candidate",
-            "verification_status": "token-structure-only",
+            "alert": "JWT without expiration", "risk": "medium",
+            "category": "candidate", "verification_status": "token-structure-only",
             "description": "The observed token does not contain an exp claim. This establishes token structure, not the server-side lifetime or revocation policy.",
             "impact": "A stolen token may remain reusable indefinitely unless it is revoked through another mechanism.",
             "solution": "Issue short-lived tokens with exp, rotate signing keys, and support revocation where required.",
@@ -48,10 +42,8 @@ def run_jwt_scan(jwt_token: str = "", target_url: str = "") -> dict:
         })
     elif isinstance(payload.get("exp"), (int, float)) and payload["exp"] < datetime.now(timezone.utc).timestamp():
         findings.append({
-            "alert": "Expired JWT observed",
-            "risk": "info",
-            "category": "observation",
-            "verification_status": "token-structure-only",
+            "alert": "Expired JWT observed", "risk": "info",
+            "category": "observation", "verification_status": "token-structure-only",
             "description": "The observed JWT contains an expiration timestamp that is earlier than the assessment time. The analyzer did not test whether the server rejects it.",
             "impact": "The token should not authorize requests; acceptance would indicate a validation flaw.",
             "solution": "Ensure expiration is always verified by the server.",
@@ -59,12 +51,10 @@ def run_jwt_scan(jwt_token: str = "", target_url: str = "") -> dict:
         })
 
     return success(
-        "JWT Analyzer", target_url,
-        f"JWT decoded without signature verification. Findings: {len(findings)}.",
+        "JWT Analyzer", target_url, f"JWT decoded without signature verification. Findings: {len(findings)}.",
         vulnerabilities=findings, header=header, payload=payload,
         analysis_note="Decoding alone does not prove that the target accepts a modified token.",
     )
 
-
 if __name__ == "__main__":
-    run_mcp_http(mcp, "jwt")
+    _serve()
