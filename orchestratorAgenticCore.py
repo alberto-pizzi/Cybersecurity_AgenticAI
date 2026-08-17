@@ -28,8 +28,8 @@ from orchestratorShared import (
 
 REGISTRY: dict[str, tuple[str, str, str, str]] = {}
 
-# Ollama planning, validation and action execution
 
+# Stores the state exchanged between the agentic workflow steps.
 class AgentState(TypedDict):
     target: str
     profiles: list[dict[str, str]]
@@ -64,6 +64,7 @@ PLAN_SCHEMA = {'type': 'object',
     'properties': {'reasoning_summary': {'type': 'string'}, 'actions': {'type': 'array', 'items': {'type': 'object', 'properties': {'profile': {'type': 'string'}, 'tool': {'type': 'string'}, 'target_url': {'type': 'string'}, 'jwt_token': {'type': 'string'}, 'injection_url': {'type': 'string'}, 'method': {'type': 'string'}, 'data': {'type': 'string'}, 'parameters': {'type': 'array', 'items': {'type': 'string'}}, 'reason': {'type': 'string'}}, 'required': ['profile', 'tool', 'target_url', 'jwt_token', 'injection_url', 'reason']}}, 'finish': {'type': 'boolean'}},
     'required': ['reasoning_summary', 'actions', 'finish']}
 
+# Turns an Ollama error response into a readable message.
 def _ollama_error(response: requests.Response) -> str:
     try:
         payload = response.json()
@@ -73,6 +74,7 @@ def _ollama_error(response: requests.Response) -> str:
         return str(payload.get('error') or payload.get('message') or payload).strip()
     return str(payload)
 
+# Asks Ollama which models are already installed.
 def _ollama_installed_models(ollama_url: str) -> list[str]:
     response = requests.get(f"{ollama_url.rstrip('/')}/api/tags", timeout=(5, 30))
     response.raise_for_status()
@@ -86,6 +88,7 @@ def _ollama_installed_models(ollama_url: str) -> list[str]:
             values.append(value)
     return list(dict.fromkeys(values))
 
+# Model matching accepts the requested Ollama name when a compatible installed tag is available.
 def _model_matches(requested: str, installed: str) -> bool:
     left, right = (requested.lower(), installed.lower())
     if left == right:
@@ -94,8 +97,9 @@ def _model_matches(requested: str, installed: str) -> bool:
         return True
     return False
 
+# Ensures a usable Ollama model is available before planning.
 def ensure_ollama_model(ollama_url: str, requested_model: str, *, allow_pull: bool=True) -> tuple[str, dict[str, Any]]:
-    """Verify Ollama and ensure a usable model exists before planning."""
+
     base = ollama_url.rstrip('/')
     diagnostics: dict[str, Any] = {'ollama_url': base, 'requested_model': requested_model, 'model_pull_attempted': False, 'fallback_model_used': False}
     version = requests.get(f'{base}/api/version', timeout=(5, 20))
@@ -134,14 +138,16 @@ def ensure_ollama_model(ollama_url: str, requested_model: str, *, allow_pull: bo
     diagnostics.update(model_ready=False, selected_model='')
     raise RuntimeError('Ollama is reachable but no usable local model exists. ' + (pull_error or f"Requested model '{requested_model}' is not installed."))
 
+# Plan validation rejects Ollama responses that do not contain the expected action list.
 def _parse_ollama_plan_content(content: str) -> dict[str, Any]:
     value = json.loads(str(content or ''))
     if not isinstance(value, dict) or not isinstance(value.get('actions', []), list):
         raise ValueError('Ollama returned an invalid plan object.')
     return value
 
+# Keeps only the discovery data that the planner needs.
 def compact_discovery_for_planner(discovery: dict[str, dict[str, Any]]) -> dict[str, Any]:
-    """Keep the LLM context bounded without removing actionable requests."""
+
     compact: dict[str, Any] = {}
     for profile, found in discovery.items():
         ranked_cases = select_request_cases(found, limit=36)
@@ -166,8 +172,9 @@ def compact_discovery_for_planner(discovery: dict[str, dict[str, Any]]) -> dict[
             'crawl_errors': [{'url': str(item.get('url', '')), 'error': str(item.get('error', item.get('message', '')))[:300]} for item in found.get('errors', [])[:8] if isinstance(item, dict)]}
     return compact
 
+# Reads the streamed Ollama response and joins its text safely.
 def _ollama_stream_content(url: str, payload: dict[str, Any], *, response_kind: str, total_timeout: int) -> str:
-    """Read a streamed Ollama response so token progress prevents false timeout."""
+
     started = time.monotonic()
     chunks: list[str] = []
     read_timeout = max(90, int(total_timeout) + 30)
@@ -212,15 +219,18 @@ def _ollama_stream_content(url: str, payload: dict[str, Any], *, response_kind: 
         raise ValueError('Ollama completed without returning plan content.')
     return content
 
+# Sends a small request so the model is ready before planning starts.
 def warm_ollama_model(ollama_url: str, model: str, *, timeout: int) -> dict[str, Any]:
-    """Load model weights before discovery so planning starts from a warm model."""
+
     started = time.monotonic()
     content = _ollama_stream_content(f"{ollama_url.rstrip('/')}/api/generate", {'model': model, 'prompt': 'Reply with READY and nothing else.', 'options': {'temperature': 0, 'num_predict': 4, 'num_ctx': 2048}, 'keep_alive': '30m'}, response_kind='generate', total_timeout=max(90, min(int(timeout), 600)))
     return {'ready': True, 'response': content[:80], 'seconds': round(time.monotonic() - started, 2)}
 
+# Builds a stable identifier for one planned action.
 def action_id(action: dict[str, Any]) -> str:
     return '|'.join((str(action.get(key, '')) for key in ('profile', 'tool', 'target_url', 'method', 'data', 'jwt_token', 'injection_url')))
 
+# Asks Ollama for the next scan actions and returns a structured plan.
 def ollama_plan(state: AgentState) -> dict[str, Any]:
     registry = {name: {'scope': values[2], 'description': values[3]} for name, values in REGISTRY.items()}
     eligible = validate_plan(state, discovery_candidate_actions(state))
@@ -261,9 +271,11 @@ def ollama_plan(state: AgentState) -> dict[str, Any]:
             errors.append(f'{kind}: {type(exc).__name__}: {exc}')
     raise RuntimeError('; '.join(errors))
 
+# Keeps a small result summary that is safe to send back to the planner.
 def compact_results(results: dict[str, dict[str, Any]]) -> dict[str, Any]:
     return {profile: {key: {'status': value.get('status'), 'target': value.get('target'), 'findings': len(value.get('vulnerabilities') or []), 'diagnosis': value.get('diagnosis'), 'output': str(value.get('output', ''))[:250]} for key, value in values.items() if isinstance(value, dict)} for profile, values in results.items()}
 
+# Before planning, discovery gathers the real pages, forms, and request cases available on the target.
 def discovery_node(state: AgentState) -> dict[str, Any]:
     print('\n[*] Discovery of anonymous and authenticated surfaces')
     discovery, diagnostics = ({}, list(state['diagnostics']))
@@ -276,8 +288,9 @@ def discovery_node(state: AgentState) -> dict[str, Any]:
             print(f"    [WARNING] {profile['name']}: {found.get('authentication_note')}", file=sys.stderr)
     return {'discovery': discovery, 'diagnostics': diagnostics}
 
+# Discovery evidence is converted into tool actions that the planner can safely choose.
 def discovery_candidate_actions(state: AgentState) -> list[dict[str, Any]]:
-    """Build a target-independent action catalogue from live discovery."""
+
     actions: list[dict[str, Any]] = []
     has_auth = any((bool(profile.get('cookies')) for profile in state['profiles']))
     for profile in state['profiles']:
@@ -333,6 +346,7 @@ def discovery_candidate_actions(state: AgentState) -> list[dict[str, Any]]:
                 actions.append({'profile': name, 'tool': 'interactsh', 'target_url': state['target'], 'method': case.get('method', 'GET'), 'data': case.get('data', ''), 'parameters': case.get('parameters', []), 'jwt_token': '', 'injection_url': case.get('injection_url', ''), 'oast_class': case.get('oast_class', 'remote-fetch'), 'reason': f"Automatically selected OAST-capable parameter: {case.get('parameter', 'unknown')}."})
     return actions
 
+# Planner validation compares proposed actions with target scope, discovery evidence, and safety rules.
 def validate_plan(state: AgentState, proposed: Any) -> list[dict[str, Any]]:
     if not isinstance(proposed, list):
         return []
@@ -473,10 +487,12 @@ def validate_plan(state: AgentState, proposed: Any) -> list[dict[str, Any]]:
             per_tool[key] = per_tool.get(key, 0) + 1
     return valid
 
+# Lists the actions that are currently valid for the planner.
 def _eligible_action_catalog(state: AgentState) -> list[dict[str, Any]]:
-    """Return discovery-derived actions after the shared deterministic validators."""
+
     return validate_plan(state, discovery_candidate_actions(state))
 
+# Combines new AI actions with valid actions already selected.
 def _merge_ai_actions(base: list[dict[str, Any]], additions: list[dict[str, Any]], *, budget: int) -> list[dict[str, Any]]:
     merged = list(base)
     known = {action_id(action) for action in merged}
@@ -488,18 +504,22 @@ def _merge_ai_actions(base: list[dict[str, Any]], additions: list[dict[str, Any]
         known.add(identifier)
     return merged
 
+# Fallback planning selects a safe deterministic set of actions when AI planning is unavailable.
 def _fallback_plan(state: AgentState, eligible: list[dict[str, Any]], budget: int) -> list[dict[str, Any]]:
-    """Keep a failed-model fallback small without imposing a coverage checklist."""
+
     authenticated = {str(profile.get('name') or ''): bool(profile.get('cookies')) for profile in state['profiles']}
     ordered = sorted(eligible, key=lambda action: (shared.tool_execution_rank(str(action.get('tool') or ''), authenticated.get(str(action.get('profile') or ''), False)), str(action.get('profile') or ''), str(action.get('target_url') or ''), str(action.get('tool') or '')))
     return ordered[:min(budget, 3)]
 
+# Pending-action filtering keeps only valid actions that have not run yet.
 def _remaining_eligible_actions(state: AgentState) -> list[dict[str, Any]]:
     return validate_plan(state, discovery_candidate_actions(state))
 
+# Result lookup avoids scheduling a tool that already produced output for the same profile.
 def _has_tool_result(profile_results: dict[str, Any], tool: str) -> bool:
     return any((key == tool or key.startswith(f'{tool}:') for key, value in profile_results.items() if isinstance(value, dict)))
 
+# Explains why an expected tool action cannot be created.
 def _missing_tool_reason(state: AgentState, profile_name: str, tool: str) -> str:
     found = state['discovery'].get(profile_name, {})
     has_authenticated_profile = any((bool(item.get('cookies')) for item in state['profiles']))
@@ -528,6 +548,7 @@ def _missing_tool_reason(state: AgentState, profile_name: str, tool: str) -> str
         return 'No discovered OAST-capable input was available.'
     return ''
 
+# Records valid actions that the planner chose not to run.
 def _materialize_unselected_actions(state: AgentState) -> dict[str, dict[str, Any]]:
     results = {profile: dict(values) for profile, values in state['results'].items()}
     for profile in state['profiles']:
@@ -543,10 +564,12 @@ def _materialize_unselected_actions(state: AgentState) -> dict[str, dict[str, An
                 profile_results[tool] = {'tool': tool, 'status': 'skipped', 'target': state['target'], 'output': 'The action was applicable but was not selected by the agentic planner; other discovery-derived actions were prioritized within the configured budget.', 'diagnosis': 'agentic_deferred_by_planner', 'timed_out': False, 'vulnerabilities': []}
     return results
 
+# Planner auditing records a concise summary of each proposed action.
 def _audit_action_summary(action: dict[str, Any]) -> dict[str, Any]:
-    """Return a bounded, secret-free action summary for the report audit."""
+
     return {'profile': str(action.get('profile') or ''), 'tool': str(action.get('tool') or ''), 'target_url': str(action.get('target_url') or ''), 'method': str(action.get('method') or 'GET'), 'parameters': [str(value) for value in action.get('parameters', [])][:12], 'reason': str(action.get('reason') or '')[:500]}
 
+# At each planning round, the model proposes useful actions and validation filters unsafe or unsupported choices.
 def planner_node(state: AgentState) -> dict[str, Any]:
     round_number = state['round'] + 1
     notes = list(state['notes'])
@@ -601,6 +624,7 @@ def planner_node(state: AgentState) -> dict[str, Any]:
         print(f"    {action['profile']:13} {action['tool']:10} {action['target_url']} — {action['reason']}", flush=True)
     return {'plan': plan, 'round': round_number, 'notes': notes, 'finished': finished, 'planner_source': planner_source, 'planner_audit': audit}
 
+# Action execution invokes one validated tool and stores the normalized result in planner state.
 async def execute_action(action: dict[str, Any], cookies: dict[str, str], discovery: dict[str, dict[str, Any]], allow_state_changes: bool=False, secondary_cookies: str='') -> tuple[dict[str, Any], dict[str, Any]]:
     tool = action['tool']
     profile = action['profile']
@@ -649,8 +673,9 @@ async def execute_action(action: dict[str, Any], cookies: dict[str, str], discov
             result['state_refresh'] = state_refresh
         return (action, result)
 
+# Within each planner round, validated actions run before the model is asked to plan again.
 async def execute_plan(plan: list[dict[str, Any]], cookies: dict[str, str], discovery: dict[str, dict[str, Any]], allow_state_changes: bool=False, secondary_cookies: str='') -> list[tuple[dict[str, Any], dict[str, Any]]]:
-    """Execute the AI-selected actions with live per-action CLI progress."""
+
     profile_order = {name: index for index, name in enumerate(cookies)}
     ordered = sorted(plan, key=lambda action: (profile_order.get(action['profile'], 999), shared.tool_execution_rank(action['tool'], bool(cookies.get(action['profile'], '')))))
     total = len(ordered)
@@ -693,8 +718,9 @@ async def execute_plan(plan: list[dict[str, Any]], cookies: dict[str, str], disc
     print(f'\n[*] Round action execution finished: {total}/{total} action(s).', flush=True)
     return executed
 
+# Records which actions ran and which ones remain available.
 def _record_execution_batch(executed: list[tuple[dict[str, Any], dict[str, Any]]], *, state: AgentState, results: dict[str, dict[str, Any]], discovery: dict[str, dict[str, Any]], completed: list[str], profile_cookies: dict[str, str]) -> int:
-    """Persist one execution stage and immediately merge new attack surface."""
+
     new_attack_surface = 0
     for action, result in executed:
         profile, tool = (action['profile'], action['tool'])
@@ -719,6 +745,7 @@ def _record_execution_batch(executed: list[tuple[dict[str, Any], dict[str, Any]]
             new_attack_surface += len(generated)
     return new_attack_surface
 
+# After validation, the selected actions run and their results are written back to shared state.
 def executor_node(state: AgentState) -> dict[str, Any]:
     if not state['plan']:
         return {}
@@ -757,9 +784,11 @@ def executor_node(state: AgentState) -> dict[str, Any]:
         audit[-1]['remaining_eligible_actions_after_execution'] = len(remaining)
     return {'results': results, 'discovery': discovery, 'completed': completed, 'notes': notes, 'planner_audit': audit, 'finished': not can_continue}
 
+# Decides whether the agent should plan again or create the report.
 def route_after_execution(state: AgentState) -> Literal['planner', 'report']:
     return 'report' if state['finished'] or state['round'] >= state['max_rounds'] or (not state['plan']) else 'planner'
 
+# Once execution is complete, reporting receives the collected state and produces the final assessment.
 def report_node(state: AgentState) -> dict[str, Any]:
     print('\n[*] Creating final PDF, HTML preview and JSON report...')
     output_name = f'SecOps_Agentic_Assessment_{datetime.now():%Y%m%d_%H%M%S}'

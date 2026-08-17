@@ -19,9 +19,6 @@ WORDLISTS_DIR = ROOT_DIR / "wordlists"
 LOCAL_BIN = Path.home() / ".local" / "bin"
 
 
-# Each FastMCP service is exposed on loopback through Streamable HTTP.
-# Ports are fixed per logical tool so deterministic and agentic orchestration
-# share the same service map and can reuse long-lived server processes.
 MCP_HTTP_HOST = "127.0.0.1"
 MCP_HTTP_PATH = "/mcp"
 MCP_SERVER_PORTS: dict[str, int] = {
@@ -45,6 +42,7 @@ MCP_SERVER_PORTS: dict[str, int] = {
 }
 
 
+# Each tool name maps to a fixed loopback port used by its MCP service.
 def mcp_http_port(tool_name: str) -> int:
     name = str(tool_name or "").strip().lower()
     if name not in MCP_SERVER_PORTS:
@@ -52,16 +50,15 @@ def mcp_http_port(tool_name: str) -> int:
     return int(MCP_SERVER_PORTS[name])
 
 
+# Builds the local MCP URL used to reach one tool server.
 def mcp_http_url(tool_name: str, host: str = MCP_HTTP_HOST) -> str:
     return f"http://{host}:{mcp_http_port(tool_name)}{MCP_HTTP_PATH}"
 
 
+# Starts one FastMCP server on its assigned local HTTP port.
 def run_mcp_http(mcp: Any, tool_name: str) -> None:
-    """Run one FastMCP service over Streamable HTTP.
 
-    The orchestrator normally supplies SECOPS_MCP_PORT. The per-tool default
-    makes each server independently runnable for diagnostics as well.
-    """
+
     host = os.getenv("SECOPS_MCP_HOST", MCP_HTTP_HOST).strip() or MCP_HTTP_HOST
     port = int(os.getenv("SECOPS_MCP_PORT", str(mcp_http_port(tool_name))))
     mcp.run(transport="http", host=host, port=port)
@@ -78,18 +75,13 @@ _FATAL_STARTUP_PATTERNS = (
 )
 
 
-
 _COOKIE_NAME_RE = re.compile(r"^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$")
 
 
+# Parses a Cookie header and rejects invalid or duplicate cookie names.
 def parse_cookie_header(value: str) -> list[tuple[str, str]]:
-    """
-    Parse a Cookie header without silently accepting duplicate names.
 
-    Cookie values are treated as opaque strings. Control characters and
-    duplicate cookie names are rejected because they can produce ambiguous
-    behaviour across Requests, ZAP, SQLMap, Commix and the target application.
-    """
+
     text = str(value or "").strip()
     if not text:
         return []
@@ -117,17 +109,19 @@ def parse_cookie_header(value: str) -> list[tuple[str, str]]:
     return pairs
 
 
+# Cookie normalization rebuilds the header in a single consistent format.
 def canonical_cookie_header(value: str) -> str:
     return "; ".join(f"{name}={cookie_value}" for name, cookie_value in parse_cookie_header(value))
 
 
+# Cookie-name extraction exposes only the names present in the supplied header.
 def cookie_names(value: str) -> list[str]:
     return [name for name, _ in parse_cookie_header(value)]
 
 
-
+# Login-page detection uses the final URL and form content to recognize authentication screens.
 def response_looks_like_login(response: Any) -> bool:
-    """Conservative login-page detector shared by authenticated scanners."""
+
     try:
         final_url = str(response.url).lower()
         text = str(response.text)[:100_000].lower()
@@ -142,8 +136,9 @@ def response_looks_like_login(response: Any) -> bool:
     )
 
 
+# Loads the local runtime file when it exists.
 def load_runtime_config() -> dict[str, Any]:
-    """Load initializer-generated runtime metadata without assuming a target product."""
+
     path = ROOT_DIR / ".secops_runtime.json"
     try:
         value = json.loads(path.read_text(encoding="utf-8"))
@@ -152,6 +147,7 @@ def load_runtime_config() -> dict[str, Any]:
         return {}
 
 
+# Converts a URL into the scheme, host, and port key used by runtime profiles.
 def origin_key(url: str) -> str:
     parsed = urlparse(str(url or ""))
     if parsed.scheme not in {"http", "https"} or not parsed.hostname:
@@ -161,8 +157,9 @@ def origin_key(url: str) -> str:
     return f"{parsed.scheme.lower()}://{parsed.hostname.lower()}:{port}"
 
 
+# Runtime profile lookup only accepts settings bound to the exact target origin and path.
 def target_runtime_profile(target: str) -> dict[str, Any]:
-    """Return optional metadata bound to the exact initialized target URL."""
+
     profiles = load_runtime_config().get("target_profiles", {})
     if not isinstance(profiles, dict):
         return {}
@@ -180,8 +177,9 @@ def target_runtime_profile(target: str) -> dict[str, Any]:
     return value
 
 
+# Docker routing resolves the optional internal route configured for the current target.
 def runtime_container_route(target: str, scanner_container: str = "") -> dict[str, Any]:
-    """Resolve an optional Docker-network route for a configured local target."""
+
     profile = target_runtime_profile(target)
     route = profile.get("container_route", {})
     if not isinstance(route, dict):
@@ -192,13 +190,10 @@ def runtime_container_route(target: str, scanner_container: str = "") -> dict[st
     return route
 
 
+# Applies target-specific preparation requests before a scanner starts.
 def apply_runtime_target_preparation(target: str, cookies: str) -> dict[str, Any]:
-    """Apply initializer-declared, exact-origin preparation requests.
 
-    The orchestrators contain no application-specific actions. A local lab may
-    declare safe preparation requests in `.secops_runtime.json`; arbitrary
-    targets receive no special requests.
-    """
+
     profile = target_runtime_profile(target)
     requests_spec = profile.get("pre_scan_requests", [])
     if not cookies or not isinstance(requests_spec, list) or not requests_spec:
@@ -239,10 +234,8 @@ def apply_runtime_target_preparation(target: str, cookies: str) -> dict[str, Any
                 "final_url": str(response.url), "accepted": ok,
             })
         except requests.RequestException as exc:
-            # A busy target after an active scanner is not evidence that the
-            # authenticated cookie stopped being valid.  Keep transport
-            # failures explicitly inconclusive so downstream scanners can
-            # retry instead of being skipped as anonymous coverage.
+
+
             conclusive = False
             error = f"{type(exc).__name__}: {exc}"
             transient_errors.append(error)
@@ -254,6 +247,7 @@ def apply_runtime_target_preparation(target: str, cookies: str) -> dict[str, Any
     }
 
 
+# Sends an HTTP request again after short temporary failures.
 def request_with_retries(
     method: str,
     url: str,
@@ -262,11 +256,8 @@ def request_with_retries(
     backoff_seconds: float = 0.65,
     **kwargs: Any,
 ) -> tuple[requests.Response | None, list[str]]:
-    """Issue a bounded HTTP request and distinguish transient transport failure.
 
-    The caller decides whether a missing response is fatal. This helper never
-    converts a timeout into an authentication failure.
-    """
+
     errors: list[str] = []
     for attempt in range(max(1, int(attempts))):
         try:
@@ -281,6 +272,7 @@ def request_with_retries(
     return None, errors
 
 
+# Session probing confirms that a scanner still reaches the target as the authenticated user.
 def scanner_session_probe(
     url: str,
     cookies: str,
@@ -289,11 +281,8 @@ def scanner_session_probe(
     timeout: int = 12,
     attempts: int = 3,
 ) -> dict[str, Any]:
-    """Verify authentication without treating service saturation as logout.
 
-    ``authenticated`` is True/False only when the response is conclusive. It is
-    None when all attempts failed at the transport layer.
-    """
+
     if not cookies:
         return {"performed": False, "authenticated": None, "conclusive": True}
     response, errors = request_with_retries(
@@ -327,19 +316,23 @@ def scanner_session_probe(
         "bytes": len(response.content),
         "attempt_errors": errors,
     }
+
+# Adds the project tool folders to PATH for the current process.
 def setup_path() -> None:
-    """Add the project-managed executable directory to PATH once."""
+
     LOCAL_BIN.mkdir(parents=True, exist_ok=True)
     parts = [item for item in os.environ.get("PATH", "").split(os.pathsep) if item]
     if str(LOCAL_BIN) not in parts:
         os.environ["PATH"] = str(LOCAL_BIN) + os.pathsep + os.environ.get("PATH", "")
 
 
+# Finds an executable by checking the project tool folder and system PATH.
 def find_executable(name: str) -> str | None:
     setup_path()
     return shutil.which(name) or shutil.which(f"{name}.bat") or shutil.which(f"{name}.exe")
 
 
+# URL normalization removes fragments and repeated trailing separators before comparison.
 def normalize_url(url: str) -> str:
     parsed = urlparse(url.strip())
     if parsed.scheme not in {"http", "https"} or not parsed.netloc:
@@ -347,6 +340,7 @@ def normalize_url(url: str) -> str:
     return url.rstrip("/")
 
 
+# Origin comparison requires the same scheme, host, and effective port.
 def same_origin(left: str, right: str) -> bool:
     a, b = urlparse(left), urlparse(right)
     a_port = a.port or (443 if a.scheme.lower() == "https" else 80)
@@ -354,6 +348,7 @@ def same_origin(left: str, right: str) -> bool:
     return (a.scheme.lower(), a.hostname, a_port) == (b.scheme.lower(), b.hostname, b_port)
 
 
+# Response previews keep a short printable body excerpt for diagnostics.
 def response_excerpt(text: str, marker: str = "", limit: int = 900) -> str:
     value = str(text or "")
     index = value.find(marker) if marker else -1
@@ -363,6 +358,7 @@ def response_excerpt(text: str, marker: str = "", limit: int = 900) -> str:
     return value[start:start + limit]
 
 
+# Keeps the useful end of long process output for diagnostics.
 def trim_process_output(result: dict[str, Any], limit: int) -> dict[str, Any]:
     for key in ("stdout", "stderr"):
         value = str(result.get(key, ""))
@@ -372,10 +368,12 @@ def trim_process_output(result: dict[str, Any], limit: int) -> dict[str, Any]:
     return result
 
 
+# Resolves a discovered link against its base URL.
 def absolute_url(base: str, candidate: str) -> str:
     return urlparse(urljoin(base, candidate))._replace(fragment="").geturl()
 
 
+# Server tools share one result structure for status, findings, output, and diagnostics.
 def make_result(
     tool: str,
     status: str,
@@ -395,18 +393,22 @@ def make_result(
     return result
 
 
+# Successful runs are wrapped in the common server result format.
 def success(tool: str, target: str = "", output: str = "", **extra: Any) -> dict[str, Any]:
     return make_result(tool, "success", target, output, **extra)
 
 
+# Partial runs preserve useful findings while using the common server result format.
 def partial(tool: str, target: str, output: str, **extra: Any) -> dict[str, Any]:
     return make_result(tool, "partial", target, output, **extra)
 
 
+# Skipped runs keep a clear reason in the common server result format.
 def skipped(tool: str, target: str, reason: str, **extra: Any) -> dict[str, Any]:
     return make_result(tool, "skipped", target, reason, **extra)
 
 
+# Failed runs include process details that help explain why the tool did not complete.
 def failure(
     tool: str,
     target: str,
@@ -431,17 +433,20 @@ def failure(
     )
 
 
+# Converts timeout output into normal text for diagnostics.
 def _decode_timeout_output(value: str | bytes | None) -> str:
     if isinstance(value, bytes):
         return value.decode("utf-8", errors="replace")
     return value or ""
 
 
+# Startup diagnosis scans process output for errors that show the scanner never launched correctly.
 def _fatal_startup_error(text: str) -> str:
     lowered = text.lower()
     return next((pattern for pattern in _FATAL_STARTUP_PATTERNS if re.search(pattern, lowered, re.I)), "")
 
 
+# While external scanners run, the process wrapper enforces time limits and preserves useful partial output.
 def run_process(
     tool: str,
     command: list[str],
@@ -451,7 +456,7 @@ def run_process(
     accepted_codes: Iterable[int] = (0,),
     cwd: Path | None = None,
 ) -> dict[str, Any]:
-    """Run a CLI and return a truthful common result, including partial timeout output."""
+
     executable = find_executable(command[0])
     if not executable:
         return failure(tool, target, f"Executable not found: {command[0]}", diagnosis="missing_executable")
@@ -473,6 +478,7 @@ def run_process(
             timeout=max(1, int(timeout)),
             shell=False,
         )
+    # A timeout keeps any useful output instead of hiding work the scanner already completed.
     except subprocess.TimeoutExpired as exc:
         stdout = _decode_timeout_output(exc.stdout)
         stderr = _decode_timeout_output(exc.stderr)
@@ -540,6 +546,7 @@ def run_process(
     )
 
 
+# Reads JSONL output and ignores lines that are not valid JSON.
 def read_json_lines(text: str) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     for raw_line in text.splitlines():

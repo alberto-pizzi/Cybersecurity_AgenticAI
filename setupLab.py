@@ -17,6 +17,7 @@ from setupTools import (
     LOCAL_LAB_CONTAINER, LOCAL_LAB_IMAGE, LOCAL_LAB_NETWORK, NIKTO_DOCKER_IMAGE, RUNTIME_FILE, TARGET, _docker_image_ready, run,
 )
 
+# Waits until an HTTP endpoint answers or the retry limit is reached.
 def wait_http(url: str, attempts: int = 60) -> bool:
     for _ in range(attempts):
         try:
@@ -27,6 +28,7 @@ def wait_http(url: str, attempts: int = 60) -> bool:
         time.sleep(2)
     return False
 
+# Reads Docker metadata for a named container.
 def inspect_container(name: str) -> dict[str, Any] | None:
     result = run(["docker", "inspect", name], required=False, capture=True, show_output=False, timeout=60)
     if result.returncode:
@@ -37,16 +39,19 @@ def inspect_container(name: str) -> dict[str, Any] | None:
     except json.JSONDecodeError:
         return None
 
+# Container validation compares the current image, network, and port bindings with the expected setup.
 def container_valid(info: dict[str, Any], image: str, network: str, ports: dict[str, str]) -> bool:
     if info.get("Config", {}).get("Image") != image or network not in (info.get("NetworkSettings", {}).get("Networks", {}) or {}):
         return False
     bindings = info.get("HostConfig", {}).get("PortBindings", {}) or {}
     return all(host in {str(item.get("HostPort", "")) for item in bindings.get(container, [])} for container, host in ports.items())
 
+# Docker setup creates the project network only when it is missing.
 def ensure_network(name: str) -> None:
     if run(["docker", "network", "inspect", name], required=False, capture=True, show_output=False, timeout=60).returncode:
         run(["docker", "network", "create", name], timeout=60)
 
+# Starts or recreates a Docker container and waits until it is ready.
 def ensure_container(name: str, image: str, ports: dict[str, str], readiness_url: str, run_options: list[str] | None = None, command: list[str] | None = None, attempts: int = 90) -> None:
     info = inspect_container(name)
     if info and container_valid(info, image, "secops-net", ports):
@@ -63,13 +68,16 @@ def ensure_container(name: str, image: str, ports: dict[str, str], readiness_url
         run(["docker", "logs", "--tail", "100", name], required=False, capture=True, timeout=60)
         raise RuntimeError(f"Container {name} is not ready at {readiness_url}.")
 
+# Collects named input values from the local-lab login page without relying on attribute order.
 class _HiddenInputParser(HTMLParser):
-    """Collect input values without depending on HTML attribute ordering."""
 
+
+    # Initializes the parser state before HTML tokens are processed.
     def __init__(self) -> None:
         super().__init__(convert_charrefs=True)
         self.values: dict[str, str] = {}
 
+    # Records useful values whenever the parser encounters a relevant start tag.
     def handle_starttag(
         self, tag: str, attrs: list[tuple[str, str | None]],
     ) -> None:
@@ -83,6 +91,7 @@ class _HiddenInputParser(HTMLParser):
         if name:
             self.values[name] = attributes.get("value", "")
 
+# Reads one hidden input value from an HTML page.
 def _hidden_input(html_text: str, name: str) -> str:
     parser = _HiddenInputParser()
     try:
@@ -91,6 +100,7 @@ def _hidden_input(html_text: str, name: str) -> str:
         return ""
     return str(parser.values.get(name, "")).strip()
 
+# Lab response inspection recognizes when the target is presenting its login page.
 def _local_lab_login_page(response: requests.Response) -> bool:
     text = response.text[:100_000].lower()
     path = urlparse(str(response.url)).path.lower()
@@ -103,6 +113,7 @@ def _local_lab_login_page(response: requests.Response) -> bool:
         )
     )
 
+# Lab response inspection recognizes the database setup page before authentication is attempted.
 def _local_lab_setup_page(response: requests.Response) -> bool:
     path = urlparse(str(response.url)).path.lower()
     text = response.text[:100_000].lower()
@@ -112,6 +123,7 @@ def _local_lab_setup_page(response: requests.Response) -> bool:
         or "setup check" in text
     )
 
+# Lab diagnostics condense status, redirects, page type, and error markers into one summary.
 def _local_lab_response_summary(
     response: requests.Response,
 ) -> dict[str, Any]:
@@ -138,6 +150,7 @@ def _local_lab_response_summary(
         ],
     }
 
+# Reads one named cookie from the current requests session.
 def _local_lab_cookie_value(
     session: requests.Session, cookie_name: str,
 ) -> str:
@@ -147,6 +160,7 @@ def _local_lab_cookie_value(
             selected = str(cookie.value)
     return selected
 
+# Removes cookies with the requested name from the current session.
 def _remove_named_cookies(
     session: requests.Session, cookie_name: str,
 ) -> None:
@@ -166,6 +180,7 @@ def _remove_named_cookies(
         except (KeyError, ValueError):
             pass
 
+# Performs one authenticated login attempt against the bundled lab.
 def _attempt_local_lab_login(
     session: requests.Session, username: str, password: str,
 ) -> tuple[bool, dict[str, Any]]:
@@ -201,6 +216,7 @@ def _attempt_local_lab_login(
         ),
     }
 
+# Resets the bundled lab database when the lab has not been initialized yet.
 def _reset_local_lab_database(
     session: requests.Session,
 ) -> dict[str, Any]:
@@ -243,14 +259,14 @@ def _reset_local_lab_database(
 
     return summary
 
+# Configures the bundled lab security profile used by the scanners.
 def _configure_local_lab_profile(
     session: requests.Session,
 ) -> dict[str, Any]:
-    """Apply the bundled training lab profile required for repeatable scans."""
+
     actions: list[dict[str, Any]] = []
 
-    # The bundled lab exposes an optional request filter. Disable it so bounded
-    # scanner payloads reach the intentionally vulnerable training handlers.
+
     for action_url in (
         f"{TARGET}/security.php?phpids=off",
     ):
@@ -295,6 +311,7 @@ def _configure_local_lab_profile(
         "phpids_disabled": phpids_disabled or not phpids_enabled, "actions": actions,
     }
 
+# Verifies the final local lab session and returns its cookie header.
 def _finalize_local_lab_cookie(
     session: requests.Session,
 ) -> tuple[str, dict[str, Any]]:
@@ -325,14 +342,14 @@ def _finalize_local_lab_cookie(
     )
     return cookie, summary
 
+# Local-lab authentication builds a reusable session with the expected security level.
 def create_local_lab_session() -> str:
-    """
-    Try the existing database first, reset only when needed, then verify the
-    exact scanner Cookie header.
-    """
+
+
     if not wait_http(f"{TARGET}/login.php", 90):
         raise RuntimeError("The bundled local training lab is not reachable.")
 
+    # A fresh requests session mimics a normal browser before local-lab login begins.
     session = requests.Session()
     session.headers.update({
         "User-Agent": "SecOps-Local-Lab-Initializer/5.0", "Accept": "text/html,application/xhtml+xml,*/*;q=0.8",
@@ -420,6 +437,7 @@ def create_local_lab_session() -> str:
         + json.dumps(diagnostics, ensure_ascii=False)
     )
 
+# Saves the latest local lab authentication data in the runtime file.
 def update_runtime_auth(cookie: str) -> None:
     try:
         payload = json.loads(RUNTIME_FILE.read_text(encoding="utf-8")) if RUNTIME_FILE.exists() else {}
@@ -442,8 +460,8 @@ def update_runtime_auth(cookie: str) -> None:
                 "method": "GET", "path": "/security.php?phpids=off", "accepted_statuses": [200, 302],
             }
         ],
-        # Exact-target safety metadata consumed generically by the crawler and
-        # ZAP server. Other targets receive no special exclusions.
+
+
         "excluded_query_keys": ["phpids", "security", "seclev_submit", "test"],
         "probe_paths": ["/security.php", "/", "/index.php"], "preferred_probe_paths": ["/security.php"],
     }
@@ -453,8 +471,9 @@ def update_runtime_auth(cookie: str) -> None:
     })
     RUNTIME_FILE.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
 
+# Pulls a required local-lab Docker image when it is missing.
 def _ensure_local_docker_image(image: str, platform_name: str = "") -> None:
-    """Use a local image; pull only when absent, optionally for a platform."""
+
     if _docker_image_ready(image):
         print(f"[+] Docker image already available locally; registry access skipped: {image}")
         return
@@ -469,6 +488,7 @@ def _ensure_local_docker_image(image: str, platform_name: str = "") -> None:
             "Restore DNS/network access and rerun the initializer."
         )
 
+# Model lookup verifies whether the requested Ollama model is already present locally.
 def _ollama_model_available(model: str) -> bool:
     try:
         response = requests.get(
@@ -492,6 +512,7 @@ def _ollama_model_available(model: str) -> bool:
         pass
     return False
 
+# Starts the bundled DVWA, ZAP, and Ollama services and prepares a session.
 def setup_local_lab(model: str) -> str:
     if not shutil.which("docker"):
         raise RuntimeError("Docker Desktop/Engine is required for --with-lab.")

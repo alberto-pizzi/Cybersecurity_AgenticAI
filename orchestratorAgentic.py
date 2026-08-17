@@ -30,15 +30,15 @@ REGISTRY = deterministic_core.agentic_registry()
 agentic_core.REGISTRY = REGISTRY
 
 
+# Falls back to the shared implementation when a public name is not defined locally.
 def __getattr__(name: str) -> Any:
     try:
         return getattr(agentic_core, name)
     except AttributeError as exc:
         raise AttributeError(name) from exc
 
-# Autonomous planner: plan without a checklist and avoid redundant tool execution.
-# Eligible but unselected actions remain visible as diagnosis="agentic_deferred_by_planner".
 
+# Builds the LangGraph flow that connects discovery, planning, execution, and reporting.
 def build_graph() -> Any:
     graph = StateGraph(AgentState)
     graph.add_node("discovery", discovery_node)
@@ -53,6 +53,7 @@ def build_graph() -> Any:
     return graph.compile()
 
 
+# Counts errors, skips, and partial runs before the final agentic summary is printed.
 def summarize(results: dict[str, Any]) -> tuple[int, int, int]:
     errors = skips = partial = 0
     for path, result in iter_leaf_results(results):
@@ -64,6 +65,7 @@ def summarize(results: dict[str, Any]) -> tuple[int, int, int]:
             print(f"[-] {'/'.join(path)}: {result.get('diagnosis', 'unknown')} — {str(result.get('output', ''))[:500]}", file=sys.stderr)
     return errors, skips, partial
 
+# Parses command-line options and drives the complete workflow for this entrypoint.
 def main() -> int:
     parser = argparse.ArgumentParser(
         description="Ollama + LangGraph FastMCP security orchestrator."
@@ -98,6 +100,7 @@ def main() -> int:
     globals()["CURRENT_SCAN_MODE"] = deterministic_core.CURRENT_SCAN_MODE
     globals()["ARJUN_TIMEOUT"] = deterministic_core.ARJUN_TIMEOUT
 
+    # If preflight finds missing local tools, execution stops before the agentic graph starts.
     checks = run_preflight_checks(include_live=True)
     errors = print_preflight_report(checks, show_ok=args.preflight_only)
     if args.preflight_only:
@@ -108,6 +111,7 @@ def main() -> int:
     target, profiles, _, secondary_cookie, injection = (
         prepare_cli_context(parser, args)
     )
+    # Before planning begins, Ollama is checked and the requested model is prepared for use.
     planner_timeout = args.ai_timeout or AI_PLANNER_TIMEOUTS[args.mode]
     try:
         selected_model, ollama_diagnostics = ensure_ollama_model(
@@ -162,6 +166,7 @@ def main() -> int:
             file=sys.stderr,
         )
 
+    # The agentic run starts from a fresh state containing profiles, planner settings, and empty results.
     initial: AgentState = {
         "target": target,
         "profiles": profiles,

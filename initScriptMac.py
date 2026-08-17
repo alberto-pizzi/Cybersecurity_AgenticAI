@@ -1,11 +1,6 @@
 from __future__ import annotations
 
-"""Compatibility entrypoint for macOS.
-
-The complete cross-platform implementation lives in initScript.py so Windows
-and macOS cannot silently diverge again.
-"""
-
+# Compatibilità per mac, richiama l'originale
 from initScript import main
 
 

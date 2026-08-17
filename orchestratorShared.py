@@ -49,6 +49,7 @@ PARAMETER_TOOL_CASE_LIMITS = dict(SCAN_MODES[CURRENT_SCAN_MODE]['limits'])
 ARJUN_TIMEOUT = int(SCAN_MODES[CURRENT_SCAN_MODE]['arjun'])
 ARJUN_ENDPOINT_LIMIT = int(SCAN_MODES[CURRENT_SCAN_MODE].get('arjun_limit', 1))
 
+# Loads the timeouts and case limits for the selected scan profile.
 def configure_scan_mode(mode: str) -> None:
     global CURRENT_SCAN_MODE, ARJUN_TIMEOUT, ARJUN_ENDPOINT_LIMIT
     selected = str(mode or 'balanced').lower()
@@ -71,6 +72,7 @@ OAST_PATH_HINTS = ('ssrf', 'webhook', 'callback', 'fetch', 'proxy', 'redirect', 
 OAST_URL_VALUE_PARAMETERS = {'url', 'uri', 'callback', 'callback_url', 'webhook', 'webhook_url', 'endpoint', 'target', 'dest', 'destination', 'redirect', 'redirect_url', 'next', 'return', 'fetch', 'resource', 'remote', 'proxy', 'image', 'src', 'file', 'filename', 'path', 'page', 'include', 'template', 'feed', 'avatar', 'document'}
 OAST_COMMAND_PARAMETERS = {'ip', 'host', 'hostname', 'cmd', 'command', 'exec', 'shell', 'ping', 'target', 'domain'}
 
+# Describes one MCP tool together with its server file and runtime dependency.
 @dataclass(frozen=True)
 class ToolSpec:
     name: str
@@ -89,12 +91,14 @@ ALL_TOOLS = (*BASE_TOOLS, ARJUN_TOOL, *PARAMETER_TOOLS, AUTHORIZATION_TOOL, *WOR
 TOOL_SCOPES = {'ffuf': 'base', 'zap': 'base', 'nuclei': 'base', 'session': 'base', 'nikto': 'base', 'arjun': 'url', 'sqlmap': 'parameterized', 'dalfox': 'parameterized', 'commix': 'parameterized', 'traversal': 'parameterized', 'idor': 'numeric', 'authorization': 'authorization', 'browser': 'browser', 'workflow': 'workflow', 'jwt': 'jwt', 'interactsh': 'oast'}
 TOOL_DESCRIPTIONS = {'ffuf': 'Hidden resource and endpoint discovery with credential-isolated path fuzzing.', 'zap': 'Session-aware crawling, passive analysis and prioritized active testing.', 'nuclei': 'Template-based exposure, misconfiguration, known-vulnerability and bounded DAST checks on discovered parameterized URLs.', 'session': 'Cookie flags, bounded session uniqueness and fixation indicators.', 'nikto': 'Web-server hardening and exposed-resource checks.', 'arjun': 'Hidden GET/POST parameter discovery.', 'sqlmap': 'SQL-injection confirmation on discovered request contracts.', 'dalfox': 'Reflected and stored XSS testing.', 'commix': 'Operating-system command-injection testing.', 'traversal': 'Path-traversal and local-file-inclusion verification.', 'idor': 'Single-reference numeric object differential checks.', 'authorization': 'Read-only anonymous and optional two-account authorization differentials on discovered high-value GET requests.', 'browser': 'Chromium verification of DOM, reflected and stored XSS using harmless markers.', 'workflow': 'Bounded CSRF, upload, authentication-throttling and CAPTCHA workflow checks.', 'jwt': 'JWT structure and claim analysis.', 'interactsh': 'Out-of-band callback confirmation.'}
 
+# The agentic registry exposes the MCP tools available to the planner.
 def agentic_registry() -> dict[str, tuple[str, str, str, str]]:
-    """Expose the deterministic tool catalogue to the AI orchestrator."""
+
     return {spec.name: (spec.server, spec.tool, TOOL_SCOPES[spec.name], TOOL_DESCRIPTIONS[spec.name]) for spec in ALL_TOOLS if spec.name in TOOL_SCOPES}
 
+# Per-tool limits define how many actions each scanner may receive in the active profile.
 def tool_action_limit(tool: str) -> int:
-    """Return the per-profile action limit shared by both orchestrators."""
+
     name = str(tool or '').lower()
     if name == 'arjun':
         return ARJUN_ENDPOINT_LIMIT
@@ -104,18 +108,21 @@ def tool_action_limit(tool: str) -> int:
         return PARAMETER_TOOL_CASE_LIMITS[name]
     return 1
 
+# Broad scanners follow a stable order chosen to preserve session health and discovery quality.
 def broad_tool_order(authenticated: bool) -> tuple[str, ...]:
-    """Run discovery before active scanning for every profile."""
+
     return ('ffuf', 'zap', 'nuclei', 'session', 'nikto')
 
+# Gives each tool a rank used to order planned actions.
 def tool_execution_rank(tool: str, authenticated: bool) -> int:
-    """Return a stable shared execution phase for a planned tool action."""
+
     broad = broad_tool_order(authenticated)
     if tool in broad:
         return broad.index(tool)
     phases = {'arjun': 10, 'sqlmap': 20, 'dalfox': 21, 'commix': 22, 'traversal': 23, 'idor': 24, 'authorization': 25, 'browser': 26, 'workflow': 27, 'jwt': 30, 'interactsh': 31}
     return phases.get(str(tool or '').lower(), 99)
 
+# Adds a directory to PATH only when it is not already present.
 def _prepend_path(path: Path) -> None:
     if not path.is_dir():
         return
@@ -125,8 +132,9 @@ def _prepend_path(path: Path) -> None:
     if os.path.normcase(resolved) not in keys:
         os.environ['PATH'] = resolved + os.pathsep + os.environ.get('PATH', '')
 
+# Rebuilds the runtime PATH so installed scanner launchers can be found.
 def configure_runtime_path() -> list[str]:
-    """Recreate the PATH written by initScript.py in every new process."""
+
     runtime = load_runtime_config()
     candidates: list[Path] = [LOCAL_BIN]
     candidates += [Path(value) for value in runtime.get('tool_directories', []) if isinstance(value, str)]
@@ -159,6 +167,7 @@ def configure_runtime_path() -> list[str]:
             added.append(str(path.expanduser().resolve()))
     return added
 
+# Finds the executable or launcher used for a scanner.
 def resolve_executable(name: str) -> str | None:
     configure_runtime_path()
     found = shutil.which(name)
@@ -167,6 +176,7 @@ def resolve_executable(name: str) -> str | None:
     value = load_runtime_config().get('executables', {}).get(name)
     return str(Path(value).resolve()) if isinstance(value, str) and Path(value).is_file() else None
 
+# Reads a server file and lists the functions declared in its source.
 def _declared_functions(path: Path) -> set[str]:
     try:
         tree = ast.parse(path.read_text(encoding='utf-8', errors='replace'))
@@ -174,21 +184,24 @@ def _declared_functions(path: Path) -> set[str]:
         return set()
     return {node.name for node in ast.walk(tree) if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))}
 
+# Server path lookup resolves a server filename inside the project directory.
 def resolve_server_path(filename: str, required_tool: str='') -> Path:
-    """Resolve only the canonical MCP server filename."""
+
     return (SERVERS / Path(filename).name).resolve()
 
+# Interpreter validation confirms that project dependencies can be imported before a server is launched.
 def _python_has_project_deps(python: str) -> bool:
-    """Return whether an interpreter can import the MCP server dependencies."""
+
     try:
         probe = subprocess.run([python, '-c', 'import requests, fastmcp, jwt'], capture_output=True, text=True, encoding='utf-8', errors='replace', timeout=30, check=False)
         return probe.returncode == 0
     except (OSError, subprocess.TimeoutExpired):
         return False
 
+# Chooses the Python interpreter used to start MCP servers.
 @functools.lru_cache(maxsize=1)
 def _server_python() -> str:
-    """Select a venv-safe interpreter for all MCP server subprocesses."""
+
     current = sys.executable
     configured = load_runtime_config().get('python_executable')
     if not (isinstance(configured, str) and Path(configured).is_file()):
@@ -201,6 +214,7 @@ def _server_python() -> str:
         return configured
     return current
 
+# Builds the environment passed to a new MCP server process.
 def _server_env() -> dict[str, str]:
     configure_runtime_path()
     env = {str(key): str(value) for key, value in os.environ.items()}
@@ -216,6 +230,7 @@ def _server_env() -> dict[str, str]:
 _HTTP_SERVER_PROCESSES: dict[str, subprocess.Popen] = {}
 _HTTP_SERVER_LOGS: dict[str, Path] = {}
 
+# Port probing detects whether an MCP endpoint is already listening locally.
 def _port_open(host: str, port: int, timeout: float=0.25) -> bool:
     try:
         with socket.create_connection((host, int(port)), timeout=timeout):
@@ -223,11 +238,13 @@ def _port_open(host: str, port: int, timeout: float=0.25) -> bool:
     except OSError:
         return False
 
+# Server logging assigns a predictable log path to each MCP process.
 def _http_server_log(spec: ToolSpec) -> Path:
     directory = ROOT / '.secops_tmp' / 'mcp-http'
     directory.mkdir(parents=True, exist_ok=True)
     return directory / f'{spec.name}.log'
 
+# Stops an MCP server process that was started by this orchestrator.
 def _stop_owned_http_server(tool_name: str) -> None:
     process = _HTTP_SERVER_PROCESSES.pop(tool_name, None)
     if process is not None and process.poll() is None:
@@ -240,11 +257,13 @@ def _stop_owned_http_server(tool_name: str) -> None:
             except Exception:
                 pass
 
+# Stops every MCP server process owned by the current orchestrator.
 def shutdown_mcp_http_servers() -> None:
     for tool_name in list(_HTTP_SERVER_PROCESSES):
         _stop_owned_http_server(tool_name)
 atexit.register(shutdown_mcp_http_servers)
 
+# Reads the end of a server log to explain a startup failure.
 def _server_startup_log(spec: ToolSpec) -> str:
     path = _HTTP_SERVER_LOGS.get(spec.name)
     if not path or not path.is_file():
@@ -254,8 +273,9 @@ def _server_startup_log(spec: ToolSpec) -> str:
     except OSError:
         return ''
 
+# Delegates MCP server startup to the shared helper so both orchestrators use the same lifecycle.
 def _ensure_http_server(spec: ToolSpec, server: Path, *, restart: bool=False) -> str:
-    """Start or reuse the loopback Streamable HTTP service for one MCP tool."""
+
     port = mcp_http_port(spec.name)
     url = mcp_http_url(spec.name)
     if restart:
@@ -285,10 +305,12 @@ def _ensure_http_server(spec: ToolSpec, server: Path, *, restart: bool=False) ->
     detail = _server_startup_log(spec)
     raise TimeoutError(f'Timed out waiting for {spec.name} MCP HTTP service at {url}' + (f'. Server log: {detail}' if detail else ''))
 
+# Transport diagnosis recognizes failures raised by the MCP HTTP layer.
 def _http_transport_failure(exc: BaseException) -> bool:
     text = f'{type(exc).__name__}: {exc}'.lower()
     return any((token in text for token in ('connection refused', 'connecterror', 'connectionerror', 'server disconnected', 'connection closed', 'closedresourceerror', 'brokenresourceerror', 'all connection attempts failed')))
 
+# Extracts the structured tool payload from an MCP response.
 def _extract_response(response: Any) -> tuple[Any, bool, str]:
     is_error = bool(getattr(response, 'is_error', False) or getattr(response, 'isError', False))
     for name in ('data', 'structured_content', 'structuredContent'):
@@ -306,11 +328,13 @@ def _extract_response(response: Any) -> tuple[Any, bool, str]:
             pass
     return (content, is_error, 'content')
 
+# Converts an exception into a short diagnosis used in scan results.
 def diagnose_error(text: str) -> str:
     lowered = text.lower()
     rules = ((('no such file', 'not found', 'winerror 2'), 'missing_file_or_executable'), (('no module named', 'modulenotfounderror'), 'missing_python_dependency'), (('connection refused', 'failed to establish'), 'service_unreachable'), (('timed out', 'timeout'), 'timeout'), (('permission denied', 'access is denied'), 'permission_denied'), (('tool not found', 'method not found', 'unknown tool'), 'mcp_tool_name_mismatch'), (('connection closed', 'closedresourceerror', 'end of file'), 'mcp_server_crashed'))
     return next((cause for needles, cause in rules if any((item in lowered for item in needles))), 'scanner_or_mcp_error')
 
+# Result construction keeps tool status, diagnosis, output, and findings in one common shape.
 def _result(tool: str, target: str, status: str, output: Any, diagnosis: str='', **extra: Any) -> dict[str, Any]:
     result = {'tool': tool, 'status': status, 'target': target, 'output': output, 'vulnerabilities': []}
     if diagnosis:
@@ -318,6 +342,7 @@ def _result(tool: str, target: str, status: str, output: Any, diagnosis: str='',
     result.update(extra)
     return result
 
+# Counts security findings and observations in one tool result.
 def _finding_counts(result: dict[str, Any]) -> tuple[int, int, int]:
     findings = [item for item in result.get('vulnerabilities') or [] if isinstance(item, dict)]
     security = 0
@@ -328,13 +353,15 @@ def _finding_counts(result: dict[str, Any]) -> tuple[int, int, int]:
             security += 1
     return (len(findings), security, len(findings) - security)
 
+# Timeout detection separates budget exhaustion from ordinary tool failures.
 def _is_time_limited(result: dict[str, Any]) -> bool:
     diagnosis = str(result.get('diagnosis', '')).lower()
     text = ' '.join((str(result.get(key, '')) for key in ('output', 'stderr', 'stdout'))).lower()
     return bool(result.get('timed_out') or diagnosis in TIME_LIMIT_DIAGNOSES or 'timeout' in diagnosis or ('timed out' in text) or ('time limit' in text) or ('time budget' in text))
 
+# Keeps useful partial results while marking a run that reached its limit.
 def _normalize_time_limit(result: dict[str, Any], tool: str, target: str) -> dict[str, Any]:
-    """A configured scan budget is an incomplete result, not an execution error."""
+
     if result.get('hard_failure') or not _is_time_limited(result):
         return result
     total, security, observations = _finding_counts(result)
@@ -351,6 +378,7 @@ def _normalize_time_limit(result: dict[str, Any], tool: str, target: str) -> dic
     result['output'] = f'Configured scan time budget reached. Findings preserved: {total} (security/candidates: {security}, observations/discovery: {observations}). Coverage is incomplete, but the scanner did not fail.'
     return result
 
+# Brings raw tool output into the common result format.
 def _normalize_result(data: Any, spec: ToolSpec, target: str, elapsed: float, is_error: bool, shape: str) -> dict[str, Any]:
     if isinstance(data, dict):
         result = dict(data)
@@ -367,6 +395,7 @@ def _normalize_result(data: Any, spec: ToolSpec, target: str, elapsed: float, is
         result.setdefault('diagnosis', diagnose_error(str(result.get('output', ''))))
     return _normalize_time_limit(result, spec.name, target)
 
+# Calls one MCP tool and returns a normalized result.
 async def call_mcp(server_file: str, tool_name: str, arguments: dict[str, Any], timeout_seconds: float=MCP_TOOL_TIMEOUT) -> dict[str, Any]:
     spec = next((item for item in ALL_TOOLS if item.server == server_file and item.tool == tool_name), ToolSpec(tool_name, server_file, tool_name))
     server = resolve_server_path(server_file, tool_name)
@@ -382,6 +411,7 @@ async def call_mcp(server_file: str, tool_name: str, arguments: dict[str, Any], 
         temporary_output = temporary_dir / f'nuclei-{uuid.uuid4().hex}.jsonl'
         effective_arguments['output_file'] = str(temporary_output)
 
+    # Sends one MCP request to the prepared server URL and returns the normalized response.
     async def invoke(url: str) -> tuple[Any, bool, str]:
         async with Client(url) as client:
             return _extract_response(await client.call_tool(tool_name, effective_arguments))
@@ -418,8 +448,9 @@ async def call_mcp(server_file: str, tool_name: str, arguments: dict[str, Any], 
         print(f"\n[SCANNER ERROR] {spec.name}: {target}\n  {result.get('output', '')}", file=sys.stderr)
     return result
 
+# Calls one MCP tool while printing periodic progress messages.
 async def call_mcp_with_progress(spec: ToolSpec, arguments: dict[str, Any], *, timeout_seconds: float=MCP_TOOL_TIMEOUT) -> dict[str, Any]:
-    """Run one MCP scanner while showing which tool is active."""
+
     target = str(arguments.get('target_url', ''))
     scanner_limit = arguments.get('timeout')
     limit_text = f', scanner limit {scanner_limit}s' if scanner_limit else ''
@@ -433,6 +464,7 @@ async def call_mcp_with_progress(spec: ToolSpec, arguments: dict[str, Any], *, t
         elapsed = int(time.monotonic() - started)
         print(f'    [WAITING ] {spec.name}: still running after {elapsed}s', flush=True)
 
+# Starts one MCP server and checks that its HTTP endpoint responds.
 async def _live_server_check(spec: ToolSpec) -> dict[str, str]:
     server = resolve_server_path(spec.server, spec.tool)
     try:
@@ -448,8 +480,9 @@ async def _live_server_check(spec: ToolSpec) -> dict[str, str]:
         message = f'{type(exc).__name__}: {exc}' + (f' | server log: {detail}' if detail else '')
         return {'level': 'error' if spec.required else 'warning', 'component': spec.name, 'cause': 'mcp_http_handshake_failed', 'detail': message}
 
+# Nikto validation confirms that the configured runtime can start successfully.
 def _nikto_runtime_check(executable: str) -> tuple[bool, str]:
-    """Reject Nikto launchers that print Perl/module errors even when cmd.exe returns zero."""
+
     try:
         completed = subprocess.run([executable, '-Version'], cwd=str(ROOT), env=_server_env(), capture_output=True, text=True, encoding='utf-8', errors='replace', timeout=30, shell=False)
     except Exception as exc:
@@ -462,12 +495,14 @@ def _nikto_runtime_check(executable: str) -> tuple[bool, str]:
         return (False, combined[-2000:] or 'Nikto returned no version information.')
     return (True, combined[-1000:])
 
+# Finds duplicate numbered server files that can confuse the runtime.
 def _numbered_duplicate_servers() -> list[Path]:
     if not SERVERS.is_dir():
         return []
     pattern = re.compile('.+\\(\\d+\\)\\.py$', re.IGNORECASE)
     return sorted((path.resolve() for path in SERVERS.iterdir() if path.is_file() and pattern.fullmatch(path.name)), key=lambda path: path.name.lower())
 
+# Preflight validation covers dependencies, server files, ports, and live MCP services before scanning.
 def run_preflight_checks(*, include_live: bool=True) -> list[dict[str, str]]:
     configure_runtime_path()
     checks: list[dict[str, str]] = []
@@ -523,9 +558,11 @@ def run_preflight_checks(*, include_live: bool=True) -> list[dict[str, str]]:
         checks.append({'level': 'ok', 'component': 'mcp', 'cause': 'preflight_passed', 'detail': 'All contracts, executables and MCP Streamable HTTP handshakes passed.'})
     return checks
 
+# During preflight, MCP services are probed concurrently to confirm that every required endpoint responds.
 async def _run_live_checks() -> list[dict[str, str]]:
     return [await _live_server_check(spec) for spec in ALL_TOOLS]
 
+# Prints the preflight result in a short operator-friendly format.
 def print_preflight_report(checks: list[dict[str, str]], *, show_ok: bool=False) -> int:
     errors = [item for item in checks if item['level'] == 'error']
     warnings = [item for item in checks if item['level'] == 'warning']
@@ -538,8 +575,10 @@ def print_preflight_report(checks: list[dict[str, str]], *, show_ok: bool=False)
             print(f"[{marker}] {item['component']}: {item['cause']} — {item['detail']}", file=stream)
     return len(errors)
 
+# Collects links, forms, and field names from HTML pages while discovery is crawling the target.
 class LinkFormParser(HTMLParser):
 
+    # Initializes the parser state before HTML tokens are processed.
     def __init__(self) -> None:
         super().__init__()
         self.links: list[str] = []
@@ -547,6 +586,7 @@ class LinkFormParser(HTMLParser):
         self.forms: list[dict[str, Any]] = []
         self.current: dict[str, Any] | None = None
 
+    # Records useful values whenever the parser encounters a relevant start tag.
     def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
         values = dict(attrs)
         tag = tag.lower()
@@ -560,16 +600,19 @@ class LinkFormParser(HTMLParser):
             field_type = str(values.get('type', tag)).lower()
             self.current['fields'].append({'name': str(values['name']), 'value': str(values.get('value', '')), 'type': field_type, 'tag': tag})
 
+    # Closes the active form record when the matching end tag is reached.
     def handle_endtag(self, tag: str) -> None:
         if tag.lower() == 'form' and self.current:
             self.forms.append(self.current)
             self.current = None
 
+# Removes fragments and returns a clean URL for crawling.
 def _clean_url(url: str) -> str:
     return urlunparse(urlparse(url)._replace(fragment=''))
 
+# Fixes links that repeat the target base path by mistake.
 def _normalize_redundant_base_path_link(target: str, candidate: str) -> str:
-    """Normalize links that accidentally repeat the target base path."""
+
     base = urlparse(target)
     parsed = urlparse(candidate)
     base_path = base.path.rstrip('/')
@@ -580,12 +623,14 @@ def _normalize_redundant_base_path_link(target: str, candidate: str) -> str:
         return urlunparse(parsed._replace(path=parsed.path[len(base_path):]))
     return candidate
 
+# Crawler filtering keeps only URLs that are safe and useful to follow.
 def _crawlable_url(url: str) -> bool:
     path = urlparse(url).path.lower()
     return not path.endswith(('.css', '.js', '.png', '.jpg', '.jpeg', '.gif', '.svg', '.ico', '.woff', '.woff2', '.ttf', '.pdf', '.zip', '.gz', '.tar', '.mp4'))
 DESTRUCTIVE_CRAWL_TOKENS = ('logout', 'log-out', 'signout', 'sign-out', 'logoff', 'disconnect', 'end-session', 'destroy-session', 'session-destroy', 'setup', 'install', 'reinstall', 'uninstall', 'reset', 'create_db', 'create-database', 'createdb', 'drop_db', 'drop-database', 'truncate', 'purge', 'wipe')
 STATE_CHANGING_QUERY_KEYS = {'create_db', 'reset', 'action', 'delete', 'remove', 'logout', 'signout', 'logoff', 'disconnect', 'destroy', 'install', 'setup', 'password_new', 'password_conf', 'new_password', 'confirm_password'}
 
+# Detects logout, setup, reset, and other destructive URLs.
 def _destructive_crawl_url(url: str) -> bool:
     parsed = urlparse(str(url or ''))
     text = f'{parsed.path}?{parsed.query}'.lower()
@@ -601,8 +646,9 @@ def _destructive_crawl_url(url: str) -> bool:
             return True
     return False
 
+# Performs a bounded GET request while blocking destructive navigation.
 def _safe_crawl_get(session: requests.Session, requested: str, target: str, *, timeout: tuple[int, int]=(5, 15), max_redirects: int=5) -> tuple[requests.Response | None, str, str]:
-    """Follow redirects without ever requesting logout/reset/install endpoints."""
+
     current = _clean_url(requested)
     seen: set[str] = set()
     response: requests.Response | None = None
@@ -629,14 +675,16 @@ def _safe_crawl_get(session: requests.Session, requested: str, target: str, *, t
         current = candidate
     return (response, current, 'redirect_limit_reached')
 
+# Removes unstable query values from an authentication probe URL.
 def _clean_probe_url(url: str) -> str:
-    """Remove fragments and state-changing query fields from a probe URL."""
+
     parsed = urlparse(str(url or ''))
     safe_pairs = [(name, value) for name, value in parse_qsl(parsed.query, keep_blank_values=True) if name.lower() not in STATE_CHANGING_QUERY_KEYS]
     return urlunparse(parsed._replace(query=urlencode(safe_pairs), fragment=''))
 
+# Builds the authentication probe URLs configured for the current target.
 def _runtime_probe_urls(target: str) -> list[str]:
-    """Resolve optional exact-origin probe paths written by the initializer."""
+
     profile = target_runtime_profile(target)
     values = profile.get('probe_paths', []) if isinstance(profile, dict) else []
     result: list[str] = []
@@ -649,12 +697,14 @@ def _runtime_probe_urls(target: str) -> list[str]:
             result.append(candidate)
     return result
 
+# Chooses a stable page that can prove whether authentication still works.
 def _stable_auth_probe_url(target: str, discovered_urls: list[str]) -> str:
-    """Choose a stable same-origin page for session validation."""
+
     candidates = [*_runtime_probe_urls(target)]
     candidates.extend((_clean_probe_url(value) for value in discovered_urls if same_origin(target, value) and (not _destructive_crawl_url(value)) and (not _looks_like_login_path(value))))
     candidates.append(_clean_probe_url(target))
 
+    # Ranks probe pages so authentication checks start from the most stable candidate.
     def score(value: str) -> int:
         parsed = urlparse(value)
         path = parsed.path.lower()
@@ -673,10 +723,12 @@ def _stable_auth_probe_url(target: str, discovered_urls: list[str]) -> str:
     unique = [value for value in dict.fromkeys(candidates) if value and same_origin(target, value) and (score(value) > 0)]
     return max(unique, key=score) if unique else _clean_probe_url(target)
 
+# Login detection recognizes common authentication paths from the URL alone.
 def _looks_like_login_path(url: str) -> bool:
     path = urlparse(str(url or '')).path.lower().rstrip('/')
     return path.endswith(('/login', '/login.php', '/signin', '/sign-in', '/auth'))
 
+# Response inspection detects login pages from both the final URL and page content.
 def _looks_like_login(response: requests.Response) -> bool:
     text = response.text[:100000].lower()
     path = urlparse(response.url).path.lower().rstrip('/')
@@ -684,8 +736,9 @@ def _looks_like_login(response: requests.Response) -> bool:
     auth_words = any((term in text for term in ('login', 'log in', 'sign in', 'signin', 'authenticate')))
     return path.endswith(('/login', '/login.php', '/signin', '/sign-in', '/auth')) or (password_field and auth_words)
 
+# Converts one HTML form into the request-case format used by scanners.
 def _form_case(action: str, method: str, fields: list[dict[str, str]], source_url: str, enctype: str='application/x-www-form-urlencoded') -> dict[str, Any] | None:
-    """Build a conservative request contract while preserving workflow metadata."""
+
     method = method.upper() if method else 'GET'
     if method not in {'GET', 'POST'}:
         return None
@@ -730,6 +783,7 @@ def _form_case(action: str, method: str, fields: list[dict[str, str]], source_ur
         url, data = (action, encoded)
     return {'url': url, 'method': method, 'data': data, 'parameters': list(dict.fromkeys(testable)), 'file_parameters': list(dict.fromkeys(file_parameters)), 'token_parameters': list(dict.fromkeys(token_parameters)), 'fields': normalized_fields, 'enctype': str(enctype or 'application/x-www-form-urlencoded').lower(), 'source_url': source_url, 'form_action': action}
 
+# Removes duplicate request cases while keeping the best available data.
 def _dedupe_request_cases(cases: list[dict[str, Any]]) -> list[dict[str, Any]]:
     unique: list[dict[str, Any]] = []
     seen: set[tuple[str, str, tuple[str, ...]]] = set()
@@ -742,8 +796,9 @@ def _dedupe_request_cases(cases: list[dict[str, Any]]) -> list[dict[str, Any]]:
         unique.append(case)
     return unique
 
+# Rechecks whether an authenticated profile is still valid.
 def refresh_authenticated_session_state(target: str, cookies: str, probe_url: str='') -> dict[str, Any]:
-    """Reassert a generic authenticated session before a scanner."""
+
     if not cookies:
         return {'performed': False, 'authenticated': False, 'usable': True}
     preparation = apply_runtime_target_preparation(target, cookies)
@@ -755,15 +810,17 @@ def refresh_authenticated_session_state(target: str, cookies: str, probe_url: st
     conclusive = bool(probe_invalid or prep_invalid or probe.get('conclusive') is True)
     return {'performed': True, 'authenticated': probe.get('authenticated'), 'conclusive': conclusive, 'preparation': preparation, 'probe': probe, 'usable': usable, 'transient_error': bool(probe.get('transient_error') or preparation.get('transient_error'))}
 
+# Records simple client-side source and sink clues for browser checks.
 def _client_side_source_sink_evidence(text: str) -> tuple[list[str], list[str]]:
-    """Return generic JavaScript-controlled sources and dangerous DOM sinks."""
+
     value = str(text or '')[:750000]
     source_hits = sorted(set(re.findall('(?:location\\.(?:hash|search|href)|document\\.(?:URL|documentURI|referrer|cookie)|window\\.name)', value, re.I)))
     sink_hits = sorted(set(re.findall('(?:innerHTML|outerHTML|insertAdjacentHTML|document\\.write(?:ln)?|eval\\s*\\(|setTimeout\\s*\\(\\s*[\'\\"]|setInterval\\s*\\(\\s*[\'\\"])', value, re.I)))
     return (source_hits[:12], sink_hits[:12])
 
+# Crawls the target and records pages, forms, parameters, scripts, and auth state.
 def discover_target(target: str, cookies: str, max_pages: int=MAX_CRAWL_PAGES, seeds: list[str] | None=None) -> dict[str, Any]:
-    """Crawl same-origin pages, forms and links while recording authentication quality."""
+
     session = requests.Session()
     session.headers.update({'User-Agent': 'SecOps-Discovery/2.0', 'Accept': 'text/html,application/xhtml+xml,application/json;q=0.8,*/*;q=0.5'})
     if cookies:
@@ -927,6 +984,7 @@ def discover_target(target: str, cookies: str, max_pages: int=MAX_CRAWL_PAGES, s
         auth_note = 'The supplied cookie was distinguished from the anonymous response.' if auth_effective is True else 'The supplied cookie reached a login or authorization failure page.' if auth_effective is False else 'The supplied cookie remained usable, but this target did not expose a conclusive anonymous/authenticated distinction.'
     return {'urls': sorted(visited), 'html_urls': sorted(html_urls), 'form_urls': sorted(form_urls), 'parameterized_urls': sorted(parameterized), 'request_cases': _dedupe_request_cases(request_cases), 'script_urls': sorted(script_urls), 'client_side_candidates': client_side_candidates, 'jwt_tokens': sorted(tokens), 'errors': errors, 'authentication_effective': auth_effective, 'authentication_note': auth_note, 'authentication_probe': auth_probe, 'target_preparation': target_preparation, 'destructive_urls_skipped': sorted(destructive_skipped)}
 
+# Combines discovery results without duplicating pages or request cases.
 def merge_discovery(left: dict[str, Any], right: dict[str, Any]) -> dict[str, Any]:
     merged = dict(left)
     for key in ('urls', 'html_urls', 'form_urls', 'parameterized_urls', 'script_urls', 'jwt_tokens'):
@@ -952,23 +1010,27 @@ def merge_discovery(left: dict[str, Any], right: dict[str, Any]) -> dict[str, An
         merged['authentication_note'] = right.get('authentication_note')
     return merged
 
+# URL ranking relies on a small set of security-related words to prioritize discovered paths.
 def _risk_terms(value: str) -> int:
     text = value.lower()
     tokens = set(re.findall('[a-z0-9]+', text))
     weights = {'cmd': 12, 'command': 12, 'exec': 12, 'shell': 12, 'sql': 11, 'query': 8, 'search': 7, 'file': 10, 'path': 10, 'include': 10, 'template': 9, 'upload': 8, 'url': 9, 'uri': 8, 'redirect': 8, 'callback': 8, 'webhook': 8, 'admin': 8, 'role': 8, 'user': 6, 'uid': 7, 'id': 5, 'token': 7, 'debug': 7, 'api': 5, 'xml': 7, 'deserialize': 10, 'xss': 10, 'sqli': 11, 'ssrf': 11, 'lfi': 11, 'rfi': 11}
     return sum((weight for term, weight in weights.items() if (term in tokens if len(term) <= 3 else term in text)))
 
+# Request classification marks cases that belong to an authentication flow.
 def _is_login_case(case: dict[str, Any]) -> bool:
     path = urlparse(str(case.get('url', ''))).path.lower()
     parameters = {str(value).lower() for value in case.get('parameters', [])}
     return path.endswith('/login') or path.endswith('/login.php') or bool({'username', 'password'} <= parameters)
 
+# Query inspection detects URLs made only of automatic index-style parameters.
 def _is_auto_index_url(url: str) -> bool:
-    """Identify Apache/nginx directory-list sorting links such as ?C=D;O=A."""
+
     parsed = urlparse(str(url))
     names = {name.lower() for name, _ in parse_qsl(parsed.query.replace(';', '&'), keep_blank_values=True)}
     return bool(names) and names <= AUTO_INDEX_PARAMETERS and parsed.path.endswith('/')
 
+# Parameter inspection detects request cases that contain only automatic index values.
 def _is_auto_index_case(case: dict[str, Any]) -> bool:
     names = {str(value).lower() for value in case.get('parameters', [])}
     return _is_auto_index_url(str(case.get('url', ''))) or (bool(names) and names <= AUTO_INDEX_PARAMETERS and urlparse(str(case.get('url', ''))).path.endswith('/'))
@@ -978,14 +1040,16 @@ COMMAND_HINTS = {'cmd', 'command', 'exec', 'shell', 'ip', 'host', 'hostname', 'p
 TRAVERSAL_HINTS = {'file', 'filename', 'path', 'page', 'include', 'template', 'document', 'folder', 'dir', 'directory', 'view', 'resource', 'download'}
 IDOR_HINTS = {'id', 'uid', 'user_id', 'account_id', 'object_id', 'item_id', 'order_id', 'document_id', 'file_id', 'profile_id'}
 
+# Parameter extraction lists the names available in a normalized request case.
 def _case_parameters(case: dict[str, Any]) -> set[str]:
     parameters = {str(value).lower() for value in case.get('parameters', []) if str(value)}
     parsed = urlparse(str(case.get('url', '')))
     parameters.update((name.lower() for name, _ in parse_qsl(parsed.query, keep_blank_values=True)))
     return parameters
 
+# XSS routing sends DOM-oriented cases to the browser when that gives better coverage.
 def _prefer_browser_for_xss_case(case: dict[str, Any]) -> bool:
-    """Return True when a real browser is better suited than Dalfox CLI."""
+
     method = str(case.get('method', 'GET')).upper()
     fields = [item for item in case.get('fields', []) if isinstance(item, dict)]
     field_types = {str(item.get('type') or item.get('tag') or '').lower() for item in fields}
@@ -995,8 +1059,9 @@ def _prefer_browser_for_xss_case(case: dict[str, Any]) -> bool:
     dom_shape = method == 'GET' and ('select' in field_types or bool(case.get('client_sources')) or bool(case.get('client_side_evidence'))) and any((token in path for token in ('xss', 'dom', 'javascript', 'client')))
     return stored_shape or dom_shape
 
+# Scores one request case for a specific scanner.
 def _tool_case_priority(tool: str, case: dict[str, Any]) -> int:
-    """Score request cases for the scanner that is actually suited to them."""
+
     if _is_auto_index_case(case):
         return -1000
     url = str(case.get('url', ''))
@@ -1056,6 +1121,7 @@ def _tool_case_priority(tool: str, case: dict[str, Any]) -> int:
         return score
     return score
 
+# Explains why a request case should not be sent to a scanner.
 def _tool_case_skip_reason(tool: str, case: dict[str, Any]) -> str:
     if not [value for value in case.get('parameters', []) if str(value)]:
         return 'The request has no testable application parameter for this parameter scanner.'
@@ -1073,8 +1139,9 @@ def _tool_case_skip_reason(tool: str, case: dict[str, Any]) -> str:
         return f"The request was not selected because its path and parameters do not match {tool}'s vulnerability class."
     return ''
 
+# Chooses the best request cases for one scanner and scan profile.
 def select_tool_request_cases(discovery: dict[str, Any], tool: str, limit: int | None=None) -> list[dict[str, Any]]:
-    """Choose the highest-value request cases separately for each scanner."""
+
     effective_limit = limit or PARAMETER_TOOL_CASE_LIMITS.get(tool, MAX_PARAMETER_ENDPOINTS)
     cases = [case for case in discovery.get('request_cases', []) if isinstance(case, dict)]
     known = {str(case.get('url') or '') for case in cases}
@@ -1102,9 +1169,7 @@ def select_tool_request_cases(discovery: dict[str, Any], tool: str, limit: int |
         if len(selected) >= effective_limit:
             break
 
-    # Deep mode deliberately back-fills a small number of safe generic GET
-    # contracts for SQLMap/Dalfox. This increases request-class coverage instead
-    # of merely increasing timeouts on the same obvious endpoints.
+
     if CURRENT_SCAN_MODE == 'deep' and tool in {'sqlmap', 'dalfox'} and len(selected) < effective_limit:
         extra_budget = min(2, effective_limit - len(selected))
         extras: list[tuple[int, int, dict[str, Any]]] = []
@@ -1136,6 +1201,7 @@ def select_tool_request_cases(discovery: dict[str, Any], tool: str, limit: int |
 WORKFLOW_STATE_HINTS = {'change', 'update', 'save', 'create', 'submit', 'send', 'comment', 'message', 'feedback', 'upload', 'password', 'email', 'profile', 'settings', 'transfer', 'captcha', 'admin'}
 WORKFLOW_DESTRUCTIVE_HINTS = {'logout', 'signout', 'logoff', 'setup', 'install', 'delete', 'remove', 'drop', 'truncate', 'purge', 'wipe', 'reset'}
 
+# Collects field names from the query string and request body.
 def _case_field_names(case: dict[str, Any]) -> set[str]:
     names = _case_parameters(case)
     names.update((str(value).lower() for value in case.get('file_parameters', []) if str(value)))
@@ -1145,6 +1211,7 @@ def _case_field_names(case: dict[str, Any]) -> set[str]:
             names.add(str(field['name']).lower())
     return names
 
+# Builds a stable key used to remove duplicate browser cases.
 def _browser_url_key(value: str) -> tuple[str, str, int, str]:
     parsed = urlparse(str(value or ''))
     port = parsed.port or (443 if parsed.scheme.lower() == 'https' else 80)
@@ -1153,6 +1220,7 @@ def _browser_url_key(value: str) -> tuple[str, str, int, str]:
         path = path.rstrip('/')
     return (parsed.scheme.lower(), (parsed.hostname or '').lower(), port, path.lower())
 
+# Scores a request case for browser-based checks.
 def _browser_case_priority(case: dict[str, Any], client_keys: set[tuple[str, str, int, str]]) -> int:
     url = str(case.get('url', ''))
     path = urlparse(url).path.lower()
@@ -1183,8 +1251,9 @@ def _browser_case_priority(case: dict[str, Any], client_keys: set[tuple[str, str
         score -= 60
     return score
 
+# Chooses pages and requests that are useful for browser checks.
 def select_browser_request_cases(discovery: dict[str, Any], limit: int | None=None) -> list[dict[str, Any]]:
-    """Select request contracts while preserving client-side source/sink evidence."""
+
     effective_limit = limit or PARAMETER_TOOL_CASE_LIMITS.get('browser', 2)
     raw_client = [dict(item) for item in discovery.get('client_side_candidates', []) if isinstance(item, dict) and str(item.get('url') or '')]
     client_by_key: dict[tuple[str, str, int, str], list[dict[str, Any]]] = {}
@@ -1247,6 +1316,7 @@ def select_browser_request_cases(discovery: dict[str, Any], limit: int | None=No
             seen.add((str(case.get('method', 'GET')).upper(), _browser_url_key(str(case.get('url', ''))), tuple(sorted(str(value) for value in case.get('parameters', []) if str(value)))))
     return selected
 
+# Scores a request case for multi-step workflow checks.
 def _workflow_case_priority(case: dict[str, Any]) -> int:
     if str(case.get('method', 'GET')).upper() != 'POST':
         return -1000
@@ -1273,8 +1343,9 @@ def _workflow_case_priority(case: dict[str, Any]) -> int:
         score += 15
     return score
 
+# Chooses request cases that are useful for workflow checks.
 def select_workflow_request_cases(discovery: dict[str, Any], limit: int | None=None) -> list[dict[str, Any]]:
-    """Select generic CSRF, upload, authentication and CAPTCHA workflow contracts."""
+
     effective_limit = limit or PARAMETER_TOOL_CASE_LIMITS.get('workflow', 3)
     ranked: list[tuple[int, int, dict[str, Any]]] = []
     for index, case in enumerate(discovery.get('request_cases', [])):
@@ -1303,8 +1374,9 @@ def select_workflow_request_cases(discovery: dict[str, Any], limit: int | None=N
             break
     return selected
 
+# Chooses safe endpoints where Arjun can look for hidden parameters.
 def select_arjun_candidates(discovery: dict[str, Any], target: str, limit: int=MAX_ARJUN_ENDPOINTS) -> list[str]:
-    """Rank Arjun targets by likely security value without blanket-excluding useful pages."""
+
     form_urls = {normalize_url(str(url)) for url in discovery.get('form_urls', [])}
     request_cases = [case for case in discovery.get('request_cases', []) if isinstance(case, dict)]
     case_by_url: dict[str, list[dict[str, Any]]] = {}
@@ -1354,8 +1426,9 @@ AUTHORIZATION_PATH_HINTS = {'admin', 'account', 'accounts', 'profile', 'profiles
 AUTHORIZATION_PARAMETER_HINTS = {'id', 'uid', 'user', 'user_id', 'userid', 'account', 'account_id', 'member', 'member_id', 'profile', 'profile_id', 'order', 'order_id', 'invoice', 'invoice_id', 'document', 'document_id', 'record', 'record_id', 'file', 'file_id', 'download', 'report', 'report_id', 'customer', 'customer_id', 'owner', 'owner_id', 'tenant', 'tenant_id', 'role', 'role_id'}
 AUTHORIZATION_EXCLUDED_PATH_HINTS = {'login', 'signin', 'sign-in', 'logout', 'signout', 'logoff', 'setup', 'install', 'reset', 'delete', 'remove', 'drop', 'truncate', 'purge', 'wipe', 'csrf', 'captcha', 'xss', 'sqli', 'exec', 'command', 'docs', 'documentation', 'instructions', 'help', 'about', 'changelog', 'license', 'copying', 'readme', 'static', 'assets'}
 
+# Scores a request case for read-only authorization checks.
 def _authorization_case_priority(case: dict[str, Any]) -> int:
-    """Rank read-only endpoints where identity or ownership should plausibly matter."""
+
     url = str(case.get('url') or '')
     method = str(case.get('method') or 'GET').upper()
     if not url or method != 'GET' or _is_auto_index_case(case) or _destructive_crawl_url(url):
@@ -1384,8 +1457,9 @@ def _authorization_case_priority(case: dict[str, Any]) -> int:
         return -1000
     return score
 
+# Chooses requests that can be compared for authorization differences.
 def select_authorization_request_cases(discovery: dict[str, Any], limit: int | None=None) -> list[dict[str, Any]]:
-    """Select same-origin, read-only requests for anonymous/two-account comparison."""
+
     effective_limit = limit or PARAMETER_TOOL_CASE_LIMITS.get('authorization', 3)
     cases = [dict(case) for case in discovery.get('request_cases', []) if isinstance(case, dict)]
     known = {str(case.get('url') or '') for case in cases}
@@ -1409,8 +1483,8 @@ def select_authorization_request_cases(discovery: dict[str, Any], limit: int | N
         if len(selected) >= effective_limit:
             break
     if CURRENT_SCAN_MODE == 'deep' and len(selected) < effective_limit:
-        # Anonymous-vs-authenticated comparison still adds useful breadth on
-        # safe read-only parameterized pages even without a second identity.
+
+
         extras: list[tuple[int, dict[str, Any]]] = []
         for case in cases:
             url = str(case.get('url') or '')
@@ -1430,8 +1504,9 @@ def select_authorization_request_cases(discovery: dict[str, Any], limit: int | N
             selected.append(case)
     return selected
 
+# Chooses and limits the endpoints sent to Arjun.
 def select_arjun_request_cases(discovery: dict[str, Any], target: str, limit: int=MAX_ARJUN_ENDPOINTS) -> list[dict[str, Any]]:
-    """Select only endpoints where hidden-name discovery adds real coverage."""
+
     ranked: list[tuple[int, dict[str, Any]]] = []
     represented_paths: set[str] = set()
     for case in discovery.get('request_cases', []):
@@ -1505,8 +1580,9 @@ def select_arjun_request_cases(discovery: dict[str, Any], target: str, limit: in
             break
     return selected
 
+# Selects generic request cases using a score and a fixed limit.
 def select_request_cases(discovery: dict[str, Any], limit: int=MAX_PARAMETER_ENDPOINTS) -> list[dict[str, Any]]:
-    """Select non-destructive cases, ranking likely injection/authorization inputs first."""
+
     cases = list(discovery.get('request_cases', []))
     known_urls = {str(case.get('url', '')) for case in cases}
     for url in discovery.get('parameterized_urls', []):
@@ -1536,6 +1612,7 @@ def select_request_cases(discovery: dict[str, Any], limit: int=MAX_PARAMETER_END
     ranked.sort(key=lambda item: (-item[0], str(item[1].get('url', ''))))
     return [case for _, case in ranked[:limit]]
 
+# Replaces one parameter value while keeping the rest of the request unchanged.
 def _replace_parameter_value(pairs: list[tuple[str, str]], parameter: str, value: str) -> list[tuple[str, str]]:
     replaced = False
     updated: list[tuple[str, str]] = []
@@ -1549,8 +1626,9 @@ def _replace_parameter_value(pairs: list[tuple[str, str]], parameter: str, value
         updated.append((parameter, value))
     return updated
 
+# Chooses request cases that can support out-of-band callback checks.
 def select_oast_request_cases(discovery: dict[str, Any], target: str, limit: int=1) -> list[dict[str, Any]]:
-    """Select concrete GET/POST inputs suitable for an Interactsh OAST probe."""
+
     ranked: list[tuple[int, dict[str, Any]]] = []
     for case in discovery.get('request_cases', []):
         if not isinstance(case, dict):
@@ -1600,6 +1678,7 @@ def select_oast_request_cases(discovery: dict[str, Any], target: str, limit: int
             break
     return selected
 
+# Adds hidden parameters found by Arjun to the discovery data.
 def enrich_discovery_with_arjun(discovery: dict[str, Any], result: dict[str, Any], base_url: str) -> tuple[dict[str, Any], list[str]]:
     parameters = {str(item).strip() for item in result.get('parameters', []) if str(item).strip()}
     parameters.update((str(item.get('parameter', '')).strip() for item in result.get('vulnerabilities', []) if isinstance(item, dict)))
@@ -1613,8 +1692,9 @@ def enrich_discovery_with_arjun(discovery: dict[str, Any], result: dict[str, Any
     updated['request_cases'] = _dedupe_request_cases([*updated.get('request_cases', []), *generated_cases])
     return (updated, generated)
 
+# Adds useful URLs found by FFUF to the discovery data.
 def enrich_discovery_with_ffuf(discovery: dict[str, Any], result: dict[str, Any], target: str) -> tuple[dict[str, Any], list[str]]:
-    """Merge only same-origin, non-destructive FFUF discoveries."""
+
     safe_urls: set[str] = set()
     blocked: set[str] = set(discovery.get('destructive_urls_skipped', []))
     for item in result.get('vulnerabilities', []):
@@ -1635,9 +1715,11 @@ def enrich_discovery_with_ffuf(discovery: dict[str, Any], result: dict[str, Any]
     updated['destructive_urls_skipped'] = sorted(blocked)
     return (updated, urls)
 
+# Skipped runs use a common result shape with an explicit reason.
 def make_skipped_result(tool: str, target: str, reason: str) -> dict[str, Any]:
     return _result(tool, target, 'skipped', reason, 'not_applicable')
 
+# Prints ZAP coverage and authentication details from the scan result.
 def log_zap_session_diagnostics(result: dict[str, Any]) -> None:
     diagnostics = result.get('session_diagnostics') if isinstance(result.get('session_diagnostics'), dict) else {}
     before = diagnostics.get('before_scan') if isinstance(diagnostics.get('before_scan'), dict) else diagnostics
@@ -1645,6 +1727,7 @@ def log_zap_session_diagnostics(result: dict[str, Any]) -> None:
     if not before:
         return
 
+    # Prints coverage for the operator.
     def print_coverage() -> None:
         if 'targeted_active_scans_started' not in result:
             return
@@ -1706,6 +1789,7 @@ def log_zap_session_diagnostics(result: dict[str, Any]) -> None:
             print(f"    [ZAP AUTH ROOT CAUSE] {after['root_cause']}")
     print_coverage()
 
+# Prints one tool result using the same status format across the project.
 def log_result(profile: str, name: str, result: dict[str, Any], target: str='') -> None:
     raw_status = str(result.get('status', 'error')).lower()
     limited = raw_status == 'partial' and _is_time_limited(result)
@@ -1755,6 +1839,7 @@ def log_result(profile: str, name: str, result: dict[str, Any], target: str='') 
         if baseline.get('performed'):
             print(f"    [NIKTO BASELINE] status={baseline.get('status', 'n/a')}; server={baseline.get('server') or 'not-disclosed'}; signals={baseline.get('signal_count', 0)}; missing headers={','.join(baseline.get('missing_security_headers') or []) or 'none'}")
 
+# Combines repeated tool runs into one summary for the report.
 def aggregate_runs(tool: str, target: str, runs: list[dict[str, Any]]) -> dict[str, Any]:
     if not runs:
         return make_skipped_result(tool, target, 'No applicable endpoint was discovered for this tool.')
@@ -1786,6 +1871,7 @@ def aggregate_runs(tool: str, target: str, runs: list[dict[str, Any]]) -> dict[s
     result = {'tool': tool, 'status': status, 'target': target, 'output': f'Runs: {len(normalized)}; successful: {successful}; time-limited: {limited}; other partial: {max(0, partials - limited)}; errors: {errors}; skipped: {skipped_count}; findings: {len(vulnerabilities)}.', 'vulnerabilities': vulnerabilities, 'runs': normalized, 'diagnosis': 'nested_scanner_errors' if errors else 'time_limit_reached' if limited else 'nested_partial_results' if partials else None, 'timed_out': bool(limited)}
     return result
 
+# Walks nested results and yields the final tool result objects.
 def iter_leaf_results(value: Any, path: tuple[str, ...]=()) -> Iterator[tuple[tuple[str, ...], dict[str, Any]]]:
     if isinstance(value, dict) and 'status' in value:
         runs = value.get('runs')
@@ -1798,6 +1884,7 @@ def iter_leaf_results(value: Any, path: tuple[str, ...]=()) -> Iterator[tuple[tu
         for key, nested in value.items():
             yield from iter_leaf_results(nested, (*path, str(key)))
 
+# Writes a small JSON report if the normal reporting path cannot finish.
 def write_emergency_json_report(target: str, results: dict[str, Any], diagnostics: list[dict[str, Any]], reason: str, output_name: str='SecOps_Emergency') -> str | None:
     try:
         directory = ROOT / 'reports'
@@ -1813,17 +1900,20 @@ def write_emergency_json_report(target: str, results: dict[str, Any], diagnostic
         print(f'[REPORT FALLBACK ERROR] {exc}', file=sys.stderr)
         return None
 
+# Chooses a stable URL used to check the current session.
 def select_session_probe_url(discovery: dict[str, Any], target: str) -> str:
-    """Choose a stable non-destructive page for session checks."""
+
     discovered = [str(value) for value in discovery.get('html_urls', []) if isinstance(value, str) and same_origin(target, value) and (not _is_auto_index_url(value))]
     return _stable_auth_probe_url(target, discovered)
 
+# Safety policy decides whether state-changing tests are allowed for the current target.
 def state_changing_tests_allowed(target: str, explicit: bool=False) -> bool:
-    """Allow bounded state-changing probes on local labs or by explicit opt-in."""
+
     return bool(explicit) or urlparse(target).hostname in {'127.0.0.1', 'localhost', '::1'}
 
+# Adds the command-line options shared by both orchestrators.
 def add_common_cli_arguments(parser: argparse.ArgumentParser, *, require_target: bool) -> None:
-    """Register CLI options shared by Deterministic and Agentic."""
+
     if require_target:
         parser.add_argument('--target', required=True)
     else:
@@ -1838,8 +1928,9 @@ def add_common_cli_arguments(parser: argparse.ArgumentParser, *, require_target:
     parser.add_argument('--interactsh-injection-url', default='')
     parser.add_argument('--mode', choices=('fast', 'balanced', 'deep'), default='balanced', help='Trade coverage for runtime; balanced is the default.')
 
+# Validates the command line and builds target, profile, and cookie settings.
 def prepare_cli_context(parser: argparse.ArgumentParser, args: argparse.Namespace) -> tuple[str, list[dict[str, str]], str, str, str]:
-    """Validate target/auth options and build the profiles used by both orchestrators."""
+
     target = normalize_url(args.target)
     local_hosts = {'127.0.0.1', 'localhost', '::1'}
     if urlparse(target).hostname not in local_hosts and (not args.authorized):
@@ -1871,8 +1962,9 @@ def prepare_cli_context(parser: argparse.ArgumentParser, args: argparse.Namespac
         print('[*] Secondary identity cookie names: ' + ', '.join(cookie_names(secondary_cookie)))
     return (target, profiles, normalized_cookie, secondary_cookie, injection_url)
 
+# Builds the arguments sent to each MCP tool from discovery data.
 def build_tool_arguments(tool: str, target_url: str, cookies: str, discovery: dict[str, Any], *, case: dict[str, Any] | None=None, secondary_cookies: str='', allow_state_changes: bool=False, timeout_override: int=0, diagnostic_only: bool=False, single_tool: bool=False) -> dict[str, Any]:
-    """Build one canonical MCP argument contract for both orchestrators."""
+
     case = case or {}
     arguments: dict[str, Any] = {'target_url': target_url, 'cookies': cookies}
     if tool in BROAD_SCANNER_TIMEOUTS:
@@ -1927,6 +2019,7 @@ def build_tool_arguments(tool: str, target_url: str, cookies: str, discovery: di
                 arguments['known_urls'] = list(discovery.get('urls', []))
     return arguments
 
+# Counts tool errors, skips, and partial runs across the assessment.
 def summarize_results(results: dict[str, Any]) -> tuple[int, int, int]:
     errors = skips = partial = 0
     rows = []
@@ -1943,8 +2036,9 @@ def summarize_results(results: dict[str, Any]) -> tuple[int, int, int]:
             print(f'[-] {path}: {cause} — {detail[:500]}', file=sys.stderr)
     return (errors, skips, partial)
 
+# Reuses the report deduplicator for the terminal finding summary.
 def _report_flatten_findings_for_summary(results: dict[str, Any]) -> list[dict[str, Any]]:
-    """Load the project report normalizer by file path so terminal counts match the report exactly."""
+
     report_path = SERVERS / 'reportServer.py'
     if not report_path.is_file():
         raise FileNotFoundError(report_path)
@@ -1956,10 +2050,8 @@ def _report_flatten_findings_for_summary(results: dict[str, Any]) -> list[dict[s
             raise ImportError(f'Cannot load report normalizer from {report_path}')
         module = importlib.util.module_from_spec(spec)
         sys.modules[module_name] = module
-        # reportServer.py normally runs as a script from servers/, so any local
-        # helper imports resolve from that directory.  Recreate that import
-        # environment for this read-only normalizer load without changing the
-        # report server itself.
+
+
         added_paths = []
         for candidate in (str(SERVERS), str(ROOT)):
             if candidate not in sys.path:
@@ -1983,8 +2075,9 @@ def _report_flatten_findings_for_summary(results: dict[str, Any]) -> list[dict[s
     return [row for row in rows if isinstance(row, dict)]
 
 
+# Prints the deduplicated confirmed findings and candidates at the end.
 def print_security_finding_summary(results: dict[str, Any]) -> None:
-    """Print the same normalized and semantically deduplicated findings used by the report."""
+
     try:
         rows = _report_flatten_findings_for_summary(results)
     except Exception as exc:

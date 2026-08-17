@@ -17,6 +17,7 @@ from setupTools import (
 )
 from utils import setup_path
 
+# Before normal execution, live preflight catches configuration problems that would break later scans.
 def run_preflight() -> None:
     script = ROOT / "orchestratorDeterministic.py"
     environment = {"PATH": os.environ.get("PATH", "")}
@@ -37,8 +38,9 @@ def run_preflight() -> None:
             )
         raise RuntimeError("The live orchestrator preflight failed.\n" + combined[-2500:])
 
+# Reads the operator guide from disk and falls back to a minimal built-in version when needed.
 def command_reference_text() -> str:
-    """Return the maintained operator guide instead of duplicating it in Python."""
+
     try:
         return COMMAND_REFERENCE_FILE.read_text(encoding="utf-8")
     except OSError:
@@ -48,23 +50,27 @@ def command_reference_text() -> str:
             "python orchestratorDeterministic.py --target <TARGET> --authorized --preflight-only\n"
         )
 
+# Ensures the operator command guide exists before it is displayed or reused.
 def write_command_reference() -> Path:
     if not COMMAND_REFERENCE_FILE.is_file():
         COMMAND_REFERENCE_FILE.write_text(command_reference_text(), encoding="utf-8")
     return COMMAND_REFERENCE_FILE
 
+# Prints the complete operator guide in a readable terminal format.
 def print_command_reference(path: Path) -> None:
     print("\n=== Complete SecOps command reference ===")
     print(command_reference_text().rstrip())
     print(f"\n[+] Command guide written: {path}")
 
+# Builds a copy-and-paste-safe command for the current shell.
 def _operator_command(script: str, *arguments: str) -> str:
-    """Return a copy/paste-safe command for PowerShell or a POSIX shell."""
+
     values = [sys.executable, str(ROOT / script), *arguments]
     return subprocess.list2cmdline(values) if os.name == "nt" else shlex.join(values)
 
+# Loads the latest local-lab cookie so generated examples use the current session.
 def _runtime_cookie_for_commands() -> str:
-    """Return the last generated cookie only for the bundled local target."""
+
     try:
         payload = json.loads(RUNTIME_FILE.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
@@ -73,10 +79,11 @@ def _runtime_cookie_for_commands() -> str:
         return ""
     return str(payload.get("last_auth_cookie") or "").strip()
 
+# Prints the main balanced and deep commands that the operator can run next.
 def print_important_commands(
     model: str, mode: str = "balanced", cookie_header: str = "",
 ) -> None:
-    """Print the four normal authenticated test commands after initialization."""
+
     cookie = cookie_header or "<COOKIE_HEADER>"
     print("\n=== Commands ready to run ===")
     print("Run them from: " + str(ROOT))
@@ -105,6 +112,7 @@ def print_important_commands(
     ))
     print(f"\n[+] Every command and modifier: {COMMAND_REFERENCE_FILE}")
 
+# Parses command-line options and drives the complete workflow for this entrypoint.
 def main() -> int:
     print(f"=== SecOps initializer [{BUILD_ID}] ===")
     parser = argparse.ArgumentParser(
@@ -128,6 +136,7 @@ def main() -> int:
     cookie = ""
     commands_printed = False
     try:
+        # Before scans can run, setup installs the required tools and verifies the local environment.
         guide_path = write_command_reference()
         if args.commands_only:
             print_command_reference(guide_path)
@@ -147,8 +156,8 @@ def main() -> int:
         status = verify_scanners(required=not args.skip_scanners)
         write_runtime_config(status)
 
-        # Create/authenticate the bundled lab before the live MCP preflight so the
-        # final copy/paste commands can always contain the current session cookie.
+
+        # When the operator enables the bundled lab, setup starts it and prepares a fresh authenticated session.
         if args.with_lab:
             cookie = setup_local_lab(args.model)
             update_runtime_auth(cookie)
@@ -172,8 +181,7 @@ def main() -> int:
     except Exception as exc:
         print(f"[-] Initialization failed: {type(exc).__name__}: {exc}", file=sys.stderr)
 
-        # Keep the old operator experience: even when a live preflight fails,
-        # print the useful startup commands instead of ending with no next step.
+
         if not args.commands_only and not commands_printed:
             print_important_commands(
                 args.model, args.mode, cookie or _runtime_cookie_for_commands(),

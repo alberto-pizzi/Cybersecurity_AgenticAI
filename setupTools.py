@@ -47,6 +47,7 @@ IDOR_FORGE_REPOSITORY = 'https://github.com/errorfiathck/IDOR-Forge.git'
 IDOR_FORGE_DIR = LOCAL_OPT / 'idor-forge'
 RELEASE_TOOLS = {'nuclei': ('projectdiscovery/nuclei', 'nuclei'), 'ffuf': ('ffuf/ffuf', 'ffuf'), 'dalfox': ('hahwul/dalfox', 'dalfox'), 'interactsh-client': ('projectdiscovery/interactsh', 'interactsh-client')}
 
+# Setup commands use one wrapper so timeouts and process failures produce consistent errors.
 def run(command: list[str], *, required: bool=True, capture: bool=False, show_output: bool=True, timeout: int=3600, cwd: Path | None=None, env_overrides: dict[str, str] | None=None) -> subprocess.CompletedProcess[str]:
     print('[+] ' + subprocess.list2cmdline(command))
     try:
@@ -72,10 +73,12 @@ def run(command: list[str], *, required: bool=True, capture: bool=False, show_ou
         raise RuntimeError(f"Command failed ({result.returncode}): {subprocess.list2cmdline(command)}\n{(stderr if capture else '')}")
     return result
 
+# Joins captured stdout and stderr into one diagnostic string.
 def _process_output(result: subprocess.CompletedProcess[str], limit: int=0) -> str:
     text = '\n'.join((part for part in ((result.stdout or '').strip(), (result.stderr or '').strip()) if part))
     return text[-limit:] if limit else text
 
+# Downloads a file to the local tool cache.
 def _download_file(url: str, destination: Path, timeout: int=180) -> None:
     destination.parent.mkdir(parents=True, exist_ok=True)
     with requests.get(url, stream=True, timeout=timeout) as response:
@@ -85,6 +88,7 @@ def _download_file(url: str, destination: Path, timeout: int=180) -> None:
                 if chunk:
                     handle.write(chunk)
 
+# Extracts a downloaded ZIP or tar.gz archive.
 def _extract_archive(archive: Path, destination: Path) -> None:
     shutil.rmtree(destination, ignore_errors=True)
     destination.mkdir(parents=True, exist_ok=True)
@@ -95,6 +99,7 @@ def _extract_archive(archive: Path, destination: Path) -> None:
         with tarfile.open(archive, 'r:gz') as source:
             source.extractall(destination)
 
+# Adds one existing directory to PATH when needed.
 def _add_path(path: Path) -> None:
     if not path.is_dir():
         return
@@ -103,6 +108,7 @@ def _add_path(path: Path) -> None:
     if os.path.normcase(resolved) not in {os.path.normcase(os.path.abspath(part)) for part in current}:
         os.environ['PATH'] = resolved + os.pathsep + os.environ.get('PATH', '')
 
+# Local tool setup creates the required folders and exposes their executable locations through PATH.
 def configure_path() -> list[str]:
     for directory in (LOCAL_BIN, LOCAL_OPT, DOWNLOADS):
         directory.mkdir(parents=True, exist_ok=True)
@@ -126,6 +132,7 @@ def configure_path() -> list[str]:
             added.append(str(path.resolve()))
     return list(dict.fromkeys(added))
 
+# Finds an installed command in the project tool folders or system PATH.
 def command_path(name: str) -> str | None:
     configure_path()
     candidate_names = [name]
@@ -138,6 +145,7 @@ def command_path(name: str) -> str | None:
     value = shutil.which(name)
     return str(Path(value).resolve()) if value else None
 
+# Writes a small launcher script for a Python-based scanner.
 def write_launcher(name: str, command: list[str]) -> Path:
     LOCAL_BIN.mkdir(parents=True, exist_ok=True)
     if os.name == 'nt':
@@ -152,15 +160,17 @@ def write_launcher(name: str, command: list[str]) -> Path:
     print(f'[+] Launcher created: {path}')
     return path
 
+# FastMCP verification confirms that the required version imports correctly.
 def _verify_fastmcp_import() -> tuple[bool, str]:
-    """Verify the FastMCP API and exact pinned version used by the project."""
+
     probe_code = f"import importlib.metadata as metadata; from fastmcp import Client, FastMCP; assert metadata.version('fastmcp') == '{FASTMCP_VERSION}'; print(metadata.version('fastmcp'))"
     probe = run([sys.executable, '-c', probe_code], required=False, capture=True, show_output=False, timeout=60)
     detail = _process_output(probe)
     return (probe.returncode == 0, detail)
 
+# Removes stale FastMCP package files before a clean reinstall.
 def _purge_fastmcp_package_tree() -> None:
-    """Remove stale FastMCP v2/v3 files before a clean pinned reinstall."""
+
     purelib = Path(sysconfig.get_paths()['purelib'])
     targets = [purelib / 'fastmcp', *purelib.glob('fastmcp*.dist-info')]
     for target in targets:
@@ -169,19 +179,17 @@ def _purge_fastmcp_package_tree() -> None:
         elif target.exists():
             target.unlink()
 
+# Installs the pinned FastMCP version after removing stale files.
 def _install_fastmcp_clean() -> None:
-    """Install the pinned stable FastMCP release from a clean package state."""
+
     run([sys.executable, '-m', 'pip', 'uninstall', '-y', 'fastmcp', 'fastmcp-slim'], required=False, capture=True, show_output=False, timeout=300)
     _purge_fastmcp_package_tree()
     run([sys.executable, '-m', 'pip', 'install', '--no-cache-dir', '--force-reinstall', FASTMCP_REQUIREMENT, *COMPATIBILITY_REQUIREMENTS], timeout=1800)
 
+# Dependency inspection reports packages that are missing or outside the supported version range.
 def _missing_python_packages() -> list[str]:
-    """Return only missing or version-incompatible requirements.
 
-    This avoids contacting PyPI on every initializer run. It is especially
-    important for offline/local-lab runs where all dependencies are already
-    installed but DNS is temporarily unavailable.
-    """
+
     missing: list[str] = []
     for raw in PYTHON_PACKAGES:
         requirement = Requirement(raw)
@@ -194,8 +202,9 @@ def _missing_python_packages() -> list[str]:
             missing.append(raw)
     return missing
 
+# Installs the Python dependencies needed by the project.
 def install_python_packages() -> None:
-    """Install pinned dependencies and keep FastMCP on a clean stable v3 runtime."""
+
     try:
         importlib.metadata.version('python-owasp-zap-v2.4')
     except importlib.metadata.PackageNotFoundError:
@@ -222,15 +231,17 @@ def install_python_packages() -> None:
     print('[+] Python dependency graph is consistent (pip check).')
     configure_path()
 
+# Browser verification confirms that Playwright can launch Chromium successfully.
 def _playwright_chromium_ready() -> tuple[bool, str]:
-    """Verify that Chromium can launch from the exact active interpreter."""
+
     probe_code = 'from playwright.sync_api import sync_playwright; p=sync_playwright().start(); b=p.chromium.launch(headless=True); print(b.version); b.close(); p.stop()'
     probe = run([sys.executable, '-c', probe_code], required=False, capture=True, show_output=False, timeout=120)
     detail = _process_output(probe)
     return (probe.returncode == 0, detail)
 
+# Installs Chromium for browser checks and verifies that it can start.
 def install_playwright_browser(*, required: bool=False) -> bool:
-    """Install/verify the Chromium runtime used by the optional browser scanner."""
+
     ready, detail = _playwright_chromium_ready()
     if ready:
         print(f"[+] Playwright Chromium ready: {(detail.splitlines()[-1] if detail else 'launch verified')}")
@@ -249,6 +260,7 @@ def install_playwright_browser(*, required: bool=False) -> bool:
     print(f'[!] {message}\n[!] Browser-only checks will be reported as skipped; all other scanners remain available.', file=sys.stderr)
     return False
 
+# Clones a Git repository or updates an existing local copy.
 def clone_or_update(url: str, destination: Path) -> None:
     if not shutil.which('git'):
         raise RuntimeError('Git is required to install repository-based tools.')
@@ -263,6 +275,7 @@ def clone_or_update(url: str, destination: Path) -> None:
     destination.parent.mkdir(parents=True, exist_ok=True)
     run(['git', 'clone', '--depth', '1', url, str(destination)], timeout=1200)
 
+# Installs a scanner directly from its upstream Git repository.
 def install_repository_tool(name: str, repository: str, script_name: str) -> None:
     if command_path(name):
         print(f'[+] {name} already available: {command_path(name)}')
@@ -274,6 +287,7 @@ def install_repository_tool(name: str, repository: str, script_name: str) -> Non
         raise RuntimeError(f'Missing {script_name} after cloning {name}.')
     write_launcher(name, [sys.executable, str(script)])
 
+# Reads the Python requirements needed by the upstream IDOR-Forge project.
 def _idor_forge_runtime_requirements(requirements: Path) -> list[str]:
     packages: list[str] = []
     for raw_line in requirements.read_text(encoding='utf-8').splitlines():
@@ -302,6 +316,7 @@ def _idor_forge_runtime_requirements(requirements: Path) -> list[str]:
         raise RuntimeError('IDOR-Forge requirements.txt did not contain usable runtime dependencies.')
     return packages
 
+# Installs the upstream IDOR-Forge project and creates its launcher.
 def install_idor_forge() -> dict[str, Any]:
     global _IDOR_FORGE_STATE
     clone_or_update(IDOR_FORGE_REPOSITORY, IDOR_FORGE_DIR)
@@ -326,6 +341,7 @@ def install_idor_forge() -> dict[str, Any]:
     print(f'[+] IDOR-Forge upstream runtime ready: {IDOR_FORGE_DIR}')
     return dict(_IDOR_FORGE_STATE)
 
+# Finds a usable Perl interpreter for Nikto when native execution is possible.
 def find_perl() -> str | None:
     found = shutil.which('perl')
     if found:
@@ -341,6 +357,7 @@ def find_perl() -> str | None:
             return str(candidate)
     return None
 
+# Perl diagnostics provide a short reinstall hint for the detected runtime.
 def _perl_reinstall_hint() -> str:
     if os.name == 'nt':
         return 'Install/repair Strawberry Perl with:\n  winget uninstall --id StrawberryPerl.StrawberryPerl --exact\n  winget install --id StrawberryPerl.StrawberryPerl --exact'
@@ -348,14 +365,16 @@ def _perl_reinstall_hint() -> str:
         return 'Install the macOS build tools and Perl with:\n  xcode-select --install\n  brew install perl cpanminus'
     return 'Install Perl and build tools with your package manager, for example:\n  sudo apt install perl cpanminus build-essential'
 
+# Perl module probing verifies that an optional module can be loaded.
 def _perl_module_available(perl: Path, module: str) -> tuple[bool, str]:
     probe = run([str(perl), f'-M{module}', '-e', f'print ${module}::VERSION'], required=False, capture=True, show_output=False, timeout=60)
     parts = [(probe.stdout or '').strip(), (probe.stderr or '').strip()]
     detail = '\n'.join((part for part in parts if part))
     return (probe.returncode == 0, detail)
 
+# Finds the root folder of a Strawberry Perl installation.
 def _strawberry_root(perl: Path) -> Path:
-    """Return the Strawberry root on Windows; a harmless parent elsewhere."""
+
     resolved = perl.resolve()
     if os.name == 'nt':
         parts = [part.lower() for part in resolved.parts]
@@ -367,8 +386,9 @@ def _strawberry_root(perl: Path) -> Path:
             pass
     return resolved.parent.parent
 
+# Prepares the Perl build tools needed for optional Nikto modules.
 def _configure_perl_toolchain(perl: Path) -> tuple[Path | None, str]:
-    """Resolve the make/compiler toolchain on Windows, macOS and Linux."""
+
     is_windows = os.name == 'nt'
     root = _strawberry_root(perl) if is_windows else None
     tool_dirs = (perl.parent, root / 'c' / 'bin', root / 'perl' / 'site' / 'bin') if root is not None else (perl.parent,)
@@ -391,8 +411,9 @@ def _configure_perl_toolchain(perl: Path) -> tuple[Path | None, str]:
     detail = f"configured make={configured_name}; resolved={make or 'missing'}; root={root or 'n/a'}"
     return (make, detail)
 
+# Installs one missing Perl module and verifies it afterward.
 def _install_perl_module(perl: Path, module: str) -> None:
-    """Install a missing Perl module through cpanm or CPAN."""
+
     make, toolchain_detail = _configure_perl_toolchain(perl)
     if make is None:
         raise RuntimeError(f'Perl is missing the required build toolchain. {toolchain_detail}\n{_perl_reinstall_hint()}')
@@ -416,8 +437,9 @@ def _install_perl_module(perl: Path, module: str) -> None:
         diagnostics = '\n--- installer attempt ---\n'.join((value for value in attempts if value))
         raise RuntimeError(f'Perl module {module} could not be installed. {toolchain_detail}. {detail}\n{diagnostics}\nInstall the missing modules manually with: cpan JSON XML::Writer\n{_perl_reinstall_hint()}')
 
+# Writes the native Nikto launcher used when Perl is available.
 def _write_nikto_launcher(perl: Path, script: Path) -> Path:
-    """Create a quoting-safe native Nikto launcher on every platform."""
+
     LOCAL_BIN.mkdir(parents=True, exist_ok=True)
     wrapper = LOCAL_OPT / 'nikto_launcher.py'
     wrapper.write_text(f'import subprocess, sys\nraise SystemExit(subprocess.call([{str(perl)!r}, {str(script)!r}, *sys.argv[1:]]))\n', encoding='utf-8')
@@ -431,6 +453,7 @@ def _write_nikto_launcher(perl: Path, script: Path) -> Path:
     configure_path()
     return launcher
 
+# Nikto probing runs a basic command to confirm that the selected runtime is usable.
 def _nikto_health(perl: Path, script: Path, launcher: Path | None=None) -> tuple[bool, str]:
     fatal = re.compile("(?:can't open perl script|cannot open perl script|invalid argument|required module not found|not recognized|non .? riconosciuto|no such file|modulenotfounderror|traceback|^error:)", re.IGNORECASE | re.MULTILINE)
     commands = [[str(perl), str(script), '-Version']]
@@ -448,16 +471,18 @@ def _nikto_health(perl: Path, script: Path, launcher: Path | None=None) -> tuple
 NIKTO_DOCKER_IMAGE = 'ghcr.io/sullo/nikto:latest'
 NUCLEI_DOCKER_IMAGE = 'projectdiscovery/nuclei:latest'
 REPORT_DOCKER_SOURCE_IMAGE = 'albertopizzi2002/reportingpdf:v1.0'
-# Keep the historical local tag because reportServer.py is intentionally unchanged.
-# The tag now aliases the registry image above; nothing is built from a project Dockerfile.
+
+
 REPORT_DOCKER_IMAGE = 'secops/report:local'
 
+# Docker image lookup avoids pulling an image that is already available locally.
 def _docker_image_ready(image: str) -> bool:
     if not shutil.which('docker'):
         return False
     result = run(['docker', 'image', 'inspect', image], required=False, capture=True, show_output=False, timeout=60)
     return result.returncode == 0
 
+# Pulls a Docker image and verifies that it is available afterward.
 def _pull_docker_image(image: str, timeout: int=1800) -> tuple[bool, str]:
     if not shutil.which('docker'):
         return (False, 'Docker is unavailable.')
@@ -467,6 +492,7 @@ def _pull_docker_image(image: str, timeout: int=1800) -> tuple[bool, str]:
             return (False, _process_output(result, 2000) or 'Docker pull failed.')
     return (True, '')
 
+# Ensures the official Nikto Docker image is available.
 def _ensure_nikto_docker_image() -> bool:
     if _docker_image_ready(NIKTO_DOCKER_IMAGE):
         print(f'[+] Nikto Docker fallback already available: {NIKTO_DOCKER_IMAGE}')
@@ -478,8 +504,9 @@ def _ensure_nikto_docker_image() -> bool:
     print('[!] Nikto Docker image could not be pulled. Native Perl will be checked as a secondary option.')
     return False
 
+# Ensures the official Nuclei Docker image is available.
 def _ensure_nuclei_docker_image() -> tuple[bool, str]:
-    """Install and verify ProjectDiscovery's official Nuclei image."""
+
     ready, detail = _pull_docker_image(NUCLEI_DOCKER_IMAGE)
     if not ready:
         return (False, detail)
@@ -490,13 +517,10 @@ def _ensure_nuclei_docker_image() -> tuple[bool, str]:
         return (True, detail[-1200:])
     return (False, detail[-2000:] or f'docker run exited with {probe.returncode}.')
 
+# Prepares the external reporting image under the local tag expected by the report server.
 def _ensure_report_docker_image() -> bool:
-    """Pull the shared report image and expose it under reportServer's existing tag.
 
-    reportServer.py is intentionally not modified. Its historical Docker fallback
-    expects ``secops/report:local``, so the externally maintained registry image is
-    tagged with that local alias after pulling. No project Dockerfile is required.
-    """
+
     ready, detail = _pull_docker_image(REPORT_DOCKER_SOURCE_IMAGE)
     if not ready:
         print(f'[!] Report Docker image could not be pulled: {REPORT_DOCKER_SOURCE_IMAGE}\n{detail[-1600:]}')
@@ -510,7 +534,7 @@ def _ensure_report_docker_image() -> bool:
         print('[!] Report Docker image was pulled but the local compatibility tag could not be created.')
         return False
 
-    # Probe the exact invocation shape used by the unchanged reportServer.py.
+
     probe = run(
         ['docker', 'run', '--rm', REPORT_DOCKER_IMAGE, 'python', '-m', 'weasyprint', '--info'],
         required=False, capture=True, show_output=False, timeout=120,
@@ -527,6 +551,7 @@ def _ensure_report_docker_image() -> bool:
     )
     return False
 
+# Writes a launcher that runs a scanner through Docker.
 def _write_docker_launcher(name: str, image: str, extra_args: tuple[str, ...]=()) -> Path:
     LOCAL_BIN.mkdir(parents=True, exist_ok=True)
     args = ' '.join(extra_args)
@@ -541,18 +566,21 @@ def _write_docker_launcher(name: str, image: str, extra_args: tuple[str, ...]=()
     configure_path()
     return launcher
 
+# Writes the Docker launcher used for Nikto.
 def _write_nikto_docker_launcher() -> Path:
     launcher = _write_docker_launcher('nikto', NIKTO_DOCKER_IMAGE)
     print(f'[+] Nikto Docker launcher created: {launcher}')
     return launcher
 
+# Writes the Docker launcher used for Nuclei.
 def _write_nuclei_docker_launcher() -> Path:
     launcher = _write_docker_launcher('nuclei-docker', NUCLEI_DOCKER_IMAGE, ('--add-host', 'host.docker.internal:host-gateway'))
     print(f'[+] Nuclei Docker launcher created: {launcher}')
     return launcher
 
+# Selects a working Nikto runtime and creates the matching launcher.
 def install_nikto() -> None:
-    """Prefer the official Docker image; use native Perl when Docker is absent."""
+
     if _ensure_nikto_docker_image():
         _write_nikto_docker_launcher()
         return
@@ -579,6 +607,7 @@ def install_nikto() -> None:
         raise RuntimeError(f'Native Nikto runtime verification failed: {detail}.\n{_perl_reinstall_hint()}')
     print(f'[+] Nikto runtime and launcher verified: {launcher}')
 
+# Ensures Arjun is installed and available on PATH.
 def ensure_arjun() -> None:
     if command_path('arjun'):
         print(f"[+] arjun already available: {command_path('arjun')}")
@@ -588,6 +617,7 @@ def ensure_arjun() -> None:
         return
     raise RuntimeError('Arjun is installed but no executable/module entry point is available.')
 
+# Reads the latest release metadata for an upstream GitHub project.
 def github_release(repository: str) -> dict[str, Any]:
     response = requests.get(f'https://api.github.com/repos/{repository}/releases/latest', headers={'Accept': 'application/vnd.github+json'}, timeout=60)
     response.raise_for_status()
@@ -596,6 +626,7 @@ def github_release(repository: str) -> dict[str, Any]:
         raise RuntimeError(f'Invalid GitHub response for {repository}.')
     return value
 
+# Chooses the release archive that matches the current operating system and CPU.
 def select_asset(release: dict[str, Any], hint: str) -> dict[str, Any]:
     machine = platform.machine().lower()
     arch = ('amd64', 'x86_64', '64bit') if machine in {'amd64', 'x86_64', 'x64'} else ('arm64', 'aarch64')
@@ -611,6 +642,7 @@ def select_asset(release: dict[str, Any], hint: str) -> dict[str, Any]:
     assets.sort(key=lambda item: not str(item.get('name', '')).lower().endswith('.zip') if os.name == 'nt' else str(item.get('name', '')).lower().endswith('.zip'))
     return assets[0]
 
+# Downloads and installs a scanner from its official release archive.
 def install_release_tool(name: str, repository: str, hint: str) -> None:
     if command_path(name):
         print(f'[+] {name} already available: {command_path(name)}')
@@ -632,6 +664,7 @@ def install_release_tool(name: str, repository: str, hint: str) -> None:
     archive.unlink(missing_ok=True)
     configure_path()
 
+# Lists the local directories that may contain Nuclei templates.
 def _nuclei_template_directories() -> list[Path]:
     home = Path.home()
     appdata = os.environ.get('APPDATA', '').strip()
@@ -640,6 +673,7 @@ def _nuclei_template_directories() -> list[Path]:
     candidates = [Path(os.environ['NUCLEI_TEMPLATES_DIR']).expanduser() if os.environ.get('NUCLEI_TEMPLATES_DIR') else None, ROOT / 'tools' / 'nuclei-templates', home / 'nuclei-templates', home / '.local' / 'nuclei-templates', home / '.config' / 'nuclei' / 'templates', home / 'AppData' / 'Roaming' / 'nuclei' / 'templates', Path(appdata) / 'nuclei-templates' if appdata else None, Path(appdata) / 'nuclei' / 'templates' if appdata else None, Path(localappdata) / 'nuclei-templates' if localappdata else None, Path(localappdata) / 'nuclei' / 'templates' if localappdata else None, Path(programdata) / 'nuclei-templates' if programdata else None]
     return list(dict.fromkeys((path.resolve() for path in candidates if path is not None)))
 
+# Counts Nuclei YAML templates in each local template directory.
 def _filesystem_nuclei_template_inventory() -> list[dict[str, Any]]:
     inventories: list[dict[str, Any]] = []
     for directory in _nuclei_template_directories():
@@ -650,16 +684,19 @@ def _filesystem_nuclei_template_inventory() -> list[dict[str, Any]]:
     inventories.sort(key=lambda item: int(item['count']), reverse=True)
     return inventories
 
+# Template inventory counts the Nuclei YAML files available in a directory.
 def _filesystem_nuclei_template_count() -> tuple[int, list[str]]:
     inventory = _filesystem_nuclei_template_inventory()
     return (max((int(item['count']) for item in inventory), default=0), [str(item['directory']) for item in inventory])
 
+# Template discovery prefers the local directory with the largest valid Nuclei inventory.
 def _best_nuclei_template_directory() -> str:
     inventory = _filesystem_nuclei_template_inventory()
     return str(inventory[0]['directory']) if inventory and int(inventory[0]['count']) > 0 else ''
 
+# Refreshes the official Nuclei template repository when normal updating is unavailable.
 def _install_official_nuclei_template_fallback() -> bool:
-    """Merge the official template repository when the Nuclei updater is unavailable."""
+
     archive = DOWNLOADS / 'nuclei-templates-main.zip'
     extract_dir = DOWNLOADS / 'extract_nuclei_templates'
     destination = Path.home() / 'nuclei-templates'
@@ -681,8 +718,9 @@ def _install_official_nuclei_template_fallback() -> bool:
         shutil.rmtree(extract_dir, ignore_errors=True)
         archive.unlink(missing_ok=True)
 
+# Prepares a current Nuclei engine and records how it will be executed.
 def ensure_nuclei_engine_current() -> dict[str, Any]:
-    """Prefer native Nuclei and fall back to the official Docker image."""
+
     global _NUCLEI_ENGINE_STATE
     executable = command_path('nuclei')
     native_error = ''
@@ -714,8 +752,9 @@ def ensure_nuclei_engine_current() -> dict[str, Any]:
     _NUCLEI_ENGINE_STATE = {'execution_mode': 'docker_official_image', 'executable': executable or '', 'launcher': str(launcher.resolve()), 'docker_image': NUCLEI_DOCKER_IMAGE, 'update_returncode': None, 'version_before': '', 'version_after': docker_detail[-1000:], 'update_output_excerpt': 'Native execution unavailable; official Docker image selected.', 'native_diagnostic': native_error[-1600:]}
     return dict(_NUCLEI_ENGINE_STATE)
 
+# Refreshes the Nuclei template set and verifies that enough templates are present.
 def ensure_nuclei_templates() -> dict[str, Any]:
-    """Update the host-side official template pack without using nuclei -tl."""
+
     global _NUCLEI_TEMPLATE_STATE
     mode = str(_NUCLEI_ENGINE_STATE.get('execution_mode') or 'native')
     executable = command_path('nuclei')
@@ -758,6 +797,7 @@ def ensure_nuclei_templates() -> dict[str, Any]:
     _NUCLEI_TEMPLATE_STATE = {'count': after, 'count_before_update': filesystem_before, 'minimum_expected': NUCLEI_TEMPLATE_MINIMUM, 'sufficient': sufficient, 'update_returncode': update_returncode, 'update_output_excerpt': combined[-2000:], 'fallback_used': fallback_used, 'inventory_source': 'filesystem', 'directory': _best_nuclei_template_directory(), 'directories': directories_after or directories_before, 'filesystem_candidates': _filesystem_nuclei_template_inventory()}
     return dict(_NUCLEI_TEMPLATE_STATE)
 
+# Installs or updates every external scanner required by the project.
 def install_scanners() -> None:
     print('\n=== Installing/verifying security scanners ===')
     ensure_arjun()
@@ -776,9 +816,11 @@ def install_scanners() -> None:
     nuclei_templates['engine'] = nuclei_engine
     _NUCLEI_TEMPLATE_STATE.update(nuclei_templates)
 
+# Scanner resolution locates the executable or launcher that will actually be invoked.
 def scanner_status() -> dict[str, str | None]:
     return {name: command_path(name) for name in SCANNERS}
 
+# Final setup verification confirms that every configured scanner and support tool is ready.
 def verify_scanners(required: bool=True) -> dict[str, str | None]:
     status = scanner_status()
     if _NUCLEI_ENGINE_STATE.get('execution_mode') == 'docker_official_image' and _docker_image_ready(NUCLEI_DOCKER_IMAGE):
@@ -812,6 +854,7 @@ def verify_scanners(required: bool=True) -> dict[str, str | None]:
         raise RuntimeError('Missing or unusable scanners: ' + ', '.join(missing))
     return status
 
+# Writes local runtime paths, ports, tool modes, and template metadata.
 def write_runtime_config(status: dict[str, str | None]) -> None:
     status_directories = []
     for value in status.values():
@@ -825,6 +868,7 @@ def write_runtime_config(status: dict[str, str | None]) -> None:
     RUNTIME_FILE.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding='utf-8')
     print(f'[+] Runtime scanner configuration written: {RUNTIME_FILE}')
 
+# FFUF setup writes the bundled fallback wordlist only when no project copy exists.
 def create_wordlist() -> None:
     WORDLISTS_DIR.mkdir(parents=True, exist_ok=True)
     words = 'admin api assets backup config debug docs images index.php js login.php robots.txt server-status uploads vulnerabilities .env .git'.split()

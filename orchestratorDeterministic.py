@@ -31,22 +31,22 @@ from orchestratorShared import (
 )
 from utils import normalize_url, same_origin, scanner_session_probe
 
-# Compatibility markers: selftest_v31_13.py validates these public contracts by source inspection.
-# Client(url)
-# mcp_http_handshake_ok
-# ToolSpec("idor", "idorForgeServer.py", "run_idor_check", "idor-forge")
-# ToolSpec("report", "reportServer.py", "generate_report", module="weasyprint")
+# The compatibility self-test looks for Client(url), mcp_http_handshake_ok, ToolSpec("idor", "idorForgeServer.py", "run_idor_check", "idor-forge"), and ToolSpec("report", "reportServer.py", "generate_report", module="weasyprint").
 
+
+# Delegates MCP server startup to the shared helper so both orchestrators use the same lifecycle.
 def _ensure_http_server(*args: Any, **kwargs: Any):
     return shared._ensure_http_server(*args, **kwargs)
 
+# Falls back to the shared implementation when a public name is not defined locally.
 def __getattr__(name: str) -> Any:
     try:
         return getattr(shared, name)
     except AttributeError as exc:
         raise AttributeError(name) from exc
 
-# Deterministic LangGraph workflow
+
+# Stores the state exchanged between the deterministic workflow steps.
 class DeterministicState(TypedDict, total=False):
     target: str
     profiles: list[dict[str, str]]
@@ -66,6 +66,7 @@ class DeterministicState(TypedDict, total=False):
     assessment_context: dict[str, Any]
     report_status: dict[str, Any]
 
+# Discovers pages, forms, and request cases separately for every active profile.
 async def deterministic_discovery_node(state: DeterministicState) -> dict[str, Any]:
     target = state['target']
     profiles = state['profiles']
@@ -89,6 +90,7 @@ async def deterministic_discovery_node(state: DeterministicState) -> dict[str, A
             print(f"    [WARNING] {name}: {found.get('authentication_note')}", file=sys.stderr)
     return {'discovery': discovery, 'diagnostics': diagnostics, 'results': results, 'workflow_state_changes': workflow_state_changes}
 
+# Because FFUF and ZAP can expand discovery, broad scanning is completed before specialist selection.
 async def deterministic_broad_scan_node(state: DeterministicState) -> dict[str, Any]:
     target = state['target']
     profiles = state['profiles']
@@ -180,6 +182,7 @@ async def deterministic_broad_scan_node(state: DeterministicState) -> dict[str, 
         results[name]['arjun'] = aggregate_runs('arjun', target, arjun_runs) if arjun_runs else make_skipped_result('arjun', target, 'No suitable HTML/form endpoint was available for hidden-parameter discovery.')
     return {'discovery': discovery, 'diagnostics': diagnostics, 'results': results, 'has_authenticated_profile': has_authenticated_profile, 'profile_session_state': profile_session_state}
 
+# For parameter testing, each specialist receives only the request cases relevant to its vulnerability class.
 async def deterministic_parameter_scan_node(state: DeterministicState) -> dict[str, Any]:
     target = state['target']
     profiles = state['profiles']
@@ -191,6 +194,7 @@ async def deterministic_parameter_scan_node(state: DeterministicState) -> dict[s
     selection_summary: dict[str, dict[str, list[dict[str, Any]]]] = {}
     semaphore = asyncio.Semaphore(2 if shared.CURRENT_SCAN_MODE == 'deep' else 1)
 
+    # A selected request case is executed and converted into the common tool-result format.
     async def run_case(spec: ToolSpec, case: dict[str, Any], cookies: str, probe_url: str) -> dict[str, Any]:
         url = str(case.get('url', ''))
         skip_reason = _tool_case_skip_reason(spec.name, case)
@@ -239,6 +243,7 @@ async def deterministic_parameter_scan_node(state: DeterministicState) -> dict[s
             results[name][spec.name] = aggregate_runs(spec.name, target, runs) if runs else make_skipped_result(spec.name, target, f"No discovered request matched {spec.name}'s vulnerability class.")
     return {'results': results, 'parameter_selection_summary': selection_summary}
 
+# Authorization checks remain read-only and use only requests that support a meaningful comparison.
 async def deterministic_authorization_node(state: DeterministicState) -> dict[str, Any]:
     target = state['target']
     profiles = state['profiles']
@@ -279,6 +284,7 @@ async def deterministic_authorization_node(state: DeterministicState) -> dict[st
             log_result(name, 'authorization', results[name]['authorization'], target)
     return {'results': results, 'authorization_selection_summary': authorization_selection_summary}
 
+# Once parameter scanners finish, browser and workflow checks reuse the latest discovery state.
 async def deterministic_browser_workflow_node(state: DeterministicState) -> dict[str, Any]:
     target = state['target']
     profiles = state['profiles']
@@ -290,6 +296,7 @@ async def deterministic_browser_workflow_node(state: DeterministicState) -> dict
     selection_summary: dict[str, dict[str, list[dict[str, Any]]]] = {}
     specs = {spec.name: spec for spec in WORKFLOW_TOOLS}
 
+    # A selected request case is executed and converted into the common tool-result format.
     async def run_case(tool: str, case: dict[str, Any], cookies: str, profile_discovery: dict[str, Any], probe_url: str) -> dict[str, Any]:
         url = str(case.get('url', target))
         refresh = refresh_authenticated_session_state(target, cookies, probe_url) if cookies else {'performed': False, 'usable': True}
@@ -347,6 +354,7 @@ async def deterministic_browser_workflow_node(state: DeterministicState) -> dict
             log_result(name, 'workflow', results[name]['workflow'], target)
     return {'results': results, 'workflow_selection_summary': selection_summary}
 
+# OAST and JWT analysis are added only when discovery provides suitable inputs.
 async def deterministic_special_checks_node(state: DeterministicState) -> dict[str, Any]:
     target = state['target']
     profiles = state['profiles']
@@ -392,6 +400,7 @@ async def deterministic_special_checks_node(state: DeterministicState) -> dict[s
             log_result(name, 'interactsh', interactsh_result, target)
     return {'results': results, 'oast_selection_summary': oast_selection_summary}
 
+# At the end of the pipeline, the complete assessment state is sent to the report service.
 async def deterministic_report_node(state: DeterministicState) -> dict[str, Any]:
     target = state['target']
     profiles = state['profiles']
@@ -427,14 +436,18 @@ async def deterministic_report_node(state: DeterministicState) -> dict[str, Any]
             report.update(json_filename=fallback, html_filename=str(Path(fallback).with_suffix('.html')), local_json_fallback=True)
     return {'assessment_context': context, 'report_status': report}
 
+# The deterministic pipeline executes the full graph and returns the state produced by its final node.
 async def run_pipeline(target: str, profiles: list[dict[str, str]], injection_url: str, allow_state_changes: bool=False, secondary_cookies: str='') -> dict[str, Any]:
+    # The deterministic graph starts from a fresh state containing discovery, results, and scan settings.
     initial: DeterministicState = {'target': target, 'profiles': profiles, 'injection_url': injection_url, 'allow_state_changes': allow_state_changes, 'secondary_cookies': secondary_cookies}
     final = await build_deterministic_graph().ainvoke(initial)
     return {'results': final['results'], 'discovery': final['discovery'], 'diagnostics': final['diagnostics'], 'report_status': final['report_status']}
 
+# Reads a parameter list passed on the command line.
 def _parse_parameter_argument(value: str) -> list[str]:
     return [item.strip() for item in str(value or '').split(',') if item.strip()]
 
+# Selects one request case for an isolated tool run.
 def _single_tool_case(discovery: dict[str, Any], tool: str, target: str, explicit_url: str, method: str, data: str, parameters: list[str]) -> dict[str, Any] | None:
     if explicit_url:
         url = normalize_url(explicit_url)
@@ -460,13 +473,15 @@ def _single_tool_case(discovery: dict[str, Any], tool: str, target: str, explici
     cases = select_tool_request_cases(discovery, tool, limit=1)
     return cases[0] if cases else None
 
+# Tool-specific preflight filtering keeps only errors relevant to the requested isolated run.
 def _single_tool_preflight_errors(checks: list[dict[str, str]], tool: str) -> list[dict[str, str]]:
-    """Return only errors that can prevent the selected isolated tool."""
+
     allowed = {'project', 'mcp', tool}
     return [item for item in checks if item.get('level') == 'error' and item.get('component') in allowed]
 
+# Isolated tool mode keeps the same preparation and validation used by full assessments.
 async def run_single_tool_debug(*, tool: str, target: str, cookies: str, mode: str, secondary_cookies: str='', explicit_url: str='', method: str='GET', data: str='', parameters: list[str] | None=None, jwt_token: str='', injection_url: str='', timeout_override: int=0, diagnostic_only: bool=False, allow_state_changes: bool=False) -> dict[str, Any]:
-    """Run one canonical MCP tool through the same production transport."""
+
     configure_scan_mode(mode)
     method = str(method or 'GET').upper()
     parameters = [str(value) for value in parameters or [] if str(value)]
@@ -522,6 +537,8 @@ async def run_single_tool_debug(*, tool: str, target: str, cookies: str, mode: s
     result.setdefault('arguments_summary', {'method': arguments.get('method', ''), 'parameters': arguments.get('parameters', arguments.get('known_parameters', [])), 'timeout': arguments.get('timeout', 0), 'scan_mode': arguments.get('scan_mode', arguments.get('scan_profile', ''))})
     result.setdefault('discovery_summary', {'html_urls': len(discovery.get('html_urls', [])), 'request_cases': len(discovery.get('request_cases', [])), 'authentication_effective': discovery.get('authentication_effective')})
     return result
+
+# Builds the ordered LangGraph used by the deterministic pipeline.
 def build_deterministic_graph() -> Any:
     graph = StateGraph(DeterministicState)
     graph.add_node("discovery", deterministic_discovery_node)
@@ -542,6 +559,7 @@ def build_deterministic_graph() -> Any:
     return graph.compile()
 
 
+# Parses command-line options and drives the complete workflow for this entrypoint.
 def main() -> int:
     parser = argparse.ArgumentParser(
         description="Deterministic LangGraph + FastMCP web-security orchestrator."
@@ -591,7 +609,9 @@ def main() -> int:
         parser.error("--diagnostic-only is valid only with --tool zap.")
 
     configure_scan_mode(args.mode)
+    # If required local services fail preflight, the deterministic run stops before scanning begins.
     checks = run_preflight_checks(include_live=True)
+    # Single-tool execution bypasses the full graph but keeps normal setup, scope, and preflight checks.
     if args.tool:
         print_preflight_report(checks, show_ok=args.preflight_only)
         selected_errors = _single_tool_preflight_errors(checks, args.tool)
