@@ -15,7 +15,7 @@ from utils import parse_cookie_header, skipped, success
 
 from utils import same_origin
 
-from scannerCommon import looks_like_login, request_retry, service
+from core.scannerCommon import looks_like_login, request_retry, service
 
 mcp, _serve = service("Session Security Analyzer", "session")
 

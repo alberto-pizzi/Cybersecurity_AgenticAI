@@ -6,7 +6,7 @@ import jwt
 
 from utils import failure, skipped, success
 
-from scannerCommon import service
+from core.scannerCommon import service
 
 mcp, _serve = service("JWT Analyzer", "jwt")
 

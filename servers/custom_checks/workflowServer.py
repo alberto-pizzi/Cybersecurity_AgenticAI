@@ -14,7 +14,7 @@ from utils import skipped, success
 
 from utils import same_origin
 
-from scannerCommon import looks_like_login, service
+from core.scannerCommon import looks_like_login, service
 
 mcp, _serve = service("Web Workflow Verifier", "workflow")
 
@@ -209,7 +209,7 @@ def _upload_check(
         parsed_known = urlparse(value)
         lowered = parsed_known.path.lower()
         if any(token in lowered for token in ("upload", "files", "media", "attachment", "image", "document")):
-            directory = value if value.endswith("/") else urljoin(value, "./")
+            directory = value if value.endswith("/") else urljoin(value, "../")
             directory_candidates.append(directory)
             candidates.append(urljoin(directory, filename))
 

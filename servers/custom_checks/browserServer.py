@@ -10,7 +10,7 @@ from utils import failure, parse_cookie_header, skipped, success
 
 from utils import same_origin
 
-from scannerCommon import mutate_parameter, service
+from core.scannerCommon import mutate_parameter, service
 
 mcp, _serve = service("Browser XSS and Workflow Verifier", "browser")
 

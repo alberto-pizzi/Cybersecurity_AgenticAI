@@ -31,7 +31,7 @@ from orchestratorShared import (
 )
 from utils import normalize_url, same_origin, scanner_session_probe
 
-# The compatibility self-test looks for Client(url), mcp_http_handshake_ok, ToolSpec("idor", "idorForgeServer.py", "run_idor_check", "idor-forge"), and ToolSpec("report", "reportServer.py", "generate_report", module="weasyprint").
+# The compatibility self-test looks for Client(url), mcp_http_handshake_ok, ToolSpec("idor", "pentest_tools/exploitation/idorForgeServer.py", "run_idor_check", "idor-forge"), and ToolSpec("report", "reporting/reportServer.py", "generate_report", module="weasyprint").
 
 
 # Delegates MCP server startup to the shared helper so both orchestrators use the same lifecycle.
@@ -365,7 +365,7 @@ async def deterministic_special_checks_node(state: DeterministicState) -> dict[s
     for profile in profiles:
         name = profile['name']
         token = (discovery[name].get('jwt_tokens') or [''])[0]
-        jwt_result = await call_mcp('jwtServer.py', 'run_jwt_scan', {'jwt_token': token, 'target_url': target}) if token else make_skipped_result('jwt', target, 'No JWT was discovered in crawled responses.')
+        jwt_result = await call_mcp('custom_checks/jwtServer.py', 'run_jwt_scan', {'jwt_token': token, 'target_url': target}) if token else make_skipped_result('jwt', target, 'No JWT was discovered in crawled responses.')
         if injection_url:
             oast_cases = [{'target_url': target, 'source_url': injection_url, 'injection_url': injection_url, 'method': 'GET', 'data': '', 'parameter': 'explicit', 'parameters': ['explicit'], 'priority_score': 1000}]
         else:
@@ -429,7 +429,7 @@ async def deterministic_report_node(state: DeterministicState) -> dict[str, Any]
         'scan_mode': shared.CURRENT_SCAN_MODE}
     context['orchestration'] = {'engine': 'langgraph', 'mode': 'deterministic', 'nodes': ['discovery', 'broad_scan', 'parameter_scan', 'authorization', 'browser_workflow', 'special_checks', 'report']}
     print('\n[*] Generazione report...')
-    report = await call_mcp('reportServer.py', 'generate_report', {'findings_summary': results, 'target_url': target, 'assessment_context': context})
+    report = await call_mcp('reporting/reportServer.py', 'generate_report', {'findings_summary': results, 'target_url': target, 'assessment_context': context})
     if report.get('status') != 'success' and (not report.get('json_filename')):
         fallback = write_emergency_json_report(target, results, diagnostics, str(report.get('output', 'Report MCP failed.')))
         if fallback:

@@ -12,7 +12,7 @@ from utils import partial, skipped, success
 
 from utils import same_origin
 
-from scannerCommon import looks_like_login, service
+from core.scannerCommon import looks_like_login, service
 
 mcp, _serve = service("Authorization Differential Verifier", "authorization")
 

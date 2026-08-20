@@ -7,7 +7,7 @@ import requests
 
 from utils import partial, scanner_session_probe, success
 
-from scannerCommon import mutate_parameter, service
+from core.scannerCommon import mutate_parameter, service
 
 mcp, _serve = service("Path Traversal and LFI Verifier", "traversal")
 

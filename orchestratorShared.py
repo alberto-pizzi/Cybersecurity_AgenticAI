@@ -81,12 +81,12 @@ class ToolSpec:
     executable: str = ''
     module: str = ''
     required: bool = True
-BASE_TOOLS = (ToolSpec('ffuf', 'ffufServer.py', 'run_ffuf_fuzz', 'ffuf'), ToolSpec('zap', 'zapServer.py', 'run_zap_scan', module='zapv2'), ToolSpec('nuclei', 'nucleiServer.py', 'run_nuclei_scan', 'nuclei'), ToolSpec('session', 'sessionServer.py', 'run_session_scan'), ToolSpec('nikto', 'niktoServer.py', 'run_nikto_scan', 'nikto'))
-ARJUN_TOOL = ToolSpec('arjun', 'arjunServer.py', 'run_arjun_scan', 'arjun')
-PARAMETER_TOOLS = (ToolSpec('sqlmap', 'sqlmapServer.py', 'run_sqlmap_scan', 'sqlmap'), ToolSpec('dalfox', 'dalfoxServer.py', 'run_dalfox_scan', 'dalfox'), ToolSpec('commix', 'commixServer.py', 'run_commix_scan', 'commix'), ToolSpec('traversal', 'traversalServer.py', 'run_traversal_scan'), ToolSpec('idor', 'idorForgeServer.py', 'run_idor_check', 'idor-forge'))
-AUTHORIZATION_TOOL = ToolSpec('authorization', 'authorizationServer.py', 'run_authorization_scan')
-WORKFLOW_TOOLS = (ToolSpec('browser', 'browserServer.py', 'run_browser_scan', module='playwright', required=False), ToolSpec('workflow', 'workflowServer.py', 'run_workflow_scan'))
-OPTIONAL_TOOLS = (ToolSpec('jwt', 'jwtServer.py', 'run_jwt_scan', module='jwt'), ToolSpec('interactsh', 'interactshServer.py', 'run_interactsh_client', 'interactsh-client', required=False), ToolSpec('report', 'reportServer.py', 'generate_report', module='weasyprint'))
+BASE_TOOLS = (ToolSpec('ffuf', 'pentest_tools/discovery/ffufServer.py', 'run_ffuf_fuzz', 'ffuf'), ToolSpec('zap', 'pentest_tools/scanning/zapServer.py', 'run_zap_scan', module='zapv2'), ToolSpec('nuclei', 'pentest_tools/scanning/nucleiServer.py', 'run_nuclei_scan', 'nuclei'), ToolSpec('session', 'custom_checks/sessionServer.py', 'run_session_scan'), ToolSpec('nikto', 'pentest_tools/scanning/niktoServer.py', 'run_nikto_scan', 'nikto'))
+ARJUN_TOOL = ToolSpec('arjun', 'pentest_tools/discovery/arjunServer.py', 'run_arjun_scan', 'arjun')
+PARAMETER_TOOLS = (ToolSpec('sqlmap', 'pentest_tools/exploitation/sqlmapServer.py', 'run_sqlmap_scan', 'sqlmap'), ToolSpec('dalfox', 'pentest_tools/exploitation/dalfoxServer.py', 'run_dalfox_scan', 'dalfox'), ToolSpec('commix', 'pentest_tools/exploitation/commixServer.py', 'run_commix_scan', 'commix'), ToolSpec('traversal', 'custom_checks/traversalServer.py', 'run_traversal_scan'), ToolSpec('idor', 'pentest_tools/exploitation/idorForgeServer.py', 'run_idor_check', 'idor-forge'))
+AUTHORIZATION_TOOL = ToolSpec('authorization', 'custom_checks/authorizationServer.py', 'run_authorization_scan')
+WORKFLOW_TOOLS = (ToolSpec('browser', 'custom_checks/browserServer.py', 'run_browser_scan', module='playwright', required=False), ToolSpec('workflow', 'custom_checks/workflowServer.py', 'run_workflow_scan'))
+OPTIONAL_TOOLS = (ToolSpec('jwt', 'custom_checks/jwtServer.py', 'run_jwt_scan', module='jwt'), ToolSpec('interactsh', 'pentest_tools/discovery/interactshServer.py', 'run_interactsh_client', 'interactsh-client', required=False), ToolSpec('report', 'reporting/reportServer.py', 'generate_report', module='weasyprint'))
 ALL_TOOLS = (*BASE_TOOLS, ARJUN_TOOL, *PARAMETER_TOOLS, AUTHORIZATION_TOOL, *WORKFLOW_TOOLS, *OPTIONAL_TOOLS)
 TOOL_SCOPES = {'ffuf': 'base', 'zap': 'base', 'nuclei': 'base', 'session': 'base', 'nikto': 'base', 'arjun': 'url', 'sqlmap': 'parameterized', 'dalfox': 'parameterized', 'commix': 'parameterized', 'traversal': 'parameterized', 'idor': 'numeric', 'authorization': 'authorization', 'browser': 'browser', 'workflow': 'workflow', 'jwt': 'jwt', 'interactsh': 'oast'}
 TOOL_DESCRIPTIONS = {'ffuf': 'Hidden resource and endpoint discovery with credential-isolated path fuzzing.', 'zap': 'Session-aware crawling, passive analysis and prioritized active testing.', 'nuclei': 'Template-based exposure, misconfiguration, known-vulnerability and bounded DAST checks on discovered parameterized URLs.', 'session': 'Cookie flags, bounded session uniqueness and fixation indicators.', 'nikto': 'Web-server hardening and exposed-resource checks.', 'arjun': 'Hidden GET/POST parameter discovery.', 'sqlmap': 'SQL-injection confirmation on discovered request contracts.', 'dalfox': 'Reflected and stored XSS testing.', 'commix': 'Operating-system command-injection testing.', 'traversal': 'Path-traversal and local-file-inclusion verification.', 'idor': 'Single-reference numeric object differential checks.', 'authorization': 'Read-only anonymous and optional two-account authorization differentials on discovered high-value GET requests.', 'browser': 'Chromium verification of DOM, reflected and stored XSS using harmless markers.', 'workflow': 'Bounded CSRF, upload, authentication-throttling and CAPTCHA workflow checks.', 'jwt': 'JWT structure and claim analysis.', 'interactsh': 'Out-of-band callback confirmation.'}
@@ -184,9 +184,12 @@ def _declared_functions(path: Path) -> set[str]:
         return set()
     return {node.name for node in ast.walk(tree) if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))}
 
-# Server path lookup resolves a server filename inside the project directory.
+# Server path lookup resolves a server filename (optionally nested in a subdirectory) inside the project directory.
 def resolve_server_path(filename: str, required_tool: str='') -> Path:
 
+    candidate = (SERVERS / filename).resolve()
+    if candidate.is_relative_to(SERVERS):
+        return candidate
     return (SERVERS / Path(filename).name).resolve()
 
 # Interpreter validation confirms that project dependencies can be imported before a server is launched.
@@ -219,6 +222,8 @@ def _server_env() -> dict[str, str]:
     configure_runtime_path()
     env = {str(key): str(value) for key, value in os.environ.items()}
     paths = [part for part in env.get('PYTHONPATH', '').split(os.pathsep) if part]
+    if str(SERVERS) not in paths:
+        paths.insert(0, str(SERVERS))
     if str(ROOT) not in paths:
         paths.insert(0, str(ROOT))
     warning_filters = [value for value in env.get('PYTHONWARNINGS', '').split(',') if value]
@@ -500,7 +505,7 @@ def _numbered_duplicate_servers() -> list[Path]:
     if not SERVERS.is_dir():
         return []
     pattern = re.compile('.+\\(\\d+\\)\\.py$', re.IGNORECASE)
-    return sorted((path.resolve() for path in SERVERS.iterdir() if path.is_file() and pattern.fullmatch(path.name)), key=lambda path: path.name.lower())
+    return sorted((path.resolve() for path in SERVERS.rglob('*.py') if path.is_file() and pattern.fullmatch(path.name)), key=lambda path: path.name.lower())
 
 # Preflight validation covers dependencies, server files, ports, and live MCP services before scanning.
 def run_preflight_checks(*, include_live: bool=True) -> list[dict[str, str]]:
@@ -2039,7 +2044,7 @@ def summarize_results(results: dict[str, Any]) -> tuple[int, int, int]:
 # Reuses the report deduplicator for the terminal finding summary.
 def _report_flatten_findings_for_summary(results: dict[str, Any]) -> list[dict[str, Any]]:
 
-    report_path = SERVERS / 'reportServer.py'
+    report_path = SERVERS / 'reporting' / 'reportServer.py'
     if not report_path.is_file():
         raise FileNotFoundError(report_path)
     module_name = '_secops_report_summary_runtime'

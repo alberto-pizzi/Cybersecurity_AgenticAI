@@ -813,7 +813,7 @@ def report_node(state: AgentState) -> dict[str, Any]:
         'execution_policy': 'AI-selected actions use the same deterministic tool catalogue, discovery selectors, request contracts, scan profiles and safety validators. The planner chooses only discovery-derived candidates according to expected information gain and may defer redundant actions without a checklist or minimum tool set. Bounded state-changing workflow probes run automatically on local labs and require explicit --allow-state-changes for remote authorized targets.',
         'allow_state_changes': state.get('allow_state_changes', False),
         'secondary_identity_supplied': bool(state.get('secondary_cookies', ''))}
-    report = asyncio.run(call_mcp('reportServer.py', 'generate_report', {'findings_summary': report_results, 'target_url': state['target'], 'output_name': output_name, 'assessment_context': context}))
+    report = asyncio.run(call_mcp('reporting/reportServer.py', 'generate_report', {'findings_summary': report_results, 'target_url': state['target'], 'output_name': output_name, 'assessment_context': context}))
     if report.get('status') != 'success' and (not report.get('json_filename')):
         fallback = write_emergency_json_report(state['target'], state['results'], state['diagnostics'], str(report.get('output', 'Report MCP failed.')), 'SecOps_Agentic_Emergency')
         if fallback:
