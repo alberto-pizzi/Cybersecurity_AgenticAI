@@ -83,7 +83,7 @@ def main() -> int:
         action="store_true",
         help="Fail instead of using deterministic fallback when Ollama planning fails.",
     )
-    parser.add_argument("--max-rounds", type=int, default=1, choices=(1, 2, 3))
+    parser.add_argument("--max-rounds", type=int, default=2, choices=(1, 2, 3))
     parser.add_argument(
         "--ai-timeout",
         type=int,
