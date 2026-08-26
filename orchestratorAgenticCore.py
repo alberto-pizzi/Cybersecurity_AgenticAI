@@ -54,6 +54,7 @@ class AgentState(TypedDict):
     planner_audit: list[dict[str, Any]]
 AI_PLANNER_TIMEOUTS = {'fast': 300, 'balanced': 480, 'deep': 720}
 AI_PLANNER_MAX_PREDICT = {'fast': 700, 'balanced': 1000, 'deep': 1400}
+AI_PLANNER_CONTEXT_WINDOWS = {'fast': 4096, 'balanced': 6144, 'deep': 8192}
 LAST_OLLAMA_PLAN_DIAGNOSTICS: dict[str, Any] = {}
 BROAD_COVERAGE_TOOLS = ('ffuf', 'zap', 'nuclei', 'session', 'nikto')
 PARAMETER_COVERAGE_TOOLS = ('sqlmap', 'dalfox', 'commix', 'traversal', 'idor')
@@ -272,74 +273,42 @@ def ollama_plan(state: AgentState) -> dict[str, Any]:
         'candidates': candidates,
     }
     system_message = (
-        "Plan an explicitly authorized web-security assessment using only the supplied "
-        "discovery-derived candidate IDs. Each candidate already represents an exact "
-        "discovery-derived request contract that Python will validate again before execution. "
+    'Plan an explicitly authorized web-security assessment using only candidate IDs supplied in the user context. '
+    'Each candidate is discovery-derived and will be validated again by Python. '
 
-        "Evaluate EVERY remaining candidate before producing the final plan. "
+    'Evaluate EVERY candidate before returning the plan. For each candidate decide SELECT or DEFER. '
 
-        "The round_action_budget is a maximum, not a quota. However, it is intentionally "
-        "large enough to permit broad testing. Do not arbitrarily restrict the plan to only "
-        "the top few highest-confidence candidates when several independent useful actions "
-        "are available. "
+    'SELECT any safe, discovery-supported candidate that can provide useful or complementary security evidence. '
+    'A candidate does not need to be the single highest-value action. When uncertain about a safe and useful candidate, '
+    'prefer SELECT. '
 
-        "First identify high-value actions using discovery evidence, previous results, "
-        "expected information gain, vulnerability relevance, and the discovered attack surface. "
+    'DEFER only for a concrete reason: genuine duplication of already selected/completed work, unsupported discovery, '
+    'unsafe or incompatible input, or clearly very low expected value. Do not keep the plan artificially small. '
 
-        "Then, before producing the final JSON, reconsider every candidate you initially "
-        "excluded. Select additional candidates whenever they can provide materially different "
-        "security evidence, test a distinct vulnerability class, exercise another meaningful "
-        "discovered surface, independently validate an important hypothesis, or materially "
-        "improve confidence in the assessment. "
+    'Broad scanners and targeted tools are complementary, not substitutes by default. FFUF, ZAP, Nuclei, session and '
+    'Nikto may provide evidence that SQLMap, Dalfox, Commix, traversal, browser, workflow or authorization do not, and '
+    'vice versa. Do not systematically prefer either category. '
 
-        "Prefer broad evidence-driven coverage over extreme selectivity when multiple "
-        "independent useful actions exist. "
+    'Use previous_results and the current candidate set to avoid real repetition. A confirmed finding must not stop exploration '
+    'of unrelated attack surfaces. '
 
-        "Do not omit an action merely because another selected scanner or technique is broadly "
-        "related to it. Consider actions redundant only when their expected evidence is genuinely "
-        "duplicative for the same discovered target and vulnerability hypothesis. "
+    'Use IDOR only for appropriate numeric references, authorization only for read-only identity/object/resource signals, '
+    'and Interactsh only for compatible OAST inputs. '
 
-        "A confirmed vulnerability must not prematurely stop exploration of unrelated attack "
-        "surfaces or independent vulnerability classes. "
+    'round_action_budget is a maximum, not a quota. Do not select actions to satisfy a count or checklist, but do not '
+    'exclude useful candidates without a concrete reason. '
 
-        "Use previous_results and the current candidate set to avoid repeating completed work. "
-        "In later rounds, use accumulated evidence, newly discovered surfaces, and the remaining "
-        "candidates to choose useful follow-up actions rather than repeating earlier actions. "
-
-        "The deterministic orchestrator is the exhaustive baseline. This agentic planner may "
-        "be selective, but selectivity means avoiding genuinely redundant, unsupported, unsafe, "
-        "or very low-value work. It must not mean reducing a rich set of useful independent "
-        "candidates to only two or three actions without a concrete reason. "
-
-        "Do not select actions merely to satisfy a fixed action count, percentage, checklist, "
-        "capability quota, or one-action-per-tool requirement. Every selected action must still "
-        "be justified by discovery evidence or previous results. "
-
-        "Use parameter tools only when their candidate parameters fit the relevant vulnerability "
-        "class. Use IDOR only for appropriate numeric object references. Use authorization testing "
-        "only for read-only identity, object, or privileged-resource signals. Use Interactsh only "
-        "for compatible OAST-capable inputs. "
-
-        "Avoid destructive actions, unsafe requests, unsupported candidates, and completed "
-        "duplicates. "
-
-        "Set finish=true only after evaluating all remaining candidates and determining that none "
-        "is likely to provide materially different or useful security evidence. "
-
-        "Respect round_action_budget. Keep reasoning_summary concise and explain the main "
-        "prioritization decisions, especially when a substantial number of apparently useful "
-        "candidates are deferred. Return only schema-valid JSON."
-    )
+    'Before returning, reconsider all deferred candidates once. Set finish=true only when no remaining candidate is likely '
+    'to add useful evidence. Keep reasoning_summary concise. Return only schema-valid JSON.'
+)
     base = state['ollama_url'].rstrip('/')
     total_timeout = max(120, int(state.get('ai_timeout') or 480))
     max_predict = AI_PLANNER_MAX_PREDICT.get(shared.CURRENT_SCAN_MODE, 320)
-    if state['round'] >= 1:
-        # Keep later rounds bounded in wall-clock time, but do not truncate the model's
-        # action list: a continuation round may still contain many useful candidates.
-        total_timeout = min(total_timeout, 300)
+    # Keep the planner timeout profile-specific on every round. The configured fast/balanced/deep
+    # budgets already bound wall-clock time, so later rounds should not collapse to the fast limit.
     context = json.dumps(prompt, ensure_ascii=False, separators=(',', ':'))
-    # The compact contract normally fits in 4k context; balanced/deep retain extra room for many candidates.
-    context_window = 4096 if shared.CURRENT_SCAN_MODE == 'fast' else 6144
+    # Larger scan profiles can expose more candidates, so scale the model context with the profile.
+    context_window = AI_PLANNER_CONTEXT_WINDOWS.get(shared.CURRENT_SCAN_MODE, 6144)
     common_options = {'temperature': 0, 'num_predict': max_predict, 'num_ctx': context_window, 'top_p': 0.9}
     LAST_OLLAMA_PLAN_DIAGNOSTICS.clear()
     LAST_OLLAMA_PLAN_DIAGNOSTICS.update({
@@ -380,21 +349,25 @@ def ollama_plan(state: AgentState) -> dict[str, Any]:
                 selected['reason'] = f"AI selected {candidate_id}: {str(action.get('reason') or 'discovery-derived candidate')[:420]}"
                 selected_actions.append(selected)
 
-            # A compact local model can interpret "prioritize information gain" too
-            # aggressively and return only a couple of actions even when many distinct
-            # candidates remain. Ask it once to reconsider the deferred candidates;
-            # Python still adds nothing on its own and the same validated IDs/budget apply.
+            # Compact local models can still produce an overly narrow first pass. Trigger one
+            # AI-only breadth review when the selection is sparse relative to the actions that
+            # could actually run in this profile/round; the review never forces a minimum count.
             review_selected_ids: list[str] = []
             review_seconds = 0.0
             review_error = ''
-            sparse_limit = min(action_budget, len(candidates))
+            review_reasoning = ''
+            review_capacity = min(action_budget, len(candidates))
+            remaining_candidate_count = len(candidates) - len(selected_actions)
             sparse_plan = (
-                sparse_limit >= 6
-                and len(selected_actions) < min(6, max(3, (sparse_limit + 1) // 2))
+                review_capacity >= 4
+                and remaining_candidate_count >= 3
+                and len(selected_actions) * 2 < review_capacity
                 and len(selected_actions) < action_budget
             )
+            # Reserve up to 40% of the profile's planning budget for the optional second AI pass.
+            # The actual allowance is also bounded by the wall-clock time still remaining.
             review_time_budget = min(
-                120,
+                max(120, int(total_timeout * 0.40)),
                 max(0, int(total_timeout - (time.monotonic() - planning_started))),
             )
             if sparse_plan and review_time_budget >= 30:
@@ -407,17 +380,30 @@ def ollama_plan(state: AgentState) -> dict[str, Any]:
                     'scan_mode': shared.CURRENT_SCAN_MODE,
                     'round': state['round'] + 1,
                     'round_action_budget': action_budget,
+                    'discovery_summary': prompt['discovery_summary'],
+                    'previous_results': prompt['previous_results'],
+                    'available_tools': registry,
                     'already_selected_action_ids': selected_ids,
                     'remaining_slots': action_budget - len(selected_actions),
                     'remaining_candidates': remaining_candidates,
                     'previous_reasoning_summary': str(compact_plan.get('reasoning_summary') or '')[:240],
                 }
                 review_system_message = (
-                    'Reconsider the deferred candidates from an explicitly authorized web-security assessment. '
-                    'The first plan selected only a small fraction of the available actions. Select additional candidate '
-                    'IDs when they provide complementary, non-redundant evidence or materially broaden vulnerability-class '
-                    'coverage. Do not repeat already selected IDs and do not fill the budget with weak or redundant actions. '
-                    'Every selected ID must come from remaining_candidates. Return only schema-valid JSON.'
+                    'Review the candidates deferred by the first AI plan for an explicitly authorized web-security assessment. '
+
+                    'Evaluate EVERY remaining candidate. ADD any safe, discovery-supported candidate that can provide useful, '
+                    'complementary or independent security evidence. When uncertain about a safe and useful candidate, prefer ADD. '
+
+                    'KEEP DEFERRED only for a concrete reason: genuine duplication, already completed coverage, unsupported discovery, '
+                    'unsafe or incompatible input, or clearly very low expected value. '
+
+                    'Broad scanners and targeted tools are complementary, not substitutes by default. Do not reject a broad scanner '
+                    'simply because targeted tools were already selected, and do not add actions merely to satisfy coverage or a count. '
+
+                    'Do not repeat already_selected_action_ids. Select only IDs from remaining_candidates. '
+                    'It is valid to add zero actions only if every remaining candidate has a concrete defer reason. '
+
+                    'Keep reasoning_summary concise. Return only schema-valid JSON.'
                 )
                 review_context = json.dumps(review_prompt, ensure_ascii=False, separators=(',', ':'))
                 review_started = time.monotonic()
@@ -439,6 +425,7 @@ def ollama_plan(state: AgentState) -> dict[str, Any]:
                         early_json=True,
                     )
                     review_plan = _parse_ollama_plan_content(review_content)
+                    review_reasoning = str(review_plan.get('reasoning_summary') or '')[:500]
                     for candidate_id in [str(value) for value in review_plan.get('selected_action_ids', [])]:
                         action = candidate_map.get(candidate_id)
                         if (
@@ -471,6 +458,7 @@ def ollama_plan(state: AgentState) -> dict[str, Any]:
                 'review_selected_action_ids': review_selected_ids,
                 'review_seconds': review_seconds,
                 'review_error': review_error,
+                'review_reasoning': review_reasoning,
                 'seconds': round(time.monotonic() - planning_started, 2),
                 'attempt_errors': list(errors),
             })
@@ -799,6 +787,7 @@ def planner_node(state: AgentState) -> dict[str, Any]:
     context_bytes = 0
     ai_selected_count = 0
     review_selected_ids: list[str] = []
+    review_reasoning = ''
     fallback_reason = ''
     try:
         decision = ollama_plan(state)
@@ -815,11 +804,16 @@ def planner_node(state: AgentState) -> dict[str, Any]:
         review_selected_ids = [str(value) for value in LAST_OLLAMA_PLAN_DIAGNOSTICS.get('review_selected_action_ids', [])]
         review_seconds = float(LAST_OLLAMA_PLAN_DIAGNOSTICS.get('review_seconds', 0) or 0)
         review_error = str(LAST_OLLAMA_PLAN_DIAGNOSTICS.get('review_error', '') or '')
+        review_reasoning = str(LAST_OLLAMA_PLAN_DIAGNOSTICS.get('review_reasoning', '') or '')[:500]
         if not plan and (not finished) and eligible:
             finished = True
             summary = (summary + ' No action was selected; the planner ended the round without forcing a checklist.').strip()
         if review_selected_ids:
             summary = (summary + f' Breadth review added {len(review_selected_ids)} complementary action(s).').strip()
+            if review_reasoning:
+                summary = (summary + f' Review: {review_reasoning}').strip()
+        elif review_seconds and review_reasoning:
+            summary = (summary + f' Breadth review added no actions. Review: {review_reasoning}').strip()
         elif review_error:
             summary = (summary + ' Optional breadth review failed; the initial AI plan was kept.').strip()
         notes.append(f'Round {round_number} [{planner_source}/{endpoint}; context={context_bytes}B]: {summary}')
@@ -847,6 +841,7 @@ def planner_node(state: AgentState) -> dict[str, Any]:
         'round_action_budget': budget,
         'ai_selected_action_count': ai_selected_count,
         'review_selected_action_count': len(review_selected_ids) if planner_source == 'ai' else 0,
+        'review_reasoning': review_reasoning if planner_source == 'ai' else '',
         'fallback_reason': fallback_reason,
         'selected_action_count': len(plan),
         'selected_actions': [_audit_action_summary(action) for action in plan],
