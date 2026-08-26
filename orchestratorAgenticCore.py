@@ -53,7 +53,7 @@ class AgentState(TypedDict):
     secondary_cookies: str
     planner_audit: list[dict[str, Any]]
 AI_PLANNER_TIMEOUTS = {'fast': 300, 'balanced': 480, 'deep': 720}
-AI_PLANNER_MAX_PREDICT = {'fast': 220, 'balanced': 320, 'deep': 460}
+AI_PLANNER_MAX_PREDICT = {'fast': 700, 'balanced': 1000, 'deep': 1400}
 LAST_OLLAMA_PLAN_DIAGNOSTICS: dict[str, Any] = {}
 BROAD_COVERAGE_TOOLS = ('ffuf', 'zap', 'nuclei', 'session', 'nikto')
 PARAMETER_COVERAGE_TOOLS = ('sqlmap', 'dalfox', 'commix', 'traversal', 'idor')
@@ -274,19 +274,24 @@ def ollama_plan(state: AgentState) -> dict[str, Any]:
     system_message = (
         'Plan an explicitly authorized web-security assessment. Choose only candidate IDs supplied in the user context; '
         'each candidate already represents an exact discovery-derived request contract that Python will validate again. '
-        'Prioritize expected information gain and evidence from discovery/results, not checklist coverage. Avoid redundant '
-        'actions and do not select one action per tool merely for coverage. Prefer parameter tools only when their candidate '
-        'parameters fit the vulnerability class, IDOR only for numeric object references, authorization only for read-only '
-        'identity/object/resource signals, and Interactsh only for OAST-compatible inputs. Respect round_action_budget. '
-        'Set finish=true only when no remaining candidate is likely to materially improve the assessment. '
-        'Keep reasoning_summary under 240 characters. Return only schema-valid JSON.'
+        'Prioritize expected information gain and evidence from discovery/results, but actively use the round action budget '
+        'when several useful candidates remain. Prefer broad, complementary coverage across distinct vulnerability classes '
+        'instead of restricting the plan to only the top few actions. A small fraction of the available candidates is '
+        'appropriate only when the omitted actions are genuinely redundant, weakly supported, or unlikely to change the '
+        'assessment. Do not select one action per tool merely to satisfy a checklist. Prefer parameter tools only when their '
+        'candidate parameters fit the vulnerability class, IDOR only for numeric object references, authorization only for '
+        'read-only identity/object/resource signals, and Interactsh only for OAST-compatible inputs. Respect '
+        'round_action_budget as a maximum, not as a target that must be filled. Set finish=true only when no remaining '
+        'candidate is likely to materially improve the assessment. Keep reasoning_summary under 240 characters and mention '
+        'the main reason when many candidates are deferred. Return only schema-valid JSON.'
     )
     base = state['ollama_url'].rstrip('/')
     total_timeout = max(120, int(state.get('ai_timeout') or 480))
     max_predict = AI_PLANNER_MAX_PREDICT.get(shared.CURRENT_SCAN_MODE, 320)
     if state['round'] >= 1:
+        # Keep later rounds bounded in wall-clock time, but do not truncate the model's
+        # action list: a continuation round may still contain many useful candidates.
         total_timeout = min(total_timeout, 300)
-        max_predict = min(max_predict, 260)
     context = json.dumps(prompt, ensure_ascii=False, separators=(',', ':'))
     # The compact contract normally fits in 4k context; balanced/deep retain extra room for many candidates.
     context_window = 4096 if shared.CURRENT_SCAN_MODE == 'fast' else 6144
@@ -311,6 +316,7 @@ def ollama_plan(state: AgentState) -> dict[str, Any]:
             'options': common_options, 'keep_alive': '30m'}, max(90, int(total_timeout * 0.3))),
     ]
     errors: list[str] = []
+    planning_started = time.monotonic()
     for kind, url, payload, budget in attempts:
         started = time.monotonic()
         try:
@@ -328,13 +334,99 @@ def ollama_plan(state: AgentState) -> dict[str, Any]:
                 selected = dict(action)
                 selected['reason'] = f"AI selected {candidate_id}: {str(action.get('reason') or 'discovery-derived candidate')[:420]}"
                 selected_actions.append(selected)
+
+            # A compact local model can interpret "prioritize information gain" too
+            # aggressively and return only a couple of actions even when many distinct
+            # candidates remain. Ask it once to reconsider the deferred candidates;
+            # Python still adds nothing on its own and the same validated IDs/budget apply.
+            review_selected_ids: list[str] = []
+            review_seconds = 0.0
+            review_error = ''
+            sparse_limit = min(action_budget, len(candidates))
+            sparse_plan = (
+                sparse_limit >= 6
+                and len(selected_actions) < min(6, max(3, (sparse_limit + 1) // 2))
+                and len(selected_actions) < action_budget
+            )
+            review_time_budget = min(
+                120,
+                max(0, int(total_timeout - (time.monotonic() - planning_started))),
+            )
+            if sparse_plan and review_time_budget >= 30:
+                remaining_candidates = [
+                    candidate for candidate in candidates
+                    if str(candidate.get('id') or '') not in selected_ids
+                ]
+                review_prompt = {
+                    'target': state['target'],
+                    'scan_mode': shared.CURRENT_SCAN_MODE,
+                    'round': state['round'] + 1,
+                    'round_action_budget': action_budget,
+                    'already_selected_action_ids': selected_ids,
+                    'remaining_slots': action_budget - len(selected_actions),
+                    'remaining_candidates': remaining_candidates,
+                    'previous_reasoning_summary': str(compact_plan.get('reasoning_summary') or '')[:240],
+                }
+                review_system_message = (
+                    'Reconsider the deferred candidates from an explicitly authorized web-security assessment. '
+                    'The first plan selected only a small fraction of the available actions. Select additional candidate '
+                    'IDs when they provide complementary, non-redundant evidence or materially broaden vulnerability-class '
+                    'coverage. Do not repeat already selected IDs and do not fill the budget with weak or redundant actions. '
+                    'Every selected ID must come from remaining_candidates. Return only schema-valid JSON.'
+                )
+                review_context = json.dumps(review_prompt, ensure_ascii=False, separators=(',', ':'))
+                review_started = time.monotonic()
+                try:
+                    review_content = _ollama_stream_content(
+                        f'{base}/api/chat',
+                        {
+                            'model': state['model'],
+                            'format': PLAN_SCHEMA,
+                            'messages': [
+                                {'role': 'system', 'content': review_system_message},
+                                {'role': 'user', 'content': review_context},
+                            ],
+                            'options': common_options,
+                            'keep_alive': '30m',
+                        },
+                        response_kind='chat',
+                        total_timeout=review_time_budget,
+                        early_json=True,
+                    )
+                    review_plan = _parse_ollama_plan_content(review_content)
+                    for candidate_id in [str(value) for value in review_plan.get('selected_action_ids', [])]:
+                        action = candidate_map.get(candidate_id)
+                        if (
+                            action is None
+                            or candidate_id in selected_ids
+                            or len(selected_actions) >= action_budget
+                        ):
+                            continue
+                        selected_ids.append(candidate_id)
+                        review_selected_ids.append(candidate_id)
+                        selected = dict(action)
+                        selected['reason'] = (
+                            f"AI review selected {candidate_id}: "
+                            f"{str(action.get('reason') or 'discovery-derived candidate')[:420]}"
+                        )
+                        selected_actions.append(selected)
+                except Exception as review_exc:
+                    # The initial AI plan is already valid, so an optional breadth review
+                    # must not turn a successful strict-agentic round into a failure.
+                    review_error = f'{type(review_exc).__name__}: {review_exc}'
+                finally:
+                    review_seconds = round(time.monotonic() - review_started, 2)
+
             LAST_OLLAMA_PLAN_DIAGNOSTICS.clear()
             LAST_OLLAMA_PLAN_DIAGNOSTICS.update({
                 'endpoint': kind,
                 'context_bytes': len(context.encode('utf-8')),
                 'candidate_count': len(candidates),
                 'selected_action_ids': selected_ids,
-                'seconds': round(time.monotonic() - started, 2),
+                'review_selected_action_ids': review_selected_ids,
+                'review_seconds': review_seconds,
+                'review_error': review_error,
+                'seconds': round(time.monotonic() - planning_started, 2),
                 'attempt_errors': list(errors),
             })
             return {
@@ -346,7 +438,7 @@ def ollama_plan(state: AgentState) -> dict[str, Any]:
             errors.append(f'{kind}: {type(exc).__name__}: {exc}')
             LAST_OLLAMA_PLAN_DIAGNOSTICS.update({
                 'endpoint': kind,
-                'seconds': round(time.monotonic() - started, 2),
+                'seconds': round(time.monotonic() - planning_started, 2),
                 'attempt_errors': list(errors),
             })
     raise RuntimeError('; '.join(errors))
@@ -661,6 +753,7 @@ def planner_node(state: AgentState) -> dict[str, Any]:
     endpoint = 'unavailable'
     context_bytes = 0
     ai_selected_count = 0
+    review_selected_ids: list[str] = []
     fallback_reason = ''
     try:
         decision = ollama_plan(state)
@@ -674,11 +767,19 @@ def planner_node(state: AgentState) -> dict[str, Any]:
         planner_seconds = float(LAST_OLLAMA_PLAN_DIAGNOSTICS.get('seconds', 0) or 0)
         candidate_count = int(LAST_OLLAMA_PLAN_DIAGNOSTICS.get('candidate_count', 0) or 0)
         selected_ids = [str(value) for value in LAST_OLLAMA_PLAN_DIAGNOSTICS.get('selected_action_ids', [])]
+        review_selected_ids = [str(value) for value in LAST_OLLAMA_PLAN_DIAGNOSTICS.get('review_selected_action_ids', [])]
+        review_seconds = float(LAST_OLLAMA_PLAN_DIAGNOSTICS.get('review_seconds', 0) or 0)
+        review_error = str(LAST_OLLAMA_PLAN_DIAGNOSTICS.get('review_error', '') or '')
         if not plan and (not finished) and eligible:
             finished = True
             summary = (summary + ' No action was selected; the planner ended the round without forcing a checklist.').strip()
+        if review_selected_ids:
+            summary = (summary + f' Breadth review added {len(review_selected_ids)} complementary action(s).').strip()
+        elif review_error:
+            summary = (summary + ' Optional breadth review failed; the initial AI plan was kept.').strip()
         notes.append(f'Round {round_number} [{planner_source}/{endpoint}; context={context_bytes}B]: {summary}')
-        print(f'\n[*] Ollama plan round {round_number} via {endpoint} (context={context_bytes} bytes; candidates={candidate_count}; selected={len(selected_ids)}; {planner_seconds:.1f}s): {summary}', flush=True)
+        review_note = f'; review=+{len(review_selected_ids)} in {review_seconds:.1f}s' if review_seconds else ''
+        print(f'\n[*] Ollama plan round {round_number} via {endpoint} (context={context_bytes} bytes; candidates={candidate_count}; selected={len(selected_ids)}{review_note}; {planner_seconds:.1f}s): {summary}', flush=True)
     except Exception as exc:
         endpoint = str(LAST_OLLAMA_PLAN_DIAGNOSTICS.get('endpoint', 'unavailable'))
         context_bytes = int(LAST_OLLAMA_PLAN_DIAGNOSTICS.get('context_bytes', 0) or 0)
@@ -700,6 +801,7 @@ def planner_node(state: AgentState) -> dict[str, Any]:
         'eligible_tools': sorted({str(action.get('tool') or '') for action in eligible}),
         'round_action_budget': budget,
         'ai_selected_action_count': ai_selected_count,
+        'review_selected_action_count': len(review_selected_ids) if planner_source == 'ai' else 0,
         'fallback_reason': fallback_reason,
         'selected_action_count': len(plan),
         'selected_actions': [_audit_action_summary(action) for action in plan],
