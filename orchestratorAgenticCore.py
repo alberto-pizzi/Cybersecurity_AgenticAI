@@ -53,16 +53,23 @@ class AgentState(TypedDict):
     secondary_cookies: str
     planner_audit: list[dict[str, Any]]
 AI_PLANNER_TIMEOUTS = {'fast': 300, 'balanced': 480, 'deep': 720}
-AI_PLANNER_MAX_PREDICT = {'fast': 700, 'balanced': 1000, 'deep': 1400}
+AI_PLANNER_MAX_PREDICT = {'fast': 220, 'balanced': 320, 'deep': 460}
 LAST_OLLAMA_PLAN_DIAGNOSTICS: dict[str, Any] = {}
 BROAD_COVERAGE_TOOLS = ('ffuf', 'zap', 'nuclei', 'session', 'nikto')
 PARAMETER_COVERAGE_TOOLS = ('sqlmap', 'dalfox', 'commix', 'traversal', 'idor')
 AUTHORIZATION_COVERAGE_TOOLS = ('authorization',)
 WORKFLOW_COVERAGE_TOOLS = ('browser', 'workflow')
 ROUND_ACTION_BUDGETS = {'fast': 14, 'balanced': 24, 'deep': 36}
-PLAN_SCHEMA = {'type': 'object',
-    'properties': {'reasoning_summary': {'type': 'string'}, 'actions': {'type': 'array', 'items': {'type': 'object', 'properties': {'profile': {'type': 'string'}, 'tool': {'type': 'string'}, 'target_url': {'type': 'string'}, 'jwt_token': {'type': 'string'}, 'injection_url': {'type': 'string'}, 'method': {'type': 'string'}, 'data': {'type': 'string'}, 'parameters': {'type': 'array', 'items': {'type': 'string'}}, 'reason': {'type': 'string'}}, 'required': ['profile', 'tool', 'target_url', 'jwt_token', 'injection_url', 'reason']}}, 'finish': {'type': 'boolean'}},
-    'required': ['reasoning_summary', 'actions', 'finish']}
+PLAN_SCHEMA = {
+    'type': 'object',
+    'properties': {
+        'reasoning_summary': {'type': 'string'},
+        'selected_action_ids': {'type': 'array', 'items': {'type': 'string'}},
+        'finish': {'type': 'boolean'},
+    },
+    'required': ['reasoning_summary', 'selected_action_ids', 'finish'],
+}
+
 
 # Turns an Ollama error response into a readable message.
 def _ollama_error(response: requests.Response) -> str:
@@ -138,42 +145,46 @@ def ensure_ollama_model(ollama_url: str, requested_model: str, *, allow_pull: bo
     diagnostics.update(model_ready=False, selected_model='')
     raise RuntimeError('Ollama is reachable but no usable local model exists. ' + (pull_error or f"Requested model '{requested_model}' is not installed."))
 
-# Plan validation rejects Ollama responses that do not contain the expected action list.
+# Plan parsing accepts only the compact ID-selection contract used by the local model.
 def _parse_ollama_plan_content(content: str) -> dict[str, Any]:
     value = json.loads(str(content or ''))
-    if not isinstance(value, dict) or not isinstance(value.get('actions', []), list):
-        raise ValueError('Ollama returned an invalid plan object.')
+    if not isinstance(value, dict) or not isinstance(value.get('selected_action_ids', []), list):
+        raise ValueError('Ollama returned an invalid compact plan object.')
     return value
 
-# Keeps only the discovery data that the planner needs.
-def compact_discovery_for_planner(discovery: dict[str, dict[str, Any]]) -> dict[str, Any]:
 
-    compact: dict[str, Any] = {}
+# The model sees compact identifiers; Python retains the exact validated request contracts.
+def _planner_candidate_view(action: dict[str, Any], candidate_id: str) -> dict[str, Any]:
+    return {
+        'id': candidate_id,
+        'profile': str(action.get('profile') or ''),
+        'tool': str(action.get('tool') or ''),
+        'method': str(action.get('method') or 'GET'),
+        'url': str(action.get('target_url') or ''),
+        'parameters': [str(value) for value in action.get('parameters', [])][:10],
+        'file_parameters': [str(value) for value in action.get('file_parameters', [])][:6],
+        'token_parameters': [str(value) for value in action.get('token_parameters', [])][:6],
+        'oast_class': str(action.get('oast_class') or ''),
+        'evidence': str(action.get('reason') or '')[:220],
+    }
+
+
+def _planner_discovery_summary(discovery: dict[str, dict[str, Any]]) -> dict[str, Any]:
+    summary: dict[str, Any] = {}
     for profile, found in discovery.items():
-        ranked_cases = select_request_cases(found, limit=36)
-        request_cases = []
-        for case in ranked_cases:
-            request_cases.append({'url': str(case.get('url', '')),
-                'method': str(case.get('method', 'GET')).upper(),
-                'data': str(case.get('data', ''))[:900],
-                'parameters': [str(value) for value in case.get('parameters', [])][:20],
-                'file_parameters': [str(value) for value in case.get('file_parameters', [])][:8],
-                'token_parameters': [str(value) for value in case.get('token_parameters', [])][:8],
-                'enctype': str(case.get('enctype', ''))[:120],
-                'source_url': str(case.get('source_url', '')),
-                'priority_score': int(case.get('priority_score', 0) or 0)})
-        compact[profile] = {'authenticated': found.get('authentication_effective'),
-            'html_url_count': len(found.get('html_urls', [])),
-            'request_case_count': len(found.get('request_cases', [])),
-            'high_value_html_urls': [str(value) for value in found.get('html_urls', [])[:45]],
-            'request_cases': request_cases,
-            'client_side_candidates': [{'url': str(item.get('url', '')), 'script_url': str(item.get('script_url', '')), 'sources': list(item.get('sources', []))[:8], 'sinks': list(item.get('sinks', []))[:8]} for item in found.get('client_side_candidates', [])[:12] if isinstance(item, dict)],
-            'jwt_tokens': [str(value)[:1800] for value in found.get('jwt_tokens', [])[:4]],
-            'crawl_errors': [{'url': str(item.get('url', '')), 'error': str(item.get('error', item.get('message', '')))[:300]} for item in found.get('errors', [])[:8] if isinstance(item, dict)]}
-    return compact
+        summary[profile] = {
+            'authenticated': found.get('authentication_effective'),
+            'html_pages': len(found.get('html_urls', [])),
+            'request_cases': len(found.get('request_cases', [])),
+            'client_side_candidates': len(found.get('client_side_candidates', [])),
+            'jwt_tokens': len(found.get('jwt_tokens', [])),
+            'crawl_errors': len(found.get('errors', [])),
+        }
+    return summary
+
 
 # Reads the streamed Ollama response and joins its text safely.
-def _ollama_stream_content(url: str, payload: dict[str, Any], *, response_kind: str, total_timeout: int) -> str:
+def _ollama_stream_content(url: str, payload: dict[str, Any], *, response_kind: str, total_timeout: int, early_json: bool=False) -> str:
 
     started = time.monotonic()
     chunks: list[str] = []
@@ -208,6 +219,15 @@ def _ollama_stream_content(url: str, payload: dict[str, Any], *, response_kind: 
                 piece = str(event.get('response') or '')
             if piece:
                 chunks.append(piece)
+                if early_json:
+                    candidate = ''.join(chunks).strip()
+                    if candidate.endswith('}'):
+                        try:
+                            parsed = json.loads(candidate)
+                        except json.JSONDecodeError:
+                            parsed = None
+                        if isinstance(parsed, dict) and isinstance(parsed.get('selected_action_ids'), list) and isinstance(parsed.get('finish'), bool):
+                            return candidate
             if event.get('done') is True:
                 break
     finally:
@@ -232,43 +252,103 @@ def action_id(action: dict[str, Any]) -> str:
 
 # Asks Ollama for the next scan actions and returns a structured plan.
 def ollama_plan(state: AgentState) -> dict[str, Any]:
-    registry = {name: {'scope': values[2], 'description': values[3]} for name, values in REGISTRY.items()}
-    eligible = validate_plan(state, discovery_candidate_actions(state))
-    remaining_by_profile: dict[str, list[dict[str, Any]]] = {}
-    for action in eligible:
-        remaining_by_profile.setdefault(action['profile'], []).append({'tool': action['tool'], 'target_url': action['target_url'], 'method': action.get('method', 'GET'), 'parameters': action.get('parameters', []), 'file_parameters': action.get('file_parameters', []), 'token_parameters': action.get('token_parameters', []), 'source_url': action.get('source_url', '')})
-    prompt = {'target': state['target'],
+    eligible = _eligible_action_catalog(state)
+    candidate_map = {f'A{index:03d}': action for index, action in enumerate(eligible, 1)}
+    candidates = [_planner_candidate_view(action, candidate_id) for candidate_id, action in candidate_map.items()]
+    candidate_tools = sorted({str(action.get('tool') or '') for action in eligible})
+    registry = {
+        name: {'scope': REGISTRY[name][2], 'description': str(REGISTRY[name][3])[:180]}
+        for name in candidate_tools if name in REGISTRY
+    }
+    prompt = {
+        'target': state['target'],
         'round': state['round'] + 1,
         'maximum_rounds': state['max_rounds'],
         'round_action_budget': ROUND_ACTION_BUDGETS.get(shared.CURRENT_SCAN_MODE, 12),
-        'profiles': [profile['name'] for profile in state['profiles']],
-        'registry': registry,
-        'discovery': compact_discovery_for_planner(state['discovery']),
+        'scan_mode': shared.CURRENT_SCAN_MODE,
+        'discovery_summary': _planner_discovery_summary(state['discovery']),
         'previous_results': compact_results(state['results']),
-        'already_completed': state['completed'],
-        'remaining_eligible_actions': remaining_by_profile,
-        'configured_oast_url': state['injection_url']}
-    system_message = 'Plan an explicitly authorized web-security assessment using only the supplied registry and discovery-derived request contracts. The deterministic orchestrator is the exhaustive baseline; this agentic planner should prioritize information gain and avoid redundant tool execution. Choose actions because discovery or previous evidence makes them useful, not to satisfy a checklist or execute one action per tool. Use parameter tools only on exact discovered requests, IDOR only on numeric object references, authorization only on read-only identity/object/resource signals, and Interactsh only on compatible inputs. Avoid destructive actions and completed duplicates. You may set finish=true whenever the remaining candidates are redundant or unlikely to change the assessment materially. Explain the prioritization concisely in reasoning_summary and return schema-valid JSON.'
+        'available_tools': registry,
+        'candidates': candidates,
+    }
+    system_message = (
+        'Plan an explicitly authorized web-security assessment. Choose only candidate IDs supplied in the user context; '
+        'each candidate already represents an exact discovery-derived request contract that Python will validate again. '
+        'Prioritize expected information gain and evidence from discovery/results, not checklist coverage. Avoid redundant '
+        'actions and do not select one action per tool merely for coverage. Prefer parameter tools only when their candidate '
+        'parameters fit the vulnerability class, IDOR only for numeric object references, authorization only for read-only '
+        'identity/object/resource signals, and Interactsh only for OAST-compatible inputs. Respect round_action_budget. '
+        'Set finish=true only when no remaining candidate is likely to materially improve the assessment. '
+        'Keep reasoning_summary under 240 characters. Return only schema-valid JSON.'
+    )
     base = state['ollama_url'].rstrip('/')
     total_timeout = max(120, int(state.get('ai_timeout') or 480))
-    max_predict = AI_PLANNER_MAX_PREDICT.get(shared.CURRENT_SCAN_MODE, 1000)
+    max_predict = AI_PLANNER_MAX_PREDICT.get(shared.CURRENT_SCAN_MODE, 320)
     if state['round'] >= 1:
         total_timeout = min(total_timeout, 300)
-        max_predict = min(max_predict, 600)
-    common_options = {'temperature': 0, 'num_predict': max_predict, 'num_ctx': 8192, 'top_p': 0.9}
+        max_predict = min(max_predict, 260)
     context = json.dumps(prompt, ensure_ascii=False, separators=(',', ':'))
-    attempts = [('chat', f'{base}/api/chat', {'model': state['model'], 'format': PLAN_SCHEMA, 'messages': [{'role': 'system', 'content': system_message}, {'role': 'user', 'content': context}], 'options': common_options, 'keep_alive': '30m'}, max(90, int(total_timeout * 0.62))),
-        ('generate', f'{base}/api/generate', {'model': state['model'], 'format': PLAN_SCHEMA, 'prompt': system_message + '\n\nAssessment context:\n' + context, 'options': common_options, 'keep_alive': '30m'}, max(90, int(total_timeout * 0.38)))]
+    # The compact contract normally fits in 4k context; balanced/deep retain extra room for many candidates.
+    context_window = 4096 if shared.CURRENT_SCAN_MODE == 'fast' else 6144
+    common_options = {'temperature': 0, 'num_predict': max_predict, 'num_ctx': context_window, 'top_p': 0.9}
+    LAST_OLLAMA_PLAN_DIAGNOSTICS.clear()
+    LAST_OLLAMA_PLAN_DIAGNOSTICS.update({
+        'endpoint': 'pending',
+        'context_bytes': len(context.encode('utf-8')),
+        'candidate_count': len(candidates),
+        'selected_action_ids': [],
+        'seconds': 0.0,
+        'attempt_errors': [],
+    })
+    attempts = [
+        ('chat', f'{base}/api/chat', {
+            'model': state['model'], 'format': PLAN_SCHEMA,
+            'messages': [{'role': 'system', 'content': system_message}, {'role': 'user', 'content': context}],
+            'options': common_options, 'keep_alive': '30m'}, max(90, int(total_timeout * 0.7))),
+        ('generate', f'{base}/api/generate', {
+            'model': state['model'], 'format': PLAN_SCHEMA,
+            'prompt': system_message + '\n\nAssessment context:\n' + context,
+            'options': common_options, 'keep_alive': '30m'}, max(90, int(total_timeout * 0.3))),
+    ]
     errors: list[str] = []
     for kind, url, payload, budget in attempts:
+        started = time.monotonic()
         try:
-            content = _ollama_stream_content(url, payload, response_kind=kind, total_timeout=budget)
-            plan = _parse_ollama_plan_content(content)
+            content = _ollama_stream_content(url, payload, response_kind=kind, total_timeout=budget, early_json=True)
+            compact_plan = _parse_ollama_plan_content(content)
+            requested_ids = [str(value) for value in compact_plan.get('selected_action_ids', [])]
+            selected_ids = []
+            selected_actions = []
+            action_budget = ROUND_ACTION_BUDGETS.get(shared.CURRENT_SCAN_MODE, 12)
+            for candidate_id in requested_ids:
+                action = candidate_map.get(candidate_id)
+                if action is None or candidate_id in selected_ids or len(selected_actions) >= action_budget:
+                    continue
+                selected_ids.append(candidate_id)
+                selected = dict(action)
+                selected['reason'] = f"AI selected {candidate_id}: {str(action.get('reason') or 'discovery-derived candidate')[:420]}"
+                selected_actions.append(selected)
             LAST_OLLAMA_PLAN_DIAGNOSTICS.clear()
-            LAST_OLLAMA_PLAN_DIAGNOSTICS.update({'endpoint': kind, 'context_bytes': len(context.encode('utf-8')), 'attempt_errors': list(errors)})
-            return plan
+            LAST_OLLAMA_PLAN_DIAGNOSTICS.update({
+                'endpoint': kind,
+                'context_bytes': len(context.encode('utf-8')),
+                'candidate_count': len(candidates),
+                'selected_action_ids': selected_ids,
+                'seconds': round(time.monotonic() - started, 2),
+                'attempt_errors': list(errors),
+            })
+            return {
+                'reasoning_summary': str(compact_plan.get('reasoning_summary') or '')[:1000],
+                'actions': selected_actions,
+                'finish': bool(compact_plan.get('finish', False)),
+            }
         except Exception as exc:
             errors.append(f'{kind}: {type(exc).__name__}: {exc}')
+            LAST_OLLAMA_PLAN_DIAGNOSTICS.update({
+                'endpoint': kind,
+                'seconds': round(time.monotonic() - started, 2),
+                'attempt_errors': list(errors),
+            })
     raise RuntimeError('; '.join(errors))
 
 # Keeps a small result summary that is safe to send back to the planner.
@@ -591,12 +671,17 @@ def planner_node(state: AgentState) -> dict[str, Any]:
         finished = bool(decision.get('finish', False)) and (not plan)
         endpoint = str(LAST_OLLAMA_PLAN_DIAGNOSTICS.get('endpoint', 'unknown'))
         context_bytes = int(LAST_OLLAMA_PLAN_DIAGNOSTICS.get('context_bytes', 0) or 0)
+        planner_seconds = float(LAST_OLLAMA_PLAN_DIAGNOSTICS.get('seconds', 0) or 0)
+        candidate_count = int(LAST_OLLAMA_PLAN_DIAGNOSTICS.get('candidate_count', 0) or 0)
+        selected_ids = [str(value) for value in LAST_OLLAMA_PLAN_DIAGNOSTICS.get('selected_action_ids', [])]
         if not plan and (not finished) and eligible:
             finished = True
             summary = (summary + ' No action was selected; the planner ended the round without forcing a checklist.').strip()
         notes.append(f'Round {round_number} [{planner_source}/{endpoint}; context={context_bytes}B]: {summary}')
-        print(f'\n[*] Ollama plan round {round_number} via {endpoint} (context={context_bytes} bytes): {summary}', flush=True)
+        print(f'\n[*] Ollama plan round {round_number} via {endpoint} (context={context_bytes} bytes; candidates={candidate_count}; selected={len(selected_ids)}; {planner_seconds:.1f}s): {summary}', flush=True)
     except Exception as exc:
+        endpoint = str(LAST_OLLAMA_PLAN_DIAGNOSTICS.get('endpoint', 'unavailable'))
+        context_bytes = int(LAST_OLLAMA_PLAN_DIAGNOSTICS.get('context_bytes', 0) or 0)
         if state.get('require_ai'):
             raise RuntimeError(f'Strict agentic mode requires a successful Ollama plan: {type(exc).__name__}: {exc}') from exc
         plan = _fallback_plan(state, eligible, budget)

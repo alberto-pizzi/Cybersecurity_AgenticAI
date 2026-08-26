@@ -100,15 +100,15 @@ def print_important_commands(
         )),
         ("4. Agentic FAST", _operator_command(
             "orchestratorAgentic.py", "--target", TARGET, "--cookies", cookie,
-            "--auth-only", "--model", model, "--max-rounds", "1", "--mode", "fast",
+            "--auth-only", "--model", model, "--max-rounds", "2", "--mode", "fast", "--require-ai",
         )),
         ("5. Agentic BALANCED", _operator_command(
             "orchestratorAgentic.py", "--target", TARGET, "--cookies", cookie,
-            "--auth-only", "--model", model, "--max-rounds", "2", "--mode", "balanced",
+            "--auth-only", "--model", model, "--max-rounds", "2", "--mode", "balanced", "--require-ai",
         )),
         ("6. Agentic DEEP", _operator_command(
             "orchestratorAgentic.py", "--target", TARGET, "--cookies", cookie,
-            "--auth-only", "--model", model, "--max-rounds", "3", "--mode", "deep",
+            "--auth-only", "--model", model, "--max-rounds", "3", "--mode", "deep", "--require-ai",
         )),
     )
     for label, command in commands:
