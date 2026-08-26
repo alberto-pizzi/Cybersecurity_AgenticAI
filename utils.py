@@ -21,46 +21,32 @@ LOCAL_BIN = Path.home() / ".local" / "bin"
 
 MCP_HTTP_HOST = "127.0.0.1"
 MCP_HTTP_PATH = "/mcp"
-MCP_SERVER_PORTS: dict[str, int] = {
-    "ffuf": 8101,
-    "zap": 8103,
-    "nuclei": 8104,
-    "session": 8105,
-    "nikto": 8106,
-    "arjun": 8107,
-    "sqlmap": 8108,
-    "dalfox": 8109,
-    "commix": 8110,
-    "traversal": 8111,
-    "idor": 8112,
-    "authorization": 8113,
-    "browser": 8114,
-    "workflow": 8115,
-    "jwt": 8116,
-    "interactsh": 8117,
-    "report": 8118,
-}
+MCP_UNIFIED_SERVICE = "secops"
+MCP_SERVER_PORTS: dict[str, int] = {MCP_UNIFIED_SERVICE: 8100}
 
 
-# Each tool name maps to a fixed loopback port used by its MCP service.
-def mcp_http_port(tool_name: str) -> int:
-    name = str(tool_name or "").strip().lower()
+# The complete security catalogue is exposed through one local MCP service.
+def mcp_http_port(service_name: str = MCP_UNIFIED_SERVICE) -> int:
+    name = str(service_name or MCP_UNIFIED_SERVICE).strip().lower()
     if name not in MCP_SERVER_PORTS:
-        raise KeyError(f"Unknown MCP HTTP service: {tool_name}")
+        raise KeyError(f"Unknown MCP HTTP service: {service_name}")
     return int(MCP_SERVER_PORTS[name])
 
 
-# Builds the local MCP URL used to reach one tool server.
-def mcp_http_url(tool_name: str, host: str = MCP_HTTP_HOST) -> str:
-    return f"http://{host}:{mcp_http_port(tool_name)}{MCP_HTTP_PATH}"
+# Builds the local URL of the unified MCP security service.
+def mcp_http_url(service_name: str = MCP_UNIFIED_SERVICE, host: str = MCP_HTTP_HOST) -> str:
+    return f"http://{host}:{mcp_http_port(service_name)}{MCP_HTTP_PATH}"
 
 
-# Starts one FastMCP server on its assigned local HTTP port.
-def run_mcp_http(mcp: Any, tool_name: str) -> None:
-
-
+# Only the unified interface is allowed to own an MCP HTTP listener.
+def run_mcp_http(mcp: Any, service_name: str = MCP_UNIFIED_SERVICE) -> None:
+    name = str(service_name or MCP_UNIFIED_SERVICE).strip().lower()
+    if name != MCP_UNIFIED_SERVICE:
+        raise RuntimeError(
+            f"Standalone MCP service '{service_name}' is disabled; run servers/secopsServer.py instead."
+        )
     host = os.getenv("SECOPS_MCP_HOST", MCP_HTTP_HOST).strip() or MCP_HTTP_HOST
-    port = int(os.getenv("SECOPS_MCP_PORT", str(mcp_http_port(tool_name))))
+    port = int(os.getenv("SECOPS_MCP_PORT", str(mcp_http_port(MCP_UNIFIED_SERVICE))))
     mcp.run(transport="http", host=host, port=port)
 
 _FATAL_STARTUP_PATTERNS = (

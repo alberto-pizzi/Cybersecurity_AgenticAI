@@ -21,6 +21,19 @@ def _finding_card(item: dict[str, Any], index: int, toc: list[tuple[int, str, st
         anchor=f"finding-{index}",
         extra=f' <span>{_esc(item["risk"]).upper()}</span>',
     )
+    scanner_fields = item.get("scanner_fields") if isinstance(item.get("scanner_fields"), dict) else {}
+    ai_assessment = scanner_fields.get("ai_assessment") if isinstance(scanner_fields, dict) else None
+    ai_block = ""
+    if isinstance(ai_assessment, dict):
+        original_risk = ai_assessment.get("scanner_risk") or scanner_fields.get("scanner_risk") or "not supplied"
+        ai_block = (
+            '<div class="quality"><b>Agentic risk assessment</b><dl>'
+            + _field('Original scanner severity', str(original_risk).upper())
+            + _field('AI assessment confidence', ai_assessment.get('confidence'))
+            + _field('AI severity rationale', ai_assessment.get('rationale'))
+            + _field('Assessment model', ai_assessment.get('model'))
+            + '</dl></div>'
+        )
     return f"""
 <article class="finding risk-{_esc(item['risk'])}">
 {heading}
@@ -50,6 +63,7 @@ def _finding_card(item: dict[str, Any], index: int, toc: list[tuple[int, str, st
 </dl>
 {('<p class="field-label">Identifiers</p>' + _render_list(item.get('identifiers') or [])) if item.get('identifiers') else ''}
 {('<p class="field-label">References</p>' + _render_list(item.get('references') or [])) if item.get('references') else ''}
+{ai_block}
 {('<div class="quality"><b>Data-quality notes</b>' + _render_list(notes) + '</div>') if notes else ''}
 </article>"""
 

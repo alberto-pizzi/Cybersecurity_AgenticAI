@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import json
+import re
 import platform
 import sys
 import time
@@ -52,9 +54,16 @@ class AgentState(TypedDict):
     allow_state_changes: bool
     secondary_cookies: str
     planner_audit: list[dict[str, Any]]
+    analysis: dict[str, Any]
+    only_tool: str
 AI_PLANNER_TIMEOUTS = {'fast': 300, 'balanced': 480, 'deep': 720}
 AI_PLANNER_MAX_PREDICT = {'fast': 700, 'balanced': 1000, 'deep': 1400}
 AI_PLANNER_CONTEXT_WINDOWS = {'fast': 4096, 'balanced': 6144, 'deep': 8192}
+AI_ANALYSIS_BATCH_TIMEOUTS = {'fast': 150, 'balanced': 210, 'deep': 270}
+AI_ANALYSIS_BATCH_SIZES = {'fast': 1, 'balanced': 3, 'deep': 4}
+AI_ANALYSIS_MAX_PREDICT = {'fast': 440, 'balanced': 700, 'deep': 980}
+AI_ANALYSIS_RESCUE_MAX_PREDICT = {'fast': 300, 'balanced': 380, 'deep': 460}
+AI_ANALYSIS_CONTEXT_WINDOWS = {'fast': 4096, 'balanced': 6144, 'deep': 8192}
 LAST_OLLAMA_PLAN_DIAGNOSTICS: dict[str, Any] = {}
 BROAD_COVERAGE_TOOLS = ('ffuf', 'zap', 'nuclei', 'session', 'nikto')
 PARAMETER_COVERAGE_TOOLS = ('sqlmap', 'dalfox', 'commix', 'traversal', 'idor')
@@ -69,6 +78,29 @@ PLAN_SCHEMA = {
         'finish': {'type': 'boolean'},
     },
     'required': ['reasoning_summary', 'selected_action_ids', 'finish'],
+}
+
+ANALYSIS_SCHEMA = {
+    'type': 'object',
+    'properties': {
+        'analyses': {
+            'type': 'array',
+            'items': {
+                'type': 'object',
+                'properties': {
+                    'id': {'type': 'string'},
+                    'risk': {'type': 'string', 'enum': ['critical', 'high', 'medium', 'low', 'info']},
+                    'description': {'type': 'string'},
+                    'impact': {'type': 'string'},
+                    'solution': {'type': 'string'},
+                    'rationale': {'type': 'string'},
+                    'confidence': {'type': 'string', 'enum': ['high', 'medium', 'low']},
+                },
+                'required': ['id', 'risk', 'description', 'impact', 'solution', 'rationale', 'confidence'],
+            },
+        },
+    },
+    'required': ['analyses'],
 }
 
 
@@ -189,7 +221,7 @@ def _ollama_stream_content(url: str, payload: dict[str, Any], *, response_kind: 
 
     started = time.monotonic()
     chunks: list[str] = []
-    read_timeout = max(90, int(total_timeout) + 30)
+    read_timeout = max(15, int(total_timeout) + 5)
     response = requests.post(url, json={**payload, 'stream': True}, stream=True, timeout=(10, read_timeout))
     try:
         if response.status_code >= 400:
@@ -201,11 +233,11 @@ def _ollama_stream_content(url: str, payload: dict[str, Any], *, response_kind: 
             else:
                 content = str(value.get('response') or '')
             if not content:
-                raise ValueError('Ollama completed without returning plan content.')
+                raise ValueError('Ollama completed without returning response content.')
             return content
         for raw in response.iter_lines(decode_unicode=True):
             if time.monotonic() - started > total_timeout:
-                raise TimeoutError(f'Ollama planning exceeded the {total_timeout}-second budget.')
+                raise TimeoutError(f'Ollama request exceeded the {total_timeout}-second budget.')
             if not raw:
                 continue
             try:
@@ -227,8 +259,11 @@ def _ollama_stream_content(url: str, payload: dict[str, Any], *, response_kind: 
                             parsed = json.loads(candidate)
                         except json.JSONDecodeError:
                             parsed = None
-                        if isinstance(parsed, dict) and isinstance(parsed.get('selected_action_ids'), list) and isinstance(parsed.get('finish'), bool):
-                            return candidate
+                        if isinstance(parsed, dict):
+                            plan_complete = isinstance(parsed.get('selected_action_ids'), list) and isinstance(parsed.get('finish'), bool)
+                            analysis_complete = isinstance(parsed.get('analyses'), list)
+                            if plan_complete or analysis_complete:
+                                return candidate
             if event.get('done') is True:
                 break
     finally:
@@ -237,7 +272,7 @@ def _ollama_stream_content(url: str, payload: dict[str, Any], *, response_kind: 
             close()
     content = ''.join(chunks).strip()
     if not content:
-        raise ValueError('Ollama completed without returning plan content.')
+        raise ValueError('Ollama completed without returning response content.')
     return content
 
 # Sends a small request so the model is ready before planning starts.
@@ -250,6 +285,22 @@ def warm_ollama_model(ollama_url: str, model: str, *, timeout: int) -> dict[str,
 # Builds a stable identifier for one planned action.
 def action_id(action: dict[str, Any]) -> str:
     return '|'.join((str(action.get(key, '')) for key in ('profile', 'tool', 'target_url', 'method', 'data', 'jwt_token', 'injection_url')))
+
+# Converts internal planner field names into readable console/report wording.
+def _humanize_planner_reasoning(value: Any) -> str:
+    text = str(value or '').strip()
+    replacements = (
+        ('already_selected_action_ids', 'actions already selected'),
+        ('selected_action_ids', 'selected actions'),
+        ('remaining_candidates', 'remaining candidates'),
+        ('reasoning_summary', 'reasoning'),
+        ('round_action_budget', 'round action budget'),
+        ('remaining_slots', 'remaining slots'),
+    )
+    for internal, readable in replacements:
+        text = text.replace(internal, readable)
+    text = re.sub(r'\bredundant with actions already selected\b', 'overlap with actions already selected', text, flags=re.IGNORECASE)
+    return re.sub(r'\s+', ' ', text).strip()
 
 # Asks Ollama for the next scan actions and returns a structured plan.
 def ollama_plan(state: AgentState) -> dict[str, Any]:
@@ -425,7 +476,7 @@ def ollama_plan(state: AgentState) -> dict[str, Any]:
                         early_json=True,
                     )
                     review_plan = _parse_ollama_plan_content(review_content)
-                    review_reasoning = str(review_plan.get('reasoning_summary') or '')[:500]
+                    review_reasoning = _humanize_planner_reasoning(review_plan.get('reasoning_summary'))[:500]
                     for candidate_id in [str(value) for value in review_plan.get('selected_action_ids', [])]:
                         action = candidate_map.get(candidate_id)
                         if (
@@ -463,7 +514,7 @@ def ollama_plan(state: AgentState) -> dict[str, Any]:
                 'attempt_errors': list(errors),
             })
             return {
-                'reasoning_summary': str(compact_plan.get('reasoning_summary') or '')[:1000],
+                'reasoning_summary': _humanize_planner_reasoning(compact_plan.get('reasoning_summary'))[:1000],
                 'actions': selected_actions,
                 'finish': bool(compact_plan.get('finish', False)),
             }
@@ -475,6 +526,407 @@ def ollama_plan(state: AgentState) -> dict[str, Any]:
                 'attempt_errors': list(errors),
             })
     raise RuntimeError('; '.join(errors))
+
+# Removes reusable credentials from evidence before it is sent to the local analysis model.
+def _redact_ai_evidence(value: Any) -> str:
+    text = str(value or '')
+    text = re.sub(r'(?i)(Cookie:\s*)[^\r\n]+', r'\1<redacted>', text)
+    text = re.sub(r'(?i)(Authorization:\s*Bearer\s+)[A-Za-z0-9._~-]+', r'\1<redacted>', text)
+    text = re.sub(r'eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]*', '<redacted-jwt>', text)
+    return text
+
+# Builds immutable evidence views while retaining references to the raw findings that AI may enrich.
+def _analysis_catalog(results: dict[str, dict[str, Any]]) -> tuple[list[dict[str, Any]], dict[str, dict[str, Any]]]:
+    candidates: list[dict[str, Any]] = []
+    finding_map: dict[str, dict[str, Any]] = {}
+    for path, result in iter_leaf_results(results):
+        profile = path[0] if path else str(result.get('profile') or 'unknown')
+        tool = path[1].split(':', 1)[0] if len(path) > 1 else str(result.get('tool') or 'unknown')
+        for finding in result.get('vulnerabilities') or []:
+            if not isinstance(finding, dict):
+                continue
+            category = str(finding.get('category') or '').lower()
+            scanner_risk = str(finding.get('risk') or 'info').lower()
+            if category not in {'vulnerability', 'candidate'}:
+                if category or scanner_risk in {'', 'info'}:
+                    continue
+                category = 'candidate'
+            finding_id = f'F{len(candidates) + 1:03d}'
+            finding_map[finding_id] = finding
+            candidates.append({
+                'id': finding_id,
+                'profile': profile,
+                'tool': tool,
+                'alert': str(finding.get('alert') or '')[:240],
+                'scanner_risk': scanner_risk,
+                'category': category,
+                'verification_status': str(finding.get('verification_status') or '')[:180],
+                'verification_confidence': str(finding.get('confidence') or '')[:80],
+                'url': str(finding.get('url') or result.get('target') or '')[:500],
+                'method': str(finding.get('method') or finding.get('request_method') or '')[:20],
+                'parameter': str(finding.get('parameter') or '')[:160],
+                'description': _redact_ai_evidence(finding.get('description'))[:650],
+                'technical_details': _redact_ai_evidence(finding.get('technical_details') or finding.get('other_information'))[:550],
+                'evidence': _redact_ai_evidence(finding.get('evidence'))[:1000],
+                'scanner_impact': _redact_ai_evidence(finding.get('impact'))[:550],
+                'scanner_solution': _redact_ai_evidence(finding.get('solution'))[:550],
+                'attack_preconditions': _redact_ai_evidence(finding.get('attack_preconditions') or finding.get('preconditions'))[:320],
+                'owasp_category': str(finding.get('owasp_category') or '')[:180],
+                'cwe_id': str(finding.get('cwe_id') or '')[:80],
+                'cve_ids': [str(value) for value in (finding.get('cve_ids') or [])][:8] if isinstance(finding.get('cve_ids') or [], list) else [],
+            })
+    return candidates, finding_map
+
+# Parses one structured batch returned by the AI analysis stage.
+def _parse_analysis_content(content: str) -> list[dict[str, Any]]:
+    raw = str(content or '').strip()
+    if raw.startswith('```'):
+        raw = re.sub(r'^```(?:json)?\s*', '', raw, flags=re.IGNORECASE)
+        raw = re.sub(r'\s*```$', '', raw)
+    first, last = raw.find('{'), raw.rfind('}')
+    if first >= 0 and last > first:
+        raw = raw[first:last + 1]
+
+    # Ollama structured output is normally valid JSON. These two bounded repairs
+    # recover the common local-model mistakes without asking the model to regenerate
+    # an otherwise complete answer.
+    candidates = [raw, re.sub(r',\s*([}\]])', r'\1', raw)]
+    repaired = candidates[-1]
+    for _ in range(4):
+        try:
+            value = json.loads(repaired)
+            break
+        except json.JSONDecodeError as exc:
+            if "Expecting ',' delimiter" not in str(exc) or exc.pos <= 0 or exc.pos >= len(repaired):
+                value = None
+                break
+            before = repaired[:exc.pos]
+            after = repaired[exc.pos:]
+            next_nonspace = after.lstrip()[:1]
+            previous_nonspace = before.rstrip()[-1:] if before.rstrip() else ''
+            if next_nonspace not in {'"', '{'} or previous_nonspace not in {'"', '}', ']', '0', '1', '2', '3', '4', '5', '6', '7', '8', '9', 'e', 'l'}:
+                value = None
+                break
+            repaired = before + ',' + after
+    else:
+        value = None
+
+    if value is None:
+        # Re-raise the original parser error so diagnostics still point to the
+        # model output rather than to the repair helper.
+        value = json.loads(raw)
+    if not isinstance(value, dict):
+        raise ValueError('Ollama returned an invalid analysis object.')
+    rows = value.get('analyses')
+    if not isinstance(rows, list):
+        raise ValueError('Ollama returned an invalid analysis object.')
+    return [dict(row) for row in rows if isinstance(row, dict)]
+
+
+def _analysis_related_findings(batch: list[dict[str, Any]], all_candidates: list[dict[str, Any]], limit: int=4) -> list[dict[str, Any]]:
+    batch_ids = {str(item.get('id') or '') for item in batch}
+    batch_urls = {str(item.get('url') or '') for item in batch if item.get('url')}
+    batch_parameters = {str(item.get('parameter') or '').lower() for item in batch if item.get('parameter')}
+    batch_alerts = {re.sub(r'\s+', ' ', str(item.get('alert') or '').strip().lower()) for item in batch if item.get('alert')}
+    ranked: list[tuple[int, dict[str, Any]]] = []
+    for item in all_candidates:
+        if str(item.get('id') or '') in batch_ids:
+            continue
+        score = 0
+        if str(item.get('url') or '') in batch_urls:
+            score += 5
+        if str(item.get('parameter') or '').lower() in batch_parameters and item.get('parameter'):
+            score += 4
+        if re.sub(r'\s+', ' ', str(item.get('alert') or '').strip().lower()) in batch_alerts and item.get('alert'):
+            score += 4
+        if score:
+            ranked.append((score, item))
+    ranked.sort(key=lambda pair: (-pair[0], str(pair[1].get('id') or '')))
+    return [
+        {
+            'id': item.get('id'),
+            'tool': item.get('tool'),
+            'alert': str(item.get('alert') or '')[:120],
+            'scanner_risk': item.get('scanner_risk'),
+            'category': item.get('category'),
+            'verification_status': str(item.get('verification_status') or '')[:90],
+            'url': str(item.get('url') or '')[:220],
+            'parameter': str(item.get('parameter') or '')[:80],
+        }
+        for _, item in ranked[:limit]
+    ]
+
+
+AI_ANALYSIS_MIN_WORDS = {'description': 20, 'impact': 12, 'solution': 15, 'rationale': 8}
+
+
+def _analysis_quality_check(rows: list[dict[str, Any]], expected: set[str]) -> list[dict[str, Any]]:
+    # Validate the AI contract without failing strict mode for weak prose alone.
+    # Strict agentic mode still requires a real, parseable AI assessment for every finding.
+    # Narrative quality is handled field-by-field later: if the AI returns a materially
+    # underdeveloped description/impact/remediation and the scanner has a stronger
+    # original value, that one field falls back to the scanner text instead of aborting
+    # the entire assessment.
+    returned_ids = [str(item.get('id') or '') for item in rows]
+    returned = set(returned_ids)
+    if returned != expected or len(returned_ids) != len(expected):
+        missing = sorted(expected - returned)
+        extra = sorted(returned - expected)
+        duplicates = sorted({value for value in returned_ids if returned_ids.count(value) > 1 and value})
+        raise ValueError(f'Analysis IDs mismatch; missing={missing}, extra={extra}, duplicates={duplicates}')
+    for row in rows:
+        risk = str(row.get('risk') or '').lower()
+        confidence = str(row.get('confidence') or '').lower()
+        if risk not in {'critical', 'high', 'medium', 'low', 'info'} or confidence not in {'high', 'medium', 'low'}:
+            raise ValueError(f"Analysis returned invalid risk/confidence for {row.get('id')!r}.")
+        short_fields: list[str] = []
+        for key, minimum in AI_ANALYSIS_MIN_WORDS.items():
+            value = str(row.get(key) or '').strip()
+            if len(value.split()) < minimum:
+                short_fields.append(key)
+        if short_fields:
+            row['_short_fields'] = short_fields
+    return rows
+
+
+# Runs one evidence-grounded analysis batch. Multi-finding failures are split
+# immediately; a single finding gets one smaller rescue attempt instead of
+# spending the entire batch budget on a second long generation.
+def _ollama_analysis_batch(state: AgentState, batch: list[dict[str, Any]], all_candidates: list[dict[str, Any]], timeout: int) -> list[dict[str, Any]]:
+    system_message = (
+        'Act as the final evidence analyst for an explicitly authorized web-security assessment. '
+        'Analyze EVERY supplied finding ID using only its scanner/verifier evidence. The finding category, verification '
+        'status, URL, parameter, payload and evidence are immutable facts; never upgrade a candidate into a confirmed '
+        'vulnerability and never invent successful exploitation, stolen data, privileges or preconditions that are not supported. '
+        'Independently choose risk as critical, high, medium, low or info; scanner_risk is useful input but is not authoritative. '
+        'Severity must be calibrated to demonstrated impact, not to the vulnerability class alone. CRITICAL is exceptional: '
+        'a confirmed SQL injection by itself is normally HIGH; use CRITICAL only when the supplied evidence demonstrates '
+        'full data-store compromise, unauthenticated administrative takeover, remote code execution, or comparably system-wide impact. '
+        'REWRITE the scanner narrative into a stronger professional finding; do not decide whether to keep the scanner wording. '
+        'Python will retain the scanner wording only as a safety net when one of your narrative fields is empty or materially underdeveloped, '
+        'so make every description, impact and remediation independently complete and more informative than the original. '
+        'Description must be 2 concise sentences: first explain the weakness and affected input/endpoint, then state the concrete '
+        'scanner observation that supports it. Retain useful technical facts such as method, parameter, response differential, matcher, '
+        'payload class, DBMS, browser execution or verifier result when supplied. Do not merely repeat the alert title or verification label. '
+        'Impact must state what the evidence actually demonstrates first, then clearly qualify additional realistic consequences as possible '
+        'when they were not directly proven. Remediation must be specific to the weakness and retain useful scanner recommendations, including '
+        'the concrete defensive technique and an appropriate verification/regression step. Avoid generic filler such as "validate input" by itself. '
+        'Target roughly 30-55 words for description, 18-35 for impact, 25-50 for remediation, and 8-20 for rationale. '
+        'For candidates, reflect uncertainty in the rationale and keep severity conservative when exploitability is not established. '
+        'Use high for major demonstrated exploitable impact, medium for meaningful but constrained impact, low for limited impact, '
+        'and info for non-exploitable security context. Related findings may inform confidence or severity only when they clearly refer '
+        'to the same weakness or attack chain. Return each requested ID exactly once and return only schema-valid JSON.'
+    )
+    mode = shared.CURRENT_SCAN_MODE
+    related_findings = [] if mode == 'fast' else _analysis_related_findings(batch, all_candidates)
+    context = json.dumps({
+        'target': state['target'],
+        'scan_mode': mode,
+        'authenticated_profiles': [profile['name'] for profile in state['profiles'] if profile.get('cookies')],
+        'related_findings': related_findings,
+        'findings_to_analyze': batch,
+    }, ensure_ascii=False, separators=(',', ':'))
+    options = {
+        'temperature': 0,
+        'num_predict': AI_ANALYSIS_MAX_PREDICT.get(mode, 700),
+        'num_ctx': AI_ANALYSIS_CONTEXT_WINDOWS.get(mode, 6144),
+        'top_p': 0.9,
+    }
+    base = state['ollama_url'].rstrip('/')
+    expected = {str(item['id']) for item in batch}
+    started = time.monotonic()
+    errors: list[str] = []
+
+    # For a one-finding request, reserve time for a compact rescue. For a larger
+    # batch, use a shorter first attempt so adaptive splitting happens early.
+    if len(batch) == 1:
+        chat_budget = max(60, min(int(timeout * 0.62), timeout - 45))
+    else:
+        chat_budget = max(55, min(int(timeout * 0.70), 105))
+
+    chat_payload = {
+        'model': state['model'], 'format': ANALYSIS_SCHEMA,
+        'messages': [{'role': 'system', 'content': system_message}, {'role': 'user', 'content': context}],
+        'options': options, 'keep_alive': '30m',
+    }
+    try:
+        content = _ollama_stream_content(
+            f'{base}/api/chat', chat_payload, response_kind='chat',
+            total_timeout=chat_budget, early_json=True,
+        )
+        return _analysis_quality_check(_parse_analysis_content(content), expected)
+    except Exception as exc:
+        errors.append(f'chat: {type(exc).__name__}: {exc}')
+        if len(batch) > 1:
+            raise RuntimeError('; '.join(errors)) from exc
+
+    remaining = max(0, int(timeout - (time.monotonic() - started)))
+    if remaining < 40:
+        raise RuntimeError('; '.join(errors + ['single-finding rescue skipped: analysis budget exhausted']))
+
+    rescue_system = (
+        system_message
+        + ' This is a single-finding rescue pass. Be concise but complete: 25-40 words for description, '
+          '15-28 for impact, 22-40 for remediation, and 8-15 for rationale. Return exactly one analysis object.'
+    )
+    rescue_options = {
+        **options,
+        'num_predict': AI_ANALYSIS_RESCUE_MAX_PREDICT.get(mode, 320),
+    }
+    generate_payload = {
+        'model': state['model'], 'format': ANALYSIS_SCHEMA,
+        'prompt': rescue_system + '\n\nAnalyze this finding:\n' + context,
+        'options': rescue_options, 'keep_alive': '30m',
+    }
+    try:
+        content = _ollama_stream_content(
+            f'{base}/api/generate', generate_payload, response_kind='generate',
+            total_timeout=remaining, early_json=True,
+        )
+        return _analysis_quality_check(_parse_analysis_content(content), expected)
+    except Exception as exc:
+        errors.append(f'generate rescue: {type(exc).__name__}: {exc}')
+        raise RuntimeError('; '.join(errors)) from exc
+
+
+# Retries failed multi-finding AI analysis batches by splitting them into smaller
+# AI-only batches before a long malformed or timed-out response can fail strict mode.
+def _ollama_analysis_batch_adaptive(
+    state: AgentState,
+    batch: list[dict[str, Any]],
+    all_candidates: list[dict[str, Any]],
+    timeout: int,
+    *,
+    label: str,
+) -> list[dict[str, Any]]:
+    try:
+        return _ollama_analysis_batch(state, batch, all_candidates, timeout)
+    except Exception as exc:
+        if len(batch) <= 1:
+            raise
+        midpoint = max(1, len(batch) // 2)
+        left = batch[:midpoint]
+        right = batch[midpoint:]
+        print(
+            f'    AI analysis: {label} did not complete cleanly; retrying as smaller AI batches ({len(left)} + {len(right)} findings).',
+            flush=True,
+        )
+        rows: list[dict[str, Any]] = []
+        rows.extend(_ollama_analysis_batch_adaptive(state, left, all_candidates, timeout, label=f'{label}.1'))
+        rows.extend(_ollama_analysis_batch_adaptive(state, right, all_candidates, timeout, label=f'{label}.2'))
+        return rows
+
+
+# Applies the AI narrative as the final report wording while preserving every
+# scanner-originating narrative field separately for auditability.
+def _apply_analysis(rows: list[dict[str, Any]], finding_map: dict[str, dict[str, Any]], model: str) -> tuple[int, int]:
+    analyzed = changed = 0
+    for row in rows:
+        finding_id = str(row.get('id') or '')
+        finding = finding_map.get(finding_id)
+        risk = str(row.get('risk') or '').lower()
+        confidence = str(row.get('confidence') or '').lower()
+        if finding is None or risk not in {'critical', 'high', 'medium', 'low', 'info'} or confidence not in {'high', 'medium', 'low'}:
+            continue
+        original_risk = str(finding.get('risk') or 'info').lower()
+        scanner_confidence = str(finding.get('confidence') or '').lower()
+        finding.setdefault('scanner_risk', original_risk)
+        finding.setdefault('scanner_confidence', scanner_confidence)
+        finding.setdefault('scanner_description', str(finding.get('description') or ''))
+        finding.setdefault('scanner_impact', str(finding.get('impact') or ''))
+        finding.setdefault('scanner_solution', str(finding.get('solution') or ''))
+        finding['risk'] = risk
+
+        # AI wording remains the primary assessment. A weak individual field does
+        # not invalidate a successful AI analysis: when the scanner already has a
+        # substantive original value, retain that value only for the weak field.
+        short_fields = {str(value) for value in row.get('_short_fields', [])}
+        scanner_values = {
+            'description': str(finding.get('scanner_description') or '').strip(),
+            'impact': str(finding.get('scanner_impact') or '').strip(),
+            'solution': str(finding.get('scanner_solution') or '').strip(),
+        }
+        narrative_fallbacks: list[str] = []
+        for key in ('description', 'impact', 'solution'):
+            ai_value = str(row.get(key) or '').strip()
+            scanner_value = scanner_values[key]
+            if key in short_fields and scanner_value:
+                finding[key] = scanner_value[:1800]
+                narrative_fallbacks.append(key)
+            else:
+                finding[key] = (ai_value or scanner_value)[:1800]
+                if not ai_value and scanner_value:
+                    narrative_fallbacks.append(key)
+
+        finding['ai_analysis'] = {
+            'source': 'ollama-analysis',
+            'model': model,
+            'risk': risk,
+            'scanner_risk': original_risk,
+            'severity_changed': risk != original_risk,
+            'analysis_confidence': confidence,
+            'scanner_confidence': scanner_confidence,
+            'rationale': str(row.get('rationale') or '').strip()[:1000],
+            'short_ai_fields': sorted(short_fields),
+            'narrative_fallbacks': narrative_fallbacks,
+        }
+        analyzed += 1
+        changed += risk != original_risk
+    return analyzed, changed
+
+# After tool execution, the agent performs a separate evidence-grounded analysis of collected findings.
+def analysis_node(state: AgentState) -> dict[str, Any]:
+    print('\nAI analysis: analyzing collected findings...', flush=True)
+    results = copy.deepcopy(state['results'])
+    candidates, finding_map = _analysis_catalog(results)
+    if not candidates:
+        analysis = {'status': 'skipped', 'model': state['model'], 'analyzed_findings': 0, 'severity_changes': 0, 'errors': [], 'seconds': 0.0}
+        print('AI analysis: no confirmed/candidate findings to analyze.', flush=True)
+        return {'results': results, 'analysis': analysis}
+
+    started = time.monotonic()
+    mode = shared.CURRENT_SCAN_MODE
+    default_batch_budget = AI_ANALYSIS_BATCH_TIMEOUTS.get(mode, 240)
+    configured_budget = int(state.get('ai_timeout') or default_batch_budget)
+    batch_budget = min(configured_budget, default_batch_budget)
+    batch_size = AI_ANALYSIS_BATCH_SIZES.get(mode, 8)
+    analyzed = changed = 0
+    errors: list[str] = []
+    batch_count = (len(candidates) + batch_size - 1) // batch_size
+    if batch_budget < 45:
+        message = f'analysis batch time budget is too small: {batch_budget}s; minimum is 45s'
+        if state.get('require_ai'):
+            raise RuntimeError(f'Strict agentic mode requires AI analysis: {message}')
+        errors.append(message)
+    else:
+        for batch_index in range(batch_count):
+            batch = candidates[batch_index * batch_size:(batch_index + 1) * batch_size]
+            try:
+                rows = _ollama_analysis_batch_adaptive(state, batch, candidates, batch_budget, label=f'batch {batch_index + 1}/{batch_count}')
+                batch_analyzed, batch_changed = _apply_analysis(rows, finding_map, state['model'])
+                analyzed += batch_analyzed
+                changed += batch_changed
+                print(f'    AI analysis: batch {batch_index + 1}/{batch_count}: analyzed={batch_analyzed}; severity changes={batch_changed}', flush=True)
+            except Exception as exc:
+                message = f'batch {batch_index + 1}: {type(exc).__name__}: {exc}'
+                errors.append(message)
+                if state.get('require_ai'):
+                    raise RuntimeError(f'Strict agentic mode requires AI analysis: {message}') from exc
+                print(f'    AI analysis: {message}; scanner data retained for this batch.', file=sys.stderr, flush=True)
+
+    analysis = {
+        'status': 'success' if not errors else 'partial',
+        'model': state['model'],
+        'candidate_findings': len(candidates),
+        'analyzed_findings': analyzed,
+        'severity_changes': changed,
+        'errors': errors,
+        'seconds': round(time.monotonic() - started, 2),
+        'batch_timeout_seconds': batch_budget,
+        'policy': 'AI supplies the final severity and professional description/impact/remediation wording; original scanner narrative, category, verification status and evidence remain preserved and scanner/verifier-controlled where applicable.',
+    }
+    print(f"AI analysis: finished; analyzed={analyzed}/{len(candidates)}; severity changes={changed}; {analysis['seconds']:.1f}s", flush=True)
+    return {'results': results, 'analysis': analysis}
 
 # Keeps a small result summary that is safe to send back to the planner.
 def compact_results(results: dict[str, dict[str, Any]]) -> dict[str, Any]:
@@ -693,9 +1145,13 @@ def validate_plan(state: AgentState, proposed: Any) -> list[dict[str, Any]]:
     return valid
 
 # Lists the actions that are currently valid for the planner.
+# --only-tool is a debug filter only: when unset, the autonomous candidate set is unchanged.
 def _eligible_action_catalog(state: AgentState) -> list[dict[str, Any]]:
-
-    return validate_plan(state, discovery_candidate_actions(state))
+    actions = validate_plan(state, discovery_candidate_actions(state))
+    only_tool = str(state.get('only_tool') or '').strip().lower()
+    if only_tool:
+        actions = [action for action in actions if str(action.get('tool') or '').lower() == only_tool]
+    return actions
 
 # Combines new AI actions with valid actions already selected.
 def _merge_ai_actions(base: list[dict[str, Any]], additions: list[dict[str, Any]], *, budget: int) -> list[dict[str, Any]]:
@@ -718,7 +1174,11 @@ def _fallback_plan(state: AgentState, eligible: list[dict[str, Any]], budget: in
 
 # Pending-action filtering keeps only valid actions that have not run yet.
 def _remaining_eligible_actions(state: AgentState) -> list[dict[str, Any]]:
-    return validate_plan(state, discovery_candidate_actions(state))
+    actions = validate_plan(state, discovery_candidate_actions(state))
+    only_tool = str(state.get('only_tool') or '').strip().lower()
+    if only_tool:
+        actions = [action for action in actions if str(action.get('tool') or '').lower() == only_tool]
+    return actions
 
 # Result lookup avoids scheduling a tool that already produced output for the same profile.
 def _has_tool_result(profile_results: dict[str, Any], tool: str) -> bool:
@@ -1012,8 +1472,8 @@ def executor_node(state: AgentState) -> dict[str, Any]:
     return {'results': results, 'discovery': discovery, 'completed': completed, 'notes': notes, 'planner_audit': audit, 'finished': not can_continue}
 
 # Decides whether the agent should plan again or create the report.
-def route_after_execution(state: AgentState) -> Literal['planner', 'report']:
-    return 'report' if state['finished'] or state['round'] >= state['max_rounds'] or (not state['plan']) else 'planner'
+def route_after_execution(state: AgentState) -> Literal['planner', 'analysis']:
+    return 'analysis' if state['finished'] or state['round'] >= state['max_rounds'] or (not state['plan']) else 'planner'
 
 # Once execution is complete, reporting receives the collected state and produces the final assessment.
 def report_node(state: AgentState) -> dict[str, Any]:
@@ -1032,14 +1492,16 @@ def report_node(state: AgentState) -> dict[str, Any]:
         'strict_ai_required': state.get('require_ai', False),
         'planner_source': state.get('planner_source', 'unknown'),
         'planner_audit': state.get('planner_audit', []),
+        'ai_analysis': state.get('analysis', {}),
         'scan_mode': shared.CURRENT_SCAN_MODE,
         'runtime_platform': platform.platform(),
         'python_executable': sys.executable,
         'mcp_server_python': shared._server_python(),
         'remaining_eligible_actions_at_report': len(remaining),
-        'execution_policy': 'AI-selected actions use the same deterministic tool catalogue, discovery selectors, request contracts, scan profiles and safety validators. The planner chooses only discovery-derived candidates according to expected information gain and may defer redundant actions without a checklist or minimum tool set. Bounded state-changing workflow probes run automatically on local labs and require explicit --allow-state-changes for remote authorized targets.',
+        'execution_policy': 'AI selects discovery-derived scan actions under deterministic safety validation. After execution, a separate Ollama node independently enriches severity, description, impact and remediation using scanner evidence; category, verification status, request evidence and confirmation rules remain deterministic and immutable. Bounded state-changing workflow probes run automatically on local labs and require explicit --allow-state-changes for remote authorized targets.',
         'allow_state_changes': state.get('allow_state_changes', False),
-        'secondary_identity_supplied': bool(state.get('secondary_cookies', ''))}
+        'secondary_identity_supplied': bool(state.get('secondary_cookies', '')),
+        'orchestration': {'engine': 'langgraph', 'mode': 'agentic', 'nodes': ['discovery', 'planner', 'executor', 'analysis', 'report']}}
     report = asyncio.run(call_mcp('reporting/reportServer.py', 'generate_report', {'findings_summary': report_results, 'target_url': state['target'], 'output_name': output_name, 'assessment_context': context}))
     if report.get('status') != 'success' and (not report.get('json_filename')):
         fallback = write_emergency_json_report(state['target'], state['results'], state['diagnostics'], str(report.get('output', 'Report MCP failed.')), 'SecOps_Agentic_Emergency')

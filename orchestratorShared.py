@@ -29,10 +29,11 @@ import requests
 with warnings.catch_warnings():
     warnings.simplefilter('ignore')
     from fastmcp import Client
-from utils import apply_runtime_target_preparation, absolute_url, canonical_cookie_header, cookie_names, load_runtime_config, normalize_url, ROOT_DIR, same_origin, scanner_session_probe, SERVERS_DIR, target_runtime_profile, mcp_http_port, mcp_http_url
+from utils import apply_runtime_target_preparation, absolute_url, canonical_cookie_header, cookie_names, load_runtime_config, normalize_url, ROOT_DIR, same_origin, scanner_session_probe, SERVERS_DIR, target_runtime_profile, MCP_UNIFIED_SERVICE, mcp_http_port, mcp_http_url
 ROOT = Path(ROOT_DIR).resolve()
 SERVERS = Path(SERVERS_DIR).resolve()
 RUNTIME_FILE = ROOT / '.secops_runtime.json'
+UNIFIED_MCP_SERVER = 'secopsServer.py'
 LOCAL_BIN = Path.home() / '.local' / 'bin'
 MCP_CONNECT_TIMEOUT = float(os.getenv('SECOPS_MCP_CONNECT_TIMEOUT', '20'))
 MCP_TOOL_TIMEOUT = float(os.getenv('SECOPS_MCP_TIMEOUT', '900'))
@@ -235,7 +236,7 @@ def _server_env() -> dict[str, str]:
 _HTTP_SERVER_PROCESSES: dict[str, subprocess.Popen] = {}
 _HTTP_SERVER_LOGS: dict[str, Path] = {}
 
-# Port probing detects whether an MCP endpoint is already listening locally.
+# Port probing detects whether the unified MCP endpoint is already listening locally.
 def _port_open(host: str, port: int, timeout: float=0.25) -> bool:
     try:
         with socket.create_connection((host, int(port)), timeout=timeout):
@@ -243,15 +244,15 @@ def _port_open(host: str, port: int, timeout: float=0.25) -> bool:
     except OSError:
         return False
 
-# Server logging assigns a predictable log path to each MCP process.
-def _http_server_log(spec: ToolSpec) -> Path:
+# The only MCP process log belongs to the unified SecOps interface.
+def _http_server_log() -> Path:
     directory = ROOT / '.secops_tmp' / 'mcp-http'
     directory.mkdir(parents=True, exist_ok=True)
-    return directory / f'{spec.name}.log'
+    return directory / f'{MCP_UNIFIED_SERVICE}.log'
 
-# Stops an MCP server process that was started by this orchestrator.
-def _stop_owned_http_server(tool_name: str) -> None:
-    process = _HTTP_SERVER_PROCESSES.pop(tool_name, None)
+# Stops the single MCP server process started by this orchestrator.
+def _stop_owned_http_server() -> None:
+    process = _HTTP_SERVER_PROCESSES.pop(MCP_UNIFIED_SERVICE, None)
     if process is not None and process.poll() is None:
         try:
             process.terminate()
@@ -262,15 +263,14 @@ def _stop_owned_http_server(tool_name: str) -> None:
             except Exception:
                 pass
 
-# Stops every MCP server process owned by the current orchestrator.
+# Stops the unified MCP process owned by the current orchestrator.
 def shutdown_mcp_http_servers() -> None:
-    for tool_name in list(_HTTP_SERVER_PROCESSES):
-        _stop_owned_http_server(tool_name)
+    _stop_owned_http_server()
 atexit.register(shutdown_mcp_http_servers)
 
-# Reads the end of a server log to explain a startup failure.
-def _server_startup_log(spec: ToolSpec) -> str:
-    path = _HTTP_SERVER_LOGS.get(spec.name)
+# Reads the end of the unified server log to explain a startup failure.
+def _server_startup_log() -> str:
+    path = _HTTP_SERVER_LOGS.get(MCP_UNIFIED_SERVICE)
     if not path or not path.is_file():
         return ''
     try:
@@ -278,37 +278,39 @@ def _server_startup_log(spec: ToolSpec) -> str:
     except OSError:
         return ''
 
-# Delegates MCP server startup to the shared helper so both orchestrators use the same lifecycle.
-def _ensure_http_server(spec: ToolSpec, server: Path, *, restart: bool=False) -> str:
-
-    port = mcp_http_port(spec.name)
-    url = mcp_http_url(spec.name)
+# Starts the one MCP process that imports and exposes the complete tool catalogue.
+def _ensure_http_server(*, restart: bool=False) -> str:
+    server = resolve_server_path(UNIFIED_MCP_SERVER)
+    port = mcp_http_port(MCP_UNIFIED_SERVICE)
+    url = mcp_http_url(MCP_UNIFIED_SERVICE)
+    if not server.is_file():
+        raise FileNotFoundError(f'Unified MCP server not found: {server}')
     if restart:
-        _stop_owned_http_server(spec.name)
+        _stop_owned_http_server()
     if _port_open('127.0.0.1', port):
         return url
-    existing = _HTTP_SERVER_PROCESSES.get(spec.name)
+    existing = _HTTP_SERVER_PROCESSES.get(MCP_UNIFIED_SERVICE)
     if existing is not None and existing.poll() is None:
         process = existing
     else:
-        log_path = _http_server_log(spec)
-        _HTTP_SERVER_LOGS[spec.name] = log_path
+        log_path = _http_server_log()
+        _HTTP_SERVER_LOGS[MCP_UNIFIED_SERVICE] = log_path
         log_handle = open(log_path, 'a', encoding='utf-8', buffering=1)
         env = _server_env()
         env.update({'SECOPS_MCP_HOST': '127.0.0.1', 'SECOPS_MCP_PORT': str(port)})
         process = subprocess.Popen([_server_python(), str(server)], cwd=str(ROOT), env=env, stdout=log_handle, stderr=subprocess.STDOUT, text=True)
         log_handle.close()
-        _HTTP_SERVER_PROCESSES[spec.name] = process
+        _HTTP_SERVER_PROCESSES[MCP_UNIFIED_SERVICE] = process
     deadline = time.monotonic() + max(3.0, MCP_CONNECT_TIMEOUT)
     while time.monotonic() < deadline:
         if _port_open('127.0.0.1', port):
             return url
         if process.poll() is not None:
-            detail = _server_startup_log(spec)
-            raise RuntimeError(f'{spec.name} HTTP MCP server exited during startup' + (f': {detail}' if detail else '.'))
+            detail = _server_startup_log()
+            raise RuntimeError('Unified SecOps HTTP MCP server exited during startup' + (f': {detail}' if detail else '.'))
         time.sleep(0.15)
-    detail = _server_startup_log(spec)
-    raise TimeoutError(f'Timed out waiting for {spec.name} MCP HTTP service at {url}' + (f'. Server log: {detail}' if detail else ''))
+    detail = _server_startup_log()
+    raise TimeoutError(f'Timed out waiting for unified MCP HTTP service at {url}' + (f'. Server log: {detail}' if detail else ''))
 
 # Transport diagnosis recognizes failures raised by the MCP HTTP layer.
 def _http_transport_failure(exc: BaseException) -> bool:
@@ -395,7 +397,7 @@ def _normalize_result(data: Any, spec: ToolSpec, target: str, elapsed: float, is
     result.setdefault('vulnerabilities', [])
     status = 'error' if is_error else str(result.get('status', 'success')).lower()
     result['status'] = status if status in {'success', 'error', 'skipped', 'partial'} else 'error'
-    result['_meta'] = {'server': spec.server, 'resolved_server': str(resolve_server_path(spec.server, spec.tool)), 'duration_seconds': round(elapsed, 3), 'response_shape': shape}
+    result['_meta'] = {'server': spec.server, 'resolved_server': str(resolve_server_path(spec.server, spec.tool)), 'mcp_server': str(resolve_server_path(UNIFIED_MCP_SERVER)), 'duration_seconds': round(elapsed, 3), 'response_shape': shape}
     if result['status'] == 'error':
         result.setdefault('diagnosis', diagnose_error(str(result.get('output', ''))))
     return _normalize_time_limit(result, spec.name, target)
@@ -421,13 +423,13 @@ async def call_mcp(server_file: str, tool_name: str, arguments: dict[str, Any], 
         async with Client(url) as client:
             return _extract_response(await client.call_tool(tool_name, effective_arguments))
     try:
-        url = await asyncio.to_thread(_ensure_http_server, spec, server)
+        url = await asyncio.to_thread(_ensure_http_server)
         try:
             data, is_error, shape = await asyncio.wait_for(invoke(url), timeout=timeout_seconds + MCP_CONNECT_TIMEOUT)
         except Exception as first_exc:
             if not _http_transport_failure(first_exc):
                 raise
-            url = await asyncio.to_thread(_ensure_http_server, spec, server, restart=True)
+            url = await asyncio.to_thread(_ensure_http_server, restart=True)
             data, is_error, shape = await asyncio.wait_for(invoke(url), timeout=timeout_seconds + MCP_CONNECT_TIMEOUT)
         result = _normalize_result(data, spec, target, time.monotonic() - started, is_error, shape)
         result.setdefault('_meta', {})['mcp_transport'] = 'streamable_http'
@@ -438,13 +440,13 @@ async def call_mcp(server_file: str, tool_name: str, arguments: dict[str, Any], 
         exception_text = f'{type(exc).__name__}: {exc}'
         exception_diagnosis = diagnose_error(exception_text)
         if exception_diagnosis == 'timeout':
-            result = _result(spec.name, target, 'partial', f'{spec.name} reached the orchestrator/MCP HTTP time budget. Coverage is incomplete; this is not classified as a scanner error.', 'time_limit_reached', timed_out=True, time_limit_reached=True, traceback=traceback.format_exc(), _meta={'server': str(server), 'duration_seconds': round(time.monotonic() - started, 3), 'mcp_transport': 'streamable_http', 'mcp_url': mcp_http_url(spec.name)})
+            result = _result(spec.name, target, 'partial', f'{spec.name} reached the orchestrator/MCP HTTP time budget. Coverage is incomplete; this is not classified as a scanner error.', 'time_limit_reached', timed_out=True, time_limit_reached=True, traceback=traceback.format_exc(), _meta={'server': str(server), 'duration_seconds': round(time.monotonic() - started, 3), 'mcp_transport': 'streamable_http', 'mcp_url': mcp_http_url(MCP_UNIFIED_SERVICE)})
         else:
-            detail = _server_startup_log(spec)
+            detail = _server_startup_log()
             message = f'MCP HTTP communication failed: {exception_text}'
             if detail:
                 message += f' | server log: {detail}'
-            result = _result(spec.name, target, 'error', message, diagnose_error(message), traceback=traceback.format_exc(), _meta={'server': str(server), 'duration_seconds': round(time.monotonic() - started, 3), 'mcp_transport': 'streamable_http', 'mcp_url': mcp_http_url(spec.name)})
+            result = _result(spec.name, target, 'error', message, diagnose_error(message), traceback=traceback.format_exc(), _meta={'server': str(server), 'duration_seconds': round(time.monotonic() - started, 3), 'mcp_transport': 'streamable_http', 'mcp_url': mcp_http_url(MCP_UNIFIED_SERVICE)})
     finally:
         if temporary_output:
             temporary_output.unlink(missing_ok=True)
@@ -469,21 +471,27 @@ async def call_mcp_with_progress(spec: ToolSpec, arguments: dict[str, Any], *, t
         elapsed = int(time.monotonic() - started)
         print(f'    [WAITING ] {spec.name}: still running after {elapsed}s', flush=True)
 
-# Starts one MCP server and checks that its HTTP endpoint responds.
-async def _live_server_check(spec: ToolSpec) -> dict[str, str]:
-    server = resolve_server_path(spec.server, spec.tool)
+# Checks one expected tool name against the catalogue exposed by the unified MCP service.
+def _tool_live_check(spec: ToolSpec, url: str, names: set[str]) -> dict[str, str]:
+    if spec.tool not in names:
+        return {'level': 'error' if spec.required else 'warning', 'component': spec.name, 'cause': 'mcp_runtime_tool_missing', 'detail': f'{url} does not expose {spec.tool}()'}
+    return {'level': 'ok', 'component': spec.name, 'cause': 'mcp_http_handshake_ok', 'detail': f'{url}: {spec.tool}()'}
+
+# One live handshake validates every tool exposed by the single MCP endpoint.
+async def _run_live_checks() -> list[dict[str, str]]:
     try:
-        url = await asyncio.to_thread(_ensure_http_server, spec, server)
+        url = await asyncio.to_thread(_ensure_http_server)
         async with Client(url) as client:
             tools = await asyncio.wait_for(client.list_tools(), timeout=MCP_CONNECT_TIMEOUT)
-        names = [str(getattr(tool, 'name', '')) for tool in tools]
-        if spec.tool not in names:
-            return {'level': 'error', 'component': spec.name, 'cause': 'mcp_runtime_tool_missing', 'detail': f'{url} exposed {names!r}'}
-        return {'level': 'ok', 'component': spec.name, 'cause': 'mcp_http_handshake_ok', 'detail': f'{url}: {spec.tool}()'}
+        names = {str(getattr(tool, 'name', '')) for tool in tools}
+        return [_tool_live_check(spec, url, names) for spec in ALL_TOOLS]
     except Exception as exc:
-        detail = _server_startup_log(spec)
+        detail = _server_startup_log()
         message = f'{type(exc).__name__}: {exc}' + (f' | server log: {detail}' if detail else '')
-        return {'level': 'error' if spec.required else 'warning', 'component': spec.name, 'cause': 'mcp_http_handshake_failed', 'detail': message}
+        return [
+            {'level': 'error' if spec.required else 'warning', 'component': spec.name, 'cause': 'mcp_http_handshake_failed', 'detail': message}
+            for spec in ALL_TOOLS
+        ]
 
 # Nikto validation confirms that the configured runtime can start successfully.
 def _nikto_runtime_check(executable: str) -> tuple[bool, str]:
@@ -513,6 +521,8 @@ def run_preflight_checks(*, include_live: bool=True) -> list[dict[str, str]]:
     checks: list[dict[str, str]] = []
     numbered_duplicates = _numbered_duplicate_servers()
     checks.append({'level': 'warning' if numbered_duplicates else 'ok', 'component': 'project', 'cause': 'numbered_server_copies_found' if numbered_duplicates else 'canonical_server_filenames', 'detail': 'Move or delete numbered MCP copies: ' + ', '.join((path.name for path in numbered_duplicates)) if numbered_duplicates else 'Only canonical MCP server filenames will be executed.'})
+    unified_server = resolve_server_path(UNIFIED_MCP_SERVER)
+    checks.append({'level': 'ok' if unified_server.is_file() else 'error', 'component': 'mcp', 'cause': 'unified_server_found' if unified_server.is_file() else 'missing_unified_server', 'detail': str(unified_server)})
     seen_executables: set[str] = set()
     for spec in ALL_TOOLS:
         server = resolve_server_path(spec.server, spec.tool)
@@ -560,12 +570,8 @@ def run_preflight_checks(*, include_live: bool=True) -> list[dict[str, str]]:
     if include_live and (not any((item['level'] == 'error' for item in checks))):
         checks.extend(asyncio.run(_run_live_checks()))
     if not any((item['level'] == 'error' for item in checks)):
-        checks.append({'level': 'ok', 'component': 'mcp', 'cause': 'preflight_passed', 'detail': 'All contracts, executables and MCP Streamable HTTP handshakes passed.'})
+        checks.append({'level': 'ok', 'component': 'mcp', 'cause': 'preflight_passed', 'detail': 'All contracts, executables and the unified MCP Streamable HTTP handshake passed.'})
     return checks
-
-# During preflight, MCP services are probed concurrently to confirm that every required endpoint responds.
-async def _run_live_checks() -> list[dict[str, str]]:
-    return [await _live_server_check(spec) for spec in ALL_TOOLS]
 
 # Prints the preflight result in a short operator-friendly format.
 def print_preflight_report(checks: list[dict[str, str]], *, show_ok: bool=False) -> int:

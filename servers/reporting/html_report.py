@@ -77,7 +77,7 @@ def _render_html(payload: dict[str, Any], *, for_pdf: bool = False) -> str:
     body_html = f"""
 {_render_executive_summary(payload, summary, toc)}
 
-{_render_severity_legend(toc)}
+{_render_severity_legend(toc, context_value)}
 {_render_overall_risk_banner(overall_rating, overall_color, overall_explanation, toc)}
 {_render_priority_actions(payload["findings"], toc)}
 {_render_glance(payload["findings"], toc)}

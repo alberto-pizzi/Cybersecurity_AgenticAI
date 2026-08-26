@@ -12,10 +12,198 @@ from pathlib import Path
 from setupLab import setup_local_lab, update_runtime_auth
 from setupTools import (
     BUILD_ID, COMMAND_REFERENCE_FILE, DEFAULT_MODEL, ROOT, RUNTIME_FILE, TARGET,
-    _ensure_report_docker_image, configure_path, create_wordlist, install_playwright_browser,
+    _ensure_report_docker_image, configure_path, configure_perl_environment, create_wordlist, install_playwright_browser,
     install_python_packages, install_scanners, run, verify_scanners, write_runtime_config,
 )
 from utils import setup_path
+
+UNIFIED_MCP_SERVER = ROOT / "servers" / "secopsServer.py"
+LINUX_BASE_PACKAGES = ("perl", "cpanminus", "build-essential")
+
+
+# Prefixes privileged Linux host commands with sudo when the initializer is not already root.
+def _linux_sudo_prefix() -> list[str]:
+    if os.name == "nt" or not sys.platform.startswith("linux"):
+        return []
+    if hasattr(os, "geteuid") and os.geteuid() == 0:
+        return []
+    sudo = shutil.which("sudo")
+    if not sudo:
+        raise RuntimeError("Linux host setup requires sudo, but sudo is not installed or not available in PATH.")
+    return [sudo]
+
+
+# Checks whether one Debian package is already installed without changing the host.
+def _debian_package_installed(package: str) -> bool:
+    dpkg_query = shutil.which("dpkg-query")
+    if not dpkg_query:
+        return False
+    result = subprocess.run(
+        [dpkg_query, "-W", "-f=${Status}", package],
+        text=True, encoding="utf-8", errors="replace", capture_output=True, check=False,
+    )
+    return result.returncode == 0 and "install ok installed" in (result.stdout or "").lower()
+
+
+# Installs the Debian Perl/build prerequisites used by the native Nikto fallback and exports the user Perl library.
+def ensure_linux_host_prerequisites() -> None:
+    if not sys.platform.startswith("linux"):
+        return
+    perl_env = configure_perl_environment()
+    if perl_env.get("PERL5LIB"):
+        print(f"[+] PERL5LIB configured for SecOps: {perl_env['PERL5LIB']}")
+    apt_get = shutil.which("apt-get")
+    dpkg_query = shutil.which("dpkg-query")
+    if not apt_get or not dpkg_query:
+        print("[*] Non-Debian Linux detected; automatic apt prerequisite installation skipped.")
+        return
+    missing = [package for package in LINUX_BASE_PACKAGES if not _debian_package_installed(package)]
+    if not missing:
+        print("[+] Linux Perl/build prerequisites already installed: " + ", ".join(LINUX_BASE_PACKAGES))
+        return
+    sudo = _linux_sudo_prefix()
+    print("[*] Installing missing Debian host prerequisites: " + ", ".join(missing))
+    run([*sudo, apt_get, "update"], timeout=1800)
+    run([*sudo, apt_get, "install", "-y", *missing], timeout=3600)
+    still_missing = [package for package in LINUX_BASE_PACKAGES if not _debian_package_installed(package)]
+    if still_missing:
+        raise RuntimeError("Debian prerequisite installation did not complete: " + ", ".join(still_missing))
+
+
+# Adds known Docker Desktop CLI directories to PATH when the installer has just created them.
+def _refresh_docker_path() -> str | None:
+    candidates: list[Path] = []
+    if os.name == "nt":
+        program_files = Path(os.environ.get("ProgramFiles", r"C:\Program Files"))
+        candidates.extend((
+            program_files / "Docker" / "Docker" / "resources" / "bin",
+            program_files / "Docker" / "Docker" / "resources",
+        ))
+    elif sys.platform == "darwin":
+        candidates.extend((
+            Path("/Applications/Docker.app/Contents/Resources/bin"),
+            Path.home() / "Applications" / "Docker.app" / "Contents" / "Resources" / "bin",
+            Path("/opt/homebrew/bin"),
+            Path("/usr/local/bin"),
+        ))
+    for directory in candidates:
+        if not directory.is_dir():
+            continue
+        current = os.environ.get("PATH", "")
+        entries = [entry for entry in current.split(os.pathsep) if entry]
+        if str(directory) not in entries:
+            os.environ["PATH"] = str(directory) + (os.pathsep + current if current else "")
+        docker = shutil.which("docker")
+        if docker:
+            return docker
+    return shutil.which("docker")
+
+
+# Installs Docker only when the Docker CLI is missing. It never changes users, groups or socket permissions.
+def ensure_docker_installed() -> str:
+    docker = _refresh_docker_path()
+    if docker:
+        print(f"[+] Docker already installed: {docker}")
+        return docker
+
+    print("[*] Docker was not found; installing it for this platform.")
+
+    if os.name == "nt":
+        winget = shutil.which("winget")
+        if winget:
+            run([
+                winget, "install", "--id", "Docker.DockerDesktop", "--exact",
+                "--accept-source-agreements", "--accept-package-agreements",
+            ], timeout=3600)
+        else:
+            choco = shutil.which("choco")
+            if not choco:
+                raise RuntimeError(
+                    "Docker is not installed and neither winget nor Chocolatey is available. "
+                    "Install Docker Desktop, then rerun initScript.py."
+                )
+            run([choco, "install", "docker-desktop", "-y"], timeout=3600)
+
+    elif sys.platform == "darwin":
+        brew = shutil.which("brew")
+        if not brew:
+            raise RuntimeError(
+                "Docker is not installed and Homebrew is not available. "
+                "Install Homebrew or Docker Desktop, then rerun initScript.py."
+            )
+        run([brew, "install", "--cask", "docker"], timeout=3600)
+
+    elif sys.platform.startswith("linux"):
+        sudo = _linux_sudo_prefix()
+        installers: list[tuple[str, list[list[str]]]] = []
+        if shutil.which("apt-get"):
+            installers.append(("apt", [
+                [*sudo, "apt-get", "update"],
+                [*sudo, "apt-get", "install", "-y", "docker.io"],
+            ]))
+        if shutil.which("dnf"):
+            installers.extend((
+                ("dnf-moby", [[*sudo, "dnf", "install", "-y", "moby-engine"]]),
+                ("dnf-docker", [[*sudo, "dnf", "install", "-y", "docker"]]),
+            ))
+        if shutil.which("yum"):
+            installers.extend((
+                ("yum-moby", [[*sudo, "yum", "install", "-y", "moby-engine"]]),
+                ("yum-docker", [[*sudo, "yum", "install", "-y", "docker"]]),
+            ))
+        if shutil.which("pacman"):
+            installers.append(("pacman", [[*sudo, "pacman", "-Sy", "--noconfirm", "docker"]]))
+        if shutil.which("zypper"):
+            installers.append(("zypper", [[*sudo, "zypper", "--non-interactive", "install", "docker"]]))
+        if shutil.which("apk"):
+            installers.append(("apk", [[*sudo, "apk", "add", "docker"]]))
+        if not installers:
+            raise RuntimeError(
+                "Docker is not installed and no supported Linux package manager was found "
+                "(apt-get, dnf, yum, pacman, zypper or apk)."
+            )
+
+        diagnostics: list[str] = []
+        installed = False
+        for label, commands in installers:
+            failed = False
+            for command in commands:
+                result = run(command, required=False, capture=True, timeout=3600)
+                if result.returncode:
+                    failed = True
+                    detail = "\n".join(filter(None, ((result.stdout or "").strip(), (result.stderr or "").strip())))
+                    diagnostics.append(f"{label}: {detail[-1200:]}")
+                    break
+            if not failed and shutil.which("docker"):
+                installed = True
+                break
+        if not installed:
+            raise RuntimeError(
+                "Docker installation was attempted but the docker command is still unavailable.\n" +
+                "\n".join(diagnostics[-4:])
+            )
+    else:
+        raise RuntimeError(f"Automatic Docker installation is not supported on platform {sys.platform!r}.")
+
+    docker = _refresh_docker_path()
+    if not docker:
+        raise RuntimeError(
+            "Docker installation completed but the docker command is not visible in the current PATH. "
+            "Restart the terminal/session if your platform installer updated PATH, then rerun initScript.py."
+        )
+    print(f"[+] Docker installed: {docker}")
+    return docker
+
+
+# Fail early when the project source tree is incomplete for the unified MCP architecture.
+def verify_unified_mcp_source() -> None:
+    if not UNIFIED_MCP_SERVER.is_file():
+        raise RuntimeError(
+            "Unified MCP server source is missing.\n"
+            f"Expected: {UNIFIED_MCP_SERVER}\n"
+            "Copy servers/secopsServer.py from the same project version before running initialization or an orchestrator."
+        )
+
 
 # Before normal execution, live preflight catches configuration problems that would break later scans.
 def run_preflight() -> None:
@@ -150,6 +338,13 @@ def main() -> int:
             print_command_reference(guide_path)
             return 0
         print(f"[+] Full command guide written: {guide_path}")
+        verify_unified_mcp_source()
+        print(f"[+] Unified MCP server source: {UNIFIED_MCP_SERVER}")
+        if not args.skip_scanners:
+            ensure_linux_host_prerequisites()
+        elif sys.platform.startswith("linux"):
+            configure_perl_environment()
+        ensure_docker_installed()
         print("\n=== SecOps FastMCP initialization ===")
         install_python_packages()
         if not args.skip_browser:

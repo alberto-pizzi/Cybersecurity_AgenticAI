@@ -1,9 +1,9 @@
 # Agentic AI Pentesting & Reporting Automation System through MCP 
 
-Automated web-application security assessment platform: FastMCP servers wrap external
-pentesting tools (plus a few project-specific checks) behind a uniform Streamable HTTP
-interface, and two orchestrators drive them against a target to produce a scanner-grounded
-PDF/HTML/JSON report. Full command reference: `init.txt`.
+Automated web-application security assessment platform: one unified FastMCP Streamable HTTP
+server (`servers/secopsServer.py`) imports the external-tool wrappers and project-specific checks
+and exposes their tools through a single `/mcp` endpoint. Two orchestrators drive the same tool
+catalogue against a target and produce PDF/HTML/JSON reports. Full command reference: `init.txt`.
 
 ## How core files works
 
@@ -23,8 +23,9 @@ Then, there are mainly **2 orchestrators** that are responsible for directing th
 - `orchestratorDeterministic.py`: Fixed, reproducible LangGraph pipeline: discovery → broad scan → parameter scan →
 authorization → browser/workflow → specialist checks → report. The baseline engine.
 
-- `orchestratorAgentic.py`: Same discovery and validators as Deterministic, but an Ollama-driven planner picks the
-highest-value candidate actions each round instead of a fixed checklist.
+- `orchestratorAgentic.py`: Same discovery and validators as Deterministic, but an Ollama-driven planner selects
+discovery-derived actions each round. After execution, a separate Ollama risk-assessment node can independently
+enrich severity, description, impact and remediation while scanner evidence and confirmation status remain immutable.
 
 The other files support the previous ones, as shared logic or support files.
 

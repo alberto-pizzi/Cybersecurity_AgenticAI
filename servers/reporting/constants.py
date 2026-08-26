@@ -64,7 +64,7 @@ METHODOLOGY_PHASES = [
     ("Automated vulnerability scanning", "Adaptive, fingerprint-driven and signature-based scanners assessed the discovered surface for known vulnerabilities, misconfigurations and exposures. See “Assessment execution” for the tools used and their purpose."),
     ("Targeted validation", "Findings capable of automated confirmation were re-tested with bounded, evidence-producing checks (for example SQL injection, XSS, command injection, path traversal) to separate confirmed vulnerabilities from candidates requiring manual review."),
     ("Coverage and manual-review triggers", "Classes that automated tooling cannot conclusively confirm (for example business-logic authorization or IDOR without a second identity) are flagged as coverage constraints for manual follow-up rather than reported as confirmed."),
-    ("Reporting", "Results were normalized, de-duplicated across corroborating tools and compiled into this scanner-grounded report, distinguishing confirmed vulnerabilities from candidates, observations and discovery."),
+    ("Reporting", "Results were normalized, de-duplicated across corroborating tools and compiled into this evidence-grounded report, distinguishing confirmed vulnerabilities from candidates, observations and discovery."),
 ]
 
 AUTO_INDEX_QUERY_KEYS = {"c", "n", "m", "s", "d", "o"}

@@ -11,9 +11,10 @@ aggiungi --authorized e mantieni il Cookie header tra virgolette.
 
 MCP
 ---
-Tutti i server FastMCP usano Streamable HTTP su 127.0.0.1 con endpoint /mcp.
-Deterministic e Agentic condividono registry, porte, selector e contratti MCP.
-Non sono previsti trasporti MCP alternativi.
+Un solo server FastMCP (`servers/secopsServer.py`) espone l'intero catalogo su
+http://127.0.0.1:8100/mcp. I moduli dei singoli tool sono importati come componenti e
+non aprono listener propri. Deterministic e Agentic condividono endpoint, registry, selector
+e contratti MCP. Non sono previsti trasporti MCP alternativi.
 
 1. INIZIALIZZAZIONE
 ------------------
@@ -45,7 +46,9 @@ python .\orchestratorAgentic.py --target <TARGET> --cookies "<COOKIE_HEADER>" --
 
 Il planner riceve candidati derivati dalla discovery e li seleziona in base al
 valore informativo atteso. Può differire controlli ridondanti e non usa una
-checklist minima. Ogni azione passa dagli stessi validator del Deterministic.
+checklist minima. Ogni azione passa dagli stessi validator del Deterministic. Al termine, un nodo AI separato
+rivaluta severity, descrizione, impatto e remediation dei finding usando soltanto l’evidenza
+degli scanner; categoria, verification status ed evidenza non possono essere modificati.
 
 4. PREFLIGHT E TEST
 -------------------

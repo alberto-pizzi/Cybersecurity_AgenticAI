@@ -23,6 +23,8 @@ LOCAL_ROOT = Path.home() / '.local'
 LOCAL_BIN = LOCAL_ROOT / 'bin'
 LOCAL_OPT = LOCAL_ROOT / 'opt'
 DOWNLOADS = LOCAL_ROOT / 'downloads'
+PERL_LOCAL_ROOT = Path.home() / 'perl5'
+PERL_LOCAL_LIB = PERL_LOCAL_ROOT / 'lib' / 'perl5'
 RUNTIME_FILE = ROOT / '.secops_runtime.json'
 COMMAND_REFERENCE_FILE = ROOT / 'init.txt'
 TARGET = 'http://127.0.0.1'
@@ -35,7 +37,7 @@ NUCLEI_TEMPLATE_UPDATE_TIMEOUT = 600
 _NUCLEI_TEMPLATE_STATE: dict[str, Any] = {}
 _NUCLEI_ENGINE_STATE: dict[str, Any] = {}
 _IDOR_FORGE_STATE: dict[str, Any] = {}
-BUILD_ID = 'secops-v31.13-streamable-http-fastmcp3-20260809'
+BUILD_ID = 'secops-v31.15-unified-mcp-agentic-risk-linux-bootstrap-20260826'
 FASTMCP_VERSION = '3.4.5'
 FASTMCP_REQUIREMENT = f'fastmcp=={FASTMCP_VERSION}'
 LANGGRAPH_REQUIREMENT = 'langgraph==1.2.10'
@@ -341,6 +343,33 @@ def install_idor_forge() -> dict[str, Any]:
     print(f'[+] IDOR-Forge upstream runtime ready: {IDOR_FORGE_DIR}')
     return dict(_IDOR_FORGE_STATE)
 
+# Configures the per-user Perl library used by CPAN on Unix-like hosts.
+def configure_perl_environment() -> dict[str, str]:
+
+    if os.name == 'nt':
+        return {}
+    PERL_LOCAL_ROOT.mkdir(parents=True, exist_ok=True)
+    PERL_LOCAL_LIB.mkdir(parents=True, exist_ok=True)
+    local_bin = PERL_LOCAL_ROOT / 'bin'
+    if local_bin.is_dir():
+        _add_path(local_bin)
+    current = [part for part in os.environ.get('PERL5LIB', '').split(os.pathsep) if part]
+    local_lib = str(PERL_LOCAL_LIB.resolve())
+    if os.path.normcase(local_lib) not in {os.path.normcase(os.path.abspath(part)) for part in current}:
+        current.insert(0, local_lib)
+    perl5lib = os.pathsep.join(current)
+    os.environ['PERL5LIB'] = perl5lib
+    os.environ.setdefault('PERL_LOCAL_LIB_ROOT', str(PERL_LOCAL_ROOT.resolve()))
+    os.environ.setdefault('PERL_MB_OPT', f"--install_base {PERL_LOCAL_ROOT.resolve()}")
+    os.environ.setdefault('PERL_MM_OPT', f"INSTALL_BASE={PERL_LOCAL_ROOT.resolve()}")
+    return {
+        'PERL5LIB': perl5lib,
+        'PERL_LOCAL_LIB_ROOT': os.environ['PERL_LOCAL_LIB_ROOT'],
+        'PERL_MB_OPT': os.environ['PERL_MB_OPT'],
+        'PERL_MM_OPT': os.environ['PERL_MM_OPT'],
+    }
+
+
 # Finds a usable Perl interpreter for Nikto when native execution is possible.
 def find_perl() -> str | None:
     found = shutil.which('perl')
@@ -367,6 +396,7 @@ def _perl_reinstall_hint() -> str:
 
 # Perl module probing verifies that an optional module can be loaded.
 def _perl_module_available(perl: Path, module: str) -> tuple[bool, str]:
+    configure_perl_environment()
     probe = run([str(perl), f'-M{module}', '-e', f'print ${module}::VERSION'], required=False, capture=True, show_output=False, timeout=60)
     parts = [(probe.stdout or '').strip(), (probe.stderr or '').strip()]
     detail = '\n'.join((part for part in parts if part))
@@ -417,12 +447,15 @@ def _install_perl_module(perl: Path, module: str) -> None:
     make, toolchain_detail = _configure_perl_toolchain(perl)
     if make is None:
         raise RuntimeError(f'Perl is missing the required build toolchain. {toolchain_detail}\n{_perl_reinstall_hint()}')
-    environment = {'PATH': os.environ.get('PATH', ''), 'MAKE': str(make), 'PERL_MM_USE_DEFAULT': '1', 'PERL_AUTOINSTALL': '--defaultdeps', 'NONINTERACTIVE_TESTING': '1'}
-    cpanm_candidates = (perl.parent / 'cpanm.bat', perl.parent / 'cpanm.exe', perl.parent / 'cpanm', perl.parent.parent / 'site' / 'bin' / 'cpanm.bat', perl.parent.parent / 'site' / 'bin' / 'cpanm.exe', Path('/opt/homebrew/bin/cpanm'), Path('/usr/local/bin/cpanm'))
+    environment = {**configure_perl_environment(), 'PATH': os.environ.get('PATH', ''), 'MAKE': str(make), 'PERL_MM_USE_DEFAULT': '1', 'PERL_AUTOINSTALL': '--defaultdeps', 'NONINTERACTIVE_TESTING': '1'}
+    cpanm_candidates = (perl.parent / 'cpanm.bat', perl.parent / 'cpanm.exe', perl.parent / 'cpanm', perl.parent.parent / 'site' / 'bin' / 'cpanm.bat', perl.parent.parent / 'site' / 'bin' / 'cpanm.exe', PERL_LOCAL_ROOT / 'bin' / 'cpanm', Path('/usr/bin/cpanm'), Path('/opt/homebrew/bin/cpanm'), Path('/usr/local/bin/cpanm'))
     attempts: list[str] = []
     cpanm = next((path for path in cpanm_candidates if path.exists()), None)
     if cpanm:
-        result = run([str(cpanm), '--notest', module], required=False, capture=True, timeout=1800, env_overrides=environment)
+        cpanm_command = [str(cpanm), '--notest', module]
+        if os.name != 'nt':
+            cpanm_command = [str(cpanm), '--local-lib', str(PERL_LOCAL_ROOT), '--notest', module]
+        result = run(cpanm_command, required=False, capture=True, timeout=1800, env_overrides=environment)
         attempts.append('\n'.join(filter(None, ((result.stdout or '').strip(), (result.stderr or '').strip())))[:4000])
         healthy, _ = _perl_module_available(perl, module)
         if healthy:
@@ -442,7 +475,18 @@ def _write_nikto_launcher(perl: Path, script: Path) -> Path:
 
     LOCAL_BIN.mkdir(parents=True, exist_ok=True)
     wrapper = LOCAL_OPT / 'nikto_launcher.py'
-    wrapper.write_text(f'import subprocess, sys\nraise SystemExit(subprocess.call([{str(perl)!r}, {str(script)!r}, *sys.argv[1:]]))\n', encoding='utf-8')
+    if os.name == 'nt':
+        wrapper_text = f'import subprocess, sys\nraise SystemExit(subprocess.call([{str(perl)!r}, {str(script)!r}, *sys.argv[1:]]))\n'
+    else:
+        local_lib = str(PERL_LOCAL_LIB.resolve())
+        wrapper_text = (
+            'import os, subprocess, sys\n'
+            f'_secops_perl5lib = {local_lib!r}\n'
+            "_existing = os.environ.get('PERL5LIB', '')\n"
+            "os.environ['PERL5LIB'] = _secops_perl5lib + (os.pathsep + _existing if _existing else '')\n"
+            f'raise SystemExit(subprocess.call([{str(perl)!r}, {str(script)!r}, *sys.argv[1:]]))\n'
+        )
+    wrapper.write_text(wrapper_text, encoding='utf-8')
     if os.name == 'nt':
         launcher = LOCAL_BIN / 'nikto.bat'
         launcher.write_text(f'@echo off\r\n"{sys.executable}" "{wrapper}" %*\r\nexit /b %ERRORLEVEL%\r\n', encoding='utf-8')
@@ -854,7 +898,7 @@ def verify_scanners(required: bool=True) -> dict[str, str | None]:
         raise RuntimeError('Missing or unusable scanners: ' + ', '.join(missing))
     return status
 
-# Writes local runtime paths, ports, tool modes, and template metadata.
+# Writes local runtime paths, the unified MCP endpoint, tool modes, and template metadata.
 def write_runtime_config(status: dict[str, str | None]) -> None:
     status_directories = []
     for value in status.values():
@@ -864,7 +908,7 @@ def write_runtime_config(status: dict[str, str | None]) -> None:
         if path.exists():
             status_directories.append(str(path.parent))
     directories = configure_path() + status_directories
-    payload = {'schema_version': 3, 'generated_at': datetime.now(timezone.utc).isoformat(), 'project_root': str(ROOT), 'python_executable': sys.executable, 'platform': platform.platform(), 'machine': platform.machine(), 'tool_directories': list(dict.fromkeys(directories)), 'executables': status, 'idor_forge': dict(_IDOR_FORGE_STATE) if _IDOR_FORGE_STATE else {'repository': IDOR_FORGE_REPOSITORY, 'directory': str(IDOR_FORGE_DIR), 'python': str(IDOR_FORGE_DIR / '.venv' / ('Scripts/python.exe' if os.name == 'nt' else 'bin/python'))}, 'mcp_transport': 'streamable_http', 'mcp_http': {'host': '127.0.0.1', 'path': '/mcp', 'services': {name: mcp_http_url(name) for name in MCP_SERVER_PORTS}}, 'playwright_chromium': {'ready': _playwright_chromium_ready()[0], 'interpreter': sys.executable}, 'nikto_perl': str(Path(find_perl()).resolve()) if find_perl() else '', 'nikto_script': str((LOCAL_OPT / 'nikto' / 'program' / 'nikto.pl').resolve()), 'nikto_image': NIKTO_DOCKER_IMAGE, 'nikto_execution_mode': 'docker_official_image' if _docker_image_ready(NIKTO_DOCKER_IMAGE) else 'native_perl', 'nuclei_image': NUCLEI_DOCKER_IMAGE if _NUCLEI_ENGINE_STATE.get('execution_mode') == 'docker_official_image' else '', 'nuclei_execution_mode': str(_NUCLEI_ENGINE_STATE.get('execution_mode') or 'native'), 'nuclei_engine': dict(_NUCLEI_ENGINE_STATE), 'report_docker_image': REPORT_DOCKER_IMAGE if _docker_image_ready(REPORT_DOCKER_IMAGE) else '', 'report_docker_source_image': REPORT_DOCKER_SOURCE_IMAGE, 'report_execution_mode': 'docker_registry_alias' if _docker_image_ready(REPORT_DOCKER_IMAGE) else 'native_weasyprint', 'nuclei_templates': dict(_NUCLEI_TEMPLATE_STATE) if _NUCLEI_TEMPLATE_STATE else {'count': _filesystem_nuclei_template_count()[0], 'directory': _best_nuclei_template_directory(), 'directories': _filesystem_nuclei_template_count()[1], 'filesystem_candidates': _filesystem_nuclei_template_inventory(), 'minimum_expected': NUCLEI_TEMPLATE_MINIMUM}}
+    payload = {'schema_version': 4, 'generated_at': datetime.now(timezone.utc).isoformat(), 'project_root': str(ROOT), 'python_executable': sys.executable, 'platform': platform.platform(), 'machine': platform.machine(), 'tool_directories': list(dict.fromkeys(directories)), 'executables': status, 'idor_forge': dict(_IDOR_FORGE_STATE) if _IDOR_FORGE_STATE else {'repository': IDOR_FORGE_REPOSITORY, 'directory': str(IDOR_FORGE_DIR), 'python': str(IDOR_FORGE_DIR / '.venv' / ('Scripts/python.exe' if os.name == 'nt' else 'bin/python'))}, 'mcp_transport': 'streamable_http', 'mcp_http': {'host': '127.0.0.1', 'path': '/mcp', 'services': {name: mcp_http_url(name) for name in MCP_SERVER_PORTS}}, 'playwright_chromium': {'ready': _playwright_chromium_ready()[0], 'interpreter': sys.executable}, 'nikto_perl': str(Path(find_perl()).resolve()) if find_perl() else '', 'nikto_script': str((LOCAL_OPT / 'nikto' / 'program' / 'nikto.pl').resolve()), 'nikto_image': NIKTO_DOCKER_IMAGE, 'nikto_execution_mode': 'docker_official_image' if _docker_image_ready(NIKTO_DOCKER_IMAGE) else 'native_perl', 'nuclei_image': NUCLEI_DOCKER_IMAGE if _NUCLEI_ENGINE_STATE.get('execution_mode') == 'docker_official_image' else '', 'nuclei_execution_mode': str(_NUCLEI_ENGINE_STATE.get('execution_mode') or 'native'), 'nuclei_engine': dict(_NUCLEI_ENGINE_STATE), 'report_docker_image': REPORT_DOCKER_IMAGE if _docker_image_ready(REPORT_DOCKER_IMAGE) else '', 'report_docker_source_image': REPORT_DOCKER_SOURCE_IMAGE, 'report_execution_mode': 'docker_registry_alias' if _docker_image_ready(REPORT_DOCKER_IMAGE) else 'native_weasyprint', 'nuclei_templates': dict(_NUCLEI_TEMPLATE_STATE) if _NUCLEI_TEMPLATE_STATE else {'count': _filesystem_nuclei_template_count()[0], 'directory': _best_nuclei_template_directory(), 'directories': _filesystem_nuclei_template_count()[1], 'filesystem_candidates': _filesystem_nuclei_template_inventory(), 'minimum_expected': NUCLEI_TEMPLATE_MINIMUM}}
     RUNTIME_FILE.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding='utf-8')
     print(f'[+] Runtime scanner configuration written: {RUNTIME_FILE}')
 

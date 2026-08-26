@@ -14,7 +14,7 @@ import orchestratorDeterministic as deterministic_core
 import orchestratorAgenticCore as agentic_core
 from orchestratorAgenticCore import (
     AgentState, AI_PLANNER_TIMEOUTS, ensure_ollama_model, warm_ollama_model,
-    discovery_node, planner_node, executor_node, report_node, route_after_execution,
+    discovery_node, planner_node, executor_node, analysis_node, report_node, route_after_execution,
     execute_action, execute_plan, validate_plan, ollama_plan,
 )
 from orchestratorShared import (
@@ -30,30 +30,31 @@ REGISTRY = deterministic_core.agentic_registry()
 agentic_core.REGISTRY = REGISTRY
 
 
-# Falls back to the shared implementation when a public name is not defined locally.
 def __getattr__(name: str) -> Any:
     try:
         return getattr(agentic_core, name)
     except AttributeError as exc:
         raise AttributeError(name) from exc
 
+# Autonomous planner: plan without a checklist and avoid redundant tool execution.
+# Eligible but unselected actions remain visible as diagnosis="agentic_deferred_by_planner".
 
-# Builds the LangGraph flow that connects discovery, planning, execution, and reporting.
 def build_graph() -> Any:
     graph = StateGraph(AgentState)
     graph.add_node("discovery", discovery_node)
     graph.add_node("planner", planner_node)
     graph.add_node("executor", executor_node)
+    graph.add_node("analysis", analysis_node)
     graph.add_node("report", report_node)
     graph.add_edge(START, "discovery")
     graph.add_edge("discovery", "planner")
     graph.add_edge("planner", "executor")
-    graph.add_conditional_edges("executor", route_after_execution, {"planner": "planner", "report": "report"})
+    graph.add_conditional_edges("executor", route_after_execution, {"planner": "planner", "analysis": "analysis"})
+    graph.add_edge("analysis", "report")
     graph.add_edge("report", END)
     return graph.compile()
 
 
-# Counts errors, skips, and partial runs before the final agentic summary is printed.
 def summarize(results: dict[str, Any]) -> tuple[int, int, int]:
     errors = skips = partial = 0
     for path, result in iter_leaf_results(results):
@@ -65,7 +66,6 @@ def summarize(results: dict[str, Any]) -> tuple[int, int, int]:
             print(f"[-] {'/'.join(path)}: {result.get('diagnosis', 'unknown')} — {str(result.get('output', ''))[:500]}", file=sys.stderr)
     return errors, skips, partial
 
-# Parses command-line options and drives the complete workflow for this entrypoint.
 def main() -> int:
     parser = argparse.ArgumentParser(
         description="Ollama + LangGraph FastMCP security orchestrator."
@@ -81,14 +81,20 @@ def main() -> int:
     parser.add_argument(
         "--require-ai",
         action="store_true",
-        help="Fail instead of using deterministic fallback when Ollama planning fails.",
+        help="Fail if a required AI planning or analysis stage cannot complete.",
     )
-    parser.add_argument("--max-rounds", type=int, default=2, choices=(1, 2, 3))
+    parser.add_argument("--max-rounds", type=int, default=1, choices=(1, 2, 3))
+    parser.add_argument(
+        "--only-tool",
+        default="",
+        choices=("", *sorted(REGISTRY)),
+        help="Debug filter: expose only this scanner/tool to the AI planner. Empty keeps the normal autonomous candidate set.",
+    )
     parser.add_argument(
         "--ai-timeout",
         type=int,
         default=0,
-        help="Total planning budget per AI round; 0 selects a mode-specific default.",
+        help="AI planning budget per round; the analysis stage also derives its bounded per-batch budget from this value. 0 selects mode-specific defaults.",
     )
     args = parser.parse_args()
 
@@ -97,10 +103,11 @@ def main() -> int:
         print("[*] Deep profile: coverage-max-20m-v1 (broader request classes and bounded high-coverage scanner phases)")
     print(f"[*] Runtime platform: {platform.platform()}")
     print(f"[*] MCP server Python: {deterministic_core._server_python()}")
+    if args.only_tool:
+        print(f"[*] Single-tool debug filter: {args.only_tool}")
     globals()["CURRENT_SCAN_MODE"] = deterministic_core.CURRENT_SCAN_MODE
     globals()["ARJUN_TIMEOUT"] = deterministic_core.ARJUN_TIMEOUT
 
-    # If preflight finds missing local tools, execution stops before the agentic graph starts.
     checks = run_preflight_checks(include_live=True)
     errors = print_preflight_report(checks, show_ok=args.preflight_only)
     if args.preflight_only:
@@ -111,7 +118,6 @@ def main() -> int:
     target, profiles, _, secondary_cookie, injection = (
         prepare_cli_context(parser, args)
     )
-    # Before planning begins, Ollama is checked and the requested model is prepared for use.
     planner_timeout = args.ai_timeout or AI_PLANNER_TIMEOUTS[args.mode]
     try:
         selected_model, ollama_diagnostics = ensure_ollama_model(
@@ -166,7 +172,6 @@ def main() -> int:
             file=sys.stderr,
         )
 
-    # The agentic run starts from a fresh state containing profiles, planner settings, and empty results.
     initial: AgentState = {
         "target": target,
         "profiles": profiles,
@@ -192,6 +197,8 @@ def main() -> int:
         "allow_state_changes": args.allow_state_changes,
         "secondary_cookies": secondary_cookie,
         "planner_audit": [],
+        "analysis": {},
+        "only_tool": args.only_tool,
     }
     started = time.time()
     try:

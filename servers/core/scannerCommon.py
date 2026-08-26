@@ -10,13 +10,20 @@ import requests
 
 from fastmcp import FastMCP
 
-from utils import ROOT_DIR, run_mcp_http, runtime_container_route
+from utils import ROOT_DIR, runtime_container_route
 
-# Create a FastMCP service and its direct-run entrypoint.
+# Creates a composable child FastMCP registry; only secopsServer.py owns the HTTP listener.
 def service(label: str, key: str) -> tuple[FastMCP, Callable[[], None]]:
 
     mcp = FastMCP(label)
-    return mcp, lambda: run_mcp_http(mcp, key)
+
+    # Child modules contain tool implementations only; direct execution must never create another MCP endpoint.
+    def _standalone_disabled() -> None:
+        raise RuntimeError(
+            f"'{key}' is a child tool module. Start servers/secopsServer.py for the unified MCP endpoint."
+        )
+
+    return mcp, _standalone_disabled
 
 # Normalize strings while preserving first-seen order.
 def unique_strings(values: Iterable[Any] | None) -> list[str]:

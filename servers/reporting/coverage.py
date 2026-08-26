@@ -239,16 +239,27 @@ def summarize(results: dict[str, Any], findings: list[dict[str, Any]], coverage:
     }
 
 # Writes the executive-summary paragraph from finding/limitation/constraint counts
-def _executive_text(summary: dict[str, Any], findings: list[dict[str, Any]]) -> str:
+def _executive_text(summary: dict[str, Any], findings: list[dict[str, Any]], context: dict[str, Any] | None = None) -> str:
     confirmed = sum(item["category"] == "vulnerability" for item in findings)
     candidates = sum(item["category"] == "candidate" for item in findings)
     observations = sum(item["category"] in {"observation", "discovery"} for item in findings)
     limits = len(summary["limitations"])
     constraints = len(summary.get("coverage_constraints") or [])
+    ai_assessment = (context or {}).get("ai_risk_assessment", {}) if isinstance(context, dict) else {}
+    assessed = int(ai_assessment.get("assessed_findings", 0) or 0) if isinstance(ai_assessment, dict) else 0
+    if assessed:
+        assessment_note = (
+            f" Ollama post-assessed {assessed} confirmed/candidate finding(s), independently enriching severity, description, "
+            "impact and remediation while the scanner/verifier evidence and confirmation category remained immutable."
+        )
+    else:
+        assessment_note = ""
     return (
         f"The automated assessment produced {confirmed} scanner-confirmed findings, {candidates} candidates requiring manual validation, "
         f"and {observations} discovery or hardening observations. {limits} execution limitation(s) and {constraints} coverage constraint(s) were recorded. "
-        "The report preserves scanner evidence and metadata; it does not invent unsupported exploitability claims. Confirmed findings include the exact tested parameter, bounded payload, response evidence, impact, remediation and reproduction steps when supplied by the scanner. Repetitive informational details may be summarized in PDF/HTML while the complete normalized set remains in JSON."
+        "The report preserves scanner evidence and metadata and does not invent unsupported exploitability claims."
+        + assessment_note
+        + " Repetitive informational details may be summarized in PDF/HTML while the complete normalized set remains in JSON."
     )
 
 # Renders the "Assessment execution" section: the coverage table plus per-row execution details

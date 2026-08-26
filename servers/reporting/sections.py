@@ -200,7 +200,7 @@ def _render_disclaimer(client_display: str, assessment_dates: str) -> str:
 
 
 # Renders the "Risk rating methodology" severity-definitions table
-def _render_severity_legend(toc: list[tuple[int, str, str]]) -> str:
+def _render_severity_legend(toc: list[tuple[int, str, str]], context_value: dict[str, Any] | None = None) -> str:
     heading = _heading(2, "Risk rating methodology", toc, anchor="risk-rating")
     rows = "".join(
         f'<tr><td><span class="rating-chip"><span class="legend-swatch" style="background:{color}"></span>'
@@ -208,12 +208,25 @@ def _render_severity_legend(toc: list[tuple[int, str, str]]) -> str:
         f"<td>{_esc(desc)}</td></tr>"
         for name, color, desc in SEVERITY_DEFINITIONS
     )
+    ai_assessment = context_value.get("ai_risk_assessment", {}) if isinstance(context_value, dict) else {}
+    assessed = int(ai_assessment.get("assessed_findings", 0) or 0) if isinstance(ai_assessment, dict) else 0
+    if assessed:
+        methodology = (
+            '<p class="section-note">For this agentic run, severity is independently post-assessed by Ollama from the '
+            'scanner/verifier evidence. The original scanner severity is preserved with each enriched finding. The AI '
+            'cannot alter the finding category, verification status, tested request or evidence, so confirmation remains '
+            'controlled by deterministic tool-specific rules. The definitions below guide the AI risk classification.</p>'
+        )
+    else:
+        methodology = (
+            '<p class="section-note">Severity is the risk rating supplied by the originating scanner for each finding, '
+            'escalated to a confirmed vulnerability only when the tool-specific evidence rule described in '
+            '“Methodology” is satisfied. The definitions below describe what each rating means for '
+            'prioritization; they are not recalculated per finding.</p>'
+        )
     return (
         f"{heading}"
-        '<p class="section-note">Severity is the risk rating supplied by the originating scanner for each finding, '
-        "escalated to a confirmed vulnerability only when the tool-specific evidence rule described in "
-        "“Methodology” is satisfied. The definitions below describe what each rating means for "
-        "prioritization; they are not recalculated per finding.</p>"
+        f"{methodology}"
         '<table class="rating-table"><colgroup><col class="rating-col"><col></colgroup>'
         f"<thead><tr><th>Rating</th><th>Definition and expected remediation priority</th></tr></thead>"
         f"<tbody>{rows}</tbody></table>"
