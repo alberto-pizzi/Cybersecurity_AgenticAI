@@ -88,17 +88,25 @@ def print_important_commands(
     print("\n=== Commands ready to run ===")
     print("Run them from: " + str(ROOT))
     commands = (
-        ("1. Deterministic BALANCED", _operator_command(
-            "orchestratorDeterministic.py", "--target", TARGET, "--cookies", cookie, "--auth-only", "--mode", "balanced",
+        ("1. Deterministic FAST", _operator_command(
+            "orchestratorDeterministic.py", "--target", TARGET, "--cookies", cookie, "--auth-only", "--mode", "fast",
         )),
-        ("2. Deterministic DEEP", _operator_command(
+        ("2. Deterministic BALANCED", _operator_command(
+            "orchestratorDeterministic.py", "--target", TARGET, "--cookies", cookie, "--auth-only", "--mode",
+            "balanced",
+        )),
+        ("3. Deterministic DEEP", _operator_command(
             "orchestratorDeterministic.py", "--target", TARGET, "--cookies", cookie, "--auth-only", "--mode", "deep",
         )),
-        ("3. Agentic BALANCED", _operator_command(
+        ("4. Agentic FAST", _operator_command(
+            "orchestratorAgentic.py", "--target", TARGET, "--cookies", cookie,
+            "--auth-only", "--model", model, "--max-rounds", "1", "--mode", "fast",
+        )),
+        ("5. Agentic BALANCED", _operator_command(
             "orchestratorAgentic.py", "--target", TARGET, "--cookies", cookie,
             "--auth-only", "--model", model, "--max-rounds", "2", "--mode", "balanced",
         )),
-        ("4. Agentic DEEP", _operator_command(
+        ("6. Agentic DEEP", _operator_command(
             "orchestratorAgentic.py", "--target", TARGET, "--cookies", cookie,
             "--auth-only", "--model", model, "--max-rounds", "3", "--mode", "deep",
         )),
