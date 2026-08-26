@@ -272,18 +272,63 @@ def ollama_plan(state: AgentState) -> dict[str, Any]:
         'candidates': candidates,
     }
     system_message = (
-        'Plan an explicitly authorized web-security assessment. Choose only candidate IDs supplied in the user context; '
-        'each candidate already represents an exact discovery-derived request contract that Python will validate again. '
-        'Prioritize expected information gain and evidence from discovery/results, but actively use the round action budget '
-        'when several useful candidates remain. Prefer broad, complementary coverage across distinct vulnerability classes '
-        'instead of restricting the plan to only the top few actions. A small fraction of the available candidates is '
-        'appropriate only when the omitted actions are genuinely redundant, weakly supported, or unlikely to change the '
-        'assessment. Do not select one action per tool merely to satisfy a checklist. Prefer parameter tools only when their '
-        'candidate parameters fit the vulnerability class, IDOR only for numeric object references, authorization only for '
-        'read-only identity/object/resource signals, and Interactsh only for OAST-compatible inputs. Respect '
-        'round_action_budget as a maximum, not as a target that must be filled. Set finish=true only when no remaining '
-        'candidate is likely to materially improve the assessment. Keep reasoning_summary under 240 characters and mention '
-        'the main reason when many candidates are deferred. Return only schema-valid JSON.'
+        "Plan an explicitly authorized web-security assessment using only the supplied "
+        "discovery-derived candidate IDs. Each candidate already represents an exact "
+        "discovery-derived request contract that Python will validate again before execution. "
+
+        "Evaluate EVERY remaining candidate before producing the final plan. "
+
+        "The round_action_budget is a maximum, not a quota. However, it is intentionally "
+        "large enough to permit broad testing. Do not arbitrarily restrict the plan to only "
+        "the top few highest-confidence candidates when several independent useful actions "
+        "are available. "
+
+        "First identify high-value actions using discovery evidence, previous results, "
+        "expected information gain, vulnerability relevance, and the discovered attack surface. "
+
+        "Then, before producing the final JSON, reconsider every candidate you initially "
+        "excluded. Select additional candidates whenever they can provide materially different "
+        "security evidence, test a distinct vulnerability class, exercise another meaningful "
+        "discovered surface, independently validate an important hypothesis, or materially "
+        "improve confidence in the assessment. "
+
+        "Prefer broad evidence-driven coverage over extreme selectivity when multiple "
+        "independent useful actions exist. "
+
+        "Do not omit an action merely because another selected scanner or technique is broadly "
+        "related to it. Consider actions redundant only when their expected evidence is genuinely "
+        "duplicative for the same discovered target and vulnerability hypothesis. "
+
+        "A confirmed vulnerability must not prematurely stop exploration of unrelated attack "
+        "surfaces or independent vulnerability classes. "
+
+        "Use previous_results and the current candidate set to avoid repeating completed work. "
+        "In later rounds, use accumulated evidence, newly discovered surfaces, and the remaining "
+        "candidates to choose useful follow-up actions rather than repeating earlier actions. "
+
+        "The deterministic orchestrator is the exhaustive baseline. This agentic planner may "
+        "be selective, but selectivity means avoiding genuinely redundant, unsupported, unsafe, "
+        "or very low-value work. It must not mean reducing a rich set of useful independent "
+        "candidates to only two or three actions without a concrete reason. "
+
+        "Do not select actions merely to satisfy a fixed action count, percentage, checklist, "
+        "capability quota, or one-action-per-tool requirement. Every selected action must still "
+        "be justified by discovery evidence or previous results. "
+
+        "Use parameter tools only when their candidate parameters fit the relevant vulnerability "
+        "class. Use IDOR only for appropriate numeric object references. Use authorization testing "
+        "only for read-only identity, object, or privileged-resource signals. Use Interactsh only "
+        "for compatible OAST-capable inputs. "
+
+        "Avoid destructive actions, unsafe requests, unsupported candidates, and completed "
+        "duplicates. "
+
+        "Set finish=true only after evaluating all remaining candidates and determining that none "
+        "is likely to provide materially different or useful security evidence. "
+
+        "Respect round_action_budget. Keep reasoning_summary concise and explain the main "
+        "prioritization decisions, especially when a substantial number of apparently useful "
+        "candidates are deferred. Return only schema-valid JSON."
     )
     base = state['ollama_url'].rstrip('/')
     total_timeout = max(120, int(state.get('ai_timeout') or 480))
