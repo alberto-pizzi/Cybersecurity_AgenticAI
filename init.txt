@@ -19,6 +19,7 @@ e contratti MCP. Non sono previsti trasporti MCP alternativi.
 1. INIZIALIZZAZIONE
 ------------------
 python .\initScript.py
+python .\initScript.py --with-lab --model llama3.1:8b
 python .\initScript.py --with-lab --model qwen2.5:7b
 python .\initScript.py --with-lab --run deterministic --mode balanced
 python .\initScript.py --with-lab --run agentic --model qwen2.5:7b --mode balanced
