@@ -44,6 +44,7 @@ dt{font-weight:700;overflow-wrap:anywhere;min-width:0}
 dd{margin:0;overflow-wrap:anywhere;word-break:break-word;min-width:0}
 pre{white-space:pre-wrap;overflow-wrap:anywhere;word-break:break-word;background:#101821;color:#e5edf5;padding:12px;border-radius:8px}
 .quality{background:#fff8dc;border:1px solid #e1cb73;padding:10px;border-radius:8px}
+.quality-title{display:block;color:#173b5e;margin: 5px 0 15px 5px}
 details{margin-top:14px}.section-note{background:#eaf1f7;border-left:4px solid #527ca3;padding:10px}
 .count{font-size:.85rem;background:#dce8f3;border-radius:12px;padding:3px 8px}
 .toc a{color: black;text-decoration: none;}
@@ -82,4 +83,9 @@ ol li::marker{font-weight:bold;}
 .disclaimer h2{margin-top:0}
 .disclaimer p{line-height:1.55}
 .legend-swatch{display:inline-block;flex:0 0 auto;width:10px;height:10px;border-radius:2px}
+.audit-rounds{list-style:none;padding:0;margin:14px 0 0}
+.audit-rounds>li{background:white;border:1px solid #d7dee5;border-radius:10px;padding:14px 18px;margin:0 0 12px}
+.audit-rounds>li>b{font-size:1.02rem;color:#173b5e}
+.audit-rounds table{margin:4px 0 10px}
+.audit-rounds dl{margin:8px 0 10px}
 """

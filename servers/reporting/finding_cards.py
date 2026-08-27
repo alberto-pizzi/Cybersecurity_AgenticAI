@@ -37,7 +37,7 @@ def _finding_card(item: dict[str, Any], index: int, toc: list[tuple[int, str, st
             ai_rows += _field('Scanner security impact', item.get('scanner_impact'))
         if item.get('scanner_solution') and item.get('scanner_solution') != item.get('solution'):
             ai_rows += _field('Scanner recommended remediation', item.get('scanner_solution'))
-        ai_block = f'<div class="quality"><b>Agentic risk assessment</b><dl>{ai_rows}</dl></div>'
+        ai_block = f'<div class="quality"><b class="quality-title">Agentic risk assessment</b><dl>{ai_rows}</dl></div>'
     return f"""
 <article class="finding risk-{_esc(item['risk'])}">
 {heading}

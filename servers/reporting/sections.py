@@ -13,7 +13,7 @@ from urllib.parse import urlparse
 
 from .charts import _render_pipeline_diagram, _svg_severity_chart
 from .constants import AUTHORS, CLIENT_NAME, METHODOLOGY_PHASES, REPORT_CLASSIFICATION, REPORT_TITLE, REPORT_VERSION, SEVERITY_DEFINITIONS, TOOL_PURPOSES
-from .fields import _render_list
+from .fields import _field, _render_list
 from .findings import _finding_family
 from .text_utils import _esc
 from .toc import _heading
@@ -522,11 +522,12 @@ def _render_scope_section(context_value: dict[str, Any], toc: list[tuple[int, st
 def _render_agentic_audit(context_value: dict[str, Any], toc: list[tuple[int, str, str]]) -> str:
     planner_audit = context_value.get("planner_audit", []) if isinstance(context_value, dict) else []
     audit_rows = ""
-    audit_details: list[str] = []
+    round_items: list[str] = []
     for item in planner_audit if isinstance(planner_audit, list) else []:
         if not isinstance(item, dict):
             continue
         outcomes = item.get("execution_outcomes", []) if isinstance(item.get("execution_outcomes"), list) else []
+        gaps = item.get("remaining_coverage_gaps", []) if isinstance(item.get("remaining_coverage_gaps"), list) else []
         audit_rows += (
             "<tr>"
             f"<td>{_esc(item.get('round',''))}</td>"
@@ -534,14 +535,79 @@ def _render_agentic_audit(context_value: dict[str, Any], toc: list[tuple[int, st
             f"<td>{_esc(item.get('eligible_action_count',0))}</td>"
             f"<td>{_esc(item.get('ai_selected_action_count',0))}</td>"
             f"<td>{_esc(item.get('selected_action_count',0))}</td>"
-            f"<td>{_esc(len(item.get('remaining_coverage_gaps',[]) or []))}</td>"
+            f"<td>{_esc(len(gaps))}</td>"
             f"<td>{_esc(len(outcomes))}</td>"
             "</tr>"
         )
-        audit_details.append(
-            f"<details><summary>Round {_esc(item.get('round',''))}: {_esc(item.get('planner_source',''))}</summary>"
-            f"<p><b>Planner summary:</b> {_esc(item.get('reasoning_summary',''))}</p>"
-            f"<pre>{_esc(json.dumps(item, indent=2, ensure_ascii=False, default=str))}</pre></details>"
+
+        # Key round facts as a label/value list, matching the finding-card style,
+        # rather than a raw JSON dump.
+        facts = "".join(
+            _field(label, value)
+            for label, value in (
+                ("Planner endpoint", item.get("planner_endpoint", "")),
+                ("Context size (bytes)", item.get("context_bytes", "")),
+                ("Round action budget", item.get("round_action_budget", "")),
+                ("Eligible tools", ", ".join(str(value) for value in (item.get("eligible_tools") or []))),
+                ("AI selected / reviewed actions", f"{item.get('ai_selected_action_count', 0)} / {item.get('review_selected_action_count', 0)}"),
+                ("Review reasoning", item.get("review_reasoning", "")),
+                ("Fallback reason", item.get("fallback_reason", "")),
+                ("New request contracts discovered", item.get("new_request_contracts", "")),
+                ("Remaining eligible actions after execution", item.get("remaining_eligible_actions_after_execution", "")),
+            )
+        )
+        facts_html = f"<dl>{facts}</dl>" if facts else ""
+
+        selected_actions = item.get("selected_actions", []) if isinstance(item.get("selected_actions"), list) else []
+        actions_html = ""
+        if selected_actions:
+            action_rows = "".join(
+                "<tr>"
+                f"<td>{_esc(action.get('profile',''))}</td>"
+                f"<td>{_esc(action.get('tool',''))}</td>"
+                f"<td>{_esc(action.get('method','GET'))}</td>"
+                f"<td>{_esc(action.get('target_url',''))}</td>"
+                f"<td>{_esc(', '.join(str(value) for value in (action.get('parameters') or [])) or '-')}</td>"
+                f"<td>{_esc(action.get('reason',''))}</td>"
+                "</tr>"
+                for action in selected_actions if isinstance(action, dict)
+            )
+            actions_html = (
+                '<p class="field-label">Selected actions</p>'
+                "<table><thead><tr><th>Profile</th><th>Tool</th><th>Method</th><th>Target URL</th><th>Parameters</th><th>Reason</th></tr></thead>"
+                f"<tbody>{action_rows}</tbody></table>"
+            )
+
+        outcomes_html = ""
+        if outcomes:
+            outcome_rows = "".join(
+                "<tr>"
+                f"<td>{_esc(row.get('profile',''))}</td>"
+                f"<td>{_esc(row.get('tool',''))}</td>"
+                f"<td>{_esc(row.get('status',''))}</td>"
+                f"<td>{_esc(row.get('diagnosis',''))}</td>"
+                f"<td>{_esc(row.get('findings',0))}</td>"
+                f"<td>{_esc(row.get('duration_seconds',''))}</td>"
+                "</tr>"
+                for row in outcomes if isinstance(row, dict)
+            )
+            outcomes_html = (
+                '<p class="field-label">Execution outcomes</p>'
+                "<table><thead><tr><th>Profile</th><th>Tool</th><th>Status</th><th>Diagnosis</th><th>Findings</th><th>Seconds</th></tr></thead>"
+                f"<tbody>{outcome_rows}</tbody></table>"
+            )
+
+        gaps_html = (
+            ('<p class="field-label">Remaining coverage gaps</p>' + _render_list([str(gap) for gap in gaps]))
+            if gaps else ""
+        )
+
+        round_items.append(
+            "<li>"
+            f"<b>Round {_esc(item.get('round',''))}: {_esc(item.get('planner_source',''))}</b>"
+            f"<p>{_esc(item.get('reasoning_summary',''))}</p>"
+            f"{facts_html}{actions_html}{outcomes_html}{gaps_html}"
+            "</li>"
         )
     if not audit_rows:
         return ""
@@ -550,5 +616,6 @@ def _render_agentic_audit(context_value: dict[str, Any], toc: list[tuple[int, st
         f"{heading}"
         "<p class='section-note'>This section records model-selected actions, coverage repair, fallback use and execution outcomes. It contains concise planner summaries, not hidden chain-of-thought.</p>"
         "<table><thead><tr><th>Round</th><th>Planner</th><th>Eligible</th><th>AI selected</th><th>Executed plan</th><th>Gaps</th><th>Outcomes</th></tr></thead>"
-        f"<tbody>{audit_rows}</tbody></table>{''.join(audit_details)}"
+        f"<tbody>{audit_rows}</tbody></table>"
+        f"<ul class=\"audit-rounds\">{''.join(round_items)}</ul>"
     )
