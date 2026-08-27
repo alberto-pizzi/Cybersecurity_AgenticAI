@@ -245,8 +245,8 @@ def _executive_text(summary: dict[str, Any], findings: list[dict[str, Any]], con
     observations = sum(item["category"] in {"observation", "discovery"} for item in findings)
     limits = len(summary["limitations"])
     constraints = len(summary.get("coverage_constraints") or [])
-    ai_assessment = (context or {}).get("ai_risk_assessment", {}) if isinstance(context, dict) else {}
-    assessed = int(ai_assessment.get("assessed_findings", 0) or 0) if isinstance(ai_assessment, dict) else 0
+    ai_assessment = (context or {}).get("ai_analysis", {}) if isinstance(context, dict) else {}
+    assessed = int(ai_assessment.get("analyzed_findings", 0) or 0) if isinstance(ai_assessment, dict) else 0
     if assessed:
         assessment_note = (
             f" Ollama post-assessed {assessed} confirmed/candidate finding(s), independently enriching severity, description, "

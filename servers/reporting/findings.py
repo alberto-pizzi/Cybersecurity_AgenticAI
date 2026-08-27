@@ -94,6 +94,17 @@ def _normalize_finding(raw: dict[str, Any], profile: str, tool: str) -> dict[str
         payloads = [payloads]
     payloads = [_redact_text(value) for value in payloads if str(value)]
 
+    # Populated by the agentic analysis stage (orchestratorAgenticCore.py's
+    # analysis_node), which enriches severity/description/impact/solution above
+    # while preserving the original scanner values here for audit.
+    ai_analysis_raw = raw.get("ai_analysis") if isinstance(raw.get("ai_analysis"), dict) else {}
+    ai_analysis = _redact_value(ai_analysis_raw) if ai_analysis_raw else {}
+    scanner_risk = _redact_text(raw.get("scanner_risk") or "").strip()
+    scanner_confidence = _redact_text(raw.get("scanner_confidence") or raw.get("confidence") or "not supplied").strip()
+    scanner_description = _redact_text(raw.get("scanner_description") or "").strip()
+    scanner_impact = _redact_text(raw.get("scanner_impact") or "").strip()
+    scanner_solution = _redact_text(raw.get("scanner_solution") or "").strip()
+
     data_quality_notes: list[str] = []
     if not description:
         data_quality_notes.append(
@@ -115,6 +126,8 @@ def _normalize_finding(raw: dict[str, Any], profile: str, tool: str) -> dict[str
             "evidence", "technical_details", "other_information", "reproduction",
             "references", "reference", "attack_preconditions", "preconditions",
             "owasp_category", "payload", "payloads",
+            "scanner_risk", "scanner_confidence", "scanner_description",
+            "scanner_impact", "scanner_solution", "ai_analysis",
         }
         and value not in (None, "", [], {})
     }
@@ -126,6 +139,12 @@ def _normalize_finding(raw: dict[str, Any], profile: str, tool: str) -> dict[str
         "category": category,
         "verification_status": _verification_status(raw, category),
         "confidence": _redact_text(raw.get("confidence") or "not supplied"),
+        "scanner_confidence": scanner_confidence,
+        "ai_analysis": ai_analysis,
+        "scanner_risk": scanner_risk,
+        "scanner_description": scanner_description,
+        "scanner_impact": scanner_impact,
+        "scanner_solution": scanner_solution,
         "url": url,
         "method": _redact_text(raw.get("method") or raw.get("request_method") or ""),
         "parameter": _redact_text(raw.get("parameter") or ""),
@@ -242,6 +261,8 @@ def _merge_finding_rows(existing: dict[str, Any], row: dict[str, Any], profile: 
             "reproduction", "attack_preconditions", "owasp_category", "payload",
             "payloads", "references", "identifiers", "data_quality_notes", "scanner_fields",
             "method", "parameter",
+            "scanner_risk", "scanner_confidence", "scanner_description",
+            "scanner_impact", "scanner_solution", "ai_analysis",
         ):
             if row.get(key) not in (None, "", [], {}):
                 existing[key] = row[key]

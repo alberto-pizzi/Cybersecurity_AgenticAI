@@ -208,8 +208,8 @@ def _render_severity_legend(toc: list[tuple[int, str, str]], context_value: dict
         f"<td>{_esc(desc)}</td></tr>"
         for name, color, desc in SEVERITY_DEFINITIONS
     )
-    ai_assessment = context_value.get("ai_risk_assessment", {}) if isinstance(context_value, dict) else {}
-    assessed = int(ai_assessment.get("assessed_findings", 0) or 0) if isinstance(ai_assessment, dict) else 0
+    ai_assessment = context_value.get("ai_analysis", {}) if isinstance(context_value, dict) else {}
+    assessed = int(ai_assessment.get("analyzed_findings", 0) or 0) if isinstance(ai_assessment, dict) else 0
     if assessed:
         methodology = (
             '<p class="section-note">For this agentic run, severity is independently post-assessed by Ollama from the '

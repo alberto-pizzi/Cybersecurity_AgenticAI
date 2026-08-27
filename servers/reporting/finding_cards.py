@@ -21,19 +21,23 @@ def _finding_card(item: dict[str, Any], index: int, toc: list[tuple[int, str, st
         anchor=f"finding-{index}",
         extra=f' <span>{_esc(item["risk"]).upper()}</span>',
     )
-    scanner_fields = item.get("scanner_fields") if isinstance(item.get("scanner_fields"), dict) else {}
-    ai_assessment = scanner_fields.get("ai_assessment") if isinstance(scanner_fields, dict) else None
+    ai_analysis = item.get("ai_analysis") if isinstance(item.get("ai_analysis"), dict) else {}
     ai_block = ""
-    if isinstance(ai_assessment, dict):
-        original_risk = ai_assessment.get("scanner_risk") or scanner_fields.get("scanner_risk") or "not supplied"
-        ai_block = (
-            '<div class="quality"><b>Agentic risk assessment</b><dl>'
-            + _field('Original scanner severity', str(original_risk).upper())
-            + _field('AI assessment confidence', ai_assessment.get('confidence'))
-            + _field('AI severity rationale', ai_assessment.get('rationale'))
-            + _field('Assessment model', ai_assessment.get('model'))
-            + '</dl></div>'
+    if ai_analysis:
+        original_risk = ai_analysis.get("scanner_risk") or item.get("scanner_risk") or "not supplied"
+        ai_rows = (
+            _field('Original scanner severity', str(original_risk).upper())
+            + _field('AI assessment confidence', ai_analysis.get('analysis_confidence'))
+            + _field('AI severity rationale', ai_analysis.get('rationale'))
+            + _field('Assessment model', ai_analysis.get('model'))
         )
+        if item.get('scanner_description') and item.get('scanner_description') != item.get('description'):
+            ai_rows += _field('Scanner description', item.get('scanner_description'))
+        if item.get('scanner_impact') and item.get('scanner_impact') != item.get('impact'):
+            ai_rows += _field('Scanner security impact', item.get('scanner_impact'))
+        if item.get('scanner_solution') and item.get('scanner_solution') != item.get('solution'):
+            ai_rows += _field('Scanner recommended remediation', item.get('scanner_solution'))
+        ai_block = f'<div class="quality"><b>Agentic risk assessment</b><dl>{ai_rows}</dl></div>'
     return f"""
 <article class="finding risk-{_esc(item['risk'])}">
 {heading}
