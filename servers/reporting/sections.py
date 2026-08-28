@@ -13,7 +13,7 @@ from urllib.parse import urlparse
 
 from .charts import _render_pipeline_diagram, _svg_severity_chart
 from .constants import AUTHORS, CLIENT_NAME, METHODOLOGY_PHASES, REPORT_CLASSIFICATION, REPORT_TITLE, REPORT_VERSION, \
-    SEVERITY_DEFINITIONS, TOOL_PURPOSES, AI_SUFFIX
+    SEVERITY_DEFINITIONS, TOOL_PURPOSES, AI_SUFFIX, PRIORITY_ACTIONS_LIMIT
 from .fields import _field, _render_list
 from .findings import _finding_family
 from .text_utils import _esc
@@ -164,11 +164,11 @@ def _render_priority_actions(findings: list[dict[str, Any]], toc: list[tuple[int
             f"<br>{_esc(item['solution'])}</li>"
         )
         # TODO this limit is ok?
-        if len(items) >= 10:
+        if len(items) >= PRIORITY_ACTIONS_LIMIT:
             break
     if not items:
         return ""
-    heading = _heading(2, "Priority remediation actions", toc, anchor="priority-actions")
+    heading = _heading(2, f"Top {min(len(items), PRIORITY_ACTIONS_LIMIT)} Priority remediation actions", toc, anchor="priority-actions")
     return (
         f"{heading}"
         '<p class="section-note">Drawn directly from the confirmed vulnerabilities and candidates below that carry '
