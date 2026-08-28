@@ -101,6 +101,8 @@ Model aliases map to providers as follows:
 - `llama` -> local Ollama model `llama3.1:8b`;
 - `qwen` -> local Ollama model `qwen2.5:7b`.
 
+The two local aliases share the same Ollama readiness path: the requested model tag is checked explicitly and is warmed before Agentic planning. Model selection is exact; `llama` and `qwen` do not replace each other automatically.
+
 The recommended/default commands printed after `initScript.py --with-lab` use Snap4City with strict AI execution:
 
 ```powershell
@@ -126,8 +128,8 @@ asks for username/password in an interactive console only when neither token can
 in memory for that process; the password is not echoed and `user_credentials.json` is not rewritten automatically.
 
 `--require-ai` disables the planner fallback: a planning or AI-analysis failure stops the Agentic run. Without it, planning
-errors can fall back to a small deterministic discovery-derived plan of at most three safe actions. Ollama failures never
-automatically switch to the remote Snap4City provider.
+errors can fall back to a small deterministic discovery-derived plan of at most three safe actions. A failed AI backend never
+automatically switches to Snap4City or to a different local model.
 
 ## What is produced
 

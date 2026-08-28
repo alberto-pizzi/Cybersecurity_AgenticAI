@@ -300,6 +300,21 @@ def _resolve_ai_cli_selection(prepare_ai: str | None, agentic_model: str) -> tup
     return effective_prepare, effective_agentic
 
 
+# Checks whether the selected local AI model is available through the configured Ollama runtime.
+def _local_ai_model_ready(alias: str) -> bool:
+    model = LOCAL_AI_MODELS.get(alias)
+    if not model:
+        return False
+    try:
+        from orchestratorAgenticCore import ensure_ollama_model
+        selected, _ = ensure_ollama_model(
+            "http://127.0.0.1:11434", model, allow_pull=False,
+        )
+    except Exception:
+        return False
+    return selected.lower() == model.lower()
+
+
 # Verifies the remote Snap4City model during initialization using the same client as the Agentic orchestrator.
 def _prepare_snap4city(credentials_path: str) -> None:
     from orchestratorAgenticCore import (
@@ -409,7 +424,6 @@ def main() -> int:
     configure_path()
     cookie = ""
     commands_printed = False
-    snap4city_attempted = False
     snap4city_ready = False
     try:
         # Before scans can run, setup installs the required tools and verifies the local environment.
@@ -452,7 +466,6 @@ def main() -> int:
             update_runtime_auth(cookie)
             print(f"\n[+] Bundled local-lab login created successfully.\n[+] Cookie header: {cookie}")
             if prepare_snap4city:
-                snap4city_attempted = True
                 _prepare_snap4city(args.snap4city_credentials)
                 snap4city_ready = True
 
@@ -478,23 +491,26 @@ def main() -> int:
 
         if not args.commands_only and not commands_printed:
             command_agentic_model: str | None = agentic_model
-            if snap4city_attempted and not snap4city_ready and agentic_model == "snap4city":
-                if LOCAL_AI_MODELS["llama"] in local_ai_models:
-                    command_agentic_model = "llama"
-                    print(
-                        "[!] Snap4City was not verified; recovery Agentic commands will use the already prepared local llama model.",
-                        file=sys.stderr,
-                    )
-                elif LOCAL_AI_MODELS["qwen"] in local_ai_models:
-                    command_agentic_model = "qwen"
-                    print(
-                        "[!] Snap4City was not verified; recovery Agentic commands will use the already prepared local qwen model.",
-                        file=sys.stderr,
-                    )
-                else:
+            if args.with_lab and agentic_model in LOCAL_AI_MODELS:
+                if not _local_ai_model_ready(agentic_model):
                     command_agentic_model = None
                     print(
-                        "[!] Snap4City was not verified and no local AI backend was prepared; Agentic recovery commands are omitted.",
+                        f"[!] Local AI model {agentic_model} was not verified; Agentic recovery commands are omitted.",
+                        file=sys.stderr,
+                    )
+            elif args.with_lab and agentic_model == "snap4city" and prepare_snap4city and not snap4city_ready:
+                command_agentic_model = None
+                for local_alias in ("llama", "qwen"):
+                    if LOCAL_AI_MODELS[local_alias] in local_ai_models and _local_ai_model_ready(local_alias):
+                        command_agentic_model = local_alias
+                        print(
+                            f"[!] Snap4City was not verified; recovery Agentic commands will use verified local model {local_alias}.",
+                            file=sys.stderr,
+                        )
+                        break
+                if command_agentic_model is None:
+                    print(
+                        "[!] Snap4City was not verified and no prepared local AI model is ready; Agentic recovery commands are omitted.",
                         file=sys.stderr,
                     )
             print_important_commands(

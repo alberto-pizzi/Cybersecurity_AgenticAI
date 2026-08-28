@@ -570,6 +570,9 @@ def setup_local_lab(models: str | list[str] | tuple[str, ...] | None = None) -> 
             else:
                 print(f"[*] Pulling Ollama model: {model}")
                 run(["docker", "exec", "ollama_secops", "ollama", "pull", model], timeout=7200)
+                if not _ollama_model_available(model):
+                    raise RuntimeError(f"Ollama model was pulled but is not available through /api/tags: {model}")
+                print(f"[+] Ollama model verified after pull: {model}")
     else:
         print("[*] No local Ollama model requested; DVWA/ZAP lab prepared without provisioning or starting an Ollama container.")
 

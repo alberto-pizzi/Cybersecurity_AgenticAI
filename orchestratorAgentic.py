@@ -16,7 +16,7 @@ from orchestratorAgenticCore import (
     AgentState, AI_PLANNER_TIMEOUTS, SNAP4CITY_DEFAULT_API_URL, resolve_ai_model,
     ensure_ollama_model, warm_ollama_model, ensure_snap4city_model,
     discovery_node, planner_node, executor_node, analysis_node, report_node, route_after_execution,
-    execute_action, execute_plan, validate_plan, ollama_plan,
+    execute_action, execute_plan, validate_plan,
 )
 from orchestratorShared import (
     BROAD_SCANNER_TIMEOUTS, PARAMETER_TOOL_TIMEOUTS, configure_scan_mode,

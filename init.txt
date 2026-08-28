@@ -82,6 +82,9 @@ Modelli Agentic supportati (il provider viene scelto internamente):
   llama      -> Ollama locale, llama3.1:8b
   qwen       -> Ollama locale, qwen2.5:7b
 
+Llama e Qwen condividono la stessa verifica Ollama, ma la selezione del modello e' esatta:
+qwen non viene sostituito automaticamente da llama e llama non viene sostituito da qwen.
+
 Non esiste un'opzione --ai-provider: --model sceglie l'AI e il codice deduce automaticamente
 il provider corretto. Quindi snap4city usa Snap4City; llama e qwen usano Ollama.
 
@@ -111,8 +114,8 @@ per quel processo. La password viene letta senza echo e le credenziali inserite 
 
 Senza --require-ai, se il planner AI fallisce può essere usato il piccolo fallback deterministico discovery-derived (massimo
 3 azioni sicure per round). Con --require-ai il fallback del planner è disabilitato e il run fallisce se planning/analysis AI
-non completano correttamente. Un fallimento di Ollama non passa automaticamente a Snap4City: per usare il provider remoto
-si sceglie esplicitamente --model snap4city.
+non completano correttamente. Un fallimento del backend AI non cambia automaticamente provider o modello: Snap4City, Llama e Qwen
+restano selezioni distinte e devono essere richiesti esplicitamente.
 
 Il planner riceve candidati derivati dalla discovery e li seleziona in base al
 valore informativo atteso. Può differire controlli ridondanti e non usa una

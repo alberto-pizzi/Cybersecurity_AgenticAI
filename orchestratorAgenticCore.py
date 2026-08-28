@@ -73,7 +73,7 @@ AI_ANALYSIS_BATCH_SIZES = {'fast': 1, 'balanced': 3, 'deep': 4}
 AI_ANALYSIS_MAX_PREDICT = {'fast': 440, 'balanced': 700, 'deep': 980}
 AI_ANALYSIS_RESCUE_MAX_PREDICT = {'fast': 300, 'balanced': 380, 'deep': 460}
 AI_ANALYSIS_CONTEXT_WINDOWS = {'fast': 4096, 'balanced': 6144, 'deep': 8192}
-LAST_OLLAMA_PLAN_DIAGNOSTICS: dict[str, Any] = {}
+LAST_AI_PLAN_DIAGNOSTICS: dict[str, Any] = {}
 BROAD_COVERAGE_TOOLS = ('ffuf', 'zap', 'nuclei', 'session', 'nikto')
 PARAMETER_COVERAGE_TOOLS = ('sqlmap', 'dalfox', 'commix', 'traversal', 'idor')
 AUTHORIZATION_COVERAGE_TOOLS = ('authorization',)
@@ -218,8 +218,8 @@ def ensure_ollama_model(ollama_url: str, requested_model: str, *, allow_pull: bo
     diagnostics.update(model_ready=False, selected_model='')
     raise RuntimeError('Ollama is reachable but no usable local model exists. ' + (pull_error or f"Requested model '{requested_model}' is not installed."))
 
-# Plan parsing accepts only the compact ID-selection contract used by the selected AI provider.
-def _parse_ollama_plan_content(content: str) -> dict[str, Any]:
+# Parses the compact ID-selection contract shared by every supported AI provider.
+def _parse_ai_plan_content(content: str) -> dict[str, Any]:
     raw = str(content or '').strip()
     if raw.startswith('```'):
         raw = re.sub(r'^```(?:json)?\s*', '', raw, flags=re.IGNORECASE)
@@ -330,8 +330,9 @@ def warm_ollama_model(ollama_url: str, model: str, *, timeout: int) -> dict[str,
     return {'ready': True, 'response': content[:80], 'seconds': round(time.monotonic() - started, 2)}
 
 
-# When the credentials file still contains placeholders, cached access/refresh tokens are tried first;
-# interactive username/password entry is only the final fallback for this process.
+# Reuses the professor-provided Snap4City TokenManager and preserves its authentication order.
+# When the credentials file still contains placeholders, cached access/refresh tokens are tried
+# first; interactive username/password entry is only the final fallback for this process.
 def _snap4city_token_manager(credentials_path: str) -> Any:
     path = str(Path(credentials_path).expanduser().resolve())
     cached = _SNAP4CITY_TOKEN_MANAGERS.get(path)
@@ -356,19 +357,27 @@ def _snap4city_token_manager(credentials_path: str) -> Any:
         or username.upper() == 'SNAP4CITY_USERNAME'
         or password.upper() in {'PASSWORD', 'SNAP4CITY_PASSWORD'}
     )
+
+    # Construct TokenManager before prompting so its original load_token_data() can reuse
+    # token_stored.json exactly as supplied by the professor. Real file credentials are passed
+    # through unchanged; placeholders are withheld so they can never be sent to the token endpoint.
     manager = TokenManager('' if placeholders else username, '' if placeholders else password)
 
     if not placeholders:
+        # From here manager.get_token() keeps the original order unchanged:
         # valid access token -> refresh token -> username/password.
         _SNAP4CITY_TOKEN_MANAGERS[path] = manager
         return manager
 
-    # With placeholder credentials first honor a still-valid cached access token.
+    # With placeholder credentials, first honor a still-valid cached access token.
     if manager.token and time.time() < manager.token_expiry:
         print('[*] Snap4City: using the valid cached access token from token_stored.json.', flush=True)
         _SNAP4CITY_TOKEN_MANAGERS[path] = manager
         return manager
 
+    # If the cached access token expired, try the professor TokenManager's refresh-token request
+    # before asking the operator for credentials. A failed refresh is consumed here so get_token()
+    # will not repeat the same failed refresh after interactive credentials are supplied.
     refresh_error = ''
     if manager.refresh_token:
         try:
@@ -404,7 +413,8 @@ def _snap4city_token_manager(credentials_path: str) -> Any:
     if not username or not password:
         raise RuntimeError('Snap4City username and password are required.')
 
-    # Keep interactive credentials only in this TokenManager instance.
+    # Keep interactive credentials only in this TokenManager instance. They are not written back
+    # to user_credentials.json; get_token() will now use its normal username/password final step.
     manager.username = username
     manager.password = password
     _SNAP4CITY_TOKEN_MANAGERS[path] = manager
@@ -607,7 +617,7 @@ def _analysis_system_message() -> str:
 
 
 # Asks the selected AI provider for the next scan actions and returns a structured plan.
-def ollama_plan(state: AgentState) -> dict[str, Any]:
+def ai_plan(state: AgentState) -> dict[str, Any]:
     eligible = _eligible_action_catalog(state)
     candidate_map = {f'A{index:03d}': action for index, action in enumerate(eligible, 1)}
     candidates = [_planner_candidate_view(action, candidate_id) for candidate_id, action in candidate_map.items()]
@@ -638,8 +648,8 @@ def ollama_plan(state: AgentState) -> dict[str, Any]:
     # Larger scan profiles can expose more candidates, so scale the model context with the profile.
     context_window = AI_PLANNER_CONTEXT_WINDOWS.get(shared.CURRENT_SCAN_MODE, 6144)
     common_options = {'temperature': 0, 'num_predict': max_predict, 'num_ctx': context_window, 'top_p': 0.9}
-    LAST_OLLAMA_PLAN_DIAGNOSTICS.clear()
-    LAST_OLLAMA_PLAN_DIAGNOSTICS.update({
+    LAST_AI_PLAN_DIAGNOSTICS.clear()
+    LAST_AI_PLAN_DIAGNOSTICS.update({
         'endpoint': 'pending',
         'context_bytes': len(context.encode('utf-8')),
         'candidate_count': len(candidates),
@@ -672,7 +682,7 @@ def ollama_plan(state: AgentState) -> dict[str, Any]:
                 )
             else:
                 content = _ollama_stream_content(url, payload, response_kind=kind, total_timeout=budget, early_json=True)
-            compact_plan = _parse_ollama_plan_content(content)
+            compact_plan = _parse_ai_plan_content(content)
             requested_ids = [str(value) for value in compact_plan.get('selected_action_ids', [])]
             selected_ids = []
             selected_actions = []
@@ -751,7 +761,7 @@ def ollama_plan(state: AgentState) -> dict[str, Any]:
                             total_timeout=review_time_budget,
                             early_json=True,
                         )
-                    review_plan = _parse_ollama_plan_content(review_content)
+                    review_plan = _parse_ai_plan_content(review_content)
                     review_reasoning = _humanize_planner_reasoning(review_plan.get('reasoning_summary'))[:500]
                     for candidate_id in [str(value) for value in review_plan.get('selected_action_ids', [])]:
                         action = candidate_map.get(candidate_id)
@@ -776,8 +786,8 @@ def ollama_plan(state: AgentState) -> dict[str, Any]:
                 finally:
                     review_seconds = round(time.monotonic() - review_started, 2)
 
-            LAST_OLLAMA_PLAN_DIAGNOSTICS.clear()
-            LAST_OLLAMA_PLAN_DIAGNOSTICS.update({
+            LAST_AI_PLAN_DIAGNOSTICS.clear()
+            LAST_AI_PLAN_DIAGNOSTICS.update({
                 'endpoint': kind,
                 'context_bytes': len(context.encode('utf-8')),
                 'candidate_count': len(candidates),
@@ -796,7 +806,7 @@ def ollama_plan(state: AgentState) -> dict[str, Any]:
             }
         except Exception as exc:
             errors.append(f'{kind}: {type(exc).__name__}: {exc}')
-            LAST_OLLAMA_PLAN_DIAGNOSTICS.update({
+            LAST_AI_PLAN_DIAGNOSTICS.update({
                 'endpoint': kind,
                 'seconds': round(time.monotonic() - planning_started, 2),
                 'attempt_errors': list(errors),
@@ -1518,21 +1528,21 @@ def planner_node(state: AgentState) -> dict[str, Any]:
     review_reasoning = ''
     fallback_reason = ''
     try:
-        decision = ollama_plan(state)
+        decision = ai_plan(state)
         ai_plan = validate_plan(state, decision.get('actions', []))
         ai_selected_count = len(ai_plan)
         plan = _merge_ai_actions([], ai_plan, budget=budget)
         summary = str(decision.get('reasoning_summary', ''))[:1000]
         finished = bool(decision.get('finish', False)) and (not plan)
-        endpoint = str(LAST_OLLAMA_PLAN_DIAGNOSTICS.get('endpoint', 'unknown'))
-        context_bytes = int(LAST_OLLAMA_PLAN_DIAGNOSTICS.get('context_bytes', 0) or 0)
-        planner_seconds = float(LAST_OLLAMA_PLAN_DIAGNOSTICS.get('seconds', 0) or 0)
-        candidate_count = int(LAST_OLLAMA_PLAN_DIAGNOSTICS.get('candidate_count', 0) or 0)
-        selected_ids = [str(value) for value in LAST_OLLAMA_PLAN_DIAGNOSTICS.get('selected_action_ids', [])]
-        review_selected_ids = [str(value) for value in LAST_OLLAMA_PLAN_DIAGNOSTICS.get('review_selected_action_ids', [])]
-        review_seconds = float(LAST_OLLAMA_PLAN_DIAGNOSTICS.get('review_seconds', 0) or 0)
-        review_error = str(LAST_OLLAMA_PLAN_DIAGNOSTICS.get('review_error', '') or '')
-        review_reasoning = str(LAST_OLLAMA_PLAN_DIAGNOSTICS.get('review_reasoning', '') or '')[:500]
+        endpoint = str(LAST_AI_PLAN_DIAGNOSTICS.get('endpoint', 'unknown'))
+        context_bytes = int(LAST_AI_PLAN_DIAGNOSTICS.get('context_bytes', 0) or 0)
+        planner_seconds = float(LAST_AI_PLAN_DIAGNOSTICS.get('seconds', 0) or 0)
+        candidate_count = int(LAST_AI_PLAN_DIAGNOSTICS.get('candidate_count', 0) or 0)
+        selected_ids = [str(value) for value in LAST_AI_PLAN_DIAGNOSTICS.get('selected_action_ids', [])]
+        review_selected_ids = [str(value) for value in LAST_AI_PLAN_DIAGNOSTICS.get('review_selected_action_ids', [])]
+        review_seconds = float(LAST_AI_PLAN_DIAGNOSTICS.get('review_seconds', 0) or 0)
+        review_error = str(LAST_AI_PLAN_DIAGNOSTICS.get('review_error', '') or '')
+        review_reasoning = str(LAST_AI_PLAN_DIAGNOSTICS.get('review_reasoning', '') or '')[:500]
         if not plan and (not finished) and eligible:
             finished = True
             summary = (summary + ' No action was selected; the planner ended the round without forcing a checklist.').strip()
@@ -1549,8 +1559,8 @@ def planner_node(state: AgentState) -> dict[str, Any]:
         provider_name = str(state.get('ai_provider') or 'ollama')
         print(f'\n[*] AI plan round {round_number} [{provider_name}] via {endpoint} (context={context_bytes} bytes; candidates={candidate_count}; selected={len(selected_ids)}{review_note}; {planner_seconds:.1f}s): {summary}', flush=True)
     except Exception as exc:
-        endpoint = str(LAST_OLLAMA_PLAN_DIAGNOSTICS.get('endpoint', 'unavailable'))
-        context_bytes = int(LAST_OLLAMA_PLAN_DIAGNOSTICS.get('context_bytes', 0) or 0)
+        endpoint = str(LAST_AI_PLAN_DIAGNOSTICS.get('endpoint', 'unavailable'))
+        context_bytes = int(LAST_AI_PLAN_DIAGNOSTICS.get('context_bytes', 0) or 0)
         if state.get('require_ai'):
             raise RuntimeError(f'Strict agentic mode requires a successful AI plan: {type(exc).__name__}: {exc}') from exc
         plan = _fallback_plan(state, eligible, budget)
@@ -1717,7 +1727,7 @@ def executor_node(state: AgentState) -> dict[str, Any]:
         print('\n[*] Discovery enrichment stage: FFUF runs before ZAP/Nuclei.', flush=True)
         ffuf_executed = asyncio.run(execute_plan(discovery_stage, cookies, discovery, allow_state_changes=state.get('allow_state_changes', False), secondary_cookies=state.get('secondary_cookies', '')))
         new_attack_surface += _record_execution_batch(ffuf_executed, state=state, results=results, discovery=discovery, completed=completed, profile_cookies=profile_cookies)
-        print('[*] FFUF enrichment is available to planned ZAP/Nuclei actions; new parameter candidates will be offered to Ollama next round.', flush=True)
+        print('[*] FFUF enrichment is available to planned ZAP/Nuclei actions; new parameter candidates will be offered to the AI planner next round.', flush=True)
     if remaining_stage:
         executed = asyncio.run(execute_plan(remaining_stage, cookies, discovery, allow_state_changes=state.get('allow_state_changes', False), secondary_cookies=state.get('secondary_cookies', '')))
         new_attack_surface += _record_execution_batch(executed, state=state, results=results, discovery=discovery, completed=completed, profile_cookies=profile_cookies)
