@@ -330,9 +330,8 @@ def warm_ollama_model(ollama_url: str, model: str, *, timeout: int) -> dict[str,
     return {'ready': True, 'response': content[:80], 'seconds': round(time.monotonic() - started, 2)}
 
 
-# Reuses the professor-provided Snap4City TokenManager and preserves its authentication order.
-# When the credentials file still contains placeholders, cached access/refresh tokens are tried
-# first; interactive username/password entry is only the final fallback for this process.
+# When the credentials file still contains placeholders, cached access/refresh tokens are tried first;
+# interactive username/password entry is only the final fallback for this process.
 def _snap4city_token_manager(credentials_path: str) -> Any:
     path = str(Path(credentials_path).expanduser().resolve())
     cached = _SNAP4CITY_TOKEN_MANAGERS.get(path)
@@ -357,27 +356,19 @@ def _snap4city_token_manager(credentials_path: str) -> Any:
         or username.upper() == 'SNAP4CITY_USERNAME'
         or password.upper() in {'PASSWORD', 'SNAP4CITY_PASSWORD'}
     )
-
-    # Construct TokenManager before prompting so its original load_token_data() can reuse
-    # token_stored.json exactly as supplied by the professor. Real file credentials are passed
-    # through unchanged; placeholders are withheld so they can never be sent to the token endpoint.
     manager = TokenManager('' if placeholders else username, '' if placeholders else password)
 
     if not placeholders:
-        # From here manager.get_token() keeps the original order unchanged:
         # valid access token -> refresh token -> username/password.
         _SNAP4CITY_TOKEN_MANAGERS[path] = manager
         return manager
 
-    # With placeholder credentials, first honor a still-valid cached access token.
+    # With placeholder credentials first honor a still-valid cached access token.
     if manager.token and time.time() < manager.token_expiry:
         print('[*] Snap4City: using the valid cached access token from token_stored.json.', flush=True)
         _SNAP4CITY_TOKEN_MANAGERS[path] = manager
         return manager
 
-    # If the cached access token expired, try the professor TokenManager's refresh-token request
-    # before asking the operator for credentials. A failed refresh is consumed here so get_token()
-    # will not repeat the same failed refresh after interactive credentials are supplied.
     refresh_error = ''
     if manager.refresh_token:
         try:
@@ -413,8 +404,7 @@ def _snap4city_token_manager(credentials_path: str) -> Any:
     if not username or not password:
         raise RuntimeError('Snap4City username and password are required.')
 
-    # Keep interactive credentials only in this TokenManager instance. They are not written back
-    # to user_credentials.json; get_token() will now use its normal username/password final step.
+    # Keep interactive credentials only in this TokenManager instance.
     manager.username = username
     manager.password = password
     _SNAP4CITY_TOKEN_MANAGERS[path] = manager
