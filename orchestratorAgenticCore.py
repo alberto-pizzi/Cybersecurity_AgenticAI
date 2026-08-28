@@ -1529,9 +1529,9 @@ def planner_node(state: AgentState) -> dict[str, Any]:
     fallback_reason = ''
     try:
         decision = ai_plan(state)
-        ai_plan = validate_plan(state, decision.get('actions', []))
-        ai_selected_count = len(ai_plan)
-        plan = _merge_ai_actions([], ai_plan, budget=budget)
+        validated_plan = validate_plan(state, decision.get('actions', []))
+        ai_selected_count = len(validated_plan)
+        plan = _merge_ai_actions([], validated_plan, budget=budget)
         summary = str(decision.get('reasoning_summary', ''))[:1000]
         finished = bool(decision.get('finish', False)) and (not plan)
         endpoint = str(LAST_AI_PLAN_DIAGNOSTICS.get('endpoint', 'unknown'))
