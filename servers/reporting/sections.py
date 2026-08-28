@@ -12,7 +12,8 @@ from typing import Any
 from urllib.parse import urlparse
 
 from .charts import _render_pipeline_diagram, _svg_severity_chart
-from .constants import AUTHORS, CLIENT_NAME, METHODOLOGY_PHASES, REPORT_CLASSIFICATION, REPORT_TITLE, REPORT_VERSION, SEVERITY_DEFINITIONS, TOOL_PURPOSES
+from .constants import AUTHORS, CLIENT_NAME, METHODOLOGY_PHASES, REPORT_CLASSIFICATION, REPORT_TITLE, REPORT_VERSION, \
+    SEVERITY_DEFINITIONS, TOOL_PURPOSES, AI_SUFFIX
 from .fields import _field, _render_list
 from .findings import _finding_family
 from .text_utils import _esc
@@ -211,11 +212,10 @@ def _render_severity_legend(toc: list[tuple[int, str, str]], context_value: dict
     ai_assessment = context_value.get("ai_analysis", {}) if isinstance(context_value, dict) else {}
     assessed = int(ai_assessment.get("analyzed_findings", 0) or 0) if isinstance(ai_assessment, dict) else 0
     if assessed:
-        # FIXME edit text
         methodology = (
             '<p class="section-note">For this agentic run, severity, description, security impact and recommended '
             'remediation are independently post-assessed by Ollama from the scanner/verifier evidence; each is marked '
-            '“(AI-reviewed)” in the finding below. The original scanner severity and, where the AI rewrote them, the '
+            f'“{AI_SUFFIX}” in the finding below. The original scanner severity and, where the AI rewrote them, the '
             'original scanner description/impact/remediation are preserved and shown in the Original scanner assessment '
             '(secondary audit) box. The AI cannot alter the finding category, verification status, tested request or '
             'evidence, so confirmation remains controlled by deterministic tool-specific rules. The definitions below '

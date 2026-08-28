@@ -87,3 +87,5 @@ FINDING_SECTION_META = {
         "Reachable paths and parameters retained to explain coverage and guide further testing; these entries are not vulnerabilities.",
     ),
 }
+
+AI_SUFFIX = "(AI-generated)"

@@ -7,7 +7,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from .constants import FINDING_SECTION_META
+from .constants import FINDING_SECTION_META, AI_SUFFIX
 from .fields import _field, _render_list, _snippet_field
 from .text_utils import _esc
 from .toc import _heading
@@ -15,13 +15,23 @@ from .toc import _heading
 # Renders a single finding as its full <article> card (fields, snippets, references)
 def _finding_card(item: dict[str, Any], index: int, toc: list[tuple[int, str, str]]) -> str:
     notes = item.get("data_quality_notes") or []
+    ai_analysis = item.get("ai_analysis") if isinstance(item.get("ai_analysis"), dict) else {}
+    narrative_fallbacks = set(ai_analysis.get("narrative_fallbacks") or []) if ai_analysis else set()
+
+    # Marks a field "AI_SUFFIX" only when the AI actually supplied its own
+    # wording for it; a field that fell back to the scanner's original text
+    # (narrative_fallbacks) is not AI-authored and stays unmarked.
+    def _ai_suffix(field_key: str) -> str:
+        if not ai_analysis or field_key in narrative_fallbacks:
+            return ""
+        return f" {AI_SUFFIX}"
+
     heading = _heading(
         3, f"{index}. {item['alert']}", toc,
         in_toc=False,  # one h3 per finding: too many to list in the index (LaTeX \subsection* equivalent)
         anchor=f"finding-{index}",
-        extra=f' <span>{_esc(item["risk"]).upper()}</span>',
+        extra=f' <span>{_esc(item["risk"]).upper()}{_ai_suffix("risk")}</span>',
     )
-    ai_analysis = item.get("ai_analysis") if isinstance(item.get("ai_analysis"), dict) else {}
     ai_block = ""
     scanner_block = ""
     if ai_analysis:
@@ -52,7 +62,7 @@ def _finding_card(item: dict[str, Any], index: int, toc: list[tuple[int, str, st
 {heading}
 <div class="badges">
 <b><span class="cat">Status</span><span class="val">{_esc(item['verification_status'])}</span></b>
-<b><span class="cat">Tool Confidence</span><span class="val">{_esc(item['confidence'])}</span></b>
+<b><span class="cat">Tool confidence</span><span class="val">{_esc(item['confidence'])}</span></b>
 <b><span class="cat">Profiles</span><span class="val">{_esc(', '.join(item.get('profiles') or [item['profile']]))}</span></b>
 <b><span class="cat">Tool</span><span class="val">{_esc(item['tool'])}</span></b>
 </div>
@@ -60,15 +70,15 @@ def _finding_card(item: dict[str, Any], index: int, toc: list[tuple[int, str, st
 {_field('Affected URL', item.get('url'))}
 {_field('HTTP method', item.get('method'))}
 {_field('Parameter', item.get('parameter'))}
-{_field('Description', item.get('description'))}
+{_field('Description' + _ai_suffix('description'), item.get('description'))}
 {_field('Why the evidence confirms or suggests the issue', item.get('technical_details'))}
 {_field('Attack preconditions', item.get('attack_preconditions'))}
 </dl>
 {_snippet_field('Payload / test input', item.get('payload') or '; '.join(item.get('payloads') or []))}
 {_snippet_field('Evidence', item.get('evidence'))}
 <dl>
-{_field('Security impact', item.get('impact'))}
-{_field('Recommended remediation', item.get('solution'))}
+{_field('Security impact' + _ai_suffix('impact'), item.get('impact'))}
+{_field('Recommended remediation' + _ai_suffix('solution'), item.get('solution'))}
 </dl>
 {_snippet_field('Reproduction / validation steps', item.get('reproduction'))}
 <dl>
