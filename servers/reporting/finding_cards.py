@@ -23,27 +23,36 @@ def _finding_card(item: dict[str, Any], index: int, toc: list[tuple[int, str, st
     )
     ai_analysis = item.get("ai_analysis") if isinstance(item.get("ai_analysis"), dict) else {}
     ai_block = ""
+    scanner_block = ""
     if ai_analysis:
-        original_risk = ai_analysis.get("scanner_risk") or item.get("scanner_risk") or "not supplied"
+        # Only the AI's own output belongs under "Agentic risk assessment";
+        # the scanner's original values are audit reference data, not an AI
+        # finding, so they get their own separate box below.
         ai_rows = (
-            _field('Original scanner severity', str(original_risk).upper())
-            + _field('AI assessment confidence', ai_analysis.get('analysis_confidence'))
+            _field('AI assessment confidence', ai_analysis.get('analysis_confidence'))
             + _field('AI severity rationale', ai_analysis.get('rationale'))
             + _field('Assessment model', ai_analysis.get('model'))
         )
-        if item.get('scanner_description') and item.get('scanner_description') != item.get('description'):
-            ai_rows += _field('Scanner description', item.get('scanner_description'))
-        if item.get('scanner_impact') and item.get('scanner_impact') != item.get('impact'):
-            ai_rows += _field('Scanner security impact', item.get('scanner_impact'))
-        if item.get('scanner_solution') and item.get('scanner_solution') != item.get('solution'):
-            ai_rows += _field('Scanner recommended remediation', item.get('scanner_solution'))
         ai_block = f'<div class="quality"><b class="quality-title">Agentic risk assessment</b><dl>{ai_rows}</dl></div>'
+
+        original_risk = ai_analysis.get("scanner_risk") or item.get("scanner_risk") or "not supplied"
+        scanner_rows = (
+            _field('Original scanner severity', str(original_risk).upper())
+            + _field('Original scanner confidence', ai_analysis.get('scanner_confidence') or item.get('scanner_confidence'))
+        )
+        if item.get('scanner_description') and item.get('scanner_description') != item.get('description'):
+            scanner_rows += _field('Scanner description', item.get('scanner_description'))
+        if item.get('scanner_impact') and item.get('scanner_impact') != item.get('impact'):
+            scanner_rows += _field('Scanner security impact', item.get('scanner_impact'))
+        if item.get('scanner_solution') and item.get('scanner_solution') != item.get('solution'):
+            scanner_rows += _field('Scanner recommended remediation', item.get('scanner_solution'))
+        scanner_block = f'<div class="scanner-original"><b class="quality-title">Original scanner assessment <span>(secondary audit)</span></b><dl>{scanner_rows}</dl></div>'
     return f"""
 <article class="finding risk-{_esc(item['risk'])}">
 {heading}
 <div class="badges">
 <b><span class="cat">Status</span><span class="val">{_esc(item['verification_status'])}</span></b>
-<b><span class="cat">Confidence</span><span class="val">{_esc(item['confidence'])}</span></b>
+<b><span class="cat">Tool Confidence</span><span class="val">{_esc(item['confidence'])}</span></b>
 <b><span class="cat">Profiles</span><span class="val">{_esc(', '.join(item.get('profiles') or [item['profile']]))}</span></b>
 <b><span class="cat">Tool</span><span class="val">{_esc(item['tool'])}</span></b>
 </div>
@@ -68,6 +77,7 @@ def _finding_card(item: dict[str, Any], index: int, toc: list[tuple[int, str, st
 {('<p class="field-label">Identifiers</p>' + _render_list(item.get('identifiers') or [])) if item.get('identifiers') else ''}
 {('<p class="field-label">References</p>' + _render_list(item.get('references') or [])) if item.get('references') else ''}
 {ai_block}
+{scanner_block}
 {('<div class="quality"><b>Data-quality notes</b>' + _render_list(notes) + '</div>') if notes else ''}
 </article>"""
 

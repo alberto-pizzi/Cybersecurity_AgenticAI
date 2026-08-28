@@ -211,11 +211,18 @@ def _render_severity_legend(toc: list[tuple[int, str, str]], context_value: dict
     ai_assessment = context_value.get("ai_analysis", {}) if isinstance(context_value, dict) else {}
     assessed = int(ai_assessment.get("analyzed_findings", 0) or 0) if isinstance(ai_assessment, dict) else 0
     if assessed:
+        # FIXME edit text
         methodology = (
-            '<p class="section-note">For this agentic run, severity is independently post-assessed by Ollama from the '
-            'scanner/verifier evidence. The original scanner severity is preserved with each enriched finding. The AI '
-            'cannot alter the finding category, verification status, tested request or evidence, so confirmation remains '
-            'controlled by deterministic tool-specific rules. The definitions below guide the AI risk classification.</p>'
+            '<p class="section-note">For this agentic run, severity, description, security impact and recommended '
+            'remediation are independently post-assessed by Ollama from the scanner/verifier evidence; each is marked '
+            '“(AI-reviewed)” in the finding below. The original scanner severity and, where the AI rewrote them, the '
+            'original scanner description/impact/remediation are preserved and shown in the Original scanner assessment '
+            '(secondary audit) box. The AI cannot alter the finding category, verification status, tested request or '
+            'evidence, so confirmation remains controlled by deterministic tool-specific rules. The definitions below '
+            'guide the AI risk classification. Each finding also carries two distinct confidence values: “Tool '
+            'confidence” in the badge row is the scanner/verifier\'s own confidence in the evidence rule that confirmed '
+            'it, while “AI assessment confidence” inside the Agentic risk assessment box is the AI\'s confidence in its '
+            'own independent severity judgement - the two are not interchangeable.</p>'
         )
     else:
         methodology = (

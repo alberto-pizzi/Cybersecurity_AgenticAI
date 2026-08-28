@@ -35,7 +35,7 @@ th{background:#24476b;color:white;position:sticky;top:0;white-space:nowrap}
 .idx{white-space:nowrap;width:1%;text-align:center}
 small{color:#4f6273}.finding{border-left:7px solid #4b86b4}
 .risk-critical,.risk-high{border-left-color:#a90000}.risk-medium{border-left-color:#d98200}.risk-low{border-left-color:#b49b00}
-.badges{display: flex;flex-wrap: wrap;gap: 6px;justify-content: center;align-items: center;}
+.badges{display: flex;flex-wrap: wrap;gap: 6px;justify-content: center;align-items: center;margin-bottom: 15px}
 .badges b{display: inline-flex;align-items: stretch;overflow: hidden;border-radius: 12px;font-size: .82rem;font-weight: normal;box-shadow: 0 0 0 1px #d3dde5;margin: 5px}
 .badges .cat{background: #3b5b7a;color: #fff;font-weight: 600;padding: 4px 8px;text-transform: uppercase;letter-spacing: .03em;font-size: .72rem;display: flex;align-items: center;}
 .badges .val {background: #e8eef4;color: #1f2d3a;padding: 4px 8px;display: flex;align-items: center;}
@@ -45,6 +45,8 @@ dd{margin:0;overflow-wrap:anywhere;word-break:break-word;min-width:0}
 pre{white-space:pre-wrap;overflow-wrap:anywhere;word-break:break-word;background:#101821;color:#e5edf5;padding:12px;border-radius:8px}
 .quality{background:#fff8dc;border:1px solid #e1cb73;padding:10px;border-radius:8px}
 .quality-title{display:block;color:#173b5e;margin: 5px 0 15px 5px}
+.scanner-original{background:#f6f8fa;border:1px solid #d7dee5;border-left:4px solid #98a7b5;padding:10px;border-radius:8px;margin-top:12px}
+.scanner-original .quality-title span{font-weight:400;color:#4f6273;font-size:.85rem}
 details{margin-top:14px}.section-note{background:#eaf1f7;border-left:4px solid #527ca3;padding:10px}
 .count{font-size:.85rem;background:#dce8f3;border-radius:12px;padding:3px 8px}
 .toc a{color: black;text-decoration: none;}
