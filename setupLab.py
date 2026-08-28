@@ -512,10 +512,17 @@ def _ollama_model_available(model: str) -> bool:
         pass
     return False
 
-# Starts the bundled DVWA, ZAP, and Ollama services and prepares a session.
-def setup_local_lab(model: str) -> str:
+# Starts the bundled DVWA/ZAP lab and, when requested, provisions one or more Ollama models.
+def setup_local_lab(models: str | list[str] | tuple[str, ...] | None = None) -> str:
     if not shutil.which("docker"):
         raise RuntimeError("Docker Desktop/Engine is required for --with-lab.")
+
+    if isinstance(models, str):
+        requested_models = [models] if models.strip() else []
+    else:
+        requested_models = [str(model).strip() for model in (models or []) if str(model).strip()]
+    requested_models = list(dict.fromkeys(requested_models))
+
     run(["docker", "info"], timeout=60)
     ensure_network(LOCAL_LAB_NETWORK)
 
@@ -527,7 +534,8 @@ def setup_local_lab(model: str) -> str:
     _ensure_local_docker_image(LOCAL_LAB_IMAGE, dvwa_platform)
     _ensure_local_docker_image("zaproxy/zap-stable")
     _ensure_local_docker_image(NIKTO_DOCKER_IMAGE)
-    _ensure_local_docker_image("ollama/ollama")
+    if requested_models:
+        _ensure_local_docker_image("ollama/ollama")
 
     dvwa_options = ["--platform", dvwa_platform] if dvwa_platform else []
     ensure_container(
@@ -549,15 +557,21 @@ def setup_local_lab(model: str) -> str:
     except Exception as exc:
         print(f"[!] Could not read ZAP version: {type(exc).__name__}: {exc}")
 
-    ensure_container(
-        "ollama_secops", "ollama/ollama", {"11434/tcp": "11434"}, "http://127.0.0.1:11434/api/tags",
-        run_options=["-v", "ollama_secops:/root/.ollama"], attempts=120,
-    )
-    if apple_silicon:
-        print("[!] Ollama is running in Docker on Apple Silicon and may use CPU emulation. A native Ollama service can be faster.")
-    if _ollama_model_available(model):
-        print(f"[+] Ollama model already available; pull skipped: {model}")
+    if requested_models:
+        ensure_container(
+            "ollama_secops", "ollama/ollama", {"11434/tcp": "11434"}, "http://127.0.0.1:11434/api/tags",
+            run_options=["-v", "ollama_secops:/root/.ollama"], attempts=120,
+        )
+        if apple_silicon:
+            print("[!] Ollama is running in Docker on Apple Silicon and may use CPU emulation. A native Ollama service can be faster.")
+        for model in requested_models:
+            if _ollama_model_available(model):
+                print(f"[+] Ollama model already available; pull skipped: {model}")
+            else:
+                print(f"[*] Pulling Ollama model: {model}")
+                run(["docker", "exec", "ollama_secops", "ollama", "pull", model], timeout=7200)
     else:
-        run(["docker", "exec", "ollama_secops", "ollama", "pull", model], timeout=7200)
+        print("[*] No local Ollama model requested; DVWA/ZAP lab prepared without provisioning or starting an Ollama container.")
+
     return create_local_lab_session()
 

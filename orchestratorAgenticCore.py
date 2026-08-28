@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import getpass
 import json
 import re
 import platform
@@ -29,6 +30,11 @@ from orchestratorShared import (
 )
 
 REGISTRY: dict[str, tuple[str, str, str, str]] = {}
+OLLAMA_DEFAULT_MODEL = 'llama3.1:8b'
+OLLAMA_QWEN_MODEL = 'qwen2.5:7b'
+SNAP4CITY_DEFAULT_API_URL = 'https://www.snap4city.org/apis/llama4-agentic-inference'
+SNAP4CITY_DEFAULT_MODEL = 'llama4-agentic-inference'
+_SNAP4CITY_TOKEN_MANAGERS: dict[str, Any] = {}
 
 
 # Stores the state exchanged between the agentic workflow steps.
@@ -41,7 +47,10 @@ class AgentState(TypedDict):
     results: dict[str, dict[str, Any]]
     round: int
     max_rounds: int
+    ai_provider: str
     ollama_url: str
+    snap4city_api_url: str
+    snap4city_credentials: str
     model: str
     injection_url: str
     notes: list[str]
@@ -57,7 +66,7 @@ class AgentState(TypedDict):
     analysis: dict[str, Any]
     only_tool: str
 AI_PLANNER_TIMEOUTS = {'fast': 300, 'balanced': 480, 'deep': 720}
-AI_PLANNER_MAX_PREDICT = {'fast': 700, 'balanced': 1000, 'deep': 1400}
+AI_PLANNER_MAX_PREDICT = {'fast': 300, 'balanced': 450, 'deep': 650}
 AI_PLANNER_CONTEXT_WINDOWS = {'fast': 4096, 'balanced': 6144, 'deep': 8192}
 AI_ANALYSIS_BATCH_TIMEOUTS = {'fast': 150, 'balanced': 210, 'deep': 270}
 AI_ANALYSIS_BATCH_SIZES = {'fast': 1, 'balanced': 3, 'deep': 4}
@@ -102,6 +111,28 @@ ANALYSIS_SCHEMA = {
     },
     'required': ['analyses'],
 }
+
+
+# Resolves user-friendly model aliases into the concrete provider/model pair.
+# Provider=auto never sends data to Snap4City unless the selected model explicitly names Snap4City.
+def resolve_ai_model(requested_model: str) -> tuple[str, str, dict[str, Any]]:
+    choice = str(requested_model or 'snap4city').strip().lower()
+    supported = {
+        'snap4city': ('snap4city', SNAP4CITY_DEFAULT_MODEL),
+        'llama': ('ollama', OLLAMA_DEFAULT_MODEL),
+        'qwen': ('ollama', OLLAMA_QWEN_MODEL),
+    }
+    if choice not in supported:
+        raise ValueError(
+            f"Unsupported AI model '{requested_model}'. Choose one of: snap4city, llama, qwen."
+        )
+    provider, model = supported[choice]
+    return provider, model, {
+        'requested_model': choice,
+        'selected_provider': provider,
+        'selected_model': model,
+        'selection_source': 'model_choice',
+    }
 
 
 # Turns an Ollama error response into a readable message.
@@ -171,18 +202,34 @@ def ensure_ollama_model(ollama_url: str, requested_model: str, *, allow_pull: bo
         except Exception as exc:
             pull_error = f'{type(exc).__name__}: {exc}'
     diagnostics['model_pull_error'] = pull_error
-    if installed:
-        selected = installed[0]
-        diagnostics.update(model_ready=True, selected_model=selected, fallback_model_used=True, fallback_reason=pull_error or 'Requested model is absent and automatic pulling was disabled.')
-        return (selected, diagnostics)
+    # If the requested local model cannot be used, fall back only to the other
+    # explicitly supported local planner model rather than to an arbitrary installed tag.
+    supported_fallbacks = [OLLAMA_DEFAULT_MODEL, OLLAMA_QWEN_MODEL]
+    for preferred in supported_fallbacks:
+        if _model_matches(requested_model, preferred):
+            continue
+        selected = next((name for name in installed if _model_matches(preferred, name)), '')
+        if selected:
+            diagnostics.update(
+                model_ready=True, selected_model=selected, fallback_model_used=True,
+                fallback_reason=pull_error or f"Requested model '{requested_model}' is unavailable; selected supported local fallback '{selected}'.",
+            )
+            return (selected, diagnostics)
     diagnostics.update(model_ready=False, selected_model='')
     raise RuntimeError('Ollama is reachable but no usable local model exists. ' + (pull_error or f"Requested model '{requested_model}' is not installed."))
 
-# Plan parsing accepts only the compact ID-selection contract used by the local model.
+# Plan parsing accepts only the compact ID-selection contract used by the selected AI provider.
 def _parse_ollama_plan_content(content: str) -> dict[str, Any]:
-    value = json.loads(str(content or ''))
+    raw = str(content or '').strip()
+    if raw.startswith('```'):
+        raw = re.sub(r'^```(?:json)?\s*', '', raw, flags=re.IGNORECASE)
+        raw = re.sub(r'\s*```$', '', raw)
+    first, last = raw.find('{'), raw.rfind('}')
+    if first >= 0 and last > first:
+        raw = raw[first:last + 1]
+    value = json.loads(raw)
     if not isinstance(value, dict) or not isinstance(value.get('selected_action_ids', []), list):
-        raise ValueError('Ollama returned an invalid compact plan object.')
+        raise ValueError('AI provider returned an invalid compact plan object.')
     return value
 
 
@@ -282,6 +329,195 @@ def warm_ollama_model(ollama_url: str, model: str, *, timeout: int) -> dict[str,
     content = _ollama_stream_content(f"{ollama_url.rstrip('/')}/api/generate", {'model': model, 'prompt': 'Reply with READY and nothing else.', 'options': {'temperature': 0, 'num_predict': 4, 'num_ctx': 2048}, 'keep_alive': '30m'}, response_kind='generate', total_timeout=max(90, min(int(timeout), 600)))
     return {'ready': True, 'response': content[:80], 'seconds': round(time.monotonic() - started, 2)}
 
+
+# Reuses the professor-provided Snap4City TokenManager and preserves its authentication order.
+# When the credentials file still contains placeholders, cached access/refresh tokens are tried
+# first; interactive username/password entry is only the final fallback for this process.
+def _snap4city_token_manager(credentials_path: str) -> Any:
+    path = str(Path(credentials_path).expanduser().resolve())
+    cached = _SNAP4CITY_TOKEN_MANAGERS.get(path)
+    if cached is not None:
+        return cached
+    try:
+        from token_manager import TokenManager
+    except ImportError as exc:
+        raise RuntimeError('Snap4City requires token_manager.py in the project root.') from exc
+    try:
+        payload = json.loads(Path(path).read_text(encoding='utf-8'))
+    except FileNotFoundError:
+        payload = {}
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f'Snap4City credentials file is not valid JSON: {path}') from exc
+
+    username = str(payload.get('username') or '').strip()
+    password = str(payload.get('password') or '').strip()
+    placeholders = (
+        not username or not password
+        or username.startswith('<') or password.startswith('<')
+        or username.upper() == 'SNAP4CITY_USERNAME'
+        or password.upper() in {'PASSWORD', 'SNAP4CITY_PASSWORD'}
+    )
+
+    # Construct TokenManager before prompting so its original load_token_data() can reuse
+    # token_stored.json exactly as supplied by the professor. Real file credentials are passed
+    # through unchanged; placeholders are withheld so they can never be sent to the token endpoint.
+    manager = TokenManager('' if placeholders else username, '' if placeholders else password)
+
+    if not placeholders:
+        # From here manager.get_token() keeps the original order unchanged:
+        # valid access token -> refresh token -> username/password.
+        _SNAP4CITY_TOKEN_MANAGERS[path] = manager
+        return manager
+
+    # With placeholder credentials, first honor a still-valid cached access token.
+    if manager.token and time.time() < manager.token_expiry:
+        print('[*] Snap4City: using the valid cached access token from token_stored.json.', flush=True)
+        _SNAP4CITY_TOKEN_MANAGERS[path] = manager
+        return manager
+
+    # If the cached access token expired, try the professor TokenManager's refresh-token request
+    # before asking the operator for credentials. A failed refresh is consumed here so get_token()
+    # will not repeat the same failed refresh after interactive credentials are supplied.
+    refresh_error = ''
+    if manager.refresh_token:
+        try:
+            print('[*] Snap4City: cached access token is unavailable/expired; trying refresh token.', flush=True)
+            token_data = manager.get_token_via_refresh_token(manager.refresh_token)
+            if token_data and 'access_token' in token_data:
+                manager.save_token_data(token_data)
+                print('[+] Snap4City: access token refreshed successfully; interactive credentials are not required.', flush=True)
+                _SNAP4CITY_TOKEN_MANAGERS[path] = manager
+                return manager
+            refresh_error = 'refresh-token response did not contain access_token'
+        except Exception as exc:
+            refresh_error = f'{type(exc).__name__}: {exc}'
+        manager.refresh_token = None
+
+    if not sys.stdin or not sys.stdin.isatty():
+        detail = f' Refresh attempt: {refresh_error}.' if refresh_error else ''
+        raise RuntimeError(
+            f'Snap4City has no usable cached token and credentials are missing/placeholders in {path}; '
+            f'no interactive console is available.{detail}'
+        )
+
+    print(
+        f"[*] Snap4City has no usable cached token and credentials are missing/placeholders in {path}; "
+        'enter them for this run.',
+        flush=True,
+    )
+    try:
+        username = input('Snap4City username: ').strip()
+        password = getpass.getpass('Snap4City password: ').strip()
+    except (EOFError, KeyboardInterrupt) as exc:
+        raise RuntimeError('Snap4City credential entry was cancelled.') from exc
+    if not username or not password:
+        raise RuntimeError('Snap4City username and password are required.')
+
+    # Keep interactive credentials only in this TokenManager instance. They are not written back
+    # to user_credentials.json; get_token() will now use its normal username/password final step.
+    manager.username = username
+    manager.password = password
+    _SNAP4CITY_TOKEN_MANAGERS[path] = manager
+    return manager
+
+
+# Calls the Snap4City/ClearML endpoint in its documented OpenAI-compatible chat mode.
+def _snap4city_chat_content(
+    state: AgentState,
+    system_message: str,
+    user_content: str,
+    *,
+    total_timeout: int,
+    temperature: float=0.0,
+) -> str:
+    manager = _snap4city_token_manager(state['snap4city_credentials'])
+    access_token = manager.get_token()
+    body = {
+        'access_token': access_token,
+        'endpoint': state['model'],
+        'params': {
+            'messages': [
+                {'role': 'system', 'content': system_message},
+                {'role': 'user', 'content': user_content},
+            ],
+            # An empty tools array plus tool_choice=none enables the documented
+            # OpenAI-compatible response envelope without asking the model to call tools.
+            'tools': [],
+            'tool_choice': 'none',
+            'temperature': temperature,
+        },
+    }
+    headers = {
+        'Accept': 'application/json',
+        'Content-Type': 'application/json',
+        'Authorization': f'Bearer {access_token}',
+    }
+    response = requests.post(
+        state['snap4city_api_url'],
+        json=body,
+        headers=headers,
+        timeout=(10, max(20, int(total_timeout))),
+    )
+    if response.status_code >= 400:
+        detail = (response.text or response.reason or 'unknown Snap4City error').strip()
+        try:
+            parsed_error = response.json()
+            if isinstance(parsed_error, dict):
+                detail = str(parsed_error.get('message') or parsed_error.get('detail') or parsed_error)
+        except ValueError:
+            pass
+        raise RuntimeError(f'HTTP {response.status_code}: {detail[:1000]}')
+    try:
+        payload = response.json()
+    except ValueError as exc:
+        raise ValueError('Snap4City returned a non-JSON response.') from exc
+    if isinstance(payload, dict) and payload.get('choices'):
+        choice = payload['choices'][0] if isinstance(payload['choices'], list) else {}
+        message = choice.get('message', {}) if isinstance(choice, dict) else {}
+        content = message.get('content') if isinstance(message, dict) else None
+        if isinstance(content, str) and content.strip():
+            return content.strip()
+    # Keep compatibility with the endpoint's documented legacy envelope, even
+    # though tools=[]/tool_choice=none should normally force the OpenAI envelope.
+    if isinstance(payload, dict) and isinstance(payload.get('answer'), str) and payload['answer'].strip():
+        return payload['answer'].strip()
+    if isinstance(payload, dict) and (payload.get('message') or payload.get('detail')):
+        raise RuntimeError(str(payload.get('message') or payload.get('detail')))
+    raise ValueError('Snap4City completed without returning assistant content.')
+
+
+# Authenticates and performs a minimal inference so --require-ai can fail before scanners start.
+def ensure_snap4city_model(
+    api_url: str,
+    requested_model: str,
+    credentials_path: str,
+    *,
+    timeout: int,
+) -> tuple[str, dict[str, Any]]:
+    selected = str(requested_model or SNAP4CITY_DEFAULT_MODEL).strip()
+    state: AgentState = {  # type: ignore[typeddict-item]
+        'ai_provider': 'snap4city',
+        'snap4city_api_url': str(api_url or SNAP4CITY_DEFAULT_API_URL).rstrip('/'),
+        'snap4city_credentials': credentials_path,
+        'model': selected,
+    }
+    started = time.monotonic()
+    content = _snap4city_chat_content(
+        state,
+        'This is a connectivity check. Follow the user instruction exactly.',
+        'Reply with READY and nothing else.',
+        total_timeout=max(45, min(int(timeout), 180)),
+    )
+    return selected, {
+        'provider': 'snap4city',
+        'model_ready': True,
+        'selected_model': selected,
+        'api_url': state['snap4city_api_url'],
+        'credentials_file': str(Path(credentials_path).expanduser()),
+        'warmup_response': content[:80],
+        'warmup_seconds': round(time.monotonic() - started, 2),
+    }
+
 # Builds a stable identifier for one planned action.
 def action_id(action: dict[str, Any]) -> str:
     return '|'.join((str(action.get(key, '')) for key in ('profile', 'tool', 'target_url', 'method', 'data', 'jwt_token', 'injection_url')))
@@ -302,7 +538,85 @@ def _humanize_planner_reasoning(value: Any) -> str:
     text = re.sub(r'\bredundant with actions already selected\b', 'overlap with actions already selected', text, flags=re.IGNORECASE)
     return re.sub(r'\s+', ' ', text).strip()
 
-# Asks Ollama for the next scan actions and returns a structured plan.
+def _planner_system_message() -> str:
+    # The professor-provided prompt uses explicit ROLE / constraints / definitions / output sections.
+    # Reuse that structure while keeping this planner task-specific and compact for local models.
+    return (
+        '[ROLE]\n'
+        'You are the autonomous planner for an explicitly authorized web-security assessment. '
+        'Choose the next safe scanner actions from discovery-derived candidate IDs.\n\n'
+        '[OBJECTIVE]\n'
+        'Maximize useful and complementary security evidence within the round action budget. '
+        'Do not execute tools yourself and do not invent endpoints, parameters, identities or candidate IDs.\n\n'
+        '[INPUT CONTRACT]\n'
+        'The user message is JSON containing target, round, scan mode, discovery summary, previous results, available tools and candidates. '
+        'Every candidate has already been derived from live discovery and will be validated again by Python.\n\n'
+        '[DECISION RULES]\n'
+        '- Evaluate every candidate before returning the plan.\n'
+        '- SELECT a safe candidate when it can add useful, complementary or independent evidence.\n'
+        '- DEFER only for a concrete reason: real duplication, already completed equivalent work, unsupported discovery, incompatible input, unsafe action, or clearly very low expected value.\n'
+        '- Broad scanners and targeted tools are complementary; neither category replaces the other by default.\n'
+        '- A confirmed finding does not stop exploration of unrelated attack surfaces.\n'
+        '- Use IDOR only for suitable numeric references, authorization only for read-only identity/object/resource signals, and Interactsh only for compatible OAST inputs.\n'
+        '- round_action_budget is a maximum, not a quota. Never add actions merely to reach a count.\n'
+        '- Set finish=true only when no remaining candidate is likely to add useful evidence.\n\n'
+        '[OUTPUT CONTRACT]\n'
+        'Return exactly one JSON object with these fields and no others: '
+        '{"reasoning_summary":"brief decision summary, not chain-of-thought","selected_action_ids":["candidate IDs"],"finish":false}. '
+        'reasoning_summary must be concise and must not reveal hidden chain-of-thought.\n\n'
+        '[FINAL INSTRUCTION]\n'
+        'Return only valid JSON. Re-check that every selected_action_id exists in candidates and that finish matches the remaining useful work.'
+    )
+
+
+def _planner_review_system_message() -> str:
+    return (
+        '[ROLE]\nYou are the breadth-review pass for an explicitly authorized web-security assessment.\n\n'
+        '[OBJECTIVE]\nReview only the candidates deferred by the first AI plan and add useful complementary actions that were missed.\n\n'
+        '[RULES]\n'
+        '- Evaluate every remaining candidate.\n'
+        '- ADD safe discovery-supported candidates that can provide useful, complementary or independent evidence.\n'
+        '- KEEP DEFERRED only for concrete duplication, completed equivalent work, unsupported discovery, incompatibility, unsafe action or clearly very low value.\n'
+        '- Broad scanners and targeted tools remain complementary; do not reject one category solely because the other was already selected.\n'
+        '- Do not repeat already_selected_action_ids and do not add actions merely to fill remaining slots.\n\n'
+        '[OUTPUT CONTRACT]\n'
+        'Return exactly one JSON object: {"reasoning_summary":"brief review summary","selected_action_ids":["remaining candidate IDs"],"finish":false}.\n\n'
+        '[FINAL INSTRUCTION]\nReturn only valid JSON.'
+    )
+
+
+def _analysis_system_message() -> str:
+    return (
+        '[ROLE]\n'
+        'You are the final evidence analyst for an explicitly authorized web-security assessment.\n\n'
+        '[IMMUTABLE FACTS]\n'
+        'Finding category, verification status, URL, parameter, payload and scanner/verifier evidence are facts supplied by the system. '
+        'Never upgrade a candidate into a confirmed vulnerability and never invent exploitation, stolen data, privileges or unsupported preconditions.\n\n'
+        '[RISK RULES]\n'
+        '- Choose risk independently as critical, high, medium, low or info; scanner_risk is input, not authority.\n'
+        '- Calibrate severity to demonstrated impact, not vulnerability class alone.\n'
+        '- CRITICAL is exceptional. A confirmed SQL injection alone is normally HIGH; reserve CRITICAL for evidence of system-wide compromise such as full data-store compromise, unauthenticated administrative takeover or remote code execution.\n'
+        '- Candidates must retain uncertainty and conservative severity.\n\n'
+        '[WRITING RULES]\n'
+        '- Analyze every supplied finding ID exactly once.\n'
+        '- Rewrite scanner narrative into stronger professional wording; do not merely repeat the alert title or verification label.\n'
+        '- Python preserves scanner wording as a safety net for empty or materially underdeveloped AI fields, so make each AI narrative field independently complete.\n'
+        '- Description: 2 concise sentences, first the weakness/affected input, then the concrete evidence.\n'
+        '- Impact: state demonstrated impact first; qualify additional realistic consequences as possible when not proven.\n'
+        '- Solution: give weakness-specific remediation and an appropriate regression/verification step; avoid generic filler such as "validate input" by itself.\n'
+        '- Preserve useful technical facts such as method, parameter, response differential, matcher, payload class, DBMS, browser execution or verifier result when supplied.\n'
+        '- Related findings may affect confidence or severity only when they clearly refer to the same weakness or attack chain.\n'
+        '- Use high for major demonstrated exploitable impact, medium for meaningful but constrained impact, low for limited impact and info for non-exploitable security context.\n'
+        '- Target roughly 30-55 words description, 18-35 impact, 25-50 solution and 8-20 rationale.\n\n'
+        '[OUTPUT CONTRACT]\n'
+        'Return exactly one JSON object with an analyses array. Each item must contain id, risk, description, impact, solution, rationale and confidence. '
+        'risk must be critical/high/medium/low/info and confidence high/medium/low.\n\n'
+        '[FINAL INSTRUCTION]\n'
+        'Return only valid JSON. Do not include chain-of-thought; rationale is a short evidence-based justification.'
+    )
+
+
+# Asks the selected AI provider for the next scan actions and returns a structured plan.
 def ollama_plan(state: AgentState) -> dict[str, Any]:
     eligible = _eligible_action_catalog(state)
     candidate_map = {f'A{index:03d}': action for index, action in enumerate(eligible, 1)}
@@ -323,35 +637,8 @@ def ollama_plan(state: AgentState) -> dict[str, Any]:
         'available_tools': registry,
         'candidates': candidates,
     }
-    system_message = (
-    'Plan an explicitly authorized web-security assessment using only candidate IDs supplied in the user context. '
-    'Each candidate is discovery-derived and will be validated again by Python. '
-
-    'Evaluate EVERY candidate before returning the plan. For each candidate decide SELECT or DEFER. '
-
-    'SELECT any safe, discovery-supported candidate that can provide useful or complementary security evidence. '
-    'A candidate does not need to be the single highest-value action. When uncertain about a safe and useful candidate, '
-    'prefer SELECT. '
-
-    'DEFER only for a concrete reason: genuine duplication of already selected/completed work, unsupported discovery, '
-    'unsafe or incompatible input, or clearly very low expected value. Do not keep the plan artificially small. '
-
-    'Broad scanners and targeted tools are complementary, not substitutes by default. FFUF, ZAP, Nuclei, session and '
-    'Nikto may provide evidence that SQLMap, Dalfox, Commix, traversal, browser, workflow or authorization do not, and '
-    'vice versa. Do not systematically prefer either category. '
-
-    'Use previous_results and the current candidate set to avoid real repetition. A confirmed finding must not stop exploration '
-    'of unrelated attack surfaces. '
-
-    'Use IDOR only for appropriate numeric references, authorization only for read-only identity/object/resource signals, '
-    'and Interactsh only for compatible OAST inputs. '
-
-    'round_action_budget is a maximum, not a quota. Do not select actions to satisfy a count or checklist, but do not '
-    'exclude useful candidates without a concrete reason. '
-
-    'Before returning, reconsider all deferred candidates once. Set finish=true only when no remaining candidate is likely '
-    'to add useful evidence. Keep reasoning_summary concise. Return only schema-valid JSON.'
-)
+    system_message = _planner_system_message()
+    provider = str(state.get('ai_provider') or 'ollama').lower()
     base = state['ollama_url'].rstrip('/')
     total_timeout = max(120, int(state.get('ai_timeout') or 480))
     max_predict = AI_PLANNER_MAX_PREDICT.get(shared.CURRENT_SCAN_MODE, 320)
@@ -370,22 +657,31 @@ def ollama_plan(state: AgentState) -> dict[str, Any]:
         'seconds': 0.0,
         'attempt_errors': [],
     })
-    attempts = [
-        ('chat', f'{base}/api/chat', {
-            'model': state['model'], 'format': PLAN_SCHEMA,
-            'messages': [{'role': 'system', 'content': system_message}, {'role': 'user', 'content': context}],
-            'options': common_options, 'keep_alive': '30m'}, max(90, int(total_timeout * 0.7))),
-        ('generate', f'{base}/api/generate', {
-            'model': state['model'], 'format': PLAN_SCHEMA,
-            'prompt': system_message + '\n\nAssessment context:\n' + context,
-            'options': common_options, 'keep_alive': '30m'}, max(90, int(total_timeout * 0.3))),
-    ]
+    if provider == 'snap4city':
+        attempts = [('snap4city', '', {}, total_timeout)]
+    else:
+        attempts = [
+            ('chat', f'{base}/api/chat', {
+                'model': state['model'], 'format': PLAN_SCHEMA,
+                'messages': [{'role': 'system', 'content': system_message}, {'role': 'user', 'content': context}],
+                'options': common_options, 'keep_alive': '30m'}, max(90, int(total_timeout * 0.7))),
+            ('generate', f'{base}/api/generate', {
+                'model': state['model'], 'format': PLAN_SCHEMA,
+                'prompt': system_message + '\n\nAssessment context:\n' + context,
+                'options': common_options, 'keep_alive': '30m'}, max(90, int(total_timeout * 0.3))),
+        ]
     errors: list[str] = []
     planning_started = time.monotonic()
     for kind, url, payload, budget in attempts:
         started = time.monotonic()
         try:
-            content = _ollama_stream_content(url, payload, response_kind=kind, total_timeout=budget, early_json=True)
+            if provider == 'snap4city':
+                content = _snap4city_chat_content(
+                    state, system_message, context,
+                    total_timeout=budget, temperature=0.0,
+                )
+            else:
+                content = _ollama_stream_content(url, payload, response_kind=kind, total_timeout=budget, early_json=True)
             compact_plan = _parse_ollama_plan_content(content)
             requested_ids = [str(value) for value in compact_plan.get('selected_action_ids', [])]
             selected_ids = []
@@ -439,42 +735,32 @@ def ollama_plan(state: AgentState) -> dict[str, Any]:
                     'remaining_candidates': remaining_candidates,
                     'previous_reasoning_summary': str(compact_plan.get('reasoning_summary') or '')[:240],
                 }
-                review_system_message = (
-                    'Review the candidates deferred by the first AI plan for an explicitly authorized web-security assessment. '
-
-                    'Evaluate EVERY remaining candidate. ADD any safe, discovery-supported candidate that can provide useful, '
-                    'complementary or independent security evidence. When uncertain about a safe and useful candidate, prefer ADD. '
-
-                    'KEEP DEFERRED only for a concrete reason: genuine duplication, already completed coverage, unsupported discovery, '
-                    'unsafe or incompatible input, or clearly very low expected value. '
-
-                    'Broad scanners and targeted tools are complementary, not substitutes by default. Do not reject a broad scanner '
-                    'simply because targeted tools were already selected, and do not add actions merely to satisfy coverage or a count. '
-
-                    'Do not repeat already_selected_action_ids. Select only IDs from remaining_candidates. '
-                    'It is valid to add zero actions only if every remaining candidate has a concrete defer reason. '
-
-                    'Keep reasoning_summary concise. Return only schema-valid JSON.'
-                )
+                review_system_message = _planner_review_system_message()
                 review_context = json.dumps(review_prompt, ensure_ascii=False, separators=(',', ':'))
                 review_started = time.monotonic()
                 try:
-                    review_content = _ollama_stream_content(
-                        f'{base}/api/chat',
-                        {
-                            'model': state['model'],
-                            'format': PLAN_SCHEMA,
-                            'messages': [
-                                {'role': 'system', 'content': review_system_message},
-                                {'role': 'user', 'content': review_context},
-                            ],
-                            'options': common_options,
-                            'keep_alive': '30m',
-                        },
-                        response_kind='chat',
-                        total_timeout=review_time_budget,
-                        early_json=True,
-                    )
+                    if provider == 'snap4city':
+                        review_content = _snap4city_chat_content(
+                            state, review_system_message, review_context,
+                            total_timeout=review_time_budget, temperature=0.0,
+                        )
+                    else:
+                        review_content = _ollama_stream_content(
+                            f'{base}/api/chat',
+                            {
+                                'model': state['model'],
+                                'format': PLAN_SCHEMA,
+                                'messages': [
+                                    {'role': 'system', 'content': review_system_message},
+                                    {'role': 'user', 'content': review_context},
+                                ],
+                                'options': common_options,
+                                'keep_alive': '30m',
+                            },
+                            response_kind='chat',
+                            total_timeout=review_time_budget,
+                            early_json=True,
+                        )
                     review_plan = _parse_ollama_plan_content(review_content)
                     review_reasoning = _humanize_planner_reasoning(review_plan.get('reasoning_summary'))[:500]
                     for candidate_id in [str(value) for value in review_plan.get('selected_action_ids', [])]:
@@ -527,7 +813,7 @@ def ollama_plan(state: AgentState) -> dict[str, Any]:
             })
     raise RuntimeError('; '.join(errors))
 
-# Removes reusable credentials from evidence before it is sent to the local analysis model.
+# Removes reusable credentials from evidence before it is sent to the selected AI provider.
 def _redact_ai_evidence(value: Any) -> str:
     text = str(value or '')
     text = re.sub(r'(?i)(Cookie:\s*)[^\r\n]+', r'\1<redacted>', text)
@@ -587,8 +873,8 @@ def _parse_analysis_content(content: str) -> list[dict[str, Any]]:
     if first >= 0 and last > first:
         raw = raw[first:last + 1]
 
-    # Ollama structured output is normally valid JSON. These two bounded repairs
-    # recover the common local-model mistakes without asking the model to regenerate
+    # Structured AI output is normally valid JSON. These two bounded repairs
+    # recover common model mistakes without asking the provider to regenerate
     # an otherwise complete answer.
     candidates = [raw, re.sub(r',\s*([}\]])', r'\1', raw)]
     repaired = candidates[-1]
@@ -616,10 +902,10 @@ def _parse_analysis_content(content: str) -> list[dict[str, Any]]:
         # model output rather than to the repair helper.
         value = json.loads(raw)
     if not isinstance(value, dict):
-        raise ValueError('Ollama returned an invalid analysis object.')
+        raise ValueError('AI provider returned an invalid analysis object.')
     rows = value.get('analyses')
     if not isinstance(rows, list):
-        raise ValueError('Ollama returned an invalid analysis object.')
+        raise ValueError('AI provider returned an invalid analysis object.')
     return [dict(row) for row in rows if isinstance(row, dict)]
 
 
@@ -689,34 +975,11 @@ def _analysis_quality_check(rows: list[dict[str, Any]], expected: set[str]) -> l
     return rows
 
 
-# Runs one evidence-grounded analysis batch. Multi-finding failures are split
+# Runs one evidence-grounded analysis batch with the selected AI provider. Multi-finding failures are split
 # immediately; a single finding gets one smaller rescue attempt instead of
 # spending the entire batch budget on a second long generation.
-def _ollama_analysis_batch(state: AgentState, batch: list[dict[str, Any]], all_candidates: list[dict[str, Any]], timeout: int) -> list[dict[str, Any]]:
-    system_message = (
-        'Act as the final evidence analyst for an explicitly authorized web-security assessment. '
-        'Analyze EVERY supplied finding ID using only its scanner/verifier evidence. The finding category, verification '
-        'status, URL, parameter, payload and evidence are immutable facts; never upgrade a candidate into a confirmed '
-        'vulnerability and never invent successful exploitation, stolen data, privileges or preconditions that are not supported. '
-        'Independently choose risk as critical, high, medium, low or info; scanner_risk is useful input but is not authoritative. '
-        'Severity must be calibrated to demonstrated impact, not to the vulnerability class alone. CRITICAL is exceptional: '
-        'a confirmed SQL injection by itself is normally HIGH; use CRITICAL only when the supplied evidence demonstrates '
-        'full data-store compromise, unauthenticated administrative takeover, remote code execution, or comparably system-wide impact. '
-        'REWRITE the scanner narrative into a stronger professional finding; do not decide whether to keep the scanner wording. '
-        'Python will retain the scanner wording only as a safety net when one of your narrative fields is empty or materially underdeveloped, '
-        'so make every description, impact and remediation independently complete and more informative than the original. '
-        'Description must be 2 concise sentences: first explain the weakness and affected input/endpoint, then state the concrete '
-        'scanner observation that supports it. Retain useful technical facts such as method, parameter, response differential, matcher, '
-        'payload class, DBMS, browser execution or verifier result when supplied. Do not merely repeat the alert title or verification label. '
-        'Impact must state what the evidence actually demonstrates first, then clearly qualify additional realistic consequences as possible '
-        'when they were not directly proven. Remediation must be specific to the weakness and retain useful scanner recommendations, including '
-        'the concrete defensive technique and an appropriate verification/regression step. Avoid generic filler such as "validate input" by itself. '
-        'Target roughly 30-55 words for description, 18-35 for impact, 25-50 for remediation, and 8-20 for rationale. '
-        'For candidates, reflect uncertainty in the rationale and keep severity conservative when exploitability is not established. '
-        'Use high for major demonstrated exploitable impact, medium for meaningful but constrained impact, low for limited impact, '
-        'and info for non-exploitable security context. Related findings may inform confidence or severity only when they clearly refer '
-        'to the same weakness or attack chain. Return each requested ID exactly once and return only schema-valid JSON.'
-    )
+def _ai_analysis_batch(state: AgentState, batch: list[dict[str, Any]], all_candidates: list[dict[str, Any]], timeout: int) -> list[dict[str, Any]]:
+    system_message = _analysis_system_message()
     mode = shared.CURRENT_SCAN_MODE
     related_findings = [] if mode == 'fast' else _analysis_related_findings(batch, all_candidates)
     context = json.dumps({
@@ -732,6 +995,7 @@ def _ollama_analysis_batch(state: AgentState, batch: list[dict[str, Any]], all_c
         'num_ctx': AI_ANALYSIS_CONTEXT_WINDOWS.get(mode, 6144),
         'top_p': 0.9,
     }
+    provider = str(state.get('ai_provider') or 'ollama').lower()
     base = state['ollama_url'].rstrip('/')
     expected = {str(item['id']) for item in batch}
     started = time.monotonic()
@@ -744,16 +1008,22 @@ def _ollama_analysis_batch(state: AgentState, batch: list[dict[str, Any]], all_c
     else:
         chat_budget = max(55, min(int(timeout * 0.70), 105))
 
-    chat_payload = {
-        'model': state['model'], 'format': ANALYSIS_SCHEMA,
-        'messages': [{'role': 'system', 'content': system_message}, {'role': 'user', 'content': context}],
-        'options': options, 'keep_alive': '30m',
-    }
     try:
-        content = _ollama_stream_content(
-            f'{base}/api/chat', chat_payload, response_kind='chat',
-            total_timeout=chat_budget, early_json=True,
-        )
+        if provider == 'snap4city':
+            content = _snap4city_chat_content(
+                state, system_message, context,
+                total_timeout=chat_budget, temperature=0.0,
+            )
+        else:
+            chat_payload = {
+                'model': state['model'], 'format': ANALYSIS_SCHEMA,
+                'messages': [{'role': 'system', 'content': system_message}, {'role': 'user', 'content': context}],
+                'options': options, 'keep_alive': '30m',
+            }
+            content = _ollama_stream_content(
+                f'{base}/api/chat', chat_payload, response_kind='chat',
+                total_timeout=chat_budget, early_json=True,
+            )
         return _analysis_quality_check(_parse_analysis_content(content), expected)
     except Exception as exc:
         errors.append(f'chat: {type(exc).__name__}: {exc}')
@@ -773,16 +1043,22 @@ def _ollama_analysis_batch(state: AgentState, batch: list[dict[str, Any]], all_c
         **options,
         'num_predict': AI_ANALYSIS_RESCUE_MAX_PREDICT.get(mode, 320),
     }
-    generate_payload = {
-        'model': state['model'], 'format': ANALYSIS_SCHEMA,
-        'prompt': rescue_system + '\n\nAnalyze this finding:\n' + context,
-        'options': rescue_options, 'keep_alive': '30m',
-    }
     try:
-        content = _ollama_stream_content(
-            f'{base}/api/generate', generate_payload, response_kind='generate',
-            total_timeout=remaining, early_json=True,
-        )
+        if provider == 'snap4city':
+            content = _snap4city_chat_content(
+                state, rescue_system, context,
+                total_timeout=remaining, temperature=0.0,
+            )
+        else:
+            generate_payload = {
+                'model': state['model'], 'format': ANALYSIS_SCHEMA,
+                'prompt': rescue_system + '\n\nAnalyze this finding:\n' + context,
+                'options': rescue_options, 'keep_alive': '30m',
+            }
+            content = _ollama_stream_content(
+                f'{base}/api/generate', generate_payload, response_kind='generate',
+                total_timeout=remaining, early_json=True,
+            )
         return _analysis_quality_check(_parse_analysis_content(content), expected)
     except Exception as exc:
         errors.append(f'generate rescue: {type(exc).__name__}: {exc}')
@@ -791,7 +1067,7 @@ def _ollama_analysis_batch(state: AgentState, batch: list[dict[str, Any]], all_c
 
 # Retries failed multi-finding AI analysis batches by splitting them into smaller
 # AI-only batches before a long malformed or timed-out response can fail strict mode.
-def _ollama_analysis_batch_adaptive(
+def _ai_analysis_batch_adaptive(
     state: AgentState,
     batch: list[dict[str, Any]],
     all_candidates: list[dict[str, Any]],
@@ -800,7 +1076,7 @@ def _ollama_analysis_batch_adaptive(
     label: str,
 ) -> list[dict[str, Any]]:
     try:
-        return _ollama_analysis_batch(state, batch, all_candidates, timeout)
+        return _ai_analysis_batch(state, batch, all_candidates, timeout)
     except Exception as exc:
         if len(batch) <= 1:
             raise
@@ -812,14 +1088,14 @@ def _ollama_analysis_batch_adaptive(
             flush=True,
         )
         rows: list[dict[str, Any]] = []
-        rows.extend(_ollama_analysis_batch_adaptive(state, left, all_candidates, timeout, label=f'{label}.1'))
-        rows.extend(_ollama_analysis_batch_adaptive(state, right, all_candidates, timeout, label=f'{label}.2'))
+        rows.extend(_ai_analysis_batch_adaptive(state, left, all_candidates, timeout, label=f'{label}.1'))
+        rows.extend(_ai_analysis_batch_adaptive(state, right, all_candidates, timeout, label=f'{label}.2'))
         return rows
 
 
 # Applies the AI narrative as the final report wording while preserving every
 # scanner-originating narrative field separately for auditability.
-def _apply_analysis(rows: list[dict[str, Any]], finding_map: dict[str, dict[str, Any]], model: str) -> tuple[int, int]:
+def _apply_analysis(rows: list[dict[str, Any]], finding_map: dict[str, dict[str, Any]], model: str, provider: str) -> tuple[int, int]:
     analyzed = changed = 0
     for row in rows:
         finding_id = str(row.get('id') or '')
@@ -859,7 +1135,8 @@ def _apply_analysis(rows: list[dict[str, Any]], finding_map: dict[str, dict[str,
                     narrative_fallbacks.append(key)
 
         finding['ai_analysis'] = {
-            'source': 'ollama-analysis',
+            'source': f'{provider}-analysis',
+            'provider': provider,
             'model': model,
             'risk': risk,
             'scanner_risk': original_risk,
@@ -880,7 +1157,7 @@ def analysis_node(state: AgentState) -> dict[str, Any]:
     results = copy.deepcopy(state['results'])
     candidates, finding_map = _analysis_catalog(results)
     if not candidates:
-        analysis = {'status': 'skipped', 'model': state['model'], 'analyzed_findings': 0, 'severity_changes': 0, 'errors': [], 'seconds': 0.0}
+        analysis = {'status': 'skipped', 'provider': str(state.get('ai_provider') or 'ollama'), 'model': state['model'], 'analyzed_findings': 0, 'severity_changes': 0, 'errors': [], 'seconds': 0.0}
         print('AI analysis: no confirmed/candidate findings to analyze.', flush=True)
         return {'results': results, 'analysis': analysis}
 
@@ -902,8 +1179,8 @@ def analysis_node(state: AgentState) -> dict[str, Any]:
         for batch_index in range(batch_count):
             batch = candidates[batch_index * batch_size:(batch_index + 1) * batch_size]
             try:
-                rows = _ollama_analysis_batch_adaptive(state, batch, candidates, batch_budget, label=f'batch {batch_index + 1}/{batch_count}')
-                batch_analyzed, batch_changed = _apply_analysis(rows, finding_map, state['model'])
+                rows = _ai_analysis_batch_adaptive(state, batch, candidates, batch_budget, label=f'batch {batch_index + 1}/{batch_count}')
+                batch_analyzed, batch_changed = _apply_analysis(rows, finding_map, state['model'], str(state.get('ai_provider') or 'ollama'))
                 analyzed += batch_analyzed
                 changed += batch_changed
                 print(f'    AI analysis: batch {batch_index + 1}/{batch_count}: analyzed={batch_analyzed}; severity changes={batch_changed}', flush=True)
@@ -916,6 +1193,7 @@ def analysis_node(state: AgentState) -> dict[str, Any]:
 
     analysis = {
         'status': 'success' if not errors else 'partial',
+        'provider': str(state.get('ai_provider') or 'ollama'),
         'model': state['model'],
         'candidate_findings': len(candidates),
         'analyzed_findings': analyzed,
@@ -1278,12 +1556,13 @@ def planner_node(state: AgentState) -> dict[str, Any]:
             summary = (summary + ' Optional breadth review failed; the initial AI plan was kept.').strip()
         notes.append(f'Round {round_number} [{planner_source}/{endpoint}; context={context_bytes}B]: {summary}')
         review_note = f'; review=+{len(review_selected_ids)} in {review_seconds:.1f}s' if review_seconds else ''
-        print(f'\n[*] Ollama plan round {round_number} via {endpoint} (context={context_bytes} bytes; candidates={candidate_count}; selected={len(selected_ids)}{review_note}; {planner_seconds:.1f}s): {summary}', flush=True)
+        provider_name = str(state.get('ai_provider') or 'ollama')
+        print(f'\n[*] AI plan round {round_number} [{provider_name}] via {endpoint} (context={context_bytes} bytes; candidates={candidate_count}; selected={len(selected_ids)}{review_note}; {planner_seconds:.1f}s): {summary}', flush=True)
     except Exception as exc:
         endpoint = str(LAST_OLLAMA_PLAN_DIAGNOSTICS.get('endpoint', 'unavailable'))
         context_bytes = int(LAST_OLLAMA_PLAN_DIAGNOSTICS.get('context_bytes', 0) or 0)
         if state.get('require_ai'):
-            raise RuntimeError(f'Strict agentic mode requires a successful Ollama plan: {type(exc).__name__}: {exc}') from exc
+            raise RuntimeError(f'Strict agentic mode requires a successful AI plan: {type(exc).__name__}: {exc}') from exc
         plan = _fallback_plan(state, eligible, budget)
         finished = not plan
         fallback_reason = f'{type(exc).__name__}: {exc}'
@@ -1487,8 +1766,11 @@ def report_node(state: AgentState) -> dict[str, Any]:
         'diagnostics': state['diagnostics'],
         'planner_notes': state['notes'],
         'planner_rounds': state['round'],
-        'ollama_model': state['model'],
-        'ollama_url': state['ollama_url'],
+        'ai_provider': str(state.get('ai_provider') or 'ollama'),
+        'ai_model': state['model'],
+        'ai_endpoint': state['snap4city_api_url'] if str(state.get('ai_provider') or 'ollama') == 'snap4city' else state['ollama_url'],
+        'ollama_model': state['model'] if str(state.get('ai_provider') or 'ollama') == 'ollama' else '',
+        'ollama_url': state['ollama_url'] if str(state.get('ai_provider') or 'ollama') == 'ollama' else '',
         'strict_ai_required': state.get('require_ai', False),
         'planner_source': state.get('planner_source', 'unknown'),
         'planner_audit': state.get('planner_audit', []),
@@ -1498,7 +1780,7 @@ def report_node(state: AgentState) -> dict[str, Any]:
         'python_executable': sys.executable,
         'mcp_server_python': shared._server_python(),
         'remaining_eligible_actions_at_report': len(remaining),
-        'execution_policy': 'AI selects discovery-derived scan actions under deterministic safety validation. After execution, a separate Ollama node independently enriches severity, description, impact and remediation using scanner evidence; category, verification status, request evidence and confirmation rules remain deterministic and immutable. Bounded state-changing workflow probes run automatically on local labs and require explicit --allow-state-changes for remote authorized targets.',
+        'execution_policy': 'AI selects discovery-derived scan actions under deterministic safety validation. After execution, a separate AI analysis node independently enriches severity, description, impact and remediation using scanner evidence; category, verification status, request evidence and confirmation rules remain deterministic and immutable. Bounded state-changing workflow probes run automatically on local labs and require explicit --allow-state-changes for remote authorized targets.',
         'allow_state_changes': state.get('allow_state_changes', False),
         'secondary_identity_supplied': bool(state.get('secondary_cookies', '')),
         'orchestration': {'engine': 'langgraph', 'mode': 'agentic', 'nodes': ['discovery', 'planner', 'executor', 'analysis', 'report']}}

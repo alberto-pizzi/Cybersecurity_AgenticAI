@@ -11,7 +11,7 @@ from pathlib import Path
 
 from setupLab import setup_local_lab, update_runtime_auth
 from setupTools import (
-    BUILD_ID, COMMAND_REFERENCE_FILE, DEFAULT_MODEL, ROOT, RUNTIME_FILE, TARGET,
+    BUILD_ID, COMMAND_REFERENCE_FILE, ROOT, RUNTIME_FILE, TARGET,
     _ensure_report_docker_image, configure_path, configure_perl_environment, create_wordlist, install_playwright_browser,
     install_python_packages, install_scanners, run, verify_scanners, write_runtime_config,
 )
@@ -19,6 +19,9 @@ from utils import setup_path
 
 UNIFIED_MCP_SERVER = ROOT / "servers" / "secopsServer.py"
 LINUX_BASE_PACKAGES = ("perl", "cpanminus", "build-essential")
+DEFAULT_AGENTIC_MODEL = "snap4city"
+LOCAL_AI_MODELS = {"llama": "llama3.1:8b", "qwen": "qwen2.5:7b"}
+AI_PREPARATION_CHOICES = ("all", "snap4city", "llama", "qwen")
 
 
 # Prefixes privileged Linux host commands with sudo when the initializer is not already root.
@@ -267,9 +270,53 @@ def _runtime_cookie_for_commands() -> str:
         return ""
     return str(payload.get("last_auth_cookie") or "").strip()
 
+
+# Resolves which AI backends the bundled lab initializer must prepare.
+def _resolve_ai_preparation(prepare_ai: str) -> tuple[list[str], bool, str]:
+    selected = str(prepare_ai or "all").lower()
+    if selected == "all":
+        return [LOCAL_AI_MODELS["llama"], LOCAL_AI_MODELS["qwen"]], True, DEFAULT_AGENTIC_MODEL
+    if selected == "snap4city":
+        return [], True, "snap4city"
+    if selected in LOCAL_AI_MODELS:
+        return [LOCAL_AI_MODELS[selected]], False, selected
+    raise ValueError(f"Unsupported AI preparation selection: {prepare_ai}")
+
+
+# Resolves the effective preparation and Agentic model from the two explicit CLI selectors.
+def _resolve_ai_cli_selection(prepare_ai: str | None, agentic_model: str) -> tuple[str, str]:
+    explicit_prepare = str(prepare_ai or "").strip().lower()
+    explicit_agentic = str(agentic_model or "").strip().lower()
+
+    if explicit_prepare and explicit_agentic and explicit_prepare != "all" and explicit_prepare != explicit_agentic:
+        raise ValueError(
+            f"--agentic-model {explicit_agentic} is not included by --prepare-ai {explicit_prepare}. "
+            "Use --prepare-ai all, omit --prepare-ai, or choose the same backend."
+        )
+
+    effective_prepare = explicit_prepare or explicit_agentic or "all"
+    _, _, default_agentic = _resolve_ai_preparation(effective_prepare)
+    effective_agentic = explicit_agentic or default_agentic
+    return effective_prepare, effective_agentic
+
+
+# Verifies the remote Snap4City model during initialization using the same client as the Agentic orchestrator.
+def _prepare_snap4city(credentials_path: str) -> None:
+    from orchestratorAgenticCore import (
+        SNAP4CITY_DEFAULT_API_URL, SNAP4CITY_DEFAULT_MODEL, ensure_snap4city_model,
+    )
+
+    selected, diagnostics = ensure_snap4city_model(
+        SNAP4CITY_DEFAULT_API_URL, SNAP4CITY_DEFAULT_MODEL, credentials_path, timeout=180,
+    )
+    print(
+        f"[+] Snap4City ready: model={selected}; "
+        f"warm-up={diagnostics.get('warmup_seconds')}s"
+    )
+
 # Prints the main balanced and deep commands that the operator can run next.
 def print_important_commands(
-    model: str, mode: str = "balanced", cookie_header: str = "",
+    agentic_model: str = DEFAULT_AGENTIC_MODEL, mode: str = "balanced", cookie_header: str = "",
 ) -> None:
 
     cookie = cookie_header or "<COOKIE_HEADER>"
@@ -288,15 +335,15 @@ def print_important_commands(
         )),
         ("4. Agentic FAST", _operator_command(
             "orchestratorAgentic.py", "--target", TARGET, "--cookies", cookie,
-            "--auth-only", "--model", model, "--max-rounds", "2", "--mode", "fast", "--require-ai",
+            "--auth-only", "--model", agentic_model, "--max-rounds", "2", "--mode", "fast", "--require-ai",
         )),
         ("5. Agentic BALANCED", _operator_command(
             "orchestratorAgentic.py", "--target", TARGET, "--cookies", cookie,
-            "--auth-only", "--model", model, "--max-rounds", "2", "--mode", "balanced", "--require-ai",
+            "--auth-only", "--model", agentic_model, "--max-rounds", "2", "--mode", "balanced", "--require-ai",
         )),
         ("6. Agentic DEEP", _operator_command(
             "orchestratorAgentic.py", "--target", TARGET, "--cookies", cookie,
-            "--auth-only", "--model", model, "--max-rounds", "3", "--mode", "deep", "--require-ai",
+            "--auth-only", "--model", agentic_model, "--max-rounds", "3", "--mode", "deep", "--require-ai",
         )),
     )
     for label, command in commands:
@@ -314,9 +361,28 @@ def main() -> int:
     parser = argparse.ArgumentParser(
         description="Initialize FastMCP SecOps and generate the complete operator command guide."
     )
-    parser.add_argument("--with-lab", action="store_true", help="Start/verify the bundled local training lab, ZAP and Ollama, then create a session.")
+    parser.add_argument("--with-lab", action="store_true", help="Start/verify the bundled local training lab and ZAP, provision the selected AI backends, then create a session.")
     parser.add_argument("--run", choices=("none", "deterministic", "agentic"), default="none", help="Run an orchestrator after initialization; deterministic/agentic requires --with-lab.")
-    parser.add_argument("--model", default=DEFAULT_MODEL, help=f"Ollama model for local-lab/agentic execution (default: {DEFAULT_MODEL}).")
+    parser.add_argument(
+        "--prepare-ai", choices=AI_PREPARATION_CHOICES, default=None,
+        help=(
+            "AI backends prepared by --with-lab. If omitted together with --agentic-model, all backends are prepared. "
+            "If --agentic-model is provided and --prepare-ai is omitted, only that selected Agentic model is prepared. "
+            "Choose all, snap4city, llama or qwen."
+        ),
+    )
+    parser.add_argument(
+        "--agentic-model", choices=("snap4city", "llama", "qwen"), default="",
+        help=(
+            "AI used by --run agentic and by the Agentic commands printed at the end. "
+            "If --prepare-ai is omitted, specifying this option also makes the initializer prepare only this model. "
+            "If both options are provided, the selected model must be included by --prepare-ai."
+        ),
+    )
+    parser.add_argument(
+        "--snap4city-credentials", default="user_credentials.json",
+        help="Snap4City credentials JSON. Cached access/refresh tokens are reused first; missing/placeholder credentials are requested interactively only when no usable token remains.",
+    )
     parser.add_argument("--mode", choices=("fast", "balanced", "deep"), default="balanced", help="Scanner coverage/runtime profile (default: balanced).")
     parser.add_argument("--skip-preflight", action="store_true", help="Skip the live deterministic MCP/dependency preflight.")
     parser.add_argument("--skip-scanners", action="store_true", help="Skip scanner installation and do not require all scanner executables.")
@@ -325,6 +391,12 @@ def main() -> int:
     parser.add_argument("--commands-only", action="store_true", help="Print every supported command/modifier, write init.txt, and exit.")
     parser.add_argument("--version", action="version", version=BUILD_ID)
     args = parser.parse_args()
+
+    try:
+        prepare_ai, agentic_model = _resolve_ai_cli_selection(args.prepare_ai, args.agentic_model)
+    except ValueError as exc:
+        parser.error(str(exc))
+    local_ai_models, prepare_snap4city, _ = _resolve_ai_preparation(prepare_ai)
 
     os.chdir(ROOT)
     setup_path()
@@ -360,11 +432,19 @@ def main() -> int:
         write_runtime_config(status)
 
 
-        # When the operator enables the bundled lab, setup starts it and prepares a fresh authenticated session.
+        # When the operator enables the bundled lab, setup starts DVWA/ZAP and provisions the selected AI backends.
         if args.with_lab:
-            cookie = setup_local_lab(args.model)
+            print(
+                "[*] AI preparation: local Ollama models="
+                + (", ".join(local_ai_models) if local_ai_models else "none")
+                + f"; Snap4City={'yes' if prepare_snap4city else 'no'}"
+                + f"; selection={prepare_ai}; Agentic model={agentic_model}"
+            )
+            cookie = setup_local_lab(local_ai_models)
             update_runtime_auth(cookie)
             print(f"\n[+] Bundled local-lab login created successfully.\n[+] Cookie header: {cookie}")
+            if prepare_snap4city:
+                _prepare_snap4city(args.snap4city_credentials)
 
         if not args.skip_preflight:
             run_preflight()
@@ -375,10 +455,11 @@ def main() -> int:
             script = "orchestratorAgentic.py" if args.run == "agentic" else "orchestratorDeterministic.py"
             command = [sys.executable, str(ROOT / script), "--target", TARGET, "--cookies", cookie, "--mode", args.mode]
             if args.run == "agentic":
-                command += ["--model", args.model, "--max-rounds", "1"]
+                rounds = "3" if args.mode == "deep" else "2"
+                command += ["--model", agentic_model, "--max-rounds", rounds, "--require-ai"]
             return run(command, required=False, timeout=7200, cwd=ROOT).returncode
 
-        print_important_commands(args.model, args.mode, cookie or _runtime_cookie_for_commands())
+        print_important_commands(agentic_model, args.mode, cookie or _runtime_cookie_for_commands())
         commands_printed = True
         return 0
     except Exception as exc:
@@ -387,7 +468,7 @@ def main() -> int:
 
         if not args.commands_only and not commands_printed:
             print_important_commands(
-                args.model, args.mode, cookie or _runtime_cookie_for_commands(),
+                agentic_model, args.mode, cookie or _runtime_cookie_for_commands(),
             )
         return 1
 

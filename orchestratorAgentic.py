@@ -13,7 +13,8 @@ from langgraph.graph import END, START, StateGraph
 import orchestratorDeterministic as deterministic_core
 import orchestratorAgenticCore as agentic_core
 from orchestratorAgenticCore import (
-    AgentState, AI_PLANNER_TIMEOUTS, ensure_ollama_model, warm_ollama_model,
+    AgentState, AI_PLANNER_TIMEOUTS, SNAP4CITY_DEFAULT_API_URL, resolve_ai_model,
+    ensure_ollama_model, warm_ollama_model, ensure_snap4city_model,
     discovery_node, planner_node, executor_node, analysis_node, report_node, route_after_execution,
     execute_action, execute_plan, validate_plan, ollama_plan,
 )
@@ -68,11 +69,20 @@ def summarize(results: dict[str, Any]) -> tuple[int, int, int]:
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="Ollama + LangGraph FastMCP security orchestrator."
+        description="LangGraph FastMCP security orchestrator with selectable AI model."
     )
     add_common_cli_arguments(parser, require_target=True)
-    parser.add_argument("--model", default="llama3.1:8b")
+    parser.add_argument(
+        "--model", choices=("snap4city", "llama", "qwen"), default="snap4city",
+        help=(
+            "AI used for planning and final finding analysis: snap4city -> remote "
+            "llama4-agentic-inference; llama -> local llama3.1:8b via Ollama; "
+            "qwen -> local qwen2.5:7b via Ollama. Default: snap4city."
+        ),
+    )
     parser.add_argument("--ollama-url", default="http://127.0.0.1:11434")
+    parser.add_argument("--snap4city-api-url", default=SNAP4CITY_DEFAULT_API_URL, help="Snap4City ClearML on-demand API URL.")
+    parser.add_argument("--snap4city-credentials", default="user_credentials.json", help="Snap4City credentials JSON. Cached access/refresh tokens are reused first; missing/placeholder credentials are requested interactively only when no usable token remains.")
     parser.add_argument(
         "--no-model-pull",
         action="store_true",
@@ -119,59 +129,78 @@ def main() -> int:
         prepare_cli_context(parser, args)
     )
     planner_timeout = args.ai_timeout or AI_PLANNER_TIMEOUTS[args.mode]
+    selected_provider, requested_model, selection_diagnostics = resolve_ai_model(args.model)
+    print(
+        f"[*] AI selection: provider={selected_provider}; model={requested_model}; "
+        f"source={selection_diagnostics.get('selection_source')}"
+    )
     try:
-        selected_model, ollama_diagnostics = ensure_ollama_model(
-            args.ollama_url,
-            args.model,
-            allow_pull=not args.no_model_pull,
-        )
-        print(
-            f"[*] Ollama ready: version={ollama_diagnostics.get('ollama_version', 'unknown')}; "
-            f"model={selected_model}; requested={args.model}"
-        )
-        if ollama_diagnostics.get("fallback_model_used"):
-            print(
-                "[!] Requested model was unavailable; using installed fallback "
-                f"{selected_model}: {ollama_diagnostics.get('fallback_reason', '')}",
-                file=sys.stderr,
-            )
-        try:
-            warmup = warm_ollama_model(
-                args.ollama_url, selected_model, timeout=planner_timeout
-            )
-            ollama_diagnostics["warmup"] = warmup
-            print(
-                f"[*] Ollama model warm: {warmup.get('seconds')}s; "
-                f"planner budget={planner_timeout}s per round"
-            )
-        except Exception as warm_exc:
-            ollama_diagnostics["warmup_error"] = (
-                f"{type(warm_exc).__name__}: {warm_exc}"
+        if selected_provider == "snap4city":
+            selected_model, ai_diagnostics = ensure_snap4city_model(
+                args.snap4city_api_url,
+                requested_model,
+                args.snap4city_credentials,
+                timeout=planner_timeout,
             )
             print(
-                "[!] Ollama warm-up was inconclusive; the streamed planner will still "
-                f"retry both endpoints: {ollama_diagnostics['warmup_error']}",
-                file=sys.stderr,
+                f"[*] Snap4City ready: model={selected_model}; "
+                f"warm-up={ai_diagnostics.get('warmup_seconds')}s; planner budget={planner_timeout}s per round"
             )
+        else:
+            selected_model, ai_diagnostics = ensure_ollama_model(
+                args.ollama_url,
+                requested_model,
+                allow_pull=not args.no_model_pull,
+            )
+            print(
+                f"[*] Ollama ready: version={ai_diagnostics.get('ollama_version', 'unknown')}; "
+                f"model={selected_model}; requested={requested_model}"
+            )
+            if ai_diagnostics.get("fallback_model_used"):
+                print(
+                    "[!] Requested model was unavailable; using installed fallback "
+                    f"{selected_model}: {ai_diagnostics.get('fallback_reason', '')}",
+                    file=sys.stderr,
+                )
+            try:
+                warmup = warm_ollama_model(
+                    args.ollama_url, selected_model, timeout=planner_timeout
+                )
+                ai_diagnostics["warmup"] = warmup
+                print(
+                    f"[*] Ollama model warm: {warmup.get('seconds')}s; "
+                    f"planner budget={planner_timeout}s per round"
+                )
+            except Exception as warm_exc:
+                ai_diagnostics["warmup_error"] = (
+                    f"{type(warm_exc).__name__}: {warm_exc}"
+                )
+                print(
+                    "[!] Ollama warm-up was inconclusive; the streamed planner will still "
+                    f"retry both endpoints: {ai_diagnostics['warmup_error']}",
+                    file=sys.stderr,
+                )
     except Exception as exc:
         if args.require_ai:
             print(
-                f"[-] Strict agentic mode could not prepare Ollama: {type(exc).__name__}: {exc}",
+                f"[-] Strict agentic mode could not prepare {selected_provider}: {type(exc).__name__}: {exc}",
                 file=sys.stderr,
             )
             return 4
-        selected_model = args.model
-        ollama_diagnostics = {
+        selected_model = requested_model
+        ai_diagnostics = {
+            "provider": selected_provider,
             "model_ready": False,
-            "requested_model": args.model,
+            "requested_model": requested_model,
             "error": f"{type(exc).__name__}: {exc}",
         }
         print(
-            "[!] Ollama readiness check failed; deterministic fallback remains available: "
-            f"{ollama_diagnostics['error']}",
+            f"[!] {selected_provider} readiness check failed; deterministic fallback remains available: "
+            f"{ai_diagnostics['error']}",
             file=sys.stderr,
         )
 
+    ai_diagnostics['selection'] = selection_diagnostics
     initial: AgentState = {
         "target": target,
         "profiles": profiles,
@@ -181,12 +210,15 @@ def main() -> int:
         "results": {profile["name"]: {} for profile in profiles},
         "round": 0,
         "max_rounds": args.max_rounds,
+        "ai_provider": selected_provider,
         "ollama_url": args.ollama_url,
+        "snap4city_api_url": args.snap4city_api_url,
+        "snap4city_credentials": args.snap4city_credentials,
         "model": selected_model,
         "injection_url": injection,
         "notes": [
-            "Ollama readiness: "
-            + json.dumps(ollama_diagnostics, ensure_ascii=False, default=str)
+            "AI readiness: "
+            + json.dumps(ai_diagnostics, ensure_ascii=False, default=str)
         ],
         "finished": False,
         "diagnostics": [],
