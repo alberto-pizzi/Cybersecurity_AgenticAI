@@ -316,13 +316,13 @@ def _prepare_snap4city(credentials_path: str) -> None:
 
 # Prints the main balanced and deep commands that the operator can run next.
 def print_important_commands(
-    agentic_model: str = DEFAULT_AGENTIC_MODEL, mode: str = "balanced", cookie_header: str = "",
+    agentic_model: str | None = DEFAULT_AGENTIC_MODEL, mode: str = "balanced", cookie_header: str = "",
 ) -> None:
 
     cookie = cookie_header or "<COOKIE_HEADER>"
     print("\n=== Commands ready to run ===")
     print("Run them from: " + str(ROOT))
-    commands = (
+    commands: list[tuple[str, str]] = [
         ("1. Deterministic FAST", _operator_command(
             "orchestratorDeterministic.py", "--target", TARGET, "--cookies", cookie, "--auth-only", "--mode", "fast",
         )),
@@ -333,19 +333,25 @@ def print_important_commands(
         ("3. Deterministic DEEP", _operator_command(
             "orchestratorDeterministic.py", "--target", TARGET, "--cookies", cookie, "--auth-only", "--mode", "deep",
         )),
-        ("4. Agentic FAST", _operator_command(
-            "orchestratorAgentic.py", "--target", TARGET, "--cookies", cookie,
-            "--auth-only", "--model", agentic_model, "--max-rounds", "2", "--mode", "fast", "--require-ai",
-        )),
-        ("5. Agentic BALANCED", _operator_command(
-            "orchestratorAgentic.py", "--target", TARGET, "--cookies", cookie,
-            "--auth-only", "--model", agentic_model, "--max-rounds", "2", "--mode", "balanced", "--require-ai",
-        )),
-        ("6. Agentic DEEP", _operator_command(
-            "orchestratorAgentic.py", "--target", TARGET, "--cookies", cookie,
-            "--auth-only", "--model", agentic_model, "--max-rounds", "3", "--mode", "deep", "--require-ai",
-        )),
-    )
+    ]
+    if agentic_model:
+        commands.extend((
+            ("4. Agentic FAST", _operator_command(
+                "orchestratorAgentic.py", "--target", TARGET, "--cookies", cookie,
+                "--auth-only", "--model", agentic_model, "--max-rounds", "2", "--mode", "fast", "--require-ai",
+            )),
+            ("5. Agentic BALANCED", _operator_command(
+                "orchestratorAgentic.py", "--target", TARGET, "--cookies", cookie,
+                "--auth-only", "--model", agentic_model, "--max-rounds", "2", "--mode", "balanced", "--require-ai",
+            )),
+            ("6. Agentic DEEP", _operator_command(
+                "orchestratorAgentic.py", "--target", TARGET, "--cookies", cookie,
+                "--auth-only", "--model", agentic_model, "--max-rounds", "3", "--mode", "deep", "--require-ai",
+            )),
+        ))
+    else:
+        print("[!] Agentic commands omitted: no verified AI backend is available from this initialization run.")
+
     for label, command in commands:
         print(f"\n{label}:\n{command}")
     print("\nZAP isolated DEEP full-priority diagnostic:")
@@ -403,6 +409,8 @@ def main() -> int:
     configure_path()
     cookie = ""
     commands_printed = False
+    snap4city_attempted = False
+    snap4city_ready = False
     try:
         # Before scans can run, setup installs the required tools and verifies the local environment.
         guide_path = write_command_reference()
@@ -444,7 +452,9 @@ def main() -> int:
             update_runtime_auth(cookie)
             print(f"\n[+] Bundled local-lab login created successfully.\n[+] Cookie header: {cookie}")
             if prepare_snap4city:
+                snap4city_attempted = True
                 _prepare_snap4city(args.snap4city_credentials)
+                snap4city_ready = True
 
         if not args.skip_preflight:
             run_preflight()
@@ -467,8 +477,28 @@ def main() -> int:
 
 
         if not args.commands_only and not commands_printed:
+            command_agentic_model: str | None = agentic_model
+            if snap4city_attempted and not snap4city_ready and agentic_model == "snap4city":
+                if LOCAL_AI_MODELS["llama"] in local_ai_models:
+                    command_agentic_model = "llama"
+                    print(
+                        "[!] Snap4City was not verified; recovery Agentic commands will use the already prepared local llama model.",
+                        file=sys.stderr,
+                    )
+                elif LOCAL_AI_MODELS["qwen"] in local_ai_models:
+                    command_agentic_model = "qwen"
+                    print(
+                        "[!] Snap4City was not verified; recovery Agentic commands will use the already prepared local qwen model.",
+                        file=sys.stderr,
+                    )
+                else:
+                    command_agentic_model = None
+                    print(
+                        "[!] Snap4City was not verified and no local AI backend was prepared; Agentic recovery commands are omitted.",
+                        file=sys.stderr,
+                    )
             print_important_commands(
-                agentic_model, args.mode, cookie or _runtime_cookie_for_commands(),
+                command_agentic_model, args.mode, cookie or _runtime_cookie_for_commands(),
             )
         return 1
 
