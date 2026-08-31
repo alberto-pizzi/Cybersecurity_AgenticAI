@@ -441,9 +441,21 @@ def _render_qualifications(toc: list[tuple[int, str, str]]) -> str:
         "qualified human penetration tester before being treated as conclusive.</p>"
     )
 
+# Builds the human-readable "AI model" cover line from the assessment context
+def _ai_model_display(context: dict[str, Any]) -> str:
+    provider = str(context.get("ai_provider") or "").strip()
+    model = str(context.get("ai_model") or "").strip()
+    if model:
+        return _esc(f"{model} (provider: {provider})") if provider else _esc(model)
+    orchestration = context.get("orchestration") if isinstance(context.get("orchestration"), dict) else {}
+    if orchestration.get("mode") == "deterministic":
+        return "None &ndash; deterministic pipeline (no generative AI model used)"
+    return "n/a"
+
 # Renders the report's cover page (title, classification/risk badges, engagement meta)
 def _render_cover(
     payload: dict[str, Any],
+    context: dict[str, Any],
     *,
     assessment_type: str,
     client_display: str,
@@ -462,6 +474,7 @@ def _render_cover(
         ("Assessment date(s)", _esc(assessment_dates)),
         ("Report issue date", generated_display),
         ("Report version / ID", _esc(f"{report_version} / {report_id}")),
+        ("AI model used", _ai_model_display(context)),
     ]
     # cover-badges is deliberately position:absolute (WeasyPrint flexbox align-self is unreliable).
     return (

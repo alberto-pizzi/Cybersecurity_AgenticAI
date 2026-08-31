@@ -63,6 +63,7 @@ def _render_html(payload: dict[str, Any], *, for_pdf: bool = False) -> str:
 
     cover_html = _render_cover(
         payload,
+        context_value,
         assessment_type=assessment_type,
         client_display=client_display,
         assessment_dates=assessment_dates,
