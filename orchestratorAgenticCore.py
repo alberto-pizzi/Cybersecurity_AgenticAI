@@ -287,64 +287,85 @@ def _planner_discovery_summary(discovery: dict[str, dict[str, Any]]) -> dict[str
     return summary
 
 
+_OLLAMA_RUNNER_CRASH_MARKER = 'model runner has unexpectedly stopped'
+
 # Reads the streamed Ollama response and joins its text safely.
 def _ollama_stream_content(url: str, payload: dict[str, Any], *, response_kind: str, total_timeout: int, early_json: bool=False) -> str:
 
-    started = time.monotonic()
-    chunks: list[str] = []
-    read_timeout = max(60, int(total_timeout) + 60)
-    response = requests.post(url, json={**payload, 'stream': True}, stream=True, timeout=(10, read_timeout))
-    try:
-        if response.status_code >= 400:
-            raise RuntimeError(f'HTTP {response.status_code}: {_ollama_error(response)}')
-        if not hasattr(response, 'iter_lines'):
-            value = response.json()
-            if response_kind == 'chat':
-                content = str((value.get('message') or {}).get('content') or '')
-            else:
-                content = str(value.get('response') or '')
-            if not content:
-                raise ValueError('Ollama completed without returning response content.')
-            return content
-        for raw in response.iter_lines(decode_unicode=True):
-            if time.monotonic() - started > total_timeout:
-                raise TimeoutError(f'Ollama request exceeded the {total_timeout}-second budget.')
-            if not raw:
+    def _attempt(budget: int) -> str:
+        started = time.monotonic()
+        chunks: list[str] = []
+        read_timeout = max(60, int(budget) + 60)
+        response = requests.post(url, json={**payload, 'stream': True}, stream=True, timeout=(10, read_timeout))
+        try:
+            if response.status_code >= 400:
+                raise RuntimeError(f'HTTP {response.status_code}: {_ollama_error(response)}')
+            if not hasattr(response, 'iter_lines'):
+                value = response.json()
+                if response_kind == 'chat':
+                    content = str((value.get('message') or {}).get('content') or '')
+                else:
+                    content = str(value.get('response') or '')
+                if not content:
+                    raise ValueError('Ollama completed without returning response content.')
+                return content
+            for raw in response.iter_lines(decode_unicode=True):
+                if time.monotonic() - started > budget:
+                    raise TimeoutError(f'Ollama request exceeded the {budget}-second budget.')
+                if not raw:
+                    continue
+                try:
+                    event = json.loads(raw)
+                except json.JSONDecodeError as exc:
+                    raise ValueError(f'Ollama returned a non-JSON stream event: {raw[:200]}') from exc
+                if event.get('error'):
+                    raise RuntimeError(str(event.get('error')))
+                if response_kind == 'chat':
+                    piece = str((event.get('message') or {}).get('content') or '')
+                else:
+                    piece = str(event.get('response') or '')
+                if piece:
+                    chunks.append(piece)
+                    if early_json:
+                        candidate = ''.join(chunks).strip()
+                        if candidate.endswith('}'):
+                            try:
+                                parsed = json.loads(candidate)
+                            except json.JSONDecodeError:
+                                parsed = None
+                            if isinstance(parsed, dict):
+                                plan_complete = isinstance(parsed.get('selected_action_ids'), list) and isinstance(parsed.get('finish'), bool)
+                                analysis_complete = isinstance(parsed.get('analyses'), list)
+                                if plan_complete or analysis_complete:
+                                    return candidate
+                if event.get('done') is True:
+                    break
+        finally:
+            close = getattr(response, 'close', None)
+            if callable(close):
+                close()
+        content = ''.join(chunks).strip()
+        if not content:
+            raise ValueError('Ollama completed without returning response content.')
+        return content
+
+    # Ollama's model runner can crash under memory pressure mid-batch (HTTP 500
+    # "model runner has unexpectedly stopped"); it typically reloads the model on
+    # the next request, so one short-delayed retry recovers without failing the
+    # whole batch outright.
+    outer_started = time.monotonic()
+    retries_left = 1
+    while True:
+        remaining = total_timeout - (time.monotonic() - outer_started)
+        try:
+            return _attempt(max(1, int(remaining)))
+        except RuntimeError as exc:
+            remaining = total_timeout - (time.monotonic() - outer_started)
+            if retries_left > 0 and _OLLAMA_RUNNER_CRASH_MARKER in str(exc) and remaining > 30:
+                retries_left -= 1
+                time.sleep(3)
                 continue
-            try:
-                event = json.loads(raw)
-            except json.JSONDecodeError as exc:
-                raise ValueError(f'Ollama returned a non-JSON stream event: {raw[:200]}') from exc
-            if event.get('error'):
-                raise RuntimeError(str(event.get('error')))
-            if response_kind == 'chat':
-                piece = str((event.get('message') or {}).get('content') or '')
-            else:
-                piece = str(event.get('response') or '')
-            if piece:
-                chunks.append(piece)
-                if early_json:
-                    candidate = ''.join(chunks).strip()
-                    if candidate.endswith('}'):
-                        try:
-                            parsed = json.loads(candidate)
-                        except json.JSONDecodeError:
-                            parsed = None
-                        if isinstance(parsed, dict):
-                            plan_complete = isinstance(parsed.get('selected_action_ids'), list) and isinstance(parsed.get('finish'), bool)
-                            analysis_complete = isinstance(parsed.get('analyses'), list)
-                            if plan_complete or analysis_complete:
-                                return candidate
-            if event.get('done') is True:
-                break
-    finally:
-        close = getattr(response, 'close', None)
-        if callable(close):
-            close()
-    content = ''.join(chunks).strip()
-    if not content:
-        raise ValueError('Ollama completed without returning response content.')
-    return content
+            raise
 
 # Sends a small request so the model is ready before planning starts.
 def warm_ollama_model(ollama_url: str, model: str, *, timeout: int) -> dict[str, Any]:
