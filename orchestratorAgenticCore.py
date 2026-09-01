@@ -65,10 +65,12 @@ class AgentState(TypedDict):
     planner_audit: list[dict[str, Any]]
     analysis: dict[str, Any]
     only_tool: str
+# CPU-only Ollama hosts can take far longer than 720s to prefill+decode a JSON-schema-constrained
+# plan (no tokens at all until prefill finishes), so these budgets stay generous by default.
 AI_PLANNER_TIMEOUTS = {
-    'fast': 480,
-    'balanced': 720,
-    'deep': 1080,
+    'fast': 900,
+    'balanced': 1500,
+    'deep': 2400,
 }
 
 AI_PLANNER_MAX_PREDICT = {
@@ -287,7 +289,7 @@ def _ollama_stream_content(url: str, payload: dict[str, Any], *, response_kind: 
 
     started = time.monotonic()
     chunks: list[str] = []
-    read_timeout = max(60, int(total_timeout) + 30)
+    read_timeout = max(60, int(total_timeout) + 60)
     response = requests.post(url, json={**payload, 'stream': True}, stream=True, timeout=(10, read_timeout))
     try:
         if response.status_code >= 400:
