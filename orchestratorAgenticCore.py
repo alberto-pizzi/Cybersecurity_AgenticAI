@@ -6,6 +6,7 @@ import getpass
 import json
 import re
 import platform
+import socket
 import sys
 import time
 import traceback
@@ -466,6 +467,19 @@ def _snap4city_token_manager(credentials_path: str) -> Any:
     return manager
 
 
+# Local address the OS would route through to reach the internet, without sending any packet
+# (UDP connect() only resolves a route). Snap4City's own access-control gateway reads
+# X-Forwarded-For/X-Real-IP rather than the raw TCP source, so this needs to be forwarded
+# explicitly; per Snap4City's own guidance this is the VM's LAN IP, not its public egress IP.
+def _local_outbound_ip() -> str:
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+            sock.connect(('8.8.8.8', 80))
+            return sock.getsockname()[0]
+    except OSError:
+        return ''
+
+
 # Calls the Snap4City/ClearML endpoint in its documented OpenAI-compatible chat mode.
 def _snap4city_chat_content(
     state: AgentState,
@@ -497,6 +511,10 @@ def _snap4city_chat_content(
         'Content-Type': 'application/json',
         'Authorization': f'Bearer {access_token}',
     }
+    local_ip = _local_outbound_ip()
+    if local_ip:
+        headers['X-Forwarded-For'] = local_ip
+        headers['X-Real-IP'] = local_ip
     response = requests.post(
         state['snap4city_api_url'],
         json=body,
