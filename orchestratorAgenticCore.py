@@ -65,10 +65,29 @@ class AgentState(TypedDict):
     planner_audit: list[dict[str, Any]]
     analysis: dict[str, Any]
     only_tool: str
-AI_PLANNER_TIMEOUTS = {'fast': 300, 'balanced': 480, 'deep': 720}
-AI_PLANNER_MAX_PREDICT = {'fast': 300, 'balanced': 450, 'deep': 650}
-AI_PLANNER_CONTEXT_WINDOWS = {'fast': 4096, 'balanced': 6144, 'deep': 8192}
-AI_ANALYSIS_BATCH_TIMEOUTS = {'fast': 150, 'balanced': 210, 'deep': 270}
+AI_PLANNER_TIMEOUTS = {
+    'fast': 480,
+    'balanced': 720,
+    'deep': 1080,
+}
+
+AI_PLANNER_MAX_PREDICT = {
+    'fast': 700,
+    'balanced': 1000,
+    'deep': 1400,
+}
+
+AI_PLANNER_CONTEXT_WINDOWS = {
+    'fast': 4096,
+    'balanced': 6144,
+    'deep': 8192,
+}
+
+AI_ANALYSIS_BATCH_TIMEOUTS = {
+    'fast': 180,
+    'balanced': 300,
+    'deep': 420,
+}
 AI_ANALYSIS_BATCH_SIZES = {'fast': 1, 'balanced': 3, 'deep': 4}
 AI_ANALYSIS_MAX_PREDICT = {'fast': 440, 'balanced': 700, 'deep': 980}
 AI_ANALYSIS_RESCUE_MAX_PREDICT = {'fast': 300, 'balanced': 380, 'deep': 460}
@@ -268,7 +287,7 @@ def _ollama_stream_content(url: str, payload: dict[str, Any], *, response_kind: 
 
     started = time.monotonic()
     chunks: list[str] = []
-    read_timeout = max(15, int(total_timeout) + 5)
+    read_timeout = max(60, int(total_timeout) + 30)
     response = requests.post(url, json={**payload, 'stream': True}, stream=True, timeout=(10, read_timeout))
     try:
         if response.status_code >= 400:
@@ -662,13 +681,23 @@ def ai_plan(state: AgentState) -> dict[str, Any]:
     else:
         attempts = [
             ('chat', f'{base}/api/chat', {
-                'model': state['model'], 'format': PLAN_SCHEMA,
-                'messages': [{'role': 'system', 'content': system_message}, {'role': 'user', 'content': context}],
-                'options': common_options, 'keep_alive': '30m'}, max(90, int(total_timeout * 0.7))),
+                'model': state['model'],
+                'format': PLAN_SCHEMA,
+                'messages': [
+                    {'role': 'system', 'content': system_message},
+                    {'role': 'user', 'content': context},
+                ],
+                'options': common_options,
+                'keep_alive': '30m',
+            }, total_timeout),
+
             ('generate', f'{base}/api/generate', {
-                'model': state['model'], 'format': PLAN_SCHEMA,
+                'model': state['model'],
+                'format': PLAN_SCHEMA,
                 'prompt': system_message + '\n\nAssessment context:\n' + context,
-                'options': common_options, 'keep_alive': '30m'}, max(90, int(total_timeout * 0.3))),
+                'options': common_options,
+                'keep_alive': '30m',
+            }, total_timeout),
         ]
     errors: list[str] = []
     planning_started = time.monotonic()
@@ -714,8 +743,8 @@ def ai_plan(state: AgentState) -> dict[str, Any]:
             # Reserve up to 40% of the profile's planning budget for the optional second AI pass.
             # The actual allowance is also bounded by the wall-clock time still remaining.
             review_time_budget = min(
+                total_timeout,
                 max(120, int(total_timeout * 0.40)),
-                max(0, int(total_timeout - (time.monotonic() - planning_started))),
             )
             if sparse_plan and review_time_budget >= 30:
                 remaining_candidates = [
