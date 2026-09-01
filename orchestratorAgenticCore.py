@@ -85,10 +85,13 @@ AI_PLANNER_CONTEXT_WINDOWS = {
     'deep': 8192,
 }
 
+# Same CPU-only-Ollama rationale as AI_PLANNER_TIMEOUTS above: this is a hard ceiling on
+# batch_budget (analysis_node caps it with min(ai_timeout, this value)), so raising --ai-timeout
+# alone does not help this stage unless this dict is also raised.
 AI_ANALYSIS_BATCH_TIMEOUTS = {
-    'fast': 180,
-    'balanced': 300,
-    'deep': 420,
+    'fast': 420,
+    'balanced': 720,
+    'deep': 1080,
 }
 AI_ANALYSIS_BATCH_SIZES = {'fast': 1, 'balanced': 3, 'deep': 4}
 AI_ANALYSIS_MAX_PREDICT = {'fast': 440, 'balanced': 700, 'deep': 980}
