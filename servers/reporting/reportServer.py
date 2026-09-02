@@ -14,6 +14,7 @@ from reporting.coverage import _executive_text, build_coverage, summarize
 from reporting.findings import _finding_groups, _human_readable_findings, flatten_findings
 from reporting.html_report import _render_html
 from reporting.pdf_maker import html2pdf
+from reporting.revision_snapshot import build_review_snapshot
 from reporting.text_utils import _as_dict, _redact_value, _safe_name
 
 
@@ -33,7 +34,7 @@ def generate_report(
     assessment_end: str = "",
     report_version: str = "1.0",
 ) -> dict:
-    """Generate scanner-grounded JSON, HTML and PDF penetration-test reports.
+    """Generate scanner-grounded JSON, HTML, PDF and review-snapshot artifacts.
 
     client_name, assessor, assessment_type, assessment_start/end and
     report_version are optional cover-page fields. Any left blank fall back
@@ -51,6 +52,7 @@ def generate_report(
     json_path = Path(REPORTS_DIR) / f"{base}.json"
     html_path = Path(REPORTS_DIR) / f"{base}.html"
     pdf_path = Path(REPORTS_DIR) / f"{base}.pdf"
+    review_snapshot_path = Path(REPORTS_DIR) / f"{base}.review.json"
     all_findings = flatten_findings(results)
     findings, omitted_detail = _human_readable_findings(all_findings)
     coverage = build_coverage(results, context)
@@ -60,7 +62,7 @@ def generate_report(
     payload = {
         "generated_at": datetime.now(timezone.utc),
         "target": target_url,
-        "reporting_policy": "Scanner-grounded: missing claims are identified, not invented.",
+        "reporting_policy": "Scanner-grounded: observed facts are not invented; potential consequences and recovery guidance remain explicitly conditional when damage is not evidenced.",
         "executive_summary": _executive_text(summary, findings),
         "summary": summary,
         "coverage": coverage,
@@ -84,9 +86,13 @@ def generate_report(
 
     try:
         json_path.write_text(json.dumps(payload, indent=2, ensure_ascii=False, default=str), encoding="utf-8")
+        review_snapshot_path.write_text(
+            json.dumps(build_review_snapshot(payload), indent=2, ensure_ascii=False, default=str),
+            encoding="utf-8",
+        )
         html_path.write_text(_render_html(payload), encoding="utf-8")
     except Exception as exc:
-        return failure("Report Generator", target_url, f"JSON/HTML report creation failed: {type(exc).__name__}: {exc}", diagnosis="report_serialization_failed")
+        return failure("Report Generator", target_url, f"JSON/HTML/review snapshot creation failed: {type(exc).__name__}: {exc}", diagnosis="report_serialization_failed")
 
     # The PDF is rendered from a separate, PDF-only HTML render (for_pdf=True):
     # same content, minus sections that only make sense in an interactive
@@ -99,7 +105,11 @@ def generate_report(
         html2pdf(pdf_source_path, pdf_path)
     except Exception as exc:
         result = failure("Report Generator", target_url, f"PDF report creation failed: {type(exc).__name__}: {exc}", diagnosis="pdf_generation_failed")
-        result.update(json_filename=str(json_path.resolve()), html_filename=str(html_path.resolve()), pdf_filename=None, findings_count=len(findings))
+        result.update(
+            json_filename=str(json_path.resolve()),
+            review_snapshot_filename=str(review_snapshot_path.resolve()) if review_snapshot_path.is_file() else None,
+            html_filename=str(html_path.resolve()), pdf_filename=None, findings_count=len(findings),
+        )
         return result
     finally:
         pdf_source_path.unlink(missing_ok=True)
@@ -117,16 +127,18 @@ def generate_report(
         "Report Generator",
         target_url,
         (
-            f"Scanner-grounded PDF, HTML and JSON reports generated. "
+            f"Scanner-grounded PDF, HTML, JSON and review snapshot generated. "
             f"Confirmed findings: {payload['security_findings_count']}; "
             f"candidates: {payload['candidate_findings_count']}; observations: {payload['observations_count']}."
         ),
         pdf_filename=str(pdf_path.resolve()),
         html_filename=str(html_path.resolve()),
         json_filename=str(json_path.resolve()),
+        review_snapshot_filename=str(review_snapshot_path.resolve()),
         local_pdf_generated=True,
         local_html_generated=True,
         local_json_generated=True,
+        local_review_snapshot_generated=True,
         findings_count=len(findings),
         security_findings_count=payload["security_findings_count"],
         candidate_findings_count=payload["candidate_findings_count"],

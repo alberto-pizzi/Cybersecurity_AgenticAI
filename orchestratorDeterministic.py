@@ -426,7 +426,8 @@ async def deterministic_report_node(state: DeterministicState) -> dict[str, Any]
         'secondary_identity_supplied': bool(secondary_cookies),
         'parameter_tool_timeouts': PARAMETER_TOOL_TIMEOUTS,
         'broad_scanner_timeouts': BROAD_SCANNER_TIMEOUTS,
-        'scan_mode': shared.CURRENT_SCAN_MODE}
+        'scan_mode': shared.CURRENT_SCAN_MODE,
+        'damage_recovery_policy': 'Confirmed findings retain scanner evidence and receive conservative consequence and recovery/restoration guidance when the originating tool does not provide it. Potential damage is never reported as observed damage without supporting evidence.'}
     context['orchestration'] = {'engine': 'langgraph', 'mode': 'deterministic', 'nodes': ['discovery', 'broad_scan', 'parameter_scan', 'authorization', 'browser_workflow', 'special_checks', 'report']}
     print('\n[*] Generazione report...')
     report = await call_mcp('reporting/reportServer.py', 'generate_report', {'findings_summary': results, 'target_url': target, 'assessment_context': context})
@@ -701,6 +702,7 @@ def main() -> int:
     print(f"[+] PDF: {report.get('pdf_filename') or 'not generated'}")
     print(f"[+] HTML preview: {report.get('html_filename') or 'not generated'}")
     print(f"[+] JSON: {report.get('json_filename') or 'not generated'}")
+    print(f"[+] Review snapshot: {report.get('review_snapshot_filename') or 'not generated'}")
     print(f"[+] Coverage constraints recorded: {report.get('coverage_constraints_count', 0)}")
     print(f"[+] Scanner run errors: {errors}")
     print(f"[+] Time-limited/partial scanner runs: {partial}")

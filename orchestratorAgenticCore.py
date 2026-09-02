@@ -126,11 +126,13 @@ ANALYSIS_SCHEMA = {
                     'risk': {'type': 'string', 'enum': ['critical', 'high', 'medium', 'low', 'info']},
                     'description': {'type': 'string'},
                     'impact': {'type': 'string'},
+                    'consequences': {'type': 'string'},
+                    'recovery': {'type': 'string'},
                     'solution': {'type': 'string'},
                     'rationale': {'type': 'string'},
                     'confidence': {'type': 'string', 'enum': ['high', 'medium', 'low']},
                 },
-                'required': ['id', 'risk', 'description', 'impact', 'solution', 'rationale', 'confidence'],
+                'required': ['id', 'risk', 'description', 'impact', 'consequences', 'recovery', 'solution', 'rationale', 'confidence'],
             },
         },
     },
@@ -654,7 +656,7 @@ def _analysis_system_message() -> str:
         'You are the final evidence analyst for an explicitly authorized web-security assessment.\n\n'
         '[IMMUTABLE FACTS]\n'
         'Finding category, verification status, URL, parameter, payload and scanner/verifier evidence are facts supplied by the system. '
-        'Never upgrade a candidate into a confirmed vulnerability and never invent exploitation, stolen data, privileges or unsupported preconditions.\n\n'
+        'Never upgrade a candidate into a confirmed vulnerability and never invent exploitation, stolen data, privileges, actual damage or unsupported preconditions.\n\n'
         '[RISK RULES]\n'
         '- Choose risk independently as critical, high, medium, low or info; scanner_risk is input, not authority.\n'
         '- Calibrate severity to demonstrated impact, not vulnerability class alone.\n'
@@ -665,14 +667,16 @@ def _analysis_system_message() -> str:
         '- Rewrite scanner narrative into stronger professional wording; do not merely repeat the alert title or verification label.\n'
         '- Python preserves scanner wording as a safety net for empty or materially underdeveloped AI fields, so make each AI narrative field independently complete.\n'
         '- Description: 2 concise sentences, first the weakness/affected input, then the concrete evidence.\n'
-        '- Impact: state demonstrated impact first; qualify additional realistic consequences as possible when not proven.\n'
+        '- Impact: state the security impact demonstrated by the supplied evidence; do not present unobserved damage as if it occurred.\n'
+        '- Consequences: explain the realistic damage that exploitation beyond the bounded verification could cause. Clearly distinguish demonstrated effects from potential downstream consequences.\n'
+        '- Recovery: give concrete containment/restoration actions that would apply if the described damage occurred, including integrity/log checks, restoration or credential rotation only when relevant; do not claim recovery was required when no damage is evidenced.\n'
         '- Solution: give weakness-specific remediation and an appropriate regression/verification step; avoid generic filler such as "validate input" by itself.\n'
         '- Preserve useful technical facts such as method, parameter, response differential, matcher, payload class, DBMS, browser execution or verifier result when supplied.\n'
         '- Related findings may affect confidence or severity only when they clearly refer to the same weakness or attack chain.\n'
         '- Use high for major demonstrated exploitable impact, medium for meaningful but constrained impact, low for limited impact and info for non-exploitable security context.\n'
-        '- Target roughly 30-55 words description, 18-35 impact, 25-50 solution and 8-20 rationale.\n\n'
+        '- Target roughly 30-55 words description, 18-35 impact, 18-40 consequences, 18-45 recovery, 25-50 solution and 8-20 rationale.\n\n'
         '[OUTPUT CONTRACT]\n'
-        'Return exactly one JSON object with an analyses array. Each item must contain id, risk, description, impact, solution, rationale and confidence. '
+        'Return exactly one JSON object with an analyses array. Each item must contain id, risk, description, impact, consequences, recovery, solution, rationale and confidence. '
         'risk must be critical/high/medium/low/info and confidence high/medium/low.\n\n'
         '[FINAL INSTRUCTION]\n'
         'Return only valid JSON. Do not include chain-of-thought; rationale is a short evidence-based justification.'
@@ -928,6 +932,12 @@ def _analysis_catalog(results: dict[str, dict[str, Any]]) -> tuple[list[dict[str
                 'technical_details': _redact_ai_evidence(finding.get('technical_details') or finding.get('other_information'))[:550],
                 'evidence': _redact_ai_evidence(finding.get('evidence'))[:1000],
                 'scanner_impact': _redact_ai_evidence(finding.get('impact'))[:550],
+                'scanner_consequences': _redact_ai_evidence(
+                    finding.get('consequences') or finding.get('damage') or finding.get('potential_damage')
+                )[:550],
+                'scanner_recovery': _redact_ai_evidence(
+                    finding.get('recovery') or finding.get('recovery_actions')
+                )[:550],
                 'scanner_solution': _redact_ai_evidence(finding.get('solution'))[:550],
                 'attack_preconditions': _redact_ai_evidence(finding.get('attack_preconditions') or finding.get('preconditions'))[:320],
                 'owasp_category': str(finding.get('owasp_category') or '')[:180],
@@ -1016,14 +1026,14 @@ def _analysis_related_findings(batch: list[dict[str, Any]], all_candidates: list
     ]
 
 
-AI_ANALYSIS_MIN_WORDS = {'description': 20, 'impact': 12, 'solution': 15, 'rationale': 8}
+AI_ANALYSIS_MIN_WORDS = {'description': 20, 'impact': 12, 'consequences': 12, 'recovery': 12, 'solution': 15, 'rationale': 8}
 
 
 def _analysis_quality_check(rows: list[dict[str, Any]], expected: set[str]) -> list[dict[str, Any]]:
     # Validate the AI contract without failing strict mode for weak prose alone.
     # Strict agentic mode still requires a real, parseable AI assessment for every finding.
     # Narrative quality is handled field-by-field later: if the AI returns a materially
-    # underdeveloped description/impact/remediation and the scanner has a stronger
+    # underdeveloped narrative field and the scanner has a stronger
     # original value, that one field falls back to the scanner text instead of aborting
     # the entire assessment.
     returned_ids = [str(item.get('id') or '') for item in rows]
@@ -1110,7 +1120,8 @@ def _ai_analysis_batch(state: AgentState, batch: list[dict[str, Any]], all_candi
     rescue_system = (
         system_message
         + ' This is a single-finding rescue pass. Be concise but complete: 25-40 words for description, '
-          '15-28 for impact, 22-40 for remediation, and 8-15 for rationale. Return exactly one analysis object.'
+          '15-28 for impact, 15-30 for consequences, 15-35 for recovery, 22-40 for remediation, and 8-15 for rationale. '
+          'Return the normal JSON root object with an analyses array containing exactly one analysis item.'
     )
     rescue_options = {
         **options,
@@ -1183,6 +1194,14 @@ def _apply_analysis(rows: list[dict[str, Any]], finding_map: dict[str, dict[str,
         finding.setdefault('scanner_confidence', scanner_confidence)
         finding.setdefault('scanner_description', str(finding.get('description') or ''))
         finding.setdefault('scanner_impact', str(finding.get('impact') or ''))
+        finding.setdefault(
+            'scanner_consequences',
+            str(finding.get('consequences') or finding.get('damage') or finding.get('potential_damage') or ''),
+        )
+        finding.setdefault(
+            'scanner_recovery',
+            str(finding.get('recovery') or finding.get('recovery_actions') or ''),
+        )
         finding.setdefault('scanner_solution', str(finding.get('solution') or ''))
         finding['risk'] = risk
 
@@ -1193,10 +1212,12 @@ def _apply_analysis(rows: list[dict[str, Any]], finding_map: dict[str, dict[str,
         scanner_values = {
             'description': str(finding.get('scanner_description') or '').strip(),
             'impact': str(finding.get('scanner_impact') or '').strip(),
+            'consequences': str(finding.get('scanner_consequences') or '').strip(),
+            'recovery': str(finding.get('scanner_recovery') or '').strip(),
             'solution': str(finding.get('scanner_solution') or '').strip(),
         }
         narrative_fallbacks: list[str] = []
-        for key in ('description', 'impact', 'solution'):
+        for key in ('description', 'impact', 'consequences', 'recovery', 'solution'):
             ai_value = str(row.get(key) or '').strip()
             scanner_value = scanner_values[key]
             if key in short_fields and scanner_value:
@@ -1274,7 +1295,7 @@ def analysis_node(state: AgentState) -> dict[str, Any]:
         'errors': errors,
         'seconds': round(time.monotonic() - started, 2),
         'batch_timeout_seconds': batch_budget,
-        'policy': 'AI supplies the final severity and professional description/impact/remediation wording; original scanner narrative, category, verification status and evidence remain preserved and scanner/verifier-controlled where applicable.',
+        'policy': 'AI supplies the final severity and professional description/impact/consequence/recovery/remediation wording; original scanner narrative, category, verification status and evidence remain preserved and scanner/verifier-controlled where applicable.',
     }
     print(f"AI analysis: finished; analyzed={analyzed}/{len(candidates)}; severity changes={changed}; {analysis['seconds']:.1f}s", flush=True)
     return {'results': results, 'analysis': analysis}
@@ -1853,7 +1874,7 @@ def report_node(state: AgentState) -> dict[str, Any]:
         'python_executable': sys.executable,
         'mcp_server_python': shared._server_python(),
         'remaining_eligible_actions_at_report': len(remaining),
-        'execution_policy': 'AI selects discovery-derived scan actions under deterministic safety validation. After execution, a separate AI analysis node independently enriches severity, description, impact and remediation using scanner evidence; category, verification status, request evidence and confirmation rules remain deterministic and immutable. Bounded state-changing workflow probes run automatically on local labs and require explicit --allow-state-changes for remote authorized targets.',
+        'execution_policy': 'AI selects discovery-derived scan actions under deterministic safety validation. After execution, a separate AI analysis node independently enriches severity, description, impact, potential consequences, recovery guidance and remediation using scanner evidence; category, verification status, request evidence and confirmation rules remain deterministic and immutable. Bounded state-changing workflow probes run automatically on local labs and require explicit --allow-state-changes for remote authorized targets.',
         'allow_state_changes': state.get('allow_state_changes', False),
         'secondary_identity_supplied': bool(state.get('secondary_cookies', '')),
         'orchestration': {'engine': 'langgraph', 'mode': 'agentic', 'nodes': ['discovery', 'planner', 'executor', 'analysis', 'report']}}

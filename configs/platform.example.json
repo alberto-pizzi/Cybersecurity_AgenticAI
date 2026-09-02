@@ -1,0 +1,82 @@
+{
+  "schema_version": 1,
+  "platform": {
+    "name": "Example multi-asset platform",
+    "description": "Example scope with multiple hosts, ports, protocols and two authenticated web identities."
+  },
+  "authorization": {
+    "confirmed": false,
+    "reference": "Replace with the real authorization/ticket/reference and set confirmed=true before executing a real assessment"
+  },
+  "credentials": {
+    "portal_primary": {
+      "kind": "cookie",
+      "env": "SECOPS_PORTAL_PRIMARY_COOKIE",
+      "purpose": "Primary authenticated web identity"
+    },
+    "portal_secondary": {
+      "kind": "cookie",
+      "env": "SECOPS_PORTAL_SECONDARY_COOKIE",
+      "purpose": "Second identity for authorization comparisons"
+    }
+  },
+  "assets": [
+    {
+      "id": "frontend",
+      "host": "portal.example.internal",
+      "address": "10.20.0.10",
+      "services": [
+        {
+          "id": "https-main",
+          "protocol": "https",
+          "port": 443,
+          "base_path": "/",
+          "credential_ref": "portal_primary",
+          "secondary_credential_ref": "portal_secondary",
+          "auth_only": true,
+          "allow_state_changes": false
+        },
+        {
+          "id": "http-redirect",
+          "protocol": "http",
+          "port": 80,
+          "base_path": "/",
+          "auth_only": false,
+          "allow_state_changes": false
+        }
+      ]
+    },
+    {
+      "id": "admin-api",
+      "host": "10.20.0.11",
+      "address": "10.20.0.11",
+      "services": [
+        {
+          "id": "https-8443",
+          "protocol": "https",
+          "port": 8443,
+          "base_path": "/api/",
+          "credential_ref": "portal_primary",
+          "auth_only": true,
+          "allow_state_changes": false
+        },
+        {
+          "id": "ssh-inventory",
+          "protocol": "ssh",
+          "port": 22,
+          "enabled": true,
+          "notes": "The service is part of the platform inventory; the current web orchestrators record it as unsupported and do not test it."
+        }
+      ]
+    }
+  ],
+  "execution": {
+    "orchestrator": "agentic",
+    "mode": "balanced",
+    "model": "llama",
+    "max_rounds": 2,
+    "require_ai": true,
+    "allow_state_changes": false,
+    "ollama_url": "http://127.0.0.1:11434"
+  }
+}

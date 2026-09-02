@@ -1,0 +1,50 @@
+{
+  "schema_version": 1,
+  "platform": {
+    "name": "microX dashboard-test",
+    "description": "Initial test definition for the professor-provided host mapping. Enable only the service confirmed as reachable before running the assessment."
+  },
+  "authorization": {
+    "confirmed": true,
+    "reference": "Professor instruction: test 192.168.1.81 mapped as dashboard-test"
+  },
+  "credentials": {},
+  "assets": [
+    {
+      "id": "microx-dashboard",
+      "host": "dashboard-test",
+      "address": "192.168.1.81",
+      "services": [
+        {
+          "id": "http-80",
+          "protocol": "http",
+          "port": 80,
+          "base_path": "/",
+          "enabled": false,
+          "auth_only": false,
+          "allow_state_changes": false,
+          "notes": "Enable this service only if curl/browser confirms that dashboard-test answers on HTTP port 80."
+        },
+        {
+          "id": "https-443",
+          "protocol": "https",
+          "port": 443,
+          "base_path": "/",
+          "enabled": false,
+          "auth_only": false,
+          "allow_state_changes": false,
+          "notes": "Enable this service only if curl/browser confirms that dashboard-test answers on HTTPS port 443."
+        }
+      ]
+    }
+  ],
+  "execution": {
+    "orchestrator": "agentic",
+    "mode": "balanced",
+    "model": "snap4city",
+    "max_rounds": 2,
+    "require_ai": true,
+    "allow_state_changes": false,
+    "snap4city_credentials": "user_credentials.json"
+  }
+}

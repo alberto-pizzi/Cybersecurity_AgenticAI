@@ -253,6 +253,7 @@ def main() -> int:
     print(f"[+] PDF: {report.get('pdf_filename') or 'not generated'}")
     print(f"[+] HTML preview: {report.get('html_filename') or 'not generated'}")
     print(f"[+] JSON: {report.get('json_filename') or 'not generated'}")
+    print(f"[+] Review snapshot: {report.get('review_snapshot_filename') or 'not generated'}")
     print(f"[+] Coverage constraints recorded: {report.get('coverage_constraints_count', 0)}")
     print_security_finding_summary(final.get("results", {}))
     print(f"[+] Scanner run errors: {errors}")

@@ -26,14 +26,15 @@ Se NON specifichi ne' --prepare-ai ne' --agentic-model, --with-lab prepara:
   - Ollama + qwen2.5:7b
   - accesso Snap4City + llama4-agentic-inference
 Snap4City e' remoto: non viene scaricato; l'initializer autentica e verifica che l'endpoint risponda.
-I comandi Agentic stampati alla fine usano Snap4City per default.
+Se la preparazione Snap4City fallisce per endpoint/modello non raggiungibile, l'errore viene mostrato ma
+l'inizializzazione prosegue. Se disponibile viene scelto un modello Ollama locale verificato; altrimenti
+l'initializer prova a preparare llama3.1:8b come fallback locale.
 
 Preparare un solo backend/model:
 python .\initScript.py --with-lab --prepare-ai snap4city
 python .\initScript.py --with-lab --prepare-ai llama
 python .\initScript.py --with-lab --prepare-ai qwen
 
-Quando viene preparato un solo backend, quel backend viene usato anche per --run agentic e per i comandi Agentic stampati.
 Se specifichi --agentic-model SENZA --prepare-ai, l'initializer prepara automaticamente solo quel modello:
 python .\initScript.py --with-lab --agentic-model llama
 python .\initScript.py --with-lab --agentic-model qwen --run agentic --mode balanced
@@ -43,19 +44,20 @@ Se specifichi ENTRAMBI, devono essere coerenti:
   OK:    --prepare-ai all --agentic-model qwen
   OK:    --prepare-ai qwen --agentic-model qwen
   ERRORE: --prepare-ai llama --agentic-model qwen
-Con --prepare-ai all qualsiasi dei tre valori di --agentic-model e' incluso e quindi valido.
 
-Eseguire subito un orchestrator dopo l'init:
+Nel repository e' presente configs/dvwa.example.json come placeholder leggibile senza una sessione valida.
+Con --with-lab viene creato anche configs/dvwa.generated.json usando la sessione DVWA appena
+generata. Il file e' gia' pronto per assessmentRunner.py; contiene una credenziale locale temporanea
+e non va riutilizzato come file di configurazione condiviso.
+
+Eseguire subito l'assessment generato dopo l'init:
 python .\initScript.py --with-lab --run deterministic --mode balanced
 python .\initScript.py --with-lab --run agentic --mode balanced
-python .\initScript.py --with-lab --prepare-ai snap4city --run agentic --mode balanced
 python .\initScript.py --with-lab --prepare-ai qwen --run agentic --mode balanced
 
-Scelta del modello Agentic quando sono stati preparati tutti e tre:
-python .\initScript.py --with-lab --prepare-ai all --agentic-model llama --run agentic --mode balanced
-python .\initScript.py --with-lab --prepare-ai all --agentic-model qwen --run agentic --mode balanced
-python .\initScript.py --with-lab --prepare-ai all --agentic-model snap4city --run agentic --mode balanced
-
+Alla fine l'initializer stampa prima i comandi assessmentRunner FAST/BALANCED/DEEP, un comando
+Agentic BALANCED per configs/dashboard-test.json con Snap4City o il fallback locale verificato, e poi un comando
+diretto orchestratorAgentic.py con un modello verificato. I comandi manuali degli orchestrator restano validi.
 
 Snap4City usa user_credentials.json. Se contiene ancora placeholder o manca e il terminale
 e' interattivo, username/password vengono richiesti in console; la password non viene mostrata.
@@ -68,14 +70,74 @@ Le dipendenze upstream di IDOR-Forge restano nella .venv del repository.
 Percorsi, interprete e launcher vengono salvati in .secops_runtime.json e
 verificati dal preflight.
 
-2. DETERMINISTIC
+2. ASSESSMENT RUNNER E CONFIGURAZIONE
+------------------------------------
+assessmentRunner.py puo' leggere una piattaforma da JSON oppure ricevere direttamente --target e --cookies,
+quindi delega ogni servizio HTTP/HTTPS agli orchestrator esistenti. Non sostituisce Deterministic o Agentic.
+Protocolli non web possono restare nell'inventario ma vengono registrati come non supportati e non testati.
+
+DVWA generato dall'initializer:
+python .\assessmentRunner.py --config .\configs\dvwa.generated.json --orchestrator deterministic --mode balanced --dry-run
+python .\assessmentRunner.py --config .\configs\dvwa.generated.json --orchestrator deterministic --mode balanced
+python .\assessmentRunner.py --config .\configs\dvwa.generated.json --orchestrator deterministic --mode balanced --auth-only
+python .\assessmentRunner.py --config .\configs\dvwa.generated.json --orchestrator agentic --model snap4city --max-rounds 2 --mode balanced --require-ai
+
+Il file DVWA generato contiene il cookie ma ha auth_only=false: senza --auth-only vengono eseguiti
+sia il profilo anonimo sia quello autenticato. Con --auth-only viene eseguito soltanto l'autenticato.
+
+Modalita' diretta senza file JSON:
+python .\assessmentRunner.py --target http://127.0.0.1 --cookies "PHPSESSID=<SESSION>; security=low" --orchestrator deterministic --mode balanced
+python .\assessmentRunner.py --target http://127.0.0.1 --cookies "PHPSESSID=<SESSION>; security=low" --orchestrator deterministic --mode balanced --auth-only
+python .\assessmentRunner.py --target http://127.0.0.1 --orchestrator deterministic --mode balanced
+python .\assessmentRunner.py --target http://127.0.0.1 --cookies "PHPSESSID=<SESSION>; security=low" --orchestrator agentic --model snap4city --max-rounds 2 --mode balanced --require-ai
+
+In modalita' diretta: cookie senza --auth-only = anonimo + autenticato; --auth-only = solo autenticato;
+senza cookie = solo anonimo. --config e --target sono alternativi.
+
+Override disponibili senza modificare il JSON:
+  --orchestrator deterministic|agentic
+  --mode fast|balanced|deep
+  --model snap4city|llama|qwen
+  --max-rounds 1|2|3
+  --auth-only
+  --require-ai / --no-require-ai
+  --authorized
+  --allow-state-changes
+  --dry-run
+  --only <ASSET/SERVICE>
+
+Per llama/qwen il runner verifica il modello esatto gia' installato in Ollama. Non lo scarica e non
+accetta la sostituzione silenziosa con l'altro modello: inizializza prima il modello richiesto.
+
+MICROX / DASHBOARD-TEST
+Prima aggiungi nella VM la mappatura autorizzata fornita dal professore:
+  192.168.1.81 dashboard-test
+Verifica poi:
+  getent hosts dashboard-test
+  curl -v http://dashboard-test/
+  curl -vk https://dashboard-test/
+
+configs/dashboard-test.json contiene HTTP/80 e HTTPS/443 inizialmente disabled. Abilita solo il servizio
+che risponde realmente e correggi porta/base_path in base alla documentazione o alle verifiche autorizzate.
+Il professore non ha fornito credenziali: non inventarle e lascia l'assessment anonimo finche' il proprietario
+non fornisce un account/sessione di test. Per una sessione cookie, aggiungi un credential_ref e preferisci una
+variabile d'ambiente come mostrato in configs/platform.example.json.
+Dopo aver abilitato il servizio reale, l'initializer stampa anche il comando equivalente a:
+  python .\assessmentRunner.py --config .\configs\dashboard-test.json --orchestrator agentic --model <MODELLO_EFFETTIVO> --max-rounds 2 --mode balanced --require-ai --authorized
+<MODELLO_EFFETTIVO> e' snap4city quando disponibile, altrimenti il fallback Ollama locale verificato.
+
+Esempio architettura complessa:
+  configs/platform.example.json
+Mostra piu' host, porte 80/443/8443, due identita' web e SSH/22 mantenuto solo come inventario.
+
+3. DETERMINISTIC
 ----------------
 python .\orchestratorDeterministic.py --target <TARGET> --cookies "<COOKIE_HEADER>" --auth-only --authorized --mode balanced
 python .\orchestratorDeterministic.py --target <TARGET> --cookies "<COOKIE_HEADER>" --auth-only --authorized --mode deep
 python .\orchestratorDeterministic.py --target <TARGET> --cookies "<PRIMARY_COOKIE>" --secondary-cookies "<SECOND_ACCOUNT_COOKIE>" --auth-only --authorized --mode deep
 python .\orchestratorDeterministic.py --target <TARGET> --authorized --mode balanced
 
-3. AGENTIC
+4. AGENTIC
 ----------
 Modelli Agentic supportati (il provider viene scelto internamente):
   snap4city  -> Snap4City, endpoint llama4-agentic-inference
@@ -88,7 +150,7 @@ qwen non viene sostituito automaticamente da llama e llama non viene sostituito 
 Non esiste un'opzione --ai-provider: --model sceglie l'AI e il codice deduce automaticamente
 il provider corretto. Quindi snap4city usa Snap4City; llama e qwen usano Ollama.
 
-I comandi Agentic stampati da initScript.py usano Snap4City per default e --require-ai.
+I comandi assessment Agentic stampati da initScript.py usano Snap4City per default e --require-ai quando Snap4City e' verificato; viene inoltre stampato un comando diretto orchestratorAgentic.py con il backend effettivamente disponibile.
 
 Snap4City FAST (2 round):
 python .\orchestratorAgentic.py --target <TARGET> --cookies "<COOKIE_HEADER>" --auth-only --authorized --model snap4city --max-rounds 2 --mode fast --require-ai
@@ -114,22 +176,24 @@ per quel processo. La password viene letta senza echo e le credenziali inserite 
 
 Senza --require-ai, se il planner AI fallisce può essere usato il piccolo fallback deterministico discovery-derived (massimo
 3 azioni sicure per round). Con --require-ai il fallback del planner è disabilitato e il run fallisce se planning/analysis AI
-non completano correttamente. Un fallimento del backend AI non cambia automaticamente provider o modello: Snap4City, Llama e Qwen
-restano selezioni distinte e devono essere richiesti esplicitamente.
+non completano correttamente. Durante un assessment gia' avviato un fallimento del backend AI non cambia automaticamente
+provider o modello: Snap4City, Llama e Qwen restano selezioni distinte. Il fallback Snap4City -> Ollama descritto nella sezione
+di inizializzazione avviene soltanto durante la preparazione, prima di avviare l'assessment.
 
 Il planner riceve candidati derivati dalla discovery e li seleziona in base al
 valore informativo atteso. Può differire controlli ridondanti e non usa una
 checklist minima. Ogni azione passa dagli stessi validator del Deterministic. Al termine, un nodo AI separato
-rivaluta severity, descrizione, impatto e remediation dei finding usando soltanto l’evidenza
-degli scanner; categoria, verification status ed evidenza non possono essere modificati.
+rivaluta severity, descrizione, impatto, conseguenze potenziali, azioni di recovery/ripristino e remediation
+dei finding usando soltanto l’evidenza degli scanner; categoria, verification status ed evidenza non possono
+essere modificati. Se il tool aveva gia' fornito questi testi, l'originale resta nel riquadro di audit del report.
 
-4. PREFLIGHT E TEST
+5. PREFLIGHT E TEST
 -------------------
 python .\orchestratorDeterministic.py --target <TARGET> --authorized --preflight-only
 python .\orchestratorAgentic.py --target <TARGET> --authorized --preflight-only
 python .\orchestratorDeterministic.py --list-tools
 
-5. TEST MIRATI
+6. TEST MIRATI
 ---------------
 ZAP:
 python .\orchestratorDeterministic.py --target <TARGET> --cookies "<COOKIE_HEADER>" --authorized --tool zap --mode deep --tool-timeout 480
@@ -148,7 +212,7 @@ python .\orchestratorDeterministic.py --target <TARGET> --cookies "<COOKIE_HEADE
 python .\orchestratorDeterministic.py --target <TARGET> --cookies "<COOKIE_HEADER>" --authorized --tool workflow --mode balanced
 python .\orchestratorDeterministic.py --target <TARGET> --cookies "<PRIMARY_COOKIE>" --secondary-cookies "<SECOND_ACCOUNT_COOKIE>" --authorized --tool authorization --mode balanced
 
-6. PROFILI E OPZIONI
+7. PROFILI E OPZIONI
 --------------------
 fast      controllo rapido e budget ridotti
 balanced  copertura ampia con priorità ai controlli importanti
@@ -168,7 +232,7 @@ Per target remoti i workflow che inviano POST o file di prova richiedono anche
 --allow-state-changes. Nel laboratorio locale autorizzato sono abilitati
 automaticamente.
 
-7. NUCLEI
+8. NUCLEI
 ---------
 Native mode:
 nuclei -update
@@ -179,7 +243,20 @@ docker run --rm projectdiscovery/nuclei:latest -version
 
 (Get-ChildItem "$HOME\nuclei-templates" -Recurse -File -Include *.yaml,*.yml | Measure-Object).Count
 
-8. REPORT
+9. REPORT
 ---------
-Deterministic: .\reports\SecOps_Assessment_<timestamp>.pdf/.html/.json
-Agentic:       .\reports\SecOps_Agentic_Assessment_<timestamp>.pdf/.html/.json
+Deterministic: .\reports\SecOps_Assessment_<timestamp>.pdf/.html/.json/.review.json
+Agentic:       .\reports\SecOps_Agentic_Assessment_<timestamp>.pdf/.html/.json/.review.json
+
+Il file .review.json conserva in forma redatta risultati, finding normalizzati, contesto, planner audit e
+analisi AI per revisioni successive senza ripetere gli scanner. Rigenerazione:
+python .\rerenderReport.py --snapshot .\reports\<REPORT>.review.json
+
+Nei finding confermati il report mostra anche conseguenze/danno potenziale e recovery/ripristino.
+Deterministic aggiunge una guida conservativa quando il tool non la fornisce; Agentic la produce tramite
+l'analisi AI vincolata alle evidenze. Un danno potenziale non viene presentato come danno realmente avvenuto.
+
+TERMINOLOGIA TOKEN/CREDENZIALI
+  Snap4City access/refresh token = credenziali dell'API LLM remota.
+  Cookie/JWT/CSRF del target     = dati della piattaforma sottoposta ad assessment.
+  Token LLM / num_predict       = unita' di testo del modello, non credenziali di accesso.

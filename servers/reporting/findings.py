@@ -80,6 +80,8 @@ def _normalize_finding(raw: dict[str, Any], profile: str, tool: str) -> dict[str
     url = _redact_text(raw.get("url") or "").strip()
     description = _redact_text(raw.get("description") or "").strip()
     impact = _redact_text(raw.get("impact") or "").strip()
+    consequences = _redact_text(raw.get("consequences") or raw.get("damage") or raw.get("potential_damage") or "").strip()
+    recovery = _redact_text(raw.get("recovery") or raw.get("recovery_actions") or "").strip()
     solution = _redact_text(raw.get("solution") or "").strip()
     evidence = _redact_text(raw.get("evidence") or "").strip()
     if category in {"observation", "discovery"} and len(evidence) > 1200:
@@ -95,7 +97,7 @@ def _normalize_finding(raw: dict[str, Any], profile: str, tool: str) -> dict[str
     payloads = [_redact_text(value) for value in payloads if str(value)]
 
     # Populated by the agentic analysis stage (orchestratorAgenticCore.py's
-    # analysis_node), which enriches severity/description/impact/solution above
+    # analysis_node), which enriches severity/description/impact/consequences/recovery/solution above
     # while preserving the original scanner values here for audit.
     ai_analysis_raw = raw.get("ai_analysis") if isinstance(raw.get("ai_analysis"), dict) else {}
     ai_analysis = _redact_value(ai_analysis_raw) if ai_analysis_raw else {}
@@ -103,6 +105,8 @@ def _normalize_finding(raw: dict[str, Any], profile: str, tool: str) -> dict[str
     scanner_confidence = _redact_text(raw.get("scanner_confidence") or raw.get("confidence") or "not supplied").strip()
     scanner_description = _redact_text(raw.get("scanner_description") or "").strip()
     scanner_impact = _redact_text(raw.get("scanner_impact") or "").strip()
+    scanner_consequences = _redact_text(raw.get("scanner_consequences") or "").strip()
+    scanner_recovery = _redact_text(raw.get("scanner_recovery") or "").strip()
     scanner_solution = _redact_text(raw.get("scanner_solution") or "").strip()
 
     data_quality_notes: list[str] = []
@@ -122,12 +126,12 @@ def _normalize_finding(raw: dict[str, Any], profile: str, tool: str) -> dict[str
         for key, value in raw.items()
         if key not in {
             "alert", "risk", "category", "verification_status", "confidence",
-            "description", "impact", "solution", "url", "method", "parameter",
+            "description", "impact", "consequences", "damage", "potential_damage", "recovery", "recovery_actions", "solution", "url", "method", "parameter",
             "evidence", "technical_details", "other_information", "reproduction",
             "references", "reference", "attack_preconditions", "preconditions",
             "owasp_category", "payload", "payloads",
             "scanner_risk", "scanner_confidence", "scanner_description",
-            "scanner_impact", "scanner_solution", "ai_analysis",
+            "scanner_impact", "scanner_consequences", "scanner_recovery", "scanner_solution", "ai_analysis",
         }
         and value not in (None, "", [], {})
     }
@@ -144,6 +148,8 @@ def _normalize_finding(raw: dict[str, Any], profile: str, tool: str) -> dict[str
         "scanner_risk": scanner_risk,
         "scanner_description": scanner_description,
         "scanner_impact": scanner_impact,
+        "scanner_consequences": scanner_consequences,
+        "scanner_recovery": scanner_recovery,
         "scanner_solution": scanner_solution,
         "url": url,
         "method": _redact_text(raw.get("method") or raw.get("request_method") or ""),
@@ -152,6 +158,8 @@ def _normalize_finding(raw: dict[str, Any], profile: str, tool: str) -> dict[str
         "technical_details": technical,
         "evidence": evidence,
         "impact": impact,
+        "consequences": consequences,
+        "recovery": recovery,
         "solution": solution,
         "reproduction": reproduction,
         "attack_preconditions": attack_preconditions,
@@ -229,6 +237,67 @@ def _finding_family(row: dict[str, Any]) -> str:
     normalized = re.sub(r"\s+in parameter ['\"][^'\"]+['\"]$", "", alert)
     return normalized
 
+# Adds conservative consequence and recovery guidance for confirmed findings when a tool does not provide it.
+def _deterministic_consequence_recovery(row: dict[str, Any]) -> dict[str, str]:
+    if str(row.get("category") or "") != "vulnerability":
+        return {}
+    family = _finding_family(row)
+    alert = str(row.get("alert") or "").lower()
+    if family == "sql-injection":
+        return {
+            "consequences": "Exploitation beyond the bounded verification could expose or alter database records and, depending on database privileges, affect application integrity or availability. The finding does not by itself prove that destructive data changes occurred.",
+            "recovery": "If unintended database changes or disclosure occurred, review database and application logs, verify data integrity, restore affected records from trusted backups when necessary, rotate exposed credentials, apply parameterized queries, and repeat the affected request as a regression test.",
+        }
+    if "command injection" in alert or "os command" in alert:
+        return {
+            "consequences": "Further exploitation could execute operating-system commands with the application service account privileges, allowing file or service modification and potentially broader host compromise. The bounded verification does not establish that persistent system changes occurred.",
+            "recovery": "If unintended command execution occurred, isolate the affected service when needed, review process and system logs, verify modified files/services, restore trusted state, rotate exposed secrets, remove the injection path, and regression-test the corrected request.",
+        }
+    if family in {"stored-xss", "dom-xss", "reflected-xss", "xss"}:
+        return {
+            "consequences": "A successful browser-side exploit could execute attacker-controlled script in an affected user's application context, enabling unauthorized actions or exposure of browser-accessible data. The verification does not imply that user data was actually stolen.",
+            "recovery": "If users were exposed to malicious script, remove the injected content or vulnerable code path, invalidate affected sessions when appropriate, review application logs for abuse, apply context-aware output encoding or sanitization, and retest the same browser flow.",
+        }
+    if family == "path-traversal-lfi":
+        return {
+            "consequences": "Further exploitation could disclose files readable by the application account and may expose configuration, source code or credentials. The verified file-access behavior does not prove that additional sensitive files were retrieved.",
+            "recovery": "If sensitive files were exposed, identify the accessed resources from logs, rotate any disclosed credentials or keys, restore altered files if modification was possible, restrict path resolution to approved locations, and regression-test traversal variants.",
+        }
+    if family == "csrf":
+        return {
+            "consequences": "An attacker could cause an authenticated user's browser to submit unintended state-changing requests within that user's privileges. The finding alone does not prove that unauthorized state changes occurred during the assessment.",
+            "recovery": "If unintended actions occurred, audit the affected account and transaction history, revert unauthorized changes where possible, invalidate relevant sessions if warranted, deploy robust anti-CSRF protections, and verify the corrected workflow with cross-origin requests.",
+        }
+    if family == "session-fixation":
+        return {
+            "consequences": "Successful exploitation could let an attacker reuse a session identifier known before authentication and assume the resulting authenticated session. The verification does not establish that an account was actually taken over.",
+            "recovery": "If session compromise is suspected, invalidate active sessions, review authentication logs, require re-authentication where appropriate, rotate the session identifier after login and privilege changes, and verify that pre-authentication identifiers cannot be reused.",
+        }
+    if "idor" in alert or "authorization" in alert or "access control" in alert:
+        return {
+            "consequences": "Exploitation could let one identity read or modify resources belonging to another identity within the affected authorization boundary. The observed authorization failure does not imply that unrelated objects were accessed or changed.",
+            "recovery": "If unauthorized access occurred, audit affected object histories and access logs, restore unauthorized modifications, notify or invalidate affected sessions when required, enforce server-side object-level authorization on every request, and retest with distinct identities.",
+        }
+    if "upload" in alert:
+        return {
+            "consequences": "Unsafe upload handling could permit storage of attacker-controlled content and, when server execution or unsafe serving is possible, may lead to script execution or malicious-content delivery. The finding does not prove persistent code execution unless evidenced separately.",
+            "recovery": "If unsafe files were stored, remove them, review upload and web-server logs, restore modified content, rotate exposed secrets if execution occurred, restrict file types and storage/serving behavior, and retest upload validation and execution boundaries.",
+        }
+    if family in {"source-configuration-disclosure", "environment-file-disclosure", "git-metadata-disclosure", "php-diagnostic-exposure"}:
+        return {
+            "consequences": "The exposed resource can reveal implementation, environment or configuration details and may disclose secrets that enable follow-on attacks. Only information actually returned by the verified resource should be treated as demonstrated exposure.",
+            "recovery": "Remove public access to the exposed resource, review access logs, rotate credentials or keys only when they were exposed or cannot be ruled out, redeploy clean configuration if needed, and verify that the resource is no longer externally retrievable.",
+        }
+    if family == "oast-interaction":
+        return {
+            "consequences": "The confirmed out-of-band interaction shows that the application can initiate attacker-influenced external communication, which may enable server-side request abuse depending on reachable destinations and protocol handling. Broader internal access is not proven without evidence.",
+            "recovery": "If unintended outbound activity occurred, review application and network logs, block or revoke any exposed destinations or credentials as appropriate, restrict outbound requests and destination validation, and regression-test the exact interaction path after remediation.",
+        }
+    return {
+        "consequences": "Exploitation beyond the bounded verification could extend the demonstrated weakness into unauthorized confidentiality, integrity or availability impact appropriate to the affected component. The report does not claim damage that is not present in the collected evidence.",
+        "recovery": "If unintended impact occurred, review the affected component and logs, restore altered state from trusted sources where necessary, rotate credentials only if exposure is supported, remediate the verified weakness, and repeat the relevant validation as a regression test.",
+    }
+
 # Scores a finding row so the strongest corroborating duplicate wins a merge
 def _finding_strength(row: dict[str, Any]) -> tuple[int, int, int, int]:
     category_score = {"vulnerability": 3, "candidate": 2, "observation": 1, "discovery": 0}.get(str(row.get("category") or ""), 0)
@@ -257,12 +326,12 @@ def _merge_finding_rows(existing: dict[str, Any], row: dict[str, Any], profile: 
     if _finding_strength(row) > _finding_strength(existing):
         for key in (
             "alert", "risk", "category", "verification_status", "confidence",
-            "description", "technical_details", "evidence", "impact", "solution",
+            "description", "technical_details", "evidence", "impact", "consequences", "recovery", "solution",
             "reproduction", "attack_preconditions", "owasp_category", "payload",
             "payloads", "references", "identifiers", "data_quality_notes", "scanner_fields",
             "method", "parameter",
             "scanner_risk", "scanner_confidence", "scanner_description",
-            "scanner_impact", "scanner_solution", "ai_analysis",
+            "scanner_impact", "scanner_consequences", "scanner_recovery", "scanner_solution", "ai_analysis",
         ):
             if row.get(key) not in (None, "", [], {}):
                 existing[key] = row[key]
@@ -309,6 +378,14 @@ def flatten_findings(results: dict[str, Any]) -> list[dict[str, Any]]:
 
     rows = list(merged.values())
     for row in rows:
+        if row.get("category") == "vulnerability" and (not row.get("consequences") or not row.get("recovery")):
+            guidance = _deterministic_consequence_recovery(row)
+            if not row.get("consequences") and guidance.get("consequences"):
+                row["consequences"] = guidance["consequences"]
+            if not row.get("recovery") and guidance.get("recovery"):
+                row["recovery"] = guidance["recovery"]
+            if guidance:
+                row["guidance_source"] = "deterministic-confirmed-finding-policy"
         row["profiles"] = sorted(set(row.get("profiles") or [row.get("profile", "unknown")]))
         row["profile"] = ", ".join(row["profiles"])
         row["tools"] = sorted(set(str(value) for value in row.get("tools", []) if value))

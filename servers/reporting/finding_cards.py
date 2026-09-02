@@ -54,6 +54,10 @@ def _finding_card(item: dict[str, Any], index: int, toc: list[tuple[int, str, st
             scanner_rows += _field('Scanner description', item.get('scanner_description'))
         if item.get('scanner_impact') and item.get('scanner_impact') != item.get('impact'):
             scanner_rows += _field('Scanner security impact', item.get('scanner_impact'))
+        if item.get('scanner_consequences') and item.get('scanner_consequences') != item.get('consequences'):
+            scanner_rows += _field('Scanner potential consequences', item.get('scanner_consequences'))
+        if item.get('scanner_recovery') and item.get('scanner_recovery') != item.get('recovery'):
+            scanner_rows += _field('Scanner recovery / restoration guidance', item.get('scanner_recovery'))
         if item.get('scanner_solution') and item.get('scanner_solution') != item.get('solution'):
             scanner_rows += _field('Scanner recommended remediation', item.get('scanner_solution'))
         scanner_block = f'<div class="scanner-original"><b class="quality-title">Original scanner assessment <span>(secondary audit)</span></b><dl>{scanner_rows}</dl></div>'
@@ -78,6 +82,8 @@ def _finding_card(item: dict[str, Any], index: int, toc: list[tuple[int, str, st
 {_snippet_field('Evidence', item.get('evidence'))}
 <dl>
 {_field('Security impact' + _ai_suffix('impact'), item.get('impact'))}
+{_field('Potential consequences / damage' + _ai_suffix('consequences'), item.get('consequences'))}
+{_field('Recovery / restoration actions' + _ai_suffix('recovery'), item.get('recovery'))}
 {_field('Recommended remediation' + _ai_suffix('solution'), item.get('solution'))}
 </dl>
 {_snippet_field('Reproduction / validation steps', item.get('reproduction'))}
