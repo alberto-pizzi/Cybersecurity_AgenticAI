@@ -2,11 +2,11 @@
   "schema_version": 1,
   "platform": {
     "name": "microX dashboard-test",
-    "description": "Initial test definition for the professor-provided host mapping. Enable only the service confirmed as reachable before running the assessment."
+    "description": "Assessment definition for the dashboard-test host."
   },
   "authorization": {
     "confirmed": true,
-    "reference": "Professor instruction: test 192.168.1.81 mapped as dashboard-test"
+    "reference": "tests 192.168.1.81 mapped as dashboard-test"
   },
   "credentials": {},
   "assets": [
@@ -19,11 +19,11 @@
           "id": "http-80",
           "protocol": "http",
           "port": 80,
-          "base_path": "/",
-          "enabled": false,
+          "base_path": "/dashboardSmartCity/",
+          "enabled": true,
           "auth_only": false,
           "allow_state_changes": false,
-          "notes": "Enable this service only if curl/browser confirms that dashboard-test answers on HTTP port 80."
+          "notes": "HTTP service confirmed reachable. Root redirects to /dashboardSmartCity/, which redirects to the management area."
         },
         {
           "id": "https-443",
@@ -33,7 +33,7 @@
           "enabled": false,
           "auth_only": false,
           "allow_state_changes": false,
-          "notes": "Enable this service only if curl/browser confirms that dashboard-test answers on HTTPS port 443."
+          "notes": "HTTPS port 443 was tested and refused the connection."
         }
       ]
     }
