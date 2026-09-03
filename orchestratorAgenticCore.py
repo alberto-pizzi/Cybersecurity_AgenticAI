@@ -1907,7 +1907,7 @@ def _final_browser_verification_actions(state: AgentState) -> list[dict[str, Any
                         continue
                     selected = dict(case)
                     break
-                if selected is None and same_origin(state['target'], finding_url) and not shared._destructive_crawl_url(finding_url):
+                if selected is None and shared.same_origin(state['target'], finding_url) and not shared._destructive_crawl_url(finding_url):
                     parsed = urlparse(finding_url)
                     pairs = [(name, '1' if any(token in value.lower() for token in ('<script', '<img', 'javascript:', 'onerror=', 'onload=')) else value) for name, value in parse_qsl(parsed.query, keep_blank_values=True)]
                     safe_url = urlunparse(parsed._replace(query=urlencode(pairs)))
