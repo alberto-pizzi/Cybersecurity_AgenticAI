@@ -1,3 +1,9 @@
+"""Snap4City OAuth credential helper.
+
+Access and refresh tokens managed here authenticate the remote Snap4City LLM API.
+They are distinct from target-platform cookies, JWTs and anti-CSRF tokens handled by
+the security assessment workflow.
+"""
 
 import requests
 import time

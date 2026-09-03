@@ -15,7 +15,7 @@ import orchestratorAgenticCore as agentic_core
 from orchestratorAgenticCore import (
     AgentState, AI_PLANNER_TIMEOUTS, SNAP4CITY_DEFAULT_API_URL, resolve_ai_model,
     ensure_ollama_model, warm_ollama_model, ensure_snap4city_model,
-    discovery_node, planner_node, executor_node, analysis_node, report_node, route_after_execution,
+    discovery_node, planner_node, executor_node, verification_node, analysis_node, report_node, route_after_execution,
     execute_action, execute_plan, validate_plan,
 )
 from orchestratorShared import (
@@ -45,12 +45,14 @@ def build_graph() -> Any:
     graph.add_node("discovery", discovery_node)
     graph.add_node("planner", planner_node)
     graph.add_node("executor", executor_node)
+    graph.add_node("verification", verification_node)
     graph.add_node("analysis", analysis_node)
     graph.add_node("report", report_node)
     graph.add_edge(START, "discovery")
     graph.add_edge("discovery", "planner")
     graph.add_edge("planner", "executor")
-    graph.add_conditional_edges("executor", route_after_execution, {"planner": "planner", "analysis": "analysis"})
+    graph.add_conditional_edges("executor", route_after_execution, {"planner": "planner", "verification": "verification"})
+    graph.add_edge("verification", "analysis")
     graph.add_edge("analysis", "report")
     graph.add_edge("report", END)
     return graph.compile()
@@ -230,6 +232,7 @@ def main() -> int:
         "secondary_cookies": secondary_cookie,
         "planner_audit": [],
         "analysis": {},
+        "verification_done": False,
         "only_tool": args.only_tool,
     }
     started = time.time()

@@ -29,7 +29,7 @@ import requests
 with warnings.catch_warnings():
     warnings.simplefilter('ignore')
     from fastmcp import Client
-from utils import apply_runtime_target_preparation, absolute_url, canonical_cookie_header, cookie_names, load_runtime_config, normalize_url, ROOT_DIR, same_origin, scanner_session_probe, SERVERS_DIR, target_runtime_profile, MCP_UNIFIED_SERVICE, mcp_http_port, mcp_http_url
+from utils import apply_runtime_target_preparation, absolute_url, canonical_cookie_header, cookie_names, load_runtime_config, normalize_url, parse_cookie_header, ROOT_DIR, same_origin, scanner_session_probe, SERVERS_DIR, target_runtime_profile, MCP_UNIFIED_SERVICE, mcp_http_port, mcp_http_url
 ROOT = Path(ROOT_DIR).resolve()
 SERVERS = Path(SERVERS_DIR).resolve()
 RUNTIME_FILE = ROOT / '.secops_runtime.json'
@@ -829,7 +829,183 @@ def _client_side_source_sink_evidence(text: str) -> tuple[list[str], list[str]]:
     sink_hits = sorted(set(re.findall('(?:innerHTML|outerHTML|insertAdjacentHTML|document\\.write(?:ln)?|eval\\s*\\(|setTimeout\\s*\\(\\s*[\'\\"]|setInterval\\s*\\(\\s*[\'\\"])', value, re.I)))
     return (source_hits[:12], sink_hits[:12])
 
-# Crawls the target and records pages, forms, parameters, scripts, and auth state.
+# Extracts literal same-origin endpoint hints from JavaScript without executing the script.
+def _javascript_endpoint_hints(text: str, base_url: str, target: str) -> list[dict[str, str]]:
+
+    value = str(text or '')[:1000000]
+    patterns = (
+        (re.compile(r"fetch\s*\(\s*[\"']([^\"']+)[\"']", re.I), 'GET'),
+        (re.compile(r"axios\.(get|post|put|patch|delete)\s*\(\s*[\"']([^\"']+)[\"']", re.I), ''),
+        (re.compile(r"\.open\s*\(\s*[\"'](GET|POST|PUT|PATCH|DELETE)[\"']\s*,\s*[\"']([^\"']+)[\"']", re.I), ''),
+    )
+    hints: list[dict[str, str]] = []
+    seen: set[tuple[str, str]] = set()
+    for pattern, fixed_method in patterns:
+        for match in pattern.finditer(value):
+            if fixed_method:
+                method, raw_url = fixed_method, match.group(1)
+            else:
+                method, raw_url = match.group(1).upper(), match.group(2)
+            if raw_url.startswith(('data:', 'javascript:', '#')) or '{' in raw_url or '}' in raw_url:
+                continue
+            try:
+                url = _normalize_redundant_base_path_link(target, _clean_url(absolute_url(base_url, raw_url)))
+            except Exception:
+                continue
+            if not same_origin(target, url) or _destructive_crawl_url(url):
+                continue
+            key = (method, url)
+            if key in seen:
+                continue
+            seen.add(key)
+            hints.append({'method': method, 'url': url})
+            if len(hints) >= 80:
+                return hints
+    return hints
+
+# Converts one browser-observed request into the normalized request-contract shape.
+def _browser_network_case(url: str, method: str, data: str, content_type: str, source_url: str, resource_type: str) -> dict[str, Any] | None:
+
+    method = str(method or 'GET').upper()
+    if method not in {'GET', 'POST', 'PUT', 'PATCH', 'DELETE'}:
+        return None
+    parsed = urlparse(url)
+    parameters = [name for name, _ in parse_qsl(parsed.query, keep_blank_values=True)]
+    fields: list[dict[str, str]] = []
+    body = str(data or '')
+    lowered_type = str(content_type or '').lower()
+    if body and method != 'GET':
+        if 'application/x-www-form-urlencoded' in lowered_type:
+            for name, value in parse_qsl(body, keep_blank_values=True):
+                parameters.append(name)
+                fields.append({'name': name, 'value': value, 'type': 'text', 'tag': 'network'})
+        elif 'json' in lowered_type or body.lstrip().startswith(('{', '[')):
+            try:
+                decoded = json.loads(body)
+            except Exception:
+                decoded = None
+            if isinstance(decoded, dict):
+                for name, value in decoded.items():
+                    parameters.append(str(name))
+                    scalar = value if isinstance(value, (str, int, float, bool)) or value is None else ''
+                    fields.append({'name': str(name), 'value': '' if scalar is None else str(scalar), 'type': 'json', 'tag': 'network'})
+    parameters = list(dict.fromkeys((str(name) for name in parameters if str(name))))
+    if not parameters:
+        return None
+    return {
+        'url': url, 'method': method, 'data': body, 'parameters': parameters, 'file_parameters': [],
+        'token_parameters': [name for name in parameters if re.search('(?:csrf|xsrf|token|nonce|authenticity|request[_-]?verification)', name, re.I)],
+        'fields': fields, 'enctype': lowered_type or 'unknown', 'content_type': lowered_type,
+        'source_url': source_url or url, 'network_resource_type': resource_type, 'discovery_source': 'playwright_network',
+    }
+
+# Uses Chromium as a bounded dynamic discovery queue so rendered navigation and XHR/fetch contracts become scanner inputs.
+def _browser_network_discovery(target: str, cookies: str, html_urls: list[str]) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[str], list[dict[str, Any]]]:
+
+    try:
+        from playwright.sync_api import sync_playwright
+    except Exception as exc:
+        return ([], [], [], [{'url': target, 'type': 'BrowserDiscoveryUnavailable', 'message': f'{type(exc).__name__}: {exc}'}])
+    navigation_budget = 8 if CURRENT_SCAN_MODE == 'fast' else 20 if CURRENT_SCAN_MODE == 'balanced' else 45
+    ranked_pages = sorted(set((_clean_url(value) for value in html_urls if value)), key=lambda value: (-_risk_terms(value), len(urlparse(value).path), value))
+    target_url = _clean_url(target)
+    if target_url in ranked_pages:
+        ranked_pages.remove(target_url)
+    queue: list[str] = [target_url, *ranked_pages]
+    queued: set[str] = set(queue)
+    navigated: list[str] = []
+    visited: set[str] = set()
+    observed: list[dict[str, Any]] = []
+    cases: list[dict[str, Any]] = []
+    errors: list[dict[str, Any]] = []
+    current_source = {'url': target_url}
+
+    def enqueue_dynamic(raw_url: str) -> None:
+        try:
+            candidate = _normalize_redundant_base_path_link(target, _clean_url(raw_url))
+        except Exception:
+            return
+        if not candidate or candidate in queued or candidate in visited:
+            return
+        if not same_origin(target, candidate) or not _crawlable_url(candidate) or _destructive_crawl_url(candidate):
+            return
+        queued.add(candidate)
+        queue.insert(0, candidate)
+
+    try:
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch(headless=True)
+            context = browser.new_context(ignore_https_errors=True, user_agent='SecOps-Browser-Discovery/1.0')
+            parsed_target = urlparse(target)
+            origin = urlunparse(parsed_target._replace(path='/', query='', fragment=''))
+            cookie_rows = [{'name': name, 'value': value, 'url': origin} for name, value in parse_cookie_header(cookies)]
+            if cookie_rows:
+                context.add_cookies(cookie_rows)
+
+            def route_guard(route: Any) -> None:
+                request_url = str(route.request.url or '')
+                request_method = str(route.request.method or 'GET').upper()
+                if same_origin(target, request_url) and (_destructive_crawl_url(request_url) or request_method not in {'GET', 'HEAD', 'OPTIONS'}):
+                    route.abort()
+                else:
+                    route.continue_()
+
+            context.route('**/*', route_guard)
+            page = context.new_page()
+
+            def record_request(request: Any) -> None:
+                url = _clean_url(str(request.url or ''))
+                if not url or not same_origin(target, url) or _destructive_crawl_url(url):
+                    return
+                method = str(request.method or 'GET').upper()
+                resource_type = str(request.resource_type or '')
+                if resource_type not in {'document', 'xhr', 'fetch'} and not urlparse(url).query:
+                    return
+                headers = request.headers or {}
+                content_type = str(headers.get('content-type') or '')
+                data = str(request.post_data or '')
+                observed.append({'url': url, 'method': method, 'resource_type': resource_type, 'content_type': content_type, 'source_url': current_source['url'], 'has_body': bool(data), 'blocked_before_send': method not in {'GET', 'HEAD', 'OPTIONS'}})
+                case = _browser_network_case(url, method, data, content_type, current_source['url'], resource_type)
+                if case:
+                    cases.append(case)
+                if resource_type == 'document' and method == 'GET' and url != current_source['url']:
+                    enqueue_dynamic(url)
+
+            page.on('request', record_request)
+            while queue and len(visited) < navigation_budget:
+                value = queue.pop(0)
+                if value in visited:
+                    continue
+                visited.add(value)
+                current_source['url'] = value
+                try:
+                    response = page.goto(value, wait_until='domcontentloaded', timeout=12000)
+                    page.wait_for_timeout(650)
+                    response_type = str((response.headers if response else {}).get('content-type') or '').lower()
+                    if not response_type or 'html' in response_type:
+                        navigated.append(value)
+                    for href in page.eval_on_selector_all('a[href]', 'elements => elements.map(element => element.href)'):
+                        enqueue_dynamic(str(href or ''))
+                    for frame in page.frames:
+                        frame_url = str(frame.url or '')
+                        if frame_url and frame_url != value:
+                            enqueue_dynamic(frame_url)
+                except Exception as exc:
+                    errors.append({'url': value, 'type': 'BrowserDiscoveryNavigation', 'message': f'{type(exc).__name__}: {exc}'})
+            browser.close()
+    except Exception as exc:
+        errors.append({'url': target, 'type': 'BrowserDiscoveryRuntime', 'message': f'{type(exc).__name__}: {exc}'})
+    unique_observed: list[dict[str, Any]] = []
+    seen_observed: set[tuple[str, str, str]] = set()
+    for row in observed:
+        key = (str(row.get('method') or ''), str(row.get('url') or ''), str(row.get('resource_type') or ''))
+        if key in seen_observed:
+            continue
+        seen_observed.add(key)
+        unique_observed.append(row)
+    return (_dedupe_request_cases(cases), unique_observed, list(dict.fromkeys(navigated)), errors)
+
+# Crawls the target and records pages, forms, parameters, scripts, browser requests, and auth state.
 def discover_target(target: str, cookies: str, max_pages: int=MAX_CRAWL_PAGES, seeds: list[str] | None=None) -> dict[str, Any]:
 
     session = requests.Session()
@@ -854,6 +1030,7 @@ def discover_target(target: str, cookies: str, max_pages: int=MAX_CRAWL_PAGES, s
     request_cases: list[dict[str, Any]] = []
     client_side_candidates: list[dict[str, Any]] = []
     script_urls: set[str] = set()
+    script_endpoint_hints: list[dict[str, str]] = []
     scanned_script_urls: set[str] = set()
     tokens: set[str] = set()
     errors: list[dict[str, Any]] = []
@@ -923,6 +1100,13 @@ def discover_target(target: str, cookies: str, max_pages: int=MAX_CRAWL_PAGES, s
             if not same_origin(target, script_final):
                 continue
             script_urls.add(script_final)
+            for hint in _javascript_endpoint_hints(script_response.text, script_final, target):
+                if hint not in script_endpoint_hints:
+                    script_endpoint_hints.append(hint)
+                if hint.get('method') == 'GET' and urlparse(str(hint.get('url') or '')).query:
+                    hinted_url = str(hint['url'])
+                    request_cases.append({'url': hinted_url, 'method': 'GET', 'data': '', 'parameters': [name for name, _ in parse_qsl(urlparse(hinted_url).query, keep_blank_values=True)], 'file_parameters': [], 'token_parameters': [], 'fields': [], 'source_url': script_final, 'discovery_source': 'javascript_literal'})
+                    parameterized.add(hinted_url)
             js_sources, js_sinks = _client_side_source_sink_evidence(script_response.text)
             if js_sources and js_sinks:
                 client_side_candidates.append({'url': final, 'script_url': script_final, 'sources': js_sources, 'sinks': js_sinks, 'evidence_source': 'same_origin_script'})
@@ -958,6 +1142,14 @@ def discover_target(target: str, cookies: str, max_pages: int=MAX_CRAWL_PAGES, s
                 request_cases.append(case)
                 if case['method'] == 'GET':
                     parameterized.add(case['url'])
+    browser_cases, browser_network_requests, browser_navigation_urls, browser_errors = _browser_network_discovery(target, cookies, sorted(html_urls)) if html_urls else ([], [], [], [])
+    request_cases.extend(browser_cases)
+    html_urls.update(browser_navigation_urls)
+    visited.update(browser_navigation_urls)
+    errors.extend(browser_errors)
+    for case in browser_cases:
+        if str(case.get('method') or '').upper() == 'GET' and urlparse(str(case.get('url') or '')).query:
+            parameterized.add(str(case['url']))
     auth_effective: bool | None = None
     auth_note = 'Anonymous profile.'
     auth_probe: dict[str, Any] = {}
@@ -993,14 +1185,26 @@ def discover_target(target: str, cookies: str, max_pages: int=MAX_CRAWL_PAGES, s
             auth_effective = None
             auth_probe = {'url': probe_url, 'error': f'{type(exc).__name__}: {exc}', 'conclusive': False}
         auth_note = 'The supplied cookie was distinguished from the anonymous response.' if auth_effective is True else 'The supplied cookie reached a login or authorization failure page.' if auth_effective is False else 'The supplied cookie remained usable, but this target did not expose a conclusive anonymous/authenticated distinction.'
-    return {'urls': sorted(visited), 'html_urls': sorted(html_urls), 'form_urls': sorted(form_urls), 'parameterized_urls': sorted(parameterized), 'request_cases': _dedupe_request_cases(request_cases), 'script_urls': sorted(script_urls), 'client_side_candidates': client_side_candidates, 'jwt_tokens': sorted(tokens), 'errors': errors, 'authentication_effective': auth_effective, 'authentication_note': auth_note, 'authentication_probe': auth_probe, 'target_preparation': target_preparation, 'destructive_urls_skipped': sorted(destructive_skipped)}
+    return {'urls': sorted(visited), 'html_urls': sorted(html_urls), 'form_urls': sorted(form_urls), 'parameterized_urls': sorted(parameterized), 'request_cases': _dedupe_request_cases(request_cases), 'script_urls': sorted(script_urls), 'script_endpoint_hints': script_endpoint_hints, 'browser_network_requests': browser_network_requests, 'browser_navigation_urls': browser_navigation_urls, 'client_side_candidates': client_side_candidates, 'jwt_tokens': sorted(tokens), 'errors': errors, 'authentication_effective': auth_effective, 'authentication_note': auth_note, 'authentication_probe': auth_probe, 'target_preparation': target_preparation, 'destructive_urls_skipped': sorted(destructive_skipped)}
 
 # Combines discovery results without duplicating pages or request cases.
 def merge_discovery(left: dict[str, Any], right: dict[str, Any]) -> dict[str, Any]:
     merged = dict(left)
-    for key in ('urls', 'html_urls', 'form_urls', 'parameterized_urls', 'script_urls', 'jwt_tokens'):
+    for key in ('urls', 'html_urls', 'form_urls', 'parameterized_urls', 'script_urls', 'browser_navigation_urls', 'jwt_tokens'):
         merged[key] = sorted(set(left.get(key, [])) | set(right.get(key, [])))
     merged['request_cases'] = _dedupe_request_cases([*left.get('request_cases', []), *right.get('request_cases', [])])
+    for key, identity in (('script_endpoint_hints', lambda row: (str(row.get('method') or ''), str(row.get('url') or ''))), ('browser_network_requests', lambda row: (str(row.get('method') or ''), str(row.get('url') or ''), str(row.get('resource_type') or '')))):
+        rows: list[dict[str, Any]] = []
+        seen_rows: set[tuple[Any, ...]] = set()
+        for row in [*left.get(key, []), *right.get(key, [])]:
+            if not isinstance(row, dict):
+                continue
+            row_key = identity(row)
+            if not row_key or row_key in seen_rows:
+                continue
+            seen_rows.add(row_key)
+            rows.append(row)
+        merged[key] = rows
     client_rows: list[dict[str, Any]] = []
     seen_client: set[str] = set()
     for row in [*left.get('client_side_candidates', []), *right.get('client_side_candidates', [])]:
@@ -1045,11 +1249,12 @@ def _is_auto_index_url(url: str) -> bool:
 def _is_auto_index_case(case: dict[str, Any]) -> bool:
     names = {str(value).lower() for value in case.get('parameters', [])}
     return _is_auto_index_url(str(case.get('url', ''))) or (bool(names) and names <= AUTO_INDEX_PARAMETERS and urlparse(str(case.get('url', ''))).path.endswith('/'))
-SQL_HINTS = {'id', 'uid', 'user', 'user_id', 'username', 'email', 'account', 'query', 'search', 'q', 'category', 'product', 'item', 'order'}
-XSS_HINTS = {'name', 'message', 'comment', 'search', 'query', 'q', 'input', 'text', 'title', 'url', 'redirect', 'callback'}
+SQL_HINTS = {'id', 'uid', 'user', 'user_id', 'userid', 'username', 'email', 'account', 'accountid', 'query', 'search', 'q', 'filter', 'sort', 'page', 'offset', 'limit', 'category', 'product', 'productid', 'item', 'itemid', 'order', 'orderid', 'dashboardid', 'widgetid', 'deviceid', 'modelid', 'serviceid'}
+XSS_HINTS = {'name', 'message', 'comment', 'search', 'query', 'q', 'input', 'text', 'title', 'pagetitle', 'html', 'content', 'url', 'linkurl', 'redirect', 'callback', 'fromsubmenu'}
 COMMAND_HINTS = {'cmd', 'command', 'exec', 'shell', 'ip', 'host', 'hostname', 'ping', 'target', 'domain'}
 TRAVERSAL_HINTS = {'file', 'filename', 'path', 'page', 'include', 'template', 'document', 'folder', 'dir', 'directory', 'view', 'resource', 'download'}
-IDOR_HINTS = {'id', 'uid', 'user_id', 'account_id', 'object_id', 'item_id', 'order_id', 'document_id', 'file_id', 'profile_id'}
+IDOR_HINTS = {'id', 'uid', 'user_id', 'userid', 'account_id', 'accountid', 'object_id', 'objectid', 'item_id', 'itemid', 'order_id', 'orderid', 'document_id', 'documentid', 'file_id', 'fileid', 'profile_id', 'profileid', 'dashboardid', 'widgetid', 'deviceid', 'modelid'}
+NAVIGATION_PARAMETERS = {'pagetitle', 'linkid', 'fromsubmenu', 'showframe', 'redirect', 'linkurl'}
 
 # Parameter extraction lists the names available in a normalized request case.
 def _case_parameters(case: dict[str, Any]) -> set[str]:
@@ -1084,7 +1289,13 @@ def _tool_case_priority(tool: str, case: dict[str, Any]) -> int:
     score = _risk_terms(text)
     if tool == 'sqlmap':
         score += 45 if any((token in path for token in ('sql', 'query', 'database', 'search'))) else 0
-        score += 9 * len(parameters & SQL_HINTS)
+        score += 18 if any((token in path for token in ('/api', 'data', 'device', 'model', 'dashboard', 'widget'))) else 0
+        score += 14 * len(parameters & SQL_HINTS)
+        score += 16 if method == 'POST' else 0
+        score += 12 if 'json' in str(case.get('content_type') or case.get('enctype') or '').lower() else 0
+        score += 8 if case.get('discovery_source') == 'playwright_network' else 0
+        if parameters and parameters <= NAVIGATION_PARAMETERS and not (parameters & SQL_HINTS):
+            score -= 65
         if _is_login_case(case) and (not any((token in path for token in ('sql', 'query', 'database')))):
             score -= 100
         if 'brute' in path and (not any((token in path for token in ('sql', 'query', 'database')))):
@@ -1096,7 +1307,8 @@ def _tool_case_priority(tool: str, case: dict[str, Any]) -> int:
         if _prefer_browser_for_xss_case(case):
             return -1000
         score += 45 if any((token in path for token in ('xss', 'comment', 'message', 'search', 'feedback'))) else 0
-        score += 10 * len(parameters & XSS_HINTS)
+        score += 12 * len(parameters & XSS_HINTS)
+        score += 10 if case.get('discovery_source') == 'playwright_network' else 0
         if any((token in path for token in ('sqli', '/exec', '/csp'))) and (not parameters & XSS_HINTS):
             score -= 35
         if _is_login_case(case):
@@ -1163,6 +1375,8 @@ def select_tool_request_cases(discovery: dict[str, Any], tool: str, limit: int |
     ranked: list[tuple[int, int, dict[str, Any]]] = []
     for index, case in enumerate(cases):
         if not isinstance(case, dict):
+            continue
+        if str(case.get('method', 'GET')).upper() not in {'GET', 'POST'}:
             continue
         if not [value for value in case.get('parameters', []) if str(value)]:
             continue
@@ -1748,7 +1962,10 @@ def log_zap_session_diagnostics(result: dict[str, Any]) -> None:
         effective_started = result.get('effective_targeted_scans_started', result.get('targeted_active_scans_started', 0))
         print(f"    [ZAP COVERAGE] seeded URLs={result.get('seeded_urls', 0)}; seeded requests={result.get('seeded_request_cases', 0)}; native targeted={result.get('targeted_active_scans_completed', 0)}/{result.get('targeted_active_scans_started', 0)}; effective native/proxy={effective_done}/{effective_started}; configured rules={result.get('active_rules_attempted', 0)}/{result.get('active_rules_planned', 0)} ({result.get('active_rule_coverage_percent', 0)}%); completed-rule coverage={result.get('active_rules_completed', 0)}/{result.get('active_rules_planned', 0)} ({result.get('active_rule_effective_coverage_percent', 0)}%); proxy confirmed={result.get('proxy_assisted_confirmed', 0)}; native security alerts={stats.get('security', 0)}; site-tree URLs={result.get('zap_sites_tree_urls', 0)}")
         if policy:
-            print('    [ZAP ACTIVE POLICY] first-tier rule IDs=' + (', '.join(policy.get('enabled_ids', [])) or 'none'))
+            if policy.get('active_scan_enabled') is False:
+                print(f"    [ZAP ACTIVE POLICY] passive-only by explicit scan mode; catalog rules={policy.get('catalog_rule_count', 0)}")
+            else:
+                print('    [ZAP ACTIVE POLICY] planned rule IDs=' + (', '.join((str(value) for value in policy.get('planned_rule_ids', []))) or 'none'))
         deferred = result.get('deferred_native_active_cases') if isinstance(result.get('deferred_native_active_cases'), list) else []
         if deferred:
             print('    [ZAP ACTIVE POLICY] deferred in balanced/prioritized: ' + ', '.join((str(item.get('case_class') or item.get('url') or '') for item in deferred if isinstance(item, dict))))
@@ -1918,9 +2135,11 @@ def select_session_probe_url(discovery: dict[str, Any], target: str) -> str:
     return _stable_auth_probe_url(target, discovered)
 
 # Safety policy decides whether state-changing tests are allowed for the current target.
-def state_changing_tests_allowed(target: str, explicit: bool=False) -> bool:
+def state_changing_tests_allowed(target: str, explicit: bool | None=None) -> bool:
 
-    return bool(explicit) or urlparse(target).hostname in {'127.0.0.1', 'localhost', '::1'}
+    if explicit is not None:
+        return bool(explicit)
+    return urlparse(target).hostname in {'127.0.0.1', 'localhost', '::1'}
 
 # Adds the command-line options shared by both orchestrators.
 def add_common_cli_arguments(parser: argparse.ArgumentParser, *, require_target: bool) -> None:
@@ -1933,7 +2152,9 @@ def add_common_cli_arguments(parser: argparse.ArgumentParser, *, require_target:
     parser.add_argument('--secondary-cookies', default='', help='Optional second authenticated identity for read-only authorization/BOLA comparison.')
     parser.add_argument('--auth-only', action='store_true')
     parser.add_argument('--authorized', action='store_true')
-    parser.add_argument('--allow-state-changes', action='store_true', help='Enable bounded POST/upload/stored-XSS workflow probes on an explicitly authorized remote target; local labs enable them automatically.')
+    state_change_group = parser.add_mutually_exclusive_group()
+    state_change_group.add_argument('--allow-state-changes', dest='allow_state_changes', action='store_true', default=None, help='Explicitly enable bounded POST/upload/stored-XSS workflow probes for this run.')
+    state_change_group.add_argument('--no-allow-state-changes', dest='allow_state_changes', action='store_false', help='Explicitly disable bounded state-changing probes, including on local targets.')
     parser.add_argument('--preflight-only', action='store_true')
     parser.add_argument('--ignore-preflight-errors', action='store_true')
     parser.add_argument('--interactsh-injection-url', default='')
@@ -1974,7 +2195,7 @@ def prepare_cli_context(parser: argparse.ArgumentParser, args: argparse.Namespac
     return (target, profiles, normalized_cookie, secondary_cookie, injection_url)
 
 # Builds the arguments sent to each MCP tool from discovery data.
-def build_tool_arguments(tool: str, target_url: str, cookies: str, discovery: dict[str, Any], *, case: dict[str, Any] | None=None, secondary_cookies: str='', allow_state_changes: bool=False, timeout_override: int=0, diagnostic_only: bool=False, single_tool: bool=False) -> dict[str, Any]:
+def build_tool_arguments(tool: str, target_url: str, cookies: str, discovery: dict[str, Any], *, case: dict[str, Any] | None=None, secondary_cookies: str='', allow_state_changes: bool | None=None, timeout_override: int=0, diagnostic_only: bool=False, single_tool: bool=False) -> dict[str, Any]:
 
     case = case or {}
     arguments: dict[str, Any] = {'target_url': target_url, 'cookies': cookies}
@@ -1986,17 +2207,14 @@ def build_tool_arguments(tool: str, target_url: str, cookies: str, discovery: di
             sample_count = 7 if CURRENT_SCAN_MODE == 'deep' else 5 if CURRENT_SCAN_MODE == 'balanced' else 3
             arguments.update({'probe_url': select_session_probe_url(discovery, target_url), 'sample_count': sample_count})
         elif tool == 'zap':
-            authenticated = bool(cookies)
-            if diagnostic_only or not authenticated:
+            if diagnostic_only:
                 scan_mode = 'passive'
             elif CURRENT_SCAN_MODE == 'deep':
                 scan_mode = 'full'
             elif CURRENT_SCAN_MODE == 'balanced':
                 scan_mode = 'prioritized'
-            elif single_tool:
-                scan_mode = 'targeted'
             else:
-                scan_mode = 'passive'
+                scan_mode = 'targeted'
             arguments.update({'seed_urls': discovery.get('html_urls', []), 'request_cases': discovery.get('request_cases', []), 'scan_mode': scan_mode, 'max_observations': 150 if CURRENT_SCAN_MODE == 'deep' else 50 if CURRENT_SCAN_MODE == 'balanced' or single_tool else 25})
             if single_tool:
                 arguments['diagnostic_only'] = diagnostic_only

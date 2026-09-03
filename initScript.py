@@ -491,7 +491,7 @@ def main() -> int:
     parser.add_argument("--skip-preflight", action="store_true", help="Skip the live deterministic MCP/dependency preflight.")
     parser.add_argument("--skip-scanners", action="store_true", help="Skip scanner installation and do not require all scanner executables.")
     parser.add_argument("--skip-browser", action="store_true", help="Do not install/verify Playwright Chromium; browser-only checks will be skipped.")
-    parser.add_argument("--require-browser", action="store_true", help="Fail initialization if Playwright Chromium cannot be installed/launched.")
+    parser.add_argument("--require-browser", action="store_true", help="Compatibility flag: Chromium is already required by default unless --skip-browser is used.")
     parser.add_argument("--commands-only", action="store_true", help="Print every supported command/modifier, write init.txt, and exit.")
     parser.add_argument("--version", action="version", version=BUILD_ID)
     args = parser.parse_args()
@@ -527,7 +527,7 @@ def main() -> int:
         print("\n=== SecOps FastMCP initialization ===")
         install_python_packages()
         if not args.skip_browser:
-            install_playwright_browser(required=args.require_browser)
+            install_playwright_browser(required=True)
         elif args.require_browser:
             raise RuntimeError("--require-browser cannot be combined with --skip-browser.")
         create_wordlist()

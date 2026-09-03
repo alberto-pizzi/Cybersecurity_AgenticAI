@@ -46,6 +46,8 @@ def load_assessment_config(path: str | Path) -> dict[str, Any]:
     model = str(execution.get("model") or "snap4city").lower()
     if model not in SUPPORTED_MODELS:
         raise ValueError(f"execution.model must be one of {sorted(SUPPORTED_MODELS)}.")
+    if "allow_state_changes" in execution and not isinstance(execution.get("allow_state_changes"), bool):
+        raise ValueError("execution.allow_state_changes must be true or false when supplied.")
     _validate_assets(assets)
     _validate_credentials(payload.get("credentials") or {})
     return payload
@@ -79,6 +81,8 @@ def _validate_assets(assets: list[Any]) -> None:
             if global_id in seen_services:
                 raise ValueError(f"Duplicate service id: {global_id}")
             seen_services.add(global_id)
+            if "allow_state_changes" in service and not isinstance(service.get("allow_state_changes"), bool):
+                raise ValueError(f"allow_state_changes for {global_id} must be true or false when supplied.")
             port = service.get("port")
             if port not in (None, ""):
                 try:
@@ -183,7 +187,7 @@ def iter_service_jobs(config: dict[str, Any]) -> Iterator[dict[str, Any]]:
                 "secondary_credential_ref": secondary_ref,
                 "secondary_credential_kind": str((credentials.get(secondary_ref) or {}).get("kind") or "") if secondary_ref else "",
                 "auth_only": bool(service.get("auth_only", False)),
-                "allow_state_changes": bool(service.get("allow_state_changes", execution.get("allow_state_changes", False))),
+                "allow_state_changes": service.get("allow_state_changes") if "allow_state_changes" in service else execution.get("allow_state_changes"),
                 "interactsh_injection_url": str(service.get("interactsh_injection_url") or "").strip(),
                 "notes": str(service.get("notes") or "").strip(),
             }

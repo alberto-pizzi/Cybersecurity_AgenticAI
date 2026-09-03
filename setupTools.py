@@ -37,7 +37,7 @@ NUCLEI_TEMPLATE_UPDATE_TIMEOUT = 600
 _NUCLEI_TEMPLATE_STATE: dict[str, Any] = {}
 _NUCLEI_ENGINE_STATE: dict[str, Any] = {}
 _IDOR_FORGE_STATE: dict[str, Any] = {}
-BUILD_ID = 'secops-v31.15-unified-mcp-agentic-risk-linux-bootstrap-20260826'
+BUILD_ID = 'secops-v31.16-dynamic-browser-discovery-20260903'
 FASTMCP_VERSION = '3.4.5'
 FASTMCP_REQUIREMENT = f'fastmcp=={FASTMCP_VERSION}'
 LANGGRAPH_REQUIREMENT = 'langgraph==1.2.10'
@@ -241,22 +241,26 @@ def _playwright_chromium_ready() -> tuple[bool, str]:
     detail = _process_output(probe)
     return (probe.returncode == 0, detail)
 
-# Installs Chromium for browser checks and verifies that it can start.
+# Installs Chromium together with its host dependencies and verifies that it can start.
 def install_playwright_browser(*, required: bool=False) -> bool:
 
     ready, detail = _playwright_chromium_ready()
     if ready:
         print(f"[+] Playwright Chromium ready: {(detail.splitlines()[-1] if detail else 'launch verified')}")
         return True
-    print('[*] Installing Playwright Chromium for DOM/stored-XSS workflow verification.')
-    result = run([sys.executable, '-m', 'playwright', 'install', 'chromium'], required=False, capture=True, timeout=2400)
+    print('[*] Installing Playwright Chromium for browser discovery and XSS verification.')
+    command = [sys.executable, '-m', 'playwright', 'install']
+    if platform.system().lower() == 'linux':
+        command.append('--with-deps')
+    command.append('chromium')
+    result = run(command, required=False, capture=True, timeout=2400)
     ready, detail = _playwright_chromium_ready()
     if ready:
-        print(f"[+] Playwright Chromium installed: {(detail.splitlines()[-1] if detail else 'launch verified')}")
+        print(f"[+] Playwright Chromium installed and launch verified: {(detail.splitlines()[-1] if detail else 'launch verified')}")
         return True
-    message = f'Playwright is installed but Chromium could not be launched. Installer return code={result.returncode}. Diagnostic: {detail[-2500:]}'
+    message = f'Playwright Chromium initialization failed. Installer return code={result.returncode}. Diagnostic: {detail[-2500:]}'
     if platform.system().lower() == 'linux':
-        message += '\nOn Linux, install browser system dependencies with: python -m playwright install-deps chromium'
+        message += '\nThe initializer already requested Playwright browser system dependencies with --with-deps; inspect the package-manager output above if installation was denied.'
     if required:
         raise RuntimeError(message)
     print(f'[!] {message}\n[!] Browser-only checks will be reported as skipped; all other scanners remain available.', file=sys.stderr)

@@ -51,7 +51,7 @@ class DeterministicState(TypedDict, total=False):
     target: str
     profiles: list[dict[str, str]]
     injection_url: str
-    allow_state_changes: bool
+    allow_state_changes: bool | None
     secondary_cookies: str
     discovery: dict[str, dict[str, Any]]
     diagnostics: list[dict[str, Any]]
@@ -70,7 +70,7 @@ class DeterministicState(TypedDict, total=False):
 async def deterministic_discovery_node(state: DeterministicState) -> dict[str, Any]:
     target = state['target']
     profiles = state['profiles']
-    allow_state_changes = bool(state.get('allow_state_changes', False))
+    allow_state_changes = state.get('allow_state_changes')
     print('\n[*] Discovery anonima e autenticata...')
     discovery: dict[str, dict[str, Any]] = {}
     diagnostics: list[dict[str, Any]] = []
@@ -81,7 +81,7 @@ async def deterministic_discovery_node(state: DeterministicState) -> dict[str, A
         found = discover_target(target, profile['cookies'])
         discovery[name] = found
         diagnostics.extend(({'phase': 'discovery', 'profile': name, **item} for item in found['errors']))
-        print(f"    {name}: {len(found['html_urls'])} pagine HTML, {len(found['request_cases'])} casi GET/POST, {len(found['errors'])} errori")
+        print(f"    {name}: {len(found['html_urls'])} pagine HTML, {len(found['request_cases'])} casi GET/POST, {len(found.get('browser_navigation_urls', []))} navigazioni Chromium, {len(found['errors'])} errori")
         for error in found['errors'][:5]:
             print(f"      [CRAWL WARNING] {error.get('type', 'error')}: {error.get('url', '')} — {error.get('message', '')}")
         if len(found['errors']) > 5:
@@ -438,7 +438,7 @@ async def deterministic_report_node(state: DeterministicState) -> dict[str, Any]
     return {'assessment_context': context, 'report_status': report}
 
 # The deterministic pipeline executes the full graph and returns the state produced by its final node.
-async def run_pipeline(target: str, profiles: list[dict[str, str]], injection_url: str, allow_state_changes: bool=False, secondary_cookies: str='') -> dict[str, Any]:
+async def run_pipeline(target: str, profiles: list[dict[str, str]], injection_url: str, allow_state_changes: bool | None=None, secondary_cookies: str='') -> dict[str, Any]:
     # The deterministic graph starts from a fresh state containing discovery, results, and scan settings.
     initial: DeterministicState = {'target': target, 'profiles': profiles, 'injection_url': injection_url, 'allow_state_changes': allow_state_changes, 'secondary_cookies': secondary_cookies}
     final = await build_deterministic_graph().ainvoke(initial)
@@ -481,7 +481,7 @@ def _single_tool_preflight_errors(checks: list[dict[str, str]], tool: str) -> li
     return [item for item in checks if item.get('level') == 'error' and item.get('component') in allowed]
 
 # Isolated tool mode keeps the same preparation and validation used by full assessments.
-async def run_single_tool_debug(*, tool: str, target: str, cookies: str, mode: str, secondary_cookies: str='', explicit_url: str='', method: str='GET', data: str='', parameters: list[str] | None=None, jwt_token: str='', injection_url: str='', timeout_override: int=0, diagnostic_only: bool=False, allow_state_changes: bool=False) -> dict[str, Any]:
+async def run_single_tool_debug(*, tool: str, target: str, cookies: str, mode: str, secondary_cookies: str='', explicit_url: str='', method: str='GET', data: str='', parameters: list[str] | None=None, jwt_token: str='', injection_url: str='', timeout_override: int=0, diagnostic_only: bool=False, allow_state_changes: bool | None=None) -> dict[str, Any]:
 
     configure_scan_mode(mode)
     method = str(method or 'GET').upper()

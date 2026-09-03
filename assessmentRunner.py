@@ -61,7 +61,7 @@ def _direct_assessment(args: argparse.Namespace) -> tuple[dict[str, Any], list[d
         "model": args.model or "snap4city",
         "max_rounds": args.max_rounds or 2,
         "require_ai": True if args.require_ai is None else bool(args.require_ai),
-        "allow_state_changes": bool(args.allow_state_changes),
+        "allow_state_changes": args.allow_state_changes,
     }
     config: dict[str, Any] = {
         "schema_version": 1,
@@ -94,7 +94,7 @@ def _direct_assessment(args: argparse.Namespace) -> tuple[dict[str, Any], list[d
         "secondary_credential_ref": secondary_ref,
         "secondary_credential_kind": "cookie" if secondary_ref else "",
         "auth_only": bool(args.auth_only),
-        "allow_state_changes": bool(args.allow_state_changes),
+        "allow_state_changes": args.allow_state_changes,
         "interactsh_injection_url": "",
         "notes": "Direct command-line target",
     }
@@ -127,8 +127,8 @@ def _apply_execution_overrides(config: dict[str, Any], args: argparse.Namespace)
         execution["max_rounds"] = args.max_rounds
     if args.require_ai is not None:
         execution["require_ai"] = args.require_ai
-    if args.allow_state_changes:
-        execution["allow_state_changes"] = True
+    if args.allow_state_changes is not None:
+        execution["allow_state_changes"] = args.allow_state_changes
     if args.authorized:
         config.setdefault("authorization", {})["confirmed"] = True
 
@@ -190,8 +190,11 @@ def _build_command(
             f"Job {job['id']} targets a non-local service, but authorization.confirmed is not true."
         )
 
-    if bool(execution.get("allow_state_changes")) or job.get("allow_state_changes"):
+    state_change_setting = job.get("allow_state_changes")
+    if state_change_setting is True:
         command.append("--allow-state-changes")
+    elif state_change_setting is False:
+        command.append("--no-allow-state-changes")
     if job.get("interactsh_injection_url"):
         command.extend(["--interactsh-injection-url", str(job["interactsh_injection_url"])])
 
@@ -239,7 +242,9 @@ def main() -> int:
     parser.add_argument("--max-rounds", type=int, choices=(1, 2, 3), default=0, help="Override Agentic maximum planning rounds.")
     parser.add_argument("--auth-only", action="store_true", help="Run only the authenticated profile. With a cookie and without this flag, both anonymous and authenticated profiles are run.")
     parser.add_argument("--authorized", action="store_true", help="Confirm that the configured non-local targets are explicitly authorized for assessment.")
-    parser.add_argument("--allow-state-changes", action="store_true", help="Allow bounded state-changing probes on authorized remote targets.")
+    state_change_group = parser.add_mutually_exclusive_group()
+    state_change_group.add_argument("--allow-state-changes", dest="allow_state_changes", action="store_true", default=None, help="Explicitly allow bounded state-changing probes for this run.")
+    state_change_group.add_argument("--no-allow-state-changes", dest="allow_state_changes", action="store_false", help="Explicitly disable bounded state-changing probes, including on local targets.")
     ai_group = parser.add_mutually_exclusive_group()
     ai_group.add_argument("--require-ai", dest="require_ai", action="store_true", default=None, help="Require successful Agentic planning and final AI analysis.")
     ai_group.add_argument("--no-require-ai", dest="require_ai", action="store_false", help="Allow the existing Agentic deterministic fallback when AI planning fails.")

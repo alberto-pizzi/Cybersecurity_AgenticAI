@@ -103,6 +103,7 @@ Override disponibili senza modificare il JSON:
   --require-ai / --no-require-ai
   --authorized
   --allow-state-changes
+  --no-allow-state-changes
   --dry-run
   --only <ASSET/SERVICE>
 
@@ -187,6 +188,31 @@ rivaluta severity, descrizione, impatto, conseguenze potenziali, azioni di recov
 dei finding usando soltanto l’evidenza degli scanner; categoria, verification status ed evidenza non possono
 essere modificati. Se il tool aveva gia' fornito questi testi, l'originale resta nel riquadro di audit del report.
 
+DISCOVERY E COPERTURA DINAMICA
+-----------------------------
+Per default initScript.py installa Playwright Chromium, su Linux richiede anche le dipendenze host
+con `python -m playwright install --with-deps chromium` e verifica un avvio headless reale. Se questa
+verifica fallisce, l'inizializzazione fallisce invece di lasciare il Browser verifier in stato
+`missing_playwright_browser`. Solo `--skip-browser` disattiva esplicitamente questa garanzia.
+
+La discovery combina crawler HTTP, form/query, endpoint letterali trovati negli script e una sola coda
+dinamica Chromium. Il browser parte dalle pagine HTML sicure e piu' interessanti gia' note, le carica e
+osserva richieste same-origin document/XHR/fetch; i nuovi link/documenti same-origin renderizzati vengono
+reinseriti subito nella stessa coda. Il budget totale di navigazioni Chromium e' 8 in fast, 20 in balanced
+e 45 in deep; le XHR/fetch osservate non consumano un ulteriore budget di pagine e possono generare
+request contract. Le richieste browser non-GET e le rotte distruttive vengono intercettate prima dell'invio:
+il body puo' diventare request contract con metodo e parametri reali; GET/POST vengono poi consumati dai tool
+compatibili, mentre gli altri metodi restano tracciati come superficie osservata.
+
+ZAP: fast=targeted, balanced=prioritized, deep=full bounded; la modalita' passiva resta per i soli
+controlli diagnostici. Se era richiesto active scan ma non e' possibile pianificare alcuna regola,
+il risultato e' PARTIAL/no_active_scan_rules_enabled, non SUCCESS con 0 regole.
+Nuclei: balanced e deep possono usare request contract per DAST gap checks bounded.
+Gli specialisti sui parametri privilegiano API/dati, identificatori/query, POST/JSON e richieste
+osservate dal browser rispetto a parametri puramente di navigazione.
+L'Agentic esegue infine una fase deterministica Chromium sui candidati XSS ancora non confermati,
+prima dell'analisi AI e del report. Il limite e' 2 candidati in fast, 8 in balanced e 15 in deep.
+
 5. PREFLIGHT E TEST
 -------------------
 python .\orchestratorDeterministic.py --target <TARGET> --authorized --preflight-only
@@ -228,9 +254,30 @@ Con --with-lab e valore all vengono predisposti entrambi i modelli Ollama e veri
 Con snap4city l'initializer non provisiona ne' richiede Ollama se nessun modello locale e' richiesto.
 Se --prepare-ai e --agentic-model sono entrambi presenti, all include qualunque modello; una selezione singola deve invece coincidere.
 
-Per target remoti i workflow che inviano POST o file di prova richiedono anche
---allow-state-changes. Nel laboratorio locale autorizzato sono abilitati
-automaticamente.
+Il gate state-changing usa tre stati. Se allow_state_changes=true nel config o viene passato
+--allow-state-changes, i probe bounded sono abilitati; se allow_state_changes=false oppure viene
+passato --no-allow-state-changes, sono disabilitati anche su un laboratorio locale. Soltanto se
+il valore non e' specificato viene applicato il default automatico: 127.0.0.1, localhost e ::1
+abilitano i probe, mentre qualunque altro host, compresi indirizzi privati/LAN come
+dashboard-test / 192.168.1.81, li mantiene disabilitati. Nel config il valore del singolo servizio
+ha precedenza sul valore della sezione execution. Questi flag non abilitano rotte distruttive e
+non disabilitano l'intero scanner: limitano solo le verifiche attive che possono cambiare stato.
+
+Il flag non e' un interruttore universale no-write per tutti gli scanner: nella versione attuale
+viene passato specificamente ai percorsi sotto. SQLMap, Commix, ZAP, Nuclei e gli altri wrapper
+non leggono questo flag e mantengono le rispettive policy/bounds indipendenti.
+
+In particolare il gate interessa:
+  - Dalfox wrapper: il probe aggiuntivo di reflection su richieste POST; i controlli GET e il tool
+    Dalfox non vengono globalmente spenti;
+  - Browser verifier: il test stored-XSS che inserisce un marker innocuo e ricarica la pagina per
+    verificarne la persistenza; i controlli DOM/reflected non persistenti restano disponibili;
+  - Workflow verifier: la validazione attiva CSRF tramite POST con/senza token, il caricamento di un
+    file-marker innocuo e la verifica CAPTCHA tramite rimozione del campo di challenge. Le sole
+    osservazioni strutturali dei form possono ancora essere prodotte senza questi invii.
+
+Deterministic e Agentic usano la stessa funzione centrale di orchestratorShared per questa policy:
+la selezione del planner AI non puo' aggirare il blocco Python.
 
 8. NUCLEI
 ---------

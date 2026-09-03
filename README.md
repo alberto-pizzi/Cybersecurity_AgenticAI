@@ -11,7 +11,7 @@ direct orchestrator commands remain supported. Full command reference: `init.txt
 
 ### Initialization
 
-- `initScript.py`: Installs/verifies dependencies, scanners, Docker images and Playwright. With `--with-lab` it sets up
+- `initScript.py`: Installs/verifies dependencies, scanners, Docker images and Playwright. Chromium is a verified default dependency: unless `--skip-browser` is explicitly used, initialization installs the Playwright Chromium build (and Linux host dependencies) and fails if a headless launch cannot be completed. With `--with-lab` it sets up
 the local training lab and ZAP and prepares the selected AI backends. If neither `--prepare-ai` nor `--agentic-model` is
 specified, it prepares all three choices: it pulls/verifies `llama3.1:8b` and `qwen2.5:7b` in the project Ollama container
 and authenticates/verifies the remote Snap4City `llama4-agentic-inference` endpoint. Snap4City is remote and therefore is
@@ -33,7 +33,7 @@ Then, there are mainly **2 orchestrators** that are responsible for directing th
 authorization → browser/workflow → specialist checks → report. The baseline engine.
 
 - `orchestratorAgentic.py`: Same discovery and validators as Deterministic, but a selectable AI planner chooses
-discovery-derived actions each round. Supported aliases are `snap4city` (Snap4City `llama4-agentic-inference`),
+discovery-derived actions each round. Before the AI analysis, a final deterministic Chromium stage retries unresolved XSS candidates when a compatible request contract is available. Supported aliases are `snap4city` (Snap4City `llama4-agentic-inference`),
 `llama` (Ollama `llama3.1:8b`) and `qwen` (Ollama `qwen2.5:7b`). After execution, the same selected provider/model
 performs a separate evidence-grounded risk assessment, including potential consequences and recovery/restoration guidance,
 while scanner evidence and confirmation status remain immutable.
@@ -55,6 +55,12 @@ The other files support the previous ones, as shared logic or support files.
 
 The runner is an optional layer above the orchestrators, not a replacement for them. Existing direct commands such as
 `python orchestratorDeterministic.py --target ...` and `python orchestratorAgentic.py --target ...` continue to work unchanged.
+
+### Discovery and scanner coverage
+
+Discovery combines the requests-based crawler with one bounded Playwright/Chromium dynamic-discovery queue. Chromium starts from the highest-value safe HTML pages already known to the crawler, loads them, records same-origin `document`, `xhr` and `fetch` requests, and immediately reinserts newly rendered same-origin links/documents into the same queue. The total Chromium navigation budget is 8 pages in `fast`, 20 in `balanced` and 45 in `deep`; XHR/fetch observations do not consume an extra page budget and can all become request contracts. HTML forms and query strings remain first-class request contracts, while same-origin JavaScript is also inspected for literal endpoint hints. During discovery, non-GET browser requests and destructive routes are intercepted before network transmission: their method/body/parameters can be recorded without turning page loading into a state-changing probe. Destructive logout/setup/reset/delete families remain excluded. The resulting contracts are shared by both orchestrators and drive specialist ranking instead of inventing endpoints or parameters.
+
+ZAP active mode is selected from the scan profile rather than from whether the current profile has a cookie: `fast` uses bounded targeted active scanning, `balanced` prioritized active scanning and `deep` the broader bounded mode; `diagnostic_only` remains passive. If active scanning was requested but no compatible active rule can be planned, the result is `partial` with `no_active_scan_rules_enabled` instead of a misleading successful `0/N` active-rule run. Nuclei consumes discovered request contracts for bounded DAST gap checks in both `balanced` and `deep`, while SQLMap/Dalfox/other parameter scanners rank API/data-oriented contracts, meaningful identifier/query parameters, method and observed JSON/network evidence ahead of navigation-only parameters. Before final AI analysis, the Agentic `verification` node sends at most 2 unresolved XSS candidates in `fast`, 8 in `balanced` and 15 in `deep` to the Chromium verifier when a compatible request contract exists.
 
 ## Requirements
 
@@ -153,7 +159,7 @@ python .\assessmentRunner.py --target http://127.0.0.1 --cookies "PHPSESSID=<SES
 ```
 
 `--orchestrator`, `--mode`, `--model`, `--max-rounds`, `--auth-only`, `--require-ai`/`--no-require-ai`,
-`--authorized` and `--allow-state-changes` override only the current run and do not rewrite the source JSON. For local Ollama
+`--authorized`, `--allow-state-changes` and `--no-allow-state-changes` override only the current run and do not rewrite the source JSON. For local Ollama
 models, `assessmentRunner.py` requires the exact requested model to be already installed and passes `--no-model-pull` to the
 Agentic orchestrator; initialize the chosen model first instead of silently substituting another model.
 
@@ -236,6 +242,18 @@ Reports produced land in `reports/` .
 
 ## Common flags
 
-- `--authorized` for any non-local target
-- `--allow-state-changes` for state-changing probes on a remote target
+- `--authorized` for any non-local target.
+- `--allow-state-changes` explicitly enables the bounded checks that intentionally submit potentially persistent/state-changing requests.
+- `--no-allow-state-changes` explicitly disables those checks, including on a local laboratory target.
+- `--skip-browser` is an initializer-only opt-out. Without it, `initScript.py` treats a launchable Playwright Chromium as required and installs Linux browser dependencies automatically when needed.
+
+The state-changing safety gate is centralized in `orchestratorShared.state_changing_tests_allowed()` and uses three states. An explicit `true`/`--allow-state-changes` always enables the bounded checks; an explicit `false`/`--no-allow-state-changes` always disables them. Only when the setting is omitted does the automatic default apply: targets whose hostname is exactly `127.0.0.1`, `localhost` or `::1` are treated as local laboratories and enable the bounded checks, while every other hostname or address, including private/LAN targets such as `dashboard-test` / `192.168.1.81`, keeps them disabled. A service-level `allow_state_changes` value overrides the execution-level value in an assessment JSON. Deterministic and Agentic execution both pass through the same Python gate, so the Agentic planner cannot bypass it.
+
+The flag is not a universal no-write switch for every third-party scanner: in the current implementation it is passed specifically to the following active verification paths. SQLMap, Commix, ZAP, Nuclei and the other scanner wrappers do not read this flag; their own bounded/safety behavior remains separate.
+
+The flag currently affects these active verification paths:
+
+- **Dalfox wrapper (`dalfoxServer.py`)**: the additional bounded reflection verifier may submit a POST only when state changes are allowed. GET-based checks and the external Dalfox scan are not globally disabled by this flag.
+- **Browser verifier (`browserServer.py`)**: the stored-XSS check may submit a harmless marker and revisit the page to verify persistence only when state changes are allowed; DOM/reflected browser checks that do not require persistent submission can still run.
+- **Workflow verifier (`workflowServer.py`)**: active POST validation for anti-CSRF enforcement, the bounded harmless file-upload marker check and the CAPTCHA-field-removal request require state changes to be allowed. Structural/form-only observations can still be reported without sending those verification requests. Routes matched as destructive (for example setup/reset/delete/logout families) remain excluded independently of this flag.
 

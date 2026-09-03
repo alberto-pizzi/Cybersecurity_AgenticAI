@@ -14,7 +14,7 @@ import warnings
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Literal, TypedDict
-from urllib.parse import parse_qsl, urlparse
+from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 
 warnings.filterwarnings("ignore", message=r".*authlib\.jose.*deprecated.*")
 import requests
@@ -61,10 +61,11 @@ class AgentState(TypedDict):
     require_ai: bool
     planner_source: str
     ai_timeout: int
-    allow_state_changes: bool
+    allow_state_changes: bool | None
     secondary_cookies: str
     planner_audit: list[dict[str, Any]]
     analysis: dict[str, Any]
+    verification_done: bool
     only_tool: str
 # CPU-only Ollama hosts can take far longer than 720s to prefill+decode a JSON-schema-constrained
 # plan (no tokens at all until prefill finishes), so these budgets stay generous by default.
@@ -283,6 +284,9 @@ def _planner_discovery_summary(discovery: dict[str, dict[str, Any]]) -> dict[str
             'authenticated': found.get('authentication_effective'),
             'html_pages': len(found.get('html_urls', [])),
             'request_cases': len(found.get('request_cases', [])),
+            'browser_network_requests': len(found.get('browser_network_requests', [])),
+            'browser_navigations': len(found.get('browser_navigation_urls', [])),
+            'script_endpoint_hints': len(found.get('script_endpoint_hints', [])),
             'client_side_candidates': len(found.get('client_side_candidates', [])),
             'jwt_tokens': len(found.get('jwt_tokens', [])),
             'crawl_errors': len(found.get('errors', [])),
@@ -1312,7 +1316,7 @@ def discovery_node(state: AgentState) -> dict[str, Any]:
         found = discover_target(state['target'], profile['cookies'], max_pages=30)
         discovery[profile['name']] = found
         diagnostics.extend(({'phase': 'discovery', 'profile': profile['name'], **item} for item in found['errors']))
-        print(f"    {profile['name']}: {len(found.get('html_urls', []))} HTML pages, {len(found.get('request_cases', []))} GET/POST cases, {len(found['jwt_tokens'])} JWTs")
+        print(f"    {profile['name']}: {len(found.get('html_urls', []))} HTML pages, {len(found.get('request_cases', []))} request contracts, {len(found.get('browser_network_requests', []))} browser network requests, {len(found.get('browser_navigation_urls', []))} Chromium navigations, {len(found['jwt_tokens'])} JWTs")
         if found.get('authentication_effective') is False:
             print(f"    [WARNING] {profile['name']}: {found.get('authentication_note')}", file=sys.stderr)
     return {'discovery': discovery, 'diagnostics': diagnostics}
@@ -1685,7 +1689,7 @@ def planner_node(state: AgentState) -> dict[str, Any]:
     return {'plan': plan, 'round': round_number, 'notes': notes, 'finished': finished, 'planner_source': planner_source, 'planner_audit': audit}
 
 # Action execution invokes one validated tool and stores the normalized result in planner state.
-async def execute_action(action: dict[str, Any], cookies: dict[str, str], discovery: dict[str, dict[str, Any]], allow_state_changes: bool=False, secondary_cookies: str='') -> tuple[dict[str, Any], dict[str, Any]]:
+async def execute_action(action: dict[str, Any], cookies: dict[str, str], discovery: dict[str, dict[str, Any]], allow_state_changes: bool | None=None, secondary_cookies: str='') -> tuple[dict[str, Any], dict[str, Any]]:
     tool = action['tool']
     profile = action['profile']
     server, function = REGISTRY[tool][:2]
@@ -1734,7 +1738,7 @@ async def execute_action(action: dict[str, Any], cookies: dict[str, str], discov
         return (action, result)
 
 # Within each planner round, validated actions run before the model is asked to plan again.
-async def execute_plan(plan: list[dict[str, Any]], cookies: dict[str, str], discovery: dict[str, dict[str, Any]], allow_state_changes: bool=False, secondary_cookies: str='') -> list[tuple[dict[str, Any], dict[str, Any]]]:
+async def execute_plan(plan: list[dict[str, Any]], cookies: dict[str, str], discovery: dict[str, dict[str, Any]], allow_state_changes: bool | None=None, secondary_cookies: str='') -> list[tuple[dict[str, Any], dict[str, Any]]]:
 
     profile_order = {name: index for index, name in enumerate(cookies)}
     ordered = sorted(plan, key=lambda action: (profile_order.get(action['profile'], 999), shared.tool_execution_rank(action['tool'], bool(cookies.get(action['profile'], '')))))
@@ -1819,11 +1823,11 @@ def executor_node(state: AgentState) -> dict[str, Any]:
     remaining_stage = [action for action in state['plan'] if action['tool'] != 'ffuf']
     if discovery_stage:
         print('\n[*] Discovery enrichment stage: FFUF runs before ZAP/Nuclei.', flush=True)
-        ffuf_executed = asyncio.run(execute_plan(discovery_stage, cookies, discovery, allow_state_changes=state.get('allow_state_changes', False), secondary_cookies=state.get('secondary_cookies', '')))
+        ffuf_executed = asyncio.run(execute_plan(discovery_stage, cookies, discovery, allow_state_changes=state.get('allow_state_changes'), secondary_cookies=state.get('secondary_cookies', '')))
         new_attack_surface += _record_execution_batch(ffuf_executed, state=state, results=results, discovery=discovery, completed=completed, profile_cookies=profile_cookies)
         print('[*] FFUF enrichment is available to planned ZAP/Nuclei actions; new parameter candidates will be offered to the AI planner next round.', flush=True)
     if remaining_stage:
-        executed = asyncio.run(execute_plan(remaining_stage, cookies, discovery, allow_state_changes=state.get('allow_state_changes', False), secondary_cookies=state.get('secondary_cookies', '')))
+        executed = asyncio.run(execute_plan(remaining_stage, cookies, discovery, allow_state_changes=state.get('allow_state_changes'), secondary_cookies=state.get('secondary_cookies', '')))
         new_attack_surface += _record_execution_batch(executed, state=state, results=results, discovery=discovery, completed=completed, profile_cookies=profile_cookies)
     next_state = dict(state)
     next_state.update(results=results, discovery=discovery, completed=completed)
@@ -1844,9 +1848,83 @@ def executor_node(state: AgentState) -> dict[str, Any]:
         audit[-1]['remaining_eligible_actions_after_execution'] = len(remaining)
     return {'results': results, 'discovery': discovery, 'completed': completed, 'notes': notes, 'planner_audit': audit, 'finished': not can_continue}
 
-# Decides whether the agent should plan again or create the report.
-def route_after_execution(state: AgentState) -> Literal['planner', 'analysis']:
-    return 'analysis' if state['finished'] or state['round'] >= state['max_rounds'] or (not state['plan']) else 'planner'
+# Builds bounded Chromium actions for XSS candidates that still require runtime validation.
+def _final_browser_verification_actions(state: AgentState) -> list[dict[str, Any]]:
+
+    limit = 2 if shared.CURRENT_SCAN_MODE == 'fast' else 8 if shared.CURRENT_SCAN_MODE == 'balanced' else 15
+    actions: list[dict[str, Any]] = []
+    seen: set[tuple[str, str, str]] = set()
+    for profile, profile_results in state.get('results', {}).items():
+        discovered = state.get('discovery', {}).get(profile, {})
+        browser_cases = select_browser_request_cases(discovered, limit=max(12, limit * 4))
+        for result_key, result in profile_results.items():
+            if not isinstance(result, dict) or str(result_key).startswith('browser:'):
+                continue
+            for finding in result.get('vulnerabilities', []) if isinstance(result.get('vulnerabilities'), list) else []:
+                if not isinstance(finding, dict):
+                    continue
+                category = str(finding.get('category') or finding.get('verification_status') or '').lower()
+                text = ' '.join(str(finding.get(key) or '') for key in ('alert', 'title', 'name', 'description', 'type')).lower()
+                if category != 'candidate' or 'xss' not in text:
+                    continue
+                finding_url = str(finding.get('url') or result.get('target') or state['target'])
+                parameter = str(finding.get('parameter') or '').strip()
+                finding_path = urlparse(finding_url).path
+                selected: dict[str, Any] | None = None
+                for case in browser_cases:
+                    case_parameters = {str(value) for value in case.get('parameters', [])}
+                    if urlparse(str(case.get('url') or '')).path != finding_path:
+                        continue
+                    if parameter and parameter not in case_parameters:
+                        continue
+                    selected = dict(case)
+                    break
+                if selected is None and same_origin(state['target'], finding_url) and not shared._destructive_crawl_url(finding_url):
+                    parsed = urlparse(finding_url)
+                    pairs = [(name, '1' if any(token in value.lower() for token in ('<script', '<img', 'javascript:', 'onerror=', 'onload=')) else value) for name, value in parse_qsl(parsed.query, keep_blank_values=True)]
+                    safe_url = urlunparse(parsed._replace(query=urlencode(pairs)))
+                    parameters = [name for name, _ in pairs]
+                    if parameters:
+                        selected = {'url': safe_url, 'method': 'GET', 'data': '', 'parameters': parameters, 'fields': [], 'source_url': safe_url}
+                if selected is None:
+                    continue
+                key = (profile, str(selected.get('url') or ''), parameter)
+                if key in seen:
+                    continue
+                seen.add(key)
+                actions.append({'profile': profile, 'tool': 'browser', 'target_url': selected['url'], 'method': selected.get('method', 'GET'), 'data': selected.get('data', ''), 'parameters': selected.get('parameters', []), 'jwt_token': '', 'injection_url': '', 'fields': selected.get('fields', []), 'source_url': selected.get('source_url', ''), 'client_sources': selected.get('client_sources', []), 'client_sinks': selected.get('client_sinks', []), 'reason': f'Final Chromium verification of XSS candidate from {result_key}.'})
+                if len(actions) >= limit:
+                    return actions
+    return actions
+
+# Runs a deterministic final browser verification stage before AI narrative analysis.
+def verification_node(state: AgentState) -> dict[str, Any]:
+
+    actions = _final_browser_verification_actions(state)
+    notes = list(state.get('notes', []))
+    if not actions:
+        notes.append('Final verification: no unresolved XSS candidate had a compatible Chromium request contract.')
+        print('\n[*] Final verification: no Chromium candidate requires validation.', flush=True)
+        return {'verification_done': True, 'notes': notes}
+    print(f'\n[*] Final verification: validating {len(actions)} XSS candidate(s) with Chromium.', flush=True)
+    cookies = {profile['name']: profile['cookies'] for profile in state['profiles']}
+    profile_cookies = dict(cookies)
+    results = {profile: dict(values) for profile, values in state['results'].items()}
+    discovery = {profile: dict(values) for profile, values in state['discovery'].items()}
+    completed = list(state['completed'])
+    before_keys = {profile: set(values) for profile, values in results.items()}
+    executed = asyncio.run(execute_plan(actions, cookies, discovery, allow_state_changes=state.get('allow_state_changes'), secondary_cookies=state.get('secondary_cookies', '')))
+    _record_execution_batch(executed, state=state, results=results, discovery=discovery, completed=completed, profile_cookies=profile_cookies)
+    for profile, values in results.items():
+        for key, value in values.items():
+            if key not in before_keys.get(profile, set()) and isinstance(value, dict) and key.startswith('browser:'):
+                value['final_verification_stage'] = True
+    notes.append(f'Final verification: Chromium executed {len(executed)} candidate validation action(s).')
+    return {'results': results, 'discovery': discovery, 'completed': completed, 'verification_done': True, 'notes': notes}
+
+# Decides whether the agent should plan again or enter final deterministic verification.
+def route_after_execution(state: AgentState) -> Literal['planner', 'verification']:
+    return 'verification' if state['finished'] or state['round'] >= state['max_rounds'] or (not state['plan']) else 'planner'
 
 # Once execution is complete, reporting receives the collected state and produces the final assessment.
 def report_node(state: AgentState) -> dict[str, Any]:
@@ -1874,10 +1952,10 @@ def report_node(state: AgentState) -> dict[str, Any]:
         'python_executable': sys.executable,
         'mcp_server_python': shared._server_python(),
         'remaining_eligible_actions_at_report': len(remaining),
-        'execution_policy': 'AI selects discovery-derived scan actions under deterministic safety validation. After execution, a separate AI analysis node independently enriches severity, description, impact, potential consequences, recovery guidance and remediation using scanner evidence; category, verification status, request evidence and confirmation rules remain deterministic and immutable. Bounded state-changing workflow probes run automatically on local labs and require explicit --allow-state-changes for remote authorized targets.',
-        'allow_state_changes': state.get('allow_state_changes', False),
+        'execution_policy': 'AI selects discovery-derived scan actions under deterministic safety validation. After the planning rounds, a deterministic Chromium verification stage rechecks unresolved XSS candidates when a compatible request contract is available; a separate AI analysis node then independently enriches severity, description, impact, potential consequences, recovery guidance and remediation using scanner evidence. Category, verification status, request evidence and confirmation rules remain deterministic and immutable. Bounded state-changing workflow probes use a tri-state policy: an explicit allow/deny is authoritative; when unspecified, only loopback local labs enable them automatically and remote authorized targets keep them disabled.',
+        'allow_state_changes': state.get('allow_state_changes'),
         'secondary_identity_supplied': bool(state.get('secondary_cookies', '')),
-        'orchestration': {'engine': 'langgraph', 'mode': 'agentic', 'nodes': ['discovery', 'planner', 'executor', 'analysis', 'report']}}
+        'orchestration': {'engine': 'langgraph', 'mode': 'agentic', 'nodes': ['discovery', 'planner', 'executor', 'verification', 'analysis', 'report']}}
     report = asyncio.run(call_mcp('reporting/reportServer.py', 'generate_report', {'findings_summary': report_results, 'target_url': state['target'], 'output_name': output_name, 'assessment_context': context}))
     if report.get('status') != 'success' and (not report.get('json_filename')):
         fallback = write_emergency_json_report(state['target'], state['results'], state['diagnostics'], str(report.get('output', 'Report MCP failed.')), 'SecOps_Agentic_Emergency')
