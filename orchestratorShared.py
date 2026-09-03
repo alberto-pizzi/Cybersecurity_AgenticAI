@@ -36,13 +36,13 @@ RUNTIME_FILE = ROOT / '.secops_runtime.json'
 UNIFIED_MCP_SERVER = 'secopsServer.py'
 LOCAL_BIN = Path.home() / '.local' / 'bin'
 MCP_CONNECT_TIMEOUT = float(os.getenv('SECOPS_MCP_CONNECT_TIMEOUT', '20'))
-MCP_TOOL_TIMEOUT = float(os.getenv('SECOPS_MCP_TIMEOUT', '900'))
+MCP_TOOL_TIMEOUT = float(os.getenv('SECOPS_MCP_TIMEOUT', '1200'))
 MAX_PARAMETER_ENDPOINTS = max(1, int(os.getenv('SECOPS_MAX_PARAMETER_ENDPOINTS', '5')))
 MAX_ARJUN_ENDPOINTS = max(1, int(os.getenv('SECOPS_MAX_ARJUN_ENDPOINTS', '3')))
 MAX_CRAWL_PAGES = max(10, int(os.getenv('SECOPS_MAX_CRAWL_PAGES', '50')))
 MAX_SCRIPT_ASSETS = max(4, int(os.getenv('SECOPS_MAX_SCRIPT_ASSETS', '24')))
 SCANNER_PROGRESS_INTERVAL = max(10, int(os.getenv('SECOPS_PROGRESS_INTERVAL', '30')))
-SCAN_MODES = {'fast': {'broad': {'zap': 90, 'nuclei': 90, 'nikto': 45, 'ffuf': 40, 'session': 20}, 'parameter': {'sqlmap': 60, 'dalfox': 35, 'commix': 40, 'traversal': 25, 'idor': 12, 'authorization': 25, 'browser': 35, 'workflow': 30}, 'limits': {'sqlmap': 1, 'dalfox': 1, 'commix': 1, 'traversal': 1, 'idor': 1, 'authorization': 1, 'browser': 1, 'workflow': 1}, 'arjun': 30, 'arjun_limit': 1}, 'balanced': {'broad': {'zap': 360, 'nuclei': 210, 'nikto': 90, 'ffuf': 75, 'session': 35}, 'parameter': {'sqlmap': 120, 'dalfox': 90, 'commix': 75, 'traversal': 45, 'idor': 20, 'authorization': 40, 'browser': 75, 'workflow': 60}, 'limits': {'sqlmap': 3, 'dalfox': 3, 'commix': 1, 'traversal': 2, 'idor': 2, 'authorization': 3, 'browser': 2, 'workflow': 3}, 'arjun': 75, 'arjun_limit': 2}, 'deep': {'broad': {'zap': 420, 'nuclei': 360, 'nikto': 150, 'ffuf': 120, 'session': 60}, 'parameter': {'sqlmap': 180, 'dalfox': 120, 'commix': 90, 'traversal': 75, 'idor': 45, 'authorization': 60, 'browser': 120, 'workflow': 90}, 'limits': {'sqlmap': 6, 'dalfox': 6, 'commix': 3, 'traversal': 5, 'idor': 4, 'authorization': 6, 'browser': 8, 'workflow': 8}, 'arjun': 90, 'arjun_limit': 5}}
+SCAN_MODES = {'fast': {'broad': {'zap': 90, 'nuclei': 90, 'nikto': 45, 'ffuf': 40, 'session': 20}, 'parameter': {'sqlmap': 60, 'dalfox': 35, 'commix': 40, 'traversal': 25, 'idor': 12, 'authorization': 25, 'browser': 35, 'workflow': 30}, 'limits': {'sqlmap': 1, 'dalfox': 1, 'commix': 1, 'traversal': 1, 'idor': 1, 'authorization': 1, 'browser': 1, 'workflow': 1}, 'arjun': 30, 'arjun_limit': 1}, 'balanced': {'broad': {'zap': 420, 'nuclei': 480, 'nikto': 105, 'ffuf': 90, 'session': 40}, 'parameter': {'sqlmap': 150, 'dalfox': 105, 'commix': 90, 'traversal': 60, 'idor': 30, 'authorization': 50, 'browser': 90, 'workflow': 75}, 'limits': {'sqlmap': 4, 'dalfox': 4, 'commix': 3, 'traversal': 4, 'idor': 3, 'authorization': 4, 'browser': 4, 'workflow': 4}, 'arjun': 90, 'arjun_limit': 3}, 'deep': {'broad': {'zap': 600, 'nuclei': 900, 'nikto': 180, 'ffuf': 150, 'session': 75}, 'parameter': {'sqlmap': 240, 'dalfox': 150, 'commix': 120, 'traversal': 90, 'idor': 60, 'authorization': 90, 'browser': 150, 'workflow': 120}, 'limits': {'sqlmap': 8, 'dalfox': 8, 'commix': 5, 'traversal': 8, 'idor': 6, 'authorization': 8, 'browser': 10, 'workflow': 10}, 'arjun': 120, 'arjun_limit': 8}}
 CURRENT_SCAN_MODE = 'balanced'
 BROAD_SCANNER_TIMEOUTS = dict(SCAN_MODES[CURRENT_SCAN_MODE]['broad'])
 PARAMETER_TOOL_TIMEOUTS = dict(SCAN_MODES[CURRENT_SCAN_MODE]['parameter'])
@@ -104,7 +104,7 @@ def tool_action_limit(tool: str) -> int:
     if name == 'arjun':
         return ARJUN_ENDPOINT_LIMIT
     if name == 'interactsh':
-        return 2 if CURRENT_SCAN_MODE == 'deep' else 1
+        return 3 if CURRENT_SCAN_MODE == 'deep' else 2 if CURRENT_SCAN_MODE == 'balanced' else 1
     if name in PARAMETER_TOOL_CASE_LIMITS:
         return PARAMETER_TOOL_CASE_LIMITS[name]
     return 1
@@ -906,7 +906,7 @@ def _browser_network_discovery(target: str, cookies: str, html_urls: list[str]) 
         from playwright.sync_api import sync_playwright
     except Exception as exc:
         return ([], [], [], [{'url': target, 'type': 'BrowserDiscoveryUnavailable', 'message': f'{type(exc).__name__}: {exc}'}])
-    navigation_budget = 8 if CURRENT_SCAN_MODE == 'fast' else 20 if CURRENT_SCAN_MODE == 'balanced' else 45
+    navigation_budget = 8 if CURRENT_SCAN_MODE == 'fast' else 30 if CURRENT_SCAN_MODE == 'balanced' else 60
     ranked_pages = sorted(set((_clean_url(value) for value in html_urls if value)), key=lambda value: (-_risk_terms(value), len(urlparse(value).path), value))
     target_url = _clean_url(target)
     if target_url in ranked_pages:
@@ -2020,6 +2020,9 @@ def log_zap_session_diagnostics(result: dict[str, Any]) -> None:
                 print(f"    [ZAP ACTIVE POLICY] passive-only by explicit scan mode; catalog rules={policy.get('catalog_rule_count', 0)}")
             else:
                 print('    [ZAP ACTIVE POLICY] planned rule IDs=' + (', '.join((str(value) for value in policy.get('planned_rule_ids', []))) or 'none'))
+                fallback = policy.get('fallback_active_plan') if isinstance(policy.get('fallback_active_plan'), dict) else {}
+                if fallback.get('used'):
+                    print(f"    [ZAP FALLBACK] generic bounded active target={fallback.get('url', '')}; rules={','.join(str(value) for value in fallback.get('rule_ids', []))}")
         deferred = result.get('deferred_native_active_cases') if isinstance(result.get('deferred_native_active_cases'), list) else []
         if deferred:
             print('    [ZAP ACTIVE POLICY] deferred in balanced/prioritized: ' + ', '.join((str(item.get('case_class') or item.get('url') or '') for item in deferred if isinstance(item, dict))))
@@ -2096,12 +2099,23 @@ def log_result(profile: str, name: str, result: dict[str, Any], target: str='') 
         inventory = result.get('template_inventory') if isinstance(result.get('template_inventory'), dict) else {}
         print(f"    [NUCLEI TEMPLATES] total={inventory.get('count', 0)}; dast={inventory.get('dast_count', 0)}; directory={inventory.get('directory', '') or 'not-resolved'}")
         fingerprint = result.get('technology_fingerprint') if isinstance(result.get('technology_fingerprint'), dict) else {}
-        print(f"    [NUCLEI STRATEGY] adaptive=True; technologies={','.join(fingerprint.get('tags') or []) or 'unknown'}; dast_cases={result.get('dast_request_count', 0)}; direct_templates={result.get('custom_template_count', 0)}; evidence_targets={len(result.get('evidence_targets') or [])}; stdin_disabled=True; specialist-covered SQLi/XSS/CMDi/traversal templates deferred")
+        print(f"    [NUCLEI STRATEGY] adaptive=True; technologies={','.join(fingerprint.get('tags') or []) or 'unknown'}; dast_cases={result.get('dast_request_count', 0)}; direct_templates={result.get('custom_template_count', 0)}; evidence_targets={len(result.get('evidence_targets') or [])}; stdin_disabled=True; DAST may overlap specialist classes to provide independent template evidence")
         phases = result.get('phases') if isinstance(result.get('phases'), list) else []
         for phase in phases:
             if not isinstance(phase, dict):
                 continue
-            print(f"    [NUCLEI PHASE] {phase.get('name', 'unknown')}: status={phase.get('status', 'unknown')}; findings={phase.get('findings', 0)}; templates={phase.get('selected_template_count', 0)}; budget={phase.get('timeout_seconds', 0)}s; input={phase.get('input_mode') or 'list'}; aggression={phase.get('fuzz_aggression') or 'n/a'}; scope={phase.get('target_scope') or 'focused'}")
+            print(f"    [NUCLEI PHASE] {phase.get('name', 'unknown')}: status={phase.get('status', 'unknown')}; findings={phase.get('findings', 0)}; templates={phase.get('selected_template_count', 0)}; budget={phase.get('timeout_seconds', 0)}s; input={phase.get('input_mode') or 'list'}; aggression={phase.get('fuzz_aggression') or 'n/a'}; fuzz-param-frequency={phase.get('fuzz_param_frequency') or 'default'}; scope={phase.get('target_scope') or 'focused'}")
+            if phase.get('dast_fallback_used'):
+                print(f"    [NUCLEI DAST RECOVERY] primary={phase.get('dast_primary_status', 'error')}/{phase.get('dast_primary_diagnosis', '')}; mode={phase.get('dast_fallback_mode') or 'unknown'}; request cases={phase.get('dast_fallback_request_cases', 0) or phase.get('dast_fallback_get_cases', 0)}; final={phase.get('status', 'unknown')}")
+            if phase.get('dast_recovery_attempts'):
+                attempts = ', '.join(f"{item.get('input_mode')}={item.get('status')}" for item in phase.get('dast_recovery_attempts') if isinstance(item, dict))
+                print(f"    [NUCLEI DAST INPUTS] {attempts}")
+            if str(phase.get('status') or '').lower() in {'error', 'partial'} and phase.get('stderr_excerpt'):
+                compact_error = ' '.join(str(phase.get('stderr_excerpt') or '').split())[-700:]
+                print(f"    [NUCLEI DIAGNOSTIC] {compact_error}")
+            if phase.get('dast_primary_stderr_excerpt'):
+                compact_primary = ' '.join(str(phase.get('dast_primary_stderr_excerpt') or '').split())[-700:]
+                print(f"    [NUCLEI DAST PRIMARY ERROR] {compact_primary}")
             if phase.get('template_batch_recovery'):
                 print(f"    [NUCLEI RECOVERY] completed exact templates={phase.get('completed_template_count', 0)}; exact rejected={phase.get('invalid_template_count', 0)}; engine tag fallback={phase.get('engine_tag_fallback_success', False)}; global matchers={phase.get('global_matcher_template_count', 0)}; global matchers enabled={phase.get('global_matchers_enabled', False)}; runtime failures={len(phase.get('runtime_template_failures') or [])}; timed out={len(phase.get('timed_out_templates') or [])}")
         if not total:
@@ -2269,13 +2283,13 @@ def build_tool_arguments(tool: str, target_url: str, cookies: str, discovery: di
                 scan_mode = 'prioritized'
             else:
                 scan_mode = 'targeted'
-            arguments.update({'seed_urls': discovery.get('html_urls', []), 'request_cases': discovery.get('request_cases', []), 'scan_mode': scan_mode, 'max_observations': 150 if CURRENT_SCAN_MODE == 'deep' else 50 if CURRENT_SCAN_MODE == 'balanced' or single_tool else 25})
+            arguments.update({'seed_urls': discovery.get('html_urls', []), 'request_cases': discovery.get('request_cases', []), 'scan_mode': scan_mode, 'max_observations': 220 if CURRENT_SCAN_MODE == 'deep' else 80 if CURRENT_SCAN_MODE == 'balanced' or single_tool else 25})
             if single_tool:
                 arguments['diagnostic_only'] = diagnostic_only
             elif diagnostic_only:
                 arguments['diagnostic_only'] = True
         elif tool == 'nuclei':
-            arguments.update({'seed_urls': discovery.get('urls', []), 'request_cases': discovery.get('request_cases', []), 'scan_profile': CURRENT_SCAN_MODE, 'max_targets': 16 if CURRENT_SCAN_MODE == 'deep' else 10 if CURRENT_SCAN_MODE == 'balanced' else 6})
+            arguments.update({'seed_urls': discovery.get('urls', []), 'request_cases': discovery.get('request_cases', []), 'scan_profile': CURRENT_SCAN_MODE, 'max_targets': 40 if CURRENT_SCAN_MODE == 'deep' else 15 if CURRENT_SCAN_MODE == 'balanced' else 5})
         elif tool == 'nikto':
             arguments['scan_profile'] = CURRENT_SCAN_MODE
         return arguments

@@ -203,8 +203,8 @@ verifica fallisce, l'inizializzazione fallisce invece di lasciare il Browser ver
 La discovery combina crawler HTTP, form/query, endpoint letterali trovati negli script e una sola coda
 dinamica Chromium. Il browser parte dalle pagine HTML sicure e piu' interessanti gia' note, le carica e
 osserva richieste same-origin document/XHR/fetch; i nuovi link/documenti same-origin renderizzati vengono
-reinseriti subito nella stessa coda. Per ogni profilo di discovery il budget di navigazioni Chromium e' 8 in fast, 20 in balanced
-e 45 in deep; le XHR/fetch osservate non consumano un ulteriore budget di pagine e possono generare
+reinseriti subito nella stessa coda. Per ogni profilo di discovery il budget di navigazioni Chromium e' 8 in fast, 30 in balanced
+e 60 in deep; le XHR/fetch osservate non consumano un ulteriore budget di pagine e possono generare
 request contract. Per le richieste realmente inviate vengono registrati anche status/content-type della response
 o requestfailed, cosi' il planner distingue endpoint raggiunti da 404/410 senza scartare 401/403. Le richieste
 browser non-GET e le rotte distruttive vengono intercettate prima dell'invio:
@@ -213,17 +213,26 @@ compatibili, mentre gli altri metodi restano tracciati come superficie osservata
 
 ZAP: fast=targeted, balanced=prioritized, deep=full bounded; la modalita' passiva resta per i soli
 controlli diagnostici. L'inventario active usa API Python/JSON e fallback curato; ogni scanner ID viene
-abilitato separatamente e il log distingue piano teorico da regole accettate. Se era richiesto active scan
-ma non e' possibile pianificare o abilitare alcuna regola,
-il risultato e' PARTIAL/no_active_scan_rules_enabled, non SUCCESS con 0 regole.
-Nuclei: balanced e deep possono usare request contract per DAST gap checks bounded.
+abilitato separatamente e il log distingue piano teorico da regole accettate. Le risorse statiche non possono
+essere scelte come target active; se serve il fallback generico viene preferito un endpoint dinamico/API-like
+GET parametrizzato e in balanced non vengono sprecate regole su stored-XSS o varianti DBMS-specifiche senza
+evidenza. Se era richiesto active scan ma non e' possibile pianificare o abilitare alcuna regola, il risultato
+e' PARTIAL/no_active_scan_rules_enabled, non SUCCESS con 0 regole.
+Nuclei: balanced e deep possono usare request contract per DAST gap checks bounded. Il DAST prova prima
+l'input Proxify JSONL; se il runtime Nuclei lo rifiuta, i casi GET compatibili vengono ritentati automaticamente
+come lista URL e lo stderr del tentativo primario viene conservato. Eventuali casi POST non recuperabili fanno
+restare la fase PARTIAL invece di risultare coperti.
+Nell'Agentic la breadth review viene usata solo per un primo piano realmente scarno: puo' aggiungere al
+massimo 3 azioni in fast, 6 in balanced e 10 in deep e non deve consumare tutti i candidati del primo round,
+cosi' i round successivi possono reagire ai risultati appena osservati.
 Gli specialisti sui parametri privilegiano API/dati, identificatori/query, POST/JSON e richieste
 osservate dal browser rispetto a parametri puramente di navigazione.
 Entrambi gli orchestratori eseguono infine una verifica Chromium candidate-driven sugli XSS ancora non confermati,
-con limite di 2 candidati in fast, 8 in balanced e 15 in deep. Il browser riceve solo il parametro del finding
+con limite di 2 candidati in fast, 10 in balanced e 20 in deep. Il browser riceve solo il parametro del finding
 sorgente: esecuzione del marker => vulnerability; reflection senza esecuzione => candidate medium; nessuna
-riproduzione nel controllo bounded => confidence/risk ridotti. CSS, JavaScript standalone, immagini e font non
-sono candidati Browser-XSS. Nel Deterministic il passaggio avviene dopo i controlli speciali e prima del report e
+riproduzione nel controllo bounded => confidence/risk ridotti. L'analisi AI successiva puo' arricchire la
+descrizione ma non puo' superare i tetti deterministici del browser: MEDIUM per reflection non eseguita e LOW
+per mancata riproduzione bounded. CSS, JavaScript standalone, immagini e font non sono candidati Browser-XSS. Nel Deterministic il passaggio avviene dopo i controlli speciali e prima del report e
 non ripete un URL/metodo/parametro gia' verificato con successo nella precedente fase browser/workflow. Nell'Agentic
 avviene prima dell'analisi AI e del report.
 
@@ -257,6 +266,48 @@ python .\orchestratorDeterministic.py --target <TARGET> --cookies "<PRIMARY_COOK
 fast      controllo rapido e budget ridotti
 balanced  copertura ampia con priorità ai controlli importanti
 deep      più target, richieste e budget per i controlli specialistici
+
+Limiti di ampiezza principali (casi/target, non numero di richieste HTTP):
+                         FAST   BALANCED   DEEP
+  Chromium navigation      8       30       60
+  ZAP request case          6       20       40
+  Nuclei static target      5       15       40
+  Nuclei DAST case          0       12       30
+  SQLMap                    1        4        8
+  Dalfox                    1        4        8
+  Commix                    1        3        5
+  Traversal                 1        4        8
+  Browser                   1        4       10
+  Workflow                  1        4       10
+  IDOR                      1        3        6
+  Authorization             1        4        8
+  Arjun                     1        3        8
+  Interactsh                1        2        3
+  Final XSS Chromium        2       10       20
+  Breadth review max       +3       +6      +10
+  Agentic azioni/round     14       30       48
+
+Timeout principali (secondi):
+                         FAST   BALANCED   DEEP
+  ZAP                     90      420      600
+  Nuclei                  90      480      900
+  SQLMap                  60      150      240
+  Dalfox                  35      105      150
+  Commix                  40       90      120
+  Traversal               25       60       90
+  Browser                 35       90      150
+  Workflow                30       75      120
+
+Ampiezza interna Nuclei: BALANCED puo' selezionare fino a 48 template ufficiali focalizzati,
+con concurrency 8 e rate limit 50 req/s; DEEP fino a 96 template technology, 160 exposure/misconfiguration
+e 256 vulnerability/CVE product-gated, con concurrency 14 e rate limit 90 req/s. Sono massimi di selezione,
+non quote obbligatorie: fingerprint, product gating e timeout possono ridurre il lavoro effettivo.
+
+ZAP e Nuclei possono generare molte richieste per ciascun caso/target selezionato. I casi Nuclei
+DAST sono scelti dal wrapper Python in modo deterministico usando metodo, path, parametri/body,
+content-type, evidenza API/XHR/fetch e response Chromium; il planner AI decide se eseguire Nuclei,
+non quali singoli request contract sono DAST. Per microX, finche' DASHBOARD_TEST_COOKIE non e'
+disponibile, questi budget si applicano al solo profilo anonimo.
 
 Init: --with-lab --run --prepare-ai --agentic-model --snap4city-credentials --mode
       --skip-scanners --skip-preflight --skip-browser --require-browser --commands-only --version
@@ -299,18 +350,31 @@ Native mode:
 nuclei -update
 nuclei -update-templates
 
+L'initializer richiede Nuclei >= 3.11.1 per l'input DAST request-shaped. Se il binario nativo
+resta piu' vecchio dopo l'update, viene preferito il Docker ufficiale aggiornato. Prima di terminare
+l'init viene inoltre eseguito un controllo `-tl -dast` sulla directory ufficiale dast/.
+
 Official Docker fallback:
 docker run --rm projectdiscovery/nuclei:latest -version
 
 (Get-ChildItem "$HOME\nuclei-templates" -Recurse -File -Include *.yaml,*.yml | Measure-Object).Count
+
+DAST: FAST=off; BALANCED=12 request contract, fuzz aggression medium, fuzz-param-frequency 100;
+DEEP=30 request contract, fuzz aggression high, fuzz-param-frequency 1000. Il wrapper prova gli
+input request-shaped in ordine JSONL Proxify -> YAML MultiDoc Proxify -> lista URL per i soli GET
+se entrambi i parser request-shaped falliscono. Non esiste un piccolo limite aggiuntivo al numero
+di payload DAST: restano i limiti di request contract, rate/concurrency, template e timeout di profilo.
 
 9. REPORT
 ---------
 Deterministic: .\reports\SecOps_Assessment_<timestamp>.pdf/.html/.json/.review.json
 Agentic:       .\reports\SecOps_Agentic_Assessment_<timestamp>.pdf/.html/.json/.review.json
 
-Il file .review.json conserva in forma redatta risultati, finding normalizzati, contesto, planner audit e
-analisi AI per revisioni successive senza ripetere gli scanner. Rigenerazione:
+Se l'esecuzione passa da assessmentRunner.py viene creato anche:
+  .\reports\Assessment_Results_Data_<ID>.json
+Per un singolo report, <ID> coincide ESATTAMENTE con il report_id (per esempio SecOps_Agentic_Assessment_<timestamp>); per assessment multi-job/dry-run coincide con il test_id. Lo schema corrente e' 4 e il file e' autosufficiente per elaborazioni future: oltre a configurazione/job redatti e report_artifacts, incorpora reports_data con summary, coverage, finding leggibili e grezzi, risultati completi degli scanner, assessment_context, discovery, diagnostics, planner notes/audit, reasoning_summary operativi e motivazioni della breadth review, decisioni Agentic, riepilogo dell'analisi AI e rationale/confidence AI per finding. Quando esiste un solo report, assessment_results, assessment_context, discovery, diagnostics, agentic_decisions e ai_analysis sono disponibili anche direttamente al livello principale. Il vecchio nome Assessment_Batch_*.manifest.json non viene piu' prodotto. Alla fine assessmentRunner.py stampa esplicitamente sia il/i percorso/i PDF sia il percorso Assessment_Results_Data_<ID>.json sotto "Assessment final artifacts".
+
+Il file .review.json resta disponibile come snapshot redatto compatibile con rerenderReport.py; non e' piu' necessario aprirlo per ottenere dati, planner audit o analisi AI destinati alle elaborazioni future, perche' tali sezioni sono gia' incorporate in Assessment_Results_Data_<ID>.json. Rigenerazione:
 python .\rerenderReport.py --snapshot .\reports\<REPORT>.review.json
 
 Nei finding confermati il report mostra anche conseguenze/danno potenziale e recovery/ripristino.

@@ -57,11 +57,45 @@ The other files support the previous ones, as shared logic or support files.
 The runner is an optional layer above the orchestrators, not a replacement for them. Existing direct commands such as
 `python orchestratorDeterministic.py --target ...` and `python orchestratorAgentic.py --target ...` continue to work unchanged.
 
+In the Agentic planner, the optional breadth review is now strictly a sparse-plan recovery pass. It runs only when the first plan selected at most roughly one third of the executable candidates and can add at most 3 actions in `fast`, 6 in `balanced` or 10 in `deep`. This prevents round 1 from consuming every candidate before round-2 planning can adapt to actual scanner evidence.
+
+### Profile breadth budgets
+
+The three profiles use wider scanner breadth while preserving explicit safety bounds and per-round Agentic caps. These values are **candidate/request-contract or target limits**, not counts of HTTP requests: ZAP and Nuclei can generate many requests per selected case/template. Nuclei's overall time budget is 90s/480s/900s in fast/balanced/deep; DAST is disabled in fast, uses medium fuzz aggression in balanced and high fuzz aggression in deep. The wrapper does not impose a small payload-count cap on Nuclei DAST; the scan is bounded by the selected request cases, rate/concurrency settings, template behavior and the profile timeout. The same specialist case limits are shared by Deterministic and Agentic; only Agentic has the breadth-review row.
+
+| Coverage bound | fast | balanced | deep |
+| --- | ---: | ---: | ---: |
+| Chromium navigations per discovery profile | 8 | 30 | 60 |
+| ZAP request contracts considered | 6 | 20 | 40 |
+| Nuclei focused/static targets | 5 | 15 | 40 |
+| Nuclei DAST request contracts | 0 | 12 | 30 |
+| SQLMap cases | 1 | 4 | 8 |
+| Dalfox cases | 1 | 4 | 8 |
+| Commix cases | 1 | 3 | 5 |
+| Traversal cases | 1 | 4 | 8 |
+| Browser cases | 1 | 4 | 10 |
+| Workflow cases | 1 | 4 | 10 |
+| IDOR cases | 1 | 3 | 6 |
+| Authorization cases | 1 | 4 | 8 |
+| Arjun endpoints | 1 | 3 | 8 |
+| Interactsh actions | 1 | 2 | 3 |
+| Final Chromium XSS candidates | 2 | 10 | 20 |
+| Agentic breadth-review additions, only for a genuinely sparse first plan | 3 | 6 | 10 |
+| Agentic maximum actions per round | 14 | 30 | 48 |
+
+The increased breadth is paired with wider scanner time budgets so larger candidate sets are not artificially truncated. Broad scanner timeouts are `zap` 90/420/600s and `nuclei` 90/480/900s in fast/balanced/deep. In balanced/deep the main specialist ceilings are SQLMap 150/240s, Dalfox 105/150s, Commix 90/120s, Traversal 60/90s, Browser 90/150s and Workflow 75/120s. These are upper bounds, not minimum runtimes: a scanner that completes earlier returns immediately. Breadth review remains 3/6/10 because it is a sparse-plan recovery mechanism rather than a coverage quota.
+
+Nuclei internal execution breadth is also wider in the larger profiles: balanced may select up to 48 focused official exposure/misconfiguration templates with concurrency 8 and rate limit 50 req/s; deep may select up to 96 technology templates, 160 exposure/misconfiguration templates and 256 product-gated vulnerability/CVE templates with concurrency 14 and rate limit 90 req/s. These are selection ceilings, not mandatory counts; fingerprint/product gating and the global phase timeout still decide what is actually executed.
+
+Nuclei DAST cases are selected deterministically from safe same-origin parameterized GET/POST request contracts using method, path, parameter/body names, content type, API/XHR/fetch evidence and observed browser-response metadata. Gap-oriented names such as URL/callback/webhook/redirect/template/GraphQL receive higher priority, but they are no longer a hard eligibility filter: other parameterized application requests can also enter the 12/30 balanced/deep DAST sets. Static assets and destructive/logout/reset/setup/delete paths are excluded. The AI decides whether the Agentic plan executes Nuclei, but it does not label individual request contracts as DAST.
+
 ### Discovery and scanner coverage
 
-Discovery combines the requests-based crawler with one bounded Playwright/Chromium dynamic-discovery queue. Chromium starts from the highest-value safe HTML pages already known to the crawler, loads them, records same-origin `document`, `xhr` and `fetch` requests, and immediately reinserts newly rendered same-origin links/documents into the same queue. For each discovery profile, the Chromium navigation budget is 8 pages in `fast`, 20 in `balanced` and 45 in `deep`; XHR/fetch observations do not consume an extra page budget and can all become request contracts. HTML forms and query strings remain first-class request contracts, while same-origin JavaScript is also inspected for literal endpoint hints. During discovery, non-GET browser requests and destructive routes are intercepted before network transmission: their method/body/parameters can be recorded without turning page loading into a state-changing probe. For requests that are actually sent, Chromium also records `response`/`requestfailed` evidence (HTTP status, response content type or failure), so a discovered endpoint can be distinguished from one that returned successfully; 404/410 responses are deprioritized without discarding authorization-relevant 401/403 cases. Destructive logout/setup/reset/delete families remain excluded. The resulting contracts are shared by both orchestrators and drive specialist ranking instead of inventing endpoints or parameters.
+Discovery combines the requests-based crawler with one bounded Playwright/Chromium dynamic-discovery queue. Chromium starts from the highest-value safe HTML pages already known to the crawler, loads them, records same-origin `document`, `xhr` and `fetch` requests, and immediately reinserts newly rendered same-origin links/documents into the same queue. For each discovery profile, the Chromium navigation budget is 8 pages in `fast`, 30 in `balanced` and 60 in `deep`; XHR/fetch observations do not consume an extra page budget and can all become request contracts. HTML forms and query strings remain first-class request contracts, while same-origin JavaScript is also inspected for literal endpoint hints. During discovery, non-GET browser requests and destructive routes are intercepted before network transmission: their method/body/parameters can be recorded without turning page loading into a state-changing probe. For requests that are actually sent, Chromium also records `response`/`requestfailed` evidence (HTTP status, response content type or failure), so a discovered endpoint can be distinguished from one that returned successfully; 404/410 responses are deprioritized without discarding authorization-relevant 401/403 cases. Destructive logout/setup/reset/delete families remain excluded. The resulting contracts are shared by both orchestrators and drive specialist ranking instead of inventing endpoints or parameters.
 
-ZAP active mode is selected from the scan profile rather than from whether the current profile has a cookie: `fast` uses bounded targeted active scanning, `balanced` prioritized active scanning and `deep` the broader bounded mode; `diagnostic_only` remains passive. Scanner inventory is read through the Python API and retried through the raw ZAP JSON API; if metadata is unavailable, a curated set of known injection/path-traversal rule IDs is used as a compatibility fallback. If semantic request classification still yields no native plan, one safe parameterized GET may receive a bounded generic active-rule union. Rule IDs are enabled one by one and the wrapper records which IDs ZAP actually accepted, so a theoretical plan cannot be reported as an effective active scan. Only when no safe case/rule can be enabled does the wrapper return `partial/no_active_scan_rules_enabled`. Nuclei consumes discovered request contracts for bounded DAST gap checks in both `balanced` and `deep`; the initializer verifies that the official `nuclei-templates/dast` subtree exists and the DAST phase explicitly selects that directory. SQLMap/Dalfox/other parameter scanners rank API/data-oriented contracts, meaningful identifier/query parameters, method and observed JSON/network evidence ahead of navigation-only parameters. After the scanner phases, both orchestrators perform a candidate-driven Chromium verification pass: at most 2 unresolved XSS candidates in `fast`, 8 in `balanced` and 15 in `deep` are sent to the browser verifier when a compatible request contract exists. The final action is restricted to the exact source parameter; confirmed execution upgrades the source candidate, an unexecuted browser reflection lowers it to medium confidence/severity, and a bounded non-reproduction lowers confidence instead of leaving a high AST-only candidate unchanged. Static assets such as CSS, JavaScript, images and fonts are excluded as Browser-XSS targets. Deterministic skips an exact URL/method/parameter case already exercised successfully by its earlier browser/workflow phase; Agentic performs the same bounded verification before AI analysis.
+ZAP active mode is selected from the scan profile rather than from whether the current profile has a cookie: `fast` uses bounded targeted active scanning, `balanced` prioritized active scanning and `deep` the broader bounded mode; `diagnostic_only` remains passive. Scanner inventory is read through the Python API and retried through the raw ZAP JSON API; if metadata is unavailable, a curated set of known injection/path-traversal rule IDs is used as a compatibility fallback. Static assets are excluded from active-case selection. If semantic request classification still yields no native plan, one safe dynamic/API-like parameterized GET may receive a bounded generic active-rule union; this fallback starts from cross-product rules such as reflected XSS, generic SQL injection and traversal instead of wasting the balanced budget on stored-XSS or DBMS-specific rules without evidence. Rule IDs are enabled one by one and the wrapper records which IDs ZAP actually accepted, so a theoretical plan cannot be reported as an effective active scan. Only when no safe case/rule can be enabled does the wrapper return `partial/no_active_scan_rules_enabled`.
+
+Nuclei consumes discovered request contracts for DAST checks in both `balanced` and `deep`; the initializer now requires a DAST-capable current Nuclei runtime (minimum v3.11.1), verifies the official `nuclei-templates/dast` subtree and performs a template-load DAST runtime check before assessments start. The DAST phase explicitly selects that directory. Request-shaped Proxify JSONL is attempted first; if the engine rejects it, the same GET/POST request contracts are serialized to the other officially supported Proxify YAML MultiDoc input mode; only if both request-shaped modes fail does the wrapper fall back to a plain URL list for compatible GET cases. Every attempt and stderr excerpt remains in coverage diagnostics. Balanced uses `-fa medium` with `fuzz-param-frequency=100`; deep uses `-fa high` with `fuzz-param-frequency=1000`. `-fm single` is retained so one parameter is mutated at a time and evidence remains attributable; it is not a low payload-count cap. SQLMap/Dalfox/other parameter scanners rank API/data-oriented contracts, meaningful identifier/query parameters, method and observed JSON/network evidence ahead of navigation-only parameters. After the scanner phases, both orchestrators perform a candidate-driven Chromium verification pass: at most 2 unresolved XSS candidates in `fast`, 10 in `balanced` and 20 in `deep` are sent to the browser verifier when a compatible request contract exists. The final action is restricted to the exact source parameter; the Browser server now exports the parameters actually exercised so reconciliation remains deterministic even if nested diagnostics are lost in transport. Confirmed execution upgrades the source candidate, an unexecuted browser reflection lowers it to medium confidence/severity, and a successful exact-parameter bounded non-reproduction lowers it to low confidence/risk instead of leaving a high AST-only candidate unchanged. The subsequent AI analysis may enrich wording and context but cannot raise severity above these deterministic browser ceilings (MEDIUM for reflection without execution, LOW for bounded non-reproduction). Static assets such as CSS, JavaScript, images and fonts are excluded as Browser-XSS targets. Deterministic skips an exact URL/method/parameter case already exercised successfully by its earlier browser/workflow phase; Agentic performs the same bounded verification before AI analysis.
 
 ## Requirements
 
@@ -236,6 +270,65 @@ already supplied description, impact, consequence, recovery or remediation text,
 "Original scanner assessment" audit area if the final Agentic wording differs. No report colors, card layout or visual styling are changed.
 
 Reports produced land in `reports/` .
+
+When execution is started through `assessmentRunner.py`, the runner also writes a redacted, self-contained machine-readable dataset named `Assessment_Results_Data_<REFERENCE_ID>.json`. For a single generated report, `<REFERENCE_ID>` is exactly that report's `report_id` (for example `SecOps_Agentic_Assessment_20260903_191426`); for a multi-job or dry-run test it is the generated `test_id`. The old `Assessment_Batch_*.manifest.json` name is no longer produced.
+
+`Assessment_Results_Data_*` is the preferred input for future automated analysis because it embeds the assessment evidence instead of acting only as an artifact index. Schema version 4 stores redacted configuration/job metadata, artifact paths and a `reports_data` entry for every generated report. Each embedded report contains the normalized summary and coverage, readable and raw findings, complete redacted scanner results, assessment context, discovery, diagnostics, planner notes/audit, the recorded operational `reasoning_summary` and breadth-review reasoning, Agentic decision metadata and final AI-analysis summary plus the per-finding AI rationale/confidence metadata already attached to normalized findings. When there is exactly one report, the main `assessment_results`, `assessment_context`, `discovery`, `diagnostics`, `agentic_decisions` and `ai_analysis` sections are also copied to the top level for direct access. The technical report JSON and `.review.json` remain separate artifacts for compatibility and report regeneration.
+
+At the end of `assessmentRunner.py`, the `Assessment final artifacts` block prints both every PDF path and the exact `Assessment_Results_Data_<REFERENCE_ID>.json` path.
+
+Example shape:
+
+```json
+{
+  "schema_version": 4,
+  "dataset_type": "secops-assessment-results-data",
+  "reference_id": "SecOps_Agentic_Assessment_20260903_191426",
+  "test_id": "microx-dashboard_20260903_191000",
+  "report_id": "SecOps_Agentic_Assessment_20260903_191426",
+  "assessment_results": {
+    "summary": {},
+    "coverage": {},
+    "findings": [],
+    "all_findings": [],
+    "scanner_results": {}
+  },
+  "discovery": {},
+  "diagnostics": {},
+  "agentic_decisions": {
+    "planner_source": "ai",
+    "planner_rounds": 2,
+    "planner_notes": [],
+    "planner_audit": [],
+    "reasoning_summaries": [],
+    "breadth_review_reasoning": []
+  },
+  "ai_analysis": {"summary": {}, "findings": []},
+  "report_artifacts": [
+    {
+      "job_id": "microx-dashboard/http-80",
+      "report_id": "SecOps_Agentic_Assessment_20260903_191426",
+      "pdf_path": "/.../SecOps_Agentic_Assessment_20260903_191426.pdf",
+      "json_path": "/.../SecOps_Agentic_Assessment_20260903_191426.json",
+      "html_path": "/.../SecOps_Agentic_Assessment_20260903_191426.html",
+      "review_snapshot_path": "/.../SecOps_Agentic_Assessment_20260903_191426.review.json"
+    }
+  ],
+  "reports_data": [
+    {
+      "report_id": "SecOps_Agentic_Assessment_20260903_191426",
+      "assessment_results": {},
+      "assessment_context": {},
+      "discovery": {},
+      "diagnostics": {},
+      "agentic_decisions": {},
+      "ai_analysis": {"summary": {}, "findings": []},
+      "artifacts": {}
+    }
+  ]
+}
+```
+
 
 ## Credential and token terminology
 

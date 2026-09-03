@@ -104,7 +104,8 @@ BROAD_COVERAGE_TOOLS = ('ffuf', 'zap', 'nuclei', 'session', 'nikto')
 PARAMETER_COVERAGE_TOOLS = ('sqlmap', 'dalfox', 'commix', 'traversal', 'idor')
 AUTHORIZATION_COVERAGE_TOOLS = ('authorization',)
 WORKFLOW_COVERAGE_TOOLS = ('browser', 'workflow')
-ROUND_ACTION_BUDGETS = {'fast': 14, 'balanced': 24, 'deep': 36}
+ROUND_ACTION_BUDGETS = {'fast': 14, 'balanced': 30, 'deep': 48}
+BREADTH_REVIEW_ADDITION_CAPS = {'fast': 3, 'balanced': 6, 'deep': 10}
 PLAN_SCHEMA = {
     'type': 'object',
     'properties': {
@@ -647,7 +648,8 @@ def _planner_review_system_message() -> str:
         '- ADD safe discovery-supported candidates that can provide useful, complementary or independent evidence.\n'
         '- KEEP DEFERRED only for concrete duplication, completed equivalent work, unsupported discovery, incompatibility, unsafe action or clearly very low value.\n'
         '- Broad scanners and targeted tools remain complementary; do not reject one category solely because the other was already selected.\n'
-        '- Do not repeat already_selected_action_ids and do not add actions merely to fill remaining slots.\n\n'
+        '- Do not repeat already_selected_action_ids and do not add actions merely to fill remaining slots.\n'
+        '- Respect review_addition_cap/remaining_slots strictly; this pass must leave useful deferred work for later evidence-driven rounds.\n\n'
         '[OUTPUT CONTRACT]\n'
         'Return exactly one JSON object: {"reasoning_summary":"brief review summary","selected_action_ids":["remaining candidate IDs"],"finish":false}.\n\n'
         '[FINAL INSTRUCTION]\nReturn only valid JSON.'
@@ -786,11 +788,18 @@ def ai_plan(state: AgentState) -> dict[str, Any]:
             review_reasoning = ''
             review_capacity = min(action_budget, len(candidates))
             remaining_candidate_count = len(candidates) - len(selected_actions)
+            review_addition_cap = min(
+                BREADTH_REVIEW_ADDITION_CAPS.get(shared.CURRENT_SCAN_MODE, 3),
+                max(0, action_budget - len(selected_actions)),
+            )
+            # A breadth review is a recovery pass for genuinely sparse plans, not a second
+            # opportunity to consume every candidate in round one. This preserves evidence-
+            # driven adaptation for later rounds after the first scanner results are known.
             sparse_plan = (
                 review_capacity >= 4
                 and remaining_candidate_count >= 3
-                and len(selected_actions) * 2 < review_capacity
-                and len(selected_actions) < action_budget
+                and len(selected_actions) <= max(2, review_capacity // 3)
+                and review_addition_cap > 0
             )
             # Reserve up to 40% of the profile's planning budget for the optional second AI pass.
             # The actual allowance is also bounded by the wall-clock time still remaining.
@@ -812,7 +821,8 @@ def ai_plan(state: AgentState) -> dict[str, Any]:
                     'previous_results': prompt['previous_results'],
                     'available_tools': registry,
                     'already_selected_action_ids': selected_ids,
-                    'remaining_slots': action_budget - len(selected_actions),
+                    'remaining_slots': review_addition_cap,
+                    'review_addition_cap': review_addition_cap,
                     'remaining_candidates': remaining_candidates,
                     'previous_reasoning_summary': str(compact_plan.get('reasoning_summary') or '')[:240],
                 }
@@ -850,6 +860,7 @@ def ai_plan(state: AgentState) -> dict[str, Any]:
                             action is None
                             or candidate_id in selected_ids
                             or len(selected_actions) >= action_budget
+                            or len(review_selected_ids) >= review_addition_cap
                         ):
                             continue
                         selected_ids.append(candidate_id)
@@ -1207,7 +1218,21 @@ def _apply_analysis(rows: list[dict[str, Any]], finding_map: dict[str, dict[str,
             str(finding.get('recovery') or finding.get('recovery_actions') or ''),
         )
         finding.setdefault('scanner_solution', str(finding.get('solution') or ''))
-        finding['risk'] = risk
+
+        # Deterministic browser evidence constrains severity. AI may enrich the narrative
+        # but cannot promote a candidate above the strongest browser outcome already observed.
+        risk_order = {'info': 0, 'low': 1, 'medium': 2, 'high': 3, 'critical': 4}
+        browser_outcome = str(finding.get('browser_final_verification') or '').lower()
+        verification_status = str(finding.get('verification_status') or '').lower()
+        risk_ceiling = None
+        if browser_outcome == 'not_reproduced' or verification_status == 'browser-not-reproduced-bounded':
+            risk_ceiling = 'low'
+        elif browser_outcome == 'reflected_not_executed' or verification_status == 'browser-reflection-without-marker-execution':
+            risk_ceiling = 'medium'
+        applied_risk = risk
+        if risk_ceiling and risk_order.get(applied_risk, 0) > risk_order[risk_ceiling]:
+            applied_risk = risk_ceiling
+        finding['risk'] = applied_risk
 
         # AI wording remains the primary assessment. A weak individual field does
         # not invalidate a successful AI analysis: when the scanner already has a
@@ -1236,9 +1261,11 @@ def _apply_analysis(rows: list[dict[str, Any]], finding_map: dict[str, dict[str,
             'source': f'{provider}-analysis',
             'provider': provider,
             'model': model,
-            'risk': risk,
+            'risk': applied_risk,
+            'ai_requested_risk': risk,
+            'risk_ceiling': risk_ceiling or '',
             'scanner_risk': original_risk,
-            'severity_changed': risk != original_risk,
+            'severity_changed': applied_risk != original_risk,
             'analysis_confidence': confidence,
             'scanner_confidence': scanner_confidence,
             'rationale': str(row.get('rationale') or '').strip()[:1000],
@@ -1246,7 +1273,7 @@ def _apply_analysis(rows: list[dict[str, Any]], finding_map: dict[str, dict[str,
             'narrative_fallbacks': narrative_fallbacks,
         }
         analyzed += 1
-        changed += risk != original_risk
+        changed += applied_risk != original_risk
     return analyzed, changed
 
 # After tool execution, the agent performs a separate evidence-grounded analysis of collected findings.
@@ -1852,7 +1879,7 @@ def executor_node(state: AgentState) -> dict[str, Any]:
 # Builds bounded Chromium actions for XSS candidates that still require runtime validation.
 def _final_browser_verification_actions(state: AgentState) -> list[dict[str, Any]]:
 
-    limit = 2 if shared.CURRENT_SCAN_MODE == 'fast' else 8 if shared.CURRENT_SCAN_MODE == 'balanced' else 15
+    limit = 2 if shared.CURRENT_SCAN_MODE == 'fast' else 10 if shared.CURRENT_SCAN_MODE == 'balanced' else 20
     actions: list[dict[str, Any]] = []
     seen: set[tuple[str, str, str]] = set()
     for profile, profile_results in state.get('results', {}).items():
@@ -1914,7 +1941,13 @@ def _reconcile_final_browser_result(results: dict[str, dict[str, Any]], action: 
     confirmed = next((item for item in browser_findings if str(item.get('category') or '').lower() == 'vulnerability'), None)
     reflected = next((item for item in browser_findings if str(item.get('verification_status') or '') == 'browser-reflection-without-marker-execution'), None)
     attempts = ((browser_result.get('diagnostics') or {}).get('dom_attempts') or []) if isinstance(browser_result.get('diagnostics'), dict) else []
-    attempted = any(isinstance(item, dict) and (not parameter or str(item.get('parameter') or '') == parameter) for item in attempts)
+    verified_parameters = {str(value) for value in browser_result.get('verified_parameters', []) if str(value)}
+    action_parameters = {str(value) for value in action.get('parameters', []) if str(value)}
+    attempted = (
+        any(isinstance(item, dict) and (not parameter or str(item.get('parameter') or '') == parameter) for item in attempts)
+        or (bool(parameter) and parameter in verified_parameters)
+        or (str(browser_result.get('status') or '').lower() == 'success' and bool(parameter) and parameter in action_parameters)
+    )
     for finding in source.get('vulnerabilities', []) if isinstance(source.get('vulnerabilities'), list) else []:
         if not isinstance(finding, dict) or str(finding.get('category') or '').lower() != 'candidate':
             continue
@@ -1928,7 +1961,7 @@ def _reconcile_final_browser_result(results: dict[str, dict[str, Any]], action: 
         elif reflected is not None:
             finding.update(risk='medium', verification_status='browser-reflection-without-marker-execution', confidence='medium', browser_final_verification='reflected_not_executed', browser_verification_evidence=str(reflected.get('evidence') or ''))
         elif str(browser_result.get('status') or '').lower() == 'success' and attempted:
-            finding.update(risk='low', verification_status='browser-not-reproduced-bounded', confidence='low', browser_final_verification='not_reproduced')
+            finding.update(risk='low', verification_status='browser-not-reproduced-bounded', confidence='low', browser_final_verification='not_reproduced', browser_verification_evidence=f"Chromium completed an exact-parameter bounded check for {parameter or 'the source parameter'} without marker execution or reflection.")
 
 # Runs a deterministic final browser verification stage before AI narrative analysis.
 def verification_node(state: AgentState) -> dict[str, Any]:

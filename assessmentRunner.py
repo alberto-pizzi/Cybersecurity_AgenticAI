@@ -4,6 +4,7 @@ import argparse
 import json
 import subprocess
 import sys
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -225,10 +226,123 @@ def _build_command(
     return command
 
 
-# Writes a redacted execution manifest that can be reviewed without exposing target credentials.
-def _write_manifest(path: Path, payload: dict[str, Any]) -> None:
+# Writes redacted assessment result data that can be reviewed without exposing target credentials.
+def _write_results_data(path: Path, payload: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(payload, indent=2, ensure_ascii=False, default=str), encoding="utf-8")
+
+
+# Loads one JSON artifact when present; malformed or missing artifacts stay explicit instead of aborting the runner.
+def _load_json_artifact(path_value: str | None) -> tuple[dict[str, Any] | None, str | None]:
+    if not path_value:
+        return None, "artifact path unavailable"
+    path = Path(path_value)
+    if not path.is_file():
+        return None, f"artifact not found: {path}"
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        return None, f"artifact could not be loaded: {type(exc).__name__}: {exc}"
+    if not isinstance(payload, dict):
+        return None, "artifact root is not a JSON object"
+    return payload, None
+
+
+# Builds the self-contained, redacted dataset used for later analysis without repeating the security scan.
+def _embedded_report_data(artifact: dict[str, Any]) -> dict[str, Any]:
+    technical, technical_error = _load_json_artifact(artifact.get("json_path"))
+    review, review_error = _load_json_artifact(artifact.get("review_snapshot_path"))
+    source = technical or review or {}
+    context = source.get("assessment_context") if isinstance(source.get("assessment_context"), dict) else {}
+    if not context and isinstance(review, dict) and isinstance(review.get("assessment_context"), dict):
+        context = review.get("assessment_context") or {}
+
+    results = source.get("results") if isinstance(source.get("results"), dict) else {}
+    if not results and isinstance(review, dict) and isinstance(review.get("results"), dict):
+        results = review.get("results") or {}
+
+    summary = source.get("summary") if isinstance(source.get("summary"), dict) else {}
+    coverage = source.get("coverage") if isinstance(source.get("coverage"), dict) else {}
+    findings = source.get("findings") if isinstance(source.get("findings"), list) else []
+    all_findings = source.get("all_findings") if isinstance(source.get("all_findings"), list) else []
+    if not all_findings and isinstance(review, dict) and isinstance(review.get("findings"), list):
+        all_findings = review.get("findings") or []
+
+    planner_audit = context.get("planner_audit") if isinstance(context.get("planner_audit"), list) else []
+    if not planner_audit and isinstance(review, dict) and isinstance(review.get("planner_audit"), list):
+        planner_audit = review.get("planner_audit") or []
+    ai_analysis_summary = context.get("ai_analysis") if isinstance(context.get("ai_analysis"), dict) else {}
+    if not ai_analysis_summary and isinstance(review, dict) and isinstance(review.get("ai_analysis"), dict):
+        ai_analysis_summary = review.get("ai_analysis") or {}
+    finding_ai_analysis = []
+    for finding in all_findings:
+        if not isinstance(finding, dict) or not isinstance(finding.get("ai_analysis"), dict):
+            continue
+        finding_ai_analysis.append({
+            "title": finding.get("title") or finding.get("alert") or finding.get("name"),
+            "tool": finding.get("tool"),
+            "url": finding.get("url"),
+            "parameter": finding.get("parameter"),
+            "analysis": finding.get("ai_analysis"),
+        })
+
+    return {
+        "report_id": artifact.get("report_id"),
+        "target": source.get("target") or (review or {}).get("target"),
+        "generated_at": source.get("generated_at") or (review or {}).get("generated_at"),
+        "reporting_policy": source.get("reporting_policy") or (review or {}).get("reporting_policy"),
+        "report_metadata": {
+            "client_name": source.get("client_name"),
+            "assessor": source.get("assessor"),
+            "assessment_type": source.get("assessment_type"),
+            "assessment_start": source.get("assessment_start"),
+            "assessment_end": source.get("assessment_end"),
+            "report_version": source.get("report_version"),
+            "security_findings_count": source.get("security_findings_count"),
+            "candidate_findings_count": source.get("candidate_findings_count"),
+            "observations_count": source.get("observations_count"),
+            "findings_count": source.get("findings_count"),
+        },
+        "assessment_results": {
+            "executive_summary": source.get("executive_summary"),
+            "summary": summary,
+            "coverage": coverage,
+            "findings": findings,
+            "all_findings": all_findings,
+            "findings_by_category": source.get("findings_by_category") if isinstance(source.get("findings_by_category"), dict) else {},
+            "scanner_results": results,
+        },
+        "assessment_context": context,
+        "discovery": context.get("discovery") if isinstance(context.get("discovery"), dict) else {},
+        "diagnostics": context.get("diagnostics") if isinstance(context.get("diagnostics"), dict) else {},
+        "agentic_decisions": {
+            "planner_source": context.get("planner_source"),
+            "planner_rounds": context.get("planner_rounds"),
+            "planner_notes": context.get("planner_notes") if isinstance(context.get("planner_notes"), list) else [],
+            "planner_audit": planner_audit,
+            "reasoning_summaries": [
+                str(item.get("reasoning_summary") or "")
+                for item in planner_audit
+                if isinstance(item, dict) and str(item.get("reasoning_summary") or "").strip()
+            ],
+            "breadth_review_reasoning": [
+                str(item.get("review_reasoning") or "")
+                for item in planner_audit
+                if isinstance(item, dict) and str(item.get("review_reasoning") or "").strip()
+            ],
+        },
+        "ai_analysis": {
+            "summary": ai_analysis_summary,
+            "findings": finding_ai_analysis,
+        },
+        "artifacts": dict(artifact),
+        "source_artifact_status": {
+            "technical_json_loaded": technical is not None,
+            "technical_json_error": technical_error,
+            "review_snapshot_loaded": review is not None,
+            "review_snapshot_error": review_error,
+        },
+    }
 
 
 # Executes the configured HTTP/HTTPS services sequentially through the existing orchestrators.
@@ -280,13 +394,21 @@ def main() -> int:
     stamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
     platform_name = str((config.get("platform") or {}).get("name") or "platform")
     safe_name = "".join(ch if ch.isalnum() or ch in "_.-" else "_" for ch in platform_name).strip("._") or "platform"
-    manifest_path = REPORTS_DIR / f"Assessment_Batch_{safe_name}_{stamp}.manifest.json"
-    manifest: dict[str, Any] = {
-        "schema_version": 1,
+    assessment_id = f"{safe_name}_{stamp}"
+    results_data_path = REPORTS_DIR / f"Assessment_Results_Data_{assessment_id}.json"
+    results_data: dict[str, Any] = {
+        "schema_version": 4,
+        "dataset_type": "secops-assessment-results-data",
+        "dataset_purpose": "Self-contained redacted evidence and decision dataset for later analysis without repeating the security scan.",
+        "test_id": assessment_id,
+        "assessment_id": assessment_id,
+        "reference_id": assessment_id,
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "source_config": str(Path(args.config).expanduser().resolve()) if args.config else None,
         "configuration": redacted_configuration(config),
         "jobs": [],
+        "report_artifacts": [],
+        "reports_data": [],
     }
 
     exit_code = 0
@@ -306,19 +428,19 @@ def main() -> int:
         }
         if not job.get("enabled"):
             record.update(status="skipped", reason="service disabled in configuration")
-            manifest["jobs"].append(record)
+            results_data["jobs"].append(record)
             print(f"[SKIP] {job['id']}: disabled")
             continue
         if not job.get("supported"):
             record.update(status="skipped", reason=job.get("unsupported_reason"))
-            manifest["jobs"].append(record)
+            results_data["jobs"].append(record)
             print(f"[SKIP] {job['id']}: {job.get('unsupported_reason')}")
             continue
         try:
             command = _build_command(config, job, resolve_secrets=not args.dry_run, force_auth_only=args.auth_only)
         except ValueError as exc:
             record.update(status="blocked", reason=str(exc))
-            manifest["jobs"].append(record)
+            results_data["jobs"].append(record)
             print(f"[BLOCKED] {job['id']}: {exc}", file=sys.stderr)
             exit_code = 2
             if args.stop_on_error:
@@ -331,19 +453,72 @@ def main() -> int:
             print("[PLAN] " + " ".join(record["command"]))
         else:
             print(f"\n[RUN] {job['id']} -> {job['target']}")
+            job_started_ns = time.time_ns()
             completed = subprocess.run(command, cwd=ROOT, check=False)
             record["returncode"] = completed.returncode
             record["status"] = "success" if completed.returncode == 0 else "error"
+            generated_pdfs = sorted(
+                (path.resolve() for path in REPORTS_DIR.glob("*.pdf") if path.stat().st_mtime_ns >= job_started_ns),
+                key=lambda path: path.stat().st_mtime_ns,
+            )
+            record["pdf_reports"] = [str(path) for path in generated_pdfs]
+            record["reports"] = []
+            for pdf_path in generated_pdfs:
+                report_id = pdf_path.stem
+                json_path = pdf_path.with_suffix(".json")
+                html_path = pdf_path.with_suffix(".html")
+                review_path = pdf_path.with_name(f"{report_id}.review.json")
+                artifact = {
+                    "job_id": job["id"],
+                    "report_id": report_id,
+                    "pdf_path": str(pdf_path),
+                    "json_path": str(json_path.resolve()) if json_path.is_file() else None,
+                    "html_path": str(html_path.resolve()) if html_path.is_file() else None,
+                    "review_snapshot_path": str(review_path.resolve()) if review_path.is_file() else None,
+                }
+                record["reports"].append(artifact)
+                results_data["report_artifacts"].append(artifact)
+                results_data["reports_data"].append(_embedded_report_data(artifact))
             if completed.returncode:
                 exit_code = 1
                 if args.stop_on_error:
-                    manifest["jobs"].append(record)
+                    results_data["jobs"].append(record)
                     break
-        manifest["jobs"].append(record)
-        _write_manifest(manifest_path, manifest)
+        results_data["jobs"].append(record)
+        _write_results_data(results_data_path, results_data)
 
-    _write_manifest(manifest_path, manifest)
-    print(f"\n[+] Assessment manifest: {manifest_path}")
+    report_artifacts = list(results_data.get("report_artifacts", []))
+    if len(report_artifacts) == 1 and report_artifacts[0].get("report_id"):
+        reference_id = str(report_artifacts[0]["report_id"])
+        final_results_data_path = REPORTS_DIR / f"Assessment_Results_Data_{reference_id}.json"
+        results_data["report_id"] = reference_id
+    else:
+        reference_id = assessment_id
+        final_results_data_path = REPORTS_DIR / f"Assessment_Results_Data_{reference_id}.json"
+    results_data["reference_id"] = reference_id
+    reports_data = [item for item in results_data.get("reports_data", []) if isinstance(item, dict)]
+    if len(reports_data) == 1:
+        single = reports_data[0]
+        results_data["assessment_results"] = single.get("assessment_results") or {}
+        results_data["assessment_context"] = single.get("assessment_context") or {}
+        results_data["discovery"] = single.get("discovery") or {}
+        results_data["diagnostics"] = single.get("diagnostics") or {}
+        results_data["agentic_decisions"] = single.get("agentic_decisions") or {}
+        results_data["ai_analysis"] = single.get("ai_analysis") or {}
+    results_data["results_data_file"] = str(final_results_data_path.resolve())
+    results_data["completed_at"] = datetime.now(timezone.utc).isoformat()
+    _write_results_data(final_results_data_path, results_data)
+    if final_results_data_path != results_data_path:
+        results_data_path.unlink(missing_ok=True)
+
+    print("\n=== Assessment final artifacts ===")
+    if report_artifacts:
+        for artifact in report_artifacts:
+            print(f"[+] PDF report: {artifact.get('pdf_path') or 'not generated'}")
+    else:
+        print("[+] PDF report: not generated")
+    print(f"[+] Results data JSON: {final_results_data_path.resolve()}")
+    print(f"[+] Results data reference ID: {reference_id}")
     return exit_code
 
 

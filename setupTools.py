@@ -37,7 +37,7 @@ NUCLEI_TEMPLATE_UPDATE_TIMEOUT = 600
 _NUCLEI_TEMPLATE_STATE: dict[str, Any] = {}
 _NUCLEI_ENGINE_STATE: dict[str, Any] = {}
 _IDOR_FORGE_STATE: dict[str, Any] = {}
-BUILD_ID = 'secops-v31.18-coverage-hardening-20260903'
+BUILD_ID = 'secops-v31.24-expanded-coverage-budgets-20260903'
 FASTMCP_VERSION = '3.4.5'
 FASTMCP_REQUIREMENT = f'fastmcp=={FASTMCP_VERSION}'
 LANGGRAPH_REQUIREMENT = 'langgraph==1.2.10'
@@ -518,10 +518,19 @@ def _nikto_health(perl: Path, script: Path, launcher: Path | None=None) -> tuple
     return (True, details[-1])
 NIKTO_DOCKER_IMAGE = 'ghcr.io/sullo/nikto:latest'
 NUCLEI_DOCKER_IMAGE = 'projectdiscovery/nuclei:latest'
+NUCLEI_MIN_DAST_VERSION = (3, 11, 1)
 REPORT_DOCKER_SOURCE_IMAGE = 'albertopizzi2002/reportingpdf:v1.0'
 
 
 REPORT_DOCKER_IMAGE = 'secops/report:local'
+
+# Parse the semantic version printed by Nuclei and enforce the DAST-compatible runtime floor.
+def _nuclei_version_tuple(text: str) -> tuple[int, int, int]:
+    match = re.search(r"(?i)\bv?(\d+)\.(\d+)\.(\d+)\b", str(text or ""))
+    return tuple(int(match.group(index)) for index in range(1, 4)) if match else (0, 0, 0)
+
+def _nuclei_version_supported(text: str) -> bool:
+    return _nuclei_version_tuple(text) >= NUCLEI_MIN_DAST_VERSION
 
 # Docker image lookup avoids pulling an image that is already available locally.
 def _docker_image_ready(image: str) -> bool:
@@ -552,18 +561,30 @@ def _ensure_nikto_docker_image() -> bool:
     print('[!] Nikto Docker image could not be pulled. Native Perl will be checked as a secondary option.')
     return False
 
-# Ensures the official Nuclei Docker image is available.
+# Ensures the official Nuclei Docker image is current enough for request-shaped DAST input.
 def _ensure_nuclei_docker_image() -> tuple[bool, str]:
 
     ready, detail = _pull_docker_image(NUCLEI_DOCKER_IMAGE)
     if not ready:
         return (False, detail)
     probe = run(['docker', 'run', '--rm', NUCLEI_DOCKER_IMAGE, '-version'], required=False, capture=True, show_output=False, timeout=120)
-    detail = _process_output(probe)
-    if probe.returncode == 0:
+    version_detail = _process_output(probe)
+    if probe.returncode == 0 and _nuclei_version_supported(version_detail):
         print(f'[+] Nuclei verified through official Docker fallback: {NUCLEI_DOCKER_IMAGE}')
-        return (True, detail[-1200:])
-    return (False, detail[-2000:] or f'docker run exited with {probe.returncode}.')
+        return (True, version_detail[-1200:])
+
+    # The latest tag may already exist locally but be stale; refresh it once before rejecting Docker.
+    refresh = run(['docker', 'pull', NUCLEI_DOCKER_IMAGE], required=False, capture=True, timeout=1800)
+    if refresh.returncode == 0:
+        probe = run(['docker', 'run', '--rm', NUCLEI_DOCKER_IMAGE, '-version'], required=False, capture=True, show_output=False, timeout=120)
+        version_detail = _process_output(probe)
+        if probe.returncode == 0 and _nuclei_version_supported(version_detail):
+            print(f'[+] Nuclei Docker image refreshed and verified: {NUCLEI_DOCKER_IMAGE}')
+            return (True, version_detail[-1200:])
+
+    required = '.'.join(str(value) for value in NUCLEI_MIN_DAST_VERSION)
+    detail = '\n'.join(value for value in (version_detail, _process_output(refresh, 1200)) if value)
+    return (False, detail[-2000:] or f'Nuclei >= {required} is required for DAST request input.')
 
 # Prepares the external reporting image under the local tag expected by the report server.
 def _ensure_report_docker_image() -> bool:
@@ -786,14 +807,18 @@ def ensure_nuclei_engine_current() -> dict[str, Any]:
             if before.returncode == 0:
                 update = run([executable, '-update'], required=False, capture=True, timeout=NUCLEI_TEMPLATE_UPDATE_TIMEOUT)
                 after = run([executable, '-version'], required=False, capture=True, show_output=False, timeout=60)
-                if after.returncode == 0:
+                if after.returncode == 0 and _nuclei_version_supported(_process_output(after, 1000)):
                     _NUCLEI_ENGINE_STATE = {'execution_mode': 'native', 'executable': executable, 'launcher': executable, 'docker_image': '', 'update_returncode': update.returncode, 'version_before': _process_output(before, 1000), 'version_after': _process_output(after, 1000), 'update_output_excerpt': _process_output(update, 1600)}
                     if update.returncode == 0:
                         print('[+] Nuclei engine update check completed.')
                     else:
-                        print('[!] Nuclei self-update did not complete; the working native executable will be retained.', file=sys.stderr)
+                        print('[!] Nuclei self-update did not complete, but the installed version satisfies the DAST runtime floor.', file=sys.stderr)
                     return dict(_NUCLEI_ENGINE_STATE)
-                native_error = _process_output(after) or f'nuclei -version exited with {after.returncode}'
+                if after.returncode == 0:
+                    required = '.'.join(str(value) for value in NUCLEI_MIN_DAST_VERSION)
+                    native_error = f'Nuclei {_process_output(after, 300)} is older than required v{required} for reliable request-shaped DAST input.'
+                else:
+                    native_error = _process_output(after) or f'nuclei -version exited with {after.returncode}'
             else:
                 native_error = _process_output(before) or f'nuclei -version exited with {before.returncode}'
         except OSError as exc:
@@ -866,6 +891,30 @@ def ensure_nuclei_templates() -> dict[str, Any]:
     _NUCLEI_TEMPLATE_STATE = {'count': after, 'dast_count': dast_after, 'count_before_update': filesystem_before, 'minimum_expected': NUCLEI_TEMPLATE_MINIMUM, 'sufficient': sufficient, 'update_returncode': update_returncode, 'update_output_excerpt': combined[-2000:], 'fallback_used': fallback_used, 'inventory_source': 'filesystem', 'directory': best_directory or _best_nuclei_template_directory(), 'directories': directories_after or directories_before, 'filesystem_candidates': _filesystem_nuclei_template_inventory()}
     return dict(_NUCLEI_TEMPLATE_STATE)
 
+# Verify that the selected engine can load the official DAST subtree before assessments are allowed to run.
+def verify_nuclei_dast_runtime(engine: dict[str, Any], templates: dict[str, Any]) -> dict[str, Any]:
+    directory = Path(str(templates.get('directory') or '')).expanduser()
+    dast_dir = directory / 'dast'
+    if not dast_dir.is_dir():
+        raise RuntimeError(f'Nuclei DAST template directory is unavailable: {dast_dir}')
+    mode = str(engine.get('execution_mode') or 'native')
+    if mode == 'docker_official_image':
+        command = [
+            'docker', 'run', '--rm', '-v', f'{directory.resolve()}:/official-templates:ro',
+            NUCLEI_DOCKER_IMAGE, '-tl', '-dast', '-t', '/official-templates/dast', '-silent', '-duc', '-no-stdin',
+        ]
+    else:
+        executable = str(engine.get('executable') or command_path('nuclei') or 'nuclei')
+        command = [executable, '-tl', '-dast', '-t', str(dast_dir), '-silent', '-duc', '-no-stdin']
+    result = run(command, required=False, capture=True, show_output=False, timeout=180)
+    combined = _process_output(result, 12000)
+    listed = [line.strip() for line in combined.splitlines() if line.strip() and not line.lstrip().startswith('[')]
+    if result.returncode != 0 or not listed:
+        raise RuntimeError('Nuclei DAST runtime validation failed: the selected engine could not list the official DAST templates.\n' + combined[-2400:])
+    state = {'validated': True, 'listed_templates': len(listed), 'sample': listed[:8], 'command': command, 'output_excerpt': combined[-1600:]}
+    print(f'[+] Nuclei DAST runtime ready: {len(listed)} template entries loadable.')
+    return state
+
 # Installs or updates every external scanner required by the project.
 def install_scanners() -> None:
     print('\n=== Installing/verifying security scanners ===')
@@ -883,6 +932,7 @@ def install_scanners() -> None:
     nuclei_engine = ensure_nuclei_engine_current()
     nuclei_templates = ensure_nuclei_templates()
     nuclei_templates['engine'] = nuclei_engine
+    nuclei_templates['dast_runtime'] = verify_nuclei_dast_runtime(nuclei_engine, nuclei_templates)
     _NUCLEI_TEMPLATE_STATE.update(nuclei_templates)
 
 # Scanner resolution locates the executable or launcher that will actually be invoked.

@@ -465,6 +465,11 @@ async def _run_browser_scan_core(
                 )
                 findings.extend(source_findings)
                 diagnostics["dom_attempts"] = [*query_attempts, *source_attempts]
+                diagnostics["verified_parameters"] = sorted({
+                    str(item.get("parameter") or "") for item in query_attempts
+                    if isinstance(item, dict) and str(item.get("parameter") or "")
+                })
+                diagnostics["query_attempt_count"] = len(query_attempts)
 
                 if str(method or "GET").upper() == "POST":
                     stored_findings, stored_diag = await _stored_check(
@@ -496,6 +501,8 @@ async def _run_browser_scan_core(
     return success(
         "Browser XSS and Workflow Verifier", target_url,
         f"Browser verification completed. Findings: {len(unique)}.", vulnerabilities=unique, diagnostics=diagnostics,
+        verified_parameters=list(diagnostics.get("verified_parameters") or []),
+        query_attempt_count=int(diagnostics.get("query_attempt_count") or 0),
     )
 
 # Use async Chromium to verify DOM, reflected and stored XSS with harmless markers.

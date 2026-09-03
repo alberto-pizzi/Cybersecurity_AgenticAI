@@ -370,7 +370,7 @@ async def deterministic_special_checks_node(state: DeterministicState) -> dict[s
         if injection_url:
             oast_cases = [{'target_url': target, 'source_url': injection_url, 'injection_url': injection_url, 'method': 'GET', 'data': '', 'parameter': 'explicit', 'parameters': ['explicit'], 'priority_score': 1000}]
         else:
-            oast_cases = select_oast_request_cases(discovery[name], target, limit=2 if shared.CURRENT_SCAN_MODE == 'deep' else 1)
+            oast_cases = select_oast_request_cases(discovery[name], target, limit=3 if shared.CURRENT_SCAN_MODE == 'deep' else 2 if shared.CURRENT_SCAN_MODE == 'balanced' else 1)
         oast_selection_summary[name] = oast_cases
         interactsh_runs: list[dict[str, Any]] = []
         confirmed_oast_classes: set[str] = set()
@@ -404,7 +404,7 @@ async def deterministic_special_checks_node(state: DeterministicState) -> dict[s
 # Selects unresolved XSS candidates for a final Chromium pass without repeating browser cases already tested earlier.
 def _final_browser_verification_cases(state: DeterministicState) -> list[tuple[str, str, dict[str, Any]]]:
 
-    limit = 2 if shared.CURRENT_SCAN_MODE == 'fast' else 8 if shared.CURRENT_SCAN_MODE == 'balanced' else 15
+    limit = 2 if shared.CURRENT_SCAN_MODE == 'fast' else 10 if shared.CURRENT_SCAN_MODE == 'balanced' else 20
     selected_rows: list[tuple[str, str, dict[str, Any]]] = []
     seen: set[tuple[str, str, str, str]] = set()
     prior_browser: dict[str, list[dict[str, Any]]] = {}
@@ -489,7 +489,13 @@ def _reconcile_deterministic_browser_result(results: dict[str, dict[str, Any]], 
     confirmed = next((item for item in browser_findings if str(item.get('category') or '').lower() == 'vulnerability'), None)
     reflected = next((item for item in browser_findings if str(item.get('verification_status') or '') == 'browser-reflection-without-marker-execution'), None)
     attempts = ((browser_result.get('diagnostics') or {}).get('dom_attempts') or []) if isinstance(browser_result.get('diagnostics'), dict) else []
-    attempted = any(isinstance(item, dict) and (not parameter or str(item.get('parameter') or '') == parameter) for item in attempts)
+    verified_parameters = {str(value) for value in browser_result.get('verified_parameters', []) if str(value)}
+    case_parameters = {str(value) for value in case.get('parameters', []) if str(value)}
+    attempted = (
+        any(isinstance(item, dict) and (not parameter or str(item.get('parameter') or '') == parameter) for item in attempts)
+        or (bool(parameter) and parameter in verified_parameters)
+        or (str(browser_result.get('status') or '').lower() == 'success' and bool(parameter) and parameter in case_parameters)
+    )
     for finding in source.get('vulnerabilities', []) if isinstance(source.get('vulnerabilities'), list) else []:
         if not isinstance(finding, dict) or str(finding.get('category') or '').lower() != 'candidate':
             continue
@@ -503,7 +509,7 @@ def _reconcile_deterministic_browser_result(results: dict[str, dict[str, Any]], 
         elif reflected is not None:
             finding.update(risk='medium', verification_status='browser-reflection-without-marker-execution', confidence='medium', browser_final_verification='reflected_not_executed', browser_verification_evidence=str(reflected.get('evidence') or ''))
         elif str(browser_result.get('status') or '').lower() == 'success' and attempted:
-            finding.update(risk='low', verification_status='browser-not-reproduced-bounded', confidence='low', browser_final_verification='not_reproduced')
+            finding.update(risk='low', verification_status='browser-not-reproduced-bounded', confidence='low', browser_final_verification='not_reproduced', browser_verification_evidence=f"Chromium completed an exact-parameter bounded check for {parameter or 'the source parameter'} without marker execution or reflection.")
 
 # Rechecks unresolved scanner-produced XSS candidates with Chromium before deterministic reporting.
 async def deterministic_verification_node(state: DeterministicState) -> dict[str, Any]:
@@ -830,7 +836,7 @@ def main() -> int:
     print(f"[*] Target: {target}")
     print(f"[*] Mode: {shared.CURRENT_SCAN_MODE}")
     if shared.CURRENT_SCAN_MODE == 'deep':
-        print("[*] Deep profile: coverage-max-20m-v1 (broader request classes, bounded ZAP/Nuclei breadth, 2-way specialist concurrency)")
+        print("[*] Deep profile: expanded-coverage-v2 (broader request classes and higher bounded ZAP/Nuclei/specialist budgets)")
     print(f"[*] Profiles: {', '.join(profile['name'] for profile in profiles)}")
     started = time.time()
     try:
