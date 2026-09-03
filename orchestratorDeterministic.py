@@ -8,7 +8,7 @@ import time
 import traceback
 from pathlib import Path
 from typing import Any, TypedDict
-from urllib.parse import parse_qsl, urlparse
+from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 
 from langgraph.graph import END, START, StateGraph
 
@@ -62,6 +62,7 @@ class DeterministicState(TypedDict, total=False):
     parameter_selection_summary: dict[str, dict[str, list[dict[str, Any]]]]
     authorization_selection_summary: dict[str, list[dict[str, Any]]]
     workflow_selection_summary: dict[str, dict[str, list[dict[str, Any]]]]
+    verification_selection_summary: dict[str, list[dict[str, Any]]]
     oast_selection_summary: dict[str, list[dict[str, Any]]]
     assessment_context: dict[str, Any]
     report_status: dict[str, Any]
@@ -400,6 +401,157 @@ async def deterministic_special_checks_node(state: DeterministicState) -> dict[s
             log_result(name, 'interactsh', interactsh_result, target)
     return {'results': results, 'oast_selection_summary': oast_selection_summary}
 
+# Selects unresolved XSS candidates for a final Chromium pass without repeating browser cases already tested earlier.
+def _final_browser_verification_cases(state: DeterministicState) -> list[tuple[str, str, dict[str, Any]]]:
+
+    limit = 2 if shared.CURRENT_SCAN_MODE == 'fast' else 8 if shared.CURRENT_SCAN_MODE == 'balanced' else 15
+    selected_rows: list[tuple[str, str, dict[str, Any]]] = []
+    seen: set[tuple[str, str, str, str]] = set()
+    prior_browser: dict[str, list[dict[str, Any]]] = {}
+    for profile, summary in state.get('workflow_selection_summary', {}).items():
+        previous_result = state.get('results', {}).get(profile, {}).get('browser', {})
+        previous_status = str(previous_result.get('status') or '').lower() if isinstance(previous_result, dict) else ''
+        if isinstance(summary, dict) and previous_status in {'success', 'partial'}:
+            prior_browser[profile] = list(summary.get('browser', []))
+
+    def already_tested(profile: str, case: dict[str, Any], parameter: str) -> bool:
+        method = str(case.get('method', 'GET')).upper()
+        path = urlparse(str(case.get('url') or '')).path
+        for previous in prior_browser.get(profile, []):
+            if str(previous.get('method', 'GET')).upper() != method:
+                continue
+            if urlparse(str(previous.get('url') or '')).path != path:
+                continue
+            previous_parameters = {str(value) for value in previous.get('parameters', [])}
+            if (not parameter) or parameter in previous_parameters:
+                return True
+        return False
+
+    for profile, profile_results in state.get('results', {}).items():
+        discovered = state.get('discovery', {}).get(profile, {})
+        browser_cases = select_browser_request_cases(discovered, limit=max(12, limit * 4))
+        for result_key, result in profile_results.items():
+            if not isinstance(result, dict) or str(result_key).startswith('browser'):
+                continue
+            findings = result.get('vulnerabilities', []) if isinstance(result.get('vulnerabilities'), list) else []
+            for finding in findings:
+                if not isinstance(finding, dict):
+                    continue
+                category = str(finding.get('category') or finding.get('verification_status') or '').lower()
+                text = ' '.join(str(finding.get(key) or '') for key in ('alert', 'title', 'name', 'description', 'type')).lower()
+                if category != 'candidate' or 'xss' not in text:
+                    continue
+                finding_url = str(finding.get('url') or result.get('target') or state['target'])
+                parameter = str(finding.get('parameter') or '').strip()
+                finding_path = urlparse(finding_url).path
+                selected: dict[str, Any] | None = None
+                for case in browser_cases:
+                    case_parameters = {str(value) for value in case.get('parameters', [])}
+                    if urlparse(str(case.get('url') or '')).path != finding_path:
+                        continue
+                    if parameter and parameter not in case_parameters:
+                        continue
+                    selected = dict(case)
+                    break
+                if selected is None and same_origin(state['target'], finding_url) and not shared._destructive_crawl_url(finding_url):
+                    parsed = urlparse(finding_url)
+                    pairs = [(name, '1' if any(token in value.lower() for token in ('<script', '<img', 'javascript:', 'onerror=', 'onload=')) else value) for name, value in parse_qsl(parsed.query, keep_blank_values=True)]
+                    safe_url = urlunparse(parsed._replace(query=urlencode(pairs)))
+                    parameters = [name for name, _ in pairs]
+                    if parameters:
+                        selected = {'url': safe_url, 'method': 'GET', 'data': '', 'parameters': parameters, 'fields': [], 'source_url': safe_url}
+                if selected is None:
+                    continue
+                if parameter:
+                    selected['parameters'] = [parameter]
+                    selected['fields'] = [field for field in selected.get('fields', []) if isinstance(field, dict) and str(field.get('name') or '') == parameter]
+                selected['verification_source_parameter'] = parameter
+                selected['verification_source_path'] = finding_path
+                if already_tested(profile, selected, parameter):
+                    continue
+                dedupe_key = (profile, str(selected.get('method', 'GET')).upper(), str(selected.get('url') or ''), parameter)
+                if dedupe_key in seen:
+                    continue
+                seen.add(dedupe_key)
+                selected_rows.append((profile, str(result_key), selected))
+                if len(selected_rows) >= limit:
+                    return selected_rows
+    return selected_rows
+
+# Apply exact-parameter Chromium evidence back to the deterministic source candidate.
+def _reconcile_deterministic_browser_result(results: dict[str, dict[str, Any]], profile: str, source_result: str, case: dict[str, Any], browser_result: dict[str, Any]) -> None:
+    source = results.get(profile, {}).get(source_result)
+    if not isinstance(source, dict):
+        return
+    parameter = str(case.get('verification_source_parameter') or (case.get('parameters') or [''])[0])
+    source_path = str(case.get('verification_source_path') or urlparse(str(case.get('url') or '')).path)
+    browser_findings = [item for item in browser_result.get('vulnerabilities', []) if isinstance(item, dict) and (not parameter or str(item.get('parameter') or '') == parameter)]
+    confirmed = next((item for item in browser_findings if str(item.get('category') or '').lower() == 'vulnerability'), None)
+    reflected = next((item for item in browser_findings if str(item.get('verification_status') or '') == 'browser-reflection-without-marker-execution'), None)
+    attempts = ((browser_result.get('diagnostics') or {}).get('dom_attempts') or []) if isinstance(browser_result.get('diagnostics'), dict) else []
+    attempted = any(isinstance(item, dict) and (not parameter or str(item.get('parameter') or '') == parameter) for item in attempts)
+    for finding in source.get('vulnerabilities', []) if isinstance(source.get('vulnerabilities'), list) else []:
+        if not isinstance(finding, dict) or str(finding.get('category') or '').lower() != 'candidate':
+            continue
+        text = ' '.join(str(finding.get(key) or '') for key in ('alert', 'title', 'name', 'description', 'type')).lower()
+        if 'xss' not in text or (parameter and str(finding.get('parameter') or '') != parameter):
+            continue
+        if source_path and urlparse(str(finding.get('url') or '')).path != source_path:
+            continue
+        if confirmed is not None:
+            finding.update(category='vulnerability', verification_status='playwright-browser-marker-executed', confidence='high', browser_final_verification='confirmed', browser_verification_evidence=str(confirmed.get('evidence') or ''))
+        elif reflected is not None:
+            finding.update(risk='medium', verification_status='browser-reflection-without-marker-execution', confidence='medium', browser_final_verification='reflected_not_executed', browser_verification_evidence=str(reflected.get('evidence') or ''))
+        elif str(browser_result.get('status') or '').lower() == 'success' and attempted:
+            finding.update(risk='low', verification_status='browser-not-reproduced-bounded', confidence='low', browser_final_verification='not_reproduced')
+
+# Rechecks unresolved scanner-produced XSS candidates with Chromium before deterministic reporting.
+async def deterministic_verification_node(state: DeterministicState) -> dict[str, Any]:
+    target = state['target']
+    rows = _final_browser_verification_cases(state)
+    results = {profile: dict(values) for profile, values in state['results'].items()}
+    selection_summary: dict[str, list[dict[str, Any]]] = {profile['name']: [] for profile in state['profiles']}
+    if not rows:
+        print('\n[*] Final verification: no unresolved XSS candidate requires an additional Chromium pass.')
+        return {'results': results, 'verification_selection_summary': selection_summary}
+
+    browser_spec = next(spec for spec in WORKFLOW_TOOLS if spec.name == 'browser')
+    profile_map = {profile['name']: profile for profile in state['profiles']}
+    browser_unavailable = False
+    print(f'\n[*] Final verification: validating {len(rows)} unresolved XSS candidate(s) with Chromium.')
+    for index, (profile_name, source_result, case) in enumerate(rows, start=1):
+        profile = profile_map.get(profile_name, {'cookies': ''})
+        cookies = str(profile.get('cookies') or '')
+        profile_discovery = state['discovery'].get(profile_name, {})
+        url = str(case.get('url') or target)
+        selection_summary.setdefault(profile_name, []).append({
+            'source_result': source_result,
+            'method': str(case.get('method', 'GET')).upper(),
+            'url': url,
+            'parameters': list(case.get('parameters', [])),
+        })
+        if browser_unavailable:
+            result = make_skipped_result('browser', url, 'Playwright was unavailable in the first final-verification run; remaining Chromium cases were not repeated.')
+        else:
+            probe_url = select_session_probe_url(profile_discovery, target)
+            refresh = refresh_authenticated_session_state(target, cookies, probe_url) if cookies else {'performed': False, 'usable': True}
+            if refresh.get('usable') is False:
+                result = make_skipped_result('browser', url, 'The authenticated session could not be restored before final Chromium verification.')
+            else:
+                arguments = build_tool_arguments('browser', url, cookies, profile_discovery, case=case, allow_state_changes=state.get('allow_state_changes'))
+                result = await call_mcp_with_progress(browser_spec, arguments, timeout_seconds=PARAMETER_TOOL_TIMEOUTS['browser'] + 35)
+                result['session_state_refresh'] = refresh
+                result['final_verification_stage'] = True
+                result['verification_source_result'] = source_result
+                result['verification_source_parameter'] = str(case.get('verification_source_parameter') or (case.get('parameters') or [''])[0])
+                _reconcile_deterministic_browser_result(results, profile_name, source_result, case, result)
+                if result.get('diagnosis') in {'missing_playwright', 'missing_playwright_browser'}:
+                    browser_unavailable = True
+        key = f'browser_final_verification_{index}'
+        results.setdefault(profile_name, {})[key] = result
+        log_result(profile_name, 'browser', result, url)
+    return {'results': results, 'verification_selection_summary': selection_summary}
+
 # At the end of the pipeline, the complete assessment state is sent to the report service.
 async def deterministic_report_node(state: DeterministicState) -> dict[str, Any]:
     target = state['target']
@@ -411,6 +563,7 @@ async def deterministic_report_node(state: DeterministicState) -> dict[str, Any]
     parameter_selection_summary = state.get('parameter_selection_summary', {})
     oast_selection_summary = state.get('oast_selection_summary', {})
     workflow_selection_summary = state.get('workflow_selection_summary', {})
+    verification_selection_summary = state.get('verification_selection_summary', {})
     authorization_selection_summary = state.get('authorization_selection_summary', {})
     context = {'profiles': [{'name': profile['name'], 'authenticated': bool(profile['cookies'])} for profile in profiles],
         'expected_tools': [spec.name for spec in (*BASE_TOOLS, ARJUN_TOOL, *PARAMETER_TOOLS, AUTHORIZATION_TOOL, *WORKFLOW_TOOLS, OPTIONAL_TOOLS[0], OPTIONAL_TOOLS[1])],
@@ -422,13 +575,14 @@ async def deterministic_report_node(state: DeterministicState) -> dict[str, Any]
         'parameter_selection': parameter_selection_summary,
         'oast_selection': oast_selection_summary,
         'workflow_selection': workflow_selection_summary,
+        'verification_selection': verification_selection_summary,
         'authorization_selection': authorization_selection_summary,
         'secondary_identity_supplied': bool(secondary_cookies),
         'parameter_tool_timeouts': PARAMETER_TOOL_TIMEOUTS,
         'broad_scanner_timeouts': BROAD_SCANNER_TIMEOUTS,
         'scan_mode': shared.CURRENT_SCAN_MODE,
         'damage_recovery_policy': 'Confirmed findings retain scanner evidence and receive conservative consequence and recovery/restoration guidance when the originating tool does not provide it. Potential damage is never reported as observed damage without supporting evidence.'}
-    context['orchestration'] = {'engine': 'langgraph', 'mode': 'deterministic', 'nodes': ['discovery', 'broad_scan', 'parameter_scan', 'authorization', 'browser_workflow', 'special_checks', 'report']}
+    context['orchestration'] = {'engine': 'langgraph', 'mode': 'deterministic', 'nodes': ['discovery', 'broad_scan', 'parameter_scan', 'authorization', 'browser_workflow', 'special_checks', 'verification', 'report']}
     print('\n[*] Generazione report...')
     report = await call_mcp('reporting/reportServer.py', 'generate_report', {'findings_summary': results, 'target_url': target, 'assessment_context': context})
     if report.get('status') != 'success' and (not report.get('json_filename')):
@@ -548,6 +702,7 @@ def build_deterministic_graph() -> Any:
     graph.add_node("authorization", deterministic_authorization_node)
     graph.add_node("browser_workflow", deterministic_browser_workflow_node)
     graph.add_node("special_checks", deterministic_special_checks_node)
+    graph.add_node("verification", deterministic_verification_node)
     graph.add_node("report", deterministic_report_node)
     graph.add_edge(START, "discovery")
     graph.add_edge("discovery", "broad_scan")
@@ -555,7 +710,8 @@ def build_deterministic_graph() -> Any:
     graph.add_edge("parameter_scan", "authorization")
     graph.add_edge("authorization", "browser_workflow")
     graph.add_edge("browser_workflow", "special_checks")
-    graph.add_edge("special_checks", "report")
+    graph.add_edge("special_checks", "verification")
+    graph.add_edge("verification", "report")
     graph.add_edge("report", END)
     return graph.compile()
 

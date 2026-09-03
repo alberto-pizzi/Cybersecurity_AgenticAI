@@ -8,7 +8,14 @@
     "confirmed": true,
     "reference": "tests 192.168.1.81 mapped as dashboard-test"
   },
-  "credentials": {},
+  "credentials": {
+    "dashboard_session": {
+      "kind": "cookie",
+      "env": "DASHBOARD_TEST_COOKIE",
+      "optional": true,
+      "purpose": "Optional authenticated dashboard-test browser/session cookie; when absent the assessment runs anonymous only."
+    }
+  },
   "assets": [
     {
       "id": "microx-dashboard",
@@ -23,7 +30,8 @@
           "enabled": true,
           "auth_only": false,
           "allow_state_changes": false,
-          "notes": "Enable this service only if curl/browser confirms that dashboard-test answers on HTTP port 80."
+          "notes": "Enable this service only if curl/browser confirms that dashboard-test answers on HTTP port 80.",
+          "credential_ref": "dashboard_session"
         },
         {
           "id": "https-443",
@@ -33,7 +41,8 @@
           "enabled": false,
           "auth_only": false,
           "allow_state_changes": false,
-          "notes": "Enable this service only if curl/browser confirms that dashboard-test answers on HTTPS port 443."
+          "notes": "Enable this service only if curl/browser confirms that dashboard-test answers on HTTPS port 443.",
+          "credential_ref": "dashboard_session"
         }
       ]
     }

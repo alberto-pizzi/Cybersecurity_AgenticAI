@@ -170,7 +170,10 @@ def _build_command(
         if str(job.get("credential_kind") or "").lower() != "cookie":
             raise ValueError(f"Job {job['id']} references a non-cookie primary credential that the web orchestrators cannot consume directly.")
         primary_value = resolve_cookie_credential(config, primary_ref) if resolve_secrets else f"<credential:{primary_ref}>"
-        command.extend(["--cookies", primary_value])
+        if primary_value:
+            command.extend(["--cookies", primary_value])
+        elif resolve_secrets:
+            print(f"[AUTH] Optional credential {primary_ref!r} is unavailable; {job['id']} will run the anonymous profile only.")
     secondary_ref = str(job.get("secondary_credential_ref") or "")
     if secondary_ref:
         if str(job.get("secondary_credential_kind") or "").lower() != "cookie":
@@ -180,6 +183,8 @@ def _build_command(
     if force_auth_only or job.get("auth_only"):
         if not primary_ref:
             raise ValueError(f"Job {job['id']} requests auth_only but has no credential_ref.")
+        if resolve_secrets and not primary_value:
+            raise ValueError(f"Job {job['id']} requests auth_only but optional credential {primary_ref!r} is unavailable.")
         command.append("--auth-only")
 
     authorization = config.get("authorization") or {}

@@ -919,6 +919,8 @@ def _browser_network_discovery(target: str, cookies: str, html_urls: list[str]) 
     cases: list[dict[str, Any]] = []
     errors: list[dict[str, Any]] = []
     current_source = {'url': target_url}
+    request_rows: dict[int, dict[str, Any]] = {}
+    request_cases_by_id: dict[int, dict[str, Any]] = {}
 
     def enqueue_dynamic(raw_url: str) -> None:
         try:
@@ -964,14 +966,51 @@ def _browser_network_discovery(target: str, cookies: str, html_urls: list[str]) 
                 headers = request.headers or {}
                 content_type = str(headers.get('content-type') or '')
                 data = str(request.post_data or '')
-                observed.append({'url': url, 'method': method, 'resource_type': resource_type, 'content_type': content_type, 'source_url': current_source['url'], 'has_body': bool(data), 'blocked_before_send': method not in {'GET', 'HEAD', 'OPTIONS'}})
+                row = {'url': url, 'method': method, 'resource_type': resource_type, 'content_type': content_type, 'source_url': current_source['url'], 'has_body': bool(data), 'blocked_before_send': method not in {'GET', 'HEAD', 'OPTIONS'}, 'response_observed': False, 'response_status': None, 'response_ok': None, 'response_content_type': '', 'request_failure': ''}
+                observed.append(row)
+                request_rows[id(request)] = row
                 case = _browser_network_case(url, method, data, content_type, current_source['url'], resource_type)
                 if case:
                     cases.append(case)
+                    request_cases_by_id[id(request)] = case
                 if resource_type == 'document' and method == 'GET' and url != current_source['url']:
                     enqueue_dynamic(url)
 
+            def record_response(response: Any) -> None:
+                request = response.request
+                row = request_rows.get(id(request))
+                if row is None:
+                    return
+                try:
+                    status = int(response.status)
+                except Exception:
+                    status = 0
+                try:
+                    headers = response.headers or {}
+                except Exception:
+                    headers = {}
+                response_type = str(headers.get('content-type') or '').lower()
+                row.update(response_observed=True, response_status=status, response_ok=200 <= status < 400, response_content_type=response_type)
+                case = request_cases_by_id.get(id(request))
+                if case is not None:
+                    case['browser_response'] = {'observed': True, 'status': status, 'ok': 200 <= status < 400, 'content_type': response_type}
+
+            def record_failed(request: Any) -> None:
+                row = request_rows.get(id(request))
+                if row is None:
+                    return
+                try:
+                    failure = str(request.failure or '')
+                except Exception:
+                    failure = ''
+                row['request_failure'] = failure or ('blocked_before_send' if row.get('blocked_before_send') else 'request_failed')
+                case = request_cases_by_id.get(id(request))
+                if case is not None:
+                    case['browser_response'] = {'observed': False, 'status': None, 'ok': False, 'failure': row['request_failure']}
+
             page.on('request', record_request)
+            page.on('response', record_response)
+            page.on('requestfailed', record_failed)
             while queue and len(visited) < navigation_budget:
                 value = queue.pop(0)
                 if value in visited:
@@ -1287,6 +1326,15 @@ def _tool_case_priority(tool: str, case: dict[str, Any]) -> int:
     parameters = _case_parameters(case)
     text = ' '.join((path, ' '.join(sorted(parameters))))
     score = _risk_terms(text)
+    browser_response = case.get('browser_response') if isinstance(case.get('browser_response'), dict) else {}
+    if browser_response.get('observed') is True:
+        status = int(browser_response.get('status') or 0)
+        if 200 <= status < 400:
+            score += 10
+        elif status in {404, 410}:
+            score -= 80
+        elif status >= 500:
+            score += 4
     if tool == 'sqlmap':
         score += 45 if any((token in path for token in ('sql', 'query', 'database', 'search'))) else 0
         score += 18 if any((token in path for token in ('/api', 'data', 'device', 'model', 'dashboard', 'widget'))) else 0
@@ -1423,6 +1471,12 @@ def select_tool_request_cases(discovery: dict[str, Any], tool: str, limit: int |
             seen.add(key)
             selected.append(case)
     return selected
+BROWSER_STATIC_SUFFIXES = {'.css', '.js', '.mjs', '.map', '.png', '.jpg', '.jpeg', '.gif', '.webp', '.svg', '.ico', '.woff', '.woff2', '.ttf', '.otf', '.eot', '.mp3', '.wav', '.mp4', '.webm', '.pdf', '.zip'}
+
+# Browser XSS checks target rendered application pages, not standalone static assets.
+def _browser_static_resource(url: str) -> bool:
+    return Path(urlparse(str(url or '')).path.lower()).suffix in BROWSER_STATIC_SUFFIXES
+
 WORKFLOW_STATE_HINTS = {'change', 'update', 'save', 'create', 'submit', 'send', 'comment', 'message', 'feedback', 'upload', 'password', 'email', 'profile', 'settings', 'transfer', 'captcha', 'admin'}
 WORKFLOW_DESTRUCTIVE_HINTS = {'logout', 'signout', 'logoff', 'setup', 'install', 'delete', 'remove', 'drop', 'truncate', 'purge', 'wipe', 'reset'}
 
@@ -1449,7 +1503,7 @@ def _browser_url_key(value: str) -> tuple[str, str, int, str]:
 def _browser_case_priority(case: dict[str, Any], client_keys: set[tuple[str, str, int, str]]) -> int:
     url = str(case.get('url', ''))
     path = urlparse(url).path.lower()
-    if _is_auto_index_case(case) or _destructive_crawl_url(url):
+    if _is_auto_index_case(case) or _destructive_crawl_url(url) or _browser_static_resource(url):
         return -1000
     parameters = _case_field_names(case)
     path_match = any((token in path for token in ('xss', 'dom', 'comment', 'message', 'feedback', 'search', 'query', 'profile', 'preview')))
@@ -1519,7 +1573,7 @@ def select_browser_request_cases(discovery: dict[str, Any], limit: int | None=No
         for case in cases:
             url = str(case.get('url') or '')
             method = str(case.get('method', 'GET')).upper()
-            if not url or method not in {'GET', 'POST'} or _destructive_crawl_url(url) or _is_auto_index_case(case):
+            if not url or method not in {'GET', 'POST'} or _destructive_crawl_url(url) or _is_auto_index_case(case) or _browser_static_resource(url):
                 continue
             path = urlparse(url).path.lower()
             if any(token in path for token in ('logout', 'setup', 'reset', 'delete')):

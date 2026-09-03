@@ -37,7 +37,7 @@ NUCLEI_TEMPLATE_UPDATE_TIMEOUT = 600
 _NUCLEI_TEMPLATE_STATE: dict[str, Any] = {}
 _NUCLEI_ENGINE_STATE: dict[str, Any] = {}
 _IDOR_FORGE_STATE: dict[str, Any] = {}
-BUILD_ID = 'secops-v31.16-dynamic-browser-discovery-20260903'
+BUILD_ID = 'secops-v31.18-coverage-hardening-20260903'
 FASTMCP_VERSION = '3.4.5'
 FASTMCP_REQUIREMENT = f'fastmcp=={FASTMCP_VERSION}'
 LANGGRAPH_REQUIREMENT = 'langgraph==1.2.10'
@@ -732,6 +732,14 @@ def _filesystem_nuclei_template_inventory() -> list[dict[str, Any]]:
     inventories.sort(key=lambda item: int(item['count']), reverse=True)
     return inventories
 
+# Count official Nuclei DAST templates in one template repository.
+def _nuclei_dast_template_count(directory: str | Path) -> int:
+    root = Path(directory).expanduser() if directory else Path()
+    dast = root / 'dast'
+    if not dast.is_dir():
+        return 0
+    return sum(1 for path in dast.rglob('*') if path.is_file() and path.suffix.lower() in {'.yaml', '.yml'})
+
 # Template inventory counts the Nuclei YAML files available in a directory.
 def _filesystem_nuclei_template_count() -> tuple[int, list[str]]:
     inventory = _filesystem_nuclei_template_inventory()
@@ -830,19 +838,32 @@ def ensure_nuclei_templates() -> dict[str, Any]:
         combined = 'Official nuclei-templates repository refreshed directly for Docker execution.' if fallback_used else 'Official nuclei-templates repository refresh failed.'
     filesystem_after, directories_after = _filesystem_nuclei_template_count()
     after = filesystem_after
+    best_directory = _best_nuclei_template_directory()
+    dast_after = _nuclei_dast_template_count(best_directory)
+    if dast_after <= 0:
+        print('[!] The installed Nuclei inventory has no DAST subtree; refreshing the complete official repository.', file=sys.stderr)
+        fallback_used = _install_official_nuclei_template_fallback() or fallback_used
+        filesystem_after, directories_after = _filesystem_nuclei_template_count()
+        after = filesystem_after
+        best_directory = _best_nuclei_template_directory()
+        dast_after = _nuclei_dast_template_count(best_directory)
     if after < NUCLEI_TEMPLATE_MINIMUM:
         print(f'[!] Only {after} Nuclei templates were detected on disk; attempting the complete official repository fallback.', file=sys.stderr)
         fallback_used = _install_official_nuclei_template_fallback() or fallback_used
         filesystem_after, directories_after = _filesystem_nuclei_template_count()
         after = filesystem_after
+        best_directory = _best_nuclei_template_directory()
+        dast_after = _nuclei_dast_template_count(best_directory)
     if after <= 0:
         raise RuntimeError('No Nuclei templates are available. Restore network access and rerun initScript.py so the official projectdiscovery/nuclei-templates repository can be installed.')
+    if dast_after <= 0:
+        raise RuntimeError('The official Nuclei DAST template subtree is missing. Restore network access and rerun initScript.py so the complete projectdiscovery/nuclei-templates repository can be installed.')
     sufficient = after >= NUCLEI_TEMPLATE_MINIMUM
     if sufficient:
         print(f'[+] Nuclei template inventory ready: {after} templates (filesystem inventory).')
     else:
         print(f'[!] Nuclei has {after} templates. Scans can continue, but the expected full-pack threshold of {NUCLEI_TEMPLATE_MINIMUM} was not reached.', file=sys.stderr)
-    _NUCLEI_TEMPLATE_STATE = {'count': after, 'count_before_update': filesystem_before, 'minimum_expected': NUCLEI_TEMPLATE_MINIMUM, 'sufficient': sufficient, 'update_returncode': update_returncode, 'update_output_excerpt': combined[-2000:], 'fallback_used': fallback_used, 'inventory_source': 'filesystem', 'directory': _best_nuclei_template_directory(), 'directories': directories_after or directories_before, 'filesystem_candidates': _filesystem_nuclei_template_inventory()}
+    _NUCLEI_TEMPLATE_STATE = {'count': after, 'dast_count': dast_after, 'count_before_update': filesystem_before, 'minimum_expected': NUCLEI_TEMPLATE_MINIMUM, 'sufficient': sufficient, 'update_returncode': update_returncode, 'update_output_excerpt': combined[-2000:], 'fallback_used': fallback_used, 'inventory_source': 'filesystem', 'directory': best_directory or _best_nuclei_template_directory(), 'directories': directories_after or directories_before, 'filesystem_candidates': _filesystem_nuclei_template_inventory()}
     return dict(_NUCLEI_TEMPLATE_STATE)
 
 # Installs or updates every external scanner required by the project.

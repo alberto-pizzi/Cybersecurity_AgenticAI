@@ -103,6 +103,8 @@ def _validate_credentials(credentials: Any) -> None:
         kind = str(credential.get("kind") or "").strip().lower()
         if not kind:
             raise ValueError(f"Credential {name!r} requires kind.")
+        if "optional" in credential and not isinstance(credential.get("optional"), bool):
+            raise ValueError(f"Credential {name!r} optional must be true or false when supplied.")
         if kind == "cookie" and not (credential.get("env") or credential.get("value")):
             raise ValueError(f"Cookie credential {name!r} requires env or value.")
 
@@ -122,6 +124,8 @@ def resolve_cookie_credential(config: dict[str, Any], reference: str) -> str:
     if env_name:
         value = os.environ.get(env_name, "").strip()
         if not value:
+            if bool(credential.get("optional", False)):
+                return ""
             raise ValueError(f"Environment variable {env_name!r} required by credential {reference!r} is empty or missing.")
         return value
     value = str(credential.get("value") or "").strip()

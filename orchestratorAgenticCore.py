@@ -1790,7 +1790,8 @@ def _record_execution_batch(executed: list[tuple[dict[str, Any], dict[str, Any]]
         profile, tool = (action['profile'], action['tool'])
         profile_results = results.setdefault(profile, {})
         number = 1 + sum((key.startswith(f'{tool}:') for key in profile_results))
-        profile_results[f'{tool}:{number}'] = {**result, 'planner_reason': action['reason'], 'planner_round': state['round']}
+        metadata = {key: action[key] for key in ('verification_source_result', 'verification_source_parameter', 'verification_source_path') if key in action}
+        profile_results[f'{tool}:{number}'] = {**result, **metadata, 'planner_reason': action['reason'], 'planner_round': state['round']}
         completed.append(action_id(action))
         log_result(profile, tool, result, action['target_url'])
         if tool == 'zap':
@@ -1888,14 +1889,46 @@ def _final_browser_verification_actions(state: AgentState) -> list[dict[str, Any
                         selected = {'url': safe_url, 'method': 'GET', 'data': '', 'parameters': parameters, 'fields': [], 'source_url': safe_url}
                 if selected is None:
                     continue
+                if parameter:
+                    selected['parameters'] = [parameter]
+                    selected['fields'] = [field for field in selected.get('fields', []) if isinstance(field, dict) and str(field.get('name') or '') == parameter]
                 key = (profile, str(selected.get('url') or ''), parameter)
                 if key in seen:
                     continue
                 seen.add(key)
-                actions.append({'profile': profile, 'tool': 'browser', 'target_url': selected['url'], 'method': selected.get('method', 'GET'), 'data': selected.get('data', ''), 'parameters': selected.get('parameters', []), 'jwt_token': '', 'injection_url': '', 'fields': selected.get('fields', []), 'source_url': selected.get('source_url', ''), 'client_sources': selected.get('client_sources', []), 'client_sinks': selected.get('client_sinks', []), 'reason': f'Final Chromium verification of XSS candidate from {result_key}.'})
+                actions.append({'profile': profile, 'tool': 'browser', 'target_url': selected['url'], 'method': selected.get('method', 'GET'), 'data': selected.get('data', ''), 'parameters': selected.get('parameters', []), 'jwt_token': '', 'injection_url': '', 'fields': selected.get('fields', []), 'source_url': selected.get('source_url', ''), 'client_sources': selected.get('client_sources', []), 'client_sinks': selected.get('client_sinks', []), 'verification_source_result': str(result_key), 'verification_source_parameter': parameter, 'verification_source_path': finding_path, 'reason': f"Final Chromium verification of XSS candidate from {result_key} parameter={parameter or 'n/a'}."})
                 if len(actions) >= limit:
                     return actions
     return actions
+
+# Reconcile one scanner XSS candidate with the exact-parameter Chromium result.
+def _reconcile_final_browser_result(results: dict[str, dict[str, Any]], action: dict[str, Any], browser_result: dict[str, Any]) -> None:
+    profile = str(action.get('profile') or '')
+    source_key = str(action.get('verification_source_result') or '')
+    parameter = str(action.get('verification_source_parameter') or '')
+    source_path = str(action.get('verification_source_path') or '')
+    source = results.get(profile, {}).get(source_key)
+    if not isinstance(source, dict):
+        return
+    browser_findings = [item for item in browser_result.get('vulnerabilities', []) if isinstance(item, dict) and (not parameter or str(item.get('parameter') or '') == parameter)]
+    confirmed = next((item for item in browser_findings if str(item.get('category') or '').lower() == 'vulnerability'), None)
+    reflected = next((item for item in browser_findings if str(item.get('verification_status') or '') == 'browser-reflection-without-marker-execution'), None)
+    attempts = ((browser_result.get('diagnostics') or {}).get('dom_attempts') or []) if isinstance(browser_result.get('diagnostics'), dict) else []
+    attempted = any(isinstance(item, dict) and (not parameter or str(item.get('parameter') or '') == parameter) for item in attempts)
+    for finding in source.get('vulnerabilities', []) if isinstance(source.get('vulnerabilities'), list) else []:
+        if not isinstance(finding, dict) or str(finding.get('category') or '').lower() != 'candidate':
+            continue
+        text = ' '.join(str(finding.get(key) or '') for key in ('alert', 'title', 'name', 'description', 'type')).lower()
+        if 'xss' not in text or (parameter and str(finding.get('parameter') or '') != parameter):
+            continue
+        if source_path and urlparse(str(finding.get('url') or '')).path != source_path:
+            continue
+        if confirmed is not None:
+            finding.update(category='vulnerability', verification_status='playwright-browser-marker-executed', confidence='high', browser_final_verification='confirmed', browser_verification_evidence=str(confirmed.get('evidence') or ''))
+        elif reflected is not None:
+            finding.update(risk='medium', verification_status='browser-reflection-without-marker-execution', confidence='medium', browser_final_verification='reflected_not_executed', browser_verification_evidence=str(reflected.get('evidence') or ''))
+        elif str(browser_result.get('status') or '').lower() == 'success' and attempted:
+            finding.update(risk='low', verification_status='browser-not-reproduced-bounded', confidence='low', browser_final_verification='not_reproduced')
 
 # Runs a deterministic final browser verification stage before AI narrative analysis.
 def verification_node(state: AgentState) -> dict[str, Any]:
@@ -1914,6 +1947,8 @@ def verification_node(state: AgentState) -> dict[str, Any]:
     completed = list(state['completed'])
     before_keys = {profile: set(values) for profile, values in results.items()}
     executed = asyncio.run(execute_plan(actions, cookies, discovery, allow_state_changes=state.get('allow_state_changes'), secondary_cookies=state.get('secondary_cookies', '')))
+    for action, browser_result in executed:
+        _reconcile_final_browser_result(results, action, browser_result)
     _record_execution_batch(executed, state=state, results=results, discovery=discovery, completed=completed, profile_cookies=profile_cookies)
     for profile, values in results.items():
         for key, value in values.items():

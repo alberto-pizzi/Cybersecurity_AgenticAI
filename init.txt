@@ -118,14 +118,19 @@ Verifica poi:
   curl -v http://dashboard-test/
   curl -vk https://dashboard-test/
 
-configs/dashboard-test.json contiene HTTP/80 e HTTPS/443 inizialmente disabled. Abilita solo il servizio
-che risponde realmente e correggi porta/base_path in base alla documentazione o alle verifiche autorizzate.
+configs/dashboard-test.json contiene HTTP/80 e HTTPS/443. Il run autorizzato del 03/09/2026 ha confermato
+HTTP/80 con base_path=/, quindi http-80 e' gia' enabled; HTTPS/443 resta disabled finche' non viene verificato.
 Il professore non ha fornito credenziali: non inventarle e lascia l'assessment anonimo finche' il proprietario
 non fornisce un account/sessione di test. Per una sessione cookie, aggiungi un credential_ref e preferisci una
 variabile d'ambiente come mostrato in configs/platform.example.json.
-Dopo aver abilitato il servizio reale, l'initializer stampa anche il comando equivalente a:
+Con il servizio HTTP/80 gia' abilitato, l'initializer stampa anche il comando equivalente a:
   python .\assessmentRunner.py --config .\configs\dashboard-test.json --orchestrator agentic --model <MODELLO_EFFETTIVO> --max-rounds 2 --mode balanced --require-ai --authorized
 <MODELLO_EFFETTIVO> e' snap4city quando disponibile, altrimenti il fallback Ollama locale verificato.
+Il file contiene anche credential_ref=dashboard_session collegato alla variabile opzionale DASHBOARD_TEST_COOKIE.
+Senza la variabile il runner continua solo anonimo; con una sessione autorizzata:
+  export DASHBOARD_TEST_COOKIE='PHPSESSID=<SESSION>; ...'
+il job esegue anonimo + authenticated senza scrivere il cookie nel JSON.
+
 
 Esempio architettura complessa:
   configs/platform.example.json
@@ -198,20 +203,29 @@ verifica fallisce, l'inizializzazione fallisce invece di lasciare il Browser ver
 La discovery combina crawler HTTP, form/query, endpoint letterali trovati negli script e una sola coda
 dinamica Chromium. Il browser parte dalle pagine HTML sicure e piu' interessanti gia' note, le carica e
 osserva richieste same-origin document/XHR/fetch; i nuovi link/documenti same-origin renderizzati vengono
-reinseriti subito nella stessa coda. Il budget totale di navigazioni Chromium e' 8 in fast, 20 in balanced
+reinseriti subito nella stessa coda. Per ogni profilo di discovery il budget di navigazioni Chromium e' 8 in fast, 20 in balanced
 e 45 in deep; le XHR/fetch osservate non consumano un ulteriore budget di pagine e possono generare
-request contract. Le richieste browser non-GET e le rotte distruttive vengono intercettate prima dell'invio:
+request contract. Per le richieste realmente inviate vengono registrati anche status/content-type della response
+o requestfailed, cosi' il planner distingue endpoint raggiunti da 404/410 senza scartare 401/403. Le richieste
+browser non-GET e le rotte distruttive vengono intercettate prima dell'invio:
 il body puo' diventare request contract con metodo e parametri reali; GET/POST vengono poi consumati dai tool
 compatibili, mentre gli altri metodi restano tracciati come superficie osservata.
 
 ZAP: fast=targeted, balanced=prioritized, deep=full bounded; la modalita' passiva resta per i soli
-controlli diagnostici. Se era richiesto active scan ma non e' possibile pianificare alcuna regola,
+controlli diagnostici. L'inventario active usa API Python/JSON e fallback curato; ogni scanner ID viene
+abilitato separatamente e il log distingue piano teorico da regole accettate. Se era richiesto active scan
+ma non e' possibile pianificare o abilitare alcuna regola,
 il risultato e' PARTIAL/no_active_scan_rules_enabled, non SUCCESS con 0 regole.
 Nuclei: balanced e deep possono usare request contract per DAST gap checks bounded.
 Gli specialisti sui parametri privilegiano API/dati, identificatori/query, POST/JSON e richieste
 osservate dal browser rispetto a parametri puramente di navigazione.
-L'Agentic esegue infine una fase deterministica Chromium sui candidati XSS ancora non confermati,
-prima dell'analisi AI e del report. Il limite e' 2 candidati in fast, 8 in balanced e 15 in deep.
+Entrambi gli orchestratori eseguono infine una verifica Chromium candidate-driven sugli XSS ancora non confermati,
+con limite di 2 candidati in fast, 8 in balanced e 15 in deep. Il browser riceve solo il parametro del finding
+sorgente: esecuzione del marker => vulnerability; reflection senza esecuzione => candidate medium; nessuna
+riproduzione nel controllo bounded => confidence/risk ridotti. CSS, JavaScript standalone, immagini e font non
+sono candidati Browser-XSS. Nel Deterministic il passaggio avviene dopo i controlli speciali e prima del report e
+non ripete un URL/metodo/parametro gia' verificato con successo nella precedente fase browser/workflow. Nell'Agentic
+avviene prima dell'analisi AI e del report.
 
 5. PREFLIGHT E TEST
 -------------------
