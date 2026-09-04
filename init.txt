@@ -111,7 +111,7 @@ Per llama/qwen il runner verifica il modello esatto gia' installato in Ollama. N
 accetta la sostituzione silenziosa con l'altro modello: inizializza prima il modello richiesto.
 
 MICROX / DASHBOARD-TEST
-Prima aggiungi nella VM la mappatura autorizzata fornita dal professore:
+Prima aggiungi nella VM la mappatura autorizzata del target:
   192.168.1.81 dashboard-test
 Verifica poi:
   getent hosts dashboard-test
@@ -120,7 +120,7 @@ Verifica poi:
 
 configs/dashboard-test.json contiene HTTP/80 e HTTPS/443. Il run autorizzato del 03/09/2026 ha confermato
 HTTP/80 con base_path=/, quindi http-80 e' gia' enabled; HTTPS/443 resta disabled finche' non viene verificato.
-Il professore non ha fornito credenziali: usa soltanto un account Snap4City autorizzato per questo test.
+Usa soltanto un account Snap4City autorizzato per questo test.
 configs/dashboard-test.json usa credential_ref=dashboard_session con login browser automatico Snap4City/Keycloak.
 Ordine di risoluzione della sessione:
   1. se DASHBOARD_TEST_COOKIE e' valorizzato, riusa quella sessione e non esegue il login browser;
@@ -183,7 +183,7 @@ python .\orchestratorAgentic.py --target <TARGET> --cookies "<COOKIE_HEADER>" --
 Con seconda identità:
 python .\orchestratorAgentic.py --target <TARGET> --cookies "<PRIMARY_COOKIE>" --secondary-cookies "<SECOND_ACCOUNT_COOKIE>" --auth-only --authorized --model snap4city --max-rounds 3 --mode deep --require-ai
 
-Snap4City rispetta la priorita' del TokenManager del professore: prima riusa un access token ancora valido in token_stored.json;
+Snap4City rispetta la priorita' del TokenManager Snap4City: prima riusa un access token ancora valido in token_stored.json;
 se e' scaduto prova il refresh token; con credenziali reali in snap4city_model_credentials.json usa username/password come ultimo passo normale.
 Se snap4city_model_credentials.json manca o contiene ancora placeholder, i placeholder non vengono mai inviati: vengono provati prima access token
 e refresh token gia' salvati e solo se entrambi non sono utilizzabili, con terminale interattivo, vengono chiesti username/password
@@ -402,3 +402,10 @@ TERMINOLOGIA TOKEN/CREDENZIALI
   Snap4City access/refresh token = credenziali dell'API LLM remota.
   Cookie/JWT/CSRF del target     = dati della piattaforma sottoposta ad assessment.
   Token LLM / num_predict       = unita' di testo del modello, non credenziali di accesso.
+
+NOTE DI VALIDAZIONE RUNTIME
+- Un profilo con cookie che la discovery dichiara non autenticato viene escluso dalla pianificazione autenticata; non sopprime la copertura anonima.
+- ZAP considera completa la copertura attiva solo se casi pianificati, tentati, avviati e completati coincidono.
+- Nikto con processo concluso ma copertura non verificabile viene registrato PARTIAL, non SUCCESS.
+- La confidence finale dell'analisi AI viene applicata a tutti i candidate/vulnerability; Chromium puo' imporre un ceiling separato per XSS.
+- Le richieste token del provider AI Snap4City hanno timeout HTTP limitati.

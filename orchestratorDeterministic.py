@@ -98,8 +98,8 @@ async def deterministic_broad_scan_node(state: DeterministicState) -> dict[str, 
     discovery = state['discovery']
     diagnostics = state['diagnostics']
     results = state['results']
-    has_authenticated_profile = any((bool(profile.get('cookies')) for profile in profiles))
     profile_session_state = {profile['name']: discovery[profile['name']].get('authentication_effective') is not False for profile in profiles}
+    has_authenticated_profile = any((bool(profile.get('cookies')) and profile_session_state.get(profile['name'], True) for profile in profiles))
     broad_specs = {spec.name: spec for spec in BASE_TOOLS}
     for profile in profiles:
         name, cookies = (profile['name'], profile['cookies'])
@@ -579,7 +579,7 @@ async def deterministic_report_node(state: DeterministicState) -> dict[str, Any]
     workflow_selection_summary = state.get('workflow_selection_summary', {})
     verification_selection_summary = state.get('verification_selection_summary', {})
     authorization_selection_summary = state.get('authorization_selection_summary', {})
-    context = {'profiles': [{'name': profile['name'], 'authenticated': bool(profile['cookies'])} for profile in profiles],
+    context = {'profiles': [{'name': profile['name'], 'authenticated': bool(profile.get('cookies')) and discovery.get(profile['name'], {}).get('authentication_effective') is not False} for profile in profiles],
         'expected_tools': [spec.name for spec in (*BASE_TOOLS, ARJUN_TOOL, *PARAMETER_TOOLS, AUTHORIZATION_TOOL, *WORKFLOW_TOOLS, OPTIONAL_TOOLS[0], OPTIONAL_TOOLS[1])],
         'discovery': discovery,
         'diagnostics': diagnostics,

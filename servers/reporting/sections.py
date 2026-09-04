@@ -163,7 +163,6 @@ def _render_priority_actions(findings: list[dict[str, Any]], toc: list[tuple[int
             f"<li><b>[{_esc(item['risk']).upper()}] {_esc(item['alert'])}</b>{target}"
             f"<br>{_esc(item['solution'])}</li>"
         )
-        # TODO this limit is ok?
         if len(items) >= PRIORITY_ACTIONS_LIMIT:
             break
     if not items:

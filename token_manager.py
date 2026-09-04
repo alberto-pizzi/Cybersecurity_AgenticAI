@@ -11,6 +11,9 @@ import json
 import os
 
 
+TOKEN_HTTP_TIMEOUT = (5, 30)
+
+
 class TokenManager:
     def __init__(self, username, password, client_id="clearml-apis", store_path="token_stored.json"):
         self.username = username
@@ -62,9 +65,13 @@ class TokenManager:
         }
         header = {'Content-Type': 'application/x-www-form-urlencoded'}
         url_token = "https://www.snap4city.org/auth/realms/master/protocol/openid-connect/token"
-        response = requests.post(url_token, data=payload, headers=header)
-        print(f"[GET_TOKEN_VIA_USER_CREDENTIALS] - Response status code: {response.status_code}")
-        return response.json()
+        try:
+            response = requests.post(url_token, data=payload, headers=header, timeout=TOKEN_HTTP_TIMEOUT)
+            print(f"[GET_TOKEN_VIA_USER_CREDENTIALS] - Response status code: {response.status_code}")
+            return response.json()
+        except (requests.RequestException, ValueError) as exc:
+            print(f"[GET_TOKEN_VIA_USER_CREDENTIALS] - Request failed: {type(exc).__name__}: {exc}")
+            return {}
 
     def get_token_via_refresh_token(self, refresh_token):
         print("[GET_TOKEN_VIA_REFRESH_TOKEN] - Sending request with Refresh Token...")
@@ -77,9 +84,13 @@ class TokenManager:
         header = {'Content-Type': 'application/x-www-form-urlencoded'}
         url_token = ("https://www.snap4city.org/auth/realms/master/protocol/openid-connect/token"
                      "")
-        response = requests.post(url_token, data=payload, headers=header)
-        print(f"[GET_TOKEN_VIA_REFRESH_TOKEN] - Status code response: {response.status_code}")
-        return response.json()
+        try:
+            response = requests.post(url_token, data=payload, headers=header, timeout=TOKEN_HTTP_TIMEOUT)
+            print(f"[GET_TOKEN_VIA_REFRESH_TOKEN] - Status code response: {response.status_code}")
+            return response.json()
+        except (requests.RequestException, ValueError) as exc:
+            print(f"[GET_TOKEN_VIA_REFRESH_TOKEN] - Request failed: {type(exc).__name__}: {exc}")
+            return {}
 
     def save_token_data(self, token_data):
         print("[SAVE_TOKEN] - Saving Access Token on JSON file...")

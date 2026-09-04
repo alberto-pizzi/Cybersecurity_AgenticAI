@@ -8,7 +8,7 @@ import subprocess
 import time
 from pathlib import Path
 from typing import Any, Iterable
-from urllib.parse import urljoin, urlparse
+from urllib.parse import urljoin, urlparse, urlunparse
 
 import requests
 
@@ -318,12 +318,17 @@ def find_executable(name: str) -> str | None:
     return shutil.which(name) or shutil.which(f"{name}.bat") or shutil.which(f"{name}.exe")
 
 
-# URL normalization removes fragments and repeated trailing separators before comparison.
+# URL normalization removes fragments and trailing path separators without altering query values.
 def normalize_url(url: str) -> str:
     parsed = urlparse(url.strip())
     if parsed.scheme not in {"http", "https"} or not parsed.netloc:
         raise ValueError("The target must be an absolute HTTP/HTTPS URL.")
-    return url.rstrip("/")
+    path = parsed.path
+    if len(path) > 1:
+        path = path.rstrip("/")
+    elif path == "/" and not parsed.query:
+        path = ""
+    return urlunparse(parsed._replace(path=path, fragment=""))
 
 
 # Origin comparison requires the same scheme, host, and effective port.

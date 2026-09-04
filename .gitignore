@@ -1,0 +1,8 @@
+# Runtime credentials and tokens
+snap4city_model_credentials.json
+token_stored.json
+
+# Generated reports and Python caches
+reports/
+__pycache__/
+*.pyc

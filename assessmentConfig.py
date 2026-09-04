@@ -37,15 +37,18 @@ def load_assessment_config(path: str | Path) -> dict[str, Any]:
     execution = payload.get("execution")
     if not isinstance(execution, dict):
         raise ValueError("execution must be a JSON object.")
-    orchestrator = str(execution.get("orchestrator") or "deterministic").lower()
+    orchestrator = str(execution.get("orchestrator") or "deterministic").strip().lower()
     if orchestrator not in SUPPORTED_ORCHESTRATORS:
         raise ValueError(f"execution.orchestrator must be one of {sorted(SUPPORTED_ORCHESTRATORS)}.")
-    mode = str(execution.get("mode") or "balanced").lower()
+    mode = str(execution.get("mode") or "balanced").strip().lower()
     if mode not in SUPPORTED_MODES:
         raise ValueError(f"execution.mode must be one of {sorted(SUPPORTED_MODES)}.")
-    model = str(execution.get("model") or "snap4city").lower()
+    model = str(execution.get("model") or "snap4city").strip().lower()
     if model not in SUPPORTED_MODELS:
         raise ValueError(f"execution.model must be one of {sorted(SUPPORTED_MODELS)}.")
+    execution["orchestrator"] = orchestrator
+    execution["mode"] = mode
+    execution["model"] = model
     if "allow_state_changes" in execution and not isinstance(execution.get("allow_state_changes"), bool):
         raise ValueError("execution.allow_state_changes must be true or false when supplied.")
     _validate_assets(assets)

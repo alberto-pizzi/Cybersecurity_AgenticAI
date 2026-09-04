@@ -592,6 +592,23 @@ def ensure_snap4city_model(
 def action_id(action: dict[str, Any]) -> str:
     return '|'.join((str(action.get(key, '')) for key in ('profile', 'tool', 'target_url', 'method', 'data', 'jwt_token', 'injection_url')))
 
+
+# Treat a profile as authenticated only while discovery has not disproved its supplied session.
+def _profile_has_effective_auth(state: AgentState, profile_name: str) -> bool:
+    profile = next((item for item in state.get('profiles', []) if str(item.get('name') or '') == profile_name), None)
+    if not isinstance(profile, dict) or not bool(profile.get('cookies')):
+        return False
+    found = state.get('discovery', {}).get(profile_name, {})
+    return not isinstance(found, dict) or found.get('authentication_effective') is not False
+
+
+# Invalid authenticated profiles remain visible in reporting but are not eligible for scanner planning.
+def _profile_is_plannable(state: AgentState, profile_name: str) -> bool:
+    profile = next((item for item in state.get('profiles', []) if str(item.get('name') or '') == profile_name), None)
+    if not isinstance(profile, dict):
+        return False
+    return not bool(profile.get('cookies')) or _profile_has_effective_auth(state, profile_name)
+
 # Converts internal planner field names into readable console/report wording.
 def _humanize_planner_reasoning(value: Any) -> str:
     text = str(value or '').strip()
@@ -609,7 +626,7 @@ def _humanize_planner_reasoning(value: Any) -> str:
     return re.sub(r'\s+', ' ', text).strip()
 
 def _planner_system_message() -> str:
-    # The professor-provided prompt uses explicit ROLE / constraints / definitions / output sections.
+    # The provider-specific prompt uses explicit role, constraints, definitions and output sections.
     # Reuse that structure while keeping this planner task-specific and compact for local models.
     return (
         '[ROLE]\n'
@@ -1083,7 +1100,7 @@ def _ai_analysis_batch(state: AgentState, batch: list[dict[str, Any]], all_candi
     context = json.dumps({
         'target': state['target'],
         'scan_mode': mode,
-        'authenticated_profiles': [profile['name'] for profile in state['profiles'] if profile.get('cookies')],
+        'authenticated_profiles': [profile['name'] for profile in state['profiles'] if _profile_has_effective_auth(state, str(profile.get('name') or ''))],
         'related_findings': related_findings,
         'findings_to_analyze': batch,
     }, ensure_ascii=False, separators=(',', ':'))
@@ -1237,8 +1254,7 @@ def _apply_analysis(rows: list[dict[str, Any]], finding_map: dict[str, dict[str,
         elif confidence_ceiling and confidence_order.get(applied_confidence, 0) > confidence_order[confidence_ceiling]:
             applied_confidence = confidence_ceiling
         finding['risk'] = applied_risk
-        if browser_outcome == 'confirmed' or verification_status == 'playwright-browser-marker-executed' or confidence_ceiling:
-            finding['confidence'] = applied_confidence
+        finding['confidence'] = applied_confidence
 
         # AI wording remains the primary assessment. A weak individual field does
         # not invalidate a successful AI analysis: when the scanner already has a
@@ -1359,10 +1375,12 @@ def discovery_node(state: AgentState) -> dict[str, Any]:
 def discovery_candidate_actions(state: AgentState) -> list[dict[str, Any]]:
 
     actions: list[dict[str, Any]] = []
-    has_auth = any((bool(profile.get('cookies')) for profile in state['profiles']))
+    has_auth = any((_profile_has_effective_auth(state, str(profile.get('name') or '')) for profile in state['profiles']))
     for profile in state['profiles']:
         name = profile['name']
-        authenticated = bool(profile.get('cookies'))
+        if not _profile_is_plannable(state, name):
+            continue
+        authenticated = _profile_has_effective_auth(state, name)
         broad = list(shared.broad_tool_order(authenticated))
         for tool in broad:
             actions.append({'profile': name, 'tool': tool, 'target_url': state['target'], 'jwt_token': '', 'injection_url': '', 'reason': 'Session-aware baseline coverage.'})
@@ -1425,10 +1443,10 @@ def validate_plan(state: AgentState, proposed: Any) -> list[dict[str, Any]]:
         if not isinstance(raw, dict):
             continue
         profile, tool = (str(raw.get('profile', '')), str(raw.get('tool', '')).lower())
-        if profile not in profiles or tool not in REGISTRY:
+        if profile not in profiles or tool not in REGISTRY or not _profile_is_plannable(state, profile):
             continue
-        has_authenticated_profile = any((bool(item.get('cookies')) for item in state['profiles']))
-        profile_has_cookie = next((bool(item.get('cookies')) for item in state['profiles'] if item.get('name') == profile), False)
+        has_authenticated_profile = any((_profile_has_effective_auth(state, str(item.get('name') or '')) for item in state['profiles']))
+        profile_has_cookie = _profile_has_effective_auth(state, profile)
         if shared.CURRENT_SCAN_MODE != 'deep':
             if profile == 'anonymous' and has_authenticated_profile and (tool in {'session', 'nikto', 'sqlmap', 'dalfox', 'commix', 'traversal', 'idor', 'authorization', 'browser', 'workflow'}):
                 continue
@@ -1578,7 +1596,7 @@ def _merge_ai_actions(base: list[dict[str, Any]], additions: list[dict[str, Any]
 # Fallback planning selects a safe deterministic set of actions when AI planning is unavailable.
 def _fallback_plan(state: AgentState, eligible: list[dict[str, Any]], budget: int) -> list[dict[str, Any]]:
 
-    authenticated = {str(profile.get('name') or ''): bool(profile.get('cookies')) for profile in state['profiles']}
+    authenticated = {str(profile.get('name') or ''): _profile_has_effective_auth(state, str(profile.get('name') or '')) for profile in state['profiles']}
     ordered = sorted(eligible, key=lambda action: (shared.tool_execution_rank(str(action.get('tool') or ''), authenticated.get(str(action.get('profile') or ''), False)), str(action.get('profile') or ''), str(action.get('target_url') or ''), str(action.get('tool') or '')))
     return ordered[:min(budget, 3)]
 
@@ -1597,8 +1615,10 @@ def _has_tool_result(profile_results: dict[str, Any], tool: str) -> bool:
 # Explains why an expected tool action cannot be created.
 def _missing_tool_reason(state: AgentState, profile_name: str, tool: str) -> str:
     found = state['discovery'].get(profile_name, {})
-    has_authenticated_profile = any((bool(item.get('cookies')) for item in state['profiles']))
-    profile_has_cookie = any((item.get('name') == profile_name and bool(item.get('cookies')) for item in state['profiles']))
+    if not _profile_is_plannable(state, profile_name):
+        return 'Authenticated session was conclusively invalid during discovery; this action was not eligible for authenticated coverage.'
+    has_authenticated_profile = any((_profile_has_effective_auth(state, str(item.get('name') or '')) for item in state['profiles']))
+    profile_has_cookie = _profile_has_effective_auth(state, profile_name)
     if profile_name == 'anonymous' and has_authenticated_profile and (shared.CURRENT_SCAN_MODE != 'deep') and (tool in {'session', 'nikto', *PARAMETER_COVERAGE_TOOLS, *AUTHORIZATION_COVERAGE_TOOLS, *WORKFLOW_COVERAGE_TOOLS}):
         return 'The richer authenticated profile provides this coverage in the selected scan mode.'
     if tool in BROAD_COVERAGE_TOOLS:
@@ -2014,7 +2034,7 @@ def report_node(state: AgentState) -> dict[str, Any]:
     output_name = f'SecOps_Agentic_Assessment_{datetime.now():%Y%m%d_%H%M%S}'
     report_results = _materialize_unselected_actions(state)
     remaining = _remaining_eligible_actions({**state, 'results': report_results})
-    context = {'profiles': [{'name': profile['name'], 'authenticated': bool(profile['cookies'])} for profile in state['profiles']],
+    context = {'profiles': [{'name': profile['name'], 'authenticated': _profile_has_effective_auth(state, str(profile.get('name') or ''))} for profile in state['profiles']],
         'expected_tools': list(REGISTRY),
         'discovery': state['discovery'],
         'diagnostics': state['diagnostics'],
