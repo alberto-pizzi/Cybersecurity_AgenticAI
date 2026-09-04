@@ -319,7 +319,7 @@ def _write_dvwa_assessment_config(cookie_header: str, agentic_model: str, mode: 
             "max_rounds": 3 if mode == "deep" else 2,
             "require_ai": True,
             "allow_state_changes": True,
-            "snap4city_credentials": "user_credentials.json",
+            "snap4city_credentials": "snap4city_model_credentials.json",
             "ollama_url": "http://127.0.0.1:11434",
         },
     }
@@ -446,7 +446,7 @@ def print_important_commands(
             "--model", agentic_model, "--max-rounds", rounds, "--mode", mode, "--require-ai",
         ))
         if DASHBOARD_TEST_ASSESSMENT_CONFIG.is_file():
-            print("\nMicroX / dashboard-test Agentic BALANCED (enable the confirmed service in the configuration first):")
+            print("\nMicroX / dashboard-test Agentic BALANCED (automatic Snap4City login uses DASHBOARD_TEST_USERNAME/PASSWORD or prompts in an interactive console; DASHBOARD_TEST_COOKIE overrides it):")
             print(_operator_command(
                 "assessmentRunner.py", "--config", str(DASHBOARD_TEST_ASSESSMENT_CONFIG),
                 "--orchestrator", "agentic", "--model", agentic_model, "--max-rounds", "2",
@@ -484,8 +484,8 @@ def main() -> int:
         ),
     )
     parser.add_argument(
-        "--snap4city-credentials", default="user_credentials.json",
-        help="Snap4City credentials JSON. Cached access/refresh tokens are reused first; missing/placeholder credentials are requested interactively only when no usable token remains.",
+        "--snap4city-credentials", default="snap4city_model_credentials.json",
+        help="Credentials JSON for the Snap4City AI model/provider (not the assessed dashboard account). Cached access/refresh tokens are reused first; missing/placeholder credentials are requested interactively only when no usable token remains.",
     )
     parser.add_argument("--mode", choices=("fast", "balanced", "deep"), default="balanced", help="Scanner coverage/runtime profile (default: balanced).")
     parser.add_argument("--skip-preflight", action="store_true", help="Skip the live deterministic MCP/dependency preflight.")

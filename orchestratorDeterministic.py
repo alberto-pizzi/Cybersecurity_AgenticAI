@@ -470,6 +470,7 @@ def _final_browser_verification_cases(state: DeterministicState) -> list[tuple[s
                     selected['fields'] = [field for field in selected.get('fields', []) if isinstance(field, dict) and str(field.get('name') or '') == parameter]
                 selected['verification_source_parameter'] = parameter
                 selected['verification_source_path'] = finding_path
+                selected['verification_source_url'] = finding_url
                 if already_tested(profile, selected, parameter):
                     continue
                 dedupe_key = (profile, str(selected.get('method', 'GET')).upper(), str(selected.get('url') or ''), parameter)
@@ -488,6 +489,7 @@ def _reconcile_deterministic_browser_result(results: dict[str, dict[str, Any]], 
         return
     parameter = str(case.get('verification_source_parameter') or (case.get('parameters') or [''])[0])
     source_path = str(case.get('verification_source_path') or urlparse(str(case.get('url') or '')).path)
+    source_url = str(case.get('verification_source_url') or '')
     browser_findings = [item for item in browser_result.get('vulnerabilities', []) if isinstance(item, dict) and (not parameter or str(item.get('parameter') or '') == parameter)]
     confirmed = next((item for item in browser_findings if str(item.get('category') or '').lower() == 'vulnerability'), None)
     reflected = next((item for item in browser_findings if str(item.get('verification_status') or '') == 'browser-reflection-without-marker-execution'), None)
@@ -505,14 +507,17 @@ def _reconcile_deterministic_browser_result(results: dict[str, dict[str, Any]], 
         text = ' '.join(str(finding.get(key) or '') for key in ('alert', 'title', 'name', 'description', 'type')).lower()
         if 'xss' not in text or (parameter and str(finding.get('parameter') or '') != parameter):
             continue
-        if source_path and urlparse(str(finding.get('url') or '')).path != source_path:
+        finding_url = str(finding.get('url') or '')
+        if source_path and urlparse(finding_url).path != source_path:
+            continue
+        if source_url and shared.xss_verification_context_score(source_url, finding_url, parameter) < 20:
             continue
         if confirmed is not None:
-            finding.update(category='vulnerability', verification_status='playwright-browser-marker-executed', confidence='high', browser_final_verification='confirmed', browser_verification_evidence=str(confirmed.get('evidence') or ''))
+            finding.update(category='vulnerability', verification_status='playwright-browser-marker-executed', confidence='high', browser_final_verification='confirmed', browser_confidence_ceiling='', browser_verification_evidence=str(confirmed.get('evidence') or ''))
         elif reflected is not None:
-            finding.update(risk='medium', verification_status='browser-reflection-without-marker-execution', confidence='medium', browser_final_verification='reflected_not_executed', browser_verification_evidence=str(reflected.get('evidence') or ''))
+            finding.update(verification_status='browser-reflection-without-marker-execution', confidence='medium', browser_final_verification='reflected_not_executed', browser_confidence_ceiling='medium', browser_verification_evidence=str(reflected.get('evidence') or ''))
         elif str(browser_result.get('status') or '').lower() == 'success' and attempted:
-            finding.update(risk='low', verification_status='browser-not-reproduced-bounded', confidence='low', browser_final_verification='not_reproduced', browser_verification_evidence=f"Chromium completed an exact-parameter bounded check for {parameter or 'the source parameter'} without marker execution or reflection.")
+            finding.update(verification_status='browser-not-reproduced-bounded', confidence='low', browser_final_verification='not_reproduced', browser_confidence_ceiling='low', browser_verification_evidence=f"Chromium completed an exact-parameter bounded check for {parameter or 'the source parameter'} without marker execution or reflection.")
 
 # Rechecks unresolved scanner-produced XSS candidates with Chromium before deterministic reporting.
 async def deterministic_verification_node(state: DeterministicState) -> dict[str, Any]:

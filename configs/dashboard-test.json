@@ -10,10 +10,16 @@
   },
   "credentials": {
     "dashboard_session": {
-      "kind": "cookie",
-      "env": "DASHBOARD_TEST_COOKIE",
+      "kind": "snap4city_oidc",
+      "cookie_env": "DASHBOARD_TEST_COOKIE",
+      "username_env": "DASHBOARD_TEST_USERNAME",
+      "password_env": "DASHBOARD_TEST_PASSWORD",
+      "login_path": "/dashboardSmartCity/",
+      "validation_path": "/dashboardSmartCity/",
+      "headless": true,
+      "timeout_seconds": 60,
       "optional": true,
-      "purpose": "Optional authenticated dashboard-test browser/session cookie; when absent the assessment runs anonymous only."
+      "purpose": "Authorized Snap4City dashboard login. Existing cookie env overrides browser login; otherwise username/password env or interactive console input are used."
     }
   },
   "assets": [
@@ -54,6 +60,6 @@
     "max_rounds": 2,
     "require_ai": true,
     "allow_state_changes": false,
-    "snap4city_credentials": "user_credentials.json"
+    "snap4city_credentials": "snap4city_model_credentials.json"
   }
 }

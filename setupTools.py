@@ -37,7 +37,7 @@ NUCLEI_TEMPLATE_UPDATE_TIMEOUT = 600
 _NUCLEI_TEMPLATE_STATE: dict[str, Any] = {}
 _NUCLEI_ENGINE_STATE: dict[str, Any] = {}
 _IDOR_FORGE_STATE: dict[str, Any] = {}
-BUILD_ID = 'secops-v31.25-zap-xss-context-20260904'
+BUILD_ID = 'secops-v31.29-xss-confidence-axis-20260904'
 FASTMCP_VERSION = '3.4.5'
 FASTMCP_REQUIREMENT = f'fastmcp=={FASTMCP_VERSION}'
 LANGGRAPH_REQUIREMENT = 'langgraph==1.2.10'

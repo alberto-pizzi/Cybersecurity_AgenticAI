@@ -84,7 +84,7 @@ def main() -> int:
     )
     parser.add_argument("--ollama-url", default="http://127.0.0.1:11434")
     parser.add_argument("--snap4city-api-url", default=SNAP4CITY_DEFAULT_API_URL, help="Snap4City ClearML on-demand API URL.")
-    parser.add_argument("--snap4city-credentials", default="user_credentials.json", help="Snap4City credentials JSON. Cached access/refresh tokens are reused first; missing/placeholder credentials are requested interactively only when no usable token remains.")
+    parser.add_argument("--snap4city-credentials", default="snap4city_model_credentials.json", help="Credentials JSON for the Snap4City AI model/provider (not the assessed dashboard account). Cached access/refresh tokens are reused first; missing/placeholder credentials are requested interactively only when no usable token remains.")
     parser.add_argument(
         "--no-model-pull",
         action="store_true",

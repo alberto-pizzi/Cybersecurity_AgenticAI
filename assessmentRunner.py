@@ -1,14 +1,16 @@
 from __future__ import annotations
 
 import argparse
+import getpass
 import json
+import os
 import subprocess
 import sys
 import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import urljoin, urlparse
 
 from assessmentConfig import (
     SUPPORTED_MODELS,
@@ -21,6 +23,7 @@ from assessmentConfig import (
     target_is_local,
 )
 from orchestratorAgenticCore import _model_matches, ensure_ollama_model, resolve_ai_model
+from utils import canonical_cookie_header, cookie_names, same_origin
 
 
 ROOT = Path(__file__).resolve().parent
@@ -152,9 +155,210 @@ def _verify_selected_agentic_model(config: dict[str, Any]) -> None:
         )
 
 
+# Returns the first visible locator among a small set of login-form selectors.
+def _first_visible_locator(page: Any, selectors: tuple[str, ...]) -> Any | None:
+    for selector in selectors:
+        try:
+            locator = page.locator(selector).first
+            if locator.count() and locator.is_visible():
+                return locator
+        except Exception:
+            continue
+    return None
+
+
+# Reports whether a browser URL still belongs to the Keycloak/OIDC login flow rather than the assessed application.
+def _looks_like_oidc_login_url(url: str) -> bool:
+    path = str(urlparse(str(url or "")).path or "").lower().rstrip("/")
+    return "/auth/realms/" in path or path.endswith(("/login", "/signin", "/sign-in"))
+
+
+# Performs the real Snap4City browser login and returns only the target cookies consumed by the existing orchestrators.
+def _snap4city_browser_login_cookie(
+    target_url: str,
+    username: str,
+    password: str,
+    credential: dict[str, Any],
+) -> str:
+    try:
+        from playwright.sync_api import sync_playwright
+    except Exception as exc:
+        raise RuntimeError(f"Playwright is unavailable for automatic Snap4City login: {type(exc).__name__}: {exc}") from exc
+
+    login_path = str(credential.get("login_path") or "/dashboardSmartCity/").strip() or "/dashboardSmartCity/"
+    validation_path = str(credential.get("validation_path") or login_path).strip() or login_path
+    login_url = urljoin(target_url, login_path)
+    validation_url = urljoin(target_url, validation_path)
+    timeout_seconds = int(credential.get("timeout_seconds") or 60)
+    timeout_ms = timeout_seconds * 1000
+    headless = bool(credential.get("headless", True))
+
+    username_selectors = (
+        "#username",
+        "input[name='username']",
+        "input[autocomplete='username']",
+        "input[type='email']",
+    )
+    password_selectors = (
+        "#password",
+        "input[name='password']",
+        "input[autocomplete='current-password']",
+        "input[type='password']",
+    )
+    submit_selectors = (
+        "#kc-login",
+        "input[type='submit']",
+        "button[type='submit']",
+        "button[name='login']",
+    )
+
+    with sync_playwright() as playwright:
+        browser = playwright.chromium.launch(headless=headless)
+        context = browser.new_context(ignore_https_errors=True, user_agent="SecOps-Snap4City-Login/1.0")
+        page = context.new_page()
+        try:
+            page.goto(login_url, wait_until="domcontentloaded", timeout=timeout_ms)
+            username_field = _first_visible_locator(page, username_selectors)
+            password_field = _first_visible_locator(page, password_selectors)
+            if username_field is None and password_field is None:
+                raise RuntimeError(
+                    f"Snap4City login form was not found after opening {login_url}; current URL is {page.url}."
+                )
+            if username_field is not None:
+                username_field.fill(username)
+
+            if password_field is None:
+                submit = _first_visible_locator(page, submit_selectors)
+                if submit is None:
+                    raise RuntimeError("Snap4City login page exposes a username field but no submit control.")
+                submit.click()
+                page.wait_for_load_state("domcontentloaded", timeout=timeout_ms)
+                password_field = _first_visible_locator(page, password_selectors)
+            if password_field is None:
+                raise RuntimeError("Snap4City login flow did not expose a password field.")
+
+            password_field.fill(password)
+            submit = _first_visible_locator(page, submit_selectors)
+            if submit is not None:
+                submit.click()
+            else:
+                password_field.press("Enter")
+
+            deadline = time.monotonic() + timeout_seconds
+            while time.monotonic() < deadline:
+                current_url = str(page.url or "")
+                password_still_visible = _first_visible_locator(page, password_selectors) is not None
+                if same_origin(target_url, current_url) and not _looks_like_oidc_login_url(current_url) and not password_still_visible:
+                    break
+                page.wait_for_timeout(250)
+            else:
+                raise RuntimeError(f"Snap4City login did not return to the assessed application within {timeout_seconds}s; current URL is {page.url}.")
+
+            page.goto(validation_url, wait_until="domcontentloaded", timeout=timeout_ms)
+            page.wait_for_timeout(300)
+            final_url = str(page.url or "")
+            if not same_origin(target_url, final_url) or _looks_like_oidc_login_url(final_url):
+                raise RuntimeError(f"Snap4City authenticated validation returned to the login flow: {final_url}")
+            if _first_visible_locator(page, password_selectors) is not None:
+                raise RuntimeError("Snap4City authenticated validation still exposes the login password form.")
+
+            cookie_rows = list(context.cookies([validation_url]))
+            if not cookie_rows:
+                raise RuntimeError("Snap4City login completed in Chromium but no target cookie was available for the HTTP orchestrators.")
+            cookie_rows.sort(key=lambda row: len(str(row.get("path") or "/")), reverse=True)
+            selected: dict[str, tuple[str, str]] = {}
+            for row in cookie_rows:
+                name = str(row.get("name") or "").strip()
+                value = str(row.get("value") or "")
+                if name and name.lower() not in selected:
+                    selected[name.lower()] = (name, value)
+            header = canonical_cookie_header("; ".join(f"{name}={value}" for name, value in selected.values()))
+            required = {str(name).strip().lower() for name in credential.get("required_cookie_names") or [] if str(name).strip()}
+            present = {name.lower() for name in cookie_names(header)}
+            missing = sorted(required - present)
+            if missing:
+                raise RuntimeError("Snap4City login completed but required target cookie(s) are missing: " + ", ".join(missing))
+            return header
+        finally:
+            browser.close()
+
+
+# Resolves an authenticated target session from a manual cookie or from the configured Snap4City OIDC browser login.
+def _resolve_job_cookie(
+    config: dict[str, Any],
+    reference: str,
+    target_url: str,
+    cache: dict[str, str],
+) -> str:
+    if reference in cache:
+        return cache[reference]
+    credentials = config.get("credentials") or {}
+    credential = credentials.get(reference)
+    if not isinstance(credential, dict):
+        raise ValueError(f"Unknown credential reference: {reference}")
+    kind = str(credential.get("kind") or "").strip().lower()
+    if kind == "cookie":
+        value = resolve_cookie_credential(config, reference)
+        if not value:
+            print(f"[AUTH] Optional credential {reference!r} is unavailable; the job will run the anonymous profile only.")
+        cache[reference] = value
+        return value
+    if kind != "snap4city_oidc":
+        raise ValueError(f"Credential {reference!r} has unsupported web credential kind={kind!r}.")
+
+    cookie_env = str(credential.get("cookie_env") or "").strip()
+    if cookie_env:
+        manual_cookie = os.environ.get(cookie_env, "").strip()
+        if manual_cookie:
+            value = canonical_cookie_header(manual_cookie)
+            print(f"[AUTH] Using existing target session from {cookie_env}; cookie names: {', '.join(cookie_names(value)) or 'none'}")
+            cache[reference] = value
+            return value
+
+    username_env = str(credential.get("username_env") or "DASHBOARD_TEST_USERNAME").strip()
+    password_env = str(credential.get("password_env") or "DASHBOARD_TEST_PASSWORD").strip()
+    username = os.environ.get(username_env, "").strip() if username_env else ""
+    password = os.environ.get(password_env, "") if password_env else ""
+    interactive = bool(getattr(sys.stdin, "isatty", lambda: False)())
+
+    if not username and interactive:
+        username = input(f"[AUTH] Snap4City username ({username_env} not set): ").strip()
+    if not password and interactive:
+        password = getpass.getpass(f"[AUTH] Snap4City password ({password_env} not set): ")
+
+    if not username or not password:
+        if bool(credential.get("optional", False)):
+            print(
+                f"[AUTH] Optional credential {reference!r} has no usable Snap4City username/password; "
+                "the job will run the anonymous profile only."
+            )
+            cache[reference] = ""
+            return ""
+        missing = []
+        if not username:
+            missing.append(username_env or "username")
+        if not password:
+            missing.append(password_env or "password")
+        raise ValueError("Missing Snap4City login credential(s): " + ", ".join(missing))
+
+    print(f"[AUTH] Performing automatic Snap4City login for {target_url} with Chromium.")
+    try:
+        value = _snap4city_browser_login_cookie(target_url, username, password, credential)
+    except RuntimeError as exc:
+        if bool(credential.get("optional", False)):
+            print(f"[AUTH] Automatic Snap4City login failed: {exc}; the job will run the anonymous profile only.")
+            cache[reference] = ""
+            return ""
+        raise ValueError(str(exc)) from exc
+    print(f"[AUTH] Automatic Snap4City login succeeded; target cookie names: {', '.join(cookie_names(value)) or 'none'}")
+    cache[reference] = value
+    return value
+
+
 # Builds one existing orchestrator command from a normalized service job.
 def _build_command(
     config: dict[str, Any], job: dict[str, Any], *, resolve_secrets: bool = True, force_auth_only: bool = False,
+    credential_cache: dict[str, str] | None = None,
 ) -> list[str]:
     execution = config.get("execution") or {}
     orchestrator = str(execution.get("orchestrator") or "deterministic").lower()
@@ -166,21 +370,18 @@ def _build_command(
         "--mode", str(execution.get("mode") or "balanced"),
     ]
 
+    cache = credential_cache if credential_cache is not None else {}
     primary_ref = str(job.get("credential_ref") or "")
+    primary_value = ""
     if primary_ref:
-        if str(job.get("credential_kind") or "").lower() != "cookie":
-            raise ValueError(f"Job {job['id']} references a non-cookie primary credential that the web orchestrators cannot consume directly.")
-        primary_value = resolve_cookie_credential(config, primary_ref) if resolve_secrets else f"<credential:{primary_ref}>"
+        primary_value = _resolve_job_cookie(config, primary_ref, job["target"], cache) if resolve_secrets else f"<credential:{primary_ref}>"
         if primary_value:
             command.extend(["--cookies", primary_value])
-        elif resolve_secrets:
-            print(f"[AUTH] Optional credential {primary_ref!r} is unavailable; {job['id']} will run the anonymous profile only.")
     secondary_ref = str(job.get("secondary_credential_ref") or "")
     if secondary_ref:
-        if str(job.get("secondary_credential_kind") or "").lower() != "cookie":
-            raise ValueError(f"Job {job['id']} references a non-cookie secondary credential that the web orchestrators cannot consume directly.")
-        secondary_value = resolve_cookie_credential(config, secondary_ref) if resolve_secrets else f"<credential:{secondary_ref}>"
-        command.extend(["--secondary-cookies", secondary_value])
+        secondary_value = _resolve_job_cookie(config, secondary_ref, job["target"], cache) if resolve_secrets else f"<credential:{secondary_ref}>"
+        if secondary_value:
+            command.extend(["--secondary-cookies", secondary_value])
     if force_auth_only or job.get("auth_only"):
         if not primary_ref:
             raise ValueError(f"Job {job['id']} requests auth_only but has no credential_ref.")
@@ -412,6 +613,7 @@ def main() -> int:
     }
 
     exit_code = 0
+    credential_cache: dict[str, str] = {}
     for job in jobs:
         record: dict[str, Any] = {
             "id": job["id"],
@@ -437,7 +639,9 @@ def main() -> int:
             print(f"[SKIP] {job['id']}: {job.get('unsupported_reason')}")
             continue
         try:
-            command = _build_command(config, job, resolve_secrets=not args.dry_run, force_auth_only=args.auth_only)
+            command = _build_command(
+                config, job, resolve_secrets=not args.dry_run, force_auth_only=args.auth_only, credential_cache=credential_cache
+            )
         except ValueError as exc:
             record.update(status="blocked", reason=str(exc))
             results_data["jobs"].append(record)

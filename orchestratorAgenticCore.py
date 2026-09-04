@@ -383,7 +383,7 @@ def warm_ollama_model(ollama_url: str, model: str, *, timeout: int) -> dict[str,
     return {'ready': True, 'response': content[:80], 'seconds': round(time.monotonic() - started, 2)}
 
 
-# Reuses the professor-provided Snap4City TokenManager and preserves its authentication order.
+# Reuses the Snap4City TokenManager and preserves its authentication order.
 # When the credentials file still contains placeholders, cached access/refresh tokens are tried
 # first; interactive username/password entry is only the final fallback for this process.
 def _snap4city_token_manager(credentials_path: str) -> Any:
@@ -412,7 +412,7 @@ def _snap4city_token_manager(credentials_path: str) -> Any:
     )
 
     # Construct TokenManager before prompting so its original load_token_data() can reuse
-    # token_stored.json exactly as supplied by the professor. Real file credentials are passed
+    # token_stored.json through its existing load_token_data() path. Real file credentials are passed
     # through unchanged; placeholders are withheld so they can never be sent to the token endpoint.
     manager = TokenManager('' if placeholders else username, '' if placeholders else password)
 
@@ -428,7 +428,7 @@ def _snap4city_token_manager(credentials_path: str) -> Any:
         _SNAP4CITY_TOKEN_MANAGERS[path] = manager
         return manager
 
-    # If the cached access token expired, try the professor TokenManager's refresh-token request
+    # If the cached access token expired, try the TokenManager refresh-token request
     # before asking the operator for credentials. A failed refresh is consumed here so get_token()
     # will not repeat the same failed refresh after interactive credentials are supplied.
     refresh_error = ''
@@ -467,7 +467,7 @@ def _snap4city_token_manager(credentials_path: str) -> Any:
         raise RuntimeError('Snap4City username and password are required.')
 
     # Keep interactive credentials only in this TokenManager instance. They are not written back
-    # to user_credentials.json; get_token() will now use its normal username/password final step.
+    # to snap4city_model_credentials.json; get_token() will now use its normal username/password final step.
     manager.username = username
     manager.password = password
     _SNAP4CITY_TOKEN_MANAGERS[path] = manager
@@ -1219,20 +1219,26 @@ def _apply_analysis(rows: list[dict[str, Any]], finding_map: dict[str, dict[str,
         )
         finding.setdefault('scanner_solution', str(finding.get('solution') or ''))
 
-        # Deterministic browser evidence constrains severity. AI may enrich the narrative
-        # but cannot promote a candidate above the strongest browser outcome already observed.
-        risk_order = {'info': 0, 'low': 1, 'medium': 2, 'high': 3, 'critical': 4}
+        # Deterministic browser evidence constrains confidence, not potential impact.
+        # A bounded non-reproduction therefore lowers confidence without rewriting severity.
+        confidence_order = {'low': 1, 'medium': 2, 'high': 3}
         browser_outcome = str(finding.get('browser_final_verification') or '').lower()
         verification_status = str(finding.get('verification_status') or '').lower()
-        risk_ceiling = None
-        if browser_outcome == 'not_reproduced' or verification_status == 'browser-not-reproduced-bounded':
-            risk_ceiling = 'low'
-        elif browser_outcome == 'reflected_not_executed' or verification_status == 'browser-reflection-without-marker-execution':
-            risk_ceiling = 'medium'
+        explicit_ceiling = str(finding.get('browser_confidence_ceiling') or '').lower()
+        confidence_ceiling = explicit_ceiling if explicit_ceiling in {'low', 'medium'} else None
+        if confidence_ceiling is None and (browser_outcome == 'not_reproduced' or verification_status == 'browser-not-reproduced-bounded'):
+            confidence_ceiling = 'low'
+        elif confidence_ceiling is None and (browser_outcome == 'reflected_not_executed' or verification_status == 'browser-reflection-without-marker-execution'):
+            confidence_ceiling = 'medium'
         applied_risk = risk
-        if risk_ceiling and risk_order.get(applied_risk, 0) > risk_order[risk_ceiling]:
-            applied_risk = risk_ceiling
+        applied_confidence = confidence
+        if browser_outcome == 'confirmed' or verification_status == 'playwright-browser-marker-executed':
+            applied_confidence = 'high'
+        elif confidence_ceiling and confidence_order.get(applied_confidence, 0) > confidence_order[confidence_ceiling]:
+            applied_confidence = confidence_ceiling
         finding['risk'] = applied_risk
+        if browser_outcome == 'confirmed' or verification_status == 'playwright-browser-marker-executed' or confidence_ceiling:
+            finding['confidence'] = applied_confidence
 
         # AI wording remains the primary assessment. A weak individual field does
         # not invalidate a successful AI analysis: when the scanner already has a
@@ -1263,10 +1269,11 @@ def _apply_analysis(rows: list[dict[str, Any]], finding_map: dict[str, dict[str,
             'model': model,
             'risk': applied_risk,
             'ai_requested_risk': risk,
-            'risk_ceiling': risk_ceiling or '',
             'scanner_risk': original_risk,
             'severity_changed': applied_risk != original_risk,
-            'analysis_confidence': confidence,
+            'analysis_confidence': applied_confidence,
+            'ai_requested_confidence': confidence,
+            'confidence_ceiling': confidence_ceiling or '',
             'scanner_confidence': scanner_confidence,
             'rationale': str(row.get('rationale') or '').strip()[:1000],
             'short_ai_fields': sorted(short_fields),
@@ -1326,7 +1333,7 @@ def analysis_node(state: AgentState) -> dict[str, Any]:
         'errors': errors,
         'seconds': round(time.monotonic() - started, 2),
         'batch_timeout_seconds': batch_budget,
-        'policy': 'AI supplies the final severity and professional description/impact/consequence/recovery/remediation wording; original scanner narrative, category, verification status and evidence remain preserved and scanner/verifier-controlled where applicable.',
+        'policy': 'AI supplies the final severity and professional description/impact/consequence/recovery/remediation wording; browser verification constrains confidence independently from severity, while original scanner narrative, category, verification status and evidence remain preserved and scanner/verifier-controlled where applicable.',
     }
     print(f"AI analysis: finished; analyzed={analyzed}/{len(candidates)}; severity changes={changed}; {analysis['seconds']:.1f}s", flush=True)
     return {'results': results, 'analysis': analysis}
@@ -1817,7 +1824,7 @@ def _record_execution_batch(executed: list[tuple[dict[str, Any], dict[str, Any]]
         profile, tool = (action['profile'], action['tool'])
         profile_results = results.setdefault(profile, {})
         number = 1 + sum((key.startswith(f'{tool}:') for key in profile_results))
-        metadata = {key: action[key] for key in ('verification_source_result', 'verification_source_parameter', 'verification_source_path') if key in action}
+        metadata = {key: action[key] for key in ('verification_source_result', 'verification_source_parameter', 'verification_source_path', 'verification_source_url') if key in action}
         profile_results[f'{tool}:{number}'] = {**result, **metadata, 'planner_reason': action['reason'], 'planner_round': state['round']}
         completed.append(action_id(action))
         log_result(profile, tool, result, action['target_url'])
@@ -1926,7 +1933,7 @@ def _final_browser_verification_actions(state: AgentState) -> list[dict[str, Any
                 if key in seen:
                     continue
                 seen.add(key)
-                actions.append({'profile': profile, 'tool': 'browser', 'target_url': selected['url'], 'method': selected.get('method', 'GET'), 'data': selected.get('data', ''), 'parameters': selected.get('parameters', []), 'jwt_token': '', 'injection_url': '', 'fields': selected.get('fields', []), 'source_url': selected.get('source_url', ''), 'client_sources': selected.get('client_sources', []), 'client_sinks': selected.get('client_sinks', []), 'verification_source_result': str(result_key), 'verification_source_parameter': parameter, 'verification_source_path': finding_path, 'reason': f"Final Chromium verification of XSS candidate from {result_key} parameter={parameter or 'n/a'}."})
+                actions.append({'profile': profile, 'tool': 'browser', 'target_url': selected['url'], 'method': selected.get('method', 'GET'), 'data': selected.get('data', ''), 'parameters': selected.get('parameters', []), 'jwt_token': '', 'injection_url': '', 'fields': selected.get('fields', []), 'source_url': selected.get('source_url', ''), 'client_sources': selected.get('client_sources', []), 'client_sinks': selected.get('client_sinks', []), 'verification_source_result': str(result_key), 'verification_source_parameter': parameter, 'verification_source_path': finding_path, 'verification_source_url': finding_url, 'reason': f"Final Chromium verification of XSS candidate from {result_key} parameter={parameter or 'n/a'}."})
                 if len(actions) >= limit:
                     return actions
     return actions
@@ -1937,6 +1944,7 @@ def _reconcile_final_browser_result(results: dict[str, dict[str, Any]], action: 
     source_key = str(action.get('verification_source_result') or '')
     parameter = str(action.get('verification_source_parameter') or '')
     source_path = str(action.get('verification_source_path') or '')
+    source_url = str(action.get('verification_source_url') or '')
     source = results.get(profile, {}).get(source_key)
     if not isinstance(source, dict):
         return
@@ -1957,14 +1965,17 @@ def _reconcile_final_browser_result(results: dict[str, dict[str, Any]], action: 
         text = ' '.join(str(finding.get(key) or '') for key in ('alert', 'title', 'name', 'description', 'type')).lower()
         if 'xss' not in text or (parameter and str(finding.get('parameter') or '') != parameter):
             continue
-        if source_path and urlparse(str(finding.get('url') or '')).path != source_path:
+        finding_url = str(finding.get('url') or '')
+        if source_path and urlparse(finding_url).path != source_path:
+            continue
+        if source_url and shared.xss_verification_context_score(source_url, finding_url, parameter) < 20:
             continue
         if confirmed is not None:
-            finding.update(category='vulnerability', verification_status='playwright-browser-marker-executed', confidence='high', browser_final_verification='confirmed', browser_verification_evidence=str(confirmed.get('evidence') or ''))
+            finding.update(category='vulnerability', verification_status='playwright-browser-marker-executed', confidence='high', browser_final_verification='confirmed', browser_confidence_ceiling='', browser_verification_evidence=str(confirmed.get('evidence') or ''))
         elif reflected is not None:
-            finding.update(risk='medium', verification_status='browser-reflection-without-marker-execution', confidence='medium', browser_final_verification='reflected_not_executed', browser_verification_evidence=str(reflected.get('evidence') or ''))
+            finding.update(verification_status='browser-reflection-without-marker-execution', confidence='medium', browser_final_verification='reflected_not_executed', browser_confidence_ceiling='medium', browser_verification_evidence=str(reflected.get('evidence') or ''))
         elif str(browser_result.get('status') or '').lower() == 'success' and attempted:
-            finding.update(risk='low', verification_status='browser-not-reproduced-bounded', confidence='low', browser_final_verification='not_reproduced', browser_verification_evidence=f"Chromium completed an exact-parameter bounded check for {parameter or 'the source parameter'} without marker execution or reflection.")
+            finding.update(verification_status='browser-not-reproduced-bounded', confidence='low', browser_final_verification='not_reproduced', browser_confidence_ceiling='low', browser_verification_evidence=f"Chromium completed an exact-parameter bounded check for {parameter or 'the source parameter'} without marker execution or reflection.")
 
 # Runs a deterministic final browser verification stage before AI narrative analysis.
 def verification_node(state: AgentState) -> dict[str, Any]:

@@ -196,6 +196,14 @@ def _finding_route_key(value: str) -> str:
         path = path.rstrip("/")
     return urlunparse((parsed.scheme.lower(), parsed.netloc.lower(), path, "", query, ""))
 
+
+# Preserves non-payload query context for XSS findings so distinct application contexts are not merged.
+def _xss_context_key(value: str, source_parameter: str) -> str:
+    parsed = urlparse(str(value or ""))
+    source = str(source_parameter or "").lower()
+    pairs = sorted((name.lower(), val) for name, val in parse_qsl(parsed.query, keep_blank_values=True) if name and name.lower() != source)
+    return urlencode(pairs)
+
 # Classifies a finding into a coarse vulnerability family for dedup/chaining grouping
 def _finding_family(row: dict[str, Any]) -> str:
     alert = str(row.get("alert") or "").lower()
@@ -354,7 +362,10 @@ def flatten_findings(results: dict[str, Any]) -> list[dict[str, Any]]:
             if row.get("category") in {"vulnerability", "candidate"}:
                 family = _finding_family(row)
                 parameter = str(row.get("parameter") or "").lower()
-                fingerprint = (family, _finding_route_key(str(row.get("url") or "")), parameter)
+                if family in {"stored-xss", "dom-xss", "reflected-xss", "xss"}:
+                    fingerprint = (family, _finding_route_key(str(row.get("url") or "")), parameter, _xss_context_key(str(row.get("url") or ""), parameter))
+                else:
+                    fingerprint = (family, _finding_route_key(str(row.get("url") or "")), parameter)
             else:
                 fingerprint = (
                     str(row.get("tool") or ""),

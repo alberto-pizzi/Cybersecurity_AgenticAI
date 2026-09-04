@@ -40,7 +40,7 @@
     "max_rounds": 2,
     "require_ai": true,
     "allow_state_changes": true,
-    "snap4city_credentials": "user_credentials.json",
+    "snap4city_credentials": "snap4city_model_credentials.json",
     "ollama_url": "http://127.0.0.1:11434"
   }
 }

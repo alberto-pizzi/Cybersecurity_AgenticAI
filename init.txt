@@ -59,8 +59,8 @@ Alla fine l'initializer stampa prima i comandi assessmentRunner FAST/BALANCED/DE
 Agentic BALANCED per configs/dashboard-test.json con Snap4City o il fallback locale verificato, e poi un comando
 diretto orchestratorAgentic.py con un modello verificato. I comandi manuali degli orchestrator restano validi.
 
-Snap4City usa user_credentials.json. Se contiene ancora placeholder o manca e il terminale
-e' interattivo, username/password vengono richiesti in console; la password non viene mostrata.
+Il modello/provider AI Snap4City usa snap4city_model_credentials.json. Questo file NON contiene le credenziali della dashboard target.
+Se contiene ancora placeholder o manca e il terminale e' interattivo, username/password del provider AI vengono richiesti in console; la password non viene mostrata.
 
 python .\initScript.py --commands-only
 
@@ -120,16 +120,25 @@ Verifica poi:
 
 configs/dashboard-test.json contiene HTTP/80 e HTTPS/443. Il run autorizzato del 03/09/2026 ha confermato
 HTTP/80 con base_path=/, quindi http-80 e' gia' enabled; HTTPS/443 resta disabled finche' non viene verificato.
-Il professore non ha fornito credenziali: non inventarle e lascia l'assessment anonimo finche' il proprietario
-non fornisce un account/sessione di test. Per una sessione cookie, aggiungi un credential_ref e preferisci una
-variabile d'ambiente come mostrato in configs/platform.example.json.
+Il professore non ha fornito credenziali: usa soltanto un account Snap4City autorizzato per questo test.
+configs/dashboard-test.json usa credential_ref=dashboard_session con login browser automatico Snap4City/Keycloak.
+Ordine di risoluzione della sessione:
+  1. se DASHBOARD_TEST_COOKIE e' valorizzato, riusa quella sessione e non esegue il login browser;
+  2. altrimenti legge DASHBOARD_TEST_USERNAME e DASHBOARD_TEST_PASSWORD;
+  3. se una delle due variabili manca e la console e' interattiva, chiede soltanto il valore mancante; la password non viene mostrata;
+  4. Chromium apre /dashboardSmartCity/, completa il login OIDC/Keycloak, valida il ritorno alla dashboard e passa i cookie agli orchestratori;
+  5. se la credenziale opzionale non e' disponibile, il job continua solo anonimo; con --auth-only il job viene bloccato.
+Le credenziali e il cookie ottenuto non vengono scritti nel JSON di configurazione o nei Results Data.
+Esempio non interattivo:
+  export DASHBOARD_TEST_USERNAME='authorized-user'
+  export DASHBOARD_TEST_PASSWORD='authorized-password'
+Queste sono credenziali dell'account della dashboard target e NON sono snap4city_model_credentials.json, che serve soltanto al provider AI Snap4City.
 Con il servizio HTTP/80 gia' abilitato, l'initializer stampa anche il comando equivalente a:
   python .\assessmentRunner.py --config .\configs\dashboard-test.json --orchestrator agentic --model <MODELLO_EFFETTIVO> --max-rounds 2 --mode balanced --require-ai --authorized
 <MODELLO_EFFETTIVO> e' snap4city quando disponibile, altrimenti il fallback Ollama locale verificato.
-Il file contiene anche credential_ref=dashboard_session collegato alla variabile opzionale DASHBOARD_TEST_COOKIE.
-Senza la variabile il runner continua solo anonimo; con una sessione autorizzata:
+DASHBOARD_TEST_COOKIE resta un override manuale opzionale per riusare una sessione gia' valida:
   export DASHBOARD_TEST_COOKIE='PHPSESSID=<SESSION>; ...'
-il job esegue anonimo + authenticated senza scrivere il cookie nel JSON.
+Se e' presente ha precedenza su username/password e il job esegue anonimo + authenticated senza scrivere il cookie nel JSON.
 
 
 Esempio architettura complessa:
@@ -175,8 +184,8 @@ Con seconda identità:
 python .\orchestratorAgentic.py --target <TARGET> --cookies "<PRIMARY_COOKIE>" --secondary-cookies "<SECOND_ACCOUNT_COOKIE>" --auth-only --authorized --model snap4city --max-rounds 3 --mode deep --require-ai
 
 Snap4City rispetta la priorita' del TokenManager del professore: prima riusa un access token ancora valido in token_stored.json;
-se e' scaduto prova il refresh token; con credenziali reali in user_credentials.json usa username/password come ultimo passo normale.
-Se user_credentials.json manca o contiene ancora placeholder, i placeholder non vengono mai inviati: vengono provati prima access token
+se e' scaduto prova il refresh token; con credenziali reali in snap4city_model_credentials.json usa username/password come ultimo passo normale.
+Se snap4city_model_credentials.json manca o contiene ancora placeholder, i placeholder non vengono mai inviati: vengono provati prima access token
 e refresh token gia' salvati e solo se entrambi non sono utilizzabili, con terminale interattivo, vengono chiesti username/password
 per quel processo. La password viene letta senza echo e le credenziali inserite non vengono scritte automaticamente nel JSON.
 
@@ -234,10 +243,12 @@ Entrambi gli orchestratori eseguono infine una verifica Chromium candidate-drive
 con limite di 2 candidati in fast, 10 in balanced e 20 in deep. Il browser riceve solo il parametro del finding
 sorgente e seleziona il request contract piu' vicino anche in base agli altri parametri del contesto, cosi' candidate
 sullo stesso path/parametro ma con linkUrl/pageTitle/linkId differenti vengono verificati separatamente. Esecuzione
-del marker => vulnerability; reflection senza esecuzione => candidate medium; nessuna riproduzione nel controllo
-bounded => confidence/risk ridotti. L'analisi AI successiva puo' arricchire la
-descrizione ma non puo' superare i tetti deterministici del browser: MEDIUM per reflection non eseguita e LOW
-per mancata riproduzione bounded. CSS, JavaScript standalone, immagini e font non sono candidati Browser-XSS. Nel Deterministic il passaggio avviene dopo i controlli speciali e prima del report e
+del marker => vulnerability con confidence high; reflection senza esecuzione => candidate con severity invariata e
+confidence al massimo medium; nessuna riproduzione nel controllo bounded => severity invariata e confidence low.
+La severity rappresenta l'impatto potenziale se il finding fosse reale, mentre la confidence rappresenta la forza
+dell'evidenza raccolta. L'analisi AI successiva puo' arricchire la descrizione e rivalutare la severity in base
+all'impatto, ma non puo' superare il tetto di confidence deterministico del browser: MEDIUM per reflection non
+eseguita e LOW per mancata riproduzione bounded. CSS, JavaScript standalone, immagini e font non sono candidati Browser-XSS. Nel Deterministic il passaggio avviene dopo i controlli speciali e prima del report e
 non ripete un URL/metodo/parametro gia' verificato con successo nella precedente fase browser/workflow. Nell'Agentic
 avviene prima dell'analisi AI e del report.
 
@@ -311,8 +322,9 @@ non quote obbligatorie: fingerprint, product gating e timeout possono ridurre il
 ZAP e Nuclei possono generare molte richieste per ciascun caso/target selezionato. I casi Nuclei
 DAST sono scelti dal wrapper Python in modo deterministico usando metodo, path, parametri/body,
 content-type, evidenza API/XHR/fetch e response Chromium; il planner AI decide se eseguire Nuclei,
-non quali singoli request contract sono DAST. Per microX, finche' DASHBOARD_TEST_COOKIE non e'
-disponibile, questi budget si applicano al solo profilo anonimo.
+non quali singoli request contract sono DAST. Per microX, se il login automatico o DASHBOARD_TEST_COOKIE
+producono una sessione valida, gli stessi budget si applicano anche al profilo authenticated; altrimenti
+restano applicati al solo profilo anonimo.
 
 Init: --with-lab --run --prepare-ai --agentic-model --snap4city-credentials --mode
       --skip-scanners --skip-preflight --skip-browser --require-browser --commands-only --version

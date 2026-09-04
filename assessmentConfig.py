@@ -107,6 +107,25 @@ def _validate_credentials(credentials: Any) -> None:
             raise ValueError(f"Credential {name!r} optional must be true or false when supplied.")
         if kind == "cookie" and not (credential.get("env") or credential.get("value")):
             raise ValueError(f"Cookie credential {name!r} requires env or value.")
+        if kind == "snap4city_oidc":
+            for field in ("username_env", "password_env", "cookie_env", "login_path", "validation_path"):
+                if field in credential and not isinstance(credential.get(field), str):
+                    raise ValueError(f"Credential {name!r} field {field} must be a string when supplied.")
+            if "headless" in credential and not isinstance(credential.get("headless"), bool):
+                raise ValueError(f"Credential {name!r} headless must be true or false when supplied.")
+            if "timeout_seconds" in credential:
+                try:
+                    timeout_seconds = int(credential.get("timeout_seconds"))
+                except (TypeError, ValueError) as exc:
+                    raise ValueError(f"Credential {name!r} timeout_seconds must be an integer.") from exc
+                if not 10 <= timeout_seconds <= 180:
+                    raise ValueError(f"Credential {name!r} timeout_seconds must be between 10 and 180.")
+            required_names = credential.get("required_cookie_names")
+            if required_names is not None and (
+                not isinstance(required_names, list)
+                or not all(isinstance(item, str) and item.strip() for item in required_names)
+            ):
+                raise ValueError(f"Credential {name!r} required_cookie_names must be a list of non-empty strings.")
 
 
 # Resolves one target credential at execution time; environment references are preferred.
