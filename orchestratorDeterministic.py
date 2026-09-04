@@ -445,14 +445,17 @@ def _final_browser_verification_cases(state: DeterministicState) -> list[tuple[s
                 parameter = str(finding.get('parameter') or '').strip()
                 finding_path = urlparse(finding_url).path
                 selected: dict[str, Any] | None = None
+                compatible_cases: list[tuple[int, dict[str, Any]]] = []
                 for case in browser_cases:
                     case_parameters = {str(value) for value in case.get('parameters', [])}
-                    if urlparse(str(case.get('url') or '')).path != finding_path:
+                    case_url = str(case.get('url') or '')
+                    if urlparse(case_url).path != finding_path:
                         continue
                     if parameter and parameter not in case_parameters:
                         continue
-                    selected = dict(case)
-                    break
+                    compatible_cases.append((shared.xss_verification_context_score(finding_url, case_url, parameter), case))
+                if compatible_cases:
+                    selected = dict(max(compatible_cases, key=lambda item: item[0])[1])
                 if selected is None and same_origin(state['target'], finding_url) and not shared._destructive_crawl_url(finding_url):
                     parsed = urlparse(finding_url)
                     pairs = [(name, '1' if any(token in value.lower() for token in ('<script', '<img', 'javascript:', 'onerror=', 'onload=')) else value) for name, value in parse_qsl(parsed.query, keep_blank_values=True)]

@@ -218,6 +218,9 @@ essere scelte come target active; se serve il fallback generico viene preferito 
 GET parametrizzato e in balanced non vengono sprecate regole su stored-XSS o varianti DBMS-specifiche senza
 evidenza. Se era richiesto active scan ma non e' possibile pianificare o abilitare alcuna regola, il risultato
 e' PARTIAL/no_active_scan_rules_enabled, non SUCCESS con 0 regole.
+Nel fallback generico ZAP balanced/deep non riduce piu' tutti i request contract con lo stesso set di regole a un solo target:
+mantiene endpoint/request shape distinti e li esegue in sequenza fino al budget temporale globale; richieste equivalenti
+con stesso metodo, path e parametri restano deduplicate.
 Nuclei: balanced e deep possono usare request contract per DAST gap checks bounded. Il DAST prova prima
 l'input Proxify JSONL; se il runtime Nuclei lo rifiuta, i casi GET compatibili vengono ritentati automaticamente
 come lista URL e lo stderr del tentativo primario viene conservato. Eventuali casi POST non recuperabili fanno
@@ -229,8 +232,10 @@ Gli specialisti sui parametri privilegiano API/dati, identificatori/query, POST/
 osservate dal browser rispetto a parametri puramente di navigazione.
 Entrambi gli orchestratori eseguono infine una verifica Chromium candidate-driven sugli XSS ancora non confermati,
 con limite di 2 candidati in fast, 10 in balanced e 20 in deep. Il browser riceve solo il parametro del finding
-sorgente: esecuzione del marker => vulnerability; reflection senza esecuzione => candidate medium; nessuna
-riproduzione nel controllo bounded => confidence/risk ridotti. L'analisi AI successiva puo' arricchire la
+sorgente e seleziona il request contract piu' vicino anche in base agli altri parametri del contesto, cosi' candidate
+sullo stesso path/parametro ma con linkUrl/pageTitle/linkId differenti vengono verificati separatamente. Esecuzione
+del marker => vulnerability; reflection senza esecuzione => candidate medium; nessuna riproduzione nel controllo
+bounded => confidence/risk ridotti. L'analisi AI successiva puo' arricchire la
 descrizione ma non puo' superare i tetti deterministici del browser: MEDIUM per reflection non eseguita e LOW
 per mancata riproduzione bounded. CSS, JavaScript standalone, immagini e font non sono candidati Browser-XSS. Nel Deterministic il passaggio avviene dopo i controlli speciali e prima del report e
 non ripete un URL/metodo/parametro gia' verificato con successo nella precedente fase browser/workflow. Nell'Agentic

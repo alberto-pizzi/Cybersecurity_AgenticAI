@@ -807,6 +807,27 @@ def _dedupe_request_cases(cases: list[dict[str, Any]]) -> list[dict[str, Any]]:
         unique.append(case)
     return unique
 
+# Score how closely a discovered request case matches the non-payload context of one XSS finding.
+def xss_verification_context_score(finding_url: str, case_url: str, parameter: str) -> int:
+
+    finding_parsed, case_parsed = urlparse(str(finding_url or '')), urlparse(str(case_url or ''))
+    if finding_parsed.path != case_parsed.path:
+        return -100000
+    source_parameter = str(parameter or '')
+    finding_pairs = [(name, value) for name, value in parse_qsl(finding_parsed.query, keep_blank_values=True) if name != source_parameter]
+    case_pairs = [(name, value) for name, value in parse_qsl(case_parsed.query, keep_blank_values=True) if name != source_parameter]
+    finding_map = {name: value for name, value in finding_pairs}
+    case_map = {name: value for name, value in case_pairs}
+    score = 0
+    for name in set(finding_map) | set(case_map):
+        if name in finding_map and name in case_map:
+            score += 6 if finding_map[name] == case_map[name] else -2
+        else:
+            score -= 1
+    if finding_pairs == case_pairs:
+        score += 20
+    return score
+
 # Rechecks whether an authenticated profile is still valid.
 def refresh_authenticated_session_state(target: str, cookies: str, probe_url: str='') -> dict[str, Any]:
 
@@ -2014,7 +2035,7 @@ def log_zap_session_diagnostics(result: dict[str, Any]) -> None:
         stats = result.get('zap_alert_stats') if isinstance(result.get('zap_alert_stats'), dict) else {}
         effective_done = result.get('effective_targeted_scans_completed', result.get('targeted_active_scans_completed', 0))
         effective_started = result.get('effective_targeted_scans_started', result.get('targeted_active_scans_started', 0))
-        print(f"    [ZAP COVERAGE] seeded URLs={result.get('seeded_urls', 0)}; seeded requests={result.get('seeded_request_cases', 0)}; native targeted={result.get('targeted_active_scans_completed', 0)}/{result.get('targeted_active_scans_started', 0)}; effective native/proxy={effective_done}/{effective_started}; configured rules={result.get('active_rules_attempted', 0)}/{result.get('active_rules_planned', 0)} ({result.get('active_rule_coverage_percent', 0)}%); completed-rule coverage={result.get('active_rules_completed', 0)}/{result.get('active_rules_planned', 0)} ({result.get('active_rule_effective_coverage_percent', 0)}%); proxy confirmed={result.get('proxy_assisted_confirmed', 0)}; native security alerts={stats.get('security', 0)}; site-tree URLs={result.get('zap_sites_tree_urls', 0)}")
+        print(f"    [ZAP COVERAGE] seeded URLs={result.get('seeded_urls', 0)}; seeded requests={result.get('seeded_request_cases', 0)}; native targeted={result.get('targeted_active_scans_completed', 0)}/{result.get('targeted_active_scans_started', 0)}; planned cases={result.get('targeted_active_scans_planned', result.get('targeted_active_scans_started', 0))}; effective native/proxy={effective_done}/{effective_started}; configured rules={result.get('active_rules_attempted', 0)}/{result.get('active_rules_planned', 0)} ({result.get('active_rule_coverage_percent', 0)}%); completed-rule coverage={result.get('active_rules_completed', 0)}/{result.get('active_rules_planned', 0)} ({result.get('active_rule_effective_coverage_percent', 0)}%); proxy confirmed={result.get('proxy_assisted_confirmed', 0)}; native security alerts={stats.get('security', 0)}; site-tree URLs={result.get('zap_sites_tree_urls', 0)}")
         if policy:
             if policy.get('active_scan_enabled') is False:
                 print(f"    [ZAP ACTIVE POLICY] passive-only by explicit scan mode; catalog rules={policy.get('catalog_rule_count', 0)}")
@@ -2022,7 +2043,11 @@ def log_zap_session_diagnostics(result: dict[str, Any]) -> None:
                 print('    [ZAP ACTIVE POLICY] planned rule IDs=' + (', '.join((str(value) for value in policy.get('planned_rule_ids', []))) or 'none'))
                 fallback = policy.get('fallback_active_plan') if isinstance(policy.get('fallback_active_plan'), dict) else {}
                 if fallback.get('used'):
-                    print(f"    [ZAP FALLBACK] generic bounded active target={fallback.get('url', '')}; rules={','.join(str(value) for value in fallback.get('rule_ids', []))}")
+                    fallback_urls = fallback.get('urls') if isinstance(fallback.get('urls'), list) else []
+                    if len(fallback_urls) > 1:
+                        print(f"    [ZAP FALLBACK] generic bounded active targets={len(fallback_urls)}; first={fallback_urls[0]}; rules={','.join(str(value) for value in fallback.get('rule_ids', []))}")
+                    else:
+                        print(f"    [ZAP FALLBACK] generic bounded active target={fallback.get('url', '')}; rules={','.join(str(value) for value in fallback.get('rule_ids', []))}")
         deferred = result.get('deferred_native_active_cases') if isinstance(result.get('deferred_native_active_cases'), list) else []
         if deferred:
             print('    [ZAP ACTIVE POLICY] deferred in balanced/prioritized: ' + ', '.join((str(item.get('case_class') or item.get('url') or '') for item in deferred if isinstance(item, dict))))
