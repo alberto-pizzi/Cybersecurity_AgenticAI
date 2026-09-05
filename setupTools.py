@@ -519,7 +519,7 @@ def _nikto_health(perl: Path, script: Path, launcher: Path | None=None) -> tuple
 NIKTO_DOCKER_IMAGE = 'ghcr.io/sullo/nikto:latest'
 NUCLEI_DOCKER_IMAGE = 'projectdiscovery/nuclei:latest'
 NUCLEI_MIN_DAST_VERSION = (3, 11, 1)
-REPORT_DOCKER_SOURCE_IMAGE = 'albertopizzi2002/reportingpdf:v1.0'
+REPORT_DOCKER_SOURCE_IMAGE = 'secopspentest/reportingpdf:v1.0'
 
 
 REPORT_DOCKER_IMAGE = 'secops/report:local'
