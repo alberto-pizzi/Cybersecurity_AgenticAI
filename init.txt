@@ -16,6 +16,20 @@ http://127.0.0.1:8100/mcp. I moduli dei singoli tool sono importati come compone
 non aprono listener propri. Deterministic e Agentic condividono endpoint, registry, selector
 e contratti MCP. Non sono previsti trasporti MCP alternativi.
 
+0. LEGENDA TOKEN/CREDENZIALI
+----------------------------------
+In questo documento la parola "token" indica due concetti di accesso diversi e senza
+relazione tra loro. Ogni menzione successiva di "token" in questo file e' etichettata con
+uno dei due marcatori qui sotto, cosi' e' sempre chiaro a quale accesso ci si riferisce:
+  (1) TOKEN-AI: token di accesso all'LLM Snap4City (access/refresh). Autenticano l'API LLM
+      remota, cioe' il backend AI usato dal planner Agentic. Gestiti dal TokenManager
+      Snap4City e salvati in token_stored.json; non hanno nulla a che vedere con il target
+      da testare.
+  (2) TOKEN-TARGET: token di accesso alla piattaforma da verificare (cookie/JWT/token CSRF
+      del target, es. --cookies, --jwt-token, login dashboard_session). Appartengono alla
+      piattaforma sottoposta ad assessment. Non sono mai credenziali Snap4City e non
+      vengono condivisi con il provider AI.
+
 1. INIZIALIZZAZIONE
 ------------------
 Preparazione completa consigliata (default AI = tutti e tre):
@@ -183,10 +197,10 @@ python .\orchestratorAgentic.py --target <TARGET> --cookies "<COOKIE_HEADER>" --
 Con seconda identità:
 python .\orchestratorAgentic.py --target <TARGET> --cookies "<PRIMARY_COOKIE>" --secondary-cookies "<SECOND_ACCOUNT_COOKIE>" --auth-only --authorized --model snap4city --max-rounds 3 --mode deep --require-ai
 
-Snap4City rispetta la priorita' del TokenManager Snap4City: prima riusa un access token ancora valido in token_stored.json;
-se e' scaduto prova il refresh token; con credenziali reali in snap4city_model_credentials.json usa username/password come ultimo passo normale.
-Se snap4city_model_credentials.json manca o contiene ancora placeholder, i placeholder non vengono mai inviati: vengono provati prima access token
-e refresh token gia' salvati e solo se entrambi non sono utilizzabili, con terminale interattivo, vengono chiesti username/password
+Snap4City rispetta la priorita' del TokenManager Snap4City (1): prima riusa un access token (1) ancora valido in token_stored.json;
+se e' scaduto prova il refresh token (1); con credenziali reali in snap4city_model_credentials.json usa username/password come ultimo passo normale.
+Se snap4city_model_credentials.json manca o contiene ancora placeholder, i placeholder non vengono mai inviati: vengono provati prima access token (1)
+e refresh token (1) gia' salvati e solo se entrambi non sono utilizzabili, con terminale interattivo, vengono chiesti username/password
 per quel processo. La password viene letta senza echo e le credenziali inserite non vengono scritte automaticamente nel JSON.
 
 Senza --require-ai, se il planner AI fallisce può essere usato il piccolo fallback deterministico discovery-derived (massimo
@@ -354,7 +368,7 @@ In particolare il gate interessa:
     Dalfox non vengono globalmente spenti;
   - Browser verifier: il test stored-XSS che inserisce un marker innocuo e ricarica la pagina per
     verificarne la persistenza; i controlli DOM/reflected non persistenti restano disponibili;
-  - Workflow verifier: la validazione attiva CSRF tramite POST con/senza token, il caricamento di un
+  - Workflow verifier: la validazione attiva CSRF tramite POST con/senza token (2), il caricamento di un
     file-marker innocuo e la verifica CAPTCHA tramite rimozione del campo di challenge. Le sole
     osservazioni strutturali dei form possono ancora essere prodotte senza questi invii.
 
@@ -398,14 +412,9 @@ Nei finding confermati il report mostra anche conseguenze/danno potenziale e rec
 Deterministic aggiunge una guida conservativa quando il tool non la fornisce; Agentic la produce tramite
 l'analisi AI vincolata alle evidenze. Un danno potenziale non viene presentato come danno realmente avvenuto.
 
-TERMINOLOGIA TOKEN/CREDENZIALI
-  Snap4City access/refresh token = credenziali dell'API LLM remota.
-  Cookie/JWT/CSRF del target     = dati della piattaforma sottoposta ad assessment.
-  Token LLM / num_predict       = unita' di testo del modello, non credenziali di accesso.
-
 NOTE DI VALIDAZIONE RUNTIME
 - Un profilo con cookie che la discovery dichiara non autenticato viene escluso dalla pianificazione autenticata; non sopprime la copertura anonima.
 - ZAP considera completa la copertura attiva solo se casi pianificati, tentati, avviati e completati coincidono.
 - Nikto con processo concluso ma copertura non verificabile viene registrato PARTIAL, non SUCCESS.
 - La confidence finale dell'analisi AI viene applicata a tutti i candidate/vulnerability; Chromium puo' imporre un ceiling separato per XSS.
-- Le richieste token del provider AI Snap4City hanno timeout HTTP limitati.
+- Le richieste token (1) del provider AI Snap4City hanno timeout HTTP limitati.

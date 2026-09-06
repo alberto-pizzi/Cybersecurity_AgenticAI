@@ -7,6 +7,19 @@ catalogue against a target and produce PDF/HTML/JSON reports plus a redacted rev
 assessment configuration can expand multiple authorized HTTP/HTTPS services into the same existing orchestrators;
 direct orchestrator commands remain supported. Full command reference: `init.txt`.
 
+## Credential and token terminology (legend)
+
+This document uses the word "token" for two unrelated access-credential concepts. Every later
+mention of "token" in this file is tagged with one of the two markers below, so it is always clear
+which access is meant:
+
+- **(1) AI-token** — Snap4City access/refresh tokens that authenticate to the remote LLM API (the AI
+  backend used by the Agentic planner). Managed by the Snap4City `TokenManager`, cached in
+  `token_stored.json`, and completely unrelated to any assessed target.
+- **(2) Target-token** — Target cookies, target JWTs and anti-CSRF tokens (for example `--cookies`,
+  `--jwt-token`, or the `dashboard_session` login) belonging to the application being assessed. Never
+  Snap4City credentials, never shared with the AI provider.
+
 ## How core files works
 
 ### Initialization
@@ -107,7 +120,7 @@ Nikto is reported as `partial` when its process exits successfully but neither r
 - Docker
 - Ollama only for local `llama`/`qwen` Agentic models. `initScript.py --with-lab` provisions both by default;
   `--prepare-ai snap4city` does not provision or require Ollama because no local model is requested.
-- The Snap4City AI model/provider requires network access plus `snap4city_model_credentials.json` or interactive model credentials. This file is unrelated to the account used to log in to the assessed dashboard. The provider is remote and is verified during initialization rather than downloaded. Token endpoint calls use bounded HTTP timeouts; transport or JSON failures fall back through the normal cached-token/refresh/user-credential sequence and cannot block indefinitely.
+- The Snap4City AI model/provider requires network access plus `snap4city_model_credentials.json` or interactive model credentials. This file is unrelated to the account used to log in to the assessed dashboard. The provider is remote and is verified during initialization rather than downloaded. Token (1) endpoint calls use bounded HTTP timeouts; transport or JSON failures fall back through the normal cached-token/refresh/user-credential sequence (1) and cannot block indefinitely.
 
 ## How to run 
 
@@ -255,11 +268,11 @@ python .\orchestratorAgentic.py --target http://127.0.0.1 --cookies "PHPSESSID=<
 
 `orchestratorAgentic.py --model` accepts exactly `snap4city`, `llama` and `qwen`. There is no public `--ai-provider`
 option: the transport/provider is an internal implementation detail inferred from the selected model. `snap4city` uses the
-remote Snap4City endpoint, while `llama` and `qwen` use local Ollama. Snap4City uses the Snap4City `TokenManager` and keeps its authentication priority: a valid access
-token already cached in `token_stored.json` is reused first; when it is expired, a cached refresh token is tried; real
+remote Snap4City endpoint, while `llama` and `qwen` use local Ollama. Snap4City uses the Snap4City `TokenManager` (1) and keeps its authentication priority: a valid access
+token (1) already cached in `token_stored.json` is reused first; when it is expired, a cached refresh token (1) is tried; real
 username/password from `snap4city_model_credentials.json` are the normal final credential step. If the JSON is missing or still contains
-placeholders, those placeholder strings are never sent to Snap4City: the wrapper first tries the cached access/refresh token and
-asks for username/password in an interactive console only when neither token can be used. Credentials entered interactively stay
+placeholders, those placeholder strings are never sent to Snap4City: the wrapper first tries the cached access/refresh token (1) and
+asks for username/password in an interactive console only when neither token (1) can be used. Credentials entered interactively stay
 in memory for that process; the password is not echoed and `snap4city_model_credentials.json` is not rewritten automatically. The repository `.gitignore` excludes `snap4city_model_credentials.json`, `token_stored.json`, generated reports and Python caches to reduce accidental commits of runtime secrets/artifacts.
 
 `--require-ai` disables the planner fallback: a planning or AI-analysis failure stops the Agentic run. Without it, planning
@@ -345,13 +358,6 @@ Example shape:
   ]
 }
 ```
-
-
-## Credential and token terminology
-
-- Snap4City access/refresh tokens authenticate the remote LLM API.
-- Target cookies, target JWTs and anti-CSRF tokens belong to the application being assessed and are not Snap4City credentials.
-- LLM generation tokens / `num_predict` are model text-budget units and are not authentication credentials.
 
 ## Common flags
 
