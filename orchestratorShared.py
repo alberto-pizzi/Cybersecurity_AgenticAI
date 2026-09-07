@@ -2118,8 +2118,14 @@ def log_zap_session_diagnostics(result: dict[str, Any]) -> None:
     print(f"    [ZAP AUTH] ZAP={result.get('zap_version', before.get('zap_version', 'unknown'))}; Python API={result.get('python_zap_api_version', before.get('python_zap_api_version', 'unknown'))}")
     print(f"    [ZAP AUTH] probe={before.get('probe_url', '')}; cookie names={', '.join(before.get('cookie_names', [])) or 'none'}")
     direct = before.get('direct') if isinstance(before.get('direct'), dict) else {}
-    direct_state = 'inconclusive' if before.get('conclusive') is False else str(before.get('effective') is True)
-    print(f"    [ZAP AUTH] direct authenticated={direct_state}; proxy matches direct={before.get('proxy_matches_direct')}; history cookie exact={before.get('history_cookie_exact')}")
+    if before.get('conclusive') is False:
+        direct_state = 'inconclusive'
+    elif before.get('direct_authenticated') is not None:
+        direct_state = str(bool(before.get('direct_authenticated')))
+    else:
+        direct_state = str(bool(before.get('effective')))
+    injection_mode = str(result.get('authentication_injection_mode') or before.get('authentication_injection_mode') or '')
+    print(f"    [ZAP AUTH] direct authenticated={direct_state}; proxy matches direct={before.get('proxy_matches_direct')}; history cookie exact={before.get('history_cookie_exact')}; mode={injection_mode or 'n/a'}")
     history = before.get('history') if isinstance(before.get('history'), dict) else {}
     if history.get('duplicate_cookie_names'):
         print('    [ZAP AUTH WARNING] duplicate Cookie names: ' + ', '.join(history['duplicate_cookie_names']))

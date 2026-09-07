@@ -1248,6 +1248,15 @@ def _apply_analysis(rows: list[dict[str, Any]], finding_map: dict[str, dict[str,
         elif confidence_ceiling is None and (browser_outcome == 'reflected_not_executed' or verification_status == 'browser-reflection-without-marker-execution'):
             confidence_ceiling = 'medium'
         applied_risk = risk
+        # An unresolved scanner candidate may retain its potential severity, but the AI must not
+        # raise it above the scanner's severity when the exact-parameter Chromium check did not execute it.
+        risk_order = {'info': 0, 'low': 1, 'medium': 2, 'high': 3, 'critical': 4}
+        candidate_category = str(finding.get('category') or '').lower() == 'candidate'
+        browser_unconfirmed = browser_outcome in {'not_reproduced', 'reflected_not_executed'} or verification_status in {
+            'browser-not-reproduced-bounded', 'browser-reflection-without-marker-execution'
+        }
+        if candidate_category and browser_unconfirmed and original_risk in risk_order and risk_order.get(applied_risk, 0) > risk_order[original_risk]:
+            applied_risk = original_risk
         applied_confidence = confidence
         if browser_outcome == 'confirmed' or verification_status == 'playwright-browser-marker-executed':
             applied_confidence = 'high'
