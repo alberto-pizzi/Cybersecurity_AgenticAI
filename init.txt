@@ -253,7 +253,11 @@ Nell'Agentic la breadth review viene usata solo per un primo piano realmente sca
 massimo 3 azioni in fast, 6 in balanced e 10 in deep e non deve consumare tutti i candidati del primo round,
 cosi' i round successivi possono reagire ai risultati appena osservati.
 Gli specialisti sui parametri privilegiano API/dati, identificatori/query, POST/JSON e richieste
-osservate dal browser rispetto a parametri puramente di navigazione.
+osservate dal browser rispetto a parametri puramente di navigazione. Il routing e' distinto per profilo:
+login/SSO/OIDC/identity-provider restano superficie testabile nel profilo anonimo, mentre nel profilo autenticato
+non vengono inviati a SQLMap/Dalfox/Commix/Traversal. Logout/signout/logoff segue la regola opposta: l'anonimo
+lo ignora; l'autenticato ne conserva il request contract GET/POST senza eseguirlo durante discovery/scanner e lo
+riserva al controllo finale di lifecycle della sessione.
 Entrambi gli orchestratori eseguono infine una verifica Chromium candidate-driven sugli XSS ancora non confermati,
 con limite di 2 candidati in fast, 10 in balanced e 20 in deep. Il browser riceve solo il parametro del finding
 sorgente e seleziona il request contract piu' vicino anche in base agli altri parametri del contesto, cosi' candidate
@@ -266,6 +270,11 @@ all'impatto, ma non puo' superare il tetto di confidence deterministico del brow
 eseguita e LOW per mancata riproduzione bounded. CSS, JavaScript standalone, immagini e font non sono candidati Browser-XSS. Nel Deterministic il passaggio avviene dopo i controlli speciali e prima del report e
 non ripete un URL/metodo/parametro gia' verificato con successo nella precedente fase browser/workflow. Nell'Agentic
 avviene prima dell'analisi AI e del report.
+Dopo gli altri controlli autenticati, il session verifier puo' eseguire un logout scoperto in modo bounded e poi
+riusare il cookie precedente sulla pagina protetta: se il vecchio cookie mantiene accesso autenticato viene prodotto
+un finding vulnerability confermato (CWE-613); se viene rifiutato l'invalidazione e' verificata; se l'esito non e'
+distinguibile il controllo resta PARTIAL. Il logout non viene quindi fuzzato genericamente e non puo' interrompere
+gli scanner autenticati precedenti.
 
 5. PREFLIGHT E TEST
 -------------------
