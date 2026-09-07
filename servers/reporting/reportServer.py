@@ -109,6 +109,13 @@ def generate_report(
             json_filename=str(json_path.resolve()),
             review_snapshot_filename=str(review_snapshot_path.resolve()) if review_snapshot_path.is_file() else None,
             html_filename=str(html_path.resolve()), pdf_filename=None, findings_count=len(findings),
+            security_findings_count=payload["security_findings_count"],
+            candidate_findings_count=payload["candidate_findings_count"],
+            observations_count=payload["observations_count"],
+            execution_limitations_count=len(summary.get("limitations") or []),
+            coverage_constraints_count=len(summary.get("coverage_constraints") or []),
+            execution_complete=bool(summary.get("execution_complete")),
+            coverage_complete=bool(summary.get("coverage_complete")),
         )
         return result
     finally:

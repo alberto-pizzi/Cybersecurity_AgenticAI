@@ -1294,9 +1294,15 @@ def _risk_terms(value: str) -> int:
 
 # Request classification marks cases that belong to an authentication flow.
 def _is_login_case(case: dict[str, Any]) -> bool:
-    path = urlparse(str(case.get('url', ''))).path.lower()
+    path = urlparse(str(case.get('url', ''))).path.lower().rstrip('/')
     parameters = {str(value).lower() for value in case.get('parameters', [])}
-    return path.endswith('/login') or path.endswith('/login.php') or bool({'username', 'password'} <= parameters)
+    identity_provider = (
+        '/protocol/openid-connect/' in path
+        or '/oauth2/' in path
+        or '/oauth/' in path
+        or '/auth/realms/' in path
+    )
+    return path.endswith(('/login', '/login.php', '/signin', '/sign-in', '/auth', '/authorize')) or identity_provider or bool({'username', 'password'} <= parameters)
 
 # Query inspection detects URLs made only of automatic index-style parameters.
 def _is_auto_index_url(url: str) -> bool:
@@ -1357,6 +1363,10 @@ def _tool_case_priority(tool: str, case: dict[str, Any]) -> int:
         elif status >= 500:
             score += 4
     if tool == 'sqlmap':
+        if _is_login_case(case):
+            return -1000
+        if len(url) > 2200 or len(parameters) > 45:
+            score -= 320
         score += 45 if any((token in path for token in ('sql', 'query', 'database', 'search'))) else 0
         score += 18 if any((token in path for token in ('/api', 'data', 'device', 'model', 'dashboard', 'widget'))) else 0
         score += 14 * len(parameters & SQL_HINTS)
@@ -1373,8 +1383,10 @@ def _tool_case_priority(tool: str, case: dict[str, Any]) -> int:
             score -= 35
         return score
     if tool == 'dalfox':
-        if _prefer_browser_for_xss_case(case):
+        if _prefer_browser_for_xss_case(case) or _is_login_case(case):
             return -1000
+        if len(url) > 2200 or len(parameters) > 45:
+            score -= 320
         score += 45 if any((token in path for token in ('xss', 'comment', 'message', 'search', 'feedback'))) else 0
         score += 12 * len(parameters & XSS_HINTS)
         score += 10 if case.get('discovery_source') == 'playwright_network' else 0
@@ -1384,6 +1396,8 @@ def _tool_case_priority(tool: str, case: dict[str, Any]) -> int:
             score -= 30
         return score
     if tool == 'commix':
+        if _is_login_case(case):
+            return -1000
         score += 55 if any((token in path for token in ('/exec', 'command', 'cmd'))) else 0
         score += 13 * len(parameters & COMMAND_HINTS)
         if any((token in path for token in ('sqli', 'xss', '/csp'))) and (not parameters & COMMAND_HINTS):
@@ -1392,6 +1406,8 @@ def _tool_case_priority(tool: str, case: dict[str, Any]) -> int:
             score -= 40
         return score
     if tool == 'traversal':
+        if _is_login_case(case):
+            return -1000
         score += 55 if any((token in path for token in ('include', 'download', 'file', 'template', 'document', 'view'))) else 0
         score += 15 * len(parameters & TRAVERSAL_HINTS)
         if any((token in path for token in ('sqli', 'xss', '/exec', '/csp'))) and (not parameters & TRAVERSAL_HINTS):
@@ -1421,8 +1437,8 @@ def _tool_case_skip_reason(tool: str, case: dict[str, Any]) -> str:
         return 'Directory-index sorting parameters are navigation controls, not application inputs.'
     if tool == 'dalfox' and _prefer_browser_for_xss_case(case):
         return 'Stored or DOM-oriented XSS contracts are delegated to the Chromium verifier, which can execute JavaScript and revisit state.'
-    if tool in {'dalfox', 'commix'} and _is_login_case(case):
-        return f'{tool} is not suited to the generic login form; SQLMap remains available for SQL-injection checks.'
+    if tool in {'sqlmap', 'dalfox', 'commix', 'traversal'} and _is_login_case(case):
+        return f'{tool} is not sent to identity-provider/login authorization endpoints; broad scanners and workflow/session checks cover those flows.'
     if tool == 'sqlmap' and 'brute' in urlparse(str(case.get('url', ''))).path.lower():
         return 'The brute-force handler is an authentication workflow, not a SQL-query request class.'
     if _tool_case_priority(tool, case) <= 0:
@@ -2311,7 +2327,7 @@ def build_tool_arguments(tool: str, target_url: str, cookies: str, discovery: di
                 scan_mode = 'prioritized'
             else:
                 scan_mode = 'targeted'
-            arguments.update({'seed_urls': discovery.get('html_urls', []), 'request_cases': discovery.get('request_cases', []), 'scan_mode': scan_mode, 'max_observations': 220 if CURRENT_SCAN_MODE == 'deep' else 80 if CURRENT_SCAN_MODE == 'balanced' or single_tool else 25})
+            arguments.update({'seed_urls': discovery.get('html_urls', []), 'request_cases': discovery.get('request_cases', []), 'scan_mode': scan_mode, 'session_probe_url': select_session_probe_url(discovery, target_url), 'max_observations': 220 if CURRENT_SCAN_MODE == 'deep' else 80 if CURRENT_SCAN_MODE == 'balanced' or single_tool else 25})
             if single_tool:
                 arguments['diagnostic_only'] = diagnostic_only
             elif diagnostic_only:

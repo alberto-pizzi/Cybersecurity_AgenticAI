@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import time
+from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Any, Callable, Iterable
 from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
@@ -29,6 +30,19 @@ def service(label: str, key: str) -> tuple[FastMCP, Callable[[], None]]:
 def unique_strings(values: Iterable[Any] | None) -> list[str]:
 
     return list(dict.fromkeys(str(value).strip() for value in (values or []) if str(value).strip()))
+
+# Computes a bounded response-body similarity without quadratic comparisons on large HTML pages.
+def bounded_text_similarity(left: str, right: str, *, text_limit: int = 80_000, chunk_size: int = 128) -> float:
+    left = str(left or "")[:max(1, int(text_limit))]
+    right = str(right or "")[:max(1, int(text_limit))]
+    if left == right:
+        return 1.0
+    size = max(32, int(chunk_size))
+    left_chunks = [left[index:index + size] for index in range(0, len(left), size)]
+    right_chunks = [right[index:index + size] for index in range(0, len(right), size)]
+    if not left_chunks and not right_chunks:
+        return 1.0
+    return SequenceMatcher(None, left_chunks, right_chunks, autojunk=True).ratio()
 
 # Shared login-page detector with per-scanner compatibility knobs.
 def looks_like_login(

@@ -1777,10 +1777,10 @@ async def execute_action(action: dict[str, Any], cookies: dict[str, str], discov
         scanner_limit = float(arguments.get('timeout', 180))
         spec = next((item for item in shared.ALL_TOOLS if item.name == tool), None)
         if spec is not None:
-            result = await call_mcp_with_progress(spec, arguments, timeout_seconds=scanner_limit + 35)
+            result = await call_mcp_with_progress(spec, arguments, timeout_seconds=scanner_limit)
         else:
             print(f"    [RUNNING ] {tool}: {action['target_url']} (scanner limit {scanner_limit:g}s)", flush=True)
-            result = await call_mcp(server, function, arguments, timeout_seconds=scanner_limit + 35)
+            result = await call_mcp(server, function, arguments, timeout_seconds=scanner_limit)
         if state_refresh is not None:
             result['state_refresh'] = state_refresh
         return (action, result)
@@ -2059,6 +2059,8 @@ def report_node(state: AgentState) -> dict[str, Any]:
         'secondary_identity_supplied': bool(state.get('secondary_cookies', '')),
         'orchestration': {'engine': 'langgraph', 'mode': 'agentic', 'nodes': ['discovery', 'planner', 'executor', 'verification', 'analysis', 'report']}}
     report = asyncio.run(call_mcp('reporting/reportServer.py', 'generate_report', {'findings_summary': report_results, 'target_url': state['target'], 'output_name': output_name, 'assessment_context': context}))
+    if report.get('status') != 'success':
+        print(f"[REPORT ERROR] {report.get('diagnosis') or 'report_failed'} — {report.get('output') or 'No report error detail returned.'}", file=sys.stderr, flush=True)
     if report.get('status') != 'success' and (not report.get('json_filename')):
         fallback = write_emergency_json_report(state['target'], state['results'], state['diagnostics'], str(report.get('output', 'Report MCP failed.')), 'SecOps_Agentic_Emergency')
         if fallback:

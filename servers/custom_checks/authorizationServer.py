@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import hashlib
 import re
-from difflib import SequenceMatcher
 from typing import Any
 from urllib.parse import parse_qsl, urljoin, urlparse
 
@@ -12,7 +11,7 @@ from utils import partial, skipped, success
 
 from utils import same_origin
 
-from core.scannerCommon import looks_like_login, service
+from core.scannerCommon import bounded_text_similarity, looks_like_login, service
 
 mcp, _serve = service("Authorization Differential Verifier", "authorization")
 
@@ -111,11 +110,7 @@ def _summary(response: requests.Response | None, guard: str) -> dict[str, Any]:
 def _similarity(left: requests.Response, right: requests.Response) -> float:
     if left.content == right.content:
         return 1.0
-    left_text = left.text[:120_000]
-    right_text = right.text[:120_000]
-    if not left_text and not right_text:
-        return 1.0
-    return SequenceMatcher(None, left_text, right_text).ratio()
+    return bounded_text_similarity(left.text, right.text, text_limit=80_000, chunk_size=128)
 
 # Compare access to determine whether the expected access behavior is present.
 def _matching_access(

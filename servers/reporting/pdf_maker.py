@@ -38,9 +38,12 @@ def html2pdf(html_path, pdf_path):
         ).write_pdf(
             str(pdf_path)
         )
+        if not pdf_path.is_file() or pdf_path.stat().st_size <= 0:
+            raise RuntimeError("Native WeasyPrint returned without creating a non-empty PDF.")
         print("Weasyprint: PDF converted into", pdf_path, file=sys.stderr)
         return
-    except (ImportError, OSError) as native_error:
+    except Exception as native_error:
+        print(f"Native WeasyPrint failed; trying Docker fallback: {type(native_error).__name__}: {native_error}", file=sys.stderr)
         docker = shutil.which("docker")
         image = os.getenv("SECOPS_REPORT_DOCKER_IMAGE", "secops/report:local").strip() or "secops/report:local"
         if not docker:

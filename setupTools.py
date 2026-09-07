@@ -37,7 +37,7 @@ NUCLEI_TEMPLATE_UPDATE_TIMEOUT = 600
 _NUCLEI_TEMPLATE_STATE: dict[str, Any] = {}
 _NUCLEI_ENGINE_STATE: dict[str, Any] = {}
 _IDOR_FORGE_STATE: dict[str, Any] = {}
-BUILD_ID = 'secops-v31.31-snap4city-login-trigger-20260907'
+BUILD_ID = 'secops-v31.32-log-fixes-20260907'
 FASTMCP_VERSION = '3.4.5'
 FASTMCP_REQUIREMENT = f'fastmcp=={FASTMCP_VERSION}'
 LANGGRAPH_REQUIREMENT = 'langgraph==1.2.10'
@@ -676,15 +676,39 @@ def install_nikto() -> None:
         raise RuntimeError(f'Native Nikto runtime verification failed: {detail}.\n{_perl_reinstall_hint()}')
     print(f'[+] Nikto runtime and launcher verified: {launcher}')
 
-# Ensures Arjun is installed and available on PATH.
+# Applies the upstream Arjun fix merged after the 2.2.7 release.
+def _patch_arjun_status_code_bug() -> bool:
+    try:
+        import importlib.util
+        spec = importlib.util.find_spec('arjun')
+        locations = list(spec.submodule_search_locations or []) if spec else []
+        main_file = Path(locations[0]) / '__main__.py' if locations else None
+        if main_file is None or not main_file.is_file():
+            return False
+        text = main_file.read_text(encoding='utf-8', errors='replace')
+        buggy = "print('%s Target returned HTTP %i, this may cause problems.' % (bad, request.status_code))"
+        fixed = "print('%s Target returned HTTP %i, this may cause problems.' % (bad, response_1.status_code))"
+        if fixed in text:
+            return True
+        if buggy not in text:
+            return False
+        main_file.write_text(text.replace(buggy, fixed, 1), encoding='utf-8')
+        print(f'[+] Applied upstream Arjun status-code compatibility fix: {main_file}')
+        return True
+    except Exception as exc:
+        print(f'[!] Arjun compatibility patch could not be applied: {type(exc).__name__}: {exc}', file=sys.stderr)
+        return False
+
+# Ensures Arjun is installed, patched and available on PATH.
 def ensure_arjun() -> None:
-    if command_path('arjun'):
-        print(f"[+] arjun already available: {command_path('arjun')}")
-        return
-    if run([sys.executable, '-m', 'arjun', '--help'], required=False, capture=True, timeout=60).returncode == 0:
-        write_launcher('arjun', [sys.executable, '-m', 'arjun'])
-        return
-    raise RuntimeError('Arjun is installed but no executable/module entry point is available.')
+    executable = command_path('arjun')
+    module_ok = run([sys.executable, '-m', 'arjun', '--help'], required=False, capture=True, show_output=False, timeout=60).returncode == 0
+    if not executable and module_ok:
+        executable = str(write_launcher('arjun', [sys.executable, '-m', 'arjun']))
+    if not executable and not module_ok:
+        raise RuntimeError('Arjun is installed but no executable/module entry point is available.')
+    patched = _patch_arjun_status_code_bug()
+    print(f"[+] arjun ready: {command_path('arjun') or executable}; upstream-status-fix={'present' if patched else 'not-required-or-unavailable'}")
 
 # Reads the latest release metadata for an upstream GitHub project.
 def github_release(repository: str) -> dict[str, Any]:

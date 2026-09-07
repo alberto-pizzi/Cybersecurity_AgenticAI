@@ -4,7 +4,6 @@ import html
 import json
 import re
 import secrets
-from difflib import SequenceMatcher
 from typing import Any
 from urllib.parse import parse_qsl, urljoin, urlparse
 
@@ -14,7 +13,7 @@ from utils import skipped, success
 
 from utils import same_origin
 
-from core.scannerCommon import looks_like_login, service
+from core.scannerCommon import bounded_text_similarity, looks_like_login, service
 
 mcp, _serve = service("Web Workflow Verifier", "workflow")
 
@@ -120,7 +119,7 @@ def _csrf_check(
         diagnostic["error"] = f"{type(exc).__name__}: {exc}"
         return findings, diagnostic
 
-    similarity = SequenceMatcher(None, baseline.text[:80_000], without_token.text[:80_000]).ratio()
+    similarity = bounded_text_similarity(baseline.text, without_token.text, text_limit=80_000, chunk_size=128)
     accepted = (
         without_token.status_code < 400
         and not looks_like_login(without_token, text_limit=80_000, paths=("/login", "/login.php", "/signin", "/auth"), words=("login", "sign in", "authenticate"))

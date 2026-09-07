@@ -691,19 +691,40 @@ def main() -> int:
                 (path.resolve() for path in REPORTS_DIR.glob("*.pdf") if path.stat().st_mtime_ns >= job_started_ns),
                 key=lambda path: path.stat().st_mtime_ns,
             )
+            generated_html = sorted(
+                (
+                    path.resolve()
+                    for path in REPORTS_DIR.glob("*.html")
+                    if path.stat().st_mtime_ns >= job_started_ns and not path.name.endswith(".pdf-source.html")
+                ),
+                key=lambda path: path.stat().st_mtime_ns,
+            )
+            report_bases: dict[str, dict[str, Path | None]] = {}
+            for pdf_path in generated_pdfs:
+                report_bases[pdf_path.stem] = {"pdf": pdf_path, "html": pdf_path.with_suffix(".html")}
+            for html_path in generated_html:
+                report_bases.setdefault(html_path.stem, {"pdf": None, "html": html_path})
             record["pdf_reports"] = [str(path) for path in generated_pdfs]
             record["reports"] = []
-            for pdf_path in generated_pdfs:
-                report_id = pdf_path.stem
-                json_path = pdf_path.with_suffix(".json")
-                html_path = pdf_path.with_suffix(".html")
-                review_path = pdf_path.with_name(f"{report_id}.review.json")
+            for report_id, paths in sorted(
+                report_bases.items(),
+                key=lambda item: max(
+                    path.stat().st_mtime_ns for path in item[1].values() if isinstance(path, Path) and path.is_file()
+                ),
+            ):
+                pdf_path = paths.get("pdf")
+                html_path = paths.get("html")
+                base_path = pdf_path if isinstance(pdf_path, Path) else html_path
+                if not isinstance(base_path, Path):
+                    continue
+                json_path = base_path.with_suffix(".json")
+                review_path = base_path.with_name(f"{report_id}.review.json")
                 artifact = {
                     "job_id": job["id"],
                     "report_id": report_id,
-                    "pdf_path": str(pdf_path),
+                    "pdf_path": str(pdf_path) if isinstance(pdf_path, Path) and pdf_path.is_file() else None,
                     "json_path": str(json_path.resolve()) if json_path.is_file() else None,
-                    "html_path": str(html_path.resolve()) if html_path.is_file() else None,
+                    "html_path": str(html_path.resolve()) if isinstance(html_path, Path) and html_path.is_file() else None,
                     "review_snapshot_path": str(review_path.resolve()) if review_path.is_file() else None,
                 }
                 record["reports"].append(artifact)
@@ -745,6 +766,8 @@ def main() -> int:
     if report_artifacts:
         for artifact in report_artifacts:
             print(f"[+] PDF report: {artifact.get('pdf_path') or 'not generated'}")
+            if not artifact.get("pdf_path") and artifact.get("html_path"):
+                print(f"[+] HTML report fallback: {artifact['html_path']}")
     else:
         print("[+] PDF report: not generated")
     print(f"[+] Results data JSON: {final_results_data_path.resolve()}")
