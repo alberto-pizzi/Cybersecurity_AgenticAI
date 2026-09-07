@@ -234,13 +234,12 @@ export DASHBOARD_TEST_PASSWORD='authorized-password'
 
 If either variable is missing and the runner has an interactive terminal, it asks only for the missing value in console and hides password input.
 These two variables are credentials of the **assessed dashboard account** and are unrelated to `snap4city_model_credentials.json`, which authenticates the
-Snap4City AI provider used by the Agentic planner. Chromium opens `/dashboardSmartCity/`, follows the Keycloak/OIDC redirect, submits the supplied account, returns to the dashboard, validates
-the authenticated page and extracts the target cookies in memory. Those cookies are then passed to the existing orchestrators exactly like a
+Snap4City AI provider used by the Agentic planner. Chromium opens `/dashboardSmartCity/`; if the anonymous landing page is shown, it activates the visible `login` control, then follows the Keycloak/OIDC flow, submits the supplied account, returns to the dashboard, verifies that the anonymous login control is no longer present, and extracts the target cookies in memory. Those cookies are then passed to the existing orchestrators exactly like a
 manual `--cookies` session, so both anonymous and authenticated discovery/scanners run because `auth_only=false`. The credentials and resulting
 cookie are not written to the configuration or Results Data. `DASHBOARD_TEST_COOKIE='PHPSESSID=<SESSION>; ...'` remains a manual override: when
 present it is used directly and the browser login is skipped. If no account/session is available, leaving the console values empty keeps the
 optional job anonymous; `--auth-only` instead blocks because an authenticated session is required. An authenticated profile is eligible for scanner planning only while discovery has not conclusively marked that session ineffective; an invalid supplied cookie therefore cannot be reported as authenticated coverage or suppress the corresponding anonymous coverage. After initialization, the printed MicroX command
-uses `--max-rounds 2 --mode balanced --require-ai` and the effective Agentic model (Snap4City or the verified local fallback).
+uses `--max-rounds 2 --mode balanced --require-ai` and the effective Agentic model (Snap4City or the verified local fallback). The initializer labels each printed command with its target (`DVWA / 127.0.0.1` or `MicroX / dashboard-test / 192.168.1.81`) and no longer prints the isolated ZAP diagnostic command.
 
 ## Agentic AI models
 

@@ -140,13 +140,14 @@ Ordine di risoluzione della sessione:
   1. se DASHBOARD_TEST_COOKIE e' valorizzato, riusa quella sessione e non esegue il login browser;
   2. altrimenti legge DASHBOARD_TEST_USERNAME e DASHBOARD_TEST_PASSWORD;
   3. se una delle due variabili manca e la console e' interattiva, chiede soltanto il valore mancante; la password non viene mostrata;
-  4. Chromium apre /dashboardSmartCity/, completa il login OIDC/Keycloak, valida il ritorno alla dashboard e passa i cookie agli orchestratori;
+  4. Chromium apre /dashboardSmartCity/; se compare la pagina pubblica, attiva il controllo login, completa il flusso OIDC/Keycloak, verifica che dopo il ritorno non sia piu' presente il controllo di login anonimo e passa i cookie agli orchestratori;
   5. se la credenziale opzionale non e' disponibile, il job continua solo anonimo; con --auth-only il job viene bloccato.
 Le credenziali e il cookie ottenuto non vengono scritti nel JSON di configurazione o nei Results Data.
 Esempio non interattivo:
   export DASHBOARD_TEST_USERNAME='authorized-user'
   export DASHBOARD_TEST_PASSWORD='authorized-password'
 Queste sono credenziali dell'account della dashboard target e NON sono snap4city_model_credentials.json, che serve soltanto al provider AI Snap4City.
+I comandi stampati dall'initializer indicano esplicitamente il target (DVWA / 127.0.0.1 oppure MicroX / dashboard-test / 192.168.1.81); il vecchio comando diagnostico ZAP isolato non viene piu' stampato.
 Con il servizio HTTP/80 gia' abilitato, l'initializer stampa anche il comando equivalente a:
   python .\assessmentRunner.py --config .\configs\dashboard-test.json --orchestrator agentic --model <MODELLO_EFFETTIVO> --max-rounds 2 --mode balanced --require-ai --authorized
 <MODELLO_EFFETTIVO> e' snap4city quando disponibile, altrimenti il fallback Ollama locale verificato.

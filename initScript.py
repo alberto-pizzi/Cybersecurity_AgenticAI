@@ -405,30 +405,30 @@ def print_important_commands(
     print("\n=== Commands ready to run ===")
     print("Run them from: " + str(ROOT))
     commands: list[tuple[str, str]] = [
-        ("1. Assessment Deterministic FAST", _operator_command(
+        ("1. DVWA / 127.0.0.1 - Assessment Deterministic FAST", _operator_command(
             "assessmentRunner.py", "--config", str(assessment_config), "--orchestrator", "deterministic",
             "--mode", "fast",
         )),
-        ("2. Assessment Deterministic BALANCED", _operator_command(
+        ("2. DVWA / 127.0.0.1 - Assessment Deterministic BALANCED", _operator_command(
             "assessmentRunner.py", "--config", str(assessment_config), "--orchestrator", "deterministic",
             "--mode", "balanced",
         )),
-        ("3. Assessment Deterministic DEEP", _operator_command(
+        ("3. DVWA / 127.0.0.1 - Assessment Deterministic DEEP", _operator_command(
             "assessmentRunner.py", "--config", str(assessment_config), "--orchestrator", "deterministic",
             "--mode", "deep",
         )),
     ]
     if agentic_model:
         commands.extend((
-            ("4. Assessment Agentic FAST", _operator_command(
+            ("4. DVWA / 127.0.0.1 - Assessment Agentic FAST", _operator_command(
                 "assessmentRunner.py", "--config", str(assessment_config), "--orchestrator", "agentic",
                 "--model", agentic_model, "--max-rounds", "2", "--mode", "fast", "--require-ai",
             )),
-            ("5. Assessment Agentic BALANCED", _operator_command(
+            ("5. DVWA / 127.0.0.1 - Assessment Agentic BALANCED", _operator_command(
                 "assessmentRunner.py", "--config", str(assessment_config), "--orchestrator", "agentic",
                 "--model", agentic_model, "--max-rounds", "2", "--mode", "balanced", "--require-ai",
             )),
-            ("6. Assessment Agentic DEEP", _operator_command(
+            ("6. DVWA / 127.0.0.1 - Assessment Agentic DEEP", _operator_command(
                 "assessmentRunner.py", "--config", str(assessment_config), "--orchestrator", "agentic",
                 "--model", agentic_model, "--max-rounds", "3", "--mode", "deep", "--require-ai",
             )),
@@ -440,23 +440,18 @@ def print_important_commands(
         print(f"\n{label}:\n{command}")
     if agentic_model:
         rounds = "3" if mode == "deep" else "2"
-        print("\nManual Agentic orchestrator command:")
+        print("\nDVWA / 127.0.0.1 - Manual Agentic orchestrator command:")
         print(_operator_command(
             "orchestratorAgentic.py", "--target", TARGET, "--cookies", cookie, "--auth-only",
             "--model", agentic_model, "--max-rounds", rounds, "--mode", mode, "--require-ai",
         ))
         if DASHBOARD_TEST_ASSESSMENT_CONFIG.is_file():
-            print("\nMicroX / dashboard-test Agentic BALANCED (automatic Snap4City login uses DASHBOARD_TEST_USERNAME/PASSWORD or prompts in an interactive console; DASHBOARD_TEST_COOKIE overrides it):")
+            print("\nMicroX / dashboard-test / 192.168.1.81 - Agentic BALANCED (automatic Snap4City login uses DASHBOARD_TEST_USERNAME/PASSWORD or prompts in an interactive console; DASHBOARD_TEST_COOKIE overrides it):")
             print(_operator_command(
                 "assessmentRunner.py", "--config", str(DASHBOARD_TEST_ASSESSMENT_CONFIG),
                 "--orchestrator", "agentic", "--model", agentic_model, "--max-rounds", "2",
                 "--mode", "balanced", "--require-ai", "--authorized",
             ))
-    print("\nZAP isolated DEEP full-priority diagnostic:")
-    print(_operator_command(
-        "orchestratorDeterministic.py", "--target", TARGET, "--cookies", cookie,
-        "--tool", "zap", "--mode", "deep", "--tool-timeout", "480",
-    ))
     print(f"\n[+] Every command and modifier: {COMMAND_REFERENCE_FILE}")
 
 # Parses command-line options and drives the complete workflow for this entrypoint.

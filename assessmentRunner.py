@@ -211,6 +211,15 @@ def _snap4city_browser_login_cookie(
         "button[type='submit']",
         "button[name='login']",
     )
+    login_trigger_selectors = (
+        'button:has-text("login")',
+        'a:has-text("login")',
+        '[role="button"]:has-text("login")',
+        "input[type='button'][value='login']",
+        "input[type='button'][value='Login']",
+        "input[type='submit'][value='login']",
+        "input[type='submit'][value='Login']",
+    )
 
     with sync_playwright() as playwright:
         browser = playwright.chromium.launch(headless=headless)
@@ -221,9 +230,24 @@ def _snap4city_browser_login_cookie(
             username_field = _first_visible_locator(page, username_selectors)
             password_field = _first_visible_locator(page, password_selectors)
             if username_field is None and password_field is None:
-                raise RuntimeError(
-                    f"Snap4City login form was not found after opening {login_url}; current URL is {page.url}."
-                )
+                login_trigger = _first_visible_locator(page, login_trigger_selectors)
+                if login_trigger is None:
+                    raise RuntimeError(
+                        f"Snap4City login form or login control was not found after opening {login_url}; current URL is {page.url}."
+                    )
+                login_trigger.click()
+                form_deadline = time.monotonic() + timeout_seconds
+                while time.monotonic() < form_deadline:
+                    username_field = _first_visible_locator(page, username_selectors)
+                    password_field = _first_visible_locator(page, password_selectors)
+                    if username_field is not None or password_field is not None:
+                        break
+                    page.wait_for_timeout(250)
+                if username_field is None and password_field is None:
+                    raise RuntimeError(
+                        f"Snap4City login control was activated but the OIDC/Keycloak form did not appear within {timeout_seconds}s; "
+                        f"current URL is {page.url}."
+                    )
             if username_field is not None:
                 username_field.fill(username)
 
@@ -261,6 +285,8 @@ def _snap4city_browser_login_cookie(
                 raise RuntimeError(f"Snap4City authenticated validation returned to the login flow: {final_url}")
             if _first_visible_locator(page, password_selectors) is not None:
                 raise RuntimeError("Snap4City authenticated validation still exposes the login password form.")
+            if _first_visible_locator(page, login_trigger_selectors) is not None:
+                raise RuntimeError("Snap4City authenticated validation still exposes the anonymous login control.")
 
             cookie_rows = list(context.cookies([validation_url]))
             if not cookie_rows:
