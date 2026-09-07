@@ -7,15 +7,15 @@ import time
 from collections import Counter
 from http.cookies import SimpleCookie
 from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import parse_qsl, urlparse
 
 import requests
 
-from utils import parse_cookie_header, skipped, success
+from utils import parse_cookie_header, partial, skipped, success
 
 from utils import same_origin
 
-from core.scannerCommon import looks_like_login, request_retry, service
+from core.scannerCommon import bounded_text_similarity, looks_like_login, request_retry, service
 
 mcp, _serve = service("Session Security Analyzer", "session")
 
@@ -266,6 +266,166 @@ def run_session_scan(
     return success(
         "Session Security Analyzer", target_url,
         f"Session analysis completed. Findings: {len(findings)}.", vulnerabilities=findings, diagnostics=diagnostics,
+    )
+
+
+# Verifies that an authenticated logout endpoint invalidates the old session identifier.
+# This check is intentionally called only at the end of an assessment because a successful
+# logout can invalidate the server-side session used by the remaining authenticated tools.
+@mcp.tool()
+def run_logout_check(
+    target_url: str, logout_url: str, cookies: str = "", probe_url: str = "",
+    method: str = "GET", data: str = "", timeout: int = 20,
+) -> dict:
+
+    selected_probe = probe_url or target_url
+    if not cookies:
+        return skipped("Session Logout Verifier", target_url, "No authenticated session cookie was supplied.")
+    if not same_origin(target_url, logout_url) or not same_origin(target_url, selected_probe):
+        return skipped("Session Logout Verifier", target_url, "Logout and probe URLs must remain on the assessment target origin.")
+
+    parsed_logout = urlparse(logout_url)
+    logout_path = parsed_logout.path.lower()
+    logout_query = parse_qsl(parsed_logout.query, keep_blank_values=True)
+    logout_shape = (
+        bool(re.search(r"(?:^|[-_/])(logout|signout|logoff)(?:\.php)?(?:$|[-_/])", logout_path))
+        or any(name.lower() in {"logout", "signout", "logoff"} for name, _ in logout_query)
+        or any(any(token in value.lower() for token in ("logout", "signout", "logoff", "sign-out", "log-off")) for _, value in logout_query)
+    )
+    if not logout_shape:
+        return skipped("Session Logout Verifier", logout_url, "The discovered URL is not a recognized logout/signout/logoff endpoint.")
+    method = str(method or "GET").upper()
+    if method not in {"GET", "POST"}:
+        return skipped("Session Logout Verifier", logout_url, "The discovered logout contract is not a bounded GET/POST request.")
+
+    timeout = max(8, min(int(timeout), 40))
+    request_timeout = max(3.0, min(8.0, timeout / 4.0))
+    common_headers = {"User-Agent": "SecOps-Session-Logout-Verifier/1.0", "Cache-Control": "no-cache"}
+    auth_headers = {**common_headers, "Cookie": cookies}
+
+    def fetch(url: str, *, authenticated: bool) -> requests.Response:
+        return requests.get(
+            url, headers=auth_headers if authenticated else common_headers,
+            timeout=(3, request_timeout), allow_redirects=True,
+        )
+
+    diagnostics: dict[str, Any] = {"logout_url": logout_url, "probe_url": selected_probe, "method": method}
+    try:
+        baseline = fetch(selected_probe, authenticated=True)
+        anonymous = fetch(selected_probe, authenticated=False)
+    except requests.RequestException as exc:
+        return partial(
+            "Session Logout Verifier", logout_url,
+            f"The authenticated/anonymous logout baseline could not be established: {type(exc).__name__}: {exc}",
+            diagnosis="logout_baseline_request_failed", vulnerabilities=[], diagnostics=diagnostics,
+        )
+
+    baseline_login = looks_like_login(baseline, text_limit=80_000)
+    anonymous_login = looks_like_login(anonymous, text_limit=80_000)
+    baseline_vs_anonymous = bounded_text_similarity(baseline.text, anonymous.text, text_limit=80_000)
+    baseline_distinguished = (
+        baseline.status_code < 400 and not baseline_login and (
+            anonymous_login
+            or anonymous.status_code in {401, 403}
+            or str(baseline.url) != str(anonymous.url)
+            or baseline_vs_anonymous < 0.92
+        )
+    )
+    diagnostics["baseline"] = {
+        "authenticated_status": baseline.status_code, "authenticated_final_url": str(baseline.url),
+        "authenticated_login_detected": baseline_login, "anonymous_status": anonymous.status_code,
+        "anonymous_final_url": str(anonymous.url), "anonymous_login_detected": anonymous_login,
+        "authenticated_vs_anonymous_similarity": round(baseline_vs_anonymous, 4),
+        "distinguished": baseline_distinguished,
+    }
+    if not baseline_distinguished:
+        return partial(
+            "Session Logout Verifier", logout_url,
+            "Logout validation is inconclusive because the supplied authenticated session cannot be reliably distinguished from the anonymous probe before logout.",
+            diagnosis="logout_baseline_inconclusive", vulnerabilities=[], diagnostics=diagnostics,
+        )
+
+    try:
+        logout_response = requests.request(
+            method, logout_url, data=data if method == "POST" else None, headers=auth_headers,
+            timeout=(3, request_timeout), allow_redirects=True,
+        )
+    except requests.RequestException as exc:
+        return partial(
+            "Session Logout Verifier", logout_url,
+            f"The logout request could not be completed: {type(exc).__name__}: {exc}",
+            diagnosis="logout_request_failed", vulnerabilities=[], diagnostics=diagnostics,
+        )
+    diagnostics["logout"] = {
+        "status": logout_response.status_code, "final_url": str(logout_response.url),
+        "login_detected": looks_like_login(logout_response, text_limit=80_000),
+        "set_cookie": _set_cookie_headers(logout_response)[:6],
+    }
+    if logout_response.status_code >= 400:
+        return partial(
+            "Session Logout Verifier", logout_url,
+            f"The discovered logout request returned HTTP {logout_response.status_code}; the recorded logout workflow could not be completed safely.",
+            diagnosis="logout_endpoint_not_executable", vulnerabilities=[], diagnostics=diagnostics,
+        )
+
+    # Replay the exact pre-logout Cookie header. A client-side deletion alone is insufficient: the
+    # old identifier must also stop authorizing requests on the server.
+    try:
+        replay = fetch(selected_probe, authenticated=True)
+    except requests.RequestException as exc:
+        return partial(
+            "Session Logout Verifier", logout_url,
+            f"The old session could not be replayed after logout: {type(exc).__name__}: {exc}",
+            diagnosis="logout_replay_request_failed", vulnerabilities=[], diagnostics=diagnostics,
+        )
+
+    replay_login = looks_like_login(replay, text_limit=80_000)
+    replay_vs_baseline = bounded_text_similarity(replay.text, baseline.text, text_limit=80_000)
+    replay_vs_anonymous = bounded_text_similarity(replay.text, anonymous.text, text_limit=80_000)
+    invalidated = (
+        replay.status_code in {401, 403}
+        or replay_login
+        or (replay_vs_anonymous >= 0.97 and replay_vs_baseline < 0.94)
+    )
+    still_authenticated = (
+        replay.status_code < 400 and not replay_login and replay_vs_baseline >= 0.94
+        and (anonymous_login or anonymous.status_code in {401, 403} or replay_vs_baseline > replay_vs_anonymous + 0.04)
+    )
+    diagnostics["replay"] = {
+        "status": replay.status_code, "final_url": str(replay.url), "login_detected": replay_login,
+        "vs_authenticated_baseline_similarity": round(replay_vs_baseline, 4),
+        "vs_anonymous_similarity": round(replay_vs_anonymous, 4),
+        "invalidated": invalidated, "still_authenticated": still_authenticated,
+    }
+
+    if invalidated:
+        return success(
+            "Session Logout Verifier", logout_url,
+            "Logout invalidated the previously authenticated session identifier; replaying the old Cookie header no longer reached the authenticated probe.",
+            vulnerabilities=[], diagnostics=diagnostics, logout_verified=True,
+        )
+
+    if still_authenticated:
+        finding = {
+            "alert": "Authenticated session remains usable after logout", "risk": "medium",
+            "category": "vulnerability", "verification_status": "logout-old-session-replay-confirmed", "confidence": "high",
+            "description": "The application accepted the exact pre-logout session cookie after the logout endpoint completed, and the protected probe remained equivalent to its authenticated baseline.",
+            "impact": "A copied or stolen session identifier can remain valid after the user logs out, extending the window for session hijacking and preventing logout from reliably terminating access.",
+            "solution": "Invalidate the server-side session on logout, expire the client cookie, and reject replay of the previous session identifier. Add a regression test that reuses the old cookie after logout and expects an unauthenticated response.",
+            "url": logout_url, "method": method, "parameter": ",".join(name for name, _ in parse_cookie_header(cookies)),
+            "evidence": f"logout_status={logout_response.status_code}; replay_status={replay.status_code}; replay_login_detected={replay_login}; replay_vs_authenticated_baseline={replay_vs_baseline:.3f}; replay_vs_anonymous={replay_vs_anonymous:.3f}",
+            "owasp_category": "A07:2021 Identification and Authentication Failures", "cwe_id": "613",
+        }
+        return success(
+            "Session Logout Verifier", logout_url,
+            "Logout completed, but replay of the old authenticated session remained valid.",
+            vulnerabilities=[finding], diagnostics=diagnostics, logout_verified=True,
+        )
+
+    return partial(
+        "Session Logout Verifier", logout_url,
+        "Logout completed, but the post-logout replay response was not sufficiently similar to either the authenticated or anonymous baseline for a deterministic conclusion.",
+        diagnosis="logout_replay_inconclusive", vulnerabilities=[], diagnostics=diagnostics,
     )
 
 if __name__ == "__main__":

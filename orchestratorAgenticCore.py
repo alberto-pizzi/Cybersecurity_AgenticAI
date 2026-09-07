@@ -25,8 +25,8 @@ from orchestratorShared import (
     discover_target, enrich_discovery_with_arjun, enrich_discovery_with_ffuf,
     iter_leaf_results, log_result, log_zap_session_diagnostics, make_skipped_result,
     merge_discovery, print_security_finding_summary, select_arjun_request_cases,
-    select_authorization_request_cases, select_browser_request_cases, select_oast_request_cases,
-    select_request_cases, select_tool_request_cases, select_workflow_request_cases,
+    select_authorization_request_cases, select_browser_request_cases, select_logout_request_cases, select_oast_request_cases,
+    select_request_cases, select_session_probe_url, select_tool_request_cases, select_workflow_request_cases,
     write_emergency_json_report,
 )
 
@@ -1384,7 +1384,6 @@ def discovery_node(state: AgentState) -> dict[str, Any]:
 def discovery_candidate_actions(state: AgentState) -> list[dict[str, Any]]:
 
     actions: list[dict[str, Any]] = []
-    has_auth = any((_profile_has_effective_auth(state, str(profile.get('name') or '')) for profile in state['profiles']))
     for profile in state['profiles']:
         name = profile['name']
         if not _profile_is_plannable(state, name):
@@ -1395,41 +1394,41 @@ def discovery_candidate_actions(state: AgentState) -> list[dict[str, Any]]:
             actions.append({'profile': name, 'tool': tool, 'target_url': state['target'], 'jwt_token': '', 'injection_url': '', 'reason': 'Session-aware baseline coverage.'})
         for case in select_arjun_request_cases(state['discovery'].get(name, {}), state['target'], limit=shared.ARJUN_ENDPOINT_LIMIT):
             actions.append({'profile': name, 'tool': 'arjun', 'target_url': case['url'], 'method': case.get('method', 'GET'), 'data': case.get('data', ''), 'parameters': case.get('parameters', []), 'jwt_token': '', 'injection_url': '', 'reason': 'Hidden-parameter discovery using the real request method and body.'})
-        if authenticated or not has_auth:
-            for tool in ('sqlmap', 'dalfox', 'commix', 'traversal', 'idor'):
-                for case in select_tool_request_cases(state['discovery'].get(name, {}), tool, limit=shared.PARAMETER_TOOL_CASE_LIMITS.get(tool, 1)):
-                    actions.append({'profile': name, 'tool': tool, 'target_url': case['url'], 'method': case.get('method', 'GET'), 'data': case.get('data', ''), 'parameters': case.get('parameters', []), 'jwt_token': '', 'injection_url': '', 'reason': f'Highest-value discovered request for {tool}.'})
+        for tool in ('sqlmap', 'dalfox', 'commix', 'traversal', 'idor'):
+            for case in select_tool_request_cases(state['discovery'].get(name, {}), tool, limit=shared.PARAMETER_TOOL_CASE_LIMITS.get(tool, 1), authenticated_profile=authenticated):
+                actions.append({'profile': name, 'tool': tool, 'target_url': case['url'], 'method': case.get('method', 'GET'), 'data': case.get('data', ''), 'parameters': case.get('parameters', []), 'jwt_token': '', 'injection_url': '', 'reason': f'Highest-value discovered request for {tool}.'})
+        if authenticated:
             for case in select_authorization_request_cases(state['discovery'].get(name, {}), limit=shared.tool_action_limit('authorization')):
                 actions.append({'profile': name, 'tool': 'authorization', 'target_url': case['url'], 'method': 'GET', 'data': '', 'parameters': case.get('parameters', []), 'jwt_token': '', 'injection_url': '', 'reason': 'Read-only authorization differential candidate derived from an identity, object or privileged-resource signal.'})
-            for case in select_browser_request_cases(state['discovery'].get(name, {}), limit=shared.tool_action_limit('browser')):
-                actions.append({'profile': name,
-                    'tool': 'browser',
-                    'target_url': case['url'],
-                    'method': case.get('method', 'GET'),
-                    'data': case.get('data', ''),
-                    'parameters': case.get('parameters', []),
-                    'jwt_token': '',
-                    'injection_url': '',
-                    'fields': case.get('fields', []),
-                    'source_url': case.get('source_url', ''),
-                    'client_sources': case.get('client_sources', []),
-                    'client_sinks': case.get('client_sinks', []),
-                    'reason': 'Browser verification candidate derived from XSS-like parameters or client-side source/sink evidence.'})
-            for case in select_workflow_request_cases(state['discovery'].get(name, {}), limit=shared.tool_action_limit('workflow')):
-                actions.append({'profile': name,
-                    'tool': 'workflow',
-                    'target_url': case['url'],
-                    'method': case.get('method', 'POST'),
-                    'data': case.get('data', ''),
-                    'parameters': case.get('parameters', []),
-                    'jwt_token': '',
-                    'injection_url': '',
-                    'source_url': case.get('source_url', ''),
-                    'fields': case.get('fields', []),
-                    'file_parameters': case.get('file_parameters', []),
-                    'token_parameters': case.get('token_parameters', []),
-                    'enctype': case.get('enctype', ''),
-                    'reason': 'Multi-step workflow candidate derived from discovered form metadata.'})
+        for case in select_browser_request_cases(state['discovery'].get(name, {}), limit=shared.tool_action_limit('browser')):
+            actions.append({'profile': name,
+                'tool': 'browser',
+                'target_url': case['url'],
+                'method': case.get('method', 'GET'),
+                'data': case.get('data', ''),
+                'parameters': case.get('parameters', []),
+                'jwt_token': '',
+                'injection_url': '',
+                'fields': case.get('fields', []),
+                'source_url': case.get('source_url', ''),
+                'client_sources': case.get('client_sources', []),
+                'client_sinks': case.get('client_sinks', []),
+                'reason': 'Browser verification candidate derived from XSS-like parameters or client-side source/sink evidence.'})
+        for case in select_workflow_request_cases(state['discovery'].get(name, {}), limit=shared.tool_action_limit('workflow')):
+            actions.append({'profile': name,
+                'tool': 'workflow',
+                'target_url': case['url'],
+                'method': case.get('method', 'POST'),
+                'data': case.get('data', ''),
+                'parameters': case.get('parameters', []),
+                'jwt_token': '',
+                'injection_url': '',
+                'source_url': case.get('source_url', ''),
+                'fields': case.get('fields', []),
+                'file_parameters': case.get('file_parameters', []),
+                'token_parameters': case.get('token_parameters', []),
+                'enctype': case.get('enctype', ''),
+                'reason': 'Multi-step workflow candidate derived from discovered form metadata.'})
         tokens = state['discovery'].get(name, {}).get('jwt_tokens', [])
         if tokens:
             actions.append({'profile': name, 'tool': 'jwt', 'target_url': state['target'], 'jwt_token': tokens[0], 'injection_url': '', 'reason': 'Discovered JWT.'})
@@ -1454,11 +1453,7 @@ def validate_plan(state: AgentState, proposed: Any) -> list[dict[str, Any]]:
         profile, tool = (str(raw.get('profile', '')), str(raw.get('tool', '')).lower())
         if profile not in profiles or tool not in REGISTRY or not _profile_is_plannable(state, profile):
             continue
-        has_authenticated_profile = any((_profile_has_effective_auth(state, str(item.get('name') or '')) for item in state['profiles']))
         profile_has_cookie = _profile_has_effective_auth(state, profile)
-        if shared.CURRENT_SCAN_MODE != 'deep':
-            if profile == 'anonymous' and has_authenticated_profile and (tool in {'session', 'nikto', 'sqlmap', 'dalfox', 'commix', 'traversal', 'idor', 'authorization', 'browser', 'workflow'}):
-                continue
         found = state['discovery'].get(profile, {})
         target_url = str(raw.get('target_url', '')).strip()
         token = str(raw.get('jwt_token', '')).strip()
@@ -1489,16 +1484,14 @@ def validate_plan(state: AgentState, proposed: Any) -> list[dict[str, Any]]:
             data = str(selected.get('data', ''))
             parameters = [str(value) for value in selected.get('parameters', [])]
         elif scope in {'parameterized', 'numeric'}:
-            cases = select_tool_request_cases(found, tool, limit=20)
+            cases = select_tool_request_cases(found, tool, limit=20, authenticated_profile=profile_has_cookie)
             matching = [case for case in cases if str(case.get('url', '')) == target_url]
             if method:
                 matching = [case for case in matching if str(case.get('method', 'GET')).upper() == method]
             if not matching:
                 continue
             selected = matching[0]
-            if _tool_case_skip_reason(tool, selected):
-                continue
-            if tool == 'sqlmap' and profile_has_cookie and shared._is_login_case(selected):
+            if _tool_case_skip_reason(tool, selected, authenticated_profile=profile_has_cookie):
                 continue
             method = str(selected.get('method', 'GET')).upper()
             data = str(selected.get('data', ''))
@@ -1626,16 +1619,13 @@ def _missing_tool_reason(state: AgentState, profile_name: str, tool: str) -> str
     found = state['discovery'].get(profile_name, {})
     if not _profile_is_plannable(state, profile_name):
         return 'Authenticated session was conclusively invalid during discovery; this action was not eligible for authenticated coverage.'
-    has_authenticated_profile = any((_profile_has_effective_auth(state, str(item.get('name') or '')) for item in state['profiles']))
     profile_has_cookie = _profile_has_effective_auth(state, profile_name)
-    if profile_name == 'anonymous' and has_authenticated_profile and (shared.CURRENT_SCAN_MODE != 'deep') and (tool in {'session', 'nikto', *PARAMETER_COVERAGE_TOOLS, *AUTHORIZATION_COVERAGE_TOOLS, *WORKFLOW_COVERAGE_TOOLS}):
-        return 'The richer authenticated profile provides this coverage in the selected scan mode.'
     if tool in BROAD_COVERAGE_TOOLS:
         return ''
     if tool == 'arjun':
         return '' if select_arjun_request_cases(found, state['target'], limit=1) else 'No suitable discovered GET/POST request was available for hidden-parameter discovery.'
     if tool in PARAMETER_COVERAGE_TOOLS:
-        return '' if select_tool_request_cases(found, tool, limit=1) else f"No discovered request matched {tool}'s vulnerability class."
+        return '' if select_tool_request_cases(found, tool, limit=1, authenticated_profile=profile_has_cookie) else f"No discovered request matched {tool}'s vulnerability class."
     if tool == 'authorization':
         if not profile_has_cookie:
             return 'Authorization comparison requires a primary authenticated profile.'
@@ -2006,31 +1996,82 @@ def _reconcile_final_browser_result(results: dict[str, dict[str, Any]], action: 
         elif str(browser_result.get('status') or '').lower() == 'success' and attempted:
             finding.update(verification_status='browser-not-reproduced-bounded', confidence='low', browser_final_verification='not_reproduced', browser_confidence_ceiling='low', browser_verification_evidence=f"Chromium completed an exact-parameter bounded check for {parameter or 'the source parameter'} without marker execution or reflection.")
 
-# Runs a deterministic final browser verification stage before AI narrative analysis.
+# Runs the final authenticated logout lifecycle check after every other authenticated test.
+async def _final_logout_checks(state: AgentState, results: dict[str, dict[str, Any]]) -> int:
+    executed = 0
+    for profile in state.get('profiles', []):
+        name = str(profile.get('name') or '')
+        cookies = str(profile.get('cookies') or '')
+        if not cookies or not _profile_has_effective_auth(state, name):
+            continue
+        discovery = state.get('discovery', {}).get(name, {})
+        logout_cases = select_logout_request_cases(discovery, limit=3)
+        if not logout_cases:
+            results.setdefault(name, {})['session_logout_final'] = make_skipped_result(
+                'session-logout', state['target'],
+                'No logout/signout/logoff endpoint was discovered safely for the authenticated profile.',
+            )
+            continue
+        probe_url = select_session_probe_url(discovery, state['target'])
+        for index, logout_case in enumerate(logout_cases, start=1):
+            logout_url = str(logout_case.get('url') or '')
+            print(f'    [RUNNING ] session-logout: {logout_url}', flush=True)
+            result = await call_mcp(
+                'custom_checks/sessionServer.py', 'run_logout_check',
+                {
+                    'target_url': state['target'], 'logout_url': logout_url, 'cookies': cookies,
+                    'probe_url': probe_url, 'method': str(logout_case.get('method') or 'GET'),
+                    'data': str(logout_case.get('data') or ''), 'timeout': 25,
+                },
+                timeout_seconds=30,
+            )
+            key = 'session_logout_final' if index == 1 else f'session_logout_final_{index}'
+            results.setdefault(name, {})[key] = result
+            log_result(name, 'session-logout', result, logout_url)
+            executed += 1
+            # A successful lifecycle decision either proved invalidation or confirmed that the
+            # old session remains valid. In both cases no second logout endpoint should mutate
+            # the already-evaluated session state.
+            if str(result.get('status') or '').lower() == 'success':
+                break
+            # A method-incompatible logout contract has not changed the authenticated session, so a
+            # second safely-discovered logout candidate may still be tried. Other partial states
+            # are inconclusive and stop here to avoid uncontrolled session transitions.
+            if str(result.get('diagnosis') or '') != 'logout_endpoint_not_executable':
+                break
+    return executed
+
+# Runs a deterministic final browser verification stage before AI narrative analysis, then
+# validates authenticated logout as the last session-mutating action in the assessment.
 def verification_node(state: AgentState) -> dict[str, Any]:
 
     actions = _final_browser_verification_actions(state)
     notes = list(state.get('notes', []))
-    if not actions:
-        notes.append('Final verification: no unresolved XSS candidate had a compatible Chromium request contract.')
-        print('\n[*] Final verification: no Chromium candidate requires validation.', flush=True)
-        return {'verification_done': True, 'notes': notes}
-    print(f'\n[*] Final verification: validating {len(actions)} XSS candidate(s) with Chromium.', flush=True)
     cookies = {profile['name']: profile['cookies'] for profile in state['profiles']}
     profile_cookies = dict(cookies)
     results = {profile: dict(values) for profile, values in state['results'].items()}
     discovery = {profile: dict(values) for profile, values in state['discovery'].items()}
     completed = list(state['completed'])
-    before_keys = {profile: set(values) for profile, values in results.items()}
-    executed = asyncio.run(execute_plan(actions, cookies, discovery, allow_state_changes=state.get('allow_state_changes'), secondary_cookies=state.get('secondary_cookies', '')))
-    for action, browser_result in executed:
-        _reconcile_final_browser_result(results, action, browser_result)
-    _record_execution_batch(executed, state=state, results=results, discovery=discovery, completed=completed, profile_cookies=profile_cookies)
-    for profile, values in results.items():
-        for key, value in values.items():
-            if key not in before_keys.get(profile, set()) and isinstance(value, dict) and key.startswith('browser:'):
-                value['final_verification_stage'] = True
-    notes.append(f'Final verification: Chromium executed {len(executed)} candidate validation action(s).')
+
+    if not actions:
+        notes.append('Final verification: no unresolved XSS candidate had a compatible Chromium request contract.')
+        print('\n[*] Final verification: no Chromium candidate requires validation.', flush=True)
+    else:
+        print(f'\n[*] Final verification: validating {len(actions)} XSS candidate(s) with Chromium.', flush=True)
+        before_keys = {profile: set(values) for profile, values in results.items()}
+        executed = asyncio.run(execute_plan(actions, cookies, discovery, allow_state_changes=state.get('allow_state_changes'), secondary_cookies=state.get('secondary_cookies', '')))
+        for action, browser_result in executed:
+            _reconcile_final_browser_result(results, action, browser_result)
+        _record_execution_batch(executed, state=state, results=results, discovery=discovery, completed=completed, profile_cookies=profile_cookies)
+        for profile, values in results.items():
+            for key, value in values.items():
+                if key not in before_keys.get(profile, set()) and isinstance(value, dict) and key.startswith('browser:'):
+                    value['final_verification_stage'] = True
+        notes.append(f'Final verification: Chromium executed {len(executed)} candidate validation action(s).')
+
+    print('\n[*] Final session lifecycle: validating discovered authenticated logout endpoint(s).', flush=True)
+    logout_executed = asyncio.run(_final_logout_checks({**state, 'discovery': discovery}, results))
+    notes.append(f'Final session lifecycle: executed {logout_executed} authenticated logout validation action(s); anonymous profiles were excluded.')
     return {'results': results, 'discovery': discovery, 'completed': completed, 'verification_done': True, 'notes': notes}
 
 # Decides whether the agent should plan again or enter final deterministic verification.
@@ -2063,7 +2104,7 @@ def report_node(state: AgentState) -> dict[str, Any]:
         'python_executable': sys.executable,
         'mcp_server_python': shared._server_python(),
         'remaining_eligible_actions_at_report': len(remaining),
-        'execution_policy': 'AI selects discovery-derived scan actions under deterministic safety validation. After the planning rounds, a deterministic Chromium verification stage rechecks unresolved XSS candidates when a compatible request contract is available; a separate AI analysis node then independently enriches severity, description, impact, potential consequences, recovery guidance and remediation using scanner evidence. Category, verification status, request evidence and confirmation rules remain deterministic and immutable. Bounded state-changing workflow probes use a tri-state policy: an explicit allow/deny is authoritative; when unspecified, only loopback local labs enable them automatically and remote authorized targets keep them disabled.',
+        'execution_policy': 'AI selects discovery-derived scan actions under deterministic safety validation. After the planning rounds, the deterministic verification stage rechecks unresolved XSS candidates with Chromium and then validates any safely discovered authenticated logout endpoint as the final session-mutating action; anonymous profiles never execute logout. A separate AI analysis node then independently enriches severity, description, impact, potential consequences, recovery guidance and remediation using scanner evidence. Category, verification status, request evidence and confirmation rules remain deterministic and immutable. Bounded state-changing workflow probes use a tri-state policy: an explicit allow/deny is authoritative; when unspecified, only loopback local labs enable them automatically and remote authorized targets keep them disabled.',
         'allow_state_changes': state.get('allow_state_changes'),
         'secondary_identity_supplied': bool(state.get('secondary_cookies', '')),
         'orchestration': {'engine': 'langgraph', 'mode': 'agentic', 'nodes': ['discovery', 'planner', 'executor', 'verification', 'analysis', 'report']}}

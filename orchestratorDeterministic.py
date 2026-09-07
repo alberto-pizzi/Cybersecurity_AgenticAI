@@ -23,11 +23,11 @@ from orchestratorShared import (
     iter_leaf_results, log_result, log_zap_session_diagnostics, make_skipped_result,
     merge_discovery, prepare_cli_context, print_preflight_report, print_security_finding_summary,
     refresh_authenticated_session_state, run_preflight_checks, select_arjun_request_cases,
-    select_authorization_request_cases, select_browser_request_cases, select_oast_request_cases,
+    select_authorization_request_cases, select_browser_request_cases, select_logout_request_cases, select_oast_request_cases,
     select_request_cases, select_session_probe_url, select_tool_request_cases,
     select_workflow_request_cases, state_changing_tests_allowed, summarize_results,
     tool_action_limit, tool_execution_rank, write_emergency_json_report,
-    _is_login_case, _server_python, _tool_case_skip_reason,
+    _server_python, _tool_case_skip_reason,
 )
 from utils import normalize_url, same_origin, scanner_session_probe
 
@@ -119,9 +119,7 @@ async def deterministic_broad_scan_node(state: DeterministicState) -> dict[str, 
             scanner_timeout = BROAD_SCANNER_TIMEOUTS.get(spec.name, 180)
             if cookies and spec.name == 'ffuf' and (shared.CURRENT_SCAN_MODE == 'balanced'):
                 scanner_timeout = min(scanner_timeout, 35)
-            if name == 'anonymous' and has_authenticated_profile and (shared.CURRENT_SCAN_MODE != 'deep') and (spec.name in {'nikto', 'session'}):
-                result = make_skipped_result(spec.name, target, 'Balanced mode runs this host/session-level scanner once on the authenticated profile to avoid duplicate time and traffic.')
-            elif cookies and (not session_valid):
+            if cookies and (not session_valid):
                 result = make_skipped_result(spec.name, target, 'Authenticated session is no longer valid; this run was skipped to avoid reporting anonymous coverage as authenticated.')
             else:
                 arguments = build_tool_arguments(spec.name, target, cookies, discovery[name], timeout_override=scanner_timeout)
@@ -190,7 +188,6 @@ async def deterministic_parameter_scan_node(state: DeterministicState) -> dict[s
     discovery = state['discovery']
     results = state['results']
     allow_state_changes = bool(state.get('workflow_state_changes', False))
-    has_authenticated_profile = bool(state.get('has_authenticated_profile', False))
     session_state = state.get('profile_session_state', {})
     selection_summary: dict[str, dict[str, list[dict[str, Any]]]] = {}
     semaphore = asyncio.Semaphore(2 if shared.CURRENT_SCAN_MODE == 'deep' else 1)
@@ -198,7 +195,7 @@ async def deterministic_parameter_scan_node(state: DeterministicState) -> dict[s
     # A selected request case is executed and converted into the common tool-result format.
     async def run_case(spec: ToolSpec, case: dict[str, Any], cookies: str, probe_url: str) -> dict[str, Any]:
         url = str(case.get('url', ''))
-        skip_reason = _tool_case_skip_reason(spec.name, case)
+        skip_reason = _tool_case_skip_reason(spec.name, case, authenticated_profile=bool(cookies))
         if skip_reason:
             return make_skipped_result(spec.name, url, skip_reason)
         timeout = PARAMETER_TOOL_TIMEOUTS.get(spec.name, 120)
@@ -215,9 +212,7 @@ async def deterministic_parameter_scan_node(state: DeterministicState) -> dict[s
         print(f'\n[*] Scanner su parametri - profilo: {name}')
         selection_summary[name] = {}
         skip_reason = ''
-        if name == 'anonymous' and has_authenticated_profile:
-            skip_reason = 'Active parameter testing uses the richer authenticated request surface; repeating it against the anonymous authentication form is non-applicable and wastes the scan budget.'
-        elif cookies and (not session_state.get(name, True)):
+        if cookies and (not session_state.get(name, True)):
             skip_reason = 'Authenticated session became invalid before parameter testing.'
         if skip_reason:
             for spec in PARAMETER_TOOLS:
@@ -228,9 +223,7 @@ async def deterministic_parameter_scan_node(state: DeterministicState) -> dict[s
         tasks: list[tuple[ToolSpec, dict[str, Any], asyncio.Task[dict[str, Any]]]] = []
         probe_url = select_session_probe_url(discovery[name], target)
         for spec in PARAMETER_TOOLS:
-            cases = select_tool_request_cases(discovery[name], spec.name)
-            if cookies and spec.name == 'sqlmap':
-                cases = [case for case in cases if not _is_login_case(case)]
+            cases = select_tool_request_cases(discovery[name], spec.name, authenticated_profile=bool(cookies))
             get_count = sum((str(case.get('method', 'GET')).upper() == 'GET' for case in cases))
             selection_summary[name][spec.name] = [{'method': str(case.get('method', 'GET')).upper(), 'url': str(case.get('url', '')), 'parameters': list(case.get('parameters', []))} for case in cases]
             print(f'    [INFO   ] {spec.name}: casi selezionati={len(cases)} (GET={get_count}, POST={len(cases) - get_count})')
@@ -292,7 +285,6 @@ async def deterministic_browser_workflow_node(state: DeterministicState) -> dict
     discovery = state['discovery']
     results = state['results']
     allow_state_changes = bool(state.get('workflow_state_changes', False))
-    has_authenticated_profile = bool(state.get('has_authenticated_profile', False))
     session_state = state.get('profile_session_state', {})
     selection_summary: dict[str, dict[str, list[dict[str, Any]]]] = {}
     specs = {spec.name: spec for spec in WORKFLOW_TOOLS}
@@ -311,9 +303,7 @@ async def deterministic_browser_workflow_node(state: DeterministicState) -> dict
         name, cookies = (profile['name'], profile['cookies'])
         selection_summary[name] = {'browser': [], 'workflow': []}
         skip_reason = ''
-        if name == 'anonymous' and has_authenticated_profile and (shared.CURRENT_SCAN_MODE != 'deep'):
-            skip_reason = 'Balanced mode runs browser/workflow verification on the richer authenticated surface.'
-        elif cookies and (not session_state.get(name, True)):
+        if cookies and (not session_state.get(name, True)):
             skip_reason = 'Authenticated session became invalid before browser/workflow verification.'
         if skip_reason:
             for spec in WORKFLOW_TOOLS:
@@ -525,45 +515,80 @@ async def deterministic_verification_node(state: DeterministicState) -> dict[str
     rows = _final_browser_verification_cases(state)
     results = {profile: dict(values) for profile, values in state['results'].items()}
     selection_summary: dict[str, list[dict[str, Any]]] = {profile['name']: [] for profile in state['profiles']}
-    if not rows:
-        print('\n[*] Final verification: no unresolved XSS candidate requires an additional Chromium pass.')
-        return {'results': results, 'verification_selection_summary': selection_summary}
 
     browser_spec = next(spec for spec in WORKFLOW_TOOLS if spec.name == 'browser')
     profile_map = {profile['name']: profile for profile in state['profiles']}
     browser_unavailable = False
-    print(f'\n[*] Final verification: validating {len(rows)} unresolved XSS candidate(s) with Chromium.')
-    for index, (profile_name, source_result, case) in enumerate(rows, start=1):
-        profile = profile_map.get(profile_name, {'cookies': ''})
-        cookies = str(profile.get('cookies') or '')
-        profile_discovery = state['discovery'].get(profile_name, {})
-        url = str(case.get('url') or target)
-        selection_summary.setdefault(profile_name, []).append({
-            'source_result': source_result,
-            'method': str(case.get('method', 'GET')).upper(),
-            'url': url,
-            'parameters': list(case.get('parameters', [])),
-        })
-        if browser_unavailable:
-            result = make_skipped_result('browser', url, 'Playwright was unavailable in the first final-verification run; remaining Chromium cases were not repeated.')
-        else:
-            probe_url = select_session_probe_url(profile_discovery, target)
-            refresh = refresh_authenticated_session_state(target, cookies, probe_url) if cookies else {'performed': False, 'usable': True}
-            if refresh.get('usable') is False:
-                result = make_skipped_result('browser', url, 'The authenticated session could not be restored before final Chromium verification.')
+    if not rows:
+        print('\n[*] Final verification: no unresolved XSS candidate requires an additional Chromium pass.')
+    else:
+        print(f'\n[*] Final verification: validating {len(rows)} unresolved XSS candidate(s) with Chromium.')
+        for index, (profile_name, source_result, case) in enumerate(rows, start=1):
+            profile = profile_map.get(profile_name, {'cookies': ''})
+            cookies = str(profile.get('cookies') or '')
+            profile_discovery = state['discovery'].get(profile_name, {})
+            url = str(case.get('url') or target)
+            selection_summary.setdefault(profile_name, []).append({
+                'source_result': source_result,
+                'method': str(case.get('method', 'GET')).upper(),
+                'url': url,
+                'parameters': list(case.get('parameters', [])),
+            })
+            if browser_unavailable:
+                result = make_skipped_result('browser', url, 'Playwright was unavailable in the first final-verification run; remaining Chromium cases were not repeated.')
             else:
-                arguments = build_tool_arguments('browser', url, cookies, profile_discovery, case=case, allow_state_changes=state.get('allow_state_changes'))
-                result = await call_mcp_with_progress(browser_spec, arguments, timeout_seconds=PARAMETER_TOOL_TIMEOUTS['browser'] + 35)
-                result['session_state_refresh'] = refresh
-                result['final_verification_stage'] = True
-                result['verification_source_result'] = source_result
-                result['verification_source_parameter'] = str(case.get('verification_source_parameter') or (case.get('parameters') or [''])[0])
-                _reconcile_deterministic_browser_result(results, profile_name, source_result, case, result)
-                if result.get('diagnosis') in {'missing_playwright', 'missing_playwright_browser'}:
-                    browser_unavailable = True
-        key = f'browser_final_verification_{index}'
-        results.setdefault(profile_name, {})[key] = result
-        log_result(profile_name, 'browser', result, url)
+                probe_url = select_session_probe_url(profile_discovery, target)
+                refresh = refresh_authenticated_session_state(target, cookies, probe_url) if cookies else {'performed': False, 'usable': True}
+                if refresh.get('usable') is False:
+                    result = make_skipped_result('browser', url, 'The authenticated session could not be restored before final Chromium verification.')
+                else:
+                    arguments = build_tool_arguments('browser', url, cookies, profile_discovery, case=case, allow_state_changes=state.get('allow_state_changes'))
+                    result = await call_mcp_with_progress(browser_spec, arguments, timeout_seconds=PARAMETER_TOOL_TIMEOUTS['browser'] + 35)
+                    result['session_state_refresh'] = refresh
+                    result['final_verification_stage'] = True
+                    result['verification_source_result'] = source_result
+                    result['verification_source_parameter'] = str(case.get('verification_source_parameter') or (case.get('parameters') or [''])[0])
+                    _reconcile_deterministic_browser_result(results, profile_name, source_result, case, result)
+                    if result.get('diagnosis') in {'missing_playwright', 'missing_playwright_browser'}:
+                        browser_unavailable = True
+            key = f'browser_final_verification_{index}'
+            results.setdefault(profile_name, {})[key] = result
+            log_result(profile_name, 'browser', result, url)
+
+    # Logout is deliberately executed only after every other authenticated scanner/verifier.
+    # Anonymous profiles do not need session termination and therefore never execute this stage.
+    print('\n[*] Final session lifecycle: validating discovered authenticated logout endpoint(s).')
+    session_state = state.get('profile_session_state', {})
+    for profile in state['profiles']:
+        profile_name = str(profile.get('name') or '')
+        cookies = str(profile.get('cookies') or '')
+        if not cookies or session_state.get(profile_name, True) is False:
+            continue
+        profile_discovery = state['discovery'].get(profile_name, {})
+        logout_cases = select_logout_request_cases(profile_discovery, limit=3)
+        if not logout_cases:
+            results.setdefault(profile_name, {})['session_logout_final'] = make_skipped_result(
+                'session-logout', target, 'No logout/signout/logoff endpoint was discovered safely for the authenticated profile.'
+            )
+            continue
+        probe_url = select_session_probe_url(profile_discovery, target)
+        for index, logout_case in enumerate(logout_cases, start=1):
+            logout_url = str(logout_case.get('url') or '')
+            print(f'    [RUNNING ] session-logout: {logout_url}')
+            result = await call_mcp(
+                'custom_checks/sessionServer.py', 'run_logout_check',
+                {'target_url': target, 'logout_url': logout_url, 'cookies': cookies, 'probe_url': probe_url,
+                 'method': str(logout_case.get('method') or 'GET'), 'data': str(logout_case.get('data') or ''), 'timeout': 25},
+                timeout_seconds=30,
+            )
+            key = 'session_logout_final' if index == 1 else f'session_logout_final_{index}'
+            results.setdefault(profile_name, {})[key] = result
+            log_result(profile_name, 'session-logout', result, logout_url)
+            if str(result.get('status') or '').lower() == 'success':
+                break
+            if str(result.get('diagnosis') or '') != 'logout_endpoint_not_executable':
+                break
+
     return {'results': results, 'verification_selection_summary': selection_summary}
 
 # At the end of the pipeline, the complete assessment state is sent to the report service.
@@ -617,7 +642,7 @@ def _parse_parameter_argument(value: str) -> list[str]:
     return [item.strip() for item in str(value or '').split(',') if item.strip()]
 
 # Selects one request case for an isolated tool run.
-def _single_tool_case(discovery: dict[str, Any], tool: str, target: str, explicit_url: str, method: str, data: str, parameters: list[str]) -> dict[str, Any] | None:
+def _single_tool_case(discovery: dict[str, Any], tool: str, target: str, explicit_url: str, method: str, data: str, parameters: list[str], authenticated_profile: bool=False) -> dict[str, Any] | None:
     if explicit_url:
         url = normalize_url(explicit_url)
         if not same_origin(target, url):
@@ -639,7 +664,7 @@ def _single_tool_case(discovery: dict[str, Any], tool: str, target: str, explici
     if tool == 'workflow':
         cases = select_workflow_request_cases(discovery, limit=1)
         return cases[0] if cases else None
-    cases = select_tool_request_cases(discovery, tool, limit=1)
+    cases = select_tool_request_cases(discovery, tool, limit=1, authenticated_profile=authenticated_profile)
     return cases[0] if cases else None
 
 # Tool-specific preflight filtering keeps only errors relevant to the requested isolated run.
@@ -667,7 +692,7 @@ async def run_single_tool_debug(*, tool: str, target: str, cookies: str, mode: s
     elif tool in {'arjun', 'sqlmap', 'dalfox', 'commix', 'traversal', 'idor', 'authorization', 'browser', 'workflow'}:
         if tool == 'authorization' and (not cookies):
             return make_skipped_result(tool, target, 'A primary authenticated Cookie header is required for authorization comparison.')
-        case = _single_tool_case(discovery, tool, target, explicit_url, method, data, parameters)
+        case = _single_tool_case(discovery, tool, target, explicit_url, method, data, parameters, authenticated_profile=bool(cookies))
         if not case:
             messages = {'arjun': 'No suitable endpoint was discovered for Arjun.', 'authorization': 'No discovered read-only request contained a plausible identity, object or privileged-resource signal.', 'browser': "No discovered request matched browser's workflow class.", 'workflow': "No discovered request matched workflow's workflow class."}
             return make_skipped_result(tool, target, messages.get(tool, f"No request matched {tool}'s vulnerability class."))

@@ -1079,6 +1079,7 @@ def discover_target(target: str, cookies: str, max_pages: int=MAX_CRAWL_PAGES, s
     target_preparation = apply_runtime_target_preparation(target, cookies) if cookies else {'performed': False, 'configured': False, 'usable': True}
     initial = [_clean_url(target), *[_clean_url(value) for value in seeds or []]]
     destructive_skipped: set[str] = set()
+    destructive_request_cases: list[dict[str, Any]] = []
     queue: list[str] = []
     for value in dict.fromkeys(initial):
         if not same_origin(target, value) or not _crawlable_url(value):
@@ -1183,6 +1184,11 @@ def discover_target(target: str, cookies: str, max_pages: int=MAX_CRAWL_PAGES, s
                 continue
             if _destructive_crawl_url(candidate):
                 destructive_skipped.add(candidate)
+                destructive_request_cases.append({
+                    'url': candidate, 'method': 'GET', 'data': '',
+                    'parameters': [name for name, _ in parse_qsl(urlparse(candidate).query, keep_blank_values=True)],
+                    'fields': [], 'source_url': final, 'destructive_kind': 'logout' if _is_logout_url(candidate) else 'other',
+                })
                 continue
             if urlparse(candidate).query:
                 parameterized.add(candidate)
@@ -1197,6 +1203,11 @@ def discover_target(target: str, cookies: str, max_pages: int=MAX_CRAWL_PAGES, s
                 continue
             if _destructive_crawl_url(action):
                 destructive_skipped.add(action)
+                fields = [field for field in form.get('fields', []) if isinstance(field, dict)]
+                destructive_case = _form_case(action, str(form.get('method', 'get')), fields, final, str(form.get('enctype', '')))
+                if destructive_case:
+                    destructive_case['destructive_kind'] = 'logout' if _is_logout_url(action) else 'other'
+                    destructive_request_cases.append(destructive_case)
                 continue
             fields = [field for field in form.get('fields', []) if isinstance(field, dict)]
             if fields:
@@ -1249,7 +1260,7 @@ def discover_target(target: str, cookies: str, max_pages: int=MAX_CRAWL_PAGES, s
             auth_effective = None
             auth_probe = {'url': probe_url, 'error': f'{type(exc).__name__}: {exc}', 'conclusive': False}
         auth_note = 'The supplied cookie was distinguished from the anonymous response.' if auth_effective is True else 'The supplied cookie reached a login or authorization failure page.' if auth_effective is False else 'The supplied cookie remained usable, but this target did not expose a conclusive anonymous/authenticated distinction.'
-    return {'urls': sorted(visited), 'html_urls': sorted(html_urls), 'form_urls': sorted(form_urls), 'parameterized_urls': sorted(parameterized), 'request_cases': _dedupe_request_cases(request_cases), 'script_urls': sorted(script_urls), 'script_endpoint_hints': script_endpoint_hints, 'browser_network_requests': browser_network_requests, 'browser_navigation_urls': browser_navigation_urls, 'client_side_candidates': client_side_candidates, 'jwt_tokens': sorted(tokens), 'errors': errors, 'authentication_effective': auth_effective, 'authentication_note': auth_note, 'authentication_probe': auth_probe, 'target_preparation': target_preparation, 'destructive_urls_skipped': sorted(destructive_skipped)}
+    return {'urls': sorted(visited), 'html_urls': sorted(html_urls), 'form_urls': sorted(form_urls), 'parameterized_urls': sorted(parameterized), 'request_cases': _dedupe_request_cases(request_cases), 'script_urls': sorted(script_urls), 'script_endpoint_hints': script_endpoint_hints, 'browser_network_requests': browser_network_requests, 'browser_navigation_urls': browser_navigation_urls, 'client_side_candidates': client_side_candidates, 'jwt_tokens': sorted(tokens), 'errors': errors, 'authentication_effective': auth_effective, 'authentication_note': auth_note, 'authentication_probe': auth_probe, 'target_preparation': target_preparation, 'destructive_urls_skipped': sorted(destructive_skipped), 'destructive_request_cases': _dedupe_request_cases(destructive_request_cases)}
 
 # Combines discovery results without duplicating pages or request cases.
 def merge_discovery(left: dict[str, Any], right: dict[str, Any]) -> dict[str, Any]:
@@ -1282,6 +1293,7 @@ def merge_discovery(left: dict[str, Any], right: dict[str, Any]) -> dict[str, An
     merged['client_side_candidates'] = client_rows
     merged['errors'] = [*left.get('errors', []), *right.get('errors', [])]
     merged['destructive_urls_skipped'] = sorted(set(left.get('destructive_urls_skipped', [])) | set(right.get('destructive_urls_skipped', [])))
+    merged['destructive_request_cases'] = _dedupe_request_cases([*left.get('destructive_request_cases', []), *right.get('destructive_request_cases', [])])
     if right.get('authentication_probe'):
         merged['authentication_probe'] = right.get('authentication_probe')
     if right.get('authentication_effective') is not None:
@@ -1307,6 +1319,58 @@ def _is_login_case(case: dict[str, Any]) -> bool:
         or '/auth/realms/' in path
     )
     return path.endswith(('/login', '/login.php', '/signin', '/sign-in', '/auth', '/authorize', '/ssologin', '/ssologin.php', '/sso/login')) or identity_provider or bool({'username', 'password'} <= parameters)
+
+# Logout endpoints are kept out of ordinary fuzzing and are tested only as an authenticated
+# session-lifecycle action at the end of the assessment.
+def _is_logout_url(value: str) -> bool:
+    parsed = urlparse(str(value or ''))
+    path = parsed.path.lower().rstrip('/')
+    path_tokens = {token for token in re.split(r'[^a-z0-9]+', path) if token}
+    logout_tokens = {'logout', 'signout', 'logoff'}
+    if path.endswith(('/logout', '/logout.php', '/signout', '/sign-out', '/logoff', '/log-off')) or bool(path_tokens & logout_tokens):
+        return True
+    for name, raw_value in parse_qsl(parsed.query, keep_blank_values=True):
+        lowered_name = name.lower()
+        lowered_value = raw_value.lower()
+        if lowered_name in logout_tokens or any(token in lowered_value for token in ('logout', 'signout', 'logoff', 'sign-out', 'log-off')):
+            return True
+    return False
+
+def _is_logout_case(case: dict[str, Any]) -> bool:
+    return _is_logout_url(str(case.get('url', '')))
+
+# Discovery never executes logout during normal crawling, but it preserves safe request metadata
+# for a final authenticated session-lifecycle check. URL-only discoveries are synthesized as GET.
+def select_logout_request_cases(discovery: dict[str, Any], limit: int=3) -> list[dict[str, Any]]:
+    cases = [dict(case) for case in discovery.get('destructive_request_cases', []) if isinstance(case, dict) and _is_logout_case(case)]
+    known = {(str(case.get('method', 'GET')).upper(), str(case.get('url', '')), str(case.get('data', ''))) for case in cases}
+    for value in discovery.get('destructive_urls_skipped', []):
+        url = str(value or '')
+        if not _is_logout_url(url):
+            continue
+        key = ('GET', url, '')
+        if key in known:
+            continue
+        known.add(key)
+        cases.append({
+            'url': url, 'method': 'GET', 'data': '',
+            'parameters': [name for name, _ in parse_qsl(urlparse(url).query, keep_blank_values=True)],
+            'fields': [], 'source_url': url, 'destructive_kind': 'logout',
+        })
+    selected: list[dict[str, Any]] = []
+    seen: set[tuple[str, str, str]] = set()
+    for case in cases:
+        key = (str(case.get('method', 'GET')).upper(), str(case.get('url', '')), str(case.get('data', '')))
+        if key in seen:
+            continue
+        seen.add(key)
+        selected.append(case)
+        if len(selected) >= max(1, int(limit)):
+            break
+    return selected
+
+def select_logout_urls(discovery: dict[str, Any], limit: int=3) -> list[str]:
+    return [str(case.get('url', '')) for case in select_logout_request_cases(discovery, limit=limit)]
 
 # Query inspection detects URLs made only of automatic index-style parameters.
 def _is_auto_index_url(url: str) -> bool:
@@ -1356,7 +1420,7 @@ def _prefer_browser_for_xss_case(case: dict[str, Any]) -> bool:
     return stored_shape or dom_shape
 
 # Scores one request case for a specific scanner.
-def _tool_case_priority(tool: str, case: dict[str, Any]) -> int:
+def _tool_case_priority(tool: str, case: dict[str, Any], authenticated_profile: bool=False) -> int:
 
     if _is_auto_index_case(case):
         return -1000
@@ -1367,6 +1431,9 @@ def _tool_case_priority(tool: str, case: dict[str, Any]) -> int:
     parameters = _case_parameters(case)
     text = ' '.join((path, ' '.join(sorted(parameters))))
     score = _risk_terms(text)
+    anonymous_login_flow = (not authenticated_profile) and _is_login_case(case)
+    if tool in {'sqlmap', 'dalfox', 'commix', 'traversal'} and _is_logout_case(case):
+        return -1000
     if tool in {'sqlmap', 'dalfox', 'commix', 'traversal'} and _oversized_generated_request(case):
         return -1000
     browser_response = case.get('browser_response') if isinstance(case.get('browser_response'), dict) else {}
@@ -1379,7 +1446,7 @@ def _tool_case_priority(tool: str, case: dict[str, Any]) -> int:
         elif status >= 500:
             score += 4
     if tool == 'sqlmap':
-        if _is_login_case(case):
+        if authenticated_profile and _is_login_case(case):
             return -1000
         score += 45 if any((token in path for token in ('sql', 'query', 'database', 'search'))) else 0
         score += 18 if any((token in path for token in ('/api', 'data', 'device', 'model', 'dashboard', 'widget'))) else 0
@@ -1387,46 +1454,46 @@ def _tool_case_priority(tool: str, case: dict[str, Any]) -> int:
         score += 16 if method == 'POST' else 0
         score += 12 if 'json' in str(case.get('content_type') or case.get('enctype') or '').lower() else 0
         score += 8 if case.get('discovery_source') == 'playwright_network' else 0
-        if parameters and parameters <= NAVIGATION_PARAMETERS and not (parameters & SQL_HINTS):
+        if parameters and parameters <= NAVIGATION_PARAMETERS and not (parameters & SQL_HINTS) and not anonymous_login_flow:
             score -= 65
-        if _is_login_case(case) and (not any((token in path for token in ('sql', 'query', 'database')))):
+        if authenticated_profile and _is_login_case(case) and (not any((token in path for token in ('sql', 'query', 'database')))):
             score -= 100
         if 'brute' in path and (not any((token in path for token in ('sql', 'query', 'database')))):
             score -= 90
         if any((token in path for token in ('xss', '/exec', '/csp'))) and (not parameters & SQL_HINTS):
             score -= 35
-        return score
+        return max(score, 12) if anonymous_login_flow else score
     if tool == 'dalfox':
-        if _prefer_browser_for_xss_case(case) or _is_login_case(case):
+        if _prefer_browser_for_xss_case(case) or (authenticated_profile and _is_login_case(case)):
             return -1000
         score += 45 if any((token in path for token in ('xss', 'comment', 'message', 'search', 'feedback'))) else 0
         score += 12 * len(parameters & XSS_HINTS)
         score += 10 if case.get('discovery_source') == 'playwright_network' else 0
         if any((token in path for token in ('sqli', '/exec', '/csp'))) and (not parameters & XSS_HINTS):
             score -= 35
-        if _is_login_case(case):
+        if authenticated_profile and _is_login_case(case):
             score -= 30
-        return score
+        return max(score, 12) if anonymous_login_flow else score
     if tool == 'commix':
-        if _is_login_case(case):
+        if authenticated_profile and _is_login_case(case):
             return -1000
         score += 55 if any((token in path for token in ('/exec', 'command', 'cmd'))) else 0
         score += 13 * len(parameters & COMMAND_HINTS)
         if any((token in path for token in ('sqli', 'xss', '/csp'))) and (not parameters & COMMAND_HINTS):
             score -= 45
-        if _is_login_case(case):
+        if authenticated_profile and _is_login_case(case):
             score -= 40
-        return score
+        return max(score, 12) if anonymous_login_flow else score
     if tool == 'traversal':
-        if _is_login_case(case):
+        if authenticated_profile and _is_login_case(case):
             return -1000
         score += 55 if any((token in path for token in ('include', 'download', 'file', 'template', 'document', 'view'))) else 0
         score += 15 * len(parameters & TRAVERSAL_HINTS)
         if any((token in path for token in ('sqli', 'xss', '/exec', '/csp'))) and (not parameters & TRAVERSAL_HINTS):
             score -= 45
-        if _is_login_case(case):
+        if authenticated_profile and _is_login_case(case):
             score -= 40
-        return score
+        return max(score, 12) if anonymous_login_flow else score
     if tool == 'idor':
         if method != 'GET':
             return -1000
@@ -1442,27 +1509,29 @@ def _tool_case_priority(tool: str, case: dict[str, Any]) -> int:
     return score
 
 # Explains why a request case should not be sent to a scanner.
-def _tool_case_skip_reason(tool: str, case: dict[str, Any]) -> str:
+def _tool_case_skip_reason(tool: str, case: dict[str, Any], authenticated_profile: bool=False) -> str:
     if not [value for value in case.get('parameters', []) if str(value)]:
         return 'The request has no testable application parameter for this parameter scanner.'
     if _is_auto_index_case(case):
         return 'Directory-index sorting parameters are navigation controls, not application inputs.'
     if tool == 'dalfox' and _prefer_browser_for_xss_case(case):
         return 'Stored or DOM-oriented XSS contracts are delegated to the Chromium verifier, which can execute JavaScript and revisit state.'
-    if tool in {'sqlmap', 'dalfox', 'commix', 'traversal'} and _is_login_case(case):
-        return f'{tool} is not sent to identity-provider/login/SSO endpoints; broad scanners and workflow/session checks cover those flows.'
+    if tool in {'sqlmap', 'dalfox', 'commix', 'traversal'} and _is_logout_case(case):
+        return f'{tool} is not sent to logout endpoints; anonymous profiles ignore logout and authenticated profiles validate logout only in the final session-lifecycle check.'
+    if authenticated_profile and tool in {'sqlmap', 'dalfox', 'commix', 'traversal'} and _is_login_case(case):
+        return f'{tool} is not sent to identity-provider/login/SSO endpoints in the authenticated profile; the anonymous profile remains eligible to test those public flows.'
     if tool in {'sqlmap', 'dalfox', 'commix', 'traversal'} and _oversized_generated_request(case):
         return f'{tool} is not sent to oversized generated table/filter requests; specialist testing is reserved for concise application parameters.'
     if tool == 'sqlmap' and 'brute' in urlparse(str(case.get('url', ''))).path.lower():
         return 'The brute-force handler is an authentication workflow, not a SQL-query request class.'
-    if _tool_case_priority(tool, case) <= 0:
+    if _tool_case_priority(tool, case, authenticated_profile=authenticated_profile) <= 0:
         if CURRENT_SCAN_MODE == 'deep' and case.get('deep_breadth') and tool in {'sqlmap', 'dalfox'}:
             return ''
         return f"The request was not selected because its path and parameters do not match {tool}'s vulnerability class."
     return ''
 
 # Chooses the best request cases for one scanner and scan profile.
-def select_tool_request_cases(discovery: dict[str, Any], tool: str, limit: int | None=None) -> list[dict[str, Any]]:
+def select_tool_request_cases(discovery: dict[str, Any], tool: str, limit: int | None=None, authenticated_profile: bool=False) -> list[dict[str, Any]]:
 
     effective_limit = limit or PARAMETER_TOOL_CASE_LIMITS.get(tool, MAX_PARAMETER_ENDPOINTS)
     cases = [case for case in discovery.get('request_cases', []) if isinstance(case, dict)]
@@ -1479,7 +1548,7 @@ def select_tool_request_cases(discovery: dict[str, Any], tool: str, limit: int |
             continue
         if not [value for value in case.get('parameters', []) if str(value)]:
             continue
-        score = _tool_case_priority(tool, case)
+        score = _tool_case_priority(tool, case, authenticated_profile=authenticated_profile)
         if score > 0:
             ranked.append((score, -index, case))
     selected: list[dict[str, Any]] = []
