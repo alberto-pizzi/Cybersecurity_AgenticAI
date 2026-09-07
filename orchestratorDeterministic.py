@@ -84,7 +84,7 @@ async def deterministic_discovery_node(state: DeterministicState) -> dict[str, A
         diagnostics.extend(({'phase': 'discovery', 'profile': name, **item} for item in found['errors']))
         print(f"    {name}: {len(found['html_urls'])} pagine HTML, {len(found['request_cases'])} casi GET/POST, {len(found.get('browser_navigation_urls', []))} navigazioni Chromium, {len(found['errors'])} errori")
         for error in found['errors'][:5]:
-            print(f"      [CRAWL WARNING] {error.get('type', 'error')}: {error.get('url', '')} — {error.get('message', '')}")
+            print(f"      [CRAWL WARNING] {error.get('type', 'error')}: {shared.compact_log_url(error.get('url', ''))} — {error.get('message', '')}")
         if len(found['errors']) > 5:
             print(f"      [CRAWL WARNING] altri {len(found['errors']) - 5} errori sono inclusi nel report.")
         if found.get('authentication_effective') is False:
@@ -574,7 +574,7 @@ async def deterministic_verification_node(state: DeterministicState) -> dict[str
         probe_url = select_session_probe_url(profile_discovery, target)
         for index, logout_case in enumerate(logout_cases, start=1):
             logout_url = str(logout_case.get('url') or '')
-            print(f'    [RUNNING ] session-logout: {logout_url}')
+            print(f'    [RUNNING ] session-logout: {shared.compact_log_url(logout_url)}')
             result = await call_mcp(
                 'custom_checks/sessionServer.py', 'run_logout_check',
                 {'target_url': target, 'logout_url': logout_url, 'cookies': cookies, 'probe_url': probe_url,

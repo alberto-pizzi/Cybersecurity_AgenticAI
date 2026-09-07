@@ -275,6 +275,7 @@ riusare il cookie precedente sulla pagina protetta: se il vecchio cookie mantien
 un finding vulnerability confermato (CWE-613); se viene rifiutato l'invalidazione e' verificata; se l'esito non e'
 distinguibile il controllo resta PARTIAL. Il logout non viene quindi fuzzato genericamente e non puo' interrompere
 gli scanner autenticati precedenti.
+Gli URL molto lunghi vengono compattati solo nella stampa terminale (endpoint + numero parametri/lunghezza query); URL completi, request contract ed evidenze restano invariati nei risultati JSON e nei report. La soglia e' configurabile con SECOPS_TERMINAL_URL_MAX.
 
 5. PREFLIGHT E TEST
 -------------------

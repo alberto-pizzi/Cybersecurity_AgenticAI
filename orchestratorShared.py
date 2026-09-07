@@ -38,6 +38,36 @@ LOCAL_BIN = Path.home() / '.local' / 'bin'
 MCP_CONNECT_TIMEOUT = float(os.getenv('SECOPS_MCP_CONNECT_TIMEOUT', '20'))
 MCP_TOOL_TIMEOUT = float(os.getenv('SECOPS_MCP_TIMEOUT', '1200'))
 MAX_PARAMETER_ENDPOINTS = max(1, int(os.getenv('SECOPS_MAX_PARAMETER_ENDPOINTS', '5')))
+TERMINAL_URL_MAX = max(120, int(os.getenv('SECOPS_TERMINAL_URL_MAX', '240')))
+
+# Keeps terminal output readable without altering the full URL stored in results, JSON or reports.
+def compact_log_url(value: Any, max_length: int | None=None) -> str:
+    text = str(value or '')
+    limit = max(80, int(max_length or TERMINAL_URL_MAX))
+    if len(text) <= limit:
+        return text
+    try:
+        parsed = urlparse(text)
+        if parsed.scheme and parsed.netloc:
+            base = urlunparse((parsed.scheme, parsed.netloc, parsed.path, '', '', ''))
+            pairs = parse_qsl(parsed.query, keep_blank_values=True)
+            if pairs:
+                names: list[str] = []
+                for name, _ in pairs:
+                    if name not in names:
+                        names.append(name)
+                preview = ','.join(names[:5])
+                if len(names) > 5:
+                    preview += f',+{len(names) - 5}'
+                summary = f"{base}?<params={len(pairs)}; query={len(parsed.query)} chars; names={preview}>"
+                if len(summary) <= limit:
+                    return summary
+                base_budget = max(30, limit - 56)
+                compact_base = base if len(base) <= base_budget else base[:base_budget - 3] + '...'
+                return f"{compact_base}?<params={len(pairs)}; query={len(parsed.query)} chars>"
+    except Exception:
+        pass
+    return text[:limit - 3] + '...'
 MAX_ARJUN_ENDPOINTS = max(1, int(os.getenv('SECOPS_MAX_ARJUN_ENDPOINTS', '3')))
 MAX_CRAWL_PAGES = max(10, int(os.getenv('SECOPS_MAX_CRAWL_PAGES', '50')))
 MAX_SCRIPT_ASSETS = max(4, int(os.getenv('SECOPS_MAX_SCRIPT_ASSETS', '24')))
@@ -411,6 +441,7 @@ async def call_mcp(server_file: str, tool_name: str, arguments: dict[str, Any], 
     spec = next((item for item in ALL_TOOLS if item.server == server_file and item.tool == tool_name), ToolSpec(tool_name, server_file, tool_name))
     server = resolve_server_path(server_file, tool_name)
     target = str(arguments.get('target_url', ''))
+    display_target = compact_log_url(target)
     started = time.monotonic()
     if not server.is_file():
         return _result(spec.name, target, 'error', f'MCP server not found: {server}', 'missing_mcp_server_file')
@@ -456,16 +487,17 @@ async def call_mcp(server_file: str, tool_name: str, arguments: dict[str, Any], 
             temporary_output.unlink(missing_ok=True)
     result = _normalize_time_limit(result, spec.name, target)
     if result.get('status') == 'error':
-        print(f"\n[SCANNER ERROR] {spec.name}: {target}\n  {result.get('output', '')}", file=sys.stderr)
+        print(f"\n[SCANNER ERROR] {spec.name}: {display_target}\n  {result.get('output', '')}", file=sys.stderr)
     return result
 
 # Calls one MCP tool while printing periodic progress messages.
 async def call_mcp_with_progress(spec: ToolSpec, arguments: dict[str, Any], *, timeout_seconds: float=MCP_TOOL_TIMEOUT) -> dict[str, Any]:
 
     target = str(arguments.get('target_url', ''))
+    display_target = compact_log_url(target)
     scanner_limit = arguments.get('timeout')
     limit_text = f', scanner limit {scanner_limit}s' if scanner_limit else ''
-    print(f'    [RUNNING ] {spec.name}: {target}{limit_text}', flush=True)
+    print(f'    [RUNNING ] {spec.name}: {display_target}{limit_text}', flush=True)
     started = time.monotonic()
     task = asyncio.create_task(call_mcp(spec.server, spec.tool, arguments, timeout_seconds=timeout_seconds))
     while True:
@@ -2147,9 +2179,9 @@ def log_zap_session_diagnostics(result: dict[str, Any]) -> None:
                 if fallback.get('used'):
                     fallback_urls = fallback.get('urls') if isinstance(fallback.get('urls'), list) else []
                     if len(fallback_urls) > 1:
-                        print(f"    [ZAP FALLBACK] generic bounded active targets={len(fallback_urls)}; first={fallback_urls[0]}; rules={','.join(str(value) for value in fallback.get('rule_ids', []))}")
+                        print(f"    [ZAP FALLBACK] generic bounded active targets={len(fallback_urls)}; first={compact_log_url(fallback_urls[0])}; rules={','.join(str(value) for value in fallback.get('rule_ids', []))}")
                     else:
-                        print(f"    [ZAP FALLBACK] generic bounded active target={fallback.get('url', '')}; rules={','.join(str(value) for value in fallback.get('rule_ids', []))}")
+                        print(f"    [ZAP FALLBACK] generic bounded active target={compact_log_url(fallback.get('url', ''))}; rules={','.join(str(value) for value in fallback.get('rule_ids', []))}")
         deferred = result.get('deferred_native_active_cases') if isinstance(result.get('deferred_native_active_cases'), list) else []
         if deferred:
             print('    [ZAP ACTIVE POLICY] deferred in balanced/prioritized: ' + ', '.join((str(item.get('case_class') or item.get('url') or '') for item in deferred if isinstance(item, dict))))
@@ -2163,7 +2195,7 @@ def log_zap_session_diagnostics(result: dict[str, Any]) -> None:
             if not isinstance(item, dict):
                 continue
             state = 'complete' if item.get('completed') else 'incomplete'
-            print(f"    [ZAP ACTIVE CASE] {item.get('method', 'GET')} {item.get('url', '')} — {state}; progress={item.get('progress', 0)}%; budget={item.get('budget_seconds', 0)}s")
+            print(f"    [ZAP ACTIVE CASE] {item.get('method', 'GET')} {compact_log_url(item.get('url', ''))} — {state}; progress={item.get('progress', 0)}%; budget={item.get('budget_seconds', 0)}s")
         preparation = result.get('post_spider_target_preparation')
         if isinstance(preparation, dict) and preparation.get('configured'):
             print(f"    [ZAP TARGET STATE] reapplied={preparation.get('performed')}; usable={preparation.get('usable')}")
@@ -2171,16 +2203,16 @@ def log_zap_session_diagnostics(result: dict[str, Any]) -> None:
             if not isinstance(record, dict):
                 continue
             if record.get('error'):
-                print(f"    [ZAP PROXY CHECK] {record.get('method', 'GET')} {record.get('url', '')} — error: {record.get('error')}")
+                print(f"    [ZAP PROXY CHECK] {record.get('method', 'GET')} {compact_log_url(record.get('url', ''))} — error: {record.get('error')}")
                 continue
             if record.get('skipped'):
-                print(f"    [ZAP PROXY CHECK] {record.get('method', 'GET')} {record.get('url', '')} — skipped: {record.get('skipped')}")
+                print(f"    [ZAP PROXY CHECK] {record.get('method', 'GET')} {compact_log_url(record.get('url', ''))} — skipped: {record.get('skipped')}")
                 continue
             for test in record.get('tests', []):
                 if not isinstance(test, dict):
                     continue
                 state = 'confirmed' if test.get('confirmed') else 'not-confirmed'
-                print(f"    [ZAP PROXY CHECK] {record.get('method', 'GET')} {record.get('url', '')} — {test.get('type', 'probe')}={state}")
+                print(f"    [ZAP PROXY CHECK] {record.get('method', 'GET')} {compact_log_url(record.get('url', ''))} — {test.get('type', 'probe')}={state}")
     if before.get('anonymous_profile'):
         print_coverage()
         return
@@ -2213,7 +2245,7 @@ def log_result(profile: str, name: str, result: dict[str, Any], target: str='') 
     limited = raw_status == 'partial' and _is_time_limited(result)
     label = 'LIMITED' if limited else raw_status.upper()
     total, security, observations = _finding_counts(result)
-    print(f"    [{label:7}] {name}: {target or result.get('target', '')} — findings={total} (security/candidates={security}, observations={observations})")
+    print(f"    [{label:7}] {name}: {compact_log_url(target or result.get('target', ''))} — findings={total} (security/candidates={security}, observations={observations})")
     detail = str(result.get('output', ''))[:400]
     if raw_status == 'error':
         print(f'              {detail}', file=sys.stderr)
@@ -2528,11 +2560,11 @@ def print_security_finding_summary(results: dict[str, Any]) -> None:
     for index, row in enumerate(confirmed, 1):
         tools = row.get('tools') if isinstance(row.get('tools'), list) else []
         tool = ','.join(str(value) for value in tools if str(value)) or str(row.get('tool') or 'unknown')
-        print(f"    {index}. [{str(row.get('risk') or 'info').upper()}] {row.get('alert') or 'Unnamed finding'} - tool={tool}; parameter={row.get('parameter') or '-'}; url={row.get('url') or ''}")
+        print(f"    {index}. [{str(row.get('risk') or 'info').upper()}] {row.get('alert') or 'Unnamed finding'} - tool={tool}; parameter={row.get('parameter') or '-'}; url={compact_log_url(row.get('url') or '')}")
     print(f'[+] Candidates requiring validation: {len(candidates)}')
     for index, row in enumerate(candidates, 1):
         tools = row.get('tools') if isinstance(row.get('tools'), list) else []
         tool = ','.join(str(value) for value in tools if str(value)) or str(row.get('tool') or 'unknown')
-        print(f"    {index}. [{str(row.get('risk') or 'info').upper()}] {row.get('alert') or 'Unnamed finding'} - tool={tool}; parameter={row.get('parameter') or '-'}; url={row.get('url') or ''}")
+        print(f"    {index}. [{str(row.get('risk') or 'info').upper()}] {row.get('alert') or 'Unnamed finding'} - tool={tool}; parameter={row.get('parameter') or '-'}; url={compact_log_url(row.get('url') or '')}")
 
 SINGLE_TOOL_CHOICES = tuple((spec.name for spec in ALL_TOOLS if spec.name != 'report'))

@@ -1738,7 +1738,7 @@ def planner_node(state: AgentState) -> dict[str, Any]:
         'reasoning_summary': summary[:1500]})
     print(f'[*] Validated actions: {len(plan)}', flush=True)
     for action in plan:
-        print(f"    {action['profile']:13} {action['tool']:10} {action['target_url']} — {action['reason']}", flush=True)
+        print(f"    {action['profile']:13} {action['tool']:10} {shared.compact_log_url(action['target_url'])} — {action['reason']}", flush=True)
     return {'plan': plan, 'round': round_number, 'notes': notes, 'finished': finished, 'planner_source': planner_source, 'planner_audit': audit}
 
 # Action execution invokes one validated tool and stores the normalized result in planner state.
@@ -1766,7 +1766,7 @@ async def execute_action(action: dict[str, Any], cookies: dict[str, str], discov
         refresh_target = f'{parsed_target.scheme}://{parsed_target.netloc}'
         profile_discovery = discovery.get(profile, {})
         probe_url = shared.select_session_probe_url(profile_discovery, refresh_target)
-        print(f'    [PRECHECK] {tool}: validating authenticated session with {probe_url}', flush=True)
+        print(f'    [PRECHECK] {tool}: validating authenticated session with {shared.compact_log_url(probe_url)}', flush=True)
         state_refresh = shared.refresh_authenticated_session_state(refresh_target, cookies[profile], probe_url)
         if state_refresh.get('usable') is False:
             print(f'    [PARTIAL ] {tool}: authenticated session precheck failed', flush=True)
@@ -1778,7 +1778,7 @@ async def execute_action(action: dict[str, Any], cookies: dict[str, str], discov
         if spec is not None:
             result = await call_mcp_with_progress(spec, arguments, timeout_seconds=scanner_limit)
         else:
-            print(f"    [RUNNING ] {tool}: {action['target_url']} (scanner limit {scanner_limit:g}s)", flush=True)
+            print(f"    [RUNNING ] {tool}: {shared.compact_log_url(action['target_url'])} (scanner limit {scanner_limit:g}s)", flush=True)
             result = await call_mcp(server, function, arguments, timeout_seconds=scanner_limit)
         if state_refresh is not None:
             result['state_refresh'] = state_refresh
@@ -1803,7 +1803,7 @@ async def execute_plan(plan: list[dict[str, Any]], cookies: dict[str, str], disc
     arjun_threshold = 2 if shared.CURRENT_SCAN_MODE == 'deep' else 1
     for index, action in enumerate(ordered, start=1):
         started = time.monotonic()
-        print(f"\n[*] Action {index}/{total}: {action['profile']} / {action['tool']} / {action['target_url']}", flush=True)
+        print(f"\n[*] Action {index}/{total}: {action['profile']} / {action['tool']} / {shared.compact_log_url(action['target_url'])}", flush=True)
         try:
             oast_key = (action['profile'], str(action.get('oast_class') or 'remote-fetch'))
             if action['tool'] == 'interactsh' and oast_key in confirmed_oast_classes:
@@ -2007,15 +2007,17 @@ async def _final_logout_checks(state: AgentState, results: dict[str, dict[str, A
         discovery = state.get('discovery', {}).get(name, {})
         logout_cases = select_logout_request_cases(discovery, limit=3)
         if not logout_cases:
-            results.setdefault(name, {})['session_logout_final'] = make_skipped_result(
+            skipped = make_skipped_result(
                 'session-logout', state['target'],
                 'No logout/signout/logoff endpoint was discovered safely for the authenticated profile.',
             )
+            results.setdefault(name, {})['session_logout_final'] = skipped
+            log_result(name, 'session-logout', skipped, state['target'])
             continue
         probe_url = select_session_probe_url(discovery, state['target'])
         for index, logout_case in enumerate(logout_cases, start=1):
             logout_url = str(logout_case.get('url') or '')
-            print(f'    [RUNNING ] session-logout: {logout_url}', flush=True)
+            print(f'    [RUNNING ] session-logout: {shared.compact_log_url(logout_url)}', flush=True)
             result = await call_mcp(
                 'custom_checks/sessionServer.py', 'run_logout_check',
                 {
