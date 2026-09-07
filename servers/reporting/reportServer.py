@@ -102,7 +102,7 @@ def generate_report(
     pdf_source_path = html_path.with_name(f"{html_path.stem}.pdf-source.html")
     try:
         pdf_source_path.write_text(_render_html(payload, for_pdf=True), encoding="utf-8")
-        html2pdf(pdf_source_path, pdf_path)
+        pdf_renderer = html2pdf(pdf_source_path, pdf_path)
     except Exception as exc:
         result = failure("Report Generator", target_url, f"PDF report creation failed: {type(exc).__name__}: {exc}", diagnosis="pdf_generation_failed")
         result.update(
@@ -146,6 +146,7 @@ def generate_report(
         local_html_generated=True,
         local_json_generated=True,
         local_review_snapshot_generated=True,
+        pdf_renderer=pdf_renderer,
         findings_count=len(findings),
         security_findings_count=payload["security_findings_count"],
         candidate_findings_count=payload["candidate_findings_count"],

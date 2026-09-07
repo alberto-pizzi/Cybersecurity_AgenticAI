@@ -369,6 +369,10 @@ def _is_time_limited(result: dict[str, Any]) -> bool:
 # Keeps useful partial results while marking a run that reached its limit.
 def _normalize_time_limit(result: dict[str, Any], tool: str, target: str) -> dict[str, Any]:
 
+    # Reporting is an artifact-generation stage, not a scanner. Preserve its concrete
+    # renderer/serialization error instead of rewriting it as a scan coverage timeout.
+    if str(tool or '').lower() == 'report':
+        return result
     if result.get('hard_failure') or not _is_time_limited(result):
         return result
     total, security, observations = _finding_counts(result)
@@ -1302,7 +1306,7 @@ def _is_login_case(case: dict[str, Any]) -> bool:
         or '/oauth/' in path
         or '/auth/realms/' in path
     )
-    return path.endswith(('/login', '/login.php', '/signin', '/sign-in', '/auth', '/authorize')) or identity_provider or bool({'username', 'password'} <= parameters)
+    return path.endswith(('/login', '/login.php', '/signin', '/sign-in', '/auth', '/authorize', '/ssologin', '/ssologin.php', '/sso/login')) or identity_provider or bool({'username', 'password'} <= parameters)
 
 # Query inspection detects URLs made only of automatic index-style parameters.
 def _is_auto_index_url(url: str) -> bool:
@@ -1321,6 +1325,16 @@ COMMAND_HINTS = {'cmd', 'command', 'exec', 'shell', 'ip', 'host', 'hostname', 'p
 TRAVERSAL_HINTS = {'file', 'filename', 'path', 'page', 'include', 'template', 'document', 'folder', 'dir', 'directory', 'view', 'resource', 'download'}
 IDOR_HINTS = {'id', 'uid', 'user_id', 'userid', 'account_id', 'accountid', 'object_id', 'objectid', 'item_id', 'itemid', 'order_id', 'orderid', 'document_id', 'documentid', 'file_id', 'fileid', 'profile_id', 'profileid', 'dashboardid', 'widgetid', 'deviceid', 'modelid'}
 NAVIGATION_PARAMETERS = {'pagetitle', 'linkid', 'fromsubmenu', 'showframe', 'redirect', 'linkurl'}
+
+# Very large generated table/filter requests are poor specialist targets: they create huge
+# command lines and long scans while mostly exercising framework/navigation controls.
+def _oversized_generated_request(case: dict[str, Any]) -> bool:
+    url = str(case.get('url', ''))
+    parameters = _case_parameters(case)
+    lowered = {name.lower() for name in parameters}
+    table_controls = sum(1 for name in lowered if name.startswith(('columns[', 'order[', 'search[')))
+    encoded_table_controls = url.lower().count('columns%5b') + url.lower().count('order%5b')
+    return len(url) > 2200 or len(parameters) > 45 or table_controls >= 12 or encoded_table_controls >= 12
 
 # Parameter extraction lists the names available in a normalized request case.
 def _case_parameters(case: dict[str, Any]) -> set[str]:
@@ -1353,6 +1367,8 @@ def _tool_case_priority(tool: str, case: dict[str, Any]) -> int:
     parameters = _case_parameters(case)
     text = ' '.join((path, ' '.join(sorted(parameters))))
     score = _risk_terms(text)
+    if tool in {'sqlmap', 'dalfox', 'commix', 'traversal'} and _oversized_generated_request(case):
+        return -1000
     browser_response = case.get('browser_response') if isinstance(case.get('browser_response'), dict) else {}
     if browser_response.get('observed') is True:
         status = int(browser_response.get('status') or 0)
@@ -1365,8 +1381,6 @@ def _tool_case_priority(tool: str, case: dict[str, Any]) -> int:
     if tool == 'sqlmap':
         if _is_login_case(case):
             return -1000
-        if len(url) > 2200 or len(parameters) > 45:
-            score -= 320
         score += 45 if any((token in path for token in ('sql', 'query', 'database', 'search'))) else 0
         score += 18 if any((token in path for token in ('/api', 'data', 'device', 'model', 'dashboard', 'widget'))) else 0
         score += 14 * len(parameters & SQL_HINTS)
@@ -1385,8 +1399,6 @@ def _tool_case_priority(tool: str, case: dict[str, Any]) -> int:
     if tool == 'dalfox':
         if _prefer_browser_for_xss_case(case) or _is_login_case(case):
             return -1000
-        if len(url) > 2200 or len(parameters) > 45:
-            score -= 320
         score += 45 if any((token in path for token in ('xss', 'comment', 'message', 'search', 'feedback'))) else 0
         score += 12 * len(parameters & XSS_HINTS)
         score += 10 if case.get('discovery_source') == 'playwright_network' else 0
@@ -1438,7 +1450,9 @@ def _tool_case_skip_reason(tool: str, case: dict[str, Any]) -> str:
     if tool == 'dalfox' and _prefer_browser_for_xss_case(case):
         return 'Stored or DOM-oriented XSS contracts are delegated to the Chromium verifier, which can execute JavaScript and revisit state.'
     if tool in {'sqlmap', 'dalfox', 'commix', 'traversal'} and _is_login_case(case):
-        return f'{tool} is not sent to identity-provider/login authorization endpoints; broad scanners and workflow/session checks cover those flows.'
+        return f'{tool} is not sent to identity-provider/login/SSO endpoints; broad scanners and workflow/session checks cover those flows.'
+    if tool in {'sqlmap', 'dalfox', 'commix', 'traversal'} and _oversized_generated_request(case):
+        return f'{tool} is not sent to oversized generated table/filter requests; specialist testing is reserved for concise application parameters.'
     if tool == 'sqlmap' and 'brute' in urlparse(str(case.get('url', ''))).path.lower():
         return 'The brute-force handler is an authentication workflow, not a SQL-query request class.'
     if _tool_case_priority(tool, case) <= 0:
