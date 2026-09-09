@@ -56,7 +56,7 @@ def load_assessment_config(path: str | Path) -> dict[str, Any]:
     return payload
 
 
-# Validates asset/service identifiers and the fields needed to derive web targets.
+# Validates asset/service identifiers and either an absolute service URL or the fields needed to derive one.
 def _validate_assets(assets: list[Any]) -> None:
     seen_assets: set[str] = set()
     seen_services: set[str] = set()
@@ -65,8 +65,8 @@ def _validate_assets(assets: list[Any]) -> None:
             raise ValueError("Every asset must be a JSON object.")
         asset_id = str(asset.get("id") or "").strip()
         host = str(asset.get("host") or "").strip()
-        if not asset_id or not host:
-            raise ValueError("Every asset requires id and host.")
+        if not asset_id:
+            raise ValueError("Every asset requires id.")
         if asset_id in seen_assets:
             raise ValueError(f"Duplicate asset id: {asset_id}")
         seen_assets.add(asset_id)
@@ -77,15 +77,32 @@ def _validate_assets(assets: list[Any]) -> None:
             if not isinstance(service, dict):
                 raise ValueError(f"Every service in asset {asset_id} must be a JSON object.")
             service_id = str(service.get("id") or "").strip()
-            protocol = str(service.get("protocol") or "").strip().lower()
-            if not service_id or not protocol:
-                raise ValueError(f"Every service in asset {asset_id} requires id and protocol.")
+            if not service_id:
+                raise ValueError(f"Every service in asset {asset_id} requires id.")
             global_id = f"{asset_id}/{service_id}"
             if global_id in seen_services:
                 raise ValueError(f"Duplicate service id: {global_id}")
             seen_services.add(global_id)
             if "allow_state_changes" in service and not isinstance(service.get("allow_state_changes"), bool):
                 raise ValueError(f"allow_state_changes for {global_id} must be true or false when supplied.")
+
+            absolute_url = str(service.get("url") or "").strip()
+            if absolute_url:
+                parsed = urlparse(absolute_url)
+                if str(parsed.scheme or "").lower() not in SUPPORTED_WEB_PROTOCOLS or not parsed.hostname:
+                    raise ValueError(f"Service url for {global_id} must be an absolute HTTP/HTTPS URL.")
+                try:
+                    _ = parsed.port
+                except ValueError as exc:
+                    raise ValueError(f"Invalid port in service url for {global_id}: {absolute_url!r}") from exc
+            else:
+                if not host:
+                    raise ValueError(f"Service {global_id} requires either service.url or asset.host.")
+                protocol = str(service.get("protocol") or "").strip().lower()
+                port = service.get("port")
+                if not protocol and port in (None, ""):
+                    raise ValueError(f"Service {global_id} requires protocol or port when service.url is not supplied.")
+
             port = service.get("port")
             if port not in (None, ""):
                 try:
@@ -156,9 +173,17 @@ def resolve_cookie_credential(config: dict[str, Any], reference: str) -> str:
     return value
 
 
+# Infers the common web protocol when a configuration supplies only host/IP and port.
+def _service_protocol(protocol: str, port: int | None) -> str:
+    explicit = str(protocol or "").strip().lower()
+    if explicit:
+        return explicit
+    return "https" if port == 443 else "http"
+
+
 # Formats a host/port/protocol service as the URL consumed by the web orchestrators.
 def service_target_url(host: str, protocol: str, port: int | None, base_path: str = "/") -> str:
-    protocol = protocol.lower()
+    protocol = _service_protocol(protocol, port)
     host = str(host).strip()
     if ":" in host and not host.startswith("["):
         host = f"[{host}]"
@@ -166,6 +191,25 @@ def service_target_url(host: str, protocol: str, port: int | None, base_path: st
     default_port = 80 if protocol == "http" else 443 if protocol == "https" else None
     port_fragment = "" if port in (None, default_port) else f":{int(port)}"
     return f"{protocol}://{host}{port_fragment}{normalized_path}"
+
+
+# Resolves one service from either its absolute url field or the legacy host/protocol/port fields.
+def _service_target(asset_host: str, service: dict[str, Any]) -> tuple[str, str, str, int | None]:
+    absolute_url = str(service.get("url") or "").strip()
+    if absolute_url:
+        parsed = urlparse(absolute_url)
+        protocol = str(parsed.scheme or "").lower()
+        host = str(parsed.hostname or "")
+        port = parsed.port
+        if port is None:
+            port = 80 if protocol == "http" else 443 if protocol == "https" else None
+        return absolute_url, host, protocol, port
+
+    port_value = service.get("port")
+    port = int(port_value) if port_value not in (None, "") else None
+    protocol = _service_protocol(str(service.get("protocol") or ""), port)
+    target = service_target_url(asset_host, protocol, port, str(service.get("base_path") or "/"))
+    return target, str(asset_host or ""), protocol, port
 
 
 # Reports whether the current orchestrators may accept a target without --authorized.
@@ -189,18 +233,24 @@ def iter_service_jobs(config: dict[str, Any]) -> Iterator[dict[str, Any]]:
         address = str(asset.get("address") or "").strip()
         for service in asset.get("services") or []:
             service_id = str(service.get("id") or "")
-            protocol = str(service.get("protocol") or "").lower()
             enabled = bool(service.get("enabled", True))
-            port_value = service.get("port")
-            port = int(port_value) if port_value not in (None, "") else None
-            target = service_target_url(host, protocol, port, str(service.get("base_path") or "/")) if protocol in SUPPORTED_WEB_PROTOCOLS else ""
+            configured_protocol = str(service.get("protocol") or "").lower()
+            configured_url = str(service.get("url") or "").strip()
+            if configured_url or configured_protocol in SUPPORTED_WEB_PROTOCOLS or (not configured_protocol and service.get("port") not in (None, "")):
+                target, resolved_host, protocol, port = _service_target(host, service)
+            else:
+                protocol = configured_protocol
+                resolved_host = host
+                port_value = service.get("port")
+                port = int(port_value) if port_value not in (None, "") else None
+                target = ""
             primary_ref = str(service.get("credential_ref") or "").strip()
             secondary_ref = str(service.get("secondary_credential_ref") or "").strip()
             yield {
                 "id": f"{asset_id}/{service_id}",
                 "asset_id": asset_id,
                 "service_id": service_id,
-                "host": host,
+                "host": resolved_host,
                 "address": address,
                 "protocol": protocol,
                 "port": port,

@@ -1,6 +1,97 @@
 SecOps FastMCP - guida operativa
 ===============================
 
+START HERE - PERCORSO CONSIGLIATO
+=================================
+Se stai aprendo il progetto per la prima volta, segui questo ordine.
+
+A) PRIMA INIZIALIZZAZIONE
+   Dalla root del repository:
+     Windows: python .\initScript.py --with-lab
+     Linux/macOS: python3 ./initScript.py --with-lab
+
+   L'initializer verifica dipendenze, scanner, Playwright/Chromium e backend AI.
+   Con --with-lab prepara anche DVWA. Al termine stampa comandi gia' pronti.
+   Per il primo test conviene usare Deterministic BALANCED sul DVWA locale.
+   Dopo la baseline puoi usare Agentic BALANCED.
+
+B) NUOVA APPLICAZIONE - UN SOLO PUNTO DI INGRESSO
+   Per un run anonimo o per una sessione di cui possiedi gia' il cookie puoi usare:
+     python .\assessmentRunner.py --target https://app.example.org/ --orchestrator deterministic --mode balanced --authorized
+
+   Se hai un cookie autorizzato aggiungi:
+     --cookies "<COOKIE_HEADER>"
+
+   IMPORTANTE: la modalita' diretta --target NON accetta username/password del target.
+   Non esegue il login OIDC per creare una sessione. Se possiedi soltanto username e
+   password del sito devi usare --config con una credenziale di login supportata, per
+   esempio kind=snap4city_oidc. In alternativa devi procurarti prima un cookie valido.
+
+   La discovery espande la superficie same-origin usando HTML, link, form, query string,
+   endpoint JavaScript e richieste document/XHR/fetch osservate da Chromium.
+
+C) NUOVA APPLICAZIONE - CONFIGURAZIONE
+   Usa --config quando hai piu' host, porte, base path o identita'. Usalo anche quando
+   devi creare la sessione da username/password oppure quando alcuni URL precisi devono
+   essere garantiti come punti di ingresso.
+
+   Ogni servizio HTTP/HTTPS puo' essere descritto con service.url completo oppure con
+   asset.host/IP, porta, protocollo e base_path.
+
+   In una normale applicazione non serve elencare tutte le pagine interne. Basta la radice
+   o il base path e la discovery cerca il resto. Se invece ricevi un elenco di URL che
+   devono essere tutti testati e non vuoi dipendere dai link scoperti, inserisci un servizio
+   per ciascun URL. configs/tourist-dashboard.json usa questa forma per otto dashboard
+   Snap4City sulla stessa origine.
+
+   Prima di avviare gli scanner esegui un dry-run:
+     python .\assessmentRunner.py --config .\configs\platform.example.json --orchestrator deterministic --mode balanced --dry-run
+
+D) AUTENTICAZIONE DA CONFIG
+   Una credenziale kind=snap4city_oidc puo' usare un cookie gia' disponibile oppure
+   username/password del target. Il runner trasforma il login riuscito in una sessione cookie
+   e passa quella sessione agli orchestrator esistenti.
+
+   Se optional=true e il login non e' disponibile o fallisce, il job continua in anonimo.
+   Se usi --auth-only, invece, la sessione autenticata e' obbligatoria e il job viene bloccato
+   quando il login non riesce.
+
+E) QUALE MODALITA' CONVIENE
+   fast      = smoke test o diagnostica breve
+   balanced  = scelta consigliata per il normale assessment
+   deep      = copertura e budget maggiori. Usarla dopo aver verificato target, login e scope
+
+   Deterministic = prima baseline consigliata. L'ordine e' fisso e riproducibile.
+   Agentic       = planner AI e analisi AI finale delle evidenze.
+   assessmentRunner.py = percorso consigliato per l'uso normale e per i config.
+   orchestrator*.py diretto = utile soprattutto per target singoli e diagnostica manuale.
+
+F) COME VEDERE COSA STA FACENDO
+   Durante il run il terminale mostra fase, tool, target, stato, limiti e diagnostica.
+   Deterministic segue la pipeline fissa. Agentic mostra anche i round e le azioni scelte.
+   PARTIAL, time_limit, skipped ed error descrivono l'esecuzione o la copertura. Non indicano
+   automaticamente la presenza o l'assenza di una vulnerabilita'.
+
+   Dopo un run con assessmentRunner.py il riferimento piu' completo e':
+     .\reports\Assessment_Results_Data_<ID>.json
+
+   Contiene risultati scanner, coverage, discovery, diagnostics, finding, contesto,
+   planner audit, decisioni Agentic e analisi AI quando presenti.
+
+G) DOVE SONO I RISULTATI
+   .\reports\SecOps_*.pdf          -> report leggibile
+   .\reports\SecOps_*.html         -> report navigabile
+   .\reports\SecOps_*.json         -> dati tecnici del report
+   .\reports\SecOps_*.review.json  -> snapshot redatto per rerenderReport.py
+   .\reports\Assessment_Results_Data_<ID>.json -> dataset redatto autosufficiente del runner
+
+   assessmentRunner.py stampa i percorsi esatti alla fine sotto "Assessment final artifacts".
+
+Per tutti i test usa esclusivamente target autorizzati. Su target non locali mantieni
+allow_state_changes=false o --no-allow-state-changes salvo autorizzazione esplicita alle
+verifiche state-changing. Il gate e' vincolante per i percorsi che lo supportano. Non e'
+un interruttore universale per tutti gli scanner esterni.
+
 AMBIENTE
 --------
 Apri il terminale nella radice del progetto:
@@ -69,9 +160,11 @@ python .\initScript.py --with-lab --run deterministic --mode balanced
 python .\initScript.py --with-lab --run agentic --mode balanced
 python .\initScript.py --with-lab --prepare-ai qwen --run agentic --mode balanced
 
-Alla fine l'initializer stampa prima i comandi assessmentRunner FAST/BALANCED/DEEP, un comando
-Agentic BALANCED per configs/dashboard-test.json con Snap4City o il fallback locale verificato, e poi un comando
-diretto orchestratorAgentic.py con un modello verificato. I comandi manuali degli orchestrator restano validi.
+Alla fine l'initializer stampa i comandi DVWA assessmentRunner FAST/BALANCED/DEEP e il comando diretto
+orchestratorAgentic.py. Inoltre scorre automaticamente configs/*.json e, per ogni configurazione reale, stampa
+un comando Deterministic BALANCED e un comando Agentic BALANCED. Sono esclusi i file di esempio/template
+(il nome contiene example, sample o template) e dvwa.generated.json, gia' coperto dai comandi DVWA.
+La stessa lista dinamica viene stampata anche con --commands-only. I comandi manuali degli orchestrator restano validi.
 
 Il modello/provider AI Snap4City usa snap4city_model_credentials.json. Questo file NON contiene le credenziali della dashboard target.
 Se contiene ancora placeholder o manca e il terminale e' interattivo, username/password del provider AI vengono richiesti in console; la password non viene mostrata.
@@ -105,8 +198,12 @@ python .\assessmentRunner.py --target http://127.0.0.1 --cookies "PHPSESSID=<SES
 python .\assessmentRunner.py --target http://127.0.0.1 --orchestrator deterministic --mode balanced
 python .\assessmentRunner.py --target http://127.0.0.1 --cookies "PHPSESSID=<SESSION>; security=low" --orchestrator agentic --model snap4city --max-rounds 2 --mode balanced --require-ai
 
-In modalita' diretta: cookie senza --auth-only = anonimo + autenticato; --auth-only = solo autenticato;
-senza cookie = solo anonimo. --config e --target sono alternativi.
+In modalita' diretta, un cookie senza --auth-only abilita anonimo + autenticato.
+Con --auth-only viene eseguito solo il profilo autenticato. Senza cookie il run e' anonimo.
+--config e --target sono alternativi.
+La modalita' --target non accetta username/password del target e non esegue il login OIDC.
+Se hai soltanto username/password usa un config con una credenziale supportata, per esempio
+kind=snap4city_oidc, oppure ottieni prima un cookie autorizzato.
 
 Override disponibili senza modificare il JSON:
   --orchestrator deterministic|agentic
@@ -137,28 +234,65 @@ HTTP/80 con base_path=/, quindi http-80 e' gia' enabled; HTTPS/443 resta disable
 Usa soltanto un account Snap4City autorizzato per questo test.
 configs/dashboard-test.json usa credential_ref=dashboard_session con login browser automatico Snap4City/Keycloak.
 Ordine di risoluzione della sessione:
-  1. se DASHBOARD_TEST_COOKIE e' valorizzato, riusa quella sessione e non esegue il login browser;
-  2. altrimenti legge DASHBOARD_TEST_USERNAME e DASHBOARD_TEST_PASSWORD;
-  3. se una delle due variabili manca e la console e' interattiva, chiede soltanto il valore mancante; la password non viene mostrata;
-  4. Chromium apre /dashboardSmartCity/; se compare la pagina pubblica, attiva il controllo login, completa il flusso OIDC/Keycloak, verifica che dopo il ritorno non sia piu' presente il controllo di login anonimo e passa i cookie agli orchestratori;
-  5. se la credenziale opzionale non e' disponibile, il job continua solo anonimo; con --auth-only il job viene bloccato.
+  1. Se DASHBOARD_TEST_COOKIE e' valorizzato, riusa quella sessione e non esegue il login browser.
+  2. Altrimenti legge DASHBOARD_TEST_USERNAME e DASHBOARD_TEST_PASSWORD.
+  3. Se una variabile manca e la console e' interattiva, chiede soltanto il valore mancante. La password non viene mostrata.
+  4. Chromium apre /dashboardSmartCity/. Se compare la pagina pubblica, attiva il controllo login e completa il flusso OIDC/Keycloak. Dopo il ritorno verifica lo stato autenticato e passa i cookie agli orchestratori.
+  5. Se la credenziale opzionale non e' disponibile o il login fallisce, il job continua solo anonimo. Con --auth-only il job viene bloccato.
 Le credenziali e il cookie ottenuto non vengono scritti nel JSON di configurazione o nei Results Data.
 Esempio non interattivo:
   export DASHBOARD_TEST_USERNAME='authorized-user'
   export DASHBOARD_TEST_PASSWORD='authorized-password'
 Queste sono credenziali dell'account della dashboard target e NON sono snap4city_model_credentials.json, che serve soltanto al provider AI Snap4City.
-I comandi stampati dall'initializer indicano esplicitamente il target (DVWA / 127.0.0.1 oppure MicroX / dashboard-test / 192.168.1.81); il vecchio comando diagnostico ZAP isolato non viene piu' stampato.
-Con il servizio HTTP/80 gia' abilitato, l'initializer stampa anche il comando equivalente a:
+I comandi aggiuntivi non sono hardcodati per dashboard-test: vengono generati automaticamente dai JSON reali presenti in configs/.
+Per dashboard-test, per esempio, vengono stampati entrambi:
+  python .\assessmentRunner.py --config .\configs\dashboard-test.json --orchestrator deterministic --mode balanced --authorized
   python .\assessmentRunner.py --config .\configs\dashboard-test.json --orchestrator agentic --model <MODELLO_EFFETTIVO> --max-rounds 2 --mode balanced --require-ai --authorized
-<MODELLO_EFFETTIVO> e' snap4city quando disponibile, altrimenti il fallback Ollama locale verificato.
+<MODELLO_EFFETTIVO> e' il modello Agentic selezionato/verificato dall'initializer quando disponibile.
 DASHBOARD_TEST_COOKIE resta un override manuale opzionale per riusare una sessione gia' valida:
   export DASHBOARD_TEST_COOKIE='PHPSESSID=<SESSION>; ...'
 Se e' presente ha precedenza su username/password e il job esegue anonimo + authenticated senza scrivere il cookie nel JSON.
 
 
+
+Configurazioni target: URL completo oppure host/IP + porta
+--------------------------------------------------------
+Per un servizio HTTP/HTTPS il config accetta due forme equivalenti:
+  1) link completo nel campo service.url, per esempio:
+       "url": "https://turismo.example.org/dashboard"
+  2) asset.host + service.port; protocol e base_path restano opzionali secondo il caso.
+     Se protocol non e' indicato, la porta 443 implica https, le altre porte implicano http.
+     Per HTTPS su porte non standard conviene indicare esplicitamente "protocol": "https".
+
+Il campo service.url, quando valorizzato, ha precedenza su host/port/base_path. I config esistenti
+che usano host + protocol + port continuano a funzionare senza modifiche.
+
+configs/tourist-dashboard.json contiene gia' gli otto URL HTTPS forniti per la dashboard turistica.
+Ogni URL e' un servizio separato. In questo modo tutte le viste vengono usate come punti di ingresso
+anche se non sono collegate tra loro durante la discovery.
+
+La credenziale tourist_session usa kind=snap4city_oidc. Ordine di risoluzione:
+  1. TOURIST_DASHBOARD_COOKIE, se contiene una sessione gia' valida.
+  2. TOURIST_DASHBOARD_USERNAME e TOURIST_DASHBOARD_PASSWORD.
+  3. Richiesta interattiva degli eventuali valori mancanti.
+  4. Login Chromium Snap4City/Keycloak e riuso della sessione per gli otto job.
+
+Se il login opzionale non riesce, i job continuano in anonimo. Con --auth-only una sessione valida
+e' invece obbligatoria. allow_state_changes resta false per tutti gli otto servizi.
+
+Esempio non interattivo:
+  export TOURIST_DASHBOARD_USERNAME='authorized-user'
+  export TOURIST_DASHBOARD_PASSWORD='authorized-password'
+
+Override con cookie gia' disponibile:
+  export TOURIST_DASHBOARD_COOKIE='PHPSESSID=<SESSION>; ...'
+
+Dry-run consigliato:
+  python .ssessmentRunner.py --config .\configs	ourist-dashboard.json --orchestrator deterministic --mode balanced --dry-run --authorized
+
 Esempio architettura complessa:
   configs/platform.example.json
-Mostra piu' host, porte 80/443/8443, due identita' web e SSH/22 mantenuto solo come inventario.
+Mostra esplicitamente entrambe le forme supportate: un servizio con service.url completo e altri servizi con asset.host/IP + porta/protocol/base_path. Include inoltre due identita' web e SSH/22 mantenuto solo come inventario.
 
 3. DETERMINISTIC
 ----------------

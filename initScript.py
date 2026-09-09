@@ -24,7 +24,6 @@ LOCAL_AI_MODELS = {"llama": "llama3.1:8b", "qwen": "qwen2.5:7b"}
 AI_PREPARATION_CHOICES = ("all", "snap4city", "llama", "qwen")
 CONFIGS_DIR = ROOT / "configs"
 DVWA_ASSESSMENT_CONFIG = CONFIGS_DIR / "dvwa.generated.json"
-DASHBOARD_TEST_ASSESSMENT_CONFIG = CONFIGS_DIR / "dashboard-test.json"
 
 
 # Prefixes privileged Linux host commands with sudo when the initializer is not already root.
@@ -262,6 +261,49 @@ def _operator_command(script: str, *arguments: str) -> str:
     values = [sys.executable, str(ROOT / script), *arguments]
     return subprocess.list2cmdline(values) if os.name == "nt" else shlex.join(values)
 
+
+# Excludes documentation/template configurations from the ready-to-run command list.
+def _is_example_config(path: Path) -> bool:
+    lowered = path.stem.lower().replace("-", "_")
+    return any(marker in lowered for marker in ("example", "sample", "template"))
+
+
+# Discovers reusable assessment configurations without duplicating the generated DVWA command set.
+def _additional_assessment_configs(assessment_config: Path) -> list[Path]:
+    if not CONFIGS_DIR.is_dir():
+        return []
+    try:
+        excluded = assessment_config.resolve()
+    except OSError:
+        excluded = assessment_config
+    discovered: list[Path] = []
+    for path in sorted(CONFIGS_DIR.glob("*.json"), key=lambda item: item.name.lower()):
+        if _is_example_config(path) or path.name.lower() == "dvwa.generated.json":
+            continue
+        try:
+            if path.resolve() == excluded:
+                continue
+        except OSError:
+            if path == assessment_config:
+                continue
+        discovered.append(path)
+    return discovered
+
+
+# Reads only the non-secret metadata needed to label commands for one assessment configuration.
+def _config_command_metadata(path: Path) -> tuple[str, str]:
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return path.stem, DEFAULT_AGENTIC_MODEL
+    platform = payload.get("platform") if isinstance(payload, dict) else {}
+    execution = payload.get("execution") if isinstance(payload, dict) else {}
+    name = str((platform or {}).get("name") or path.stem).strip() or path.stem
+    model = str((execution or {}).get("model") or DEFAULT_AGENTIC_MODEL).strip().lower()
+    if model not in {"snap4city", "llama", "qwen"}:
+        model = DEFAULT_AGENTIC_MODEL
+    return name, model
+
 # Loads the latest local-lab cookie so generated examples use the current session.
 def _runtime_cookie_for_commands() -> str:
 
@@ -445,11 +487,21 @@ def print_important_commands(
             "orchestratorAgentic.py", "--target", TARGET, "--cookies", cookie, "--auth-only",
             "--model", agentic_model, "--max-rounds", rounds, "--mode", mode, "--require-ai",
         ))
-        if DASHBOARD_TEST_ASSESSMENT_CONFIG.is_file():
-            print("\nMicroX / dashboard-test / 192.168.1.81 - Agentic BALANCED (automatic Snap4City login uses DASHBOARD_TEST_USERNAME/PASSWORD or prompts in an interactive console; DASHBOARD_TEST_COOKIE overrides it):")
+    additional_configs = _additional_assessment_configs(assessment_config)
+    if additional_configs:
+        print("\n=== Configured assessments - BALANCED ===")
+        for config_path in additional_configs:
+            config_name, configured_model = _config_command_metadata(config_path)
+            selected_model = agentic_model or configured_model
+            print(f"\n{config_name} - Deterministic BALANCED:")
             print(_operator_command(
-                "assessmentRunner.py", "--config", str(DASHBOARD_TEST_ASSESSMENT_CONFIG),
-                "--orchestrator", "agentic", "--model", agentic_model, "--max-rounds", "2",
+                "assessmentRunner.py", "--config", str(config_path),
+                "--orchestrator", "deterministic", "--mode", "balanced", "--authorized",
+            ))
+            print(f"\n{config_name} - Agentic BALANCED:")
+            print(_operator_command(
+                "assessmentRunner.py", "--config", str(config_path),
+                "--orchestrator", "agentic", "--model", selected_model, "--max-rounds", "2",
                 "--mode", "balanced", "--require-ai", "--authorized",
             ))
     print(f"\n[+] Every command and modifier: {COMMAND_REFERENCE_FILE}")
@@ -510,6 +562,9 @@ def main() -> int:
         guide_path = write_command_reference()
         if args.commands_only:
             print_command_reference(guide_path)
+            print_important_commands(
+                agentic_model, args.mode, _runtime_cookie_for_commands(), DVWA_ASSESSMENT_CONFIG,
+            )
             return 0
         print(f"[+] Full command guide written: {guide_path}")
         verify_unified_mcp_source()

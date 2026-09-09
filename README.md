@@ -7,6 +7,91 @@ catalogue against a target and produce PDF/HTML/JSON reports plus a redacted rev
 assessment configuration can expand multiple authorized HTTP/HTTPS services into the same existing orchestrators;
 direct orchestrator commands remain supported. Full command reference: `init.txt`.
 
+## Start here: recommended workflow
+
+If this is the first time you open the repository, use this sequence.
+
+1. **Initialize the environment** from the repository root.
+
+   ```powershell
+   python .\initScript.py --with-lab
+   ```
+
+   On Linux/macOS use `python3 ./initScript.py --with-lab`. The initializer verifies the project dependencies, scanners,
+   Playwright/Chromium and the selected AI backends. With `--with-lab` it also prepares the local DVWA lab. At the end it
+   prints ready-to-copy commands.
+
+2. **Run the first baseline with Deterministic in `balanced` mode on DVWA.** The execution order is fixed, so this is the
+   easiest run to inspect and reproduce. After the baseline works, use Agentic in `balanced` mode when you want adaptive
+   action selection and AI evidence analysis.
+
+3. **Choose how to describe the new target.**
+   - Use `assessmentRunner.py --target <URL>` for a single starting URL when the run is anonymous or when you already have
+     a valid cookie that can be passed with `--cookies`.
+   - Use `assessmentRunner.py --config <FILE>` when you only have the target username/password and the session must be
+     created through browser/OIDC login. Direct `--target` mode does not accept target username/password and does not run
+     the `snap4city_oidc` login workflow.
+   - Also use `--config` when the authorized scope contains several hosts, ports, base paths, identities or explicit entry
+     URLs that must all be tested.
+
+4. **Do not list every internal URL unless the scope requires specific entry URLs.** For a normal application, give the
+   root URL or the relevant base path and let discovery expand the same-origin surface. Discovery follows HTML links and
+   forms, extracts query/request contracts and literal same-origin JavaScript endpoints, and observes dynamic
+   `document`, `xhr` and `fetch` requests with Chromium. If several supplied URLs must each be guaranteed as starting
+   points, declare them as separate services in the configuration. `configs/tourist-dashboard.json` demonstrates this
+   with eight explicit Snap4City dashboard views on the same origin.
+
+5. **Validate a new configuration before scanning it.**
+
+   ```powershell
+   python .\assessmentRunner.py --config .\configs\platform.example.json --orchestrator deterministic --mode balanced --dry-run
+   ```
+
+   `--dry-run` validates and expands the configuration without starting scanners.
+
+6. **Use `balanced` unless you need a different trade-off.** `fast` is intended for smoke tests and short diagnostics.
+   `deep` increases discovery and scanner budgets, so use it after the target, authentication and scope have been checked.
+
+7. **Watch the terminal during the assessment.** Deterministic reports the fixed pipeline stages. Agentic also reports
+   planner rounds and selected actions. Execution status and coverage remain separate from security findings.
+
+8. **Read the final artifacts from `reports/`.** PDF and HTML are the human-readable reports. The report JSON contains the
+   technical report data. `.review.json` is the redacted rerender snapshot. When `assessmentRunner.py` is used,
+   `Assessment_Results_Data_<ID>.json` is the preferred redacted dataset for audit and later analysis. The runner prints
+   the exact paths under `Assessment final artifacts`.
+
+### Authentication: direct target or configuration?
+
+This distinction is important:
+
+- `--target` mode accepts `--cookies`. It can therefore run anonymously or reuse an authenticated session that already exists.
+- `--target` mode has no target `--username` or `--password` option. It does not create an OIDC session from account credentials.
+- If you only have the username/password of the assessed application, use a JSON configuration with a credential such as
+  `kind: "snap4city_oidc"`. `assessmentRunner.py` performs the browser login and passes the resulting cookies to the existing orchestrators.
+- When an OIDC credential has `optional: true`, missing credentials or a failed login fall back to the anonymous profile.
+  `--auth-only` is different: it requires a valid authenticated session, so the job is blocked if login cannot provide one.
+
+### What should I normally choose?
+
+| Need | Recommended choice |
+| --- | --- |
+| First run / reproducible baseline | `assessmentRunner.py` or `orchestratorDeterministic.py`, `--mode balanced` |
+| Single target, anonymous or cookie already available | `assessmentRunner.py --target <URL>` |
+| Only target username/password available | `assessmentRunner.py --config <FILE>` with a supported login credential such as `snap4city_oidc` |
+| Multiple hosts / ports / base paths / identities | `assessmentRunner.py --config <FILE>` starting from `configs/platform.example.json` |
+| Several exact entry URLs that must all be covered | declare one enabled service per supplied URL in the config |
+| Check a configuration without scanning | add `--dry-run` |
+| Adaptive tool selection and AI evidence analysis | Agentic + `--model <model>`; add `--require-ai` when AI completion is mandatory |
+| Quick smoke test | `--mode fast` |
+| Normal assessment | `--mode balanced` |
+| Broader bounded assessment after validation | `--mode deep` |
+| Debug one scanner/request manually | Deterministic isolated `--tool ...` mode described in `init.txt` |
+
+For non-local targets, keep state-changing checks disabled unless the authorized scope explicitly permits them. An explicit
+`allow_state_changes=false` in the configuration or `--no-allow-state-changes` on the CLI is binding. The planner cannot
+bypass this shared Python gate. The flag applies only to the project paths documented below and is not a universal switch
+for every external scanner.
+
 ## Credential and token terminology (legend)
 
 This document uses the word "token" for two unrelated access-credential concepts. Every later
@@ -20,7 +105,7 @@ which access is meant:
   `--jwt-token`, or the `dashboard_session` login) belonging to the application being assessed. Never
   Snap4City credentials, never shared with the AI provider.
 
-## How core files works
+## How the core files work
 
 ### Initialization
 
@@ -35,8 +120,8 @@ be coherent: `--prepare-ai all` accepts any Agentic model, while a single-backen
 is prepared, that backend becomes the default. The initializer writes
 `.secops_runtime.json`, used by preflight checks and both orchestrators. `--commands-only` prints the `init.txt` command reference.
 
-- `init.txt`: Operational cheat sheet, generated by `initScript.py --commands-only` — regenerate it
-rather than hand-editing.
+- `init.txt`: Canonical operational cheat sheet stored in the repository and printed by `initScript.py --commands-only`.
+  The initializer reads the existing file and does not overwrite it during normal initialization, so documentation updates remain stable.
 
 ### Orchestrators
 
@@ -55,10 +140,11 @@ The other files support the previous ones, as shared logic or support files.
 
 ### Platform assessment configuration
 
-- `assessmentConfig.py`: validates a platform scope containing multiple assets, host/IP metadata, ports, protocols and credential references.
+- `assessmentConfig.py`: validates a platform scope containing multiple assets, credential references and web targets expressed either as an absolute per-service `url`, or as asset host/IP plus service port/protocol/base path. When only host/IP and port are supplied, port 443 infers HTTPS and other ports infer HTTP unless `protocol` is explicitly set.
 - `assessmentRunner.py`: accepts either a platform JSON configuration or a direct `--target`/`--cookies` invocation, then delegates
-  each HTTP/HTTPS job to the existing Deterministic or Agentic orchestrator. Non-web protocols may be inventoried but are explicitly
-  recorded as unsupported by the current web-assessment orchestrators rather than being silently treated as tested.
+  each HTTP/HTTPS job to the existing Deterministic or Agentic orchestrator. Direct mode consumes an already available cookie session;
+  target username/password login is configuration-driven. Non-web protocols may be inventoried but are explicitly recorded as unsupported
+  by the current web-assessment orchestrators rather than being silently treated as tested.
 - `configs/dvwa.example.json`: non-secret placeholder that shows the exact DVWA configuration structure without containing a usable session.
 - `configs/dvwa.generated.json`: generated by `initScript.py --with-lab` from the fresh DVWA session and immediately usable.
 - `configs/dashboard-test.json`: definition for the authorized `192.168.1.81` / `dashboard-test` test; the 2026-09-03 run confirmed
@@ -66,8 +152,8 @@ The other files support the previous ones, as shared logic or support files.
   `DASHBOARD_TEST_COOKIE` when an existing session is supplied, otherwise it performs the real Snap4City/Keycloak browser login with
   `DASHBOARD_TEST_USERNAME` and `DASHBOARD_TEST_PASSWORD`. In an interactive terminal each missing value is requested in console
   (the password is read with hidden input); if no usable authorized account is supplied, the optional profile remains anonymous only.
-- `configs/platform.example.json`: example of a larger multi-host scope with multiple ports, two web identities and a non-web
-  service kept only as inventory. Environment-variable credential references are preferred for reusable configurations.
+- `configs/tourist-dashboard.json`: complete Snap4City tourism-dashboard configuration for the eight supplied HTTPS views. Each view is an explicit service URL so every entry point is assessed. `TOURIST_DASHBOARD_COOKIE` can reuse an existing session. Otherwise `TOURIST_DASHBOARD_USERNAME` and `TOURIST_DASHBOARD_PASSWORD` are used by the optional `snap4city_oidc` browser login. If login is unavailable or fails, the jobs continue anonymously unless `--auth-only` is requested. State-changing checks remain explicitly disabled.
+- `configs/platform.example.json`: example of a larger multi-host scope that explicitly demonstrates both supported web-target forms: one service uses an absolute `service.url`, while other services use asset host/IP plus port/protocol/base path. It also shows two web identities and a non-web service kept only as inventory. Environment-variable credential references are preferred for reusable configurations.
 
 The runner is an optional layer above the orchestrators, not a replacement for them. Existing direct commands such as
 `python orchestratorDeterministic.py --target ...` and `python orchestratorAgentic.py --target ...` continue to work unchanged.
@@ -128,7 +214,7 @@ Logout handling is profile-aware and intentionally separate from generic fuzzing
   `--prepare-ai snap4city` does not provision or require Ollama because no local model is requested.
 - The Snap4City AI model/provider requires network access plus `snap4city_model_credentials.json` or interactive model credentials. This file is unrelated to the account used to log in to the assessed dashboard. The provider is remote and is verified during initialization rather than downloaded. Token (1) endpoint calls use bounded HTTP timeouts; transport or JSON failures fall back through the normal cached-token/refresh/user-credential sequence (1) and cannot block indefinitely.
 
-## How to run 
+## Detailed initialization and run options 
 
 The recommended complete local-lab initialization is:
 
@@ -175,9 +261,10 @@ The repository also contains `configs/dvwa.example.json`, which is only a readab
 After step 1 succeeds, `initScript.py` writes `configs/dvwa.generated.json` with the fresh DVWA cookie and `auth_only=false`, then prints
 ready-to-copy `assessmentRunner.py` commands for fast, balanced and deep Deterministic/Agentic runs. Those generated commands therefore
 run both anonymous and authenticated profiles by default; add `--auth-only` when only the authenticated profile is wanted. It also prints one
-direct `orchestratorAgentic.py` command so the original manual workflow remains immediately available, plus one Agentic
-BALANCED command for `configs/dashboard-test.json` using Snap4City when available or the verified local fallback selected
-during initialization.
+direct `orchestratorAgentic.py` command so the original manual workflow remains immediately available. In addition, every non-example JSON
+under `configs/` receives exactly one Deterministic BALANCED and one Agentic BALANCED command; files whose names contain `example`, `sample`
+or `template`, and the already-covered `dvwa.generated.json`, are excluded. The additional commands use `--authorized` explicitly and the
+verified Agentic model selected by initialization when available. The same dynamic list is printed by `--commands-only`.
 
 If Snap4City authentication succeeds but its configured remote model/endpoint cannot be prepared, initialization reports the
 Snap4City error and continues. A verified local Ollama model is used as the Agentic fallback when one is already available;
@@ -205,9 +292,11 @@ python .\assessmentRunner.py --config .\configs\dvwa.generated.json --orchestrat
 python .\assessmentRunner.py --config .\configs\dvwa.generated.json --orchestrator agentic --model snap4city --max-rounds 2 --mode balanced --require-ai
 ```
 
-The runner can also be used without a JSON file. `--config` and `--target` are alternatives; direct-target mode accepts the same
+The runner can also be used without a JSON file. `--config` and `--target` are alternatives. Direct-target mode accepts the same
 primary and secondary cookie headers used by the orchestrators. With a cookie and no `--auth-only`, both anonymous and authenticated
-profiles are executed; with `--auth-only`, only the authenticated profile is executed; without a cookie, the run is anonymous only.
+profiles are executed. With `--auth-only`, only the authenticated profile is executed. Without a cookie, the run is anonymous only.
+Direct-target mode does **not** accept target username/password and does not execute the OIDC browser-login resolver. If account
+credentials are all you have, use a configuration with `kind: "snap4city_oidc"` or obtain an authorized cookie separately.
 For example:
 
 ```powershell
@@ -244,8 +333,35 @@ Snap4City AI provider used by the Agentic planner. Chromium opens `/dashboardSma
 manual `--cookies` session, so both anonymous and authenticated discovery/scanners run because `auth_only=false`. The credentials and resulting
 cookie are not written to the configuration or Results Data. `DASHBOARD_TEST_COOKIE='PHPSESSID=<SESSION>; ...'` remains a manual override: when
 present it is used directly and the browser login is skipped. If no account/session is available, leaving the console values empty keeps the
-optional job anonymous; `--auth-only` instead blocks because an authenticated session is required. An authenticated profile is eligible for scanner planning only while discovery has not conclusively marked that session ineffective; an invalid supplied cookie therefore cannot be reported as authenticated coverage or suppress the corresponding anonymous coverage. After initialization, the printed MicroX command
-uses `--max-rounds 2 --mode balanced --require-ai` and the effective Agentic model (Snap4City or the verified local fallback). The initializer labels each printed command with its target (`DVWA / 127.0.0.1` or `MicroX / dashboard-test / 192.168.1.81`) and no longer prints the isolated ZAP diagnostic command.
+optional job anonymous; `--auth-only` instead blocks because an authenticated session is required. An authenticated profile is eligible for scanner planning only while discovery has not conclusively marked that session ineffective; an invalid supplied cookie therefore cannot be reported as authenticated coverage or suppress the corresponding anonymous coverage. After initialization, `dashboard-test.json` is included automatically in the generic per-config command list: it receives one Deterministic BALANCED command and one Agentic BALANCED command using `--max-rounds 2 --mode balanced --require-ai` and the effective Agentic model (Snap4City or the verified local fallback). The initializer no longer depends on a hardcoded dashboard-test command and no longer prints the isolated ZAP diagnostic command.
+
+
+### Tourist dashboard configuration
+
+`configs/tourist-dashboard.json` contains the eight supplied Snap4City dashboard-view URLs as eight enabled HTTPS service jobs. They share
+one optional target credential named `tourist_session`:
+
+```bash
+export TOURIST_DASHBOARD_USERNAME='authorized-user'
+export TOURIST_DASHBOARD_PASSWORD='authorized-password'
+```
+
+An existing session can be supplied instead:
+
+```bash
+export TOURIST_DASHBOARD_COOKIE='PHPSESSID=<SESSION>; ...'
+```
+
+The cookie has priority over username/password. Otherwise Chromium performs the Snap4City/Keycloak OIDC login once and the resulting
+session is reused for the service jobs. Because `optional=true` and `auth_only=false`, a missing account or failed login does not cancel the
+assessment: the affected jobs continue with the anonymous profile. If `--auth-only` is added, a valid authenticated session becomes mandatory.
+The recommended validation command is:
+
+```powershell
+python .\assessmentRunner.py --config .\configs\tourist-dashboard.json --orchestrator deterministic --mode balanced --dry-run --authorized
+```
+
+After the dry-run is correct, remove `--dry-run` or select Agentic as required by the assessment.
 
 ## Agentic AI models
 

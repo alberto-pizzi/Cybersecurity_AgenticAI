@@ -2,7 +2,7 @@
   "schema_version": 1,
   "platform": {
     "name": "Example multi-asset platform",
-    "description": "Example scope with multiple hosts, ports, protocols and two authenticated web identities."
+    "description": "Example scope showing both supported web target forms: an absolute service URL and asset host/IP plus service port/protocol/base path."
   },
   "authorization": {
     "confirmed": false,
@@ -27,14 +27,13 @@
       "address": "10.20.0.10",
       "services": [
         {
-          "id": "https-main",
-          "protocol": "https",
-          "port": 443,
-          "base_path": "/",
+          "id": "https-main-by-url",
+          "url": "https://portal.example.internal/app/",
           "credential_ref": "portal_primary",
           "secondary_credential_ref": "portal_secondary",
           "auth_only": true,
-          "allow_state_changes": false
+          "allow_state_changes": false,
+          "notes": "Absolute-URL form. When url is set it takes precedence over asset.host, service.port, protocol and base_path for the target URL."
         },
         {
           "id": "http-redirect",
@@ -42,7 +41,8 @@
           "port": 80,
           "base_path": "/",
           "auth_only": false,
-          "allow_state_changes": false
+          "allow_state_changes": false,
+          "notes": "Host/IP + port form. This service resolves from asset.host plus port/protocol/base_path; omitting protocol would infer HTTP for port 80."
         }
       ]
     },
@@ -58,7 +58,8 @@
           "base_path": "/api/",
           "credential_ref": "portal_primary",
           "auth_only": true,
-          "allow_state_changes": false
+          "allow_state_changes": false,
+          "notes": "Host/IP + port form with explicit HTTPS because 8443 is a non-standard HTTPS port."
         },
         {
           "id": "ssh-inventory",
