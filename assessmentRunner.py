@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import getpass
 import json
 import os
+import shutil
 import subprocess
 import sys
 import time
@@ -545,7 +547,13 @@ def _embedded_report_data(artifact: dict[str, Any]) -> dict[str, Any]:
         results = review.get("results") or {}
 
     summary = source.get("summary") if isinstance(source.get("summary"), dict) else {}
-    coverage = source.get("coverage") if isinstance(source.get("coverage"), dict) else {}
+    coverage = source.get("coverage") if isinstance(source.get("coverage"), list) else []
+    endpoint_coverage = source.get("endpoint_coverage") if isinstance(source.get("endpoint_coverage"), list) else []
+    endpoint_coverage_summary = source.get("endpoint_coverage_summary") if isinstance(source.get("endpoint_coverage_summary"), dict) else {}
+    if not endpoint_coverage and isinstance(review, dict) and isinstance(review.get("endpoint_coverage"), list):
+        endpoint_coverage = review.get("endpoint_coverage") or []
+    if not endpoint_coverage_summary and isinstance(review, dict) and isinstance(review.get("endpoint_coverage_summary"), dict):
+        endpoint_coverage_summary = review.get("endpoint_coverage_summary") or {}
     findings = source.get("findings") if isinstance(source.get("findings"), list) else []
     all_findings = source.get("all_findings") if isinstance(source.get("all_findings"), list) else []
     if not all_findings and isinstance(review, dict) and isinstance(review.get("findings"), list):
@@ -590,6 +598,8 @@ def _embedded_report_data(artifact: dict[str, Any]) -> dict[str, Any]:
             "executive_summary": source.get("executive_summary"),
             "summary": summary,
             "coverage": coverage,
+            "endpoint_coverage": endpoint_coverage,
+            "endpoint_coverage_summary": endpoint_coverage_summary,
             "findings": findings,
             "all_findings": all_findings,
             "findings_by_category": source.get("findings_by_category") if isinstance(source.get("findings_by_category"), dict) else {},
@@ -597,7 +607,7 @@ def _embedded_report_data(artifact: dict[str, Any]) -> dict[str, Any]:
         },
         "assessment_context": context,
         "discovery": context.get("discovery") if isinstance(context.get("discovery"), dict) else {},
-        "diagnostics": context.get("diagnostics") if isinstance(context.get("diagnostics"), dict) else {},
+        "diagnostics": context.get("diagnostics") if isinstance(context.get("diagnostics"), (dict, list)) else {},
         "agentic_decisions": {
             "planner_source": context.get("planner_source"),
             "planner_rounds": context.get("planner_rounds"),
@@ -629,6 +639,230 @@ def _embedded_report_data(artifact: dict[str, Any]) -> dict[str, Any]:
 
 
 # Executes the configured HTTP/HTTPS services sequentially through the existing orchestrators.
+
+def _aggregate_report_requested(config: dict[str, Any]) -> tuple[bool, bool]:
+    reporting = config.get("reporting") if isinstance(config.get("reporting"), dict) else {}
+    return bool(reporting.get("aggregate_report", False)), bool(reporting.get("keep_job_reports", True))
+
+
+def _annotate_aggregate_provenance(result: dict[str, Any], *, job_id: str, target: str, report_id: str) -> dict[str, Any]:
+    """Copy one job result and attach entry-point provenance to every raw finding."""
+    annotated = copy.deepcopy(result)
+
+    def visit(node: Any) -> None:
+        if not isinstance(node, dict):
+            return
+        node.setdefault("aggregate_source_job_id", job_id)
+        node.setdefault("aggregate_source_entry_point", target)
+        if report_id:
+            node.setdefault("aggregate_source_report_id", report_id)
+        vulnerabilities = node.get("vulnerabilities")
+        if isinstance(vulnerabilities, list):
+            for finding in vulnerabilities:
+                if not isinstance(finding, dict):
+                    continue
+                finding.setdefault("aggregate_source_job_id", job_id)
+                finding.setdefault("aggregate_source_entry_point", target)
+                if report_id:
+                    finding.setdefault("aggregate_source_report_id", report_id)
+        runs = node.get("runs")
+        if isinstance(runs, list):
+            for run in runs:
+                visit(run)
+
+    visit(annotated)
+    return annotated
+
+
+def _aggregate_report_inputs(results_data: dict[str, Any], config: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any], str]:
+    aggregate_results: dict[str, dict[str, Any]] = {}
+    profiles: dict[str, bool] = {}
+    expected_tools: set[str] = set()
+    entry_points: list[dict[str, Any]] = []
+    discovery_by_entry: dict[str, Any] = {}
+    diagnostics_by_entry: dict[str, Any] = {}
+    endpoint_selection_by_entry: dict[str, Any] = {}
+    secondary_identity_supplied = False
+
+    for row_index, row in enumerate(results_data.get("reports_data", []), start=1):
+        if not isinstance(row, dict):
+            continue
+        artifact = row.get("artifacts") if isinstance(row.get("artifacts"), dict) else {}
+        job_id = str(artifact.get("job_id") or f"entry-{row_index}")
+        target = str(row.get("target") or "")
+        entry_points.append({"job_id": job_id, "target": target, "report_id": row.get("report_id")})
+        context = row.get("assessment_context") if isinstance(row.get("assessment_context"), dict) else {}
+        for profile in context.get("profiles", []) if isinstance(context.get("profiles"), list) else []:
+            if isinstance(profile, dict):
+                name = str(profile.get("name") or "").strip()
+                if name:
+                    profiles[name] = profiles.get(name, False) or bool(profile.get("authenticated"))
+            elif str(profile).strip():
+                profiles[str(profile)] = profiles.get(str(profile), False)
+        for tool in context.get("expected_tools", []) if isinstance(context.get("expected_tools"), list) else []:
+            if str(tool).strip():
+                expected_tools.add(str(tool))
+        secondary_identity_supplied = secondary_identity_supplied or bool(context.get("secondary_identity_supplied"))
+        discovery_by_entry[job_id] = row.get("discovery") if isinstance(row.get("discovery"), dict) else {}
+        diagnostics_by_entry[job_id] = row.get("diagnostics") if isinstance(row.get("diagnostics"), (dict, list)) else {}
+        endpoint_selection_by_entry[job_id] = context.get("endpoint_selection") if isinstance(context.get("endpoint_selection"), dict) else {}
+
+        scanner_results = ((row.get("assessment_results") or {}).get("scanner_results")
+                           if isinstance(row.get("assessment_results"), dict) else {})
+        if not isinstance(scanner_results, dict):
+            continue
+        for profile_name, tool_results in scanner_results.items():
+            if not isinstance(tool_results, dict):
+                continue
+            profile_name = str(profile_name)
+            aggregate_results.setdefault(profile_name, {})
+            profiles.setdefault(profile_name, profile_name != "anonymous")
+            for tool_key, result in tool_results.items():
+                if not isinstance(result, dict):
+                    continue
+                aggregate_key = f"{tool_key}:{job_id}"
+                suffix = 2
+                while aggregate_key in aggregate_results[profile_name]:
+                    aggregate_key = f"{tool_key}:{job_id}:{suffix}"
+                    suffix += 1
+                aggregate_results[profile_name][aggregate_key] = _annotate_aggregate_provenance(
+                    result,
+                    job_id=job_id,
+                    target=target,
+                    report_id=str(row.get("report_id") or ""),
+                )
+
+    targets = [row["target"] for row in entry_points if row.get("target")]
+    origins = []
+    for target in targets:
+        try:
+            parsed = urlparse(target)
+            origin = f"{parsed.scheme}://{parsed.netloc}" if parsed.scheme and parsed.netloc else ""
+        except ValueError:
+            origin = ""
+        if origin:
+            origins.append(origin)
+    target_label = origins[0] if origins and len(set(origins)) == 1 else str((config.get("platform") or {}).get("name") or "Multi-entry assessment")
+
+    context = {
+        "profiles": [{"name": name, "authenticated": authenticated} for name, authenticated in sorted(profiles.items())],
+        "expected_tools": sorted(expected_tools),
+        "discovery": discovery_by_entry,
+        "endpoint_selection": endpoint_selection_by_entry,
+        "diagnostics": diagnostics_by_entry,
+        "entry_points": entry_points,
+        "entry_point_count": len(entry_points),
+        "logical_target_name": str((config.get("platform") or {}).get("name") or target_label),
+        "multi_entry_target": True,
+        "reporting_scope": "aggregate logical target",
+        "secondary_identity_supplied": secondary_identity_supplied,
+        "scan_mode": str((config.get("execution") or {}).get("mode") or "balanced"),
+        "allow_state_changes": (config.get("execution") or {}).get("allow_state_changes"),
+        "orchestration": {
+            "engine": "assessmentRunner aggregate",
+            "mode": str((config.get("execution") or {}).get("orchestrator") or ""),
+            "entry_points": len(entry_points),
+        },
+    }
+    return aggregate_results, context, target_label
+
+
+def _generate_aggregate_report(results_data: dict[str, Any], config: dict[str, Any], assessment_id: str) -> dict[str, Any]:
+    servers_dir = str((ROOT / "servers").resolve())
+    if servers_dir not in sys.path:
+        sys.path.insert(0, servers_dir)
+    from reporting.coverage import _executive_text, build_coverage, build_endpoint_coverage, summarize, summarize_endpoint_coverage
+    from reporting.findings import _finding_groups, _human_readable_findings, flatten_findings
+    from reporting.html_report import _render_html
+    from reporting.pdf_maker import html2pdf
+    from reporting.revision_snapshot import build_review_snapshot
+    from reporting.text_utils import _redact_value, _safe_name
+
+    results, context, target_label = _aggregate_report_inputs(results_data, config)
+    REPORTS_DIR.mkdir(parents=True, exist_ok=True)
+    base = _safe_name(f"{assessment_id}_aggregate")
+    json_path = REPORTS_DIR / f"{base}.json"
+    html_path = REPORTS_DIR / f"{base}.html"
+    pdf_path = REPORTS_DIR / f"{base}.pdf"
+    review_path = REPORTS_DIR / f"{base}.review.json"
+    pdf_source_path = REPORTS_DIR / f"{base}.pdf-source.html"
+
+    all_findings = flatten_findings(results)
+    findings, omitted_detail = _human_readable_findings(all_findings)
+    coverage = build_coverage(results, context)
+    endpoint_coverage = build_endpoint_coverage(results, context)
+    endpoint_coverage_summary = summarize_endpoint_coverage(endpoint_coverage)
+    summary = summarize(results, all_findings, coverage, context)
+    summary["omitted_human_readable_detail"] = omitted_detail
+    payload = {
+        "generated_at": datetime.now(timezone.utc),
+        "target": target_label,
+        "reporting_policy": "Scanner-grounded aggregate report for multiple authorized entry points of one logical target; observed facts are not invented and per-entry evidence remains traceable in the Results Data dataset.",
+        "executive_summary": _executive_text(summary, findings, context),
+        "summary": summary,
+        "coverage": coverage,
+        "endpoint_coverage": endpoint_coverage,
+        "endpoint_coverage_summary": endpoint_coverage_summary,
+        "security_findings_count": sum(item["category"] == "vulnerability" for item in findings),
+        "candidate_findings_count": sum(item["category"] == "candidate" for item in findings),
+        "observations_count": sum(item["category"] in {"discovery", "observation"} for item in findings),
+        "findings_count": len(findings),
+        "findings": findings,
+        "all_findings": all_findings,
+        "findings_by_category": _finding_groups(findings),
+        "assessment_context": _redact_value(context),
+        "results": _redact_value(results),
+        "client_name": "",
+        "assessor": "",
+        "assessment_type": "Multi-entry web application assessment",
+        "assessment_start": "",
+        "assessment_end": "",
+        "report_version": "1.0",
+        "report_id": base,
+    }
+    json_path.write_text(json.dumps(payload, indent=2, ensure_ascii=False, default=str), encoding="utf-8")
+    review_path.write_text(json.dumps(build_review_snapshot(payload), indent=2, ensure_ascii=False, default=str), encoding="utf-8")
+    html_path.write_text(_render_html(payload), encoding="utf-8")
+    try:
+        pdf_source_path.write_text(_render_html(payload, for_pdf=True), encoding="utf-8")
+        html2pdf(pdf_source_path, pdf_path)
+    finally:
+        pdf_source_path.unlink(missing_ok=True)
+    return {
+        "job_id": "aggregate",
+        "report_id": base,
+        "pdf_path": str(pdf_path.resolve()) if pdf_path.is_file() else None,
+        "json_path": str(json_path.resolve()),
+        "html_path": str(html_path.resolve()),
+        "review_snapshot_path": str(review_path.resolve()),
+        "aggregate": True,
+    }
+
+
+def _archive_job_report_artifacts(results_data: dict[str, Any], assessment_id: str) -> list[dict[str, Any]]:
+    supporting_dir = REPORTS_DIR / "supporting" / assessment_id
+    supporting_dir.mkdir(parents=True, exist_ok=True)
+    moved: list[dict[str, Any]] = []
+    for artifact in results_data.get("report_artifacts", []):
+        if not isinstance(artifact, dict):
+            continue
+        updated = dict(artifact)
+        for key in ("pdf_path", "html_path", "json_path", "review_snapshot_path"):
+            raw = artifact.get(key)
+            if not raw:
+                continue
+            source = Path(str(raw))
+            if not source.is_file():
+                continue
+            destination = supporting_dir / source.name
+            if destination.exists():
+                destination = supporting_dir / f"{source.stem}_{artifact.get('job_id','job')}{source.suffix}"
+            shutil.move(str(source), str(destination))
+            updated[key] = str(destination.resolve())
+        updated["supporting"] = True
+        moved.append(updated)
+    return moved
+
 def main() -> int:
     parser = argparse.ArgumentParser(
         description="Run one direct target or expand a multi-asset assessment JSON file through the existing deterministic or agentic orchestrators."
@@ -798,6 +1032,41 @@ def main() -> int:
                     break
         results_data["jobs"].append(record)
         _write_results_data(results_data_path, results_data)
+
+    aggregate_requested, keep_job_reports = _aggregate_report_requested(config)
+    source_report_artifacts = list(results_data.get("report_artifacts", []))
+    if aggregate_requested and len(results_data.get("reports_data", [])) > 1 and not args.dry_run:
+        try:
+            aggregate_artifact = _generate_aggregate_report(results_data, config, assessment_id)
+            aggregate_data = _embedded_report_data(aggregate_artifact)
+            if keep_job_reports:
+                results_data["supporting_report_artifacts"] = source_report_artifacts
+            else:
+                supporting = _archive_job_report_artifacts(results_data, assessment_id)
+                results_data["supporting_report_artifacts"] = supporting
+                supporting_by_id = {str(item.get("report_id") or ""): item for item in supporting}
+                for job_record in results_data.get("jobs", []):
+                    if not isinstance(job_record, dict):
+                        continue
+                    updated_reports = []
+                    for item in job_record.get("reports", []) if isinstance(job_record.get("reports"), list) else []:
+                        if not isinstance(item, dict):
+                            continue
+                        updated_reports.append(supporting_by_id.get(str(item.get("report_id") or ""), item))
+                    if updated_reports:
+                        job_record["reports"] = updated_reports
+                        job_record["pdf_reports"] = [str(item.get("pdf_path")) for item in updated_reports if item.get("pdf_path")]
+            results_data["report_artifacts"] = [aggregate_artifact]
+            results_data["reports_data"] = [aggregate_data]
+            results_data["aggregate_report"] = {
+                "enabled": True,
+                "entry_point_reports_merged": len(source_report_artifacts),
+                "supporting_job_reports_kept": keep_job_reports,
+            }
+            print(f"[+] Aggregate logical-target report generated from {len(source_report_artifacts)} per-entry report artifact(s).")
+        except Exception as exc:
+            results_data["aggregate_report"] = {"enabled": True, "status": "error", "error": f"{type(exc).__name__}: {exc}"}
+            print(f"[!] Aggregate report generation failed: {type(exc).__name__}: {exc}", file=sys.stderr)
 
     report_artifacts = list(results_data.get("report_artifacts", []))
     if len(report_artifacts) == 1 and report_artifacts[0].get("report_id"):

@@ -72,6 +72,8 @@ def _finding_card(item: dict[str, Any], index: int, toc: list[tuple[int, str, st
 </div>
 <dl>
 {_field('Affected URL', item.get('url'))}
+{_field('Source entry point(s)', ', '.join(item.get('source_entry_points') or []))}
+{_field('Source job(s)', ', '.join(item.get('source_job_ids') or []))}
 {_field('HTTP method', item.get('method'))}
 {_field('Parameter', item.get('parameter'))}
 {_field('Description' + _ai_suffix('description'), item.get('description'))}
@@ -132,7 +134,8 @@ def _render_glance(findings: list[dict[str, Any]], toc: list[tuple[int, str, str
         f'<td class="idx">{index}</td><td class="no-wrap">{_esc(item.get('risk','info')).upper()}</td>'
         f"<td><b>{_esc(item.get('alert','Unnamed finding'))}</b></td>"
         f"<td>{_esc(item.get('tool',''))}</td>"
-        f"<td>{_esc(item.get('url',''))}<br><small>parameter: {_esc(item.get('parameter') or '-')}</small></td>"
+        f"<td>{_esc(item.get('url',''))}<br><small>parameter: {_esc(item.get('parameter') or '-')}</small>"
+        f"{('<br><small>entry point: ' + _esc(', '.join(item.get('source_entry_points') or [])) + '</small>') if item.get('source_entry_points') else ''}</td>"
         "</tr>"
         for index, item in enumerate(glance_items, 1)
     )

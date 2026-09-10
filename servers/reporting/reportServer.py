@@ -10,7 +10,7 @@ from fastmcp import FastMCP
 
 from utils import REPORTS_DIR, failure, run_mcp_http, success
 
-from reporting.coverage import _executive_text, build_coverage, summarize
+from reporting.coverage import _executive_text, build_coverage, build_endpoint_coverage, summarize, summarize_endpoint_coverage
 from reporting.findings import _finding_groups, _human_readable_findings, flatten_findings
 from reporting.html_report import _render_html
 from reporting.pdf_maker import html2pdf
@@ -56,6 +56,8 @@ def generate_report(
     all_findings = flatten_findings(results)
     findings, omitted_detail = _human_readable_findings(all_findings)
     coverage = build_coverage(results, context)
+    endpoint_coverage = build_endpoint_coverage(results, context)
+    endpoint_coverage_summary = summarize_endpoint_coverage(endpoint_coverage)
     summary = summarize(results, all_findings, coverage, context)
     summary["omitted_human_readable_detail"] = omitted_detail
 
@@ -66,6 +68,8 @@ def generate_report(
         "executive_summary": _executive_text(summary, findings),
         "summary": summary,
         "coverage": coverage,
+        "endpoint_coverage": endpoint_coverage,
+        "endpoint_coverage_summary": endpoint_coverage_summary,
         "security_findings_count": sum(item["category"] == "vulnerability" for item in findings),
         "candidate_findings_count": sum(item["category"] == "candidate" for item in findings),
         "observations_count": sum(item["category"] in {"discovery", "observation"} for item in findings),
@@ -102,20 +106,13 @@ def generate_report(
     pdf_source_path = html_path.with_name(f"{html_path.stem}.pdf-source.html")
     try:
         pdf_source_path.write_text(_render_html(payload, for_pdf=True), encoding="utf-8")
-        pdf_renderer = html2pdf(pdf_source_path, pdf_path)
+        html2pdf(pdf_source_path, pdf_path)
     except Exception as exc:
         result = failure("Report Generator", target_url, f"PDF report creation failed: {type(exc).__name__}: {exc}", diagnosis="pdf_generation_failed")
         result.update(
             json_filename=str(json_path.resolve()),
             review_snapshot_filename=str(review_snapshot_path.resolve()) if review_snapshot_path.is_file() else None,
             html_filename=str(html_path.resolve()), pdf_filename=None, findings_count=len(findings),
-            security_findings_count=payload["security_findings_count"],
-            candidate_findings_count=payload["candidate_findings_count"],
-            observations_count=payload["observations_count"],
-            execution_limitations_count=len(summary.get("limitations") or []),
-            coverage_constraints_count=len(summary.get("coverage_constraints") or []),
-            execution_complete=bool(summary.get("execution_complete")),
-            coverage_complete=bool(summary.get("coverage_complete")),
         )
         return result
     finally:
@@ -146,7 +143,6 @@ def generate_report(
         local_html_generated=True,
         local_json_generated=True,
         local_review_snapshot_generated=True,
-        pdf_renderer=pdf_renderer,
         findings_count=len(findings),
         security_findings_count=payload["security_findings_count"],
         candidate_findings_count=payload["candidate_findings_count"],

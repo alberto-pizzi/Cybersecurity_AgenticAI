@@ -19,6 +19,7 @@ import traceback
 import uuid
 import warnings
 from collections import Counter
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from html.parser import HTMLParser
@@ -74,30 +75,41 @@ MAX_CRAWL_PAGES = max(10, int(os.getenv('SECOPS_MAX_CRAWL_PAGES', '180')))
 MAX_SCRIPT_ASSETS = max(4, int(os.getenv('SECOPS_MAX_SCRIPT_ASSETS', '72')))
 SCANNER_PROGRESS_INTERVAL = max(10, int(os.getenv('SECOPS_PROGRESS_INTERVAL', '30')))
 DISCOVERY_LIMITS = {
-    'fast': {'crawl_pages': 35, 'browser_pages': 12, 'scripts': 12, 'route_variants': 2, 'per_origin_pages': 24},
-    'balanced': {'crawl_pages': 90, 'browser_pages': 45, 'scripts': 36, 'route_variants': 3, 'per_origin_pages': 60},
-    'deep': {'crawl_pages': 180, 'browser_pages': 90, 'scripts': 72, 'route_variants': 4, 'per_origin_pages': 120},
+    'fast': {'crawl_pages': 35, 'browser_pages': 16, 'scripts': 12, 'route_variants': 2, 'per_origin_pages': 24},
+    'balanced': {'crawl_pages': 90, 'browser_pages': 60, 'scripts': 36, 'route_variants': 3, 'per_origin_pages': 60},
+    'deep': {'crawl_pages': 180, 'browser_pages': 120, 'scripts': 72, 'route_variants': 4, 'per_origin_pages': 120},
 }
+FINAL_BROWSER_VERIFICATION_LIMITS = {'fast': 8, 'balanced': 40, 'deep': 120}
+FINAL_BROWSER_VERIFICATION_MAX_LIMITS = {'fast': 12, 'balanced': 64, 'deep': 180}
+JWT_TOKEN_LIMITS = {'fast': 16, 'balanced': 64, 'deep': 192}
 SCAN_MODES = {
     'fast': {
         'broad': {'zap': 120, 'nuclei': 150, 'nikto': 60, 'ffuf': 50, 'session': 25},
         'parameter': {'sqlmap': 75, 'dalfox': 45, 'commix': 50, 'traversal': 35, 'idor': 18, 'authorization': 30, 'browser': 45, 'workflow': 40},
-        'limits': {'sqlmap': 3, 'dalfox': 3, 'commix': 3, 'traversal': 3, 'idor': 1, 'authorization': 2, 'browser': 3, 'workflow': 3},
+        'limits': {'sqlmap': 3, 'dalfox': 3, 'commix': 3, 'traversal': 3, 'idor': 3, 'authorization': 4, 'browser': 3, 'workflow': 3},
         'arjun': 45, 'arjun_limit': 3,
     },
     'balanced': {
         'broad': {'zap': 540, 'nuclei': 660, 'nikto': 150, 'ffuf': 120, 'session': 50},
         'parameter': {'sqlmap': 180, 'dalfox': 120, 'commix': 120, 'traversal': 75, 'idor': 45, 'authorization': 70, 'browser': 120, 'workflow': 105},
-        'limits': {'sqlmap': 10, 'dalfox': 10, 'commix': 8, 'traversal': 10, 'idor': 4, 'authorization': 6, 'browser': 10, 'workflow': 10},
+        'limits': {'sqlmap': 10, 'dalfox': 10, 'commix': 8, 'traversal': 10, 'idor': 10, 'authorization': 12, 'browser': 10, 'workflow': 10},
         'arjun': 120, 'arjun_limit': 10,
     },
     'deep': {
         'broad': {'zap': 900, 'nuclei': 1200, 'nikto': 240, 'ffuf': 210, 'session': 90},
         'parameter': {'sqlmap': 300, 'dalfox': 210, 'commix': 180, 'traversal': 120, 'idor': 90, 'authorization': 120, 'browser': 210, 'workflow': 180},
-        'limits': {'sqlmap': 18, 'dalfox': 18, 'commix': 14, 'traversal': 18, 'idor': 8, 'authorization': 12, 'browser': 20, 'workflow': 20},
+        'limits': {'sqlmap': 18, 'dalfox': 18, 'commix': 14, 'traversal': 18, 'idor': 20, 'authorization': 24, 'browser': 20, 'workflow': 20},
         'arjun': 180, 'arjun_limit': 18,
     },
 }
+# Specialist budgets have a fixed base and a bounded adaptive overflow. The overflow is
+# available only to high-value deferred request contracts selected by deterministic ranking.
+ADAPTIVE_SPECIALIST_OVERFLOW = {
+    'fast': {'arjun': 1, 'sqlmap': 1, 'dalfox': 1, 'commix': 1, 'traversal': 1, 'idor': 1, 'authorization': 1, 'browser': 1, 'workflow': 1},
+    'balanced': {'arjun': 4, 'sqlmap': 4, 'dalfox': 4, 'commix': 3, 'traversal': 4, 'idor': 4, 'authorization': 4, 'browser': 4, 'workflow': 4},
+    'deep': {'arjun': 6, 'sqlmap': 6, 'dalfox': 6, 'commix': 5, 'traversal': 6, 'idor': 8, 'authorization': 8, 'browser': 6, 'workflow': 6},
+}
+ADAPTIVE_HIGH_VALUE_PATH_HINTS = ('/api/', '/admin/', 'management', 'search', 'query', 'upload', 'download', 'callback', 'webhook', 'config', 'settings', 'profile', 'account')
 AUTHORIZED_SCOPE_ORIGINS: set[str] = set()
 AUTHORIZED_SCOPE_HOST_SUFFIXES: set[str] = set()
 PRIMARY_SCOPE_TARGET = ''
@@ -181,18 +193,119 @@ def agentic_registry() -> dict[str, tuple[str, str, str, str]]:
 
     return {spec.name: (spec.server, spec.tool, TOOL_SCOPES[spec.name], TOOL_DESCRIPTIONS[spec.name]) for spec in ALL_TOOLS if spec.name in TOOL_SCOPES}
 
-# Per-tool limits define how many actions each scanner may receive in the active profile.
-def tool_action_limit(tool: str) -> int:
+# Returns the configured fixed specialist base for the active profile.
+def specialist_base_limit(tool: str) -> int:
 
     name = str(tool or '').lower()
     if name == 'arjun':
         return ARJUN_ENDPOINT_LIMIT
+    if name in PARAMETER_TOOL_CASE_LIMITS:
+        return int(PARAMETER_TOOL_CASE_LIMITS[name])
+    return 0
+
+# Returns the maximum specialist action count after bounded adaptive overflow.
+def adaptive_tool_max_limit(tool: str) -> int:
+
+    name = str(tool or '').lower()
+    base = specialist_base_limit(name)
+    return base + int(ADAPTIVE_SPECIALIST_OVERFLOW.get(CURRENT_SCAN_MODE, {}).get(name, 0)) if base else 0
+
+# Final XSS verification has an independent base and adaptive ceiling for every active profile.
+def final_browser_verification_limit() -> int:
+    return int(FINAL_BROWSER_VERIFICATION_LIMITS.get(CURRENT_SCAN_MODE, 40))
+
+def final_browser_verification_max_limit() -> int:
+    base = final_browser_verification_limit()
+    return max(base, int(FINAL_BROWSER_VERIFICATION_MAX_LIMITS.get(CURRENT_SCAN_MODE, base)))
+
+# JWT analysis is local/cheap and therefore keeps a generous independent unique-token allowance per profile.
+def jwt_token_limit() -> int:
+    return int(JWT_TOKEN_LIMITS.get(CURRENT_SCAN_MODE, 64))
+
+
+# Scores an unresolved XSS candidate for the deterministic final Chromium pass.
+def final_xss_verification_priority(finding: dict[str, Any], case: dict[str, Any], context_score: int=0) -> int:
+    score = max(0, int(context_score))
+    parameter = str(finding.get('parameter') or '').strip().lower()
+    parameters = _case_field_names(case)
+    if parameter:
+        score += 30
+    if parameter and parameter in parameters:
+        score += 18
+    if parameters & XSS_HINTS:
+        score += 18
+    if case.get('discovery_source') == 'playwright_network':
+        score += 18
+    if case.get('client_sources') or case.get('client_sinks') or case.get('client_side_evidence'):
+        score += 24
+    response = case.get('browser_response') if isinstance(case.get('browser_response'), dict) else {}
+    if response.get('observed') is True:
+        try:
+            status = int(response.get('status') or 0)
+        except (TypeError, ValueError):
+            status = 0
+        if 200 <= status < 400:
+            score += 15
+    if str(case.get('method') or 'GET').upper() == 'POST':
+        score += 8
+    confidence = str(finding.get('confidence') or '').lower()
+    if confidence == 'high':
+        score += 16
+    elif confidence == 'medium':
+        score += 8
+    if finding.get('evidence') or finding.get('payload'):
+        score += 8
+    return max(1, score)
+
+# Extends the final Chromium XSS-verification base only when deferred candidates remain close to
+# the deterministic priority cutoff. Every candidate is already an unresolved XSS finding with a
+# compatible request contract, so the score threshold is the additional overflow gate.
+def select_adaptive_final_xss_candidates(ranked: list[tuple[int, dict[str, Any]]]) -> list[dict[str, Any]]:
+    base = max(1, final_browser_verification_limit())
+    maximum = max(base, final_browser_verification_max_limit())
+    ordered = sorted(ranked, key=lambda item: -int(item[0]))
+    selected = [{**case, 'final_xss_priority_score': int(score)} for score, case in ordered[:base]]
+    if len(ordered) <= base or len(selected) < base or maximum <= base:
+        return selected
+    cutoff = int(ordered[base - 1][0])
+    threshold = max(1, (cutoff * 3 + 3) // 4)
+    for score, case in ordered[base:]:
+        if len(selected) >= maximum:
+            break
+        if int(score) < threshold:
+            continue
+        selected.append({
+            **case,
+            'final_xss_priority_score': int(score),
+            'adaptive_final_xss_budget': True,
+            'adaptive_final_xss_base': base,
+            'adaptive_final_xss_max': maximum,
+            'adaptive_final_xss_threshold': threshold,
+        })
+    return selected
+
+# Summarizes how much adaptive specialist overflow was actually used by one selection.
+def specialist_budget_diagnostics(tool: str, cases: list[dict[str, Any]]) -> dict[str, int]:
+
+    base = specialist_base_limit(tool)
+    maximum = adaptive_tool_max_limit(tool) or base
+    adaptive_used = sum(1 for case in cases if isinstance(case, dict) and case.get('adaptive_budget'))
+    return {'base': base, 'adaptive_max': maximum, 'selected': len(cases), 'adaptive_used': adaptive_used}
+
+# Per-tool limits define how many actions each scanner may receive in the active profile.
+def tool_action_limit(tool: str, include_adaptive: bool=False) -> int:
+
+    name = str(tool or '').lower()
+    if name == 'arjun':
+        return adaptive_tool_max_limit(name) if include_adaptive else ARJUN_ENDPOINT_LIMIT
     if name == 'interactsh':
         return 3 if CURRENT_SCAN_MODE == 'deep' else 2 if CURRENT_SCAN_MODE == 'balanced' else 1
+    if name == 'jwt':
+        return jwt_token_limit()
     if name in {'zap', 'nuclei', 'nikto'}:
         return 13 if CURRENT_SCAN_MODE == 'deep' else 7 if CURRENT_SCAN_MODE == 'balanced' else 3
     if name in PARAMETER_TOOL_CASE_LIMITS:
-        return PARAMETER_TOOL_CASE_LIMITS[name]
+        return adaptive_tool_max_limit(name) if include_adaptive else PARAMETER_TOOL_CASE_LIMITS[name]
     return 1
 
 # Broad scanners follow a stable order chosen to preserve session health and discovery quality.
@@ -1256,16 +1369,36 @@ def discover_target(target: str, cookies: str, max_pages: int=MAX_CRAWL_PAGES, s
     initial = [_clean_url(target), *[_clean_url(value) for value in seeds or []]]
     destructive_skipped: set[str] = set()
     destructive_request_cases: list[dict[str, Any]] = []
+    coverage_skipped_cases: list[dict[str, Any]] = []
     queue: list[str] = []
     queued: set[str] = set()
     queued_signatures: Counter[tuple[str, str, tuple[str, ...]]] = Counter()
     visited_signatures: Counter[tuple[str, str, tuple[str, ...]]] = Counter()
-    origin_visits: Counter[str] = Counter()
+    origin_useful_visits: Counter[str] = Counter()
+    origin_attempts: Counter[str] = Counter()
     skipped_route_variants = 0
     skipped_origin_budget = 0
     skipped_out_of_scope = 0
+    http_attempts = 0
+    dead_http_responses = 0
+    attempt_budget = max(page_budget, (page_budget * 3 + 1) // 2)
+    per_origin_attempt_limit = max(per_origin_limit, (per_origin_limit * 3 + 1) // 2)
 
-    def enqueue(raw_url: str, *, force: bool=False) -> None:
+    def record_coverage_skip(raw_url: str, reason_code: str, reason: str, *, method: str='GET', source_url: str='') -> None:
+        value = str(raw_url or '').strip()
+        if not value:
+            return
+        row = {
+            'url': value,
+            'method': str(method or 'GET').upper(),
+            'reason_code': str(reason_code or '').upper(),
+            'reason': str(reason or ''),
+            'source_url': str(source_url or ''),
+        }
+        if row not in coverage_skipped_cases:
+            coverage_skipped_cases.append(row)
+
+    def enqueue(raw_url: str, *, force: bool=False, source_url: str='') -> None:
         nonlocal skipped_route_variants, skipped_origin_budget, skipped_out_of_scope
         try:
             value = _normalize_redundant_base_path_link(target, _clean_url(raw_url))
@@ -1275,19 +1408,23 @@ def discover_target(target: str, cookies: str, max_pages: int=MAX_CRAWL_PAGES, s
             return
         if not url_in_authorized_scope(target, value):
             skipped_out_of_scope += 1
+            record_coverage_skip(value, 'OUT_OF_SCOPE', 'Discovered URL was outside the explicitly authorized HTTP scope.', source_url=source_url)
             return
         if not _crawlable_url(value):
             return
         if _destructive_crawl_url(value):
             destructive_skipped.add(value)
+            record_coverage_skip(value, 'STATE_CHANGE_BLOCKED', 'Destructive or state-changing route was excluded by the discovery safety policy.', source_url=source_url)
             return
         signature = _discovery_route_signature(value)
         origin = normalized_origin(value)
         if not force and queued_signatures[signature] >= route_variant_limit:
             skipped_route_variants += 1
+            record_coverage_skip(value, 'DUPLICATE_ROUTE_VARIANT', 'Additional value variant of the same route and parameter-name shape was omitted by the anti-saturation limit.', source_url=source_url)
             return
-        if origin_visits[origin] >= per_origin_limit:
+        if origin_useful_visits[origin] >= per_origin_limit:
             skipped_origin_budget += 1
+            record_coverage_skip(value, 'BUDGET_LIMIT', 'Per-origin useful-page discovery budget was already saturated.', source_url=source_url)
             return
         queued.add(value)
         queued_signatures[signature] += 1
@@ -1311,7 +1448,7 @@ def discover_target(target: str, cookies: str, max_pages: int=MAX_CRAWL_PAGES, s
     initial_login_detected = False
     pages_processed = 0
 
-    while queue and pages_processed < page_budget:
+    while queue and pages_processed < page_budget and http_attempts < attempt_budget:
         requested = queue.pop(0)
         if requested in visited:
             continue
@@ -1319,17 +1456,20 @@ def discover_target(target: str, cookies: str, max_pages: int=MAX_CRAWL_PAGES, s
         origin = normalized_origin(requested)
         if visited_signatures[signature] >= route_variant_limit:
             skipped_route_variants += 1
+            record_coverage_skip(requested, 'DUPLICATE_ROUTE_VARIANT', 'Additional value variant of the same route and parameter-name shape was omitted by the anti-saturation limit.')
             continue
-        if origin_visits[origin] >= per_origin_limit:
+        if origin_useful_visits[origin] >= per_origin_limit or origin_attempts[origin] >= per_origin_attempt_limit:
             skipped_origin_budget += 1
+            record_coverage_skip(requested, 'BUDGET_LIMIT', 'Per-origin discovery page/attempt budget was already saturated.')
             continue
         if _destructive_crawl_url(requested):
             destructive_skipped.add(requested)
+            record_coverage_skip(requested, 'STATE_CHANGE_BLOCKED', 'Destructive or state-changing route was excluded by the discovery safety policy.')
             continue
         visited.add(requested)
         visited_signatures[signature] += 1
-        origin_visits[origin] += 1
-        pages_processed += 1
+        origin_attempts[origin] += 1
+        http_attempts += 1
         try:
             response, final, redirect_issue = _safe_crawl_get(session, requested, target, timeout=(5, 15), max_redirects=5, cookies=cookies)
         except requests.RequestException as exc:
@@ -1342,15 +1482,32 @@ def discover_target(target: str, cookies: str, max_pages: int=MAX_CRAWL_PAGES, s
         if redirect_issue:
             errors.append({'url': requested, 'type': 'SafeRedirectGuard', 'message': redirect_issue})
             if redirect_issue.startswith(('destructive_', 'out_of_scope_')):
+                code = 'STATE_CHANGE_BLOCKED' if redirect_issue.startswith('destructive_') else 'OUT_OF_SCOPE'
+                record_coverage_skip(requested, code, 'Redirect target was blocked by the discovery safety/scope guard.')
                 continue
         if not url_in_authorized_scope(target, final):
             errors.append({'url': requested, 'type': 'OutOfScopeRedirect', 'message': final})
+            record_coverage_skip(final, 'OUT_OF_SCOPE', 'Redirected URL was outside the explicitly authorized HTTP scope.', source_url=requested)
             continue
         visited.add(final)
         if requested == _clean_url(target) and _looks_like_login(response):
             initial_login_detected = True
         if response.status_code >= 400:
             errors.append({'url': final, 'type': f'HTTP{response.status_code}', 'message': response.reason or 'HTTP error'})
+        # A dead 404/410 remains recorded as surface evidence, but it must not consume
+        # the useful HTML-page quota or become a Chromium/ZAP HTML seed. A separate
+        # bounded attempt budget prevents a broken-link-heavy application from causing
+        # unbounded extra requests while useful pages are still being sought.
+        if response.status_code in {404, 410}:
+            dead_http_responses += 1
+            continue
+        final_origin = normalized_origin(final)
+        if origin_useful_visits[final_origin] >= per_origin_limit:
+            skipped_origin_budget += 1
+            record_coverage_skip(final, 'BUDGET_LIMIT', 'Per-origin useful-page discovery budget was already saturated.', source_url=requested)
+            continue
+        pages_processed += 1
+        origin_useful_visits[final_origin] += 1
         content_type = response.headers.get('content-type', '').lower()
         if 'html' not in content_type and (not response.text.lstrip().startswith(('<', '<!'))):
             continue
@@ -1413,11 +1570,13 @@ def discover_target(target: str, cookies: str, max_pages: int=MAX_CRAWL_PAGES, s
                 continue
             if not url_in_authorized_scope(target, candidate):
                 skipped_out_of_scope += 1
+                record_coverage_skip(candidate, 'OUT_OF_SCOPE', 'Link discovered in HTML was outside the explicitly authorized HTTP scope.', source_url=final)
                 continue
             if not _crawlable_url(candidate):
                 continue
             if _destructive_crawl_url(candidate):
                 destructive_skipped.add(candidate)
+                record_coverage_skip(candidate, 'STATE_CHANGE_BLOCKED', 'Destructive or state-changing link was excluded by the discovery safety policy.', source_url=final)
                 destructive_request_cases.append({
                     'url': candidate, 'method': 'GET', 'data': '',
                     'parameters': [name for name, _ in parse_qsl(urlparse(candidate).query, keep_blank_values=True)],
@@ -1427,7 +1586,7 @@ def discover_target(target: str, cookies: str, max_pages: int=MAX_CRAWL_PAGES, s
             if urlparse(candidate).query:
                 parameterized.add(candidate)
             if candidate not in visited:
-                enqueue(candidate)
+                enqueue(candidate, source_url=final)
 
         for form in parser.forms:
             try:
@@ -1436,9 +1595,11 @@ def discover_target(target: str, cookies: str, max_pages: int=MAX_CRAWL_PAGES, s
                 continue
             if not url_in_authorized_scope(target, action):
                 skipped_out_of_scope += 1
+                record_coverage_skip(action, 'OUT_OF_SCOPE', 'Form action discovered in HTML was outside the explicitly authorized HTTP scope.', method=str(form.get('method', 'get')), source_url=final)
                 continue
             if _destructive_crawl_url(action):
                 destructive_skipped.add(action)
+                record_coverage_skip(action, 'STATE_CHANGE_BLOCKED', 'Destructive or state-changing form action was excluded by the discovery safety policy.', method=str(form.get('method', 'get')), source_url=final)
                 fields = [field for field in form.get('fields', []) if isinstance(field, dict)]
                 destructive_case = _form_case(action, str(form.get('method', 'get')), fields, final, str(form.get('enctype', '')))
                 if destructive_case:
@@ -1503,20 +1664,66 @@ def discover_target(target: str, cookies: str, max_pages: int=MAX_CRAWL_PAGES, s
         'mode': CURRENT_SCAN_MODE,
         'http_page_budget': page_budget,
         'http_pages_processed': pages_processed,
+        'http_attempt_budget': attempt_budget,
+        'http_requests_attempted': http_attempts,
+        'dead_http_404_410': dead_http_responses,
         'browser_page_budget': int(limits['browser_pages']),
         'script_budget': script_budget,
         'scripts_processed': len(scanned_script_urls),
         'route_variant_limit': route_variant_limit,
         'per_origin_page_limit': per_origin_limit,
+        'per_origin_attempt_limit': per_origin_attempt_limit,
         'route_variants_skipped': skipped_route_variants,
         'origin_budget_skipped': skipped_origin_budget,
         'out_of_scope_urls_skipped': skipped_out_of_scope,
         'authorized_origins': sorted(AUTHORIZED_SCOPE_ORIGINS),
         'authorized_host_suffixes': sorted(AUTHORIZED_SCOPE_HOST_SUFFIXES),
     }
-    return {'urls': sorted(visited), 'html_urls': sorted(html_urls), 'form_urls': sorted(form_urls), 'parameterized_urls': sorted(parameterized), 'request_cases': _dedupe_request_cases(request_cases), 'script_urls': sorted(script_urls), 'script_endpoint_hints': script_endpoint_hints, 'browser_network_requests': browser_network_requests, 'browser_navigation_urls': browser_navigation_urls, 'client_side_candidates': client_side_candidates, 'jwt_tokens': sorted(tokens), 'errors': errors, 'authentication_effective': auth_effective, 'authentication_note': auth_note, 'authentication_probe': auth_probe, 'target_preparation': target_preparation, 'destructive_urls_skipped': sorted(destructive_skipped), 'destructive_request_cases': _dedupe_request_cases(destructive_request_cases), 'budget_diagnostics': budget_diagnostics}
+    return {'urls': sorted(visited), 'html_urls': sorted(html_urls), 'form_urls': sorted(form_urls), 'parameterized_urls': sorted(parameterized), 'request_cases': _dedupe_request_cases(request_cases), 'script_urls': sorted(script_urls), 'script_endpoint_hints': script_endpoint_hints, 'browser_network_requests': browser_network_requests, 'browser_navigation_urls': browser_navigation_urls, 'client_side_candidates': client_side_candidates, 'jwt_tokens': sorted(tokens), 'errors': errors, 'authentication_effective': auth_effective, 'authentication_note': auth_note, 'authentication_probe': auth_probe, 'target_preparation': target_preparation, 'destructive_urls_skipped': sorted(destructive_skipped), 'destructive_request_cases': _dedupe_request_cases(destructive_request_cases), 'coverage_skipped_cases': coverage_skipped_cases, 'budget_diagnostics': budget_diagnostics}
+
+# Orders discovery diagnostics so browser/runtime failures are visible before ordinary dead-link HTTP errors.
+def prioritized_discovery_errors(errors: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    def priority(row: dict[str, Any]) -> tuple[int, str, str]:
+        kind = str(row.get('type') or '')
+        if kind.startswith('BrowserDiscovery'):
+            rank = 0
+        elif kind in {'UnsafeURLBlocked', 'SafeRedirectGuard', 'OutOfScopeRedirect'}:
+            rank = 1
+        elif kind in {'HTTP401', 'HTTP403'}:
+            rank = 2
+        elif kind in {'HTTP404', 'HTTP410'}:
+            rank = 4
+        else:
+            rank = 3
+        return (rank, kind, str(row.get('url') or ''))
+    return sorted((row for row in errors if isinstance(row, dict)), key=priority)
+
+# Returns the Chromium discovery diagnostic when HTML existed but no dynamic navigation completed.
+def chromium_discovery_warning(discovery: dict[str, Any]) -> str:
+    if not discovery.get('html_urls') or discovery.get('browser_navigation_urls'):
+        return ''
+    browser_errors = [
+        row for row in discovery.get('errors', [])
+        if isinstance(row, dict) and str(row.get('type') or '').startswith('BrowserDiscovery')
+    ]
+    if browser_errors:
+        first = prioritized_discovery_errors(browser_errors)[0]
+        return f"Chromium dynamic discovery completed 0 navigations; first browser error: {first.get('type')}: {first.get('message')}"
+    return 'Chromium dynamic discovery completed 0 navigations even though HTML pages were available; review browser runtime/navigation diagnostics.'
 
 # Returns additional explicitly authorized origins that were actually observed during discovery.
+
+# Runs synchronous discovery safely even if a caller is already inside an asyncio event loop.
+# The normal CLI paths are synchronous here, but the worker fallback prevents Playwright Sync API
+# failures when this function is reused from async LangGraph/test harnesses.
+def discover_target_sync_safe(target: str, cookies: str, max_pages: int=MAX_CRAWL_PAGES, seeds: list[str] | None=None) -> dict[str, Any]:
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return discover_target(target, cookies, max_pages=max_pages, seeds=seeds)
+    with ThreadPoolExecutor(max_workers=1, thread_name_prefix='secops-discovery') as executor:
+        return executor.submit(discover_target, target, cookies, max_pages, seeds).result()
+
 def discovered_scope_origins(discovery: dict[str, Any], target: str, limit: int | None=None) -> list[str]:
     primary = normalized_origin(target)
     candidates: dict[str, int] = {}
@@ -1544,7 +1751,7 @@ def discovery_for_origin(discovery: dict[str, Any], origin: str) -> dict[str, An
     filtered: dict[str, Any] = {}
     for key in ('urls', 'html_urls', 'form_urls', 'parameterized_urls', 'script_urls', 'browser_navigation_urls'):
         filtered[key] = [value for value in discovery.get(key, []) if isinstance(value, str) and same_origin(origin, value)]
-    for key in ('request_cases', 'browser_network_requests', 'script_endpoint_hints', 'client_side_candidates', 'destructive_request_cases'):
+    for key in ('request_cases', 'browser_network_requests', 'script_endpoint_hints', 'client_side_candidates', 'destructive_request_cases', 'coverage_skipped_cases'):
         rows = []
         for row in discovery.get(key, []):
             if not isinstance(row, dict):
@@ -1570,6 +1777,17 @@ def merge_discovery(left: dict[str, Any], right: dict[str, Any]) -> dict[str, An
     for key in ('urls', 'html_urls', 'form_urls', 'parameterized_urls', 'script_urls', 'browser_navigation_urls', 'jwt_tokens'):
         merged[key] = sorted(set(left.get(key, [])) | set(right.get(key, [])))
     merged['request_cases'] = _dedupe_request_cases([*left.get('request_cases', []), *right.get('request_cases', [])])
+    coverage_skips: list[dict[str, Any]] = []
+    seen_coverage_skips: set[tuple[str, str, str]] = set()
+    for row in [*left.get('coverage_skipped_cases', []), *right.get('coverage_skipped_cases', [])]:
+        if not isinstance(row, dict):
+            continue
+        key = (str(row.get('method') or 'GET').upper(), str(row.get('url') or ''), str(row.get('reason_code') or ''))
+        if not key[1] or key in seen_coverage_skips:
+            continue
+        seen_coverage_skips.add(key)
+        coverage_skips.append(dict(row))
+    merged['coverage_skipped_cases'] = coverage_skips
     for key, identity in (('script_endpoint_hints', lambda row: (str(row.get('method') or ''), str(row.get('url') or ''))), ('browser_network_requests', lambda row: (str(row.get('method') or ''), str(row.get('url') or ''), str(row.get('resource_type') or '')))):
         rows: list[dict[str, Any]] = []
         seen_rows: set[tuple[Any, ...]] = set()
@@ -1844,7 +2062,7 @@ def _tool_case_skip_reason(tool: str, case: dict[str, Any], authenticated_profil
 # Chooses the best request cases for one scanner and scan profile.
 def select_tool_request_cases(discovery: dict[str, Any], tool: str, limit: int | None=None, authenticated_profile: bool=False) -> list[dict[str, Any]]:
 
-    effective_limit = limit or PARAMETER_TOOL_CASE_LIMITS.get(tool, MAX_PARAMETER_ENDPOINTS)
+    effective_limit = int(limit or PARAMETER_TOOL_CASE_LIMITS.get(tool, MAX_PARAMETER_ENDPOINTS))
     cases = [case for case in discovery.get('request_cases', []) if isinstance(case, dict)]
     known = {str(case.get('url') or '') for case in cases}
     for value in discovery.get('parameterized_urls', []):
@@ -1862,20 +2080,24 @@ def select_tool_request_cases(discovery: dict[str, Any], tool: str, limit: int |
         score = _tool_case_priority(tool, case, authenticated_profile=authenticated_profile)
         if score > 0:
             ranked.append((score, -index, case))
-    selected: list[dict[str, Any]] = []
+    unique_ranked: list[tuple[int, dict[str, Any]]] = []
     seen: set[tuple[str, str, tuple[str, ...]]] = set()
-    for _, _, case in sorted(ranked, key=lambda item: (-item[0], -item[1])):
-        key = (str(case.get('method', 'GET')).upper(), str(case.get('url', '')), tuple(sorted((str(value) for value in case.get('parameters', [])))))
-        if key in seen:
+    shape_counts: dict[tuple[str, tuple[str, str, tuple[str, ...]], tuple[str, ...]], int] = {}
+    variant_cap = max(1, int(DISCOVERY_LIMITS.get(CURRENT_SCAN_MODE, {}).get('route_variants', 2)))
+    for score, _, case in sorted(ranked, key=lambda item: (-item[0], -item[1])):
+        method = str(case.get('method', 'GET')).upper()
+        url = str(case.get('url', ''))
+        params = tuple(sorted((str(value).lower() for value in case.get('parameters', []) if str(value))))
+        key = (method, url, params)
+        shape = (method, _discovery_route_signature(url), params)
+        if key in seen or shape_counts.get(shape, 0) >= variant_cap:
             continue
         seen.add(key)
-        selected.append(case)
-        if len(selected) >= effective_limit:
-            break
+        shape_counts[shape] = shape_counts.get(shape, 0) + 1
+        unique_ranked.append((int(score), case))
 
-
-    if CURRENT_SCAN_MODE == 'deep' and tool in {'sqlmap', 'dalfox'} and len(selected) < effective_limit:
-        extra_budget = min(2, effective_limit - len(selected))
+    if CURRENT_SCAN_MODE == 'deep' and tool in {'sqlmap', 'dalfox'} and len(unique_ranked) < effective_limit:
+        extra_budget = min(2, effective_limit - len(unique_ranked))
         extras: list[tuple[int, int, dict[str, Any]]] = []
         for index, case in enumerate(cases):
             if not isinstance(case, dict):
@@ -1892,16 +2114,26 @@ def select_tool_request_cases(discovery: dict[str, Any], tool: str, limit: int |
                 continue
             if tool == 'dalfox' and _prefer_browser_for_xss_case(case):
                 continue
-            key = (method, url, tuple(sorted(params)))
-            if key in seen:
+            param_key = tuple(sorted(value.lower() for value in params))
+            key = (method, url, param_key)
+            shape = (method, _discovery_route_signature(url), param_key)
+            if key in seen or shape_counts.get(shape, 0) >= variant_cap:
                 continue
             generic_score = _risk_terms(path + ' ' + ' '.join(params)) + min(18, len(params) * 4)
             extras.append((generic_score, -index, {**case, 'deep_breadth': True, 'selection_reason': f'deep-generic-{tool}-coverage'}))
-        for _, _, case in sorted(extras, key=lambda item: (-item[0], -item[1]))[:extra_budget]:
-            key = (str(case.get('method', 'GET')).upper(), str(case.get('url', '')), tuple(sorted((str(value) for value in case.get('parameters', [])))))
+        for score, _, case in sorted(extras, key=lambda item: (-item[0], -item[1]))[:extra_budget]:
+            method = str(case.get('method', 'GET')).upper()
+            url = str(case.get('url', ''))
+            param_key = tuple(sorted((str(value).lower() for value in case.get('parameters', []) if str(value))))
+            key = (method, url, param_key)
+            shape = (method, _discovery_route_signature(url), param_key)
+            if shape_counts.get(shape, 0) >= variant_cap:
+                continue
             seen.add(key)
-            selected.append(case)
-    return selected
+            shape_counts[shape] = shape_counts.get(shape, 0) + 1
+            unique_ranked.append((int(score), case))
+    return _select_with_adaptive_specialist_budget(tool, unique_ranked, effective_limit)
+
 BROWSER_STATIC_SUFFIXES = {'.css', '.js', '.mjs', '.map', '.png', '.jpg', '.jpeg', '.gif', '.webp', '.svg', '.ico', '.woff', '.woff2', '.ttf', '.otf', '.eot', '.mp3', '.wav', '.mp4', '.webm', '.pdf', '.zip'}
 
 # Browser XSS checks target rendered application pages, not standalone static assets.
@@ -1910,6 +2142,121 @@ def _browser_static_resource(url: str) -> bool:
 
 WORKFLOW_STATE_HINTS = {'change', 'update', 'save', 'create', 'submit', 'send', 'comment', 'message', 'feedback', 'upload', 'password', 'email', 'profile', 'settings', 'transfer', 'captcha', 'admin'}
 WORKFLOW_DESTRUCTIVE_HINTS = {'logout', 'signout', 'logoff', 'setup', 'install', 'delete', 'remove', 'drop', 'truncate', 'purge', 'wipe', 'reset'}
+
+# Returns evidence labels that justify spending adaptive overflow on a deferred specialist case.
+def _adaptive_specialist_evidence(tool: str, case: dict[str, Any]) -> list[str]:
+
+    name = str(tool or '').lower()
+    url = str(case.get('url') or '')
+    path = urlparse(url).path.lower()
+    method = str(case.get('method') or 'GET').upper()
+    parameters = _case_parameters(case)
+    content_type = str(case.get('content_type') or case.get('enctype') or '').lower()
+    class_reasons: list[str] = []
+    generic_reasons: list[str] = []
+    if method == 'POST':
+        generic_reasons.append('POST request contract')
+    if 'json' in content_type:
+        generic_reasons.append('JSON request body')
+    if case.get('discovery_source') == 'playwright_network':
+        generic_reasons.append('observed XHR/fetch request')
+    response = case.get('browser_response') if isinstance(case.get('browser_response'), dict) else {}
+    if response.get('observed') is True:
+        try:
+            status = int(response.get('status') or 0)
+        except (TypeError, ValueError):
+            status = 0
+        if 200 <= status < 400:
+            generic_reasons.append('observed live 2xx/3xx response')
+    if any(hint in path for hint in ADAPTIVE_HIGH_VALUE_PATH_HINTS):
+        generic_reasons.append('high-value application/API route')
+    if name == 'sqlmap':
+        if parameters & SQL_HINTS:
+            class_reasons.append('SQL-relevant parameter')
+        if any(token in path for token in ('sql', 'query', 'database', 'search')):
+            class_reasons.append('SQL/data-oriented route')
+    elif name == 'dalfox':
+        if parameters & XSS_HINTS:
+            class_reasons.append('XSS-relevant parameter')
+        if any(token in path for token in ('xss', 'comment', 'message', 'search', 'feedback')):
+            class_reasons.append('XSS-oriented route')
+    elif name == 'commix':
+        if parameters & COMMAND_HINTS:
+            class_reasons.append('command-execution parameter')
+        if any(token in path for token in ('/exec', 'command', '/cmd')):
+            class_reasons.append('command-execution route')
+    elif name == 'traversal':
+        if parameters & TRAVERSAL_HINTS:
+            class_reasons.append('file/path parameter')
+        if any(token in path for token in ('include', 'download', 'file', 'template', 'document', 'view')):
+            class_reasons.append('file/path-oriented route')
+    elif name == 'idor':
+        numeric_pairs = [(key.lower(), value) for key, value in parse_qsl(urlparse(url).query, keep_blank_values=True) if value.isdigit()]
+        if any(key in IDOR_HINTS for key, _ in numeric_pairs):
+            class_reasons.append('numeric object-reference parameter')
+        if any(token in path for token in ('idor', 'object', 'profile', 'account', 'user', 'dashboard', 'widget', 'device')):
+            class_reasons.append('object/resource-oriented route')
+    elif name == 'authorization':
+        auth_names = parameters & AUTHORIZATION_PARAMETER_HINTS
+        path_tokens = {token for token in re.split('[^a-z0-9_-]+', path) if token}
+        if auth_names:
+            class_reasons.append('authorization/object identifier parameter')
+        if path_tokens & AUTHORIZATION_PATH_HINTS:
+            class_reasons.append('identity/privileged-resource route')
+    elif name == 'browser':
+        if parameters & XSS_HINTS:
+            class_reasons.append('XSS-relevant parameter')
+        if case.get('client_sources') or case.get('client_sinks') or case.get('client_side_evidence'):
+            class_reasons.append('client-side source/sink evidence')
+    elif name == 'workflow':
+        names = _case_field_names(case)
+        if case.get('file_parameters') or 'multipart/form-data' in content_type:
+            class_reasons.append('upload-capable form')
+        if case.get('token_parameters'):
+            class_reasons.append('anti-CSRF/token field')
+        if any('captcha' in value for value in names) or 'captcha' in path:
+            class_reasons.append('CAPTCHA workflow')
+        if _is_login_case(case):
+            class_reasons.append('authentication workflow')
+        if names & WORKFLOW_STATE_HINTS or any(token in path for token in WORKFLOW_STATE_HINTS):
+            class_reasons.append('state-changing workflow field')
+    elif name == 'arjun':
+        if parameters:
+            class_reasons.append('existing application parameters')
+        if case.get('fields'):
+            class_reasons.append('discovered form fields')
+        if any(hint in path for hint in ADAPTIVE_HIGH_VALUE_PATH_HINTS):
+            class_reasons.append('API/form candidate route')
+    return [*class_reasons, *generic_reasons] if class_reasons else []
+
+# Extends a saturated specialist base only for deferred high-value cases near the base cutoff.
+def _select_with_adaptive_specialist_budget(tool: str, ranked: list[tuple[int, dict[str, Any]]], base_limit: int) -> list[dict[str, Any]]:
+
+    requested = max(1, int(base_limit))
+    configured_base = specialist_base_limit(tool)
+    selected = [{**case, 'priority_score': int(score)} for score, case in ranked[:requested]]
+    extra_capacity = int(ADAPTIVE_SPECIALIST_OVERFLOW.get(CURRENT_SCAN_MODE, {}).get(str(tool or '').lower(), 0))
+    if requested != configured_base or extra_capacity <= 0 or len(ranked) <= requested or len(selected) < requested:
+        return selected
+    cutoff_score = int(ranked[requested - 1][0])
+    threshold = max(1, (cutoff_score * 3 + 3) // 4)
+    for score, case in ranked[requested:]:
+        if len(selected) >= requested + extra_capacity:
+            break
+        evidence = _adaptive_specialist_evidence(tool, case)
+        if int(score) < threshold or not evidence:
+            continue
+        selected.append({
+            **case,
+            'priority_score': int(score),
+            'adaptive_budget': True,
+            'adaptive_budget_base': requested,
+            'adaptive_budget_max': requested + extra_capacity,
+            'adaptive_budget_threshold': threshold,
+            'adaptive_budget_evidence': evidence,
+            'selection_reason': 'adaptive-high-value-overflow',
+        })
+    return selected
 
 # Collects field names from the query string and request body.
 def _case_field_names(case: dict[str, Any]) -> set[str]:
@@ -1971,7 +2318,7 @@ def _browser_case_priority(case: dict[str, Any], client_keys: set[tuple[str, str
 # Chooses pages and requests that are useful for browser checks.
 def select_browser_request_cases(discovery: dict[str, Any], limit: int | None=None) -> list[dict[str, Any]]:
 
-    effective_limit = limit or PARAMETER_TOOL_CASE_LIMITS.get('browser', 2)
+    effective_limit = int(limit or PARAMETER_TOOL_CASE_LIMITS.get('browser', 2))
     raw_client = [dict(item) for item in discovery.get('client_side_candidates', []) if isinstance(item, dict) and str(item.get('url') or '')]
     client_by_key: dict[tuple[str, str, int, str], list[dict[str, Any]]] = {}
     for item in raw_client:
@@ -1994,19 +2341,24 @@ def select_browser_request_cases(discovery: dict[str, Any], limit: int | None=No
         url = str(evidence[0].get('url') or '')
         cases.append({'url': url, 'method': 'GET', 'data': '', 'parameters': [name for name, _ in parse_qsl(urlparse(url).query, keep_blank_values=True)], 'fields': [], 'source_url': url, 'client_side_only': True, 'client_sources': sorted({str(value) for item in evidence for value in item.get('sources', []) if str(value)}), 'client_sinks': sorted({str(value) for item in evidence for value in item.get('sinks', []) if str(value)}), 'client_side_evidence': evidence})
     ranked = sorted(((_browser_case_priority(case, client_keys), -index, case) for index, case in enumerate(cases)), key=lambda item: (-item[0], -item[1]))
-    selected: list[dict[str, Any]] = []
-    seen: set[tuple[str, tuple[str, str, int, str], tuple[str, ...]]] = set()
+    unique_ranked: list[tuple[int, dict[str, Any]]] = []
+    seen: set[tuple[str, str, tuple[str, ...]]] = set()
+    shape_counts: dict[tuple[str, tuple[str, str, int, str], tuple[str, ...]], int] = {}
+    variant_cap = max(1, int(DISCOVERY_LIMITS.get(CURRENT_SCAN_MODE, {}).get('route_variants', 2)))
     for score, _, case in ranked:
         if score <= 0:
             continue
-        key = (str(case.get('method', 'GET')).upper(), _browser_url_key(str(case.get('url', ''))), tuple(sorted((str(value) for value in case.get('parameters', [])))))
-        if key in seen:
+        method = str(case.get('method', 'GET')).upper()
+        url = str(case.get('url', ''))
+        params = tuple(sorted((str(value).lower() for value in case.get('parameters', []) if str(value))))
+        key = (method, url, params)
+        shape = (method, _browser_url_key(url), params)
+        if key in seen or shape_counts.get(shape, 0) >= variant_cap:
             continue
         seen.add(key)
-        selected.append(case)
-        if len(selected) >= effective_limit:
-            break
-    if CURRENT_SCAN_MODE == 'deep' and len(selected) < effective_limit:
+        shape_counts[shape] = shape_counts.get(shape, 0) + 1
+        unique_ranked.append((int(score), case))
+    if CURRENT_SCAN_MODE == 'deep' and len(unique_ranked) < effective_limit:
         extras: list[tuple[int, dict[str, Any]]] = []
         for case in cases:
             url = str(case.get('url') or '')
@@ -2016,9 +2368,10 @@ def select_browser_request_cases(discovery: dict[str, Any], limit: int | None=No
             path = urlparse(url).path.lower()
             if any(token in path for token in ('logout', 'setup', 'reset', 'delete')):
                 continue
-            params = tuple(sorted(str(value) for value in case.get('parameters', []) if str(value)))
-            key = (method, _browser_url_key(url), params)
-            if key in seen:
+            params = tuple(sorted(str(value).lower() for value in case.get('parameters', []) if str(value)))
+            key = (method, url, params)
+            shape = (method, _browser_url_key(url), params)
+            if key in seen or shape_counts.get(shape, 0) >= variant_cap:
                 continue
             score = _risk_terms(path + ' ' + ' '.join(params))
             if any(token in path for token in ('csp', 'javascript', 'brute', 'csrf', 'upload', 'redirect', 'callback')):
@@ -2028,10 +2381,17 @@ def select_browser_request_cases(discovery: dict[str, Any], limit: int | None=No
             if params:
                 score += 15
             extras.append((score, {**case, 'selection_reason': 'deep-browser-breadth'}))
-        for _, case in sorted(extras, key=lambda item: (-item[0], str(item[1].get('url') or '')))[:max(0, effective_limit - len(selected))]:
-            selected.append(case)
-            seen.add((str(case.get('method', 'GET')).upper(), _browser_url_key(str(case.get('url', ''))), tuple(sorted(str(value) for value in case.get('parameters', []) if str(value)))))
-    return selected
+        for score, case in sorted(extras, key=lambda item: (-item[0], str(item[1].get('url') or '')))[:max(0, effective_limit - len(unique_ranked))]:
+            method = str(case.get('method', 'GET')).upper()
+            url = str(case.get('url', ''))
+            params = tuple(sorted(str(value).lower() for value in case.get('parameters', []) if str(value)))
+            shape = (method, _browser_url_key(url), params)
+            if shape_counts.get(shape, 0) >= variant_cap:
+                continue
+            unique_ranked.append((int(score), case))
+            seen.add((method, url, params))
+            shape_counts[shape] = shape_counts.get(shape, 0) + 1
+    return _select_with_adaptive_specialist_budget('browser', unique_ranked, effective_limit)
 
 # Scores a request case for multi-step workflow checks.
 def _workflow_case_priority(case: dict[str, Any]) -> int:
@@ -2063,7 +2423,7 @@ def _workflow_case_priority(case: dict[str, Any]) -> int:
 # Chooses request cases that are useful for workflow checks.
 def select_workflow_request_cases(discovery: dict[str, Any], limit: int | None=None) -> list[dict[str, Any]]:
 
-    effective_limit = limit or PARAMETER_TOOL_CASE_LIMITS.get('workflow', 3)
+    effective_limit = int(limit or PARAMETER_TOOL_CASE_LIMITS.get('workflow', 3))
     ranked: list[tuple[int, int, dict[str, Any]]] = []
     for index, case in enumerate(discovery.get('request_cases', [])):
         if not isinstance(case, dict):
@@ -2079,17 +2439,22 @@ def select_workflow_request_cases(discovery: dict[str, Any], limit: int | None=N
             auth_shape = any(token in path for token in ('brute', 'login', 'signin', 'auth')) or bool({'username', 'password'} <= names)
             if method == 'GET' and auth_shape and not _destructive_crawl_url(str(case.get('url') or '')):
                 ranked.append((82 + min(12, len(names) * 2), -index, {**case, 'selection_reason': 'deep-get-auth-workflow'}))
-    selected: list[dict[str, Any]] = []
+    unique_ranked: list[tuple[int, dict[str, Any]]] = []
     seen: set[tuple[str, str, tuple[str, ...]]] = set()
-    for _, _, case in sorted(ranked, key=lambda item: (-item[0], -item[1])):
-        key = (str(case.get('method', 'POST')).upper(), str(case.get('url', '')), tuple(sorted(_case_field_names(case))))
-        if key in seen:
+    shape_counts: dict[tuple[str, tuple[str, str, tuple[str, ...]], tuple[str, ...]], int] = {}
+    variant_cap = max(1, int(DISCOVERY_LIMITS.get(CURRENT_SCAN_MODE, {}).get('route_variants', 2)))
+    for score, _, case in sorted(ranked, key=lambda item: (-item[0], -item[1])):
+        method = str(case.get('method', 'POST')).upper()
+        url = str(case.get('url', ''))
+        fields = tuple(sorted(_case_field_names(case)))
+        key = (method, url, fields)
+        shape = (method, _discovery_route_signature(url), fields)
+        if key in seen or shape_counts.get(shape, 0) >= variant_cap:
             continue
         seen.add(key)
-        selected.append(case)
-        if len(selected) >= effective_limit:
-            break
-    return selected
+        shape_counts[shape] = shape_counts.get(shape, 0) + 1
+        unique_ranked.append((int(score), case))
+    return _select_with_adaptive_specialist_budget('workflow', unique_ranked, effective_limit)
 
 # Chooses safe endpoints where Arjun can look for hidden parameters.
 def select_arjun_candidates(discovery: dict[str, Any], target: str, limit: int=MAX_ARJUN_ENDPOINTS) -> list[str]:
@@ -2177,31 +2542,35 @@ def _authorization_case_priority(case: dict[str, Any]) -> int:
 # Chooses requests that can be compared for authorization differences.
 def select_authorization_request_cases(discovery: dict[str, Any], limit: int | None=None) -> list[dict[str, Any]]:
 
-    effective_limit = limit or PARAMETER_TOOL_CASE_LIMITS.get('authorization', 3)
+    effective_limit = int(limit or PARAMETER_TOOL_CASE_LIMITS.get('authorization', 3))
     cases = [dict(case) for case in discovery.get('request_cases', []) if isinstance(case, dict)]
     known = {str(case.get('url') or '') for case in cases}
     for value in discovery.get('parameterized_urls', []):
         url = str(value or '')
         if url and url not in known:
             cases.append({'url': url, 'method': 'GET', 'data': '', 'parameters': [name for name, _ in parse_qsl(urlparse(url).query, keep_blank_values=True)], 'source_url': url, 'synthetic_from_parameterized_url': True})
+
     ranked: list[tuple[int, int, dict[str, Any]]] = []
     for index, case in enumerate(cases):
         score = _authorization_case_priority(case)
         if score > 0:
             ranked.append((score, -index, case))
-    selected: list[dict[str, Any]] = []
+
+    unique_ranked: list[tuple[int, dict[str, Any]]] = []
     seen: set[str] = set()
-    for _, _, case in sorted(ranked, key=lambda item: (-item[0], -item[1])):
+    shape_counts: dict[tuple[tuple[str, str, tuple[str, ...]], tuple[str, ...]], int] = {}
+    variant_cap = max(1, int(DISCOVERY_LIMITS.get(CURRENT_SCAN_MODE, {}).get('route_variants', 2)))
+    for score, _, case in sorted(ranked, key=lambda item: (-item[0], -item[1])):
         url = str(case.get('url') or '')
-        if url in seen:
+        params = tuple(sorted(str(value).lower() for value in case.get('parameters', []) if str(value)))
+        shape = (_discovery_route_signature(url), params)
+        if not url or url in seen or shape_counts.get(shape, 0) >= variant_cap:
             continue
         seen.add(url)
-        selected.append(case)
-        if len(selected) >= effective_limit:
-            break
-    if CURRENT_SCAN_MODE == 'deep' and len(selected) < effective_limit:
+        shape_counts[shape] = shape_counts.get(shape, 0) + 1
+        unique_ranked.append((int(score), case))
 
-
+    if CURRENT_SCAN_MODE == 'deep' and len(unique_ranked) < effective_limit:
         extras: list[tuple[int, dict[str, Any]]] = []
         for case in cases:
             url = str(case.get('url') or '')
@@ -2214,16 +2583,28 @@ def select_authorization_request_cases(discovery: dict[str, Any], limit: int | N
                 continue
             if not list(case.get('parameters') or []) and not urlparse(url).query:
                 continue
+            params = tuple(sorted(str(value).lower() for value in case.get('parameters', []) if str(value)))
+            shape = (_discovery_route_signature(url), params)
+            if shape_counts.get(shape, 0) >= variant_cap:
+                continue
             score = _risk_terms(path) + (12 if urlparse(url).query else 0)
             extras.append((score, {**case, 'selection_reason': 'deep-readonly-auth-breadth'}))
-        for _, case in sorted(extras, key=lambda item: (-item[0], str(item[1].get('url') or '')))[:max(0, min(3, effective_limit - len(selected)))]:
-            seen.add(str(case.get('url') or ''))
-            selected.append(case)
-    return selected
+        for score, case in sorted(extras, key=lambda item: (-item[0], str(item[1].get('url') or '')))[:max(0, min(6, effective_limit - len(unique_ranked)))]:
+            url = str(case.get('url') or '')
+            params = tuple(sorted(str(value).lower() for value in case.get('parameters', []) if str(value)))
+            shape = (_discovery_route_signature(url), params)
+            if url in seen or shape_counts.get(shape, 0) >= variant_cap:
+                continue
+            seen.add(url)
+            shape_counts[shape] = shape_counts.get(shape, 0) + 1
+            unique_ranked.append((int(score), case))
+
+    return _select_with_adaptive_specialist_budget('authorization', unique_ranked, effective_limit)
 
 # Chooses and limits the endpoints sent to Arjun.
 def select_arjun_request_cases(discovery: dict[str, Any], target: str, limit: int=MAX_ARJUN_ENDPOINTS) -> list[dict[str, Any]]:
 
+    effective_limit = int(limit)
     ranked: list[tuple[int, dict[str, Any]]] = []
     represented_paths: set[str] = set()
     for case in discovery.get('request_cases', []):
@@ -2255,7 +2636,7 @@ def select_arjun_request_cases(discovery: dict[str, Any], target: str, limit: in
         if score < 12:
             continue
         ranked.append((score, {'url': url, 'method': method, 'data': str(case.get('data') or ''), 'parameters': parameters}))
-    for url in select_arjun_candidates(discovery, target, limit=max(limit * 3, 6)):
+    for url in select_arjun_candidates(discovery, target, limit=max(effective_limit * 3, 6)):
         parsed = urlparse(url)
         path = parsed.path.lower()
         if path in represented_paths or parsed.query or _destructive_crawl_url(url):
@@ -2282,20 +2663,126 @@ def select_arjun_request_cases(discovery: dict[str, Any], target: str, limit: in
                 relaxed.append((score, {'url': url, 'method': 'GET', 'data': '', 'parameters': [], 'selection_reason': 'deep-safe-hidden-parameter-breadth' if CURRENT_SCAN_MODE == 'deep' else 'relaxed-safe-hidden-parameter-fallback'}))
         relaxed.sort(key=lambda item: (-item[0], item[1]['url']))
         if CURRENT_SCAN_MODE == 'deep':
-            ranked.extend(relaxed[:max(0, limit - len(ranked))])
+            ranked.extend(relaxed[:max(0, effective_limit - len(ranked))])
         elif not ranked and relaxed:
             ranked.append(relaxed[0])
-    selected: list[dict[str, Any]] = []
+    unique_ranked: list[tuple[int, dict[str, Any]]] = []
     seen: set[tuple[str, str]] = set()
-    for _, case in sorted(ranked, key=lambda item: (-item[0], item[1]['url'])):
+    for score, case in sorted(ranked, key=lambda item: (-item[0], item[1]['url'])):
         key = (case['method'], urlparse(case['url']).path.lower())
         if key in seen:
             continue
         seen.add(key)
-        selected.append(case)
-        if len(selected) >= max(1, limit):
-            break
-    return selected
+        unique_ranked.append((int(score), case))
+    return _select_with_adaptive_specialist_budget('arjun', unique_ranked, max(1, effective_limit))
+
+# Builds report-facing reasons for discovered request contracts that were not selected for
+# request-level security testing. The result is deterministic and shared by both orchestrators.
+def endpoint_selection_decisions(discovery: dict[str, Any], target: str, authenticated_profile: bool=False) -> list[dict[str, Any]]:
+    cases = [dict(case) for case in discovery.get('request_cases', []) if isinstance(case, dict) and str(case.get('url') or '')]
+    if not cases:
+        return []
+
+    def key(case: dict[str, Any]) -> tuple[str, str]:
+        return (str(case.get('method') or 'GET').upper(), _clean_url(str(case.get('url') or '')))
+
+    def shape(case: dict[str, Any]) -> tuple[str, tuple[str, str, tuple[str, ...]], tuple[str, ...]]:
+        method = str(case.get('method') or 'GET').upper()
+        url = str(case.get('url') or '')
+        fields = tuple(sorted(_case_field_names(case)))
+        return (method, _discovery_route_signature(url), fields)
+
+    selected_by_tool: dict[str, set[tuple[str, str]]] = {}
+    selected_shapes_by_tool: dict[str, set[tuple[str, tuple[str, str, tuple[str, ...]], tuple[str, ...]]]] = {}
+    selected_counts: dict[str, int] = {}
+
+    for tool in ('sqlmap', 'dalfox', 'commix', 'traversal', 'idor'):
+        selected = select_tool_request_cases(discovery, tool, authenticated_profile=authenticated_profile)
+        selected_by_tool[tool] = {key(case) for case in selected}
+        selected_shapes_by_tool[tool] = {shape(case) for case in selected}
+        selected_counts[tool] = len(selected)
+
+    browser_selected = select_browser_request_cases(discovery)
+    workflow_selected = select_workflow_request_cases(discovery)
+    authorization_selected = select_authorization_request_cases(discovery) if authenticated_profile else []
+    arjun_selected = select_arjun_request_cases(discovery, target)
+    for tool, selected in (
+        ('browser', browser_selected),
+        ('workflow', workflow_selected),
+        ('authorization', authorization_selected),
+        ('arjun', arjun_selected),
+    ):
+        selected_by_tool[tool] = {key(case) for case in selected}
+        selected_shapes_by_tool[tool] = {shape(case) for case in selected}
+        selected_counts[tool] = len(selected)
+
+    raw_client = [item for item in discovery.get('client_side_candidates', []) if isinstance(item, dict)]
+    client_keys = {_browser_url_key(str(item.get('url') or '')) for item in raw_client if str(item.get('url') or '')}
+    variant_cap = max(1, int(DISCOVERY_LIMITS.get(CURRENT_SCAN_MODE, {}).get('route_variants', 2)))
+    shape_frequency: Counter[tuple[str, tuple[str, str, tuple[str, ...]], tuple[str, ...]]] = Counter(shape(case) for case in cases)
+
+    decisions: list[dict[str, Any]] = []
+    for case in cases:
+        method, url = key(case)
+        fields = _case_field_names(case)
+        selected_tools = sorted(tool for tool, values in selected_by_tool.items() if (method, url) in values)
+        eligible_tools: list[str] = []
+
+        if method in {'GET', 'POST'} and not _destructive_crawl_url(url):
+            for tool in ('sqlmap', 'dalfox', 'commix', 'traversal', 'idor'):
+                if not _tool_case_skip_reason(tool, case, authenticated_profile=authenticated_profile):
+                    eligible_tools.append(tool)
+            if _browser_case_priority(case, client_keys) > 0:
+                eligible_tools.append('browser')
+            workflow_score = _workflow_case_priority(case)
+            if workflow_score > 0:
+                eligible_tools.append('workflow')
+            elif CURRENT_SCAN_MODE == 'deep' and method == 'GET':
+                path = urlparse(url).path.lower()
+                if (any(token in path for token in ('brute', 'login', 'signin', 'auth')) or {'username', 'password'} <= fields) and not _destructive_crawl_url(url):
+                    eligible_tools.append('workflow')
+            if authenticated_profile and _authorization_case_priority(case) > 0:
+                eligible_tools.append('authorization')
+            if (method, url) in selected_by_tool.get('arjun', set()):
+                eligible_tools.append('arjun')
+
+        reason_code = ''
+        reason = ''
+        if method not in {'GET', 'POST'}:
+            reason_code = 'UNSUPPORTED_METHOD'
+            reason = f'{method} was observed during discovery but request-level specialist wrappers accept only supported GET/POST contracts.'
+        elif _destructive_crawl_url(url):
+            reason_code = 'STATE_CHANGE_BLOCKED'
+            reason = 'The request maps to a destructive/state-changing route excluded by the safety policy.'
+        elif selected_tools:
+            reason_code = 'SELECTED_FOR_SECURITY_TEST'
+            reason = 'Deterministic ranking selected this request contract for one or more request-level security tools.'
+        elif not fields:
+            reason_code = 'NO_COMPATIBLE_PARAMETERS'
+            reason = 'No compatible application parameter, form field or client-side input was available for request-level specialist testing.'
+        else:
+            current_shape = shape(case)
+            duplicate_tools = [tool for tool in eligible_tools if current_shape in selected_shapes_by_tool.get(tool, set()) and shape_frequency[current_shape] > variant_cap]
+            if duplicate_tools:
+                reason_code = 'DUPLICATE_ROUTE_VARIANT'
+                reason = 'A higher-ranked value variant with the same method, route and parameter-name shape was retained; this variant was omitted by the anti-saturation cap.'
+            elif eligible_tools and any(selected_counts.get(tool, 0) >= adaptive_tool_max_limit(tool) > 0 for tool in eligible_tools):
+                reason_code = 'BUDGET_LIMIT'
+                reason = 'The request was compatible with a specialist, but that specialist had already reached its bounded adaptive case ceiling for this profile.'
+            else:
+                reason_code = 'DEFERRED_LOW_PRIORITY'
+                reason = 'The request remained below the deterministic specialist cutoff after vulnerability-class ranking and higher-value candidates were preferred.'
+
+        decisions.append({
+            'url': url,
+            'method': method,
+            'parameters': sorted(fields),
+            'selected_tools': selected_tools,
+            'eligible_tools': sorted(set(eligible_tools)),
+            'reason_code': reason_code,
+            'reason': reason,
+        })
+    return decisions
 
 # Selects generic request cases using a score and a fixed limit.
 def select_request_cases(discovery: dict[str, Any], limit: int=MAX_PARAMETER_ENDPOINTS) -> list[dict[str, Any]]:
@@ -2755,7 +3242,7 @@ def build_tool_arguments(tool: str, target_url: str, cookies: str, discovery: di
                 scan_mode = 'prioritized'
             else:
                 scan_mode = 'targeted'
-            arguments.update({'seed_urls': discovery.get('html_urls', []), 'request_cases': discovery.get('request_cases', []), 'scan_mode': scan_mode, 'session_probe_url': select_session_probe_url(discovery, target_url), 'max_observations': 360 if CURRENT_SCAN_MODE == 'deep' else 140 if CURRENT_SCAN_MODE == 'balanced' or single_tool else 40})
+            arguments.update({'seed_urls': discovery.get('html_urls', []), 'request_cases': discovery.get('request_cases', []), 'scan_mode': scan_mode, 'session_probe_url': select_session_probe_url(discovery, target_url), 'max_observations': 450 if CURRENT_SCAN_MODE == 'deep' else 220 if CURRENT_SCAN_MODE == 'balanced' or single_tool else 60})
             if single_tool:
                 arguments['diagnostic_only'] = diagnostic_only
             elif diagnostic_only:

@@ -547,12 +547,14 @@ def _render_agentic_audit(context_value: dict[str, Any], toc: list[tuple[int, st
             continue
         outcomes = item.get("execution_outcomes", []) if isinstance(item.get("execution_outcomes"), list) else []
         gaps = item.get("remaining_coverage_gaps", []) if isinstance(item.get("remaining_coverage_gaps"), list) else []
+        selected_group_count = item.get("selected_group_count", 0)
+        concrete_pool_count = item.get("concrete_action_pool_count", item.get("eligible_action_count", 0))
         audit_rows += (
             "<tr>"
             f"<td>{_esc(item.get('round',''))}</td>"
             f"<td>{_esc(item.get('planner_source',''))}</td>"
-            f"<td>{_esc(item.get('eligible_action_count',0))}</td>"
-            f"<td>{_esc(item.get('ai_selected_action_count',0))}</td>"
+            f"<td>{_esc(concrete_pool_count)}</td>"
+            f"<td>{_esc(selected_group_count)}</td>"
             f"<td>{_esc(item.get('selected_action_count',0))}</td>"
             f"<td>{_esc(len(gaps))}</td>"
             f"<td>{_esc(len(outcomes))}</td>"
@@ -566,9 +568,14 @@ def _render_agentic_audit(context_value: dict[str, Any], toc: list[tuple[int, st
             for label, value in (
                 ("Planner endpoint", item.get("planner_endpoint", "")),
                 ("Context size (bytes)", item.get("context_bytes", "")),
-                ("Round action budget", item.get("round_action_budget", "")),
+                ("Tool-group candidates shown / pool", f"{item.get('planner_candidate_count', 0)} / {item.get('planner_candidate_pool_count', 0)}"),
+                ("Tool-group budget per profile", item.get("tool_group_budget_per_profile", item.get("round_action_budget", ""))),
+                ("Concrete action budget per profile", item.get("execution_action_budget_per_profile", item.get("round_action_budget", ""))),
                 ("Eligible tools", ", ".join(str(value) for value in (item.get("eligible_tools") or []))),
-                ("AI selected / reviewed actions", f"{item.get('ai_selected_action_count', 0)} / {item.get('review_selected_action_count', 0)}"),
+                ("Baseline / AI / breadth-review tool groups", f"{item.get('baseline_selected_group_count', 0)} / {item.get('ai_selected_group_count', 0)} / {item.get('review_selected_group_count', 0)}"),
+                ("Validated concrete actions", item.get('validated_concrete_action_count', item.get('selected_action_count', 0))),
+                ("Selected groups per profile", json.dumps(item.get("selected_groups_per_profile", {}), ensure_ascii=False, sort_keys=True) if item.get("selected_groups_per_profile") else ""),
+                ("Concrete actions per profile", json.dumps(item.get("expanded_actions_per_profile", {}), ensure_ascii=False, sort_keys=True) if item.get("expanded_actions_per_profile") else ""),
                 ("Review reasoning", item.get("review_reasoning", "")),
                 ("Fallback reason", item.get("fallback_reason", "")),
                 ("New request contracts discovered", item.get("new_request_contracts", "")),
@@ -576,6 +583,26 @@ def _render_agentic_audit(context_value: dict[str, Any], toc: list[tuple[int, st
             )
         )
         facts_html = f"<dl>{facts}</dl>" if facts else ""
+
+        selected_groups = item.get("selected_tool_groups", []) if isinstance(item.get("selected_tool_groups"), list) else []
+        groups_html = ""
+        if selected_groups:
+            group_rows = "".join(
+                "<tr>"
+                f"<td>{_esc(group.get('id',''))}</td>"
+                f"<td>{_esc(group.get('profile',''))}</td>"
+                f"<td>{_esc(group.get('tool',''))}</td>"
+                f"<td>{_esc(group.get('source',''))}</td>"
+                f"<td>{_esc(group.get('concrete_action_count',0))}</td>"
+                f"<td>{_esc(group.get('adaptive_action_count',0))}</td>"
+                "</tr>"
+                for group in selected_groups if isinstance(group, dict)
+            )
+            groups_html = (
+                '<p class="field-label">Selected tool groups</p>'
+                "<table><thead><tr><th>ID</th><th>Profile</th><th>Tool</th><th>Source</th><th>Available concrete actions</th><th>Adaptive</th></tr></thead>"
+                f"<tbody>{group_rows}</tbody></table>"
+            )
 
         selected_actions = item.get("selected_actions", []) if isinstance(item.get("selected_actions"), list) else []
         actions_html = ""
@@ -625,7 +652,7 @@ def _render_agentic_audit(context_value: dict[str, Any], toc: list[tuple[int, st
             "<li>"
             f"<b>Round {_esc(item.get('round',''))}: {_esc(item.get('planner_source',''))}</b>"
             f"<p>{_esc(item.get('reasoning_summary',''))}</p>"
-            f"{facts_html}{actions_html}{outcomes_html}{gaps_html}"
+            f"{facts_html}{groups_html}{actions_html}{outcomes_html}{gaps_html}"
             "</li>"
         )
     if not audit_rows:
@@ -633,8 +660,8 @@ def _render_agentic_audit(context_value: dict[str, Any], toc: list[tuple[int, st
     heading = _heading(2, "Agentic planning audit", toc, anchor="agentic-audit")
     return (
         f"{heading}"
-        "<p class='section-note'>This section records model-selected actions, coverage repair, fallback use and execution outcomes. It contains concise planner summaries, not hidden chain-of-thought.</p>"
-        "<table><thead><tr><th>Round</th><th>Planner</th><th>Eligible</th><th>AI selected</th><th>Executed plan</th><th>Gaps</th><th>Outcomes</th></tr></thead>"
+        "<p class='section-note'>This section records model-selected profile/tool capability groups, their deterministic expansion into concrete request-level executions, coverage repair, fallback use and execution outcomes. It contains concise planner summaries, not hidden chain-of-thought.</p>"
+        "<table><thead><tr><th>Round</th><th>Planner</th><th>Concrete pool</th><th>Tool groups</th><th>Concrete plan</th><th>Gaps</th><th>Outcomes</th></tr></thead>"
         f"<tbody>{audit_rows}</tbody></table>"
         f"<ul class=\"audit-rounds\">{''.join(round_items)}</ul>"
     )

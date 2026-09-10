@@ -18,6 +18,8 @@ def build_review_snapshot(payload: dict[str, Any]) -> dict[str, Any]:
         "reporting_policy": payload.get("reporting_policy"),
         "summary": payload.get("summary") or {},
         "coverage": payload.get("coverage") or {},
+        "endpoint_coverage": payload.get("endpoint_coverage") or [],
+        "endpoint_coverage_summary": payload.get("endpoint_coverage_summary") or {},
         "findings": payload.get("all_findings") or [],
         "results": payload.get("results") or {},
         "assessment_context": context,

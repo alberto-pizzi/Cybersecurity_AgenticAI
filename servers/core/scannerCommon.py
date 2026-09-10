@@ -1,8 +1,8 @@
 from __future__ import annotations
 
 import json
-import time
 from difflib import SequenceMatcher
+import time
 from pathlib import Path
 from typing import Any, Callable, Iterable
 from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
@@ -31,18 +31,22 @@ def unique_strings(values: Iterable[Any] | None) -> list[str]:
 
     return list(dict.fromkeys(str(value).strip() for value in (values or []) if str(value).strip()))
 
-# Computes a bounded response-body similarity without quadratic comparisons on large HTML pages.
-def bounded_text_similarity(left: str, right: str, *, text_limit: int = 80_000, chunk_size: int = 128) -> float:
-    left = str(left or "")[:max(1, int(text_limit))]
-    right = str(right or "")[:max(1, int(text_limit))]
-    if left == right:
-        return 1.0
-    size = max(32, int(chunk_size))
-    left_chunks = [left[index:index + size] for index in range(0, len(left), size)]
-    right_chunks = [right[index:index + size] for index in range(0, len(right), size)]
+# Compare two response bodies with bounded work so proxy/session validation does not depend on full-page byte equality.
+def bounded_text_similarity(left: Any, right: Any, *, text_limit: int = 80_000, chunk_size: int = 128) -> float:
+
+    limit = max(1, int(text_limit))
+    width = max(16, int(chunk_size))
+
+    def chunks(value: Any) -> list[str]:
+        text = " ".join(str(value or "")[:limit].split())
+        return [text[index:index + width] for index in range(0, len(text), width)]
+
+    left_chunks, right_chunks = chunks(left), chunks(right)
     if not left_chunks and not right_chunks:
         return 1.0
-    return SequenceMatcher(None, left_chunks, right_chunks, autojunk=True).ratio()
+    if not left_chunks or not right_chunks:
+        return 0.0
+    return float(SequenceMatcher(None, left_chunks, right_chunks, autojunk=False).ratio())
 
 # Shared login-page detector with per-scanner compatibility knobs.
 def looks_like_login(

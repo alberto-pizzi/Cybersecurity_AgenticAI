@@ -95,6 +95,9 @@ def _normalize_finding(raw: dict[str, Any], profile: str, tool: str) -> dict[str
     if not isinstance(payloads, list):
         payloads = [payloads]
     payloads = [_redact_text(value) for value in payloads if str(value)]
+    source_entry_point = _redact_text(raw.get("aggregate_source_entry_point") or "").strip()
+    source_job_id = _redact_text(raw.get("aggregate_source_job_id") or "").strip()
+    source_report_id = _redact_text(raw.get("aggregate_source_report_id") or "").strip()
 
     # Populated by the agentic analysis stage (orchestratorAgenticCore.py's
     # analysis_node), which enriches severity/description/impact/consequences/recovery/solution above
@@ -132,6 +135,7 @@ def _normalize_finding(raw: dict[str, Any], profile: str, tool: str) -> dict[str
             "owasp_category", "payload", "payloads",
             "scanner_risk", "scanner_confidence", "scanner_description",
             "scanner_impact", "scanner_consequences", "scanner_recovery", "scanner_solution", "ai_analysis",
+            "aggregate_source_entry_point", "aggregate_source_job_id", "aggregate_source_report_id",
         }
         and value not in (None, "", [], {})
     }
@@ -167,6 +171,9 @@ def _normalize_finding(raw: dict[str, Any], profile: str, tool: str) -> dict[str
         "payload": payload,
         "payloads": payloads,
         "references": _references(raw),
+        "source_entry_point": source_entry_point,
+        "source_job_id": source_job_id,
+        "source_report_id": source_report_id,
         "identifiers": _identifier_lines(raw),
         "data_quality_notes": data_quality_notes,
         "scanner_fields": preserved,
@@ -323,6 +330,15 @@ def _merge_finding_rows(existing: dict[str, Any], row: dict[str, Any], profile: 
     affected_urls = existing.setdefault("affected_urls", [existing.get("url", "")])
     if row.get("url") and row.get("url") not in affected_urls:
         affected_urls.append(row.get("url"))
+    source_entry_points = existing.setdefault("source_entry_points", [existing.get("source_entry_point", "")] if existing.get("source_entry_point") else [])
+    if row.get("source_entry_point") and row.get("source_entry_point") not in source_entry_points:
+        source_entry_points.append(row.get("source_entry_point"))
+    source_job_ids = existing.setdefault("source_job_ids", [existing.get("source_job_id", "")] if existing.get("source_job_id") else [])
+    if row.get("source_job_id") and row.get("source_job_id") not in source_job_ids:
+        source_job_ids.append(row.get("source_job_id"))
+    source_report_ids = existing.setdefault("source_report_ids", [existing.get("source_report_id", "")] if existing.get("source_report_id") else [])
+    if row.get("source_report_id") and row.get("source_report_id") not in source_report_ids:
+        source_report_ids.append(row.get("source_report_id"))
     corroboration = existing.setdefault("corroborating_findings", [])
     corroboration.append({
         "tool": tool,
@@ -330,6 +346,8 @@ def _merge_finding_rows(existing: dict[str, Any], row: dict[str, Any], profile: 
         "verification_status": row.get("verification_status", ""),
         "risk": row.get("risk", ""),
         "url": row.get("url", ""),
+        "source_entry_point": row.get("source_entry_point", ""),
+        "source_job_id": row.get("source_job_id", ""),
     })
     if _finding_strength(row) > _finding_strength(existing):
         for key in (
@@ -340,6 +358,7 @@ def _merge_finding_rows(existing: dict[str, Any], row: dict[str, Any], profile: 
             "method", "parameter",
             "scanner_risk", "scanner_confidence", "scanner_description",
             "scanner_impact", "scanner_consequences", "scanner_recovery", "scanner_solution", "ai_analysis",
+            "source_entry_point", "source_job_id", "source_report_id",
         ):
             if row.get(key) not in (None, "", [], {}):
                 existing[key] = row[key]
@@ -382,6 +401,9 @@ def flatten_findings(results: dict[str, Any]) -> list[dict[str, Any]]:
                 row["tools"] = [tool]
                 row["canonical_url"] = canonical_url
                 row["affected_urls"] = [row.get("url", "")] if row.get("url") else []
+                row["source_entry_points"] = [row.get("source_entry_point")] if row.get("source_entry_point") else []
+                row["source_job_ids"] = [row.get("source_job_id")] if row.get("source_job_id") else []
+                row["source_report_ids"] = [row.get("source_report_id")] if row.get("source_report_id") else []
                 row["corroborating_findings"] = []
                 merged[fingerprint] = row
             else:
@@ -401,6 +423,9 @@ def flatten_findings(results: dict[str, Any]) -> list[dict[str, Any]]:
         row["profile"] = ", ".join(row["profiles"])
         row["tools"] = sorted(set(str(value) for value in row.get("tools", []) if value))
         row["tool"] = ", ".join(row["tools"]) or str(row.get("tool") or "unknown")
+        row["source_entry_points"] = sorted(set(str(value) for value in row.get("source_entry_points", []) if value))
+        row["source_job_ids"] = sorted(set(str(value) for value in row.get("source_job_ids", []) if value))
+        row["source_report_ids"] = sorted(set(str(value) for value in row.get("source_report_ids", []) if value))
     return sorted(
         rows,
         key=lambda row: (

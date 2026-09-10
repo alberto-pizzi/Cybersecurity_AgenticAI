@@ -11,20 +11,6 @@
       "snap4city.org"
     ]
   },
-  "credentials": {
-    "tourist_session": {
-      "kind": "snap4city_oidc",
-      "cookie_env": "TOURIST_DASHBOARD_COOKIE",
-      "username_env": "TOURIST_DASHBOARD_USERNAME",
-      "password_env": "TOURIST_DASHBOARD_PASSWORD",
-      "login_path": "/dashboardSmartCity/",
-      "validation_path": "/dashboardSmartCity/",
-      "headless": true,
-      "timeout_seconds": 60,
-      "optional": true,
-      "purpose": "Authorized Snap4City target login. An existing cookie overrides browser login. Otherwise the runner uses the target username/password from environment variables or interactive console input. If optional login is unavailable or fails, the job continues anonymously unless --auth-only is requested."
-    }
-  },
   "assets": [
     {
       "id": "tourist-dashboard",
@@ -34,7 +20,6 @@
           "id": "dashboard-4786",
           "url": "https://www.snap4city.org/dashboardSmartCity/view/newTheme.php?iddasboard=NDc4Ng==",
           "enabled": true,
-          "credential_ref": "tourist_session",
           "auth_only": false,
           "allow_state_changes": false,
           "notes": "Explicit authorized dashboard-view entry point. Kept as a separate service job to guarantee coverage of this supplied URL."
@@ -43,7 +28,6 @@
           "id": "dashboard-4332",
           "url": "https://www.snap4city.org/dashboardSmartCity/view/newTheme.php?iddasboard=NDMzMg==",
           "enabled": true,
-          "credential_ref": "tourist_session",
           "auth_only": false,
           "allow_state_changes": false,
           "notes": "Explicit authorized dashboard-view entry point. Kept as a separate service job to guarantee coverage of this supplied URL."
@@ -52,7 +36,6 @@
           "id": "dashboard-4901",
           "url": "https://www.snap4city.org/dashboardSmartCity/view/newTheme.php?iddasboard=NDkwMQ==",
           "enabled": true,
-          "credential_ref": "tourist_session",
           "auth_only": false,
           "allow_state_changes": false,
           "notes": "Explicit authorized dashboard-view entry point. Kept as a separate service job to guarantee coverage of this supplied URL."
@@ -61,7 +44,6 @@
           "id": "dashboard-4621",
           "url": "https://www.snap4city.org/dashboardSmartCity/view/newTheme.php?iddasboard=NDYyMQ==",
           "enabled": true,
-          "credential_ref": "tourist_session",
           "auth_only": false,
           "allow_state_changes": false,
           "notes": "Explicit authorized dashboard-view entry point. Kept as a separate service job to guarantee coverage of this supplied URL."
@@ -70,7 +52,6 @@
           "id": "dashboard-4722",
           "url": "https://www.snap4city.org/dashboardSmartCity/view/newTheme.php?iddasboard=NDcyMg==",
           "enabled": true,
-          "credential_ref": "tourist_session",
           "auth_only": false,
           "allow_state_changes": false,
           "notes": "Explicit authorized dashboard-view entry point. Kept as a separate service job to guarantee coverage of this supplied URL."
@@ -79,7 +60,6 @@
           "id": "dashboard-4257",
           "url": "https://www.snap4city.org/dashboardSmartCity/view/newTheme.php?iddasboard=NDI1Nw==",
           "enabled": true,
-          "credential_ref": "tourist_session",
           "auth_only": false,
           "allow_state_changes": false,
           "notes": "Explicit authorized dashboard-view entry point. Kept as a separate service job to guarantee coverage of this supplied URL."
@@ -88,7 +68,6 @@
           "id": "dashboard-4883",
           "url": "https://www.snap4city.org/dashboardSmartCity/view/newTheme.php?iddasboard=NDg4Mw==",
           "enabled": true,
-          "credential_ref": "tourist_session",
           "auth_only": false,
           "allow_state_changes": false,
           "notes": "Explicit authorized dashboard-view entry point. Kept as a separate service job to guarantee coverage of this supplied URL."
@@ -97,7 +76,6 @@
           "id": "dashboard-4923",
           "url": "https://www.snap4city.org/dashboardSmartCity/view/newTheme.php?iddasboard=NDkyMw==",
           "enabled": true,
-          "credential_ref": "tourist_session",
           "auth_only": false,
           "allow_state_changes": false,
           "notes": "Explicit authorized dashboard-view entry point. Kept as a separate service job to guarantee coverage of this supplied URL."
@@ -113,5 +91,9 @@
     "require_ai": true,
     "allow_state_changes": false,
     "snap4city_credentials": "snap4city_model_credentials.json"
+  },
+  "reporting": {
+    "aggregate_report": true,
+    "keep_job_reports": false
   }
 }

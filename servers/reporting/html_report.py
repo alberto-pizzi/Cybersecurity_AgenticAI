@@ -7,7 +7,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any
 
-from .coverage import _render_constraints, _render_execution, _render_limitations
+from .coverage import _render_constraints, _render_endpoint_coverage, _render_execution, _render_limitations
 from .style import report_css
 from .finding_cards import _render_findings, _render_glance
 from .findings import _finding_groups
@@ -91,6 +91,8 @@ def _render_html(payload: dict[str, Any], *, for_pdf: bool = False) -> str:
 {_render_agentic_audit(context_value, toc)}
 
 {_render_execution(payload["coverage"], toc)}
+
+{_render_endpoint_coverage(payload.get("endpoint_coverage") or [], toc)}
 
 {_render_limitations(summary, toc)}
 
