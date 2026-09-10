@@ -679,18 +679,72 @@ def _aggregate_report_inputs(results_data: dict[str, Any], config: dict[str, Any
     profiles: dict[str, bool] = {}
     expected_tools: set[str] = set()
     entry_points: list[dict[str, Any]] = []
+    entry_points_by_job: dict[str, dict[str, Any]] = {}
     discovery_by_entry: dict[str, Any] = {}
     diagnostics_by_entry: dict[str, Any] = {}
     endpoint_selection_by_entry: dict[str, Any] = {}
     secondary_identity_supplied = False
 
+    # Start from runner job records so an entry point remains visible even when its orchestrator
+    # exits before producing a per-job report. Non-web inventory rows have no target and are not
+    # counted as web entry points in the aggregate report.
+    for job_index, job in enumerate(results_data.get("jobs", []), start=1):
+        if not isinstance(job, dict):
+            continue
+        target = str(job.get("target") or "").strip()
+        if not target:
+            continue
+        job_id = str(job.get("id") or f"entry-{job_index}")
+        entry = {
+            "job_id": job_id,
+            "target": target,
+            "report_id": None,
+            "report_available": False,
+            "status": str(job.get("status") or "unknown"),
+            "reason": str(job.get("reason") or ""),
+        }
+        entry_points.append(entry)
+        entry_points_by_job[job_id] = entry
+        if entry["status"] in {"error", "blocked"}:
+            diagnostics_by_entry[job_id] = [{
+                "phase": "assessment_runner",
+                "type": "job_execution",
+                "status": entry["status"],
+                "message": entry["reason"] or f"Entry point finished with status {entry['status']} before a complete per-job report was available.",
+            }]
+
+    reported_jobs: set[str] = set()
     for row_index, row in enumerate(results_data.get("reports_data", []), start=1):
         if not isinstance(row, dict):
             continue
         artifact = row.get("artifacts") if isinstance(row.get("artifacts"), dict) else {}
         job_id = str(artifact.get("job_id") or f"entry-{row_index}")
         target = str(row.get("target") or "")
-        entry_points.append({"job_id": job_id, "target": target, "report_id": row.get("report_id")})
+        report_id = str(row.get("report_id") or "")
+        source_status = row.get("source_artifact_status") if isinstance(row.get("source_artifact_status"), dict) else None
+        report_usable = True if source_status is None else bool(
+            source_status.get("technical_json_loaded") or source_status.get("review_snapshot_loaded")
+        )
+        if report_usable:
+            reported_jobs.add(job_id)
+        if job_id in entry_points_by_job:
+            entry = entry_points_by_job[job_id]
+            if target and not entry.get("target"):
+                entry["target"] = target
+            entry["report_id"] = report_id or entry.get("report_id")
+            entry["report_available"] = report_usable
+        else:
+            entry = {"job_id": job_id, "target": target, "report_id": report_id or None, "report_available": report_usable, "status": "reported", "reason": ""}
+            entry_points.append(entry)
+            entry_points_by_job[job_id] = entry
+        if not report_usable:
+            diagnostics_by_entry[job_id] = [{
+                "phase": "assessment_runner",
+                "type": "report_artifact",
+                "status": "partial",
+                "message": "The per-entry report artifact could not be loaded into the aggregate Results Data dataset.",
+            }]
+
         context = row.get("assessment_context") if isinstance(row.get("assessment_context"), dict) else {}
         for profile in context.get("profiles", []) if isinstance(context.get("profiles"), list) else []:
             if isinstance(profile, dict):
@@ -704,7 +758,9 @@ def _aggregate_report_inputs(results_data: dict[str, Any], config: dict[str, Any
                 expected_tools.add(str(tool))
         secondary_identity_supplied = secondary_identity_supplied or bool(context.get("secondary_identity_supplied"))
         discovery_by_entry[job_id] = row.get("discovery") if isinstance(row.get("discovery"), dict) else {}
-        diagnostics_by_entry[job_id] = row.get("diagnostics") if isinstance(row.get("diagnostics"), (dict, list)) else {}
+        row_diagnostics = row.get("diagnostics") if isinstance(row.get("diagnostics"), (dict, list)) else {}
+        if row_diagnostics:
+            diagnostics_by_entry[job_id] = row_diagnostics
         endpoint_selection_by_entry[job_id] = context.get("endpoint_selection") if isinstance(context.get("endpoint_selection"), dict) else {}
 
         scanner_results = ((row.get("assessment_results") or {}).get("scanner_results")
@@ -729,7 +785,7 @@ def _aggregate_report_inputs(results_data: dict[str, Any], config: dict[str, Any
                     result,
                     job_id=job_id,
                     target=target,
-                    report_id=str(row.get("report_id") or ""),
+                    report_id=report_id,
                 )
 
     targets = [row["target"] for row in entry_points if row.get("target")]
@@ -744,6 +800,11 @@ def _aggregate_report_inputs(results_data: dict[str, Any], config: dict[str, Any
             origins.append(origin)
     target_label = origins[0] if origins and len(set(origins)) == 1 else str((config.get("platform") or {}).get("name") or "Multi-entry assessment")
 
+    status_counts: dict[str, int] = {}
+    for entry in entry_points:
+        status = str(entry.get("status") or "unknown")
+        status_counts[status] = status_counts.get(status, 0) + 1
+
     context = {
         "profiles": [{"name": name, "authenticated": authenticated} for name, authenticated in sorted(profiles.items())],
         "expected_tools": sorted(expected_tools),
@@ -752,6 +813,8 @@ def _aggregate_report_inputs(results_data: dict[str, Any], config: dict[str, Any
         "diagnostics": diagnostics_by_entry,
         "entry_points": entry_points,
         "entry_point_count": len(entry_points),
+        "entry_point_reports_available": len(reported_jobs),
+        "entry_point_status_counts": status_counts,
         "logical_target_name": str((config.get("platform") or {}).get("name") or target_label),
         "multi_entry_target": True,
         "reporting_scope": "aggregate logical target",
@@ -982,6 +1045,8 @@ def main() -> int:
             completed = subprocess.run(command, cwd=ROOT, check=False)
             record["returncode"] = completed.returncode
             record["status"] = "success" if completed.returncode == 0 else "error"
+            if completed.returncode != 0:
+                record["reason"] = f"orchestrator exited with return code {completed.returncode}"
             generated_pdfs = sorted(
                 (path.resolve() for path in REPORTS_DIR.glob("*.pdf") if path.stat().st_mtime_ns >= job_started_ns),
                 key=lambda path: path.stat().st_mtime_ns,
@@ -1035,7 +1100,8 @@ def main() -> int:
 
     aggregate_requested, keep_job_reports = _aggregate_report_requested(config)
     source_report_artifacts = list(results_data.get("report_artifacts", []))
-    if aggregate_requested and len(results_data.get("reports_data", [])) > 1 and not args.dry_run:
+    aggregate_entry_points = [row for row in results_data.get("jobs", []) if isinstance(row, dict) and str(row.get("target") or "").strip()]
+    if aggregate_requested and len(aggregate_entry_points) > 1 and not args.dry_run:
         try:
             aggregate_artifact = _generate_aggregate_report(results_data, config, assessment_id)
             aggregate_data = _embedded_report_data(aggregate_artifact)

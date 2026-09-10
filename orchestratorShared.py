@@ -1848,11 +1848,15 @@ def select_sibling_broad_origins(discovery: dict[str, Any], target: str) -> dict
     cutoff_score = int(selected[-1][1])
     threshold_score = int(math.ceil(cutoff_score * BROAD_SIBLING_ADAPTIVE_RATIO))
     evidence = _discovered_scope_origin_evidence(discovery, target)
-    for origin, score in ranking[base_limit:max_limit]:
+    for origin, score in ranking[base_limit:]:
+        if len(selected) >= max_limit:
+            break
+        # Ranking is descending, so once the score falls below the adaptive threshold no later
+        # origin can qualify. Non-interactive origins are skipped without consuming overflow slots.
+        if int(score) < threshold_score:
+            break
         bucket = evidence.get(origin, {})
-        # Overflow is reserved for origins with real application interaction evidence, not merely
-        # static links/assets. This keeps balanced bounded while allowing strong extra surfaces.
-        if int(score) < threshold_score or int(bucket.get('interactive', 0)) <= 0:
+        if int(bucket.get('interactive', 0)) <= 0:
             continue
         selected.append((origin, score))
 

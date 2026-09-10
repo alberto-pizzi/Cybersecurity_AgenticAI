@@ -142,20 +142,8 @@ async def deterministic_broad_scan_node(state: DeterministicState) -> dict[str, 
     for profile in profiles:
         name, cookies = (profile['name'], profile['cookies'])
         print(f'\n[*] Scanner generali - profilo: {name}')
-        sibling_selection = shared.select_sibling_broad_origins(discovery[name], target)
-        sibling_ranking = sibling_selection['ranking']
-        sibling_origins = []
-        if name == 'anonymous' or not anonymous_available:
-            sibling_origins = [origin for origin, _ in sibling_selection['selected']]
-            if sibling_ranking:
-                print(
-                    f"    [INFO   ] Broad sibling policy: selected={len(sibling_origins)}/{len(sibling_ranking)} "
-                    f"(base={sibling_selection['base_limit']}, adaptive_overflow={sibling_selection['overflow']}, "
-                    f"max={sibling_selection['max_limit']}) authorized observed origin(s) for full ZAP/Nuclei/Nikto coverage "
-                    f"in {shared.CURRENT_SCAN_MODE}; specialist request-level candidates remain eligible on every authorized observed origin."
-                )
-        elif sibling_ranking:
-            print('    [INFO   ] Broad sibling coverage is already assigned to the anonymous profile; duplicate no-cookie scans are omitted here.')
+        sibling_origins: list[str] = []
+        sibling_selection_logged = False
         if cookies and 'anonymous' in results:
             anonymous_ffuf = results.get('anonymous', {}).get('ffuf', {})
             if isinstance(anonymous_ffuf, dict):
@@ -168,6 +156,23 @@ async def deterministic_broad_scan_node(state: DeterministicState) -> dict[str, 
         probe_url = select_session_probe_url(discovery[name], target)
         for scanner_name in broad_tool_order(bool(cookies)):
             spec = broad_specs[scanner_name]
+            # FFUF executes first and may expand discovery. Freeze the sibling broad set only after
+            # that enrichment, immediately before ZAP/Nuclei/Nikto consume it.
+            if spec.name == 'zap' and not sibling_selection_logged:
+                sibling_selection = shared.select_sibling_broad_origins(discovery[name], target)
+                sibling_ranking = sibling_selection['ranking']
+                if name == 'anonymous' or not anonymous_available:
+                    sibling_origins = [origin for origin, _ in sibling_selection['selected']]
+                    if sibling_ranking:
+                        print(
+                            f"    [INFO   ] Broad sibling policy: selected={len(sibling_origins)}/{len(sibling_ranking)} "
+                            f"(base={sibling_selection['base_limit']}, adaptive_overflow={sibling_selection['overflow']}, "
+                            f"max={sibling_selection['max_limit']}) authorized observed origin(s) for full ZAP/Nuclei/Nikto coverage "
+                            f"in {shared.CURRENT_SCAN_MODE}; specialist request-level candidates remain eligible on every authorized observed origin."
+                        )
+                elif sibling_ranking:
+                    print('    [INFO   ] Broad sibling coverage is already assigned to the anonymous profile; duplicate no-cookie scans are omitted here.')
+                sibling_selection_logged = True
             scanner_timeout = BROAD_SCANNER_TIMEOUTS.get(spec.name, 180)
             if cookies and spec.name == 'ffuf' and (shared.CURRENT_SCAN_MODE == 'balanced'):
                 scanner_timeout = min(scanner_timeout, 35)

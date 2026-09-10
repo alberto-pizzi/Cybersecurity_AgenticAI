@@ -277,6 +277,7 @@ anonymous-only: non contiene credential_ref e quindi assessmentRunner.py non chi
 allow_state_changes resta false per tutti gli otto servizi.
 
 Poiche' gli otto URL appartengono allo stesso target logico, il blocco reporting usa aggregate_report=true.
+Se un entry point termina con error o blocked prima di produrre il proprio report, resta comunque visibile nel report aggregato come limitazione di esecuzione; anche un job concluso con successo ma privo di un artefatto per-entry leggibile viene marcato come limitazione partial.
 aggregate_report e keep_job_reports devono essere booleani JSON reali (true/false); stringhe come "false" vengono rifiutate dalla validazione del config.
 Dopo l'esecuzione dei job viene prodotto un solo report primario che aggrega risultati, coverage e discovery.
 Con keep_job_reports=false gli artefatti dei singoli entry point vengono spostati in

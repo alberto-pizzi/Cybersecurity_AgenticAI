@@ -52,6 +52,26 @@ def _context_summary_html(context: dict[str, Any], toc: list[tuple[int, str, str
     if run_rows:
         parts.append(_heading(3, "Run configuration", toc) + dl(run_rows))
 
+    entry_points = context.get("entry_points") if isinstance(context.get("entry_points"), list) else []
+    if entry_points:
+        entry_rows: list[tuple[str, str]] = []
+        for item in entry_points:
+            if not isinstance(item, dict):
+                continue
+            job_id = str(item.get("job_id") or "entry point")
+            target = str(item.get("target") or "")
+            status = str(item.get("status") or "unknown")
+            reason = str(item.get("reason") or "")
+            report_available = item.get("report_available")
+            value = f"{_esc(target)} — {_esc(status)}"
+            if report_available is False:
+                value += " — per-entry report unavailable"
+            if reason:
+                value += f"<br><small>{_esc(reason)}</small>"
+            entry_rows.append((job_id, value))
+        if entry_rows:
+            parts.append(_heading(3, "Entry-point execution", toc) + dl(entry_rows))
+
     # Configured limits and timeouts
     limit_rows: list[tuple[str, str]] = []
     if context.get("parameter_endpoint_limit") is not None:
@@ -68,20 +88,44 @@ def _context_summary_html(context: dict[str, Any], toc: list[tuple[int, str, str
     if limit_rows:
         parts.append(_heading(3, "Configured limits", toc) + dl(limit_rows))
 
-    # Per-profile discovery summary
+    # Per-profile discovery summary. Aggregate reports nest discovery as job -> profile -> data.
     profiles_meta = {
         str(row.get("name")): row
         for row in (context.get("profiles") or [])
         if isinstance(row, dict) and row.get("name")
     }
     discovery = context.get("discovery") if isinstance(context.get("discovery"), dict) else {}
+    entry_targets = {
+        str(row.get("job_id") or ""): str(row.get("target") or "")
+        for row in (context.get("entry_points") or [])
+        if isinstance(row, dict)
+    }
+
+    def is_profile_discovery(value: Any) -> bool:
+        return isinstance(value, dict) and any(
+            key in value for key in ("request_cases", "html_urls", "urls", "errors", "browser_navigation_urls")
+        )
+
+    discovery_rows: list[tuple[str, str, dict[str, Any]]] = []
+    if any(is_profile_discovery(value) for value in discovery.values()):
+        for profile_name, data in discovery.items():
+            if is_profile_discovery(data):
+                discovery_rows.append(("", str(profile_name), data))
+    else:
+        for job_id, per_profile in discovery.items():
+            if not isinstance(per_profile, dict):
+                continue
+            for profile_name, data in per_profile.items():
+                if is_profile_discovery(data):
+                    discovery_rows.append((str(job_id), str(profile_name), data))
+
     profile_cards: list[str] = []
-    for profile_name, data in discovery.items():
-        if not isinstance(data, dict):
-            continue
+    for job_id, profile_name, data in discovery_rows:
         meta = profiles_meta.get(profile_name, {})
         auth_label = "authenticated" if meta.get("authenticated") else "anonymous"
         rows: list[tuple[str, str]] = [("Profile", f"{_esc(profile_name)} ({auth_label})")]
+        if job_id:
+            rows.append(("Entry point", _esc(entry_targets.get(job_id) or job_id)))
 
         auth_effective = data.get("authentication_effective")
         if auth_effective is not None:

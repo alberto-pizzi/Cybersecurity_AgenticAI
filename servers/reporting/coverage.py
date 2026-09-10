@@ -576,11 +576,33 @@ def summarize(results: dict[str, Any], findings: list[dict[str, Any]], coverage:
                 "cause": str(result.get("diagnosis") or "unspecified"),
                 "explanation": _redact_text(result.get("output") or note),
             })
+    for entry in context.get("entry_points", []) if isinstance(context.get("entry_points"), list) else []:
+        if not isinstance(entry, dict):
+            continue
+        status = str(entry.get("status") or "").lower()
+        report_available = bool(entry.get("report_available", True))
+        if status not in {"error", "blocked"} and not (status in {"success", "reported", "unknown"} and not report_available):
+            continue
+        job_id = str(entry.get("job_id") or "entry-point")
+        target = str(entry.get("target") or "")
+        reason = str(entry.get("reason") or "")
+        if status == "error":
+            cause = "entry_point_execution_failed"
+        elif status == "blocked":
+            cause = "entry_point_blocked"
+        else:
+            cause = "entry_point_report_missing"
+        limitations.append({
+            "path": f"assessmentRunner/{job_id}",
+            "status": status if cause != "entry_point_report_missing" else "partial",
+            "cause": cause,
+            "explanation": reason or f"The configured entry point {target or job_id} did not produce a complete per-job assessment report.",
+        })
     risks = Counter(item["risk"] for item in findings)
     categories = Counter(item["category"] for item in findings)
     discovery = context.get("discovery") if isinstance(context.get("discovery"), dict) else {}
     constraints = _coverage_constraints(results, findings, coverage, context)
-    execution_complete = not any(row["status"] in {"error", "partial", "time_limit", "not_run"} for row in coverage)
+    execution_complete = (not limitations) and not any(row["status"] in {"error", "partial", "time_limit", "not_run"} for row in coverage)
     return {
         "risk_counts": dict(risks),
         "category_counts": dict(categories),
