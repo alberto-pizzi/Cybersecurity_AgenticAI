@@ -7,6 +7,7 @@ import functools
 import html
 import importlib.util
 import json
+import math
 import os
 import re
 import shutil
@@ -31,7 +32,7 @@ import requests
 with warnings.catch_warnings():
     warnings.simplefilter('ignore')
     from fastmcp import Client
-from utils import apply_runtime_target_preparation, absolute_url, canonical_cookie_header, cookie_names, load_runtime_config, normalize_url, normalized_origin, parse_cookie_header, ROOT_DIR, same_origin, scanner_session_probe, SERVERS_DIR, target_runtime_profile, url_in_authorized_scope as _url_in_explicit_scope, MCP_UNIFIED_SERVICE, mcp_http_port, mcp_http_url
+from utils import apply_runtime_target_preparation, absolute_url, canonical_cookie_header, cookie_names, load_runtime_config, normalize_url, normalized_origin, parse_cookie_header, ROOT_DIR, same_origin, sanitize_discovered_url, scanner_session_probe, SERVERS_DIR, target_runtime_profile, url_in_authorized_scope as _url_in_explicit_scope, MCP_UNIFIED_SERVICE, mcp_http_port, mcp_http_url
 ROOT = Path(ROOT_DIR).resolve()
 SERVERS = Path(SERVERS_DIR).resolve()
 RUNTIME_FILE = ROOT / '.secops_runtime.json'
@@ -75,13 +76,20 @@ MAX_CRAWL_PAGES = max(10, int(os.getenv('SECOPS_MAX_CRAWL_PAGES', '180')))
 MAX_SCRIPT_ASSETS = max(4, int(os.getenv('SECOPS_MAX_SCRIPT_ASSETS', '72')))
 SCANNER_PROGRESS_INTERVAL = max(10, int(os.getenv('SECOPS_PROGRESS_INTERVAL', '30')))
 DISCOVERY_LIMITS = {
-    'fast': {'crawl_pages': 35, 'browser_pages': 16, 'scripts': 12, 'route_variants': 2, 'per_origin_pages': 24},
-    'balanced': {'crawl_pages': 90, 'browser_pages': 60, 'scripts': 36, 'route_variants': 3, 'per_origin_pages': 60},
-    'deep': {'crawl_pages': 180, 'browser_pages': 120, 'scripts': 72, 'route_variants': 4, 'per_origin_pages': 120},
+    'fast': {'crawl_pages': 35, 'browser_pages': 16, 'browser_pages_max': 32, 'browser_per_origin_pages': 32, 'scripts': 12, 'route_variants': 2, 'per_origin_pages': 24},
+    'balanced': {'crawl_pages': 90, 'browser_pages': 60, 'browser_pages_max': 120, 'browser_per_origin_pages': 120, 'scripts': 36, 'route_variants': 3, 'per_origin_pages': 60},
+    'deep': {'crawl_pages': 180, 'browser_pages': 120, 'browser_pages_max': 240, 'browser_per_origin_pages': 240, 'scripts': 72, 'route_variants': 4, 'per_origin_pages': 120},
 }
 FINAL_BROWSER_VERIFICATION_LIMITS = {'fast': 8, 'balanced': 40, 'deep': 120}
 FINAL_BROWSER_VERIFICATION_MAX_LIMITS = {'fast': 12, 'balanced': 64, 'deep': 180}
 JWT_TOKEN_LIMITS = {'fast': 16, 'balanced': 64, 'deep': 192}
+# Broad sibling coverage is deliberately smaller than primary-origin coverage in fast/balanced.
+# Authorized siblings remain available to specialist selectors even when they are not selected for
+# the full ZAP/Nuclei/Nikto baseline. Deep preserves the wider broad sweep.
+BROAD_SIBLING_ORIGIN_BASE_LIMITS = {'fast': 1, 'balanced': 3, 'deep': 8}
+BROAD_SIBLING_ORIGIN_MAX_LIMITS = {'fast': 2, 'balanced': 5, 'deep': 12}
+BROAD_SIBLING_ADAPTIVE_RATIO = 0.75
+BROAD_SIBLING_TIMEOUT_FACTORS = {'fast': 0.50, 'balanced': 0.60, 'deep': 0.75}
 SCAN_MODES = {
     'fast': {
         'broad': {'zap': 120, 'nuclei': 150, 'nikto': 60, 'ffuf': 50, 'session': 25},
@@ -822,9 +830,9 @@ class LinkFormParser(HTMLParser):
             self.forms.append(self.current)
             self.current = None
 
-# Removes fragments and returns a clean URL for crawling.
+# Removes fragments and sanitizes stray whitespace from discovered URL authorities.
 def _clean_url(url: str) -> str:
-    return urlunparse(urlparse(url)._replace(fragment=''))
+    return sanitize_discovered_url(url)
 
 # Fixes links that repeat the target base path by mistake.
 def _normalize_redundant_base_path_link(target: str, candidate: str) -> str:
@@ -863,6 +871,13 @@ def _discovery_url_score(url: str) -> int:
         score -= 12
     if len(parsed.query) > 700:
         score -= 18
+    return score
+
+# Queue ranking protects the primary target surface without excluding explicitly authorized sibling origins.
+def _discovery_queue_score(target: str, url: str) -> int:
+    score = _discovery_url_score(url)
+    if same_origin(target, url):
+        score += 24
     return score
 
 # Script scoring favors application/API code while still allowing a bounded amount of framework/vendor code.
@@ -1184,19 +1199,25 @@ def _browser_network_case(url: str, method: str, data: str, content_type: str, s
     }
 
 # Uses Chromium as a bounded dynamic discovery queue so rendered navigation and XHR/fetch contracts become scanner inputs.
-def _browser_network_discovery(target: str, cookies: str, html_urls: list[str]) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[str], list[dict[str, Any]]]:
+def _browser_network_discovery(target: str, cookies: str, html_urls: list[str]) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[str], list[dict[str, Any]], dict[str, Any]]:
 
+    limits = DISCOVERY_LIMITS.get(CURRENT_SCAN_MODE, DISCOVERY_LIMITS['balanced'])
+    navigation_budget = int(limits['browser_pages'])
+    navigation_max_budget = max(navigation_budget, int(limits.get('browser_pages_max', navigation_budget)))
+    route_variant_limit = int(limits['route_variants'])
+    per_origin_limit = int(limits.get('browser_per_origin_pages', limits['per_origin_pages']))
+    budget_info: dict[str, Any] = {
+        'base_budget': navigation_budget, 'max_budget': navigation_max_budget,
+        'attempted': 0, 'adaptive_overflow_used': 0, 'remaining_candidates': 0,
+        'adaptive_threshold': None, 'max_saturated': False,
+    }
     try:
         from playwright.sync_api import sync_playwright
     except Exception as exc:
-        return ([], [], [], [{'url': target, 'type': 'BrowserDiscoveryUnavailable', 'message': f'{type(exc).__name__}: {exc}'}])
-    limits = DISCOVERY_LIMITS.get(CURRENT_SCAN_MODE, DISCOVERY_LIMITS['balanced'])
-    navigation_budget = int(limits['browser_pages'])
-    route_variant_limit = int(limits['route_variants'])
-    per_origin_limit = int(limits['per_origin_pages'])
+        return ([], [], [], [{'url': target, 'type': 'BrowserDiscoveryUnavailable', 'message': f'{type(exc).__name__}: {exc}'}], budget_info)
     ranked_pages = sorted(
         { _clean_url(value) for value in html_urls if value and url_in_authorized_scope(target, value) },
-        key=lambda value: (-_discovery_url_score(value), len(urlparse(value).path), value),
+        key=lambda value: (-_discovery_queue_score(target, value), len(urlparse(value).path), value),
     )
     target_url = _clean_url(target)
     if target_url in ranked_pages:
@@ -1233,7 +1254,7 @@ def _browser_network_discovery(target: str, cookies: str, html_urls: list[str]) 
         queued.add(candidate)
         queued_signatures[signature] += 1
         queue.append(candidate)
-        queue.sort(key=lambda value: (-_discovery_url_score(value), value))
+        queue.sort(key=lambda value: (-_discovery_queue_score(target, value), value))
 
     enqueue_dynamic(target_url, force=True)
     for value in ranked_pages:
@@ -1316,7 +1337,17 @@ def _browser_network_discovery(target: str, cookies: str, html_urls: list[str]) 
             page.on('request', record_request)
             page.on('response', record_response)
             page.on('requestfailed', record_failed)
-            while queue and len(visited) < navigation_budget:
+            base_scores: list[int] = []
+            adaptive_threshold: int | None = None
+            while queue and len(visited) < navigation_max_budget:
+                value = queue[0]
+                value_score = _discovery_queue_score(target, value)
+                if len(visited) >= navigation_budget:
+                    if adaptive_threshold is None:
+                        cutoff_score = min(base_scores) if base_scores else value_score
+                        adaptive_threshold = max(1, int(cutoff_score * 0.75))
+                    if value_score < adaptive_threshold:
+                        break
                 value = queue.pop(0)
                 if value in visited:
                     continue
@@ -1327,6 +1358,8 @@ def _browser_network_discovery(target: str, cookies: str, html_urls: list[str]) 
                 visited.add(value)
                 visited_signatures[signature] += 1
                 origin_visits[origin_key] += 1
+                if len(visited) <= navigation_budget and _discovery_route_signature(value) != _discovery_route_signature(target_url):
+                    base_scores.append(value_score)
                 current_source['url'] = value
                 try:
                     response = page.goto(value, wait_until='domcontentloaded', timeout=12000)
@@ -1342,6 +1375,13 @@ def _browser_network_discovery(target: str, cookies: str, html_urls: list[str]) 
                             enqueue_dynamic(frame_url)
                 except Exception as exc:
                     errors.append({'url': value, 'type': 'BrowserDiscoveryNavigation', 'message': f'{type(exc).__name__}: {exc}'})
+            budget_info.update(
+                attempted=len(visited),
+                adaptive_overflow_used=max(0, len(visited) - navigation_budget),
+                remaining_candidates=len(queue),
+                adaptive_threshold=adaptive_threshold,
+                max_saturated=bool(queue and len(visited) >= navigation_max_budget),
+            )
             browser.close()
     except Exception as exc:
         errors.append({'url': target, 'type': 'BrowserDiscoveryRuntime', 'message': f'{type(exc).__name__}: {exc}'})
@@ -1353,7 +1393,13 @@ def _browser_network_discovery(target: str, cookies: str, html_urls: list[str]) 
             continue
         seen_observed.add(key)
         unique_observed.append(row)
-    return (_dedupe_request_cases(cases), unique_observed, list(dict.fromkeys(navigated)), errors)
+    budget_info.update(
+        attempted=max(int(budget_info.get('attempted', 0) or 0), len(visited)),
+        adaptive_overflow_used=max(int(budget_info.get('adaptive_overflow_used', 0) or 0), max(0, len(visited) - navigation_budget)),
+        remaining_candidates=max(int(budget_info.get('remaining_candidates', 0) or 0), len(queue)),
+        max_saturated=bool(budget_info.get('max_saturated')) or bool(queue and len(visited) >= navigation_max_budget),
+    )
+    return (_dedupe_request_cases(cases), unique_observed, list(dict.fromkeys(navigated)), errors, budget_info)
 
 # Crawls the target and records pages, forms, parameters, scripts, browser requests, and auth state.
 def discover_target(target: str, cookies: str, max_pages: int=MAX_CRAWL_PAGES, seeds: list[str] | None=None) -> dict[str, Any]:
@@ -1429,7 +1475,7 @@ def discover_target(target: str, cookies: str, max_pages: int=MAX_CRAWL_PAGES, s
         queued.add(value)
         queued_signatures[signature] += 1
         queue.append(value)
-        queue.sort(key=lambda candidate: (-_discovery_url_score(candidate), candidate))
+        queue.sort(key=lambda candidate: (-_discovery_queue_score(target, candidate), candidate))
 
     for value in dict.fromkeys(initial):
         enqueue(value, force=value == _clean_url(target))
@@ -1615,7 +1661,7 @@ def discover_target(target: str, cookies: str, max_pages: int=MAX_CRAWL_PAGES, s
                 if case['method'] == 'GET':
                     parameterized.add(case['url'])
 
-    browser_cases, browser_network_requests, browser_navigation_urls, browser_errors = _browser_network_discovery(target, cookies, sorted(html_urls)) if html_urls else ([], [], [], [])
+    browser_cases, browser_network_requests, browser_navigation_urls, browser_errors, browser_budget_info = _browser_network_discovery(target, cookies, sorted(html_urls)) if html_urls else ([], [], [], [], {'base_budget': int(limits['browser_pages']), 'max_budget': int(limits.get('browser_pages_max', limits['browser_pages'])), 'attempted': 0, 'adaptive_overflow_used': 0, 'remaining_candidates': 0, 'adaptive_threshold': None, 'max_saturated': False})
     request_cases.extend(browser_cases)
     html_urls.update(browser_navigation_urls)
     visited.update(browser_navigation_urls)
@@ -1666,8 +1712,17 @@ def discover_target(target: str, cookies: str, max_pages: int=MAX_CRAWL_PAGES, s
         'http_pages_processed': pages_processed,
         'http_attempt_budget': attempt_budget,
         'http_requests_attempted': http_attempts,
+        'http_remaining_candidates': len(queue),
+        'http_page_budget_saturated': bool(queue and pages_processed >= page_budget),
+        'http_attempt_budget_saturated': bool(queue and http_attempts >= attempt_budget),
         'dead_http_404_410': dead_http_responses,
-        'browser_page_budget': int(limits['browser_pages']),
+        'browser_page_budget': int(browser_budget_info.get('base_budget', limits['browser_pages'])),
+        'browser_page_max_budget': int(browser_budget_info.get('max_budget', limits.get('browser_pages_max', limits['browser_pages']))),
+        'browser_pages_attempted': int(browser_budget_info.get('attempted', 0) or 0),
+        'browser_adaptive_overflow_used': int(browser_budget_info.get('adaptive_overflow_used', 0) or 0),
+        'browser_remaining_candidates': int(browser_budget_info.get('remaining_candidates', 0) or 0),
+        'browser_adaptive_threshold': browser_budget_info.get('adaptive_threshold'),
+        'browser_max_budget_saturated': bool(browser_budget_info.get('max_saturated', False)),
         'script_budget': script_budget,
         'scripts_processed': len(scanned_script_urls),
         'route_variant_limit': route_variant_limit,
@@ -1724,26 +1779,112 @@ def discover_target_sync_safe(target: str, cookies: str, max_pages: int=MAX_CRAW
     with ThreadPoolExecutor(max_workers=1, thread_name_prefix='secops-discovery') as executor:
         return executor.submit(discover_target, target, cookies, max_pages, seeds).result()
 
-def discovered_scope_origins(discovery: dict[str, Any], target: str, limit: int | None=None) -> list[str]:
+def _discovered_scope_origin_evidence(discovery: dict[str, Any], target: str) -> dict[str, dict[str, int]]:
     primary = normalized_origin(target)
-    candidates: dict[str, int] = {}
-    values: list[str] = []
-    for key in ('urls', 'html_urls', 'form_urls', 'parameterized_urls', 'script_urls', 'browser_navigation_urls'):
-        values.extend(str(value) for value in discovery.get(key, []) if isinstance(value, str))
-    for key in ('request_cases', 'browser_network_requests', 'script_endpoint_hints'):
-        for row in discovery.get(key, []):
-            if isinstance(row, dict):
-                values.append(str(row.get('url') or ''))
-    for value in values:
+    evidence: dict[str, dict[str, int]] = {}
+
+    def add(value: str, bonus: int=0, interactive: int=0) -> None:
+        value = str(value or '')
         if not value or not url_in_authorized_scope(target, value):
-            continue
+            return
         origin = normalized_origin(value)
         if not origin or origin == primary:
+            return
+        bucket = evidence.setdefault(origin, {'max_score': -1000, 'observations': 0, 'interactive': 0})
+        bucket['max_score'] = max(bucket['max_score'], _discovery_url_score(value) + int(bonus))
+        bucket['observations'] += 1
+        bucket['interactive'] += int(interactive)
+
+    for key in ('urls', 'html_urls', 'parameterized_urls', 'script_urls'):
+        for value in discovery.get(key, []):
+            if isinstance(value, str):
+                add(value)
+    for value in discovery.get('form_urls', []):
+        if isinstance(value, str):
+            add(value, bonus=10, interactive=2)
+    for value in discovery.get('browser_navigation_urls', []):
+        if isinstance(value, str):
+            add(value, bonus=8, interactive=1)
+    for row in discovery.get('request_cases', []):
+        if not isinstance(row, dict):
             continue
-        candidates[origin] = max(candidates.get(origin, -1000), _discovery_url_score(value))
-    default_limit = 2 if CURRENT_SCAN_MODE == 'fast' else 6 if CURRENT_SCAN_MODE == 'balanced' else 12
-    effective_limit = max(0, int(default_limit if limit is None else limit))
-    return [origin for origin, _ in sorted(candidates.items(), key=lambda item: (-item[1], item[0]))[:effective_limit]]
+        method = str(row.get('method') or 'GET').upper()
+        params = row.get('parameters') if isinstance(row.get('parameters'), list) else []
+        bonus = (12 if method in {'POST', 'PUT', 'PATCH', 'DELETE'} else 4) + min(18, len(params) * 3)
+        add(str(row.get('url') or ''), bonus=bonus, interactive=3)
+    for row in discovery.get('browser_network_requests', []):
+        if isinstance(row, dict):
+            add(str(row.get('url') or ''), bonus=14, interactive=3)
+    for row in discovery.get('script_endpoint_hints', []):
+        if isinstance(row, dict):
+            add(str(row.get('url') or ''), bonus=8, interactive=1)
+    return evidence
+
+
+def discovered_scope_origin_ranking(discovery: dict[str, Any], target: str) -> list[tuple[str, int]]:
+    ranked: list[tuple[str, int]] = []
+    for origin, bucket in _discovered_scope_origin_evidence(discovery, target).items():
+        score = int(bucket['max_score']) + min(24, int(bucket['observations'])) + min(24, int(bucket['interactive']))
+        ranked.append((origin, score))
+    return sorted(ranked, key=lambda item: (-item[1], item[0]))
+
+
+def sibling_broad_origin_limits() -> tuple[int, int]:
+    base = max(0, int(BROAD_SIBLING_ORIGIN_BASE_LIMITS.get(CURRENT_SCAN_MODE, 3)))
+    maximum = max(base, int(BROAD_SIBLING_ORIGIN_MAX_LIMITS.get(CURRENT_SCAN_MODE, base)))
+    return base, maximum
+
+
+def select_sibling_broad_origins(discovery: dict[str, Any], target: str) -> dict[str, Any]:
+    ranking = discovered_scope_origin_ranking(discovery, target)
+    base_limit, max_limit = sibling_broad_origin_limits()
+    if not ranking or base_limit <= 0:
+        return {'selected': [], 'ranking': ranking, 'base_limit': base_limit, 'max_limit': max_limit, 'overflow': 0, 'cutoff_score': None, 'threshold_score': None}
+
+    selected = list(ranking[:base_limit])
+    if len(ranking) <= base_limit or len(selected) >= max_limit:
+        return {'selected': selected, 'ranking': ranking, 'base_limit': base_limit, 'max_limit': max_limit, 'overflow': 0, 'cutoff_score': selected[-1][1] if selected else None, 'threshold_score': None}
+
+    cutoff_score = int(selected[-1][1])
+    threshold_score = int(math.ceil(cutoff_score * BROAD_SIBLING_ADAPTIVE_RATIO))
+    evidence = _discovered_scope_origin_evidence(discovery, target)
+    for origin, score in ranking[base_limit:max_limit]:
+        bucket = evidence.get(origin, {})
+        # Overflow is reserved for origins with real application interaction evidence, not merely
+        # static links/assets. This keeps balanced bounded while allowing strong extra surfaces.
+        if int(score) < threshold_score or int(bucket.get('interactive', 0)) <= 0:
+            continue
+        selected.append((origin, score))
+
+    return {
+        'selected': selected,
+        'ranking': ranking,
+        'base_limit': base_limit,
+        'max_limit': max_limit,
+        'overflow': max(0, len(selected) - min(base_limit, len(ranking))),
+        'cutoff_score': cutoff_score,
+        'threshold_score': threshold_score,
+    }
+
+
+def sibling_broad_origin_limit() -> int:
+    # Backward-compatible helper: returns the adaptive maximum, not the normal base allocation.
+    return sibling_broad_origin_limits()[1]
+
+
+def sibling_broad_timeout(tool: str, base_timeout: float | int | None=None) -> int:
+    scanner = str(tool or '').lower()
+    if base_timeout is None:
+        base_timeout = BROAD_SCANNER_TIMEOUTS.get(scanner, 180)
+    factor = float(BROAD_SIBLING_TIMEOUT_FACTORS.get(CURRENT_SCAN_MODE, 0.60))
+    return max(45, int(float(base_timeout) * factor))
+
+
+def discovered_scope_origins(discovery: dict[str, Any], target: str, limit: int | None=None) -> list[str]:
+    ranking = discovered_scope_origin_ranking(discovery, target)
+    if limit is None:
+        return [origin for origin, _ in ranking]
+    return [origin for origin, _ in ranking[:max(0, int(limit))]]
 
 
 # Filters discovery evidence to one origin so broad scanners can test sibling origins independently without sharing cookies.

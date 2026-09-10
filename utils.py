@@ -334,7 +334,7 @@ def find_executable(name: str) -> str | None:
 # URL normalization removes fragments and trailing path separators without altering query values.
 def normalize_url(url: str) -> str:
     try:
-        parsed = urlparse(str(url or "").strip())
+        parsed = urlparse(sanitize_discovered_url(url))
     except ValueError as exc:
         raise ValueError("The target must be a valid absolute HTTP/HTTPS URL.") from exc
     if _url_origin_parts(url) is None:
@@ -415,9 +415,38 @@ def trim_process_output(result: dict[str, Any], limit: int) -> dict[str, Any]:
     return result
 
 
-# Resolves a discovered link against its base URL.
+# Removes stray whitespace from discovered URL authorities without touching path/query data.
+def sanitize_discovered_url(url: str) -> str:
+    raw = str(url or "").strip()
+    if not raw:
+        return ""
+    parsed = urlparse(raw)
+    netloc = str(parsed.netloc or "").strip()
+    if netloc:
+        userinfo = ""
+        hostport = netloc
+        if "@" in hostport:
+            userinfo, hostport = hostport.rsplit("@", 1)
+        host = hostport
+        port_fragment = ""
+        if hostport.startswith("["):
+            closing = hostport.find("]")
+            if closing >= 0:
+                host = hostport[: closing + 1]
+                port_fragment = hostport[closing + 1 :]
+        elif ":" in hostport:
+            maybe_host, maybe_port = hostport.rsplit(":", 1)
+            if maybe_port.isdigit():
+                host, port_fragment = maybe_host, ":" + maybe_port
+        host = re.sub(r"(?i)(?:%20|%09|%0a|%0d)+$", "", host.strip())
+        hostport = host + port_fragment
+        netloc = (userinfo + "@" if userinfo else "") + hostport
+    return urlunparse(parsed._replace(netloc=netloc, fragment=""))
+
+
+# Resolves a discovered link against its base URL and sanitizes stray authority whitespace.
 def absolute_url(base: str, candidate: str) -> str:
-    return urlparse(urljoin(base, candidate))._replace(fragment="").geturl()
+    return sanitize_discovered_url(urljoin(str(base or "").strip(), str(candidate or "").strip()))
 
 
 # Server tools share one result structure for status, findings, output, and diagnostics.

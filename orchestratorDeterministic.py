@@ -100,10 +100,22 @@ async def deterministic_discovery_node(state: DeterministicState) -> dict[str, A
         dead_count = int(budget.get('dead_http_404_410', 0) or 0)
         if dead_count:
             print(f"      [DISCOVERY] {dead_count} risposte HTTP 404/410 conservate come diagnostica e escluse dal budget utile; tentativi HTTP={budget.get('http_requests_attempted', 0)}/{budget.get('http_attempt_budget', 0)}")
+        http_pages = int(budget.get('http_pages_processed', 0) or 0)
+        http_page_budget = int(budget.get('http_page_budget', 0) or 0)
+        http_remaining = int(budget.get('http_remaining_candidates', 0) or 0)
+        if http_remaining and budget.get('http_page_budget_saturated'):
+            print(f"      [DISCOVERY] Budget pagine HTTP utili saturo: {http_pages}/{http_page_budget}; restano {http_remaining} candidati in coda.")
+        elif http_remaining and budget.get('http_attempt_budget_saturated'):
+            print(f"      [DISCOVERY] Budget tentativi HTTP saturo: {budget.get('http_requests_attempted', 0)}/{budget.get('http_attempt_budget', 0)}; restano {http_remaining} candidati in coda.")
         browser_budget = int(budget.get('browser_page_budget', 0) or 0)
-        browser_used = len(found.get('browser_navigation_urls', []))
-        if browser_budget and browser_used >= browser_budget:
-            print(f"      [DISCOVERY] Budget navigazioni Chromium saturo: {browser_used}/{browser_budget}; ulteriori pagine dinamiche possono restare non navigate.")
+        browser_max_budget = int(budget.get('browser_page_max_budget', browser_budget) or browser_budget)
+        browser_attempted = int(budget.get('browser_pages_attempted', len(found.get('browser_navigation_urls', []))) or 0)
+        browser_overflow = int(budget.get('browser_adaptive_overflow_used', 0) or 0)
+        browser_remaining = int(budget.get('browser_remaining_candidates', 0) or 0)
+        if browser_overflow:
+            print(f"      [DISCOVERY] Budget adattivo Chromium: base={browser_budget}, overflow={browser_overflow}, tentativi={browser_attempted}/{browser_max_budget}.")
+        if browser_remaining and browser_attempted >= browser_max_budget:
+            print(f"      [DISCOVERY] Budget massimo navigazioni Chromium saturo: {browser_attempted}/{browser_max_budget}; restano {browser_remaining} candidati in coda.")
         browser_warning = shared.chromium_discovery_warning(found)
         if browser_warning:
             print(f"      [BROWSER WARNING] {browser_warning}")
@@ -126,9 +138,24 @@ async def deterministic_broad_scan_node(state: DeterministicState) -> dict[str, 
     profile_session_state = {profile['name']: discovery[profile['name']].get('authentication_effective') is not False for profile in profiles}
     has_authenticated_profile = any((bool(profile.get('cookies')) and profile_session_state.get(profile['name'], True) for profile in profiles))
     broad_specs = {spec.name: spec for spec in BASE_TOOLS}
+    anonymous_available = any(str(profile.get('name') or '') == 'anonymous' for profile in profiles)
     for profile in profiles:
         name, cookies = (profile['name'], profile['cookies'])
         print(f'\n[*] Scanner generali - profilo: {name}')
+        sibling_selection = shared.select_sibling_broad_origins(discovery[name], target)
+        sibling_ranking = sibling_selection['ranking']
+        sibling_origins = []
+        if name == 'anonymous' or not anonymous_available:
+            sibling_origins = [origin for origin, _ in sibling_selection['selected']]
+            if sibling_ranking:
+                print(
+                    f"    [INFO   ] Broad sibling policy: selected={len(sibling_origins)}/{len(sibling_ranking)} "
+                    f"(base={sibling_selection['base_limit']}, adaptive_overflow={sibling_selection['overflow']}, "
+                    f"max={sibling_selection['max_limit']}) authorized observed origin(s) for full ZAP/Nuclei/Nikto coverage "
+                    f"in {shared.CURRENT_SCAN_MODE}; specialist request-level candidates remain eligible on every authorized observed origin."
+                )
+        elif sibling_ranking:
+            print('    [INFO   ] Broad sibling coverage is already assigned to the anonymous profile; duplicate no-cookie scans are omitted here.')
         if cookies and 'anonymous' in results:
             anonymous_ffuf = results.get('anonymous', {}).get('ffuf', {})
             if isinstance(anonymous_ffuf, dict):
@@ -153,9 +180,9 @@ async def deterministic_broad_scan_node(state: DeterministicState) -> dict[str, 
             log_result(name, spec.name, result, target)
             sibling_runs: list[dict[str, Any]] = []
             if result.get('status') != 'skipped' and spec.name in {'zap', 'nuclei', 'nikto'}:
-                for sibling_origin in shared.discovered_scope_origins(discovery[name], target):
+                for sibling_origin in sibling_origins:
                     sibling_discovery = shared.discovery_for_origin(discovery[name], sibling_origin)
-                    sibling_timeout = max(45, int(scanner_timeout * (0.75 if shared.CURRENT_SCAN_MODE == 'deep' else 0.6)))
+                    sibling_timeout = shared.sibling_broad_timeout(spec.name, scanner_timeout)
                     sibling_arguments = build_tool_arguments(spec.name, sibling_origin, cookies, sibling_discovery, timeout_override=sibling_timeout)
                     sibling_result = await call_mcp_with_progress(spec, sibling_arguments)
                     _tag_coverage_action(sibling_result, spec.name, target_url=sibling_origin)

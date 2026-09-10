@@ -1637,10 +1637,22 @@ def discovery_node(state: AgentState) -> dict[str, Any]:
         dead_count = int(budget.get('dead_http_404_410', 0) or 0)
         if dead_count:
             print(f"      [DISCOVERY] {dead_count} HTTP 404/410 responses kept as diagnostics and excluded from the useful-page budget; HTTP attempts={budget.get('http_requests_attempted', 0)}/{budget.get('http_attempt_budget', 0)}")
+        http_pages = int(budget.get('http_pages_processed', 0) or 0)
+        http_page_budget = int(budget.get('http_page_budget', 0) or 0)
+        http_remaining = int(budget.get('http_remaining_candidates', 0) or 0)
+        if http_remaining and budget.get('http_page_budget_saturated'):
+            print(f"      [DISCOVERY] HTTP useful-page budget saturated: {http_pages}/{http_page_budget}; {http_remaining} queued candidate(s) remain.")
+        elif http_remaining and budget.get('http_attempt_budget_saturated'):
+            print(f"      [DISCOVERY] HTTP attempt budget saturated: {budget.get('http_requests_attempted', 0)}/{budget.get('http_attempt_budget', 0)}; {http_remaining} queued candidate(s) remain.")
         browser_budget = int(budget.get('browser_page_budget', 0) or 0)
-        browser_used = len(found.get('browser_navigation_urls', []))
-        if browser_budget and browser_used >= browser_budget:
-            print(f"      [DISCOVERY] Chromium navigation budget saturated: {browser_used}/{browser_budget}; additional dynamic pages may remain unnavigated.")
+        browser_max_budget = int(budget.get('browser_page_max_budget', browser_budget) or browser_budget)
+        browser_attempted = int(budget.get('browser_pages_attempted', len(found.get('browser_navigation_urls', []))) or 0)
+        browser_overflow = int(budget.get('browser_adaptive_overflow_used', 0) or 0)
+        browser_remaining = int(budget.get('browser_remaining_candidates', 0) or 0)
+        if browser_overflow:
+            print(f"      [DISCOVERY] Chromium adaptive navigation budget: base={browser_budget}, overflow={browser_overflow}, attempted={browser_attempted}/{browser_max_budget}.")
+        if browser_remaining and browser_attempted >= browser_max_budget:
+            print(f"      [DISCOVERY] Chromium navigation max budget saturated: {browser_attempted}/{browser_max_budget}; {browser_remaining} queued candidate(s) remain.")
         browser_warning = shared.chromium_discovery_warning(found)
         if browser_warning:
             print(f"      [BROWSER WARNING] {browser_warning}")
@@ -1648,6 +1660,20 @@ def discovery_node(state: AgentState) -> dict[str, Any]:
             print(f"      [DISCOVERY WARNING] {error.get('type', 'error')}: {shared.compact_log_url(error.get('url', ''))} — {error.get('message', '')}")
         if found.get('authentication_effective') is False:
             print(f"    [WARNING] {profile['name']}: {found.get('authentication_note')}", file=sys.stderr)
+    broad_profile = next((str(profile.get('name') or '') for profile in state['profiles'] if str(profile.get('name') or '') == 'anonymous'), '')
+    if not broad_profile:
+        broad_profile = next((str(profile.get('name') or '') for profile in state['profiles'] if str(profile.get('name') or '')), '')
+    if broad_profile and broad_profile in discovery:
+        sibling_selection = shared.select_sibling_broad_origins(discovery[broad_profile], state['target'])
+        sibling_ranking = sibling_selection['ranking']
+        if sibling_ranking:
+            print(
+                f"    [DISCOVERY] Broad sibling policy ({shared.CURRENT_SCAN_MODE}): "
+                f"selected={len(sibling_selection['selected'])}/{len(sibling_ranking)} "
+                f"(base={sibling_selection['base_limit']}, adaptive_overflow={sibling_selection['overflow']}, "
+                f"max={sibling_selection['max_limit']}); full ZAP/Nuclei/Nikto coverage is limited to the ranked adaptive set, "
+                "while request-level specialists remain eligible across the full authorized discovered scope."
+            )
     return {'discovery': discovery, 'diagnostics': diagnostics}
 
 # Discovery evidence is converted into tool actions that the planner can safely choose.
@@ -1670,9 +1696,19 @@ def discovery_candidate_actions(state: AgentState) -> list[dict[str, Any]]:
         # scan each sibling broad surface only once there instead of duplicating an identical no-cookie
         # ZAP/Nuclei/Nikto run under the authenticated profile label.
         if name == 'anonymous' or not anonymous_available:
-            for sibling_origin in shared.discovered_scope_origins(state['discovery'].get(name, {}), state['target']):
+            sibling_selection = shared.select_sibling_broad_origins(state['discovery'].get(name, {}), state['target'])
+            for sibling_origin, sibling_score in sibling_selection['selected']:
                 for tool in ('zap', 'nuclei', 'nikto'):
-                    actions.append({'profile': name, 'tool': tool, 'target_url': sibling_origin, 'jwt_token': '', 'injection_url': '', 'reason': 'Broad no-cookie coverage for an explicitly authorized sibling origin observed during discovery.'})
+                    actions.append({
+                        'profile': name,
+                        'tool': tool,
+                        'target_url': sibling_origin,
+                        'jwt_token': '',
+                        'injection_url': '',
+                        'sibling_broad': True,
+                        'sibling_origin_score': sibling_score,
+                        'reason': 'Ranked broad no-cookie coverage for a high-value explicitly authorized sibling origin observed during discovery.',
+                    })
         for case in select_arjun_request_cases(state['discovery'].get(name, {}), state['target'], limit=shared.ARJUN_ENDPOINT_LIMIT):
             adaptive = bool(case.get('adaptive_budget'))
             actions.append({'profile': name, 'tool': 'arjun', 'target_url': case['url'], 'method': case.get('method', 'GET'), 'data': case.get('data', ''), 'parameters': case.get('parameters', []), 'jwt_token': '', 'injection_url': '', 'adaptive_budget': adaptive, 'priority_score': case.get('priority_score'), 'reason': ('Adaptive high-value overflow selected by deterministic ranking: ' if adaptive else '') + 'Hidden-parameter discovery using the real request method and body.'})
@@ -1763,7 +1799,7 @@ def validate_plan(state: AgentState, proposed: Any) -> list[dict[str, Any]]:
             if tool in {'ffuf', 'session'}:
                 target_url = state['target']
             else:
-                sibling_origins = set(shared.discovered_scope_origins(found, state['target']))
+                sibling_origins = {origin for origin, _ in shared.select_sibling_broad_origins(found, state['target'])['selected']}
                 if (not target_url) or shared.same_origin(state['target'], target_url):
                     target_url = state['target']
                 else:
@@ -1862,7 +1898,7 @@ def validate_plan(state: AgentState, proposed: Any) -> list[dict[str, Any]]:
                 data = str(selected.get('data', ''))
                 parameters = [str(value) for value in selected.get('parameters', [])]
                 oast_class = str(selected.get('oast_class') or 'remote-fetch')
-        action = {'profile': profile, 'tool': tool, 'target_url': target_url, 'method': method or 'GET', 'data': data, 'parameters': parameters, 'source_url': source_url, 'fields': fields, 'client_sources': client_sources, 'client_sinks': client_sinks, 'file_parameters': file_parameters, 'token_parameters': token_parameters, 'enctype': enctype, 'jwt_token': token, 'injection_url': injection, 'oast_class': oast_class, 'adaptive_budget': bool(selected.get('adaptive_budget')), 'priority_score': selected.get('priority_score'), 'reason': str(raw.get('reason', ''))[:500] or 'No planner reason supplied.'}
+        action = {'profile': profile, 'tool': tool, 'target_url': target_url, 'method': method or 'GET', 'data': data, 'parameters': parameters, 'source_url': source_url, 'fields': fields, 'client_sources': client_sources, 'client_sinks': client_sinks, 'file_parameters': file_parameters, 'token_parameters': token_parameters, 'enctype': enctype, 'jwt_token': token, 'injection_url': injection, 'oast_class': oast_class, 'adaptive_budget': bool(selected.get('adaptive_budget')), 'priority_score': selected.get('priority_score'), 'sibling_broad': bool(raw.get('sibling_broad')), 'sibling_origin_score': raw.get('sibling_origin_score'), 'reason': str(raw.get('reason', ''))[:500] or 'No planner reason supplied.'}
         identifier = action_id(action)
         key = (profile, tool)
         limit = shared.tool_action_limit(tool, include_adaptive=True)
@@ -2149,6 +2185,8 @@ async def execute_action(action: dict[str, Any], cookies: dict[str, str], discov
     else:
         profile_discovery = discovery.get(profile, {})
         arguments = shared.build_tool_arguments(tool, action['target_url'], cookies.get(profile, ''), profile_discovery, case=action, secondary_cookies=secondary_cookies, allow_state_changes=allow_state_changes)
+        if action.get('sibling_broad') and tool in {'zap', 'nuclei', 'nikto'}:
+            arguments['timeout'] = shared.sibling_broad_timeout(tool, arguments.get('timeout'))
         if tool == 'ffuf':
             arguments.pop('session_probe_url', None)
     state_refresh: dict[str, Any] | None = None

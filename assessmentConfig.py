@@ -54,7 +54,19 @@ def load_assessment_config(path: str | Path) -> dict[str, Any]:
     _validate_authorization(payload.get("authorization") or {})
     _validate_assets(assets)
     _validate_credentials(payload.get("credentials") or {})
+    _validate_reporting(payload.get("reporting"))
     return payload
+
+
+# Validates the optional aggregate-reporting controls used by multi-job assessments.
+def _validate_reporting(reporting: Any) -> None:
+    if reporting is None:
+        return
+    if not isinstance(reporting, dict):
+        raise ValueError("reporting must be a JSON object when supplied.")
+    for field in ("aggregate_report", "keep_job_reports"):
+        if field in reporting and not isinstance(reporting.get(field), bool):
+            raise ValueError(f"reporting.{field} must be true or false when supplied.")
 
 
 # Validates optional scope extensions without implicitly authorizing unrelated external hosts.
