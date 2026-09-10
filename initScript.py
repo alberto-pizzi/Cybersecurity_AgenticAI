@@ -11,7 +11,7 @@ from pathlib import Path
 
 from setupLab import setup_local_lab, update_runtime_auth
 from setupTools import (
-    BUILD_ID, COMMAND_REFERENCE_FILE, ROOT, RUNTIME_FILE, TARGET,
+    COMMAND_REFERENCE_FILE, ROOT, RUNTIME_FILE, TARGET,
     _ensure_report_docker_image, configure_path, configure_perl_environment, create_wordlist, install_playwright_browser,
     install_python_packages, install_scanners, run, verify_scanners, write_runtime_config,
 )
@@ -206,7 +206,7 @@ def verify_unified_mcp_source() -> None:
         raise RuntimeError(
             "Unified MCP server source is missing.\n"
             f"Expected: {UNIFIED_MCP_SERVER}\n"
-            "Copy servers/secopsServer.py from the same project version before running initialization or an orchestrator."
+            "Copy servers/secopsServer.py from the same project source tree before running initialization or an orchestrator."
         )
 
 
@@ -508,7 +508,7 @@ def print_important_commands(
 
 # Parses command-line options and drives the complete workflow for this entrypoint.
 def main() -> int:
-    print(f"=== SecOps initializer [{BUILD_ID}] ===")
+    print("=== SecOps initializer ===")
     parser = argparse.ArgumentParser(
         description="Initialize FastMCP SecOps and generate the complete operator command guide."
     )
@@ -540,7 +540,6 @@ def main() -> int:
     parser.add_argument("--skip-browser", action="store_true", help="Do not install/verify Playwright Chromium; browser-only checks will be skipped.")
     parser.add_argument("--require-browser", action="store_true", help="Compatibility flag: Chromium is already required by default unless --skip-browser is used.")
     parser.add_argument("--commands-only", action="store_true", help="Print every supported command/modifier, write init.txt, and exit.")
-    parser.add_argument("--version", action="version", version=BUILD_ID)
     args = parser.parse_args()
 
     try:

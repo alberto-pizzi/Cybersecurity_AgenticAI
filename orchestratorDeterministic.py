@@ -72,7 +72,8 @@ async def deterministic_discovery_node(state: DeterministicState) -> dict[str, A
     target = state['target']
     profiles = state['profiles']
     allow_state_changes = state.get('allow_state_changes')
-    print('\n[*] Discovery anonima e autenticata...')
+    active_profiles = ', '.join(str(profile.get('name') or '') for profile in profiles) or 'none'
+    print(f'\n[*] Discovery profili attivi: {active_profiles}')
     discovery: dict[str, dict[str, Any]] = {}
     diagnostics: list[dict[str, Any]] = []
     results = {profile['name']: {} for profile in profiles}
@@ -124,8 +125,17 @@ async def deterministic_broad_scan_node(state: DeterministicState) -> dict[str, 
             else:
                 arguments = build_tool_arguments(spec.name, target, cookies, discovery[name], timeout_override=scanner_timeout)
                 result = await call_mcp_with_progress(spec, arguments)
-            results[name][spec.name] = result
             log_result(name, spec.name, result, target)
+            sibling_runs: list[dict[str, Any]] = []
+            if result.get('status') != 'skipped' and spec.name in {'zap', 'nuclei', 'nikto'}:
+                for sibling_origin in shared.discovered_scope_origins(discovery[name], target):
+                    sibling_discovery = shared.discovery_for_origin(discovery[name], sibling_origin)
+                    sibling_timeout = max(45, int(scanner_timeout * (0.75 if shared.CURRENT_SCAN_MODE == 'deep' else 0.6)))
+                    sibling_arguments = build_tool_arguments(spec.name, sibling_origin, cookies, sibling_discovery, timeout_override=sibling_timeout)
+                    sibling_result = await call_mcp_with_progress(spec, sibling_arguments)
+                    sibling_runs.append(sibling_result)
+                    log_result(name, spec.name, sibling_result, sibling_origin)
+            results[name][spec.name] = aggregate_runs(spec.name, target, [result, *sibling_runs]) if sibling_runs else result
             if result.get('status') == 'skipped':
                 continue
             if spec.name == 'zap':
@@ -446,7 +456,7 @@ def _final_browser_verification_cases(state: DeterministicState) -> list[tuple[s
                     compatible_cases.append((shared.xss_verification_context_score(finding_url, case_url, parameter), case))
                 if compatible_cases:
                     selected = dict(max(compatible_cases, key=lambda item: item[0])[1])
-                if selected is None and same_origin(state['target'], finding_url) and not shared._destructive_crawl_url(finding_url):
+                if selected is None and shared.url_in_authorized_scope(state['target'], finding_url) and not shared._destructive_crawl_url(finding_url):
                     parsed = urlparse(finding_url)
                     pairs = [(name, '1' if any(token in value.lower() for token in ('<script', '<img', 'javascript:', 'onerror=', 'onload=')) else value) for name, value in parse_qsl(parsed.query, keep_blank_values=True)]
                     safe_url = urlunparse(parsed._replace(query=urlencode(pairs)))
@@ -645,8 +655,8 @@ def _parse_parameter_argument(value: str) -> list[str]:
 def _single_tool_case(discovery: dict[str, Any], tool: str, target: str, explicit_url: str, method: str, data: str, parameters: list[str], authenticated_profile: bool=False) -> dict[str, Any] | None:
     if explicit_url:
         url = normalize_url(explicit_url)
-        if not same_origin(target, url):
-            raise ValueError('--tool-url must have the same origin as --target.')
+        if not shared.url_in_authorized_scope(target, url):
+            raise ValueError('--tool-url must be inside the explicitly authorized assessment scope.')
         effective_parameters = list(parameters)
         if not effective_parameters:
             source = urlparse(url).query if method == 'GET' else data

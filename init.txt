@@ -27,8 +27,9 @@ B) NUOVA APPLICAZIONE - UN SOLO PUNTO DI INGRESSO
    password del sito devi usare --config con una credenziale di login supportata, per
    esempio kind=snap4city_oidc. In alternativa devi procurarti prima un cookie valido.
 
-   La discovery espande la superficie same-origin usando HTML, link, form, query string,
-   endpoint JavaScript e richieste document/XHR/fetch osservate da Chromium.
+   La discovery espande la superficie autorizzata usando HTML, link, form, query string,
+   endpoint JavaScript e richieste document/XHR/fetch osservate da Chromium. Origini diverse
+   dalla principale entrano solo se dichiarate esplicitamente nello scope autorizzato.
 
 C) NUOVA APPLICAZIONE - CONFIGURAZIONE
    Usa --config quando hai piu' host, porte, base path o identita'. Usalo anche quando
@@ -213,6 +214,8 @@ Override disponibili senza modificare il JSON:
   --auth-only
   --require-ai / --no-require-ai
   --authorized
+  --authorized-origin https://api.example.org      (ripetibile)
+  --authorized-host-suffix example.org            (ripetibile)
   --allow-state-changes
   --no-allow-state-changes
   --dry-run
@@ -233,6 +236,7 @@ configs/dashboard-test.json contiene HTTP/80 e HTTPS/443. Il run autorizzato del
 HTTP/80 con base_path=/, quindi http-80 e' gia' enabled; HTTPS/443 resta disabled finche' non viene verificato.
 Usa soltanto un account Snap4City autorizzato per questo test.
 configs/dashboard-test.json usa credential_ref=dashboard_session con login browser automatico Snap4City/Keycloak.
+Lo stesso config autorizza anche il suffisso snap4city.org: eventuali origini sorelle scoperte possono essere testate, ma il cookie di dashboard-test non viene copiato su tali host.
 Ordine di risoluzione della sessione:
   1. Se DASHBOARD_TEST_COOKIE e' valorizzato, riusa quella sessione e non esegue il login browser.
   2. Altrimenti legge DASHBOARD_TEST_USERNAME e DASHBOARD_TEST_PASSWORD.
@@ -279,6 +283,9 @@ La credenziale tourist_session usa kind=snap4city_oidc. Ordine di risoluzione:
 
 Se il login opzionale non riesce, i job continuano in anonimo. Con --auth-only una sessione valida
 e' invece obbligatoria. allow_state_changes resta false per tutti gli otto servizi.
+Per forzare un servizio a essere SOLO ANONIMO, rimuovi credential_ref dal servizio (oppure impostalo
+a stringa vuota). auth_only=false da solo non disabilita l'autenticazione: permette anonimo + autenticato
+quando una credenziale valida e' disponibile.
 
 Esempio non interattivo:
   export TOURIST_DASHBOARD_USERNAME='authorized-user'
@@ -360,14 +367,17 @@ verifica fallisce, l'inizializzazione fallisce invece di lasciare il Browser ver
 
 La discovery combina crawler HTTP, form/query, endpoint letterali trovati negli script e una sola coda
 dinamica Chromium. Il browser parte dalle pagine HTML sicure e piu' interessanti gia' note, le carica e
-osserva richieste same-origin document/XHR/fetch; i nuovi link/documenti same-origin renderizzati vengono
-reinseriti subito nella stessa coda. Per ogni profilo di discovery il budget di navigazioni Chromium e' 8 in fast, 30 in balanced
-e 60 in deep; le XHR/fetch osservate non consumano un ulteriore budget di pagine e possono generare
+osserva richieste document/XHR/fetch nell'ambito autorizzato; origini diverse dalla principale entrano solo se dichiarate con allowed_origins/allowed_host_suffixes o con i corrispondenti flag CLI. I nuovi link/documenti autorizzati vengono reinseriti nella stessa coda. I budget Chromium sono 12/45/90 e quelli del crawler HTTP 35/90/180 in fast/balanced/deep; le XHR/fetch osservate non consumano un ulteriore budget di pagine e possono generare
 request contract. Per le richieste realmente inviate vengono registrati anche status/content-type della response
 o requestfailed, cosi' il planner distingue endpoint raggiunti da 404/410 senza scartare 401/403. Le richieste
 browser non-GET e le rotte distruttive vengono intercettate prima dell'invio:
 il body puo' diventare request contract con metodo e parametri reali; GET/POST vengono poi consumati dai tool
 compatibili, mentre gli altri metodi restano tracciati come superficie osservata.
+POST e JSON restano request contract di prima classe: non vengono eliminati per rendere la discovery sicura.
+La coda deduplica per origin+path+nomi parametri, applica quote per origin e penalizza asset statici, vendor/chunk,
+paginazioni/archivi e varianti equivalenti; API, form, XHR/fetch e superfici con parametri ricevono priorita'.
+Le origini sorelle autorizzate possono essere sottoposte a ZAP/Nuclei/Nikto come target separati. Il cookie della
+origine principale non viene inoltrato automaticamente a host diversi; i probe di sessione restano exact-origin.
 
 ZAP: fast=targeted, balanced=prioritized, deep=full bounded; la modalita' passiva resta per i soli
 controlli diagnostici. L'inventario active usa API Python/JSON e fallback curato; ogni scanner ID viene
@@ -380,11 +390,11 @@ Nel fallback generico ZAP balanced/deep non riduce piu' tutti i request contract
 mantiene endpoint/request shape distinti e li esegue in sequenza fino al budget temporale globale; richieste equivalenti
 con stesso metodo, path e parametri restano deduplicate.
 Nuclei: balanced e deep possono usare request contract per DAST gap checks bounded. Il DAST prova prima
-l'input Proxify JSONL; se il runtime Nuclei lo rifiuta, i casi GET compatibili vengono ritentati automaticamente
-come lista URL e lo stderr del tentativo primario viene conservato. Eventuali casi POST non recuperabili fanno
-restare la fase PARTIAL invece di risultare coperti.
+l'input Proxify JSONL; se il runtime Nuclei lo rifiuta, gli stessi contract GET/POST vengono ritentati
+in YAML MultiDoc Proxify. Solo se entrambi i formati request-shaped falliscono si usa la lista URL per i GET compatibili;
+i POST non rappresentabili restano esplicitamente non coperti invece di essere dichiarati testati.
 Nell'Agentic la breadth review viene usata solo per un primo piano realmente scarno: puo' aggiungere al
-massimo 3 azioni in fast, 6 in balanced e 10 in deep e non deve consumare tutti i candidati del primo round,
+massimo 4 azioni in fast, 10 in balanced e 16 in deep e non deve consumare tutti i candidati del primo round,
 cosi' i round successivi possono reagire ai risultati appena osservati.
 Gli specialisti sui parametri privilegiano API/dati, identificatori/query, POST/JSON e richieste
 osservate dal browser rispetto a parametri puramente di navigazione. Il routing e' distinto per profilo:
@@ -444,34 +454,36 @@ deep      più target, richieste e budget per i controlli specialistici
 
 Limiti di ampiezza principali (casi/target, non numero di richieste HTTP):
                          FAST   BALANCED   DEEP
-  Chromium navigation      8       30       60
-  ZAP request case          6       20       40
-  Nuclei static target      5       15       40
-  Nuclei DAST case          0       12       30
-  SQLMap                    1        4        8
-  Dalfox                    1        4        8
-  Commix                    1        3        5
-  Traversal                 1        4        8
-  Browser                   1        4       10
-  Workflow                  1        4       10
-  IDOR                      1        3        6
-  Authorization             1        4        8
-  Arjun                     1        3        8
+  Crawler HTTP pages       35       90      180
+  Chromium navigation      12       45       90
+  JavaScript assets        12       36       72
+  ZAP request case         10       32       60
+  Nuclei static target      8       30       80
+  Nuclei DAST case          0       18       48
+  SQLMap                    3       10       18
+  Dalfox                    3       10       18
+  Commix                    3        8       14
+  Traversal                 3       10       18
+  Browser                   3       10       20
+  Workflow                  3       10       20
+  IDOR                      1        4        8
+  Authorization             2        6       12
+  Arjun                     3       10       18
   Interactsh                1        2        3
   Final XSS Chromium        2       10       20
-  Breadth review max       +3       +6      +10
-  Agentic azioni/round     14       30       48
+  Breadth review max       +4      +10      +16
+  Agentic azioni/round     16       40       64
 
 Timeout principali (secondi):
                          FAST   BALANCED   DEEP
-  ZAP                     90      420      600
-  Nuclei                  90      480      900
-  SQLMap                  60      150      240
-  Dalfox                  35      105      150
-  Commix                  40       90      120
-  Traversal               25       60       90
-  Browser                 35       90      150
-  Workflow                30       75      120
+  ZAP                    120      540      900
+  Nuclei                 150      660     1200
+  SQLMap                  75      180      300
+  Dalfox                  45      120      210
+  Commix                  50      120      180
+  Traversal               35       75      120
+  Browser                  45      120      210
+  Workflow                 40      105      180
 
 Ampiezza interna Nuclei: BALANCED puo' selezionare fino a 48 template ufficiali focalizzati,
 con concurrency 8 e rate limit 50 req/s; DEEP fino a 96 template technology, 160 exposure/misconfiguration
@@ -486,7 +498,7 @@ producono una sessione valida, gli stessi budget si applicano anche al profilo a
 restano applicati al solo profilo anonimo.
 
 Init: --with-lab --run --prepare-ai --agentic-model --snap4city-credentials --mode
-      --skip-scanners --skip-preflight --skip-browser --require-browser --commands-only --version
+      --skip-scanners --skip-preflight --skip-browser --require-browser --commands-only
 
 --prepare-ai: all, snap4city, llama, qwen.
 Se --prepare-ai e --agentic-model sono entrambi omessi, il valore effettivo e' all.
@@ -504,8 +516,8 @@ dashboard-test / 192.168.1.81, li mantiene disabilitati. Nel config il valore de
 ha precedenza sul valore della sezione execution. Questi flag non abilitano rotte distruttive e
 non disabilitano l'intero scanner: limitano solo le verifiche attive che possono cambiare stato.
 
-Il flag non e' un interruttore universale no-write per tutti gli scanner: nella versione attuale
-viene passato specificamente ai percorsi sotto. SQLMap, Commix, ZAP, Nuclei e gli altri wrapper
+Il flag non e' un interruttore universale no-write per tutti gli scanner: viene passato
+specificamente ai percorsi sotto. SQLMap, Commix, ZAP, Nuclei e gli altri wrapper
 non leggono questo flag e mantengono le rispettive policy/bounds indipendenti.
 
 In particolare il gate interessa:
@@ -519,6 +531,17 @@ In particolare il gate interessa:
 
 Deterministic e Agentic usano la stessa funzione centrale di orchestratorShared per questa policy:
 la selezione del planner AI non puo' aggirare il blocco Python.
+
+POST realmente trasmessi dopo la discovery:
+  - Arjun puo' usare POST quando il request contract selezionato e' POST;
+  - ZAP puo' fare replay/seeding e active scan dei request contract POST selezionati;
+  - Nuclei usa i request contract POST nella fase DAST di balanced/deep (DAST e' disabilitato in fast);
+  - SQLMap, Commix, Traversal e il processo Dalfox esterno possono testare un contract POST selezionato;
+  - Browser invia il POST stored-XSS soltanto quando allow_state_changes e' abilitato;
+  - Workflow puo' fare fino a tre tentativi di autenticazione invalidi su un form POST; CSRF attivo, upload e CAPTCHA
+    richiedono invece allow_state_changes=true;
+  - IDOR-Forge e Authorization restano GET-only.
+Il logout POST autenticato e' separato: viene riservato alla verifica finale del ciclo di sessione.
 
 8. NUCLEI
 ---------
@@ -535,8 +558,8 @@ docker run --rm projectdiscovery/nuclei:latest -version
 
 (Get-ChildItem "$HOME\nuclei-templates" -Recurse -File -Include *.yaml,*.yml | Measure-Object).Count
 
-DAST: FAST=off; BALANCED=12 request contract, fuzz aggression medium, fuzz-param-frequency 100;
-DEEP=30 request contract, fuzz aggression high, fuzz-param-frequency 1000. Il wrapper prova gli
+DAST: FAST=off; BALANCED=18 request contract, fuzz aggression medium, fuzz-param-frequency 100;
+DEEP=48 request contract, fuzz aggression high, fuzz-param-frequency 1000. Il wrapper prova gli
 input request-shaped in ordine JSONL Proxify -> YAML MultiDoc Proxify -> lista URL per i soli GET
 se entrambi i parser request-shaped falliscono. Non esiste un piccolo limite aggiuntivo al numero
 di payload DAST: restano i limiti di request contract, rate/concurrency, template e timeout di profilo.

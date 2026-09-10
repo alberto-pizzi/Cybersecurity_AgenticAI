@@ -6,7 +6,10 @@
   },
   "authorization": {
     "confirmed": true,
-    "reference": "Authorized tourist-dashboard URLs supplied for the assessment."
+    "reference": "Authorized tourist-dashboard URLs supplied for the assessment.",
+    "allowed_host_suffixes": [
+      "snap4city.org"
+    ]
   },
   "credentials": {
     "tourist_session": {

@@ -71,41 +71,41 @@ class AgentState(TypedDict):
 # plan (no tokens at all until prefill finishes), so these budgets stay generous by default.
 AI_PLANNER_TIMEOUTS = {
     'fast': 900,
-    'balanced': 1500,
-    'deep': 2400,
+    'balanced': 1800,
+    'deep': 3000,
 }
 
 AI_PLANNER_MAX_PREDICT = {
-    'fast': 700,
-    'balanced': 1000,
-    'deep': 1400,
+    'fast': 800,
+    'balanced': 1300,
+    'deep': 1800,
 }
 
 AI_PLANNER_CONTEXT_WINDOWS = {
-    'fast': 4096,
-    'balanced': 6144,
-    'deep': 8192,
+    'fast': 6144,
+    'balanced': 8192,
+    'deep': 12288,
 }
 
 # Same CPU-only-Ollama rationale as AI_PLANNER_TIMEOUTS above: this is a hard ceiling on
 # batch_budget (analysis_node caps it with min(ai_timeout, this value)), so raising --ai-timeout
 # alone does not help this stage unless this dict is also raised.
 AI_ANALYSIS_BATCH_TIMEOUTS = {
-    'fast': 420,
-    'balanced': 720,
-    'deep': 1080,
+    'fast': 480,
+    'balanced': 900,
+    'deep': 1500,
 }
-AI_ANALYSIS_BATCH_SIZES = {'fast': 1, 'balanced': 3, 'deep': 4}
-AI_ANALYSIS_MAX_PREDICT = {'fast': 440, 'balanced': 700, 'deep': 980}
-AI_ANALYSIS_RESCUE_MAX_PREDICT = {'fast': 300, 'balanced': 380, 'deep': 460}
-AI_ANALYSIS_CONTEXT_WINDOWS = {'fast': 4096, 'balanced': 6144, 'deep': 8192}
+AI_ANALYSIS_BATCH_SIZES = {'fast': 2, 'balanced': 4, 'deep': 6}
+AI_ANALYSIS_MAX_PREDICT = {'fast': 520, 'balanced': 850, 'deep': 1200}
+AI_ANALYSIS_RESCUE_MAX_PREDICT = {'fast': 340, 'balanced': 460, 'deep': 600}
+AI_ANALYSIS_CONTEXT_WINDOWS = {'fast': 6144, 'balanced': 8192, 'deep': 12288}
 LAST_AI_PLAN_DIAGNOSTICS: dict[str, Any] = {}
 BROAD_COVERAGE_TOOLS = ('ffuf', 'zap', 'nuclei', 'session', 'nikto')
 PARAMETER_COVERAGE_TOOLS = ('sqlmap', 'dalfox', 'commix', 'traversal', 'idor')
 AUTHORIZATION_COVERAGE_TOOLS = ('authorization',)
 WORKFLOW_COVERAGE_TOOLS = ('browser', 'workflow')
-ROUND_ACTION_BUDGETS = {'fast': 14, 'balanced': 30, 'deep': 48}
-BREADTH_REVIEW_ADDITION_CAPS = {'fast': 3, 'balanced': 6, 'deep': 10}
+ROUND_ACTION_BUDGETS = {'fast': 16, 'balanced': 40, 'deep': 64}
+BREADTH_REVIEW_ADDITION_CAPS = {'fast': 4, 'balanced': 10, 'deep': 16}
 PLAN_SCHEMA = {
     'type': 'object',
     'properties': {
@@ -1369,10 +1369,11 @@ def compact_results(results: dict[str, dict[str, Any]]) -> dict[str, Any]:
 
 # Before planning, discovery gathers the real pages, forms, and request cases available on the target.
 def discovery_node(state: AgentState) -> dict[str, Any]:
-    print('\n[*] Discovery of anonymous and authenticated surfaces')
+    active_profiles = ', '.join(str(profile.get('name') or '') for profile in state['profiles']) or 'none'
+    print(f'\n[*] Discovery of active profiles: {active_profiles}')
     discovery, diagnostics = ({}, list(state['diagnostics']))
     for profile in state['profiles']:
-        found = discover_target(state['target'], profile['cookies'], max_pages=30)
+        found = discover_target(state['target'], profile['cookies'])
         discovery[profile['name']] = found
         diagnostics.extend(({'phase': 'discovery', 'profile': profile['name'], **item} for item in found['errors']))
         print(f"    {profile['name']}: {len(found.get('html_urls', []))} HTML pages, {len(found.get('request_cases', []))} request contracts, {len(found.get('browser_network_requests', []))} browser network requests, {len(found.get('browser_navigation_urls', []))} Chromium navigations, {len(found['jwt_tokens'])} JWTs")
@@ -1392,6 +1393,9 @@ def discovery_candidate_actions(state: AgentState) -> list[dict[str, Any]]:
         broad = list(shared.broad_tool_order(authenticated))
         for tool in broad:
             actions.append({'profile': name, 'tool': tool, 'target_url': state['target'], 'jwt_token': '', 'injection_url': '', 'reason': 'Session-aware baseline coverage.'})
+        for sibling_origin in shared.discovered_scope_origins(state['discovery'].get(name, {}), state['target']):
+            for tool in ('zap', 'nuclei', 'nikto'):
+                actions.append({'profile': name, 'tool': tool, 'target_url': sibling_origin, 'jwt_token': '', 'injection_url': '', 'reason': 'Broad anonymous coverage for an explicitly authorized sibling origin observed during discovery.'})
         for case in select_arjun_request_cases(state['discovery'].get(name, {}), state['target'], limit=shared.ARJUN_ENDPOINT_LIMIT):
             actions.append({'profile': name, 'tool': 'arjun', 'target_url': case['url'], 'method': case.get('method', 'GET'), 'data': case.get('data', ''), 'parameters': case.get('parameters', []), 'jwt_token': '', 'injection_url': '', 'reason': 'Hidden-parameter discovery using the real request method and body.'})
         for tool in ('sqlmap', 'dalfox', 'commix', 'traversal', 'idor'):
@@ -1471,7 +1475,17 @@ def validate_plan(state: AgentState, proposed: Any) -> list[dict[str, Any]]:
         oast_class = str(raw.get('oast_class') or '')
         scope = REGISTRY[tool][2]
         if scope == 'base':
-            target_url = state['target']
+            if tool in {'ffuf', 'session'}:
+                target_url = state['target']
+            else:
+                sibling_origins = set(shared.discovered_scope_origins(found, state['target']))
+                if (not target_url) or shared.same_origin(state['target'], target_url):
+                    target_url = state['target']
+                else:
+                    normalized_target = shared.normalized_origin(target_url)
+                    if normalized_target not in sibling_origins:
+                        continue
+                    target_url = normalized_target
         elif scope == 'url':
             cases = select_arjun_request_cases(found, state['target'], limit=10)
             matching = [case for case in cases if str(case.get('url', '')) == target_url]
@@ -1753,7 +1767,7 @@ async def execute_action(action: dict[str, Any], cookies: dict[str, str], discov
         timeout_by_class = {'explicit': (120, 75), 'command': (75, 55), 'remote-fetch': (60, 45)}
         deep_timeout, normal_timeout = timeout_by_class.get(oast_class, timeout_by_class['remote-fetch'])
         oast_timeout = deep_timeout if shared.CURRENT_SCAN_MODE == 'deep' else normal_timeout
-        arguments = {'target_url': action['target_url'], 'injection_url': action['injection_url'], 'cookies': cookies.get(profile, ''), 'method': action.get('method', 'GET'), 'data': action.get('data', ''), 'parameter': (action.get('parameters') or [''])[0], 'timeout': oast_timeout}
+        arguments = {'target_url': action['target_url'], 'injection_url': action['injection_url'], 'cookies': shared.scope_cookie_header(action['target_url'], cookies.get(profile, '')), 'method': action.get('method', 'GET'), 'data': action.get('data', ''), 'parameter': (action.get('parameters') or [''])[0], 'timeout': oast_timeout}
     else:
         profile_discovery = discovery.get(profile, {})
         arguments = shared.build_tool_arguments(tool, action['target_url'], cookies.get(profile, ''), profile_discovery, case=action, secondary_cookies=secondary_cookies, allow_state_changes=allow_state_changes)
@@ -1936,7 +1950,7 @@ def _final_browser_verification_actions(state: AgentState) -> list[dict[str, Any
                     compatible_cases.append((shared.xss_verification_context_score(finding_url, case_url, parameter), case))
                 if compatible_cases:
                     selected = dict(max(compatible_cases, key=lambda item: item[0])[1])
-                if selected is None and shared.same_origin(state['target'], finding_url) and not shared._destructive_crawl_url(finding_url):
+                if selected is None and shared.url_in_authorized_scope(state['target'], finding_url) and not shared._destructive_crawl_url(finding_url):
                     parsed = urlparse(finding_url)
                     pairs = [(name, '1' if any(token in value.lower() for token in ('<script', '<img', 'javascript:', 'onerror=', 'onload=')) else value) for name, value in parse_qsl(parsed.query, keep_blank_values=True)]
                     safe_url = urlunparse(parsed._replace(query=urlencode(pairs)))

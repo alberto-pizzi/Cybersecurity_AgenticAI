@@ -133,14 +133,27 @@ def load_runtime_config() -> dict[str, Any]:
         return {}
 
 
+# Parses an HTTP/HTTPS origin without allowing malformed authority/port text to escape as an exception.
+def _url_origin_parts(url: str) -> tuple[str, str, int] | None:
+    try:
+        parsed = urlparse(str(url or "").strip())
+        scheme = str(parsed.scheme or "").lower()
+        host = str(parsed.hostname or "").lower()
+        if scheme not in {"http", "https"} or not host:
+            return None
+        port = parsed.port or (443 if scheme == "https" else 80)
+    except (TypeError, ValueError):
+        return None
+    return scheme, host, int(port)
+
+
 # Converts a URL into the scheme, host, and port key used by runtime profiles.
 def origin_key(url: str) -> str:
-    parsed = urlparse(str(url or ""))
-    if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+    parts = _url_origin_parts(url)
+    if parts is None:
         return ""
-    default_port = 443 if parsed.scheme == "https" else 80
-    port = parsed.port or default_port
-    return f"{parsed.scheme.lower()}://{parsed.hostname.lower()}:{port}"
+    scheme, host, port = parts
+    return f"{scheme}://{host}:{port}"
 
 
 # Runtime profile lookup only accepts settings bound to the exact target origin and path.
@@ -320,9 +333,12 @@ def find_executable(name: str) -> str | None:
 
 # URL normalization removes fragments and trailing path separators without altering query values.
 def normalize_url(url: str) -> str:
-    parsed = urlparse(url.strip())
-    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
-        raise ValueError("The target must be an absolute HTTP/HTTPS URL.")
+    try:
+        parsed = urlparse(str(url or "").strip())
+    except ValueError as exc:
+        raise ValueError("The target must be a valid absolute HTTP/HTTPS URL.") from exc
+    if _url_origin_parts(url) is None:
+        raise ValueError("The target must be a valid absolute HTTP/HTTPS URL with a valid port.")
     path = parsed.path
     if len(path) > 1:
         path = path.rstrip("/")
@@ -331,12 +347,52 @@ def normalize_url(url: str) -> str:
     return urlunparse(parsed._replace(path=path, fragment=""))
 
 
-# Origin comparison requires the same scheme, host, and effective port.
+# Origin comparison requires the same scheme, host, and effective port; malformed discovered URLs are out of scope.
 def same_origin(left: str, right: str) -> bool:
-    a, b = urlparse(left), urlparse(right)
-    a_port = a.port or (443 if a.scheme.lower() == "https" else 80)
-    b_port = b.port or (443 if b.scheme.lower() == "https" else 80)
-    return (a.scheme.lower(), a.hostname, a_port) == (b.scheme.lower(), b.hostname, b_port)
+    a = _url_origin_parts(left)
+    b = _url_origin_parts(right)
+    return a is not None and b is not None and a == b
+
+
+# Converts an absolute HTTP/HTTPS URL into a stable origin string.
+def normalized_origin(url: str) -> str:
+    parts = _url_origin_parts(url)
+    if parts is None:
+        return ""
+    scheme, host, port = parts
+    default_port = 80 if scheme == "http" else 443
+    port_fragment = "" if port == default_port else f":{port}"
+    host_fragment = f"[{host}]" if ":" in host and not host.startswith("[") else host
+    return f"{scheme}://{host_fragment}{port_fragment}"
+
+
+# Host-suffix matching is boundary-aware so example.org never authorizes notexample.org.
+def host_matches_authorized_suffix(host: str, suffix: str) -> bool:
+    candidate = str(host or "").strip().lower().rstrip(".")
+    allowed = str(suffix or "").strip().lower().lstrip(".").rstrip(".")
+    if not candidate or not allowed or "/" in allowed or "://" in allowed:
+        return False
+    return candidate == allowed or candidate.endswith("." + allowed)
+
+
+# Explicit assessment scope may extend beyond one origin without implicitly trusting unrelated external hosts.
+def url_in_authorized_scope(
+    target: str,
+    candidate: str,
+    authorized_origins: list[str] | tuple[str, ...] | set[str] | None = None,
+    authorized_host_suffixes: list[str] | tuple[str, ...] | set[str] | None = None,
+) -> bool:
+    if same_origin(target, candidate):
+        return True
+    candidate_parts = _url_origin_parts(candidate)
+    if candidate_parts is None:
+        return False
+    candidate_origin = normalized_origin(candidate)
+    exact_origins = {normalized_origin(value) for value in (authorized_origins or []) if normalized_origin(value)}
+    if candidate_origin in exact_origins:
+        return True
+    host = candidate_parts[1]
+    return any(host_matches_authorized_suffix(host, suffix) for suffix in (authorized_host_suffixes or []))
 
 
 # Response previews keep a short printable body excerpt for diagnostics.

@@ -51,9 +51,47 @@ def load_assessment_config(path: str | Path) -> dict[str, Any]:
     execution["model"] = model
     if "allow_state_changes" in execution and not isinstance(execution.get("allow_state_changes"), bool):
         raise ValueError("execution.allow_state_changes must be true or false when supplied.")
+    _validate_authorization(payload.get("authorization") or {})
     _validate_assets(assets)
     _validate_credentials(payload.get("credentials") or {})
     return payload
+
+
+# Validates optional scope extensions without implicitly authorizing unrelated external hosts.
+def _validate_authorization(authorization: Any) -> None:
+    if not isinstance(authorization, dict):
+        raise ValueError("authorization must be a JSON object when supplied.")
+    if "confirmed" in authorization and not isinstance(authorization.get("confirmed"), bool):
+        raise ValueError("authorization.confirmed must be true or false when supplied.")
+    origins = authorization.get("allowed_origins", [])
+    if origins is not None:
+        if not isinstance(origins, list) or not all(isinstance(value, str) and value.strip() for value in origins):
+            raise ValueError("authorization.allowed_origins must be a list of non-empty absolute HTTP/HTTPS origins.")
+        for value in origins:
+            parsed = urlparse(value.strip())
+            if str(parsed.scheme or "").lower() not in SUPPORTED_WEB_PROTOCOLS or not parsed.hostname:
+                raise ValueError(f"Invalid authorization.allowed_origins entry: {value!r}")
+            if parsed.path not in {"", "/"} or parsed.query or parsed.fragment or parsed.username or parsed.password:
+                raise ValueError(f"authorization.allowed_origins entries must contain only scheme, host and optional port: {value!r}")
+            try:
+                _ = parsed.port
+            except ValueError as exc:
+                raise ValueError(f"Invalid port in authorization.allowed_origins entry: {value!r}") from exc
+    suffixes = authorization.get("allowed_host_suffixes", [])
+    if suffixes is not None:
+        if not isinstance(suffixes, list) or not all(isinstance(value, str) and value.strip() for value in suffixes):
+            raise ValueError("authorization.allowed_host_suffixes must be a list of non-empty DNS suffixes.")
+        for value in suffixes:
+            suffix = value.strip().lower().lstrip(".").rstrip(".")
+            if not suffix or "://" in suffix or "/" in suffix or ":" in suffix or " " in suffix:
+                raise ValueError(f"Invalid authorization.allowed_host_suffixes entry: {value!r}")
+    if (origins or suffixes) and authorization.get("confirmed") is not True:
+        raise ValueError("authorization.allowed_origins/allowed_host_suffixes require authorization.confirmed=true.")
+
+
+# Public validation entry point used by the runner after applying CLI scope overrides.
+def validate_authorization_scope(authorization: Any) -> None:
+    _validate_authorization(authorization)
 
 
 # Validates asset/service identifiers and either an absolute service URL or the fields needed to derive one.

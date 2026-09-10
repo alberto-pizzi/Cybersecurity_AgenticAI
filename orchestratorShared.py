@@ -18,6 +18,7 @@ import time
 import traceback
 import uuid
 import warnings
+from collections import Counter
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from html.parser import HTMLParser
@@ -29,7 +30,7 @@ import requests
 with warnings.catch_warnings():
     warnings.simplefilter('ignore')
     from fastmcp import Client
-from utils import apply_runtime_target_preparation, absolute_url, canonical_cookie_header, cookie_names, load_runtime_config, normalize_url, parse_cookie_header, ROOT_DIR, same_origin, scanner_session_probe, SERVERS_DIR, target_runtime_profile, MCP_UNIFIED_SERVICE, mcp_http_port, mcp_http_url
+from utils import apply_runtime_target_preparation, absolute_url, canonical_cookie_header, cookie_names, load_runtime_config, normalize_url, normalized_origin, parse_cookie_header, ROOT_DIR, same_origin, scanner_session_probe, SERVERS_DIR, target_runtime_profile, url_in_authorized_scope as _url_in_explicit_scope, MCP_UNIFIED_SERVICE, mcp_http_port, mcp_http_url
 ROOT = Path(ROOT_DIR).resolve()
 SERVERS = Path(SERVERS_DIR).resolve()
 RUNTIME_FILE = ROOT / '.secops_runtime.json'
@@ -68,17 +69,70 @@ def compact_log_url(value: Any, max_length: int | None=None) -> str:
     except Exception:
         pass
     return text[:limit - 3] + '...'
-MAX_ARJUN_ENDPOINTS = max(1, int(os.getenv('SECOPS_MAX_ARJUN_ENDPOINTS', '3')))
-MAX_CRAWL_PAGES = max(10, int(os.getenv('SECOPS_MAX_CRAWL_PAGES', '50')))
-MAX_SCRIPT_ASSETS = max(4, int(os.getenv('SECOPS_MAX_SCRIPT_ASSETS', '24')))
+MAX_ARJUN_ENDPOINTS = max(1, int(os.getenv('SECOPS_MAX_ARJUN_ENDPOINTS', '12')))
+MAX_CRAWL_PAGES = max(10, int(os.getenv('SECOPS_MAX_CRAWL_PAGES', '180')))
+MAX_SCRIPT_ASSETS = max(4, int(os.getenv('SECOPS_MAX_SCRIPT_ASSETS', '72')))
 SCANNER_PROGRESS_INTERVAL = max(10, int(os.getenv('SECOPS_PROGRESS_INTERVAL', '30')))
-SCAN_MODES = {'fast': {'broad': {'zap': 90, 'nuclei': 90, 'nikto': 45, 'ffuf': 40, 'session': 20}, 'parameter': {'sqlmap': 60, 'dalfox': 35, 'commix': 40, 'traversal': 25, 'idor': 12, 'authorization': 25, 'browser': 35, 'workflow': 30}, 'limits': {'sqlmap': 1, 'dalfox': 1, 'commix': 1, 'traversal': 1, 'idor': 1, 'authorization': 1, 'browser': 1, 'workflow': 1}, 'arjun': 30, 'arjun_limit': 1}, 'balanced': {'broad': {'zap': 420, 'nuclei': 480, 'nikto': 105, 'ffuf': 90, 'session': 40}, 'parameter': {'sqlmap': 150, 'dalfox': 105, 'commix': 90, 'traversal': 60, 'idor': 30, 'authorization': 50, 'browser': 90, 'workflow': 75}, 'limits': {'sqlmap': 4, 'dalfox': 4, 'commix': 3, 'traversal': 4, 'idor': 3, 'authorization': 4, 'browser': 4, 'workflow': 4}, 'arjun': 90, 'arjun_limit': 3}, 'deep': {'broad': {'zap': 600, 'nuclei': 900, 'nikto': 180, 'ffuf': 150, 'session': 75}, 'parameter': {'sqlmap': 240, 'dalfox': 150, 'commix': 120, 'traversal': 90, 'idor': 60, 'authorization': 90, 'browser': 150, 'workflow': 120}, 'limits': {'sqlmap': 8, 'dalfox': 8, 'commix': 5, 'traversal': 8, 'idor': 6, 'authorization': 8, 'browser': 10, 'workflow': 10}, 'arjun': 120, 'arjun_limit': 8}}
+DISCOVERY_LIMITS = {
+    'fast': {'crawl_pages': 35, 'browser_pages': 12, 'scripts': 12, 'route_variants': 2, 'per_origin_pages': 24},
+    'balanced': {'crawl_pages': 90, 'browser_pages': 45, 'scripts': 36, 'route_variants': 3, 'per_origin_pages': 60},
+    'deep': {'crawl_pages': 180, 'browser_pages': 90, 'scripts': 72, 'route_variants': 4, 'per_origin_pages': 120},
+}
+SCAN_MODES = {
+    'fast': {
+        'broad': {'zap': 120, 'nuclei': 150, 'nikto': 60, 'ffuf': 50, 'session': 25},
+        'parameter': {'sqlmap': 75, 'dalfox': 45, 'commix': 50, 'traversal': 35, 'idor': 18, 'authorization': 30, 'browser': 45, 'workflow': 40},
+        'limits': {'sqlmap': 3, 'dalfox': 3, 'commix': 3, 'traversal': 3, 'idor': 1, 'authorization': 2, 'browser': 3, 'workflow': 3},
+        'arjun': 45, 'arjun_limit': 3,
+    },
+    'balanced': {
+        'broad': {'zap': 540, 'nuclei': 660, 'nikto': 150, 'ffuf': 120, 'session': 50},
+        'parameter': {'sqlmap': 180, 'dalfox': 120, 'commix': 120, 'traversal': 75, 'idor': 45, 'authorization': 70, 'browser': 120, 'workflow': 105},
+        'limits': {'sqlmap': 10, 'dalfox': 10, 'commix': 8, 'traversal': 10, 'idor': 4, 'authorization': 6, 'browser': 10, 'workflow': 10},
+        'arjun': 120, 'arjun_limit': 10,
+    },
+    'deep': {
+        'broad': {'zap': 900, 'nuclei': 1200, 'nikto': 240, 'ffuf': 210, 'session': 90},
+        'parameter': {'sqlmap': 300, 'dalfox': 210, 'commix': 180, 'traversal': 120, 'idor': 90, 'authorization': 120, 'browser': 210, 'workflow': 180},
+        'limits': {'sqlmap': 18, 'dalfox': 18, 'commix': 14, 'traversal': 18, 'idor': 8, 'authorization': 12, 'browser': 20, 'workflow': 20},
+        'arjun': 180, 'arjun_limit': 18,
+    },
+}
+AUTHORIZED_SCOPE_ORIGINS: set[str] = set()
+AUTHORIZED_SCOPE_HOST_SUFFIXES: set[str] = set()
+PRIMARY_SCOPE_TARGET = ''
 CURRENT_SCAN_MODE = 'balanced'
 BROAD_SCANNER_TIMEOUTS = dict(SCAN_MODES[CURRENT_SCAN_MODE]['broad'])
 PARAMETER_TOOL_TIMEOUTS = dict(SCAN_MODES[CURRENT_SCAN_MODE]['parameter'])
 PARAMETER_TOOL_CASE_LIMITS = dict(SCAN_MODES[CURRENT_SCAN_MODE]['limits'])
 ARJUN_TIMEOUT = int(SCAN_MODES[CURRENT_SCAN_MODE]['arjun'])
 ARJUN_ENDPOINT_LIMIT = int(SCAN_MODES[CURRENT_SCAN_MODE].get('arjun_limit', 1))
+
+# Configures the explicit HTTP scope extension for this process; same-origin remains allowed by default.
+def configure_authorized_scope(target: str, origins: list[str] | None=None, host_suffixes: list[str] | None=None) -> None:
+    global PRIMARY_SCOPE_TARGET
+    PRIMARY_SCOPE_TARGET = normalize_url(target)
+    AUTHORIZED_SCOPE_ORIGINS.clear()
+    AUTHORIZED_SCOPE_HOST_SUFFIXES.clear()
+    for value in origins or []:
+        origin = normalized_origin(str(value or '').strip())
+        if origin:
+            AUTHORIZED_SCOPE_ORIGINS.add(origin)
+    for value in host_suffixes or []:
+        suffix = str(value or '').strip().lower().lstrip('.').rstrip('.')
+        if suffix and '://' not in suffix and '/' not in suffix:
+            AUTHORIZED_SCOPE_HOST_SUFFIXES.add(suffix)
+
+# Returns true only for the primary origin or an explicitly authorized origin/host suffix.
+def url_in_authorized_scope(target: str, candidate: str) -> bool:
+    return _url_in_explicit_scope(target, candidate, AUTHORIZED_SCOPE_ORIGINS, AUTHORIZED_SCOPE_HOST_SUFFIXES)
+
+# Keeps target cookies on the primary origin; sibling origins are discovered and tested without credential leakage.
+def scope_cookie_header(candidate: str, cookies: str) -> str:
+    if not cookies:
+        return ''
+    base = PRIMARY_SCOPE_TARGET or candidate
+    return cookies if same_origin(base, candidate) else ''
 
 # Loads the timeouts and case limits for the selected scan profile.
 def configure_scan_mode(mode: str) -> None:
@@ -135,6 +189,8 @@ def tool_action_limit(tool: str) -> int:
         return ARJUN_ENDPOINT_LIMIT
     if name == 'interactsh':
         return 3 if CURRENT_SCAN_MODE == 'deep' else 2 if CURRENT_SCAN_MODE == 'balanced' else 1
+    if name in {'zap', 'nuclei', 'nikto'}:
+        return 13 if CURRENT_SCAN_MODE == 'deep' else 7 if CURRENT_SCAN_MODE == 'balanced' else 3
     if name in PARAMETER_TOOL_CASE_LIMITS:
         return PARAMETER_TOOL_CASE_LIMITS[name]
     return 1
@@ -673,7 +729,42 @@ def _normalize_redundant_base_path_link(target: str, candidate: str) -> str:
 # Crawler filtering keeps only URLs that are safe and useful to follow.
 def _crawlable_url(url: str) -> bool:
     path = urlparse(url).path.lower()
-    return not path.endswith(('.css', '.js', '.png', '.jpg', '.jpeg', '.gif', '.svg', '.ico', '.woff', '.woff2', '.ttf', '.pdf', '.zip', '.gz', '.tar', '.mp4'))
+    return not path.endswith(('.css', '.js', '.mjs', '.map', '.png', '.jpg', '.jpeg', '.gif', '.svg', '.ico', '.woff', '.woff2', '.ttf', '.eot', '.pdf', '.zip', '.gz', '.tar', '.mp3', '.mp4', '.webm'))
+
+# Route fingerprints ignore changing values so calendars, pagination and cache-busters cannot exhaust discovery budgets.
+def _discovery_route_signature(url: str) -> tuple[str, str, tuple[str, ...]]:
+    parsed = urlparse(str(url or ''))
+    names = tuple(sorted({name.lower() for name, _ in parse_qsl(parsed.query, keep_blank_values=True)}))
+    return (normalized_origin(url), parsed.path.rstrip('/') or '/', names)
+
+# Generic URL scoring prioritizes interactive surfaces while de-prioritizing repetitive presentation routes.
+def _discovery_url_score(url: str) -> int:
+    parsed = urlparse(str(url or ''))
+    path = parsed.path.lower()
+    score = 30 + _risk_terms(path + ' ' + ' '.join(name for name, _ in parse_qsl(parsed.query, keep_blank_values=True)))
+    if parsed.query:
+        score += 14
+    if any(token in path for token in ('/api/', '/graphql', '/admin', '/manage', '/account', '/profile', '/search', '/query', '/upload', '/download', '/callback', '/webhook', '/config', '/settings')):
+        score += 28
+    if any(token in path for token in ('calendar', 'archive', 'page/', 'pagination', 'news/', 'blog/', 'static/', 'assets/')):
+        score -= 12
+    if len(parsed.query) > 700:
+        score -= 18
+    return score
+
+# Script scoring favors application/API code while still allowing a bounded amount of framework/vendor code.
+def _script_value_score(url: str) -> int:
+    path = urlparse(str(url or '')).path.lower()
+    name = path.rsplit('/', 1)[-1]
+    score = 20 + _risk_terms(path)
+    if any(token in name for token in ('app', 'main', 'client', 'api', 'service', 'auth', 'dashboard', 'admin')):
+        score += 24
+    if any(token in name for token in ('vendor', 'webpack', 'runtime', 'polyfill', 'chunk', 'bundle')):
+        score -= 12
+    if name.endswith('.min.js'):
+        score -= 6
+    return score
+
 DESTRUCTIVE_CRAWL_TOKENS = ('logout', 'log-out', 'signout', 'sign-out', 'logoff', 'disconnect', 'end-session', 'destroy-session', 'session-destroy', 'setup', 'install', 'reinstall', 'uninstall', 'reset', 'create_db', 'create-database', 'createdb', 'drop_db', 'drop-database', 'truncate', 'purge', 'wipe')
 STATE_CHANGING_QUERY_KEYS = {'create_db', 'reset', 'action', 'delete', 'remove', 'logout', 'signout', 'logoff', 'disconnect', 'destroy', 'install', 'setup', 'password_new', 'password_conf', 'new_password', 'confirm_password'}
 
@@ -694,15 +785,18 @@ def _destructive_crawl_url(url: str) -> bool:
     return False
 
 # Performs a bounded GET request while blocking destructive navigation.
-def _safe_crawl_get(session: requests.Session, requested: str, target: str, *, timeout: tuple[int, int]=(5, 15), max_redirects: int=5) -> tuple[requests.Response | None, str, str]:
+def _safe_crawl_get(session: requests.Session, requested: str, target: str, *, timeout: tuple[int, int]=(5, 15), max_redirects: int=5, cookies: str='') -> tuple[requests.Response | None, str, str]:
 
     current = _clean_url(requested)
     seen: set[str] = set()
     response: requests.Response | None = None
     for _ in range(max(0, int(max_redirects)) + 1):
+        if not url_in_authorized_scope(target, current):
+            return (response, current, f'out_of_scope_url_blocked:{current}')
         if _destructive_crawl_url(current):
             return (response, current, f'destructive_url_blocked:{current}')
-        response = session.get(current, timeout=timeout, allow_redirects=False)
+        request_headers = {'Cookie': scope_cookie_header(current, cookies)} if scope_cookie_header(current, cookies) else {}
+        response = session.get(current, timeout=timeout, allow_redirects=False, headers=request_headers)
         if response.status_code not in {301, 302, 303, 307, 308}:
             return (response, current, '')
         location = str(response.headers.get('Location') or '').strip()
@@ -712,8 +806,8 @@ def _safe_crawl_get(session: requests.Session, requested: str, target: str, *, t
             candidate = _normalize_redundant_base_path_link(target, _clean_url(absolute_url(current, location)))
         except Exception:
             return (response, current, 'invalid_redirect_location')
-        if not same_origin(target, candidate):
-            return (response, current, f'cross_origin_redirect_blocked:{candidate}')
+        if not url_in_authorized_scope(target, candidate):
+            return (response, current, f'out_of_scope_redirect_blocked:{candidate}')
         if _destructive_crawl_url(candidate):
             return (response, current, f'destructive_redirect_blocked:{candidate}')
         if candidate in seen:
@@ -886,21 +980,27 @@ def _client_side_source_sink_evidence(text: str) -> tuple[list[str], list[str]]:
     sink_hits = sorted(set(re.findall('(?:innerHTML|outerHTML|insertAdjacentHTML|document\\.write(?:ln)?|eval\\s*\\(|setTimeout\\s*\\(\\s*[\'\\"]|setInterval\\s*\\(\\s*[\'\\"])', value, re.I)))
     return (source_hits[:12], sink_hits[:12])
 
-# Extracts literal same-origin endpoint hints from JavaScript without executing the script.
+# Extracts literal authorized-scope endpoint hints from JavaScript without executing the script.
 def _javascript_endpoint_hints(text: str, base_url: str, target: str) -> list[dict[str, str]]:
 
     value = str(text or '')[:1000000]
     patterns = (
-        (re.compile(r"fetch\s*\(\s*[\"']([^\"']+)[\"']", re.I), 'GET'),
-        (re.compile(r"axios\.(get|post|put|patch|delete)\s*\(\s*[\"']([^\"']+)[\"']", re.I), ''),
-        (re.compile(r"\.open\s*\(\s*[\"'](GET|POST|PUT|PATCH|DELETE)[\"']\s*,\s*[\"']([^\"']+)[\"']", re.I), ''),
+        (re.compile(r"fetch\s*\(\s*[\"']([^\"']+)[\"']\s*,\s*\{[^}]{0,800}?method\s*:\s*[\"'](GET|POST|PUT|PATCH|DELETE)[\"']", re.I | re.S), 'fetch-options'),
+        (re.compile(r"fetch\s*\(\s*[\"']([^\"']+)[\"']", re.I), 'fetch-get'),
+        (re.compile(r"axios\.(get|post|put|patch|delete)\s*\(\s*[\"']([^\"']+)[\"']", re.I), 'method-first'),
+        (re.compile(r"\.open\s*\(\s*[\"'](GET|POST|PUT|PATCH|DELETE)[\"']\s*,\s*[\"']([^\"']+)[\"']", re.I), 'method-first'),
     )
     hints: list[dict[str, str]] = []
     seen: set[tuple[str, str]] = set()
-    for pattern, fixed_method in patterns:
+    explicit_fetch_starts = {match.start() for match in patterns[0][0].finditer(value)}
+    for pattern, kind in patterns:
         for match in pattern.finditer(value):
-            if fixed_method:
-                method, raw_url = fixed_method, match.group(1)
+            if kind == 'fetch-get' and match.start() in explicit_fetch_starts:
+                continue
+            if kind == 'fetch-options':
+                raw_url, method = match.group(1), match.group(2).upper()
+            elif kind == 'fetch-get':
+                raw_url, method = match.group(1), 'GET'
             else:
                 method, raw_url = match.group(1).upper(), match.group(2)
             if raw_url.startswith(('data:', 'javascript:', '#')) or '{' in raw_url or '}' in raw_url:
@@ -909,14 +1009,14 @@ def _javascript_endpoint_hints(text: str, base_url: str, target: str) -> list[di
                 url = _normalize_redundant_base_path_link(target, _clean_url(absolute_url(base_url, raw_url)))
             except Exception:
                 continue
-            if not same_origin(target, url) or _destructive_crawl_url(url):
+            if not url_in_authorized_scope(target, url) or _destructive_crawl_url(url):
                 continue
             key = (method, url)
             if key in seen:
                 continue
             seen.add(key)
             hints.append({'method': method, 'url': url})
-            if len(hints) >= 80:
+            if len(hints) >= 160:
                 return hints
     return hints
 
@@ -931,6 +1031,23 @@ def _browser_network_case(url: str, method: str, data: str, content_type: str, s
     fields: list[dict[str, str]] = []
     body = str(data or '')
     lowered_type = str(content_type or '').lower()
+
+    def add_json_fields(value: Any, prefix: str='', depth: int=0) -> None:
+        if depth > 4 or len(fields) >= 80:
+            return
+        if isinstance(value, dict):
+            for key, nested in value.items():
+                name = f'{prefix}.{key}' if prefix else str(key)
+                if isinstance(nested, (dict, list)):
+                    add_json_fields(nested, name, depth + 1)
+                else:
+                    parameters.append(name)
+                    scalar = nested if isinstance(nested, (str, int, float, bool)) or nested is None else ''
+                    fields.append({'name': name, 'value': '' if scalar is None else str(scalar), 'type': 'json', 'tag': 'network'})
+        elif isinstance(value, list):
+            for index, nested in enumerate(value[:20]):
+                add_json_fields(nested, f'{prefix}[{index}]' if prefix else f'[{index}]', depth + 1)
+
     if body and method != 'GET':
         if 'application/x-www-form-urlencoded' in lowered_type:
             for name, value in parse_qsl(body, keep_blank_values=True):
@@ -941,11 +1058,8 @@ def _browser_network_case(url: str, method: str, data: str, content_type: str, s
                 decoded = json.loads(body)
             except Exception:
                 decoded = None
-            if isinstance(decoded, dict):
-                for name, value in decoded.items():
-                    parameters.append(str(name))
-                    scalar = value if isinstance(value, (str, int, float, bool)) or value is None else ''
-                    fields.append({'name': str(name), 'value': '' if scalar is None else str(scalar), 'type': 'json', 'tag': 'network'})
+            if decoded is not None:
+                add_json_fields(decoded)
     parameters = list(dict.fromkeys((str(name) for name in parameters if str(name))))
     if not parameters:
         return None
@@ -963,13 +1077,22 @@ def _browser_network_discovery(target: str, cookies: str, html_urls: list[str]) 
         from playwright.sync_api import sync_playwright
     except Exception as exc:
         return ([], [], [], [{'url': target, 'type': 'BrowserDiscoveryUnavailable', 'message': f'{type(exc).__name__}: {exc}'}])
-    navigation_budget = 8 if CURRENT_SCAN_MODE == 'fast' else 30 if CURRENT_SCAN_MODE == 'balanced' else 60
-    ranked_pages = sorted(set((_clean_url(value) for value in html_urls if value)), key=lambda value: (-_risk_terms(value), len(urlparse(value).path), value))
+    limits = DISCOVERY_LIMITS.get(CURRENT_SCAN_MODE, DISCOVERY_LIMITS['balanced'])
+    navigation_budget = int(limits['browser_pages'])
+    route_variant_limit = int(limits['route_variants'])
+    per_origin_limit = int(limits['per_origin_pages'])
+    ranked_pages = sorted(
+        { _clean_url(value) for value in html_urls if value and url_in_authorized_scope(target, value) },
+        key=lambda value: (-_discovery_url_score(value), len(urlparse(value).path), value),
+    )
     target_url = _clean_url(target)
     if target_url in ranked_pages:
         ranked_pages.remove(target_url)
-    queue: list[str] = [target_url, *ranked_pages]
-    queued: set[str] = set(queue)
+    queue: list[str] = []
+    queued: set[str] = set()
+    queued_signatures: Counter[tuple[str, str, tuple[str, ...]]] = Counter()
+    visited_signatures: Counter[tuple[str, str, tuple[str, ...]]] = Counter()
+    origin_visits: Counter[str] = Counter()
     navigated: list[str] = []
     visited: set[str] = set()
     observed: list[dict[str, Any]] = []
@@ -979,17 +1102,29 @@ def _browser_network_discovery(target: str, cookies: str, html_urls: list[str]) 
     request_rows: dict[int, dict[str, Any]] = {}
     request_cases_by_id: dict[int, dict[str, Any]] = {}
 
-    def enqueue_dynamic(raw_url: str) -> None:
+    def enqueue_dynamic(raw_url: str, *, force: bool=False) -> None:
         try:
             candidate = _normalize_redundant_base_path_link(target, _clean_url(raw_url))
         except Exception:
             return
         if not candidate or candidate in queued or candidate in visited:
             return
-        if not same_origin(target, candidate) or not _crawlable_url(candidate) or _destructive_crawl_url(candidate):
+        if not url_in_authorized_scope(target, candidate) or not _crawlable_url(candidate) or _destructive_crawl_url(candidate):
+            return
+        signature = _discovery_route_signature(candidate)
+        origin = normalized_origin(candidate)
+        if not force and queued_signatures[signature] >= route_variant_limit:
+            return
+        if origin_visits[origin] >= per_origin_limit:
             return
         queued.add(candidate)
-        queue.insert(0, candidate)
+        queued_signatures[signature] += 1
+        queue.append(candidate)
+        queue.sort(key=lambda value: (-_discovery_url_score(value), value))
+
+    enqueue_dynamic(target_url, force=True)
+    for value in ranked_pages:
+        enqueue_dynamic(value)
 
     try:
         with sync_playwright() as playwright:
@@ -1004,7 +1139,7 @@ def _browser_network_discovery(target: str, cookies: str, html_urls: list[str]) 
             def route_guard(route: Any) -> None:
                 request_url = str(route.request.url or '')
                 request_method = str(route.request.method or 'GET').upper()
-                if same_origin(target, request_url) and (_destructive_crawl_url(request_url) or request_method not in {'GET', 'HEAD', 'OPTIONS'}):
+                if _destructive_crawl_url(request_url) or request_method not in {'GET', 'HEAD', 'OPTIONS'}:
                     route.abort()
                 else:
                     route.continue_()
@@ -1014,7 +1149,7 @@ def _browser_network_discovery(target: str, cookies: str, html_urls: list[str]) 
 
             def record_request(request: Any) -> None:
                 url = _clean_url(str(request.url or ''))
-                if not url or not same_origin(target, url) or _destructive_crawl_url(url):
+                if not url or not url_in_authorized_scope(target, url) or _destructive_crawl_url(url):
                     return
                 method = str(request.method or 'GET').upper()
                 resource_type = str(request.resource_type or '')
@@ -1072,7 +1207,13 @@ def _browser_network_discovery(target: str, cookies: str, html_urls: list[str]) 
                 value = queue.pop(0)
                 if value in visited:
                     continue
+                signature = _discovery_route_signature(value)
+                origin_key = normalized_origin(value)
+                if visited_signatures[signature] >= route_variant_limit or origin_visits[origin_key] >= per_origin_limit:
+                    continue
                 visited.add(value)
+                visited_signatures[signature] += 1
+                origin_visits[origin_key] += 1
                 current_source['url'] = value
                 try:
                     response = page.goto(value, wait_until='domcontentloaded', timeout=12000)
@@ -1106,20 +1247,56 @@ def discover_target(target: str, cookies: str, max_pages: int=MAX_CRAWL_PAGES, s
 
     session = requests.Session()
     session.headers.update({'User-Agent': 'SecOps-Discovery/2.0', 'Accept': 'text/html,application/xhtml+xml,application/json;q=0.8,*/*;q=0.5'})
-    if cookies:
-        session.headers['Cookie'] = cookies
     target_preparation = apply_runtime_target_preparation(target, cookies) if cookies else {'performed': False, 'configured': False, 'usable': True}
+    limits = DISCOVERY_LIMITS.get(CURRENT_SCAN_MODE, DISCOVERY_LIMITS['balanced'])
+    page_budget = min(max(1, int(max_pages)), int(limits['crawl_pages']))
+    script_budget = min(MAX_SCRIPT_ASSETS, int(limits['scripts']))
+    route_variant_limit = int(limits['route_variants'])
+    per_origin_limit = int(limits['per_origin_pages'])
     initial = [_clean_url(target), *[_clean_url(value) for value in seeds or []]]
     destructive_skipped: set[str] = set()
     destructive_request_cases: list[dict[str, Any]] = []
     queue: list[str] = []
-    for value in dict.fromkeys(initial):
-        if not same_origin(target, value) or not _crawlable_url(value):
-            continue
+    queued: set[str] = set()
+    queued_signatures: Counter[tuple[str, str, tuple[str, ...]]] = Counter()
+    visited_signatures: Counter[tuple[str, str, tuple[str, ...]]] = Counter()
+    origin_visits: Counter[str] = Counter()
+    skipped_route_variants = 0
+    skipped_origin_budget = 0
+    skipped_out_of_scope = 0
+
+    def enqueue(raw_url: str, *, force: bool=False) -> None:
+        nonlocal skipped_route_variants, skipped_origin_budget, skipped_out_of_scope
+        try:
+            value = _normalize_redundant_base_path_link(target, _clean_url(raw_url))
+        except Exception:
+            return
+        if not value or value in queued:
+            return
+        if not url_in_authorized_scope(target, value):
+            skipped_out_of_scope += 1
+            return
+        if not _crawlable_url(value):
+            return
         if _destructive_crawl_url(value):
             destructive_skipped.add(value)
-            continue
+            return
+        signature = _discovery_route_signature(value)
+        origin = normalized_origin(value)
+        if not force and queued_signatures[signature] >= route_variant_limit:
+            skipped_route_variants += 1
+            return
+        if origin_visits[origin] >= per_origin_limit:
+            skipped_origin_budget += 1
+            return
+        queued.add(value)
+        queued_signatures[signature] += 1
         queue.append(value)
+        queue.sort(key=lambda candidate: (-_discovery_url_score(candidate), candidate))
+
+    for value in dict.fromkeys(initial):
+        enqueue(value, force=value == _clean_url(target))
+
     visited: set[str] = set()
     html_urls: set[str] = set()
     form_urls: set[str] = set()
@@ -1132,16 +1309,29 @@ def discover_target(target: str, cookies: str, max_pages: int=MAX_CRAWL_PAGES, s
     tokens: set[str] = set()
     errors: list[dict[str, Any]] = []
     initial_login_detected = False
-    while queue and len(visited) < max_pages:
+    pages_processed = 0
+
+    while queue and pages_processed < page_budget:
         requested = queue.pop(0)
         if requested in visited:
+            continue
+        signature = _discovery_route_signature(requested)
+        origin = normalized_origin(requested)
+        if visited_signatures[signature] >= route_variant_limit:
+            skipped_route_variants += 1
+            continue
+        if origin_visits[origin] >= per_origin_limit:
+            skipped_origin_budget += 1
             continue
         if _destructive_crawl_url(requested):
             destructive_skipped.add(requested)
             continue
         visited.add(requested)
+        visited_signatures[signature] += 1
+        origin_visits[origin] += 1
+        pages_processed += 1
         try:
-            response, final, redirect_issue = _safe_crawl_get(session, requested, target, timeout=(5, 15), max_redirects=5)
+            response, final, redirect_issue = _safe_crawl_get(session, requested, target, timeout=(5, 15), max_redirects=5, cookies=cookies)
         except requests.RequestException as exc:
             errors.append({'url': requested, 'type': type(exc).__name__, 'message': str(exc)})
             continue
@@ -1151,10 +1341,10 @@ def discover_target(target: str, cookies: str, max_pages: int=MAX_CRAWL_PAGES, s
         final = _clean_url(final)
         if redirect_issue:
             errors.append({'url': requested, 'type': 'SafeRedirectGuard', 'message': redirect_issue})
-            if redirect_issue.startswith(('destructive_', 'cross_origin_')):
+            if redirect_issue.startswith(('destructive_', 'out_of_scope_')):
                 continue
-        if not same_origin(target, final):
-            errors.append({'url': requested, 'type': 'CrossOriginRedirect', 'message': final})
+        if not url_in_authorized_scope(target, final):
+            errors.append({'url': requested, 'type': 'OutOfScopeRedirect', 'message': final})
             continue
         visited.add(final)
         if requested == _clean_url(target) and _looks_like_login(response):
@@ -1165,7 +1355,7 @@ def discover_target(target: str, cookies: str, max_pages: int=MAX_CRAWL_PAGES, s
         if 'html' not in content_type and (not response.text.lstrip().startswith(('<', '<!'))):
             continue
         html_urls.add(final)
-        tokens.update(re.findall('eyJ[A-Za-z0-9_-]+\\.[A-Za-z0-9_-]+\\.[A-Za-z0-9_-]*', response.text))
+        tokens.update(re.findall(r'eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]*', response.text))
         source_hits, sink_hits = _client_side_source_sink_evidence(response.text)
         if source_hits and sink_hits:
             client_side_candidates.append({'url': final, 'sources': source_hits, 'sinks': sink_hits, 'evidence_source': 'inline_html'})
@@ -1176,43 +1366,55 @@ def discover_target(target: str, cookies: str, max_pages: int=MAX_CRAWL_PAGES, s
         except Exception as exc:
             errors.append({'url': final, 'type': type(exc).__name__, 'message': f'HTML parse: {exc}'})
             continue
+
+        ranked_scripts: list[str] = []
         for source in parser.scripts:
-            if len(scanned_script_urls) >= MAX_SCRIPT_ASSETS:
-                break
             try:
                 script_url = _normalize_redundant_base_path_link(target, _clean_url(absolute_url(final, source)))
             except Exception:
                 continue
-            if not same_origin(target, script_url) or _destructive_crawl_url(script_url) or script_url in scanned_script_urls:
+            if not url_in_authorized_scope(target, script_url) or _destructive_crawl_url(script_url) or script_url in scanned_script_urls:
                 continue
+            ranked_scripts.append(script_url)
+        ranked_scripts = sorted(set(ranked_scripts), key=lambda value: (-_script_value_score(value), value))
+        for script_url in ranked_scripts:
+            if len(scanned_script_urls) >= script_budget:
+                break
             scanned_script_urls.add(script_url)
             try:
-                script_response, script_final, script_issue = _safe_crawl_get(session, script_url, target, timeout=(4, 12), max_redirects=4)
+                script_response, script_final, script_issue = _safe_crawl_get(session, script_url, target, timeout=(4, 12), max_redirects=4, cookies=cookies)
             except requests.RequestException as exc:
                 errors.append({'url': script_url, 'type': type(exc).__name__, 'message': f'JavaScript fetch: {exc}'})
                 continue
             if script_response is None or script_issue or script_response.status_code >= 400:
                 continue
             script_final = _clean_url(script_final)
-            if not same_origin(target, script_final):
+            if not url_in_authorized_scope(target, script_final):
                 continue
             script_urls.add(script_final)
             for hint in _javascript_endpoint_hints(script_response.text, script_final, target):
                 if hint not in script_endpoint_hints:
                     script_endpoint_hints.append(hint)
-                if hint.get('method') == 'GET' and urlparse(str(hint.get('url') or '')).query:
-                    hinted_url = str(hint['url'])
-                    request_cases.append({'url': hinted_url, 'method': 'GET', 'data': '', 'parameters': [name for name, _ in parse_qsl(urlparse(hinted_url).query, keep_blank_values=True)], 'file_parameters': [], 'token_parameters': [], 'fields': [], 'source_url': script_final, 'discovery_source': 'javascript_literal'})
-                    parameterized.add(hinted_url)
+                hinted_url = str(hint.get('url') or '')
+                hint_method = str(hint.get('method') or 'GET').upper()
+                hint_parameters = [name for name, _ in parse_qsl(urlparse(hinted_url).query, keep_blank_values=True)]
+                if hint_parameters and hint_method in {'GET', 'POST'}:
+                    request_cases.append({'url': hinted_url, 'method': hint_method, 'data': '', 'parameters': hint_parameters, 'file_parameters': [], 'token_parameters': [], 'fields': [], 'source_url': script_final, 'discovery_source': 'javascript_literal'})
+                    if hint_method == 'GET':
+                        parameterized.add(hinted_url)
             js_sources, js_sinks = _client_side_source_sink_evidence(script_response.text)
             if js_sources and js_sinks:
-                client_side_candidates.append({'url': final, 'script_url': script_final, 'sources': js_sources, 'sinks': js_sinks, 'evidence_source': 'same_origin_script'})
+                client_side_candidates.append({'url': final, 'script_url': script_final, 'sources': js_sources, 'sinks': js_sinks, 'evidence_source': 'authorized_scope_script'})
+
         for href in parser.links:
             try:
                 candidate = _normalize_redundant_base_path_link(target, _clean_url(absolute_url(final, href)))
             except Exception:
                 continue
-            if not same_origin(target, candidate) or not _crawlable_url(candidate):
+            if not url_in_authorized_scope(target, candidate):
+                skipped_out_of_scope += 1
+                continue
+            if not _crawlable_url(candidate):
                 continue
             if _destructive_crawl_url(candidate):
                 destructive_skipped.add(candidate)
@@ -1224,14 +1426,16 @@ def discover_target(target: str, cookies: str, max_pages: int=MAX_CRAWL_PAGES, s
                 continue
             if urlparse(candidate).query:
                 parameterized.add(candidate)
-            if candidate not in visited and candidate not in queue:
-                queue.append(candidate)
+            if candidate not in visited:
+                enqueue(candidate)
+
         for form in parser.forms:
             try:
                 action = _normalize_redundant_base_path_link(target, _clean_url(absolute_url(final, form['action'] or final)))
             except Exception:
                 continue
-            if not same_origin(target, action):
+            if not url_in_authorized_scope(target, action):
+                skipped_out_of_scope += 1
                 continue
             if _destructive_crawl_url(action):
                 destructive_skipped.add(action)
@@ -1249,6 +1453,7 @@ def discover_target(target: str, cookies: str, max_pages: int=MAX_CRAWL_PAGES, s
                 request_cases.append(case)
                 if case['method'] == 'GET':
                     parameterized.add(case['url'])
+
     browser_cases, browser_network_requests, browser_navigation_urls, browser_errors = _browser_network_discovery(target, cookies, sorted(html_urls)) if html_urls else ([], [], [], [])
     request_cases.extend(browser_cases)
     html_urls.update(browser_navigation_urls)
@@ -1257,6 +1462,7 @@ def discover_target(target: str, cookies: str, max_pages: int=MAX_CRAWL_PAGES, s
     for case in browser_cases:
         if str(case.get('method') or '').upper() == 'GET' and urlparse(str(case.get('url') or '')).query:
             parameterized.add(str(case['url']))
+
     auth_effective: bool | None = None
     auth_note = 'Anonymous profile.'
     auth_probe: dict[str, Any] = {}
@@ -1265,7 +1471,7 @@ def discover_target(target: str, cookies: str, max_pages: int=MAX_CRAWL_PAGES, s
         try:
             original_headers = dict(session.headers)
             session.headers['Cache-Control'] = 'no-cache'
-            probe_response, probe_final, probe_redirect_issue = _safe_crawl_get(session, probe_url, target, timeout=(5, 15), max_redirects=5)
+            probe_response, probe_final, probe_redirect_issue = _safe_crawl_get(session, probe_url, target, timeout=(5, 15), max_redirects=5, cookies=cookies)
             session.headers.clear()
             session.headers.update(original_headers)
             if probe_response is None:
@@ -1274,7 +1480,7 @@ def discover_target(target: str, cookies: str, max_pages: int=MAX_CRAWL_PAGES, s
             final_login_detected = _looks_like_login(probe_response)
             anonymous_session = requests.Session()
             anonymous_session.headers.update({'User-Agent': 'SecOps-Discovery-Anonymous-Comparison/1.0', 'Cache-Control': 'no-cache'})
-            anonymous_response, anonymous_final, anonymous_redirect_issue = _safe_crawl_get(anonymous_session, probe_url, target, timeout=(5, 15), max_redirects=5)
+            anonymous_response, anonymous_final, anonymous_redirect_issue = _safe_crawl_get(anonymous_session, probe_url, target, timeout=(5, 15), max_redirects=5, cookies='')
             if anonymous_response is None:
                 raise requests.RequestException(anonymous_redirect_issue or f'Anonymous probe was blocked: {anonymous_final}')
             anonymous_response.url = anonymous_final
@@ -1292,7 +1498,71 @@ def discover_target(target: str, cookies: str, max_pages: int=MAX_CRAWL_PAGES, s
             auth_effective = None
             auth_probe = {'url': probe_url, 'error': f'{type(exc).__name__}: {exc}', 'conclusive': False}
         auth_note = 'The supplied cookie was distinguished from the anonymous response.' if auth_effective is True else 'The supplied cookie reached a login or authorization failure page.' if auth_effective is False else 'The supplied cookie remained usable, but this target did not expose a conclusive anonymous/authenticated distinction.'
-    return {'urls': sorted(visited), 'html_urls': sorted(html_urls), 'form_urls': sorted(form_urls), 'parameterized_urls': sorted(parameterized), 'request_cases': _dedupe_request_cases(request_cases), 'script_urls': sorted(script_urls), 'script_endpoint_hints': script_endpoint_hints, 'browser_network_requests': browser_network_requests, 'browser_navigation_urls': browser_navigation_urls, 'client_side_candidates': client_side_candidates, 'jwt_tokens': sorted(tokens), 'errors': errors, 'authentication_effective': auth_effective, 'authentication_note': auth_note, 'authentication_probe': auth_probe, 'target_preparation': target_preparation, 'destructive_urls_skipped': sorted(destructive_skipped), 'destructive_request_cases': _dedupe_request_cases(destructive_request_cases)}
+
+    budget_diagnostics = {
+        'mode': CURRENT_SCAN_MODE,
+        'http_page_budget': page_budget,
+        'http_pages_processed': pages_processed,
+        'browser_page_budget': int(limits['browser_pages']),
+        'script_budget': script_budget,
+        'scripts_processed': len(scanned_script_urls),
+        'route_variant_limit': route_variant_limit,
+        'per_origin_page_limit': per_origin_limit,
+        'route_variants_skipped': skipped_route_variants,
+        'origin_budget_skipped': skipped_origin_budget,
+        'out_of_scope_urls_skipped': skipped_out_of_scope,
+        'authorized_origins': sorted(AUTHORIZED_SCOPE_ORIGINS),
+        'authorized_host_suffixes': sorted(AUTHORIZED_SCOPE_HOST_SUFFIXES),
+    }
+    return {'urls': sorted(visited), 'html_urls': sorted(html_urls), 'form_urls': sorted(form_urls), 'parameterized_urls': sorted(parameterized), 'request_cases': _dedupe_request_cases(request_cases), 'script_urls': sorted(script_urls), 'script_endpoint_hints': script_endpoint_hints, 'browser_network_requests': browser_network_requests, 'browser_navigation_urls': browser_navigation_urls, 'client_side_candidates': client_side_candidates, 'jwt_tokens': sorted(tokens), 'errors': errors, 'authentication_effective': auth_effective, 'authentication_note': auth_note, 'authentication_probe': auth_probe, 'target_preparation': target_preparation, 'destructive_urls_skipped': sorted(destructive_skipped), 'destructive_request_cases': _dedupe_request_cases(destructive_request_cases), 'budget_diagnostics': budget_diagnostics}
+
+# Returns additional explicitly authorized origins that were actually observed during discovery.
+def discovered_scope_origins(discovery: dict[str, Any], target: str, limit: int | None=None) -> list[str]:
+    primary = normalized_origin(target)
+    candidates: dict[str, int] = {}
+    values: list[str] = []
+    for key in ('urls', 'html_urls', 'form_urls', 'parameterized_urls', 'script_urls', 'browser_navigation_urls'):
+        values.extend(str(value) for value in discovery.get(key, []) if isinstance(value, str))
+    for key in ('request_cases', 'browser_network_requests', 'script_endpoint_hints'):
+        for row in discovery.get(key, []):
+            if isinstance(row, dict):
+                values.append(str(row.get('url') or ''))
+    for value in values:
+        if not value or not url_in_authorized_scope(target, value):
+            continue
+        origin = normalized_origin(value)
+        if not origin or origin == primary:
+            continue
+        candidates[origin] = max(candidates.get(origin, -1000), _discovery_url_score(value))
+    default_limit = 2 if CURRENT_SCAN_MODE == 'fast' else 6 if CURRENT_SCAN_MODE == 'balanced' else 12
+    effective_limit = max(0, int(default_limit if limit is None else limit))
+    return [origin for origin, _ in sorted(candidates.items(), key=lambda item: (-item[1], item[0]))[:effective_limit]]
+
+
+# Filters discovery evidence to one origin so broad scanners can test sibling origins independently without sharing cookies.
+def discovery_for_origin(discovery: dict[str, Any], origin: str) -> dict[str, Any]:
+    filtered: dict[str, Any] = {}
+    for key in ('urls', 'html_urls', 'form_urls', 'parameterized_urls', 'script_urls', 'browser_navigation_urls'):
+        filtered[key] = [value for value in discovery.get(key, []) if isinstance(value, str) and same_origin(origin, value)]
+    for key in ('request_cases', 'browser_network_requests', 'script_endpoint_hints', 'client_side_candidates', 'destructive_request_cases'):
+        rows = []
+        for row in discovery.get(key, []):
+            if not isinstance(row, dict):
+                continue
+            row_url = str(row.get('url') or row.get('source_url') or '')
+            if row_url and same_origin(origin, row_url):
+                rows.append(dict(row))
+        filtered[key] = rows
+    filtered['jwt_tokens'] = list(discovery.get('jwt_tokens', []))
+    filtered['errors'] = []
+    filtered['destructive_urls_skipped'] = [value for value in discovery.get('destructive_urls_skipped', []) if isinstance(value, str) and same_origin(origin, value)]
+    filtered['authentication_effective'] = None
+    filtered['authentication_note'] = 'Sibling authorized origin is scanned without reusing the primary-origin cookie.'
+    filtered['authentication_probe'] = {}
+    filtered['target_preparation'] = {'performed': False, 'configured': False, 'usable': True}
+    filtered['budget_diagnostics'] = dict(discovery.get('budget_diagnostics') or {})
+    return filtered
+
 
 # Combines discovery results without duplicating pages or request cases.
 def merge_discovery(left: dict[str, Any], right: dict[str, Any]) -> dict[str, Any]:
@@ -1331,6 +1601,9 @@ def merge_discovery(left: dict[str, Any], right: dict[str, Any]) -> dict[str, An
     if right.get('authentication_effective') is not None:
         merged['authentication_effective'] = right.get('authentication_effective')
         merged['authentication_note'] = right.get('authentication_note')
+    left_budget = left.get('budget_diagnostics') if isinstance(left.get('budget_diagnostics'), dict) else {}
+    right_budget = right.get('budget_diagnostics') if isinstance(right.get('budget_diagnostics'), dict) else {}
+    merged['budget_diagnostics'] = {**left_budget, **right_budget}
     return merged
 
 # URL ranking relies on a small set of security-related words to prioritize discovered paths.
@@ -1463,6 +1736,12 @@ def _tool_case_priority(tool: str, case: dict[str, Any], authenticated_profile: 
     parameters = _case_parameters(case)
     text = ' '.join((path, ' '.join(sorted(parameters))))
     score = _risk_terms(text)
+    if method == 'POST':
+        score += 10
+    if 'json' in str(case.get('content_type') or case.get('enctype') or '').lower():
+        score += 6
+    if case.get('discovery_source') == 'playwright_network':
+        score += 4
     anonymous_login_flow = (not authenticated_profile) and _is_login_case(case)
     if tool in {'sqlmap', 'dalfox', 'commix', 'traversal'} and _is_logout_case(case):
         return -1000
@@ -1644,12 +1923,19 @@ def _case_field_names(case: dict[str, Any]) -> set[str]:
 
 # Builds a stable key used to remove duplicate browser cases.
 def _browser_url_key(value: str) -> tuple[str, str, int, str]:
-    parsed = urlparse(str(value or ''))
-    port = parsed.port or (443 if parsed.scheme.lower() == 'https' else 80)
+    try:
+        parsed = urlparse(str(value or ''))
+        scheme = parsed.scheme.lower()
+        host = (parsed.hostname or '').lower()
+        if scheme not in {'http', 'https'} or not host:
+            return ('', '', 0, '')
+        port = parsed.port or (443 if scheme == 'https' else 80)
+    except ValueError:
+        return ('', '', 0, '')
     path = re.sub('/+', '/', parsed.path or '/')
     if path != '/':
         path = path.rstrip('/')
-    return (parsed.scheme.lower(), (parsed.hostname or '').lower(), port, path.lower())
+    return (scheme, host, port, path.lower())
 
 # Scores a request case for browser-based checks.
 def _browser_case_priority(case: dict[str, Any], client_keys: set[tuple[str, str, int, str]]) -> int:
@@ -1945,7 +2231,7 @@ def select_arjun_request_cases(discovery: dict[str, Any], target: str, limit: in
             continue
         url = normalize_url(str(case.get('url') or ''))
         method = str(case.get('method') or 'GET').upper()
-        if not url or method not in {'GET', 'POST'} or (not same_origin(target, url)):
+        if not url or method not in {'GET', 'POST'} or (not url_in_authorized_scope(target, url)):
             continue
         parsed = urlparse(url)
         path = parsed.path.lower()
@@ -1983,7 +2269,7 @@ def select_arjun_request_cases(discovery: dict[str, Any], target: str, limit: in
         existing_paths = {urlparse(str(item[1].get('url') or '')).path.lower() for item in ranked}
         for raw_url in discovery.get('html_urls', []) or discovery.get('urls', []):
             url = normalize_url(str(raw_url or ''))
-            if not url or not same_origin(target, url) or urlparse(url).query or _destructive_crawl_url(url):
+            if not url or not url_in_authorized_scope(target, url) or urlparse(url).query or _destructive_crawl_url(url):
                 continue
             path = urlparse(url).path.lower()
             if path in existing_paths or path.endswith(('/login.php', '/login', '/setup.php', '/logout.php')):
@@ -2035,7 +2321,7 @@ def select_request_cases(discovery: dict[str, Any], limit: int=MAX_PARAMETER_END
             continue
         seen.add(key)
         score = _risk_terms(path + ' ' + ' '.join(parameters))
-        score += 7 if method == 'POST' else 3
+        score += 12 if method == 'POST' else 3
         if _is_login_case(case):
             score -= 20
         score += min(8, len(parameters) * 2)
@@ -2066,7 +2352,7 @@ def select_oast_request_cases(discovery: dict[str, Any], target: str, limit: int
             continue
         url = str(case.get('url') or '')
         method = str(case.get('method') or 'GET').upper()
-        if not url or method not in {'GET', 'POST'} or (not same_origin(target, url)):
+        if not url or method not in {'GET', 'POST'} or (not url_in_authorized_scope(target, url)):
             continue
         path = urlparse(url).path.lower()
         if any((token in path for token in ('logout', 'setup', 'install', 'reset', 'delete'))):
@@ -2133,7 +2419,7 @@ def enrich_discovery_with_ffuf(discovery: dict[str, Any], result: dict[str, Any]
             continue
         for field in ('url', 'final_url'):
             value = str(item.get(field) or '').strip()
-            if not value or not same_origin(target, value):
+            if not value or not url_in_authorized_scope(target, value):
                 continue
             if _destructive_crawl_url(value):
                 blocked.add(value)
@@ -2385,6 +2671,8 @@ def add_common_cli_arguments(parser: argparse.ArgumentParser, *, require_target:
     parser.add_argument('--secondary-cookies', default='', help='Optional second authenticated identity for read-only authorization/BOLA comparison.')
     parser.add_argument('--auth-only', action='store_true')
     parser.add_argument('--authorized', action='store_true')
+    parser.add_argument('--authorized-origin', action='append', default=[], help='Additional exact HTTP/HTTPS origin explicitly included in the authorized assessment scope. Repeat as needed.')
+    parser.add_argument('--authorized-host-suffix', action='append', default=[], help='Additional authorized host suffix, for example example.org; matches the suffix itself and its subdomains. Repeat as needed.')
     state_change_group = parser.add_mutually_exclusive_group()
     state_change_group.add_argument('--allow-state-changes', dest='allow_state_changes', action='store_true', default=None, help='Explicitly enable bounded POST/upload/stored-XSS workflow probes for this run.')
     state_change_group.add_argument('--no-allow-state-changes', dest='allow_state_changes', action='store_false', help='Explicitly disable bounded state-changing probes, including on local targets.')
@@ -2400,9 +2688,27 @@ def prepare_cli_context(parser: argparse.ArgumentParser, args: argparse.Namespac
     local_hosts = {'127.0.0.1', 'localhost', '::1'}
     if urlparse(target).hostname not in local_hosts and (not args.authorized):
         parser.error('Remote targets require --authorized.')
+    if (getattr(args, 'authorized_origin', None) or getattr(args, 'authorized_host_suffix', None)) and not args.authorized:
+        parser.error('Scope extensions require --authorized.')
+    for value in getattr(args, 'authorized_origin', []) or []:
+        raw_origin = str(value or '').strip()
+        try:
+            parsed_origin = urlparse(raw_origin)
+            _ = parsed_origin.port
+        except ValueError:
+            parser.error(f'Invalid --authorized-origin value: {value!r}. Use an absolute HTTP/HTTPS origin.')
+        if (not normalized_origin(raw_origin)) or parsed_origin.path not in {'', '/'} or parsed_origin.query or parsed_origin.fragment or parsed_origin.username or parsed_origin.password:
+            parser.error(f'Invalid --authorized-origin value: {value!r}. Use only scheme, host and optional port.')
+    for value in getattr(args, 'authorized_host_suffix', []) or []:
+        suffix = str(value or '').strip().lower().lstrip('.').rstrip('.')
+        if not suffix or '://' in suffix or '/' in suffix or ':' in suffix or any(ch.isspace() for ch in suffix):
+            parser.error(f'Invalid --authorized-host-suffix value: {value!r}. Use only a DNS host suffix such as example.org.')
+    configure_authorized_scope(target, list(getattr(args, 'authorized_origin', []) or []), list(getattr(args, 'authorized_host_suffix', []) or []))
+    if AUTHORIZED_SCOPE_ORIGINS or AUTHORIZED_SCOPE_HOST_SUFFIXES:
+        print('[*] Authorized scope extensions: origins=' + (', '.join(sorted(AUTHORIZED_SCOPE_ORIGINS)) or 'none') + '; host suffixes=' + (', '.join(sorted(AUTHORIZED_SCOPE_HOST_SUFFIXES)) or 'none'))
     injection_url = str(getattr(args, 'interactsh_injection_url', '') or '').strip()
-    if injection_url and (not same_origin(target, injection_url)):
-        parser.error('--interactsh-injection-url must have the same origin as --target.')
+    if injection_url and (not url_in_authorized_scope(target, injection_url)):
+        parser.error('--interactsh-injection-url must be inside the explicitly authorized assessment scope.')
     normalized_cookie = ''
     profiles = [] if args.auth_only else [{'name': 'anonymous', 'cookies': ''}]
     if args.cookies:
@@ -2431,7 +2737,8 @@ def prepare_cli_context(parser: argparse.ArgumentParser, args: argparse.Namespac
 def build_tool_arguments(tool: str, target_url: str, cookies: str, discovery: dict[str, Any], *, case: dict[str, Any] | None=None, secondary_cookies: str='', allow_state_changes: bool | None=None, timeout_override: int=0, diagnostic_only: bool=False, single_tool: bool=False) -> dict[str, Any]:
 
     case = case or {}
-    arguments: dict[str, Any] = {'target_url': target_url, 'cookies': cookies}
+    effective_cookies = scope_cookie_header(target_url, cookies)
+    arguments: dict[str, Any] = {'target_url': target_url, 'cookies': effective_cookies}
     if tool in BROAD_SCANNER_TIMEOUTS:
         arguments['timeout'] = timeout_override or BROAD_SCANNER_TIMEOUTS[tool]
         if tool == 'ffuf':
@@ -2448,13 +2755,13 @@ def build_tool_arguments(tool: str, target_url: str, cookies: str, discovery: di
                 scan_mode = 'prioritized'
             else:
                 scan_mode = 'targeted'
-            arguments.update({'seed_urls': discovery.get('html_urls', []), 'request_cases': discovery.get('request_cases', []), 'scan_mode': scan_mode, 'session_probe_url': select_session_probe_url(discovery, target_url), 'max_observations': 220 if CURRENT_SCAN_MODE == 'deep' else 80 if CURRENT_SCAN_MODE == 'balanced' or single_tool else 25})
+            arguments.update({'seed_urls': discovery.get('html_urls', []), 'request_cases': discovery.get('request_cases', []), 'scan_mode': scan_mode, 'session_probe_url': select_session_probe_url(discovery, target_url), 'max_observations': 360 if CURRENT_SCAN_MODE == 'deep' else 140 if CURRENT_SCAN_MODE == 'balanced' or single_tool else 40})
             if single_tool:
                 arguments['diagnostic_only'] = diagnostic_only
             elif diagnostic_only:
                 arguments['diagnostic_only'] = True
         elif tool == 'nuclei':
-            arguments.update({'seed_urls': discovery.get('urls', []), 'request_cases': discovery.get('request_cases', []), 'scan_profile': CURRENT_SCAN_MODE, 'max_targets': 40 if CURRENT_SCAN_MODE == 'deep' else 15 if CURRENT_SCAN_MODE == 'balanced' else 5})
+            arguments.update({'seed_urls': discovery.get('urls', []), 'request_cases': discovery.get('request_cases', []), 'scan_profile': CURRENT_SCAN_MODE, 'max_targets': 80 if CURRENT_SCAN_MODE == 'deep' else 30 if CURRENT_SCAN_MODE == 'balanced' else 8})
         elif tool == 'nikto':
             arguments['scan_profile'] = CURRENT_SCAN_MODE
         return arguments

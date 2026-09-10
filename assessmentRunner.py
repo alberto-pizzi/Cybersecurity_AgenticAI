@@ -21,6 +21,7 @@ from assessmentConfig import (
     redacted_configuration,
     resolve_cookie_credential,
     target_is_local,
+    validate_authorization_scope,
 )
 from orchestratorAgenticCore import _model_matches, ensure_ollama_model, resolve_ai_model
 from utils import canonical_cookie_header, cookie_names, same_origin
@@ -32,8 +33,12 @@ REPORTS_DIR = ROOT / "reports"
 
 # Builds one ephemeral single-target assessment without requiring a JSON configuration file.
 def _direct_assessment(args: argparse.Namespace) -> tuple[dict[str, Any], list[dict[str, Any]]]:
-    parsed = urlparse(str(args.target or "").strip())
-    protocol = str(parsed.scheme or "").lower()
+    try:
+        parsed = urlparse(str(args.target or "").strip())
+        protocol = str(parsed.scheme or "").lower()
+        port = parsed.port
+    except ValueError as exc:
+        raise ValueError("--target must be a valid absolute HTTP/HTTPS URL with a valid port.") from exc
     if protocol not in {"http", "https"} or not parsed.hostname:
         raise ValueError("--target must be an absolute HTTP/HTTPS URL.")
     if args.auth_only and not args.cookies:
@@ -76,6 +81,8 @@ def _direct_assessment(args: argparse.Namespace) -> tuple[dict[str, Any], list[d
         "authorization": {
             "confirmed": bool(args.authorized),
             "reference": "Command-line --authorized confirmation" if args.authorized else "",
+            "allowed_origins": list(args.authorized_origin or []),
+            "allowed_host_suffixes": list(args.authorized_host_suffix or []),
         },
         "credentials": credentials,
         "assets": [],
@@ -88,7 +95,7 @@ def _direct_assessment(args: argparse.Namespace) -> tuple[dict[str, Any], list[d
         "host": str(parsed.hostname or ""),
         "address": "",
         "protocol": protocol,
-        "port": parsed.port,
+        "port": port,
         "target": str(args.target).strip(),
         "enabled": True,
         "supported": True,
@@ -135,6 +142,11 @@ def _apply_execution_overrides(config: dict[str, Any], args: argparse.Namespace)
         execution["allow_state_changes"] = args.allow_state_changes
     if args.authorized:
         config.setdefault("authorization", {})["confirmed"] = True
+    authorization = config.setdefault("authorization", {})
+    if args.authorized_origin:
+        authorization["allowed_origins"] = list(dict.fromkeys([*(authorization.get("allowed_origins") or []), *args.authorized_origin]))
+    if args.authorized_host_suffix:
+        authorization["allowed_host_suffixes"] = list(dict.fromkeys([*(authorization.get("allowed_host_suffixes") or []), *args.authorized_host_suffix]))
 
 
 # Verifies that an explicitly selected local Agentic model is already installed before any service job starts.
@@ -167,6 +179,30 @@ def _first_visible_locator(page: Any, selectors: tuple[str, ...]) -> Any | None:
     return None
 
 
+# Returns a short visible Keycloak diagnostic without exposing entered credentials.
+def _keycloak_login_diagnostic(page: Any) -> str:
+    error_selectors = (
+        "#input-error", "#kc-error-message", ".kc-feedback-text", ".alert-error",
+        "[role='alert']", ".pf-c-alert__title", ".pf-v5-c-alert__title",
+    )
+    for selector in error_selectors:
+        try:
+            locator = page.locator(selector).first
+            if locator.count() and locator.is_visible():
+                text = " ".join(str(locator.inner_text() or "").split())
+                if text:
+                    return "credentials_rejected: " + text[:240]
+        except Exception:
+            continue
+    additional_step_selectors = (
+        "input[name='otp']", "input[name='totp']", "input[autocomplete='one-time-code']",
+        "#otp", "#kc-otp-login-form",
+    )
+    if _first_visible_locator(page, additional_step_selectors) is not None:
+        return "additional_authentication_step_required"
+    return ""
+
+
 # Reports whether a browser URL still belongs to the Keycloak/OIDC login flow rather than the assessed application.
 def _looks_like_oidc_login_url(url: str) -> bool:
     path = str(urlparse(str(url or "")).path or "").lower().rstrip("/")
@@ -185,7 +221,7 @@ def _snap4city_browser_login_cookie(
     except Exception as exc:
         raise RuntimeError(f"Playwright is unavailable for automatic Snap4City login: {type(exc).__name__}: {exc}") from exc
 
-    login_path = str(credential.get("login_path") or "/dashboardSmartCity/").strip() or "/dashboardSmartCity/"
+    login_path = str(credential.get("login_path") or "/").strip() or "/"
     validation_path = str(credential.get("validation_path") or login_path).strip() or login_path
     login_url = urljoin(target_url, login_path)
     validation_url = urljoin(target_url, validation_path)
@@ -274,8 +310,24 @@ def _snap4city_browser_login_cookie(
                 password_still_visible = _first_visible_locator(page, password_selectors) is not None
                 if same_origin(target_url, current_url) and not _looks_like_oidc_login_url(current_url) and not password_still_visible:
                     break
+                diagnostic = _keycloak_login_diagnostic(page)
+                if diagnostic.startswith("credentials_rejected:"):
+                    message = diagnostic.split(":", 1)[1].strip()
+                    raise RuntimeError(f"Snap4City/Keycloak rejected the supplied target credentials: {message}")
+                if diagnostic == "additional_authentication_step_required":
+                    raise RuntimeError("Snap4City/Keycloak requires an additional authentication step such as OTP; automatic username/password login cannot complete it.")
                 page.wait_for_timeout(250)
             else:
+                diagnostic = _keycloak_login_diagnostic(page)
+                password_still_visible = _first_visible_locator(page, password_selectors) is not None
+                if diagnostic.startswith("credentials_rejected:"):
+                    message = diagnostic.split(":", 1)[1].strip()
+                    raise RuntimeError(f"Snap4City/Keycloak rejected the supplied target credentials: {message}")
+                if password_still_visible and _looks_like_oidc_login_url(str(page.url or "")):
+                    raise RuntimeError(
+                        "Snap4City login remained on the Keycloak password form; the credentials may be invalid or the account may require an additional login step. "
+                        f"Current URL is {page.url}."
+                    )
                 raise RuntimeError(f"Snap4City login did not return to the assessed application within {timeout_seconds}s; current URL is {page.url}.")
 
             page.goto(validation_url, wait_until="domcontentloaded", timeout=timeout_ms)
@@ -418,6 +470,10 @@ def _build_command(
     authorization = config.get("authorization") or {}
     if bool(authorization.get("confirmed")):
         command.append("--authorized")
+        for value in authorization.get("allowed_origins") or []:
+            command.extend(["--authorized-origin", str(value)])
+        for value in authorization.get("allowed_host_suffixes") or []:
+            command.extend(["--authorized-host-suffix", str(value)])
     elif not target_is_local(job["target"]):
         raise ValueError(
             f"Job {job['id']} targets a non-local service, but authorization.confirmed is not true."
@@ -588,6 +644,8 @@ def main() -> int:
     parser.add_argument("--max-rounds", type=int, choices=(1, 2, 3), default=0, help="Override Agentic maximum planning rounds.")
     parser.add_argument("--auth-only", action="store_true", help="Run only the authenticated profile. With a cookie and without this flag, both anonymous and authenticated profiles are run.")
     parser.add_argument("--authorized", action="store_true", help="Confirm that the configured non-local targets are explicitly authorized for assessment.")
+    parser.add_argument("--authorized-origin", action="append", default=[], help="Additional exact HTTP/HTTPS origin included in the authorized scope; repeat as needed.")
+    parser.add_argument("--authorized-host-suffix", action="append", default=[], help="Additional authorized DNS suffix included in the scope; repeat as needed.")
     state_change_group = parser.add_mutually_exclusive_group()
     state_change_group.add_argument("--allow-state-changes", dest="allow_state_changes", action="store_true", default=None, help="Explicitly allow bounded state-changing probes for this run.")
     state_change_group.add_argument("--no-allow-state-changes", dest="allow_state_changes", action="store_false", help="Explicitly disable bounded state-changing probes, including on local targets.")
@@ -605,9 +663,12 @@ def main() -> int:
                 raise ValueError("--cookies and --secondary-cookies are direct --target options; use credential references inside a configuration file.")
             config = load_assessment_config(args.config)
             _apply_execution_overrides(config, args)
+            authorization = config.get("authorization") or {}
+            validate_authorization_scope(authorization)
             jobs = list(iter_service_jobs(config))
         else:
             config, jobs = _direct_assessment(args)
+            validate_authorization_scope(config.get("authorization") or {})
         _verify_selected_agentic_model(config)
     except (ValueError, RuntimeError) as exc:
         parser.error(str(exc))
