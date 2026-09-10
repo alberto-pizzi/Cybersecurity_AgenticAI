@@ -79,5 +79,9 @@
     "require_ai": true,
     "allow_state_changes": false,
     "ollama_url": "http://127.0.0.1:11434"
+  },
+  "reporting": {
+    "aggregate_report": true,
+    "keep_job_reports": false
   }
 }
