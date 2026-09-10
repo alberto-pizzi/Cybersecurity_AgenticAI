@@ -204,7 +204,7 @@ The profiles increase both discovery breadth and scanner execution ceilings. Lim
 | Agentic breadth-review additions per sparse profile | 3 | 6 | 8 |
 | Agentic concrete actions per round/profile (base / adaptive max) | 48 / 80 | 144 / 240 | 288 / 480 |
 
-Broad scanner timeout ceilings are `zap` 120/540/900s, `nuclei` 150/660/1200s, `nikto` 60/150/240s and `ffuf` 50/120/210s in fast/balanced/deep. Main specialist ceilings are SQLMap 75/180/300s, Dalfox 45/120/210s, Commix 50/120/180s, Traversal 35/75/120s, Browser 45/120/210s and Workflow 40/105/180s. Agentic planner ceilings are 900/1800/3000s with context windows 6144/8192/12288 and output budgets 800/1300/1800 tokens. These are upper bounds; completed tools return immediately.
+Broad scanner timeout ceilings are `zap` 120/540/900s, `nuclei` 360/900/1500s, `nikto` 60/150/240s and `ffuf` 50/120/210s in fast/balanced/deep. Main specialist ceilings are SQLMap 75/180/300s, Dalfox 45/120/210s, Commix 90/180/300s, Traversal 35/75/120s, Browser 45/120/210s and Workflow 40/105/180s. Agentic planner ceilings are 900/1800/3000s with context windows 6144/8192/12288 and output budgets 800/1300/1800 tokens. These are upper bounds; completed tools return immediately.
 
 JWT analysis is profile-local and bounded at 16/64/192 unique discovered tokens in fast/balanced/deep. The bound is intentionally high because the verifier only decodes and inspects token structure/claims locally and does not perform a network attack; different tokens can represent different issuers, audiences or roles. In Agentic, the JWT capability is baseline-selected whenever tokens exist, while raw token values remain local and are not exposed in the compact planner view.
 

@@ -486,10 +486,10 @@ Limiti di ampiezza principali (casi/target, non numero di richieste HTTP):
 Timeout principali (secondi):
                          FAST   BALANCED   DEEP
   ZAP                    120      540      900
-  Nuclei                 150      660     1200
+  Nuclei                 360      900     1500
   SQLMap                  75      180      300
   Dalfox                  45      120      210
-  Commix                  50      120      180
+  Commix                  90      180      300
   Traversal               35       75      120
   Browser                  45      120      210
   Workflow                 40      105      180

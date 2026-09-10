@@ -105,20 +105,20 @@ BROAD_SIBLING_ADAPTIVE_RATIO = 0.75
 BROAD_SIBLING_TIMEOUT_FACTORS = {'fast': 0.50, 'balanced': 0.60, 'deep': 0.75}
 SCAN_MODES = {
     'fast': {
-        'broad': {'zap': 120, 'nuclei': 150, 'nikto': 60, 'ffuf': 50, 'session': 25},
-        'parameter': {'sqlmap': 75, 'dalfox': 45, 'commix': 50, 'traversal': 35, 'idor': 18, 'authorization': 30, 'browser': 45, 'workflow': 40},
+        'broad': {'zap': 120, 'nuclei': 360, 'nikto': 60, 'ffuf': 50, 'session': 25},
+        'parameter': {'sqlmap': 75, 'dalfox': 45, 'commix': 90, 'traversal': 35, 'idor': 18, 'authorization': 30, 'browser': 45, 'workflow': 40},
         'limits': {'sqlmap': 3, 'dalfox': 3, 'commix': 3, 'traversal': 3, 'idor': 3, 'authorization': 4, 'browser': 3, 'workflow': 3},
         'arjun': 45, 'arjun_limit': 3,
     },
     'balanced': {
-        'broad': {'zap': 540, 'nuclei': 660, 'nikto': 150, 'ffuf': 120, 'session': 50},
-        'parameter': {'sqlmap': 180, 'dalfox': 120, 'commix': 120, 'traversal': 75, 'idor': 45, 'authorization': 70, 'browser': 120, 'workflow': 105},
+        'broad': {'zap': 540, 'nuclei': 900, 'nikto': 150, 'ffuf': 120, 'session': 50},
+        'parameter': {'sqlmap': 180, 'dalfox': 120, 'commix': 180, 'traversal': 75, 'idor': 45, 'authorization': 70, 'browser': 120, 'workflow': 105},
         'limits': {'sqlmap': 10, 'dalfox': 10, 'commix': 8, 'traversal': 10, 'idor': 10, 'authorization': 12, 'browser': 10, 'workflow': 10},
         'arjun': 120, 'arjun_limit': 10,
     },
     'deep': {
-        'broad': {'zap': 900, 'nuclei': 1200, 'nikto': 240, 'ffuf': 210, 'session': 90},
-        'parameter': {'sqlmap': 300, 'dalfox': 210, 'commix': 180, 'traversal': 120, 'idor': 90, 'authorization': 120, 'browser': 210, 'workflow': 180},
+        'broad': {'zap': 900, 'nuclei': 1500, 'nikto': 240, 'ffuf': 210, 'session': 90},
+        'parameter': {'sqlmap': 300, 'dalfox': 210, 'commix': 300, 'traversal': 120, 'idor': 90, 'authorization': 120, 'browser': 210, 'workflow': 180},
         'limits': {'sqlmap': 18, 'dalfox': 18, 'commix': 14, 'traversal': 18, 'idor': 20, 'authorization': 24, 'browser': 20, 'workflow': 20},
         'arjun': 180, 'arjun_limit': 18,
     },
