@@ -11,6 +11,9 @@ A) PRIMA INIZIALIZZAZIONE
      Linux/macOS: python3 ./initScript.py --with-lab
 
    L'initializer verifica dipendenze, scanner, Playwright/Chromium e backend AI.
+   Su Debian installa anche le librerie host richieste dal renderer PDF WeasyPrint:
+   libpango-1.0-0, libpangoft2-1.0-0 e libharfbuzz-subset0. Queste dipendenze
+   di reporting vengono controllate anche quando si usa --skip-scanners.
    Con --with-lab prepara anche DVWA. Al termine stampa comandi gia' pronti.
    Per il primo test conviene usare Deterministic BALANCED sul DVWA locale.
    Dopo la baseline puoi usare Agentic BALANCED.
@@ -211,6 +214,7 @@ Override disponibili senza modificare il JSON:
   --mode fast|balanced|deep
   --model snap4city|llama|qwen
   --max-rounds 1|2|3
+    Con un valore >= 2, dopo il primo round di esecuzione il planner riceve sempre un secondo passaggio con gli esiti reali dei tool; i round successivi restano condizionati da nuova superficie o azioni ancora eleggibili.
   --auth-only
   --require-ai / --no-require-ai
   --authorized
@@ -620,3 +624,5 @@ NOTE DI VALIDAZIONE RUNTIME
 - Nikto con processo concluso ma copertura non verificabile viene registrato PARTIAL, non SUCCESS.
 - La confidence finale dell'analisi AI viene applicata a tutti i candidate/vulnerability; Chromium puo' imporre un ceiling separato per XSS.
 - Le richieste token (1) del provider AI Snap4City hanno timeout HTTP limitati.
+
+I payload di reporting troppo grandi vengono compressi e trasferiti in chunk limitati sullo stesso endpoint MCP/HTTP unificato. Dimensione dei chunk, numero massimo di chunk e limite totale sono coerenti tra client e report server; non viene usato alcun handoff locale su file.

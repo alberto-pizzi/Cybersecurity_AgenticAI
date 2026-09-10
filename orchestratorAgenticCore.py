@@ -2317,16 +2317,22 @@ def executor_node(state: AgentState) -> dict[str, Any]:
         print('\n[*] Discovery enrichment stage: FFUF runs before ZAP/Nuclei.', flush=True)
         ffuf_executed = asyncio.run(execute_plan(discovery_stage, cookies, discovery, allow_state_changes=state.get('allow_state_changes'), secondary_cookies=state.get('secondary_cookies', '')))
         new_attack_surface += _record_execution_batch(ffuf_executed, state=state, results=results, discovery=discovery, completed=completed, profile_cookies=profile_cookies)
-        print('[*] FFUF enrichment is available to planned ZAP/Nuclei actions; new parameter candidates will be offered to the AI planner next round.', flush=True)
+        print('[*] FFUF enrichment is available to planned ZAP/Nuclei actions; any new parameter candidates will be available to a later planner round.', flush=True)
     if remaining_stage:
         executed = asyncio.run(execute_plan(remaining_stage, cookies, discovery, allow_state_changes=state.get('allow_state_changes'), secondary_cookies=state.get('secondary_cookies', '')))
         new_attack_surface += _record_execution_batch(executed, state=state, results=results, discovery=discovery, completed=completed, profile_cookies=profile_cookies)
     next_state = dict(state)
     next_state.update(results=results, discovery=discovery, completed=completed)
     remaining = _remaining_eligible_actions(next_state)
-    can_continue = state['round'] < state['max_rounds'] and bool(new_attack_surface > 0 or remaining)
+    # When at least two rounds are allowed, always give the planner one feedback pass after
+    # round 1 so it can inspect scanner outcomes even when the first plan exhausted the
+    # initial candidate catalogue. Later rounds remain demand-driven by newly discovered or
+    # still-unexecuted actions, preserving --max-rounds as an upper bound rather than forcing
+    # every configured round.
+    feedback_round_due = state['round'] == 1 and state['max_rounds'] >= 2
+    can_continue = state['round'] < state['max_rounds'] and bool(feedback_round_due or new_attack_surface > 0 or remaining)
     notes = list(state['notes'])
-    notes.append(f"Round {state['round']} execution: new request contracts={new_attack_surface}; remaining eligible actions={len(remaining)}.")
+    notes.append(f"Round {state['round']} execution: new request contracts={new_attack_surface}; remaining eligible actions={len(remaining)}; feedback round due={feedback_round_due}.")
     audit = [dict(item) for item in state.get('planner_audit', [])]
     if audit and int(audit[-1].get('round', 0) or 0) == state['round']:
         outcome_rows: list[dict[str, Any]] = []

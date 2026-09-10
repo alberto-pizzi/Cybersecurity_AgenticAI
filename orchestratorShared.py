@@ -4,6 +4,9 @@ import atexit
 import ast
 import asyncio
 import functools
+import base64
+import hashlib
+import zlib
 import html
 import importlib.util
 import json
@@ -40,6 +43,10 @@ UNIFIED_MCP_SERVER = 'secopsServer.py'
 LOCAL_BIN = Path.home() / '.local' / 'bin'
 MCP_CONNECT_TIMEOUT = float(os.getenv('SECOPS_MCP_CONNECT_TIMEOUT', '20'))
 MCP_TOOL_TIMEOUT = float(os.getenv('SECOPS_MCP_TIMEOUT', '1200'))
+MCP_REPORT_MAX_BYTES = max(1024 * 1024, int(os.getenv('SECOPS_MCP_REPORT_MAX_BYTES', str(64 * 1024 * 1024))))
+MCP_REPORT_INLINE_MAX_BYTES = min(MCP_REPORT_MAX_BYTES, max(65536, int(os.getenv('SECOPS_MCP_REPORT_INLINE_MAX_BYTES', str(128 * 1024)))))
+MCP_REPORT_CHUNK_BYTES = min(512 * 1024, max(16384, int(os.getenv('SECOPS_MCP_REPORT_CHUNK_BYTES', str(64 * 1024)))))
+MCP_REPORT_MAX_CHUNKS = max(8, int(os.getenv('SECOPS_REPORT_UPLOAD_MAX_CHUNKS', '2048')))
 MAX_PARAMETER_ENDPOINTS = max(1, int(os.getenv('SECOPS_MAX_PARAMETER_ENDPOINTS', '5')))
 TERMINAL_URL_MAX = max(120, int(os.getenv('SECOPS_TERMINAL_URL_MAX', '240')))
 
@@ -624,15 +631,75 @@ async def call_mcp(server_file: str, tool_name: str, arguments: dict[str, Any], 
         return _result(spec.name, target, 'error', f'MCP server not found: {server}', 'missing_mcp_server_file')
     effective_arguments = dict(arguments)
     temporary_output: Path | None = None
+    report_transfer_meta: dict[str, Any] = {}
     if spec.name == 'nuclei' and (not effective_arguments.get('output_file')):
         temporary_dir = ROOT / '.secops_tmp'
         temporary_dir.mkdir(parents=True, exist_ok=True)
         temporary_output = temporary_dir / f'nuclei-{uuid.uuid4().hex}.jsonl'
         effective_arguments['output_file'] = str(temporary_output)
 
-    # Sends one MCP request to the prepared server URL and returns the normalized response.
+    async def invoke_report_chunked(client: Client, encoded: bytes) -> tuple[Any, bool, str]:
+        if len(encoded) > MCP_REPORT_MAX_BYTES:
+            raise ValueError(f'Report MCP payload is {len(encoded)} bytes, above the configured {MCP_REPORT_MAX_BYTES}-byte safety ceiling.')
+        compressed = zlib.compress(encoded, level=6)
+        upload_id = uuid.uuid4().hex
+        digest = hashlib.sha256(compressed).hexdigest()
+        minimum_chunk_bytes = max(1, math.ceil(len(compressed) / MCP_REPORT_MAX_CHUNKS))
+        chunk_bytes = min(512 * 1024, max(MCP_REPORT_CHUNK_BYTES, minimum_chunk_bytes))
+        chunks = [compressed[index:index + chunk_bytes] for index in range(0, len(compressed), chunk_bytes)] or [b'']
+        if len(chunks) > MCP_REPORT_MAX_CHUNKS:
+            raise ValueError(f'Report MCP payload requires {len(chunks)} chunks, above the configured {MCP_REPORT_MAX_CHUNKS}-chunk safety ceiling.')
+        try:
+            for index, chunk in enumerate(chunks):
+                response = await client.call_tool('upload_report_chunk', {
+                    'upload_id': upload_id,
+                    'chunk_index': index,
+                    'total_chunks': len(chunks),
+                    'compressed_sha256': digest,
+                    'uncompressed_bytes': len(encoded),
+                    'chunk_b64': base64.b64encode(chunk).decode('ascii'),
+                })
+                data, is_error, _ = _extract_response(response)
+                if is_error or not isinstance(data, dict) or str(data.get('status', '')).lower() != 'success':
+                    raise RuntimeError(f'Report chunk {index + 1}/{len(chunks)} was rejected: {data}')
+            final_response = await client.call_tool('generate_report_from_chunks', {'upload_id': upload_id})
+            report_transfer_meta.update({
+                'report_payload_transport': 'http_chunked',
+                'report_payload_bytes': len(encoded),
+                'report_compressed_bytes': len(compressed),
+                'report_http_chunks': len(chunks),
+            })
+            return _extract_response(final_response)
+        except Exception:
+            try:
+                await client.call_tool('discard_report_upload', {'upload_id': upload_id})
+            except Exception:
+                pass
+            raise
+
+    # Sends MCP requests only through the unified HTTP endpoint. Oversized report inputs are
+    # compressed, split into bounded HTTP tool calls, reconstructed in memory by the report
+    # service, and then rendered by a final HTTP tool call. No filesystem handoff is used.
     async def invoke(url: str) -> tuple[Any, bool, str]:
         async with Client(url) as client:
+            if spec.name == 'report':
+                encoded = json.dumps(effective_arguments, ensure_ascii=False, default=str).encode('utf-8')
+                if len(encoded) > MCP_REPORT_INLINE_MAX_BYTES:
+                    print(
+                        f'[INFO] Report MCP input is {len(encoded)} bytes; sending it as bounded HTTP chunks through the unified MCP endpoint.',
+                        flush=True,
+                    )
+                    return await invoke_report_chunked(client, encoded)
+                try:
+                    response = await client.call_tool(tool_name, effective_arguments)
+                    report_transfer_meta.update({'report_payload_transport': 'http_inline', 'report_payload_bytes': len(encoded), 'report_http_chunks': 1})
+                    return _extract_response(response)
+                except Exception as exc:
+                    detail = f'{type(exc).__name__}: {exc}'.lower()
+                    if '413' not in detail and 'content too large' not in detail and 'request entity too large' not in detail and 'payload too large' not in detail:
+                        raise
+                    print('[INFO] Inline report request was rejected as too large; retrying the same report through bounded MCP/HTTP chunks.', flush=True)
+                    return await invoke_report_chunked(client, encoded)
             return _extract_response(await client.call_tool(tool_name, effective_arguments))
     try:
         url = await asyncio.to_thread(_ensure_http_server)
@@ -646,6 +713,8 @@ async def call_mcp(server_file: str, tool_name: str, arguments: dict[str, Any], 
         result = _normalize_result(data, spec, target, time.monotonic() - started, is_error, shape)
         result.setdefault('_meta', {})['mcp_transport'] = 'streamable_http'
         result.setdefault('_meta', {})['mcp_url'] = url
+        if report_transfer_meta:
+            result.setdefault('_meta', {}).update(report_transfer_meta)
     except (KeyboardInterrupt, asyncio.CancelledError):
         raise
     except Exception as exc:

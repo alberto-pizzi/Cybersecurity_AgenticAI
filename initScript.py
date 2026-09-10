@@ -19,6 +19,7 @@ from utils import setup_path
 
 UNIFIED_MCP_SERVER = ROOT / "servers" / "secopsServer.py"
 LINUX_BASE_PACKAGES = ("perl", "cpanminus", "build-essential")
+LINUX_REPORT_PACKAGES = ("libpango-1.0-0", "libpangoft2-1.0-0", "libharfbuzz-subset0")
 DEFAULT_AGENTIC_MODEL = "snap4city"
 LOCAL_AI_MODELS = {"llama": "llama3.1:8b", "qwen": "qwen2.5:7b"}
 AI_PREPARATION_CHOICES = ("all", "snap4city", "llama", "qwen")
@@ -50,27 +51,32 @@ def _debian_package_installed(package: str) -> bool:
     return result.returncode == 0 and "install ok installed" in (result.stdout or "").lower()
 
 
-# Installs the Debian Perl/build prerequisites used by the native Nikto fallback and exports the user Perl library.
-def ensure_linux_host_prerequisites() -> None:
+# Installs Debian host prerequisites for native PDF reporting and, when requested, scanner fallbacks.
+def ensure_linux_host_prerequisites(*, include_scanner_packages: bool = True) -> None:
     if not sys.platform.startswith("linux"):
         return
-    perl_env = configure_perl_environment()
-    if perl_env.get("PERL5LIB"):
-        print(f"[+] PERL5LIB configured for SecOps: {perl_env['PERL5LIB']}")
+    if include_scanner_packages:
+        perl_env = configure_perl_environment()
+        if perl_env.get("PERL5LIB"):
+            print(f"[+] PERL5LIB configured for SecOps: {perl_env['PERL5LIB']}")
     apt_get = shutil.which("apt-get")
     dpkg_query = shutil.which("dpkg-query")
     if not apt_get or not dpkg_query:
         print("[*] Non-Debian Linux detected; automatic apt prerequisite installation skipped.")
         return
-    missing = [package for package in LINUX_BASE_PACKAGES if not _debian_package_installed(package)]
+    packages = list(LINUX_REPORT_PACKAGES)
+    if include_scanner_packages:
+        packages.extend(LINUX_BASE_PACKAGES)
+    packages = list(dict.fromkeys(packages))
+    missing = [package for package in packages if not _debian_package_installed(package)]
     if not missing:
-        print("[+] Linux Perl/build prerequisites already installed: " + ", ".join(LINUX_BASE_PACKAGES))
+        print("[+] Linux host prerequisites already installed: " + ", ".join(packages))
         return
     sudo = _linux_sudo_prefix()
     print("[*] Installing missing Debian host prerequisites: " + ", ".join(missing))
     run([*sudo, apt_get, "update"], timeout=1800)
     run([*sudo, apt_get, "install", "-y", *missing], timeout=3600)
-    still_missing = [package for package in LINUX_BASE_PACKAGES if not _debian_package_installed(package)]
+    still_missing = [package for package in packages if not _debian_package_installed(package)]
     if still_missing:
         raise RuntimeError("Debian prerequisite installation did not complete: " + ", ".join(still_missing))
 
@@ -568,10 +574,8 @@ def main() -> int:
         print(f"[+] Full command guide written: {guide_path}")
         verify_unified_mcp_source()
         print(f"[+] Unified MCP server source: {UNIFIED_MCP_SERVER}")
-        if not args.skip_scanners:
-            ensure_linux_host_prerequisites()
-        elif sys.platform.startswith("linux"):
-            configure_perl_environment()
+        if sys.platform.startswith("linux"):
+            ensure_linux_host_prerequisites(include_scanner_packages=not args.skip_scanners)
         ensure_docker_installed()
         print("\n=== SecOps FastMCP initialization ===")
         install_python_packages()
