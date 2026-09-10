@@ -926,6 +926,48 @@ def _archive_job_report_artifacts(results_data: dict[str, Any], assessment_id: s
         moved.append(updated)
     return moved
 
+# Selects the one human-facing report artifact for a job. A normal Assessment report
+# always wins over an Emergency report when both were created during the same run.
+def _report_artifact_is_emergency(artifact: dict[str, Any]) -> bool:
+    report_id = str(artifact.get('report_id') or '').lower()
+    return 'emergency' in report_id
+
+
+def _report_artifact_mtime_ns(artifact: dict[str, Any]) -> int:
+    values = []
+    for key in ('pdf_path', 'html_path', 'json_path', 'review_snapshot_path'):
+        raw = artifact.get(key)
+        if not raw:
+            continue
+        path = Path(str(raw))
+        if path.is_file():
+            try:
+                values.append(path.stat().st_mtime_ns)
+            except OSError:
+                pass
+    return max(values, default=0)
+
+
+def _select_primary_job_report_artifact(artifacts: list[dict[str, Any]]) -> tuple[dict[str, Any] | None, list[dict[str, Any]]]:
+    rows = [dict(item) for item in artifacts if isinstance(item, dict)]
+    if not rows:
+        return None, []
+    normal = [item for item in rows if not _report_artifact_is_emergency(item)]
+    pool = normal or rows
+    primary = max(
+        pool,
+        key=lambda item: (
+            bool(item.get('pdf_path')),
+            bool(item.get('html_path')),
+            bool(item.get('json_path')),
+            bool(item.get('review_snapshot_path')),
+            _report_artifact_mtime_ns(item),
+        ),
+    )
+    suppressed = [item for item in rows if item.get('report_id') != primary.get('report_id')]
+    return primary, suppressed
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(
         description="Run one direct target or expand a multi-asset assessment JSON file through the existing deterministic or agentic orchestrators."
@@ -1064,8 +1106,7 @@ def main() -> int:
                 report_bases[pdf_path.stem] = {"pdf": pdf_path, "html": pdf_path.with_suffix(".html")}
             for html_path in generated_html:
                 report_bases.setdefault(html_path.stem, {"pdf": None, "html": html_path})
-            record["pdf_reports"] = [str(path) for path in generated_pdfs]
-            record["reports"] = []
+            artifact_candidates: list[dict[str, Any]] = []
             for report_id, paths in sorted(
                 report_bases.items(),
                 key=lambda item: max(
@@ -1079,17 +1120,29 @@ def main() -> int:
                     continue
                 json_path = base_path.with_suffix(".json")
                 review_path = base_path.with_name(f"{report_id}.review.json")
-                artifact = {
+                artifact_candidates.append({
                     "job_id": job["id"],
                     "report_id": report_id,
                     "pdf_path": str(pdf_path) if isinstance(pdf_path, Path) and pdf_path.is_file() else None,
                     "json_path": str(json_path.resolve()) if json_path.is_file() else None,
                     "html_path": str(html_path.resolve()) if isinstance(html_path, Path) and html_path.is_file() else None,
                     "review_snapshot_path": str(review_path.resolve()) if review_path.is_file() else None,
-                }
-                record["reports"].append(artifact)
-                results_data["report_artifacts"].append(artifact)
-                results_data["reports_data"].append(_embedded_report_data(artifact))
+                })
+            primary_artifact, suppressed_artifacts = _select_primary_job_report_artifact(artifact_candidates)
+            record["reports"] = [primary_artifact] if primary_artifact else []
+            record["pdf_reports"] = [str(primary_artifact.get("pdf_path"))] if primary_artifact and primary_artifact.get("pdf_path") else []
+            if suppressed_artifacts:
+                record["suppressed_report_artifacts"] = [
+                    {"report_id": item.get("report_id"), "reason": "superseded by the normal primary report artifact"}
+                    for item in suppressed_artifacts
+                ]
+                print(
+                    f"[REPORT] Selected {primary_artifact.get('report_id')} as the primary job report; suppressed {len(suppressed_artifacts)} superseded recovery artifact(s).",
+                    flush=True,
+                )
+            if primary_artifact:
+                results_data["report_artifacts"].append(primary_artifact)
+                results_data["reports_data"].append(_embedded_report_data(primary_artifact))
             if completed.returncode:
                 exit_code = 1
                 if args.stop_on_error:
@@ -1161,9 +1214,13 @@ def main() -> int:
     print("\n=== Assessment final artifacts ===")
     if report_artifacts:
         for artifact in report_artifacts:
-            print(f"[+] PDF report: {artifact.get('pdf_path') or 'not generated'}")
-            if not artifact.get("pdf_path") and artifact.get("html_path"):
-                print(f"[+] HTML report fallback: {artifact['html_path']}")
+            pdf_path = artifact.get('pdf_path')
+            html_path = artifact.get('html_path')
+            emergency = _report_artifact_is_emergency(artifact)
+            print(f"[+] PDF report: {pdf_path or 'not generated'}")
+            if html_path:
+                label = "Emergency HTML report" if emergency else ("HTML report (PDF fallback)" if not pdf_path else "HTML report")
+                print(f"[+] {label}: {html_path}")
     else:
         print("[+] PDF report: not generated")
     print(f"[+] Results data JSON: {final_results_data_path.resolve()}")

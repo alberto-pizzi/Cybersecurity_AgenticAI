@@ -126,6 +126,7 @@ def _consume_report_upload(upload_id: str) -> dict:
     expected_bytes = int(row.get("uncompressed_bytes", 0))
     if expected_bytes > REPORT_UPLOAD_MAX_BYTES:
         raise ValueError("report payload exceeds the configured in-memory safety ceiling")
+    print(f"[REPORT SERVER] upload {upload_id}: reconstructing {total_chunks} chunk(s), compressed_bytes={len(compressed)}.", flush=True)
     decompressor = zlib.decompressobj()
     decoded = decompressor.decompress(compressed, REPORT_UPLOAD_MAX_BYTES + 1)
     if len(decoded) > REPORT_UPLOAD_MAX_BYTES or decompressor.unconsumed_tail:
@@ -139,6 +140,7 @@ def _consume_report_upload(upload_id: str) -> dict:
         or decompressor.unused_data
     ):
         raise ValueError("report payload size or stream integrity mismatch after decompression")
+    print(f"[REPORT SERVER] upload {upload_id}: payload reconstructed and SHA-256 verified; uncompressed_bytes={len(decoded)}.", flush=True)
     loaded = json.loads(decoded.decode("utf-8"))
     if not isinstance(loaded, dict):
         raise ValueError("reconstructed report payload must be one JSON object")
@@ -180,6 +182,7 @@ def _generate_report(
 
     REPORTS_DIR.mkdir(parents=True, exist_ok=True)
     base = _safe_name(output_name) or f"SecOps_Assessment_{datetime.now():%Y%m%d_%H%M%S}"
+    print(f"[REPORT SERVER] report {base}: building normalized findings and coverage model.", flush=True)
     json_path = Path(REPORTS_DIR) / f"{base}.json"
     html_path = Path(REPORTS_DIR) / f"{base}.html"
     pdf_path = Path(REPORTS_DIR) / f"{base}.pdf"
@@ -220,6 +223,7 @@ def _generate_report(
     }
 
     try:
+        print(f"[REPORT SERVER] report {base}: writing JSON, review snapshot and HTML artifacts.", flush=True)
         json_path.write_text(json.dumps(payload, indent=2, ensure_ascii=False, default=str), encoding="utf-8")
         review_snapshot_path.write_text(
             json.dumps(build_review_snapshot(payload), indent=2, ensure_ascii=False, default=str),
@@ -236,8 +240,11 @@ def _generate_report(
     # served to the user (html_path, written above) is unaffected.
     pdf_source_path = html_path.with_name(f"{html_path.stem}.pdf-source.html")
     try:
+        print(f"[REPORT SERVER] report {base}: JSON/review/HTML ready; preparing PDF-only HTML.", flush=True)
         pdf_source_path.write_text(_render_html(payload, for_pdf=True), encoding="utf-8")
+        print(f"[REPORT SERVER] report {base}: starting PDF rendering.", flush=True)
         html2pdf(pdf_source_path, pdf_path)
+        print(f"[REPORT SERVER] report {base}: PDF rendering completed; file={pdf_path}.", flush=True)
     except Exception as exc:
         result = failure("Report Generator", target_url, f"PDF report creation failed: {type(exc).__name__}: {exc}", diagnosis="pdf_generation_failed")
         result.update(

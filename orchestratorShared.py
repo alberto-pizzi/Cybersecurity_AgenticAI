@@ -47,6 +47,12 @@ MCP_REPORT_MAX_BYTES = max(1024 * 1024, int(os.getenv('SECOPS_MCP_REPORT_MAX_BYT
 MCP_REPORT_INLINE_MAX_BYTES = min(MCP_REPORT_MAX_BYTES, max(65536, int(os.getenv('SECOPS_MCP_REPORT_INLINE_MAX_BYTES', str(128 * 1024)))))
 MCP_REPORT_CHUNK_BYTES = min(512 * 1024, max(16384, int(os.getenv('SECOPS_MCP_REPORT_CHUNK_BYTES', str(64 * 1024)))))
 MCP_REPORT_MAX_CHUNKS = max(8, int(os.getenv('SECOPS_REPORT_UPLOAD_MAX_CHUNKS', '2048')))
+MCP_REPORT_CHUNK_TIMEOUT = max(30.0, float(os.getenv('SECOPS_MCP_REPORT_CHUNK_TIMEOUT', '120')))
+MCP_REPORT_TRANSFER_TIMEOUT = max(MCP_REPORT_CHUNK_TIMEOUT, float(os.getenv('SECOPS_MCP_REPORT_TRANSFER_TIMEOUT', '900')))
+MCP_REPORT_PDF_TIMEOUT_HINT = max(300.0, float(os.getenv('SECOPS_REPORT_PDF_TIMEOUT', '3600')))
+MCP_REPORT_RENDER_TIMEOUT = max(MCP_TOOL_TIMEOUT, MCP_REPORT_PDF_TIMEOUT_HINT + 300.0, float(os.getenv('SECOPS_MCP_REPORT_RENDER_TIMEOUT', '4200')))
+MCP_REPORT_RENDER_SECONDS_PER_MIB = max(0.0, float(os.getenv('SECOPS_MCP_REPORT_RENDER_SECONDS_PER_MIB', '60')))
+MCP_REPORT_RENDER_TIMEOUT_MAX = max(MCP_REPORT_RENDER_TIMEOUT, float(os.getenv('SECOPS_MCP_REPORT_RENDER_TIMEOUT_MAX', '7200')))
 MAX_PARAMETER_ENDPOINTS = max(1, int(os.getenv('SECOPS_MAX_PARAMETER_ENDPOINTS', '5')))
 TERMINAL_URL_MAX = max(120, int(os.getenv('SECOPS_TERMINAL_URL_MAX', '240')))
 
@@ -492,6 +498,23 @@ def _server_startup_log() -> str:
     except OSError:
         return ''
 
+# Returns the latest report-stage progress markers emitted by the unified MCP server.
+def _server_report_progress_log() -> str:
+    path = _HTTP_SERVER_LOGS.get(MCP_UNIFIED_SERVICE)
+    if not path or not path.is_file():
+        return ''
+    try:
+        lines = [line.strip() for line in path.read_text(encoding='utf-8', errors='replace').splitlines() if '[REPORT SERVER]' in line]
+    except OSError:
+        return ''
+    return '\n'.join(lines[-8:])
+
+# Gives report rendering a dedicated budget independent from ordinary scanner calls.
+def _report_render_timeout(payload_bytes: int) -> float:
+    mib = max(1, math.ceil(max(0, int(payload_bytes)) / float(1024 * 1024)))
+    adaptive = MCP_REPORT_RENDER_TIMEOUT + (mib * MCP_REPORT_RENDER_SECONDS_PER_MIB)
+    return min(MCP_REPORT_RENDER_TIMEOUT_MAX, max(MCP_REPORT_RENDER_TIMEOUT, adaptive))
+
 # Starts the one MCP process that imports and exposes the complete tool catalogue.
 def _ensure_http_server(*, restart: bool=False) -> str:
     server = resolve_server_path(UNIFIED_MCP_SERVER)
@@ -649,30 +672,60 @@ async def call_mcp(server_file: str, tool_name: str, arguments: dict[str, Any], 
         chunks = [compressed[index:index + chunk_bytes] for index in range(0, len(compressed), chunk_bytes)] or [b'']
         if len(chunks) > MCP_REPORT_MAX_CHUNKS:
             raise ValueError(f'Report MCP payload requires {len(chunks)} chunks, above the configured {MCP_REPORT_MAX_CHUNKS}-chunk safety ceiling.')
+        transfer_started = time.monotonic()
+        render_timeout = _report_render_timeout(len(encoded))
+        print(
+            f'[REPORT HTTP] payload={len(encoded)} bytes; compressed={len(compressed)} bytes; chunks={len(chunks)}; chunk_size<={chunk_bytes} bytes; transfer budget={MCP_REPORT_TRANSFER_TIMEOUT:.0f}s; render budget={render_timeout:.0f}s.',
+            flush=True,
+        )
         try:
             for index, chunk in enumerate(chunks):
-                response = await client.call_tool('upload_report_chunk', {
-                    'upload_id': upload_id,
-                    'chunk_index': index,
-                    'total_chunks': len(chunks),
-                    'compressed_sha256': digest,
-                    'uncompressed_bytes': len(encoded),
-                    'chunk_b64': base64.b64encode(chunk).decode('ascii'),
-                })
+                remaining = MCP_REPORT_TRANSFER_TIMEOUT - (time.monotonic() - transfer_started)
+                if remaining <= 0:
+                    raise TimeoutError(f'Report HTTP chunk transfer exceeded its {MCP_REPORT_TRANSFER_TIMEOUT:.0f}-second budget after {index}/{len(chunks)} chunks.')
+                response = await asyncio.wait_for(
+                    client.call_tool('upload_report_chunk', {
+                        'upload_id': upload_id,
+                        'chunk_index': index,
+                        'total_chunks': len(chunks),
+                        'compressed_sha256': digest,
+                        'uncompressed_bytes': len(encoded),
+                        'chunk_b64': base64.b64encode(chunk).decode('ascii'),
+                    }),
+                    timeout=min(MCP_REPORT_CHUNK_TIMEOUT, remaining),
+                )
                 data, is_error, _ = _extract_response(response)
                 if is_error or not isinstance(data, dict) or str(data.get('status', '')).lower() != 'success':
                     raise RuntimeError(f'Report chunk {index + 1}/{len(chunks)} was rejected: {data}')
-            final_response = await client.call_tool('generate_report_from_chunks', {'upload_id': upload_id})
+                print(
+                    f'[REPORT HTTP] chunk {index + 1}/{len(chunks)} accepted; compressed bytes received={int(data.get("received_compressed_bytes", 0) or 0)}.',
+                    flush=True,
+                )
+            transfer_elapsed = time.monotonic() - transfer_started
+            print(
+                f'[REPORT HTTP] upload complete: {len(chunks)}/{len(chunks)} chunks accepted in {transfer_elapsed:.1f}s; requesting reconstruction and report rendering.',
+                flush=True,
+            )
+            render_started = time.monotonic()
+            final_response = await asyncio.wait_for(
+                client.call_tool('generate_report_from_chunks', {'upload_id': upload_id}),
+                timeout=render_timeout,
+            )
+            render_elapsed = time.monotonic() - render_started
             report_transfer_meta.update({
                 'report_payload_transport': 'http_chunked',
                 'report_payload_bytes': len(encoded),
                 'report_compressed_bytes': len(compressed),
                 'report_http_chunks': len(chunks),
+                'report_transfer_seconds': round(transfer_elapsed, 3),
+                'report_render_seconds': round(render_elapsed, 3),
+                'report_render_timeout_seconds': render_timeout,
             })
+            print(f'[REPORT HTTP] report service returned after reconstruction/rendering in {render_elapsed:.1f}s.', flush=True)
             return _extract_response(final_response)
         except Exception:
             try:
-                await client.call_tool('discard_report_upload', {'upload_id': upload_id})
+                await asyncio.wait_for(client.call_tool('discard_report_upload', {'upload_id': upload_id}), timeout=min(30.0, MCP_REPORT_CHUNK_TIMEOUT))
             except Exception:
                 pass
             raise
@@ -691,8 +744,10 @@ async def call_mcp(server_file: str, tool_name: str, arguments: dict[str, Any], 
                     )
                     return await invoke_report_chunked(client, encoded)
                 try:
-                    response = await client.call_tool(tool_name, effective_arguments)
-                    report_transfer_meta.update({'report_payload_transport': 'http_inline', 'report_payload_bytes': len(encoded), 'report_http_chunks': 1})
+                    render_timeout = _report_render_timeout(len(encoded))
+                    print(f'[REPORT HTTP] inline report request; payload={len(encoded)} bytes; render budget={render_timeout:.0f}s.', flush=True)
+                    response = await asyncio.wait_for(client.call_tool(tool_name, effective_arguments), timeout=render_timeout)
+                    report_transfer_meta.update({'report_payload_transport': 'http_inline', 'report_payload_bytes': len(encoded), 'report_http_chunks': 1, 'report_render_timeout_seconds': render_timeout})
                     return _extract_response(response)
                 except Exception as exc:
                     detail = f'{type(exc).__name__}: {exc}'.lower()
@@ -703,13 +758,16 @@ async def call_mcp(server_file: str, tool_name: str, arguments: dict[str, Any], 
             return _extract_response(await client.call_tool(tool_name, effective_arguments))
     try:
         url = await asyncio.to_thread(_ensure_http_server)
+        operation_timeout = timeout_seconds + MCP_CONNECT_TIMEOUT
+        if spec.name == 'report':
+            operation_timeout = MCP_REPORT_TRANSFER_TIMEOUT + MCP_REPORT_RENDER_TIMEOUT_MAX + (2 * MCP_CONNECT_TIMEOUT)
         try:
-            data, is_error, shape = await asyncio.wait_for(invoke(url), timeout=timeout_seconds + MCP_CONNECT_TIMEOUT)
+            data, is_error, shape = await asyncio.wait_for(invoke(url), timeout=operation_timeout)
         except Exception as first_exc:
             if not _http_transport_failure(first_exc):
                 raise
             url = await asyncio.to_thread(_ensure_http_server, restart=True)
-            data, is_error, shape = await asyncio.wait_for(invoke(url), timeout=timeout_seconds + MCP_CONNECT_TIMEOUT)
+            data, is_error, shape = await asyncio.wait_for(invoke(url), timeout=operation_timeout)
         result = _normalize_result(data, spec, target, time.monotonic() - started, is_error, shape)
         result.setdefault('_meta', {})['mcp_transport'] = 'streamable_http'
         result.setdefault('_meta', {})['mcp_url'] = url
@@ -721,7 +779,14 @@ async def call_mcp(server_file: str, tool_name: str, arguments: dict[str, Any], 
         exception_text = f'{type(exc).__name__}: {exc}'
         exception_diagnosis = diagnose_error(exception_text)
         if exception_diagnosis == 'timeout':
-            result = _result(spec.name, target, 'partial', f'{spec.name} reached the orchestrator/MCP HTTP time budget. Coverage is incomplete; this is not classified as a scanner error.', 'time_limit_reached', timed_out=True, time_limit_reached=True, traceback=traceback.format_exc(), _meta={'server': str(server), 'duration_seconds': round(time.monotonic() - started, 3), 'mcp_transport': 'streamable_http', 'mcp_url': mcp_http_url(MCP_UNIFIED_SERVICE)})
+            if spec.name == 'report':
+                progress = _server_report_progress_log()
+                message = 'Report generation exceeded its dedicated MCP/HTTP transfer or rendering time budget.'
+                if progress:
+                    message += f' Last report-server progress:\n{progress}'
+                result = _result(spec.name, target, 'partial', message, 'report_time_limit_reached', timed_out=True, time_limit_reached=True, traceback=traceback.format_exc(), _meta={'server': str(server), 'duration_seconds': round(time.monotonic() - started, 3), 'mcp_transport': 'streamable_http', 'mcp_url': mcp_http_url(MCP_UNIFIED_SERVICE)})
+            else:
+                result = _result(spec.name, target, 'partial', f'{spec.name} reached the orchestrator/MCP HTTP time budget. Coverage is incomplete; this is not classified as a scanner error.', 'time_limit_reached', timed_out=True, time_limit_reached=True, traceback=traceback.format_exc(), _meta={'server': str(server), 'duration_seconds': round(time.monotonic() - started, 3), 'mcp_transport': 'streamable_http', 'mcp_url': mcp_http_url(MCP_UNIFIED_SERVICE)})
         else:
             detail = _server_startup_log()
             message = f'MCP HTTP communication failed: {exception_text}'
@@ -3332,7 +3397,74 @@ def iter_leaf_results(value: Any, path: tuple[str, ...]=()) -> Iterator[tuple[tu
         for key, nested in value.items():
             yield from iter_leaf_results(nested, (*path, str(key)))
 
-# Writes a small JSON report if the normal reporting path cannot finish.
+# Recovers normal report artifacts that may already have been written when the final MCP/HTTP
+# response is interrupted or reaches its outer time budget. This prevents a second emergency
+# report from being created when the primary JSON/HTML report is already usable.
+def recover_normal_report_artifacts(output_name: str, report: dict[str, Any]) -> dict[str, Any]:
+    stem = re.sub(r'[^A-Za-z0-9_.-]+', '_', str(output_name or '').strip()).strip('._')[:120]
+    if not stem:
+        return report
+    directory = ROOT / 'reports'
+    json_path = directory / f'{stem}.json'
+    html_path = directory / f'{stem}.html'
+    pdf_path = directory / f'{stem}.pdf'
+    review_path = directory / f'{stem}.review.json'
+    available = {
+        'json_filename': json_path if json_path.is_file() else None,
+        'html_filename': html_path if html_path.is_file() else None,
+        'pdf_filename': pdf_path if pdf_path.is_file() else None,
+        'review_snapshot_filename': review_path if review_path.is_file() else None,
+    }
+    if not any(available.values()):
+        return report
+
+    recovered = dict(report or {})
+    original_status = str(recovered.get('status') or 'error')
+    original_diagnosis = str(recovered.get('diagnosis') or '')
+    original_output = str(recovered.get('output') or '').strip()
+    for key, path in available.items():
+        if path is not None:
+            recovered[key] = str(path.resolve())
+    recovered['normal_report_artifacts_recovered'] = True
+    recovered['local_json_generated'] = bool(available['json_filename'])
+    recovered['local_html_generated'] = bool(available['html_filename'])
+    recovered['local_pdf_generated'] = bool(available['pdf_filename'])
+    recovered['local_review_snapshot_generated'] = bool(available['review_snapshot_filename'])
+    recovered['original_report_status'] = original_status
+    if original_diagnosis:
+        recovered['original_diagnosis'] = original_diagnosis
+
+    payload = None
+    if available['json_filename'] is not None:
+        try:
+            loaded = json.loads(json_path.read_text(encoding='utf-8'))
+            payload = loaded if isinstance(loaded, dict) else None
+        except (OSError, json.JSONDecodeError):
+            payload = None
+    if isinstance(payload, dict):
+        for key in ('findings_count', 'security_findings_count', 'candidate_findings_count', 'observations_count'):
+            if key in payload:
+                recovered[key] = payload.get(key)
+        summary = payload.get('summary') if isinstance(payload.get('summary'), dict) else {}
+        recovered['coverage_constraints_count'] = len(summary.get('coverage_constraints') or [])
+        recovered['execution_limitations_count'] = len(summary.get('limitations') or [])
+        if 'execution_complete' in summary:
+            recovered['execution_complete'] = bool(summary.get('execution_complete'))
+        if 'coverage_complete' in summary:
+            recovered['coverage_complete'] = bool(summary.get('coverage_complete'))
+
+    if available['pdf_filename'] is not None:
+        recovered['status'] = 'success'
+        recovered['diagnosis'] = 'report_response_recovered'
+        recovered['output'] = 'Normal report artifacts, including the PDF, were recovered after the MCP/HTTP response did not complete normally.'
+    else:
+        recovered['status'] = 'partial'
+        recovered['diagnosis'] = 'normal_report_recovered_without_pdf'
+        suffix = f' Original reporting detail: {original_output}' if original_output else ''
+        recovered['output'] = 'Normal JSON/HTML report artifacts were recovered after the MCP/HTTP reporting failure; the PDF was not generated.' + suffix
+    return recovered
+
+# Writes a small JSON report only when no normal report artifact can be recovered.
 def write_emergency_json_report(target: str, results: dict[str, Any], diagnostics: list[dict[str, Any]], reason: str, output_name: str='SecOps_Emergency') -> str | None:
     try:
         directory = ROOT / 'reports'
