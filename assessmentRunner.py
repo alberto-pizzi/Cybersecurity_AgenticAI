@@ -886,12 +886,23 @@ def _generate_aggregate_report(results_data: dict[str, Any], config: dict[str, A
     json_path.write_text(json.dumps(payload, indent=2, ensure_ascii=False, default=str), encoding="utf-8")
     review_path.write_text(json.dumps(build_review_snapshot(payload), indent=2, ensure_ascii=False, default=str), encoding="utf-8")
     html_path.write_text(_render_html(payload), encoding="utf-8")
+    # PDF rendering is wrapped in its own try/except (mirroring servers/reporting/reportServer.py's
+    # _generate_report) so that a PDF failure - e.g. WeasyPrint/its native Pango/Harfbuzz libraries
+    # missing, or the Docker fallback being unavailable - degrades to "no PDF" instead of raising and
+    # discarding the JSON/HTML/review-snapshot artifacts that were already written above. Previously
+    # an exception here propagated out of this function entirely: the caller's except-block then
+    # logged "Aggregate report generation failed" and kept the old per-job report list, silently
+    # orphaning the aggregate HTML/JSON already on disk with no reference to them anywhere.
+    pdf_error: str | None = None
     try:
         pdf_source_path.write_text(_render_html(payload, for_pdf=True), encoding="utf-8")
         html2pdf(pdf_source_path, pdf_path)
+    except Exception as exc:
+        pdf_error = f"{type(exc).__name__}: {exc}"
+        print(f"[!] Aggregate report PDF rendering failed; keeping JSON/HTML artifacts. {pdf_error}", file=sys.stderr)
     finally:
         pdf_source_path.unlink(missing_ok=True)
-    return {
+    result = {
         "job_id": "aggregate",
         "report_id": base,
         "pdf_path": str(pdf_path.resolve()) if pdf_path.is_file() else None,
@@ -900,6 +911,9 @@ def _generate_aggregate_report(results_data: dict[str, Any], config: dict[str, A
         "review_snapshot_path": str(review_path.resolve()),
         "aggregate": True,
     }
+    if pdf_error:
+        result["pdf_error"] = pdf_error
+    return result
 
 
 def _archive_job_report_artifacts(results_data: dict[str, Any], assessment_id: str) -> list[dict[str, Any]]:
@@ -1181,8 +1195,13 @@ def main() -> int:
                 "enabled": True,
                 "entry_point_reports_merged": len(source_report_artifacts),
                 "supporting_job_reports_kept": keep_job_reports,
+                "pdf_generated": bool(aggregate_artifact.get("pdf_path")),
             }
+            if aggregate_artifact.get("pdf_error"):
+                results_data["aggregate_report"]["pdf_error"] = aggregate_artifact["pdf_error"]
             print(f"[+] Aggregate logical-target report generated from {len(source_report_artifacts)} per-entry report artifact(s).")
+            if not aggregate_artifact.get("pdf_path"):
+                print(f"[!] Aggregate report PDF was not generated; HTML/JSON artifacts remain available. {aggregate_artifact.get('pdf_error') or ''}", file=sys.stderr)
         except Exception as exc:
             results_data["aggregate_report"] = {"enabled": True, "status": "error", "error": f"{type(exc).__name__}: {exc}"}
             print(f"[!] Aggregate report generation failed: {type(exc).__name__}: {exc}", file=sys.stderr)

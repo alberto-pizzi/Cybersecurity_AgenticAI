@@ -29,7 +29,7 @@ from datetime import datetime, timezone
 from html.parser import HTMLParser
 from pathlib import Path
 from typing import Any, Iterator
-from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
+from urllib.parse import parse_qsl, unquote, urlencode, urlparse, urlunparse
 warnings.filterwarnings('ignore', message='.*authlib\\.jose.*deprecated.*')
 import requests
 with warnings.catch_warnings():
@@ -90,8 +90,14 @@ MAX_SCRIPT_ASSETS = max(4, int(os.getenv('SECOPS_MAX_SCRIPT_ASSETS', '72')))
 SCANNER_PROGRESS_INTERVAL = max(10, int(os.getenv('SECOPS_PROGRESS_INTERVAL', '30')))
 DISCOVERY_LIMITS = {
     'fast': {'crawl_pages': 35, 'browser_pages': 16, 'browser_pages_max': 32, 'browser_per_origin_pages': 32, 'scripts': 12, 'route_variants': 2, 'per_origin_pages': 24},
-    'balanced': {'crawl_pages': 90, 'browser_pages': 60, 'browser_pages_max': 120, 'browser_per_origin_pages': 120, 'scripts': 36, 'route_variants': 3, 'per_origin_pages': 60},
-    'deep': {'crawl_pages': 180, 'browser_pages': 120, 'browser_pages_max': 240, 'browser_per_origin_pages': 240, 'scripts': 72, 'route_variants': 4, 'per_origin_pages': 120},
+    # crawl/browser/per-origin budgets and route_variants were raised for 'balanced': the previous
+    # route_variants=3 collapsed every same-shape-different-value route (e.g. a routing parameter
+    # like ssoLogin.php?redirect=<module>.php, which selects a different application page per value)
+    # down to at most 3 tested variants, so config-driven menus with many distinct redirect/page
+    # targets were almost entirely invisible to the specialist selectors regardless of how many were
+    # actually discovered. 'deep' keeps a strictly larger route_variants ceiling than 'balanced'.
+    'balanced': {'crawl_pages': 140, 'browser_pages': 90, 'browser_pages_max': 160, 'browser_per_origin_pages': 160, 'scripts': 48, 'route_variants': 6, 'per_origin_pages': 90},
+    'deep': {'crawl_pages': 180, 'browser_pages': 120, 'browser_pages_max': 240, 'browser_per_origin_pages': 240, 'scripts': 72, 'route_variants': 8, 'per_origin_pages': 120},
 }
 FINAL_BROWSER_VERIFICATION_LIMITS = {'fast': 8, 'balanced': 40, 'deep': 120}
 FINAL_BROWSER_VERIFICATION_MAX_LIMITS = {'fast': 12, 'balanced': 64, 'deep': 180}
@@ -113,8 +119,13 @@ SCAN_MODES = {
     'balanced': {
         'broad': {'zap': 540, 'nuclei': 900, 'nikto': 150, 'ffuf': 120, 'session': 50},
         'parameter': {'sqlmap': 180, 'dalfox': 120, 'commix': 180, 'traversal': 75, 'idor': 45, 'authorization': 70, 'browser': 120, 'workflow': 105},
-        'limits': {'sqlmap': 10, 'dalfox': 10, 'commix': 8, 'traversal': 10, 'idor': 10, 'authorization': 12, 'browser': 10, 'workflow': 10},
-        'arjun': 120, 'arjun_limit': 10,
+        # Raised from the previous 8-12 ceiling: each case already runs with its own independent
+        # per-case timeout (the 'parameter' timeouts above), so more selected cases means more total
+        # wall-clock time for this phase, not less time per case. The previous ceiling was small
+        # enough that, on an application with hundreds of discovered parameterized endpoints, only a
+        # small fraction of the real attack surface ever reached a specialist tool in 'balanced' mode.
+        'limits': {'sqlmap': 15, 'dalfox': 15, 'commix': 12, 'traversal': 15, 'idor': 14, 'authorization': 17, 'browser': 15, 'workflow': 15},
+        'arjun': 120, 'arjun_limit': 15,
     },
     'deep': {
         'broad': {'zap': 900, 'nuclei': 1500, 'nikto': 240, 'ffuf': 210, 'session': 90},
@@ -127,7 +138,7 @@ SCAN_MODES = {
 # available only to high-value deferred request contracts selected by deterministic ranking.
 ADAPTIVE_SPECIALIST_OVERFLOW = {
     'fast': {'arjun': 1, 'sqlmap': 1, 'dalfox': 1, 'commix': 1, 'traversal': 1, 'idor': 1, 'authorization': 1, 'browser': 1, 'workflow': 1},
-    'balanced': {'arjun': 4, 'sqlmap': 4, 'dalfox': 4, 'commix': 3, 'traversal': 4, 'idor': 4, 'authorization': 4, 'browser': 4, 'workflow': 4},
+    'balanced': {'arjun': 6, 'sqlmap': 6, 'dalfox': 6, 'commix': 5, 'traversal': 6, 'idor': 6, 'authorization': 6, 'browser': 6, 'workflow': 6},
     'deep': {'arjun': 6, 'sqlmap': 6, 'dalfox': 6, 'commix': 5, 'traversal': 6, 'idor': 8, 'authorization': 8, 'browser': 6, 'workflow': 6},
 }
 ADAPTIVE_HIGH_VALUE_PATH_HINTS = ('/api/', '/admin/', 'management', 'search', 'query', 'upload', 'download', 'callback', 'webhook', 'config', 'settings', 'profile', 'account')
@@ -2188,7 +2199,10 @@ def _is_auto_index_case(case: dict[str, Any]) -> bool:
 SQL_HINTS = {'id', 'uid', 'user', 'user_id', 'userid', 'username', 'email', 'account', 'accountid', 'query', 'search', 'q', 'filter', 'sort', 'page', 'offset', 'limit', 'category', 'product', 'productid', 'item', 'itemid', 'order', 'orderid', 'dashboardid', 'widgetid', 'deviceid', 'modelid', 'serviceid'}
 XSS_HINTS = {'name', 'message', 'comment', 'search', 'query', 'q', 'input', 'text', 'title', 'pagetitle', 'html', 'content', 'url', 'linkurl', 'redirect', 'callback', 'fromsubmenu'}
 COMMAND_HINTS = {'cmd', 'command', 'exec', 'shell', 'ip', 'host', 'hostname', 'ping', 'target', 'domain'}
-TRAVERSAL_HINTS = {'file', 'filename', 'path', 'page', 'include', 'template', 'document', 'folder', 'dir', 'directory', 'view', 'resource', 'download'}
+# 'redirect'/'linkurl' were added: a parameter that selects which internal page/module to load by
+# name (e.g. redirect=devices.php) is a routing-by-filename pattern and a classic local-file-
+# inclusion/path-traversal vector, not merely an XSS-reflection surface.
+TRAVERSAL_HINTS = {'file', 'filename', 'path', 'page', 'include', 'template', 'document', 'folder', 'dir', 'directory', 'view', 'resource', 'download', 'redirect', 'linkurl'}
 IDOR_HINTS = {'id', 'uid', 'user_id', 'userid', 'account_id', 'accountid', 'object_id', 'objectid', 'item_id', 'itemid', 'order_id', 'orderid', 'document_id', 'documentid', 'file_id', 'fileid', 'profile_id', 'profileid', 'dashboardid', 'widgetid', 'deviceid', 'modelid'}
 NAVIGATION_PARAMETERS = {'pagetitle', 'linkid', 'fromsubmenu', 'showframe', 'redirect', 'linkurl'}
 
@@ -2208,6 +2222,32 @@ def _case_parameters(case: dict[str, Any]) -> set[str]:
     parsed = urlparse(str(case.get('url', '')))
     parameters.update((name.lower() for name, _ in parse_qsl(parsed.query, keep_blank_values=True)))
     return parameters
+
+INTERNAL_RESOURCE_VALUE_PATTERN = re.compile(r'\.(php\d?|phtml|jsp|jspx|asp|aspx|cgi|pl|do|action|html?)(?:[/?]|$)')
+
+# Generic (application-agnostic) detector for a parameter whose VALUE, not just its name, selects
+# an internal server-side file or module (e.g. redirect=devices.php, page=admin/setup.jsp,
+# tpl=../../etc/passwd). Name-based hint sets like TRAVERSAL_HINTS miss this whole vulnerability
+# class whenever the application uses an otherwise-unremarkable parameter name (redirect, tab,
+# mod, scr, ...) to route to a file by value, which is a common local-file-inclusion and path-
+# traversal pattern independent of the specific target application.
+def _parameter_values_reference_internal_resource(case: dict[str, Any]) -> bool:
+    values: list[str] = [value for _, value in parse_qsl(urlparse(str(case.get('url', ''))).query, keep_blank_values=True)]
+    for field in case.get('fields', []) if isinstance(case.get('fields'), list) else []:
+        if isinstance(field, dict) and field.get('value'):
+            values.append(str(field['value']))
+    for raw in values:
+        try:
+            value = unquote(unquote(str(raw or ''))).lower()
+        except Exception:
+            value = str(raw or '').lower()
+        if not value:
+            continue
+        if INTERNAL_RESOURCE_VALUE_PATTERN.search(value):
+            return True
+        if '../' in value or '..%2f' in value or '..\\' in value or value.startswith('/etc/') or value.startswith('file:'):
+            return True
+    return False
 
 # XSS routing sends DOM-oriented cases to the browser when that gives better coverage.
 def _prefer_browser_for_xss_case(case: dict[str, Any]) -> bool:
@@ -2297,6 +2337,11 @@ def _tool_case_priority(tool: str, case: dict[str, Any], authenticated_profile: 
             return -1000
         score += 55 if any((token in path for token in ('include', 'download', 'file', 'template', 'document', 'view'))) else 0
         score += 15 * len(parameters & TRAVERSAL_HINTS)
+        # Application-agnostic signal: the parameter VALUE (not its name) already looks like it
+        # selects a server-side file/module, e.g. redirect=devices.php. This catches routing-by-
+        # filename parameters that a name-only hint list would miss under an unrelated name.
+        if _parameter_values_reference_internal_resource(case):
+            score += 40
         if any((token in path for token in ('sqli', 'xss', '/exec', '/csp'))) and (not parameters & TRAVERSAL_HINTS):
             score -= 45
         if authenticated_profile and _is_login_case(case):
