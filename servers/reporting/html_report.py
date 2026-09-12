@@ -92,7 +92,7 @@ def _render_html(payload: dict[str, Any], *, for_pdf: bool = False) -> str:
 
 {_render_execution(payload["coverage"], toc)}
 
-{_render_endpoint_coverage(payload.get("endpoint_coverage") or [], toc)}
+{_render_endpoint_coverage(payload.get("endpoint_coverage") or [], toc, for_pdf=for_pdf)}
 
 {_render_limitations(summary, toc)}
 

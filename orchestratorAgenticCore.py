@@ -41,6 +41,8 @@ _SNAP4CITY_TOKEN_MANAGERS: dict[str, Any] = {}
 # Stores the state exchanged between the agentic workflow steps.
 class AgentState(TypedDict):
     target: str
+    entry_points: list[str]
+    discovery_seeds: list[str]
     profiles: list[dict[str, str]]
     discovery: dict[str, dict[str, Any]]
     plan: list[dict[str, Any]]
@@ -113,8 +115,8 @@ AGENTIC_BASELINE_TOOLS = ('ffuf', 'zap', 'nuclei', 'session', 'nikto', 'jwt')
 PROFILE_EXECUTION_ACTION_BUDGETS = {'fast': 48, 'balanced': 144, 'deep': 288}
 # Concrete execution can grow above the base only when selected capability groups still contain
 # validated request actions. The ceiling is per profile and per round and is intentionally above
-# the sum of all current per-tool maxima, so it normally acts only as an emergency guardrail.
-PROFILE_EXECUTION_ACTION_MAX = {'fast': 80, 'balanced': 240, 'deep': 480}
+# the concrete capacity needed by the currently selected capability groups, so it normally acts only as an emergency guardrail.
+PROFILE_EXECUTION_ACTION_MAX = {'fast': 80, 'balanced': 360, 'deep': 600}
 PROFILE_TOOL_GROUP_BUDGETS = {'fast': 12, 'balanced': 16, 'deep': 18}
 PROFILE_BREADTH_REVIEW_GROUP_CAPS = {'fast': 3, 'balanced': 6, 'deep': 8}
 # A grouped catalog is much smaller than the concrete request-action pool. The limit is only a
@@ -317,6 +319,7 @@ def _planner_group_candidate_view(group: dict[str, Any], candidate_id: str) -> d
             'url': str(action.get('target_url') or ''),
             'parameters': [str(value) for value in action.get('parameters', [])][:6],
             'adaptive': bool(action.get('adaptive_budget')),
+            'coverage_reserve': bool(action.get('coverage_reserve')),
             'evidence': str(action.get('reason') or '')[:150],
         })
     return {
@@ -325,6 +328,7 @@ def _planner_group_candidate_view(group: dict[str, Any], candidate_id: str) -> d
         'tool': str(group.get('tool') or ''),
         'concrete_action_count': len(actions),
         'adaptive_action_count': sum(bool(action.get('adaptive_budget')) for action in actions),
+        'coverage_reserve_action_count': sum(bool(action.get('coverage_reserve')) for action in actions),
         'examples': examples,
     }
 
@@ -402,36 +406,79 @@ def _expand_planner_groups(
         effective = min(maximum, available)
         offsets = [0] * len(prepared)
         used = 0
+        reserve_used = 0
+
+        def append_action(index: int, offset: int) -> None:
+            nonlocal used, reserve_used
+            candidate_id, group, selection_source, actions = prepared[index]
+            action = dict(actions[offset])
+            action['planner_group_id'] = candidate_id
+            action['planner_group_action_index'] = offset + 1
+            action['planner_group_action_count'] = len(actions)
+            if selection_source == 'baseline':
+                prefix = 'Deterministic baseline selected'
+            elif selection_source == 'review':
+                prefix = 'AI review selected'
+            else:
+                prefix = 'AI selected'
+            action['reason'] = f"{prefix} {candidate_id} ({group.get('tool')} capability): {str(action.get('reason') or 'discovery-derived candidate')[:380]}"
+            expanded.append(action)
+            used += 1
+            if action.get('coverage_reserve'):
+                reserve_used += 1
+
+        # Coverage-reserve actions represent high-confidence routing/file selectors that the
+        # deterministic ranking explicitly marked for direct validation. Consume them before
+        # discretionary round-robin expansion so they cannot be diluted by many other tool groups.
+        reserve_offsets: list[list[int]] = []
+        for _, _, _, actions in prepared:
+            reserve_offsets.append([idx for idx, action in enumerate(actions) if bool(action.get('coverage_reserve'))])
+        reserve_positions = [0] * len(prepared)
         while used < effective:
             added = False
-            for index, (candidate_id, group, selection_source, actions) in enumerate(prepared):
-                offset = offsets[index]
-                if offset >= len(actions):
+            for index, indices in enumerate(reserve_offsets):
+                position = reserve_positions[index]
+                if position >= len(indices):
                     continue
-                action = dict(actions[offset])
-                offsets[index] += 1
-                action['planner_group_id'] = candidate_id
-                action['planner_group_action_index'] = offset + 1
-                action['planner_group_action_count'] = len(actions)
-                if selection_source == 'baseline':
-                    prefix = 'Deterministic baseline selected'
-                elif selection_source == 'review':
-                    prefix = 'AI review selected'
-                else:
-                    prefix = 'AI selected'
-                action['reason'] = f"{prefix} {candidate_id} ({group.get('tool')} capability): {str(action.get('reason') or 'discovery-derived candidate')[:380]}"
-                expanded.append(action)
-                used += 1
+                offset = indices[position]
+                reserve_positions[index] += 1
+                append_action(index, offset)
                 added = True
                 if used >= effective:
                     break
             if not added:
                 break
+
+        # Continue with all non-reserve actions in capability-fair round-robin order.
+        consumed_offsets = {
+            (index, offset)
+            for index, indices in enumerate(reserve_offsets)
+            for offset in indices[:reserve_positions[index]]
+        }
+        while used < effective:
+            added = False
+            for index, (candidate_id, group, selection_source, actions) in enumerate(prepared):
+                offset = offsets[index]
+                while offset < len(actions) and ((index, offset) in consumed_offsets or bool(actions[offset].get('coverage_reserve'))):
+                    offset += 1
+                offsets[index] = offset
+                if offset >= len(actions):
+                    continue
+                append_action(index, offset)
+                offsets[index] = offset + 1
+                added = True
+                if used >= effective:
+                    break
+            if not added:
+                break
+        reserve_available = sum(len(indices) for indices in reserve_offsets)
         diagnostics[profile] = {
             'base': base,
             'adaptive_max': maximum,
             'available': available,
             'selected': used,
+            'coverage_reserve_available': reserve_available,
+            'coverage_reserve_selected': reserve_used,
             'execution_overflow_used': max(0, used - min(base, used)),
             'adaptive_cases_available': adaptive_available,
             'deferred': max(0, available - used),
@@ -899,6 +946,7 @@ def ai_plan(state: AgentState) -> dict[str, Any]:
     baseline_group_ids = [
         candidate_id for candidate_id, group in candidate_map.items()
         if str(group.get('tool') or '').lower() in AGENTIC_BASELINE_TOOLS
+        or any(bool(action.get('coverage_reserve')) for action in group.get('actions', []) if isinstance(action, dict))
     ]
     candidate_tools = sorted({str(group.get('tool') or '') for group in eligible_groups})
     registry = {
@@ -1629,7 +1677,11 @@ def discovery_node(state: AgentState) -> dict[str, Any]:
     print(f'\n[*] Discovery of active profiles: {active_profiles}')
     discovery, diagnostics = ({}, list(state['diagnostics']))
     for profile in state['profiles']:
-        found = discover_target_sync_safe(state['target'], profile['cookies'])
+        found = discover_target_sync_safe(
+            state['target'], profile['cookies'],
+            seeds=list(state.get('discovery_seeds') or []),
+            forced_seeds=list(state.get('entry_points') or []),
+        )
         discovery[profile['name']] = found
         diagnostics.extend(({'phase': 'discovery', 'profile': profile['name'], **item} for item in found['errors']))
         print(f"    {profile['name']}: {len(found.get('html_urls', []))} HTML pages, {len(found.get('request_cases', []))} request contracts, {len(found.get('browser_network_requests', []))} browser network requests, {len(found.get('browser_navigation_urls', []))} Chromium navigations, {len(found['jwt_tokens'])} JWTs")
@@ -1680,6 +1732,7 @@ def discovery_node(state: AgentState) -> dict[str, Any]:
 def discovery_candidate_actions(state: AgentState) -> list[dict[str, Any]]:
 
     actions: list[dict[str, Any]] = []
+    state_changes_allowed = shared.state_changing_tests_allowed(state['target'], state.get('allow_state_changes'))
     for profile in state['profiles']:
         name = profile['name']
         if not _profile_is_plannable(state, name):
@@ -1713,9 +1766,11 @@ def discovery_candidate_actions(state: AgentState) -> list[dict[str, Any]]:
             adaptive = bool(case.get('adaptive_budget'))
             actions.append({'profile': name, 'tool': 'arjun', 'target_url': case['url'], 'method': case.get('method', 'GET'), 'data': case.get('data', ''), 'parameters': case.get('parameters', []), 'jwt_token': '', 'injection_url': '', 'adaptive_budget': adaptive, 'priority_score': case.get('priority_score'), 'reason': ('Adaptive high-value overflow selected by deterministic ranking: ' if adaptive else '') + 'Hidden-parameter discovery using the real request method and body.'})
         for tool in ('sqlmap', 'dalfox', 'commix', 'traversal', 'idor'):
-            for case in select_tool_request_cases(state['discovery'].get(name, {}), tool, limit=shared.PARAMETER_TOOL_CASE_LIMITS.get(tool, 1), authenticated_profile=authenticated):
+            for case in select_tool_request_cases(state['discovery'].get(name, {}), tool, limit=shared.PARAMETER_TOOL_CASE_LIMITS.get(tool, 1), authenticated_profile=authenticated, allow_state_changes=state_changes_allowed):
                 adaptive = bool(case.get('adaptive_budget'))
-                actions.append({'profile': name, 'tool': tool, 'target_url': case['url'], 'method': case.get('method', 'GET'), 'data': case.get('data', ''), 'parameters': case.get('parameters', []), 'jwt_token': '', 'injection_url': '', 'adaptive_budget': adaptive, 'priority_score': case.get('priority_score'), 'reason': (f'Adaptive high-value overflow selected by deterministic ranking for {tool}. ' if adaptive else '') + f'Highest-value discovered request for {tool}.'})
+                coverage_reserve = bool(case.get('coverage_reserve'))
+                prefix = f'Adaptive high-value overflow selected by deterministic ranking for {tool}. ' if adaptive else 'Routing-value coverage reserve selected for direct traversal/LFI validation. ' if coverage_reserve else ''
+                actions.append({'profile': name, 'tool': tool, 'target_url': case['url'], 'method': case.get('method', 'GET'), 'data': case.get('data', ''), 'parameters': case.get('parameters', []), 'jwt_token': '', 'injection_url': '', 'adaptive_budget': adaptive, 'coverage_reserve': coverage_reserve, 'priority_score': case.get('priority_score'), 'reason': prefix + f'Highest-value discovered request for {tool}.'})
         if authenticated:
             for case in select_authorization_request_cases(state['discovery'].get(name, {}), limit=shared.tool_action_limit('authorization')):
                 adaptive = bool(case.get('adaptive_budget'))
@@ -1819,7 +1874,7 @@ def validate_plan(state: AgentState, proposed: Any) -> list[dict[str, Any]]:
             data = str(selected.get('data', ''))
             parameters = [str(value) for value in selected.get('parameters', [])]
         elif scope in {'parameterized', 'numeric'}:
-            cases = select_tool_request_cases(found, tool, limit=shared.PARAMETER_TOOL_CASE_LIMITS.get(tool, 1), authenticated_profile=profile_has_cookie)
+            cases = select_tool_request_cases(found, tool, limit=shared.PARAMETER_TOOL_CASE_LIMITS.get(tool, 1), authenticated_profile=profile_has_cookie, allow_state_changes=shared.state_changing_tests_allowed(state['target'], state.get('allow_state_changes')))
             matching = [case for case in cases if str(case.get('url', '')) == target_url]
             if method:
                 matching = [case for case in matching if str(case.get('method', 'GET')).upper() == method]
@@ -1827,6 +1882,8 @@ def validate_plan(state: AgentState, proposed: Any) -> list[dict[str, Any]]:
                 continue
             selected = matching[0]
             if _tool_case_skip_reason(tool, selected, authenticated_profile=profile_has_cookie):
+                continue
+            if (not shared.state_changing_tests_allowed(state['target'], state.get('allow_state_changes'))) and shared.request_case_state_change_reason(selected):
                 continue
             method = str(selected.get('method', 'GET')).upper()
             data = str(selected.get('data', ''))
@@ -1898,7 +1955,7 @@ def validate_plan(state: AgentState, proposed: Any) -> list[dict[str, Any]]:
                 data = str(selected.get('data', ''))
                 parameters = [str(value) for value in selected.get('parameters', [])]
                 oast_class = str(selected.get('oast_class') or 'remote-fetch')
-        action = {'profile': profile, 'tool': tool, 'target_url': target_url, 'method': method or 'GET', 'data': data, 'parameters': parameters, 'source_url': source_url, 'fields': fields, 'client_sources': client_sources, 'client_sinks': client_sinks, 'file_parameters': file_parameters, 'token_parameters': token_parameters, 'enctype': enctype, 'jwt_token': token, 'injection_url': injection, 'oast_class': oast_class, 'adaptive_budget': bool(selected.get('adaptive_budget')), 'priority_score': selected.get('priority_score'), 'sibling_broad': bool(raw.get('sibling_broad')), 'sibling_origin_score': raw.get('sibling_origin_score'), 'reason': str(raw.get('reason', ''))[:500] or 'No planner reason supplied.'}
+        action = {'profile': profile, 'tool': tool, 'target_url': target_url, 'method': method or 'GET', 'data': data, 'parameters': parameters, 'source_url': source_url, 'fields': fields, 'client_sources': client_sources, 'client_sinks': client_sinks, 'file_parameters': file_parameters, 'token_parameters': token_parameters, 'enctype': enctype, 'jwt_token': token, 'injection_url': injection, 'oast_class': oast_class, 'adaptive_budget': bool(selected.get('adaptive_budget')), 'coverage_reserve': bool(selected.get('coverage_reserve') or raw.get('coverage_reserve')), 'priority_score': selected.get('priority_score'), 'sibling_broad': bool(raw.get('sibling_broad')), 'sibling_origin_score': raw.get('sibling_origin_score'), 'reason': str(raw.get('reason', ''))[:500] or 'No planner reason supplied.'}
         identifier = action_id(action)
         key = (profile, tool)
         limit = shared.tool_action_limit(tool, include_adaptive=True)
@@ -2020,7 +2077,7 @@ def _missing_tool_reason(state: AgentState, profile_name: str, tool: str) -> str
     if tool == 'arjun':
         return '' if select_arjun_request_cases(found, state['target'], limit=1) else 'No suitable discovered GET/POST request was available for hidden-parameter discovery.'
     if tool in PARAMETER_COVERAGE_TOOLS:
-        return '' if select_tool_request_cases(found, tool, limit=1, authenticated_profile=profile_has_cookie) else f"No discovered request matched {tool}'s vulnerability class."
+        return '' if select_tool_request_cases(found, tool, limit=1, authenticated_profile=profile_has_cookie, allow_state_changes=shared.state_changing_tests_allowed(state['target'], state.get('allow_state_changes'))) else f"No discovered policy-eligible request matched {tool}'s vulnerability class."
     if tool == 'authorization':
         if not profile_has_cookie:
             return 'Authorization comparison requires a primary authenticated profile.'
@@ -2554,12 +2611,15 @@ def report_node(state: AgentState) -> dict[str, Any]:
     report_results = _materialize_unselected_actions(state)
     remaining = _remaining_eligible_actions({**state, 'results': report_results})
     context = {'profiles': [{'name': profile['name'], 'authenticated': _profile_has_effective_auth(state, str(profile.get('name') or ''))} for profile in state['profiles']],
+        'explicit_entry_points': list(state.get('entry_points') or []),
+        'priority_discovery_seeds': list(state.get('discovery_seeds') or []),
         'expected_tools': list(REGISTRY),
         'discovery': state['discovery'],
         'endpoint_selection': {
             profile['name']: shared.endpoint_selection_decisions(
                 state['discovery'].get(profile['name'], {}), state['target'],
                 authenticated_profile=_profile_has_effective_auth(state, str(profile.get('name') or '')),
+                allow_state_changes=shared.state_changing_tests_allowed(state['target'], state.get('allow_state_changes')),
             )
             for profile in state['profiles']
         },

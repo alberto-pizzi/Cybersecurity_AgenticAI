@@ -5,7 +5,7 @@ import json
 import os
 from pathlib import Path
 from typing import Any, Iterator
-from urllib.parse import urlparse
+from urllib.parse import urljoin, urlparse
 
 
 SCHEMA_VERSION = 1
@@ -153,6 +153,24 @@ def _validate_assets(assets: list[Any]) -> None:
                 if not protocol and port in (None, ""):
                     raise ValueError(f"Service {global_id} requires protocol or port when service.url is not supplied.")
 
+            entry_points = service.get("entry_points", [])
+            if entry_points is not None:
+                if not isinstance(entry_points, list) or not all(isinstance(value, str) and value.strip() for value in entry_points):
+                    raise ValueError(f"entry_points for {global_id} must be a list of non-empty absolute HTTP/HTTPS URLs or root-relative paths.")
+                if len(entry_points) > 256:
+                    raise ValueError(f"entry_points for {global_id} exceeds the 256-entry safety limit.")
+                for value in entry_points:
+                    raw = value.strip()
+                    if raw.startswith("/"):
+                        continue
+                    parsed_entry = urlparse(raw)
+                    if str(parsed_entry.scheme or "").lower() not in SUPPORTED_WEB_PROTOCOLS or not parsed_entry.hostname:
+                        raise ValueError(f"Invalid entry_points value for {global_id}: {value!r}")
+                    try:
+                        _ = parsed_entry.port
+                    except ValueError as exc:
+                        raise ValueError(f"Invalid port in entry_points value for {global_id}: {value!r}") from exc
+
             port = service.get("port")
             if port not in (None, ""):
                 try:
@@ -294,6 +312,13 @@ def iter_service_jobs(config: dict[str, Any]) -> Iterator[dict[str, Any]]:
                 port_value = service.get("port")
                 port = int(port_value) if port_value not in (None, "") else None
                 target = ""
+            entry_points: list[str] = []
+            for raw_entry in service.get("entry_points") or []:
+                value = str(raw_entry or "").strip()
+                if not value:
+                    continue
+                entry_points.append(urljoin(target, value) if value.startswith("/") and target else value)
+            entry_points = list(dict.fromkeys(entry_points))
             primary_ref = str(service.get("credential_ref") or "").strip()
             secondary_ref = str(service.get("secondary_credential_ref") or "").strip()
             yield {
@@ -305,6 +330,7 @@ def iter_service_jobs(config: dict[str, Any]) -> Iterator[dict[str, Any]]:
                 "protocol": protocol,
                 "port": port,
                 "target": target,
+                "entry_points": entry_points,
                 "enabled": enabled,
                 "supported": protocol in SUPPORTED_WEB_PROTOCOLS,
                 "unsupported_reason": "" if protocol in SUPPORTED_WEB_PROTOCOLS else "current orchestrators assess HTTP/HTTPS application services only",

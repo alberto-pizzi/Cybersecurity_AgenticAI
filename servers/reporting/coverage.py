@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import os
 import re
 from collections import Counter
 from typing import Any
@@ -226,6 +227,16 @@ def build_endpoint_coverage(results: dict[str, Any], context: dict[str, Any]) ->
             row["discovery_sources"].append(source)
         return row
 
+    explicit_entry_points = [str(value) for value in (context.get("explicit_entry_points") or []) if isinstance(value, str) and str(value).strip()]
+    profile_names = [
+        str(item.get("name") or "") for item in (context.get("profiles") or [])
+        if isinstance(item, dict) and str(item.get("name") or "")
+    ]
+    for profile in profile_names:
+        for url in explicit_entry_points:
+            row = ensure_row("", profile, "GET", url, source="Configured entry point")
+            row["configured_entry_point"] = True
+
     for job_id, profile, discovery, entry_point in _iter_endpoint_discovery(context):
         browser_urls = {_endpoint_coverage_url_key(str(value)) for value in discovery.get("browser_navigation_urls", []) if str(value)}
         for case in discovery.get("request_cases", []):
@@ -349,6 +360,53 @@ def build_endpoint_coverage(results: dict[str, Any], context: dict[str, Any]) ->
                 row["reason_code"] = "TESTED"
                 row["reason"] = "One or more concrete security-tool executions were recorded for this endpoint."
 
+        # Broad scanners can test many concrete URLs inside one MCP invocation. Record those exact
+        # targets so the endpoint matrix does not attribute all broad coverage only to the root URL.
+        # This records execution coverage only; it does not promote broad scans to specialist findings.
+        if tool == "nuclei" and status != "skipped":
+            nuclei_targets: list[tuple[str, str, str]] = []
+            for value in result.get("focused_targets", []) if isinstance(result.get("focused_targets"), list) else []:
+                if str(value):
+                    nuclei_targets.append(("GET", str(value), "nuclei focused target"))
+            for case in result.get("dast_request_cases", []) if isinstance(result.get("dast_request_cases"), list) else []:
+                if isinstance(case, dict) and str(case.get("url") or ""):
+                    nuclei_targets.append((str(case.get("method") or "GET").upper(), str(case.get("url")), "nuclei DAST request"))
+            for nested_method, nested_url, nested_label in nuclei_targets:
+                nested = ensure_row(source_job, profile, nested_method, nested_url, entry_point=source_entry, source="Scanner evidence")
+                label = f"{nested_label} ({status})"
+                if label not in nested["tests"]:
+                    nested["tests"].append(label)
+                if status == "error":
+                    if nested["status"] not in {"HTTP 404", "HTTP 410", "Tested"}:
+                        nested["status"] = "Execution error"
+                        nested["reason_code"] = "EXECUTION_ERROR"
+                        nested["reason"] = "Nuclei received this target/request context, but the scanner invocation failed."
+                elif nested["status"] not in {"HTTP 404", "HTTP 410"}:
+                    nested["status"] = "Tested"
+                    nested["reason_code"] = "TESTED"
+                    nested["reason"] = "This endpoint/request context was included in an executed Nuclei target or DAST request set."
+
+        if tool == "zap" and status != "skipped":
+            active_scans = result.get("targeted_active_scans") if isinstance(result.get("targeted_active_scans"), list) else []
+            for scan in active_scans:
+                if not isinstance(scan, dict) or not scan.get("started") or not str(scan.get("url") or ""):
+                    continue
+                nested_method = str(scan.get("method") or "GET").upper()
+                nested_url = str(scan.get("url"))
+                nested = ensure_row(source_job, profile, nested_method, nested_url, entry_point=source_entry, source="Scanner evidence")
+                label = f"zap targeted active scan ({status})"
+                if label not in nested["tests"]:
+                    nested["tests"].append(label)
+                if status == "error":
+                    if nested["status"] not in {"HTTP 404", "HTTP 410", "Tested"}:
+                        nested["status"] = "Execution error"
+                        nested["reason_code"] = "EXECUTION_ERROR"
+                        nested["reason"] = "ZAP started a targeted active scan for this endpoint, but the scanner invocation failed."
+                elif nested["status"] not in {"HTTP 404", "HTTP 410"}:
+                    nested["status"] = "Tested"
+                    nested["reason_code"] = "TESTED"
+                    nested["reason"] = "A targeted ZAP active scan was actually started for this endpoint/request context."
+
     orchestration = context.get("orchestration") if isinstance(context.get("orchestration"), dict) else {}
     orchestration_mode = str(orchestration.get("mode") or "").lower()
     for row in rows.values():
@@ -389,10 +447,16 @@ def summarize_endpoint_coverage(rows: list[dict[str, Any]]) -> dict[str, Any]:
         skipped = sum(str(row.get("status") or "") == "Skipped" for row in items)
         errors = sum(str(row.get("status") or "") == "Execution error" for row in items)
         coverage = (100.0 * tested / reachable) if reachable else 0.0
+        explicit = [row for row in items if bool(row.get("configured_entry_point"))]
+        explicit_tested = sum(str(row.get("status") or "") == "Tested" for row in explicit)
+        explicit_coverage = (100.0 * explicit_tested / len(explicit)) if explicit else 0.0
         return {
             "discovered_contexts": total,
             "reachable_in_scope": reachable,
             "tested": tested,
+            "configured_entry_points": len(explicit),
+            "tested_entry_points": explicit_tested,
+            "entry_point_tested_coverage_percent": round(explicit_coverage, 1),
             "discovered_only": discovered_only,
             "intentionally_skipped": skipped,
             "execution_errors": errors,
@@ -409,7 +473,7 @@ def summarize_endpoint_coverage(rows: list[dict[str, Any]]) -> dict[str, Any]:
 
 
 # Renders the endpoint coverage matrix using the same table language as the rest of the report.
-def _render_endpoint_coverage(rows: list[dict[str, Any]], toc: list[tuple[int, str, str]]) -> str:
+def _render_endpoint_coverage(rows: list[dict[str, Any]], toc: list[tuple[int, str, str]], *, for_pdf: bool=False) -> str:
     heading = _heading(2, "Endpoint coverage matrix", toc, anchor="endpoint-coverage")
     if not rows:
         return f"{heading}<p>No endpoint coverage data were recorded.</p>"
@@ -423,6 +487,9 @@ def _render_endpoint_coverage(rows: list[dict[str, Any]], toc: list[tuple[int, s
         ("Discovered contexts", "discovered_contexts", False),
         ("Reachable / in scope", "reachable_in_scope", False),
         ("Tested", "tested", False),
+        ("Configured entry points", "configured_entry_points", False),
+        ("Tested entry points", "tested_entry_points", False),
+        ("Entry-point tested coverage", "entry_point_tested_coverage_percent", True),
         ("Discovery only", "discovered_only", False),
         ("Intentionally skipped", "intentionally_skipped", False),
         ("Execution errors", "execution_errors", False),
@@ -440,8 +507,25 @@ def _render_endpoint_coverage(rows: list[dict[str, Any]], toc: list[tuple[int, s
     summary_head = "".join(f"<th>{_esc(column)}</th>" for column in summary_columns)
 
     aggregate = any(str(row.get("job_id") or "") for row in rows)
+    display_rows = list(rows)
+    detail_note = ""
+    if for_pdf:
+        pdf_limit = max(80, int(os.getenv("SECOPS_REPORT_PDF_ENDPOINT_ROWS", "260")))
+        if len(display_rows) > pdf_limit:
+            status_priority = {
+                "Execution error": 0, "Discovered only": 1, "Skipped": 2,
+                "Tested": 3, "HTTP 404": 4, "HTTP 410": 4,
+            }
+            display_rows = sorted(
+                display_rows,
+                key=lambda row: (status_priority.get(str(row.get("status") or ""), 6), str(row.get("profile") or ""), str(row.get("url") or "")),
+            )[:pdf_limit]
+            detail_note = (
+                f'<p class="section-note"><strong>PDF detail limit:</strong> showing {len(display_rows)} of {len(rows)} endpoint rows, prioritizing gaps and execution errors. '
+                'The complete endpoint matrix remains available in the HTML and JSON artifacts.</p>'
+            )
     body_rows = []
-    for index, row in enumerate(rows, start=1):
+    for index, row in enumerate(display_rows, start=1):
         profile_text = _esc(row.get("profile", ""))
         if aggregate and row.get("job_id"):
             profile_text += f"<br><small>{_esc(row.get('job_id', ''))}</small>"
@@ -464,9 +548,11 @@ def _render_endpoint_coverage(rows: list[dict[str, Any]], toc: list[tuple[int, s
         f"{heading}"
         '<p class="section-note">Each row represents a discovered endpoint/request context for one assessment profile. '
         '"Tested" means that at least one concrete security-tool execution was recorded for that endpoint; discovery alone does not count as a security test. '
-        'The reason code states why an untested context was deferred or excluded. Anonymous and authenticated coverage are calculated independently.</p>'
+        'The reason code states why an untested context was deferred or excluded. Anonymous and authenticated coverage are calculated independently. '
+        'Configured entry-point coverage counts the supplied URLs themselves: a value such as 0/N means none of those N exact request contexts received a concrete security-tool execution, not that the complete assessment executed zero attacks.</p>'
         f'<table><thead><tr><th>Metric</th>{summary_head}</tr></thead><tbody>{"".join(summary_rows)}</tbody></table>'
         '<p class="section-note">Tested coverage is the percentage of reachable, in-scope request contexts for which at least one concrete security-tool execution was recorded. Out-of-scope references and HTTP 404/410 responses are excluded from the denominator.</p>'
+        f'{detail_note}'
         '<table><thead><tr><th>#</th><th>Profile / job</th><th>Method</th><th>Endpoint</th><th>Discovered by</th><th>Security tests</th><th>Status</th><th>Reason code</th><th>Reason</th></tr></thead>'
         f"<tbody>{''.join(body_rows)}</tbody></table>"
     )

@@ -22,7 +22,7 @@ from orchestratorShared import (
     build_tool_arguments, call_mcp, call_mcp_with_progress, configure_scan_mode,
     diagnose_error, discover_target, enrich_discovery_with_arjun, enrich_discovery_with_ffuf,
     iter_leaf_results, log_result, log_zap_session_diagnostics, make_skipped_result,
-    merge_discovery, prepare_cli_context, print_preflight_report, print_security_finding_summary,
+    merge_discovery, prepare_cli_context, prepare_cli_entry_points, prepare_cli_discovery_seeds, print_preflight_report, print_security_finding_summary,
     refresh_authenticated_session_state, run_preflight_checks, select_arjun_request_cases,
     select_authorization_request_cases, select_browser_request_cases, select_logout_request_cases, select_oast_request_cases,
     select_request_cases, select_session_probe_url, select_tool_request_cases,
@@ -62,6 +62,8 @@ def _tag_coverage_action(result: dict[str, Any], tool: str, *, target_url: str, 
 # Stores the state exchanged between the deterministic workflow steps.
 class DeterministicState(TypedDict, total=False):
     target: str
+    entry_points: list[str]
+    discovery_seeds: list[str]
     profiles: list[dict[str, str]]
     injection_url: str
     allow_state_changes: bool | None
@@ -93,7 +95,10 @@ async def deterministic_discovery_node(state: DeterministicState) -> dict[str, A
     workflow_state_changes = state_changing_tests_allowed(target, allow_state_changes)
     for profile in profiles:
         name = profile['name']
-        found = await asyncio.to_thread(discover_target, target, profile['cookies'])
+        found = await asyncio.to_thread(
+            discover_target, target, profile['cookies'], shared.MAX_CRAWL_PAGES,
+            list(state.get('discovery_seeds') or []), list(state.get('entry_points') or []),
+        )
         discovery[name] = found
         diagnostics.extend(({'phase': 'discovery', 'profile': name, **item} for item in found['errors']))
         print(f"    {name}: {len(found['html_urls'])} pagine HTML, {len(found['request_cases'])} casi GET/POST, {len(found.get('browser_navigation_urls', []))} navigazioni Chromium, {len(found['errors'])} errori")
@@ -180,7 +185,7 @@ async def deterministic_broad_scan_node(state: DeterministicState) -> dict[str, 
             if cookies and (not session_valid):
                 result = make_skipped_result(spec.name, target, 'Authenticated session is no longer valid; this run was skipped to avoid reporting anonymous coverage as authenticated.')
             else:
-                arguments = build_tool_arguments(spec.name, target, cookies, discovery[name], timeout_override=scanner_timeout)
+                arguments = build_tool_arguments(spec.name, target, cookies, discovery[name], allow_state_changes=state.get('allow_state_changes'), timeout_override=scanner_timeout)
                 result = await call_mcp_with_progress(spec, arguments)
             _tag_coverage_action(result, spec.name, target_url=target)
             log_result(name, spec.name, result, target)
@@ -189,7 +194,7 @@ async def deterministic_broad_scan_node(state: DeterministicState) -> dict[str, 
                 for sibling_origin in sibling_origins:
                     sibling_discovery = shared.discovery_for_origin(discovery[name], sibling_origin)
                     sibling_timeout = shared.sibling_broad_timeout(spec.name, scanner_timeout)
-                    sibling_arguments = build_tool_arguments(spec.name, sibling_origin, cookies, sibling_discovery, timeout_override=sibling_timeout)
+                    sibling_arguments = build_tool_arguments(spec.name, sibling_origin, cookies, sibling_discovery, allow_state_changes=state.get('allow_state_changes'), timeout_override=sibling_timeout)
                     sibling_result = await call_mcp_with_progress(spec, sibling_arguments)
                     _tag_coverage_action(sibling_result, spec.name, target_url=sibling_origin)
                     sibling_runs.append(sibling_result)
@@ -295,11 +300,17 @@ async def deterministic_parameter_scan_node(state: DeterministicState) -> dict[s
         tasks: list[tuple[ToolSpec, dict[str, Any], asyncio.Task[dict[str, Any]]]] = []
         probe_url = select_session_probe_url(discovery[name], target)
         for spec in PARAMETER_TOOLS:
-            cases = select_tool_request_cases(discovery[name], spec.name, authenticated_profile=bool(cookies))
+            cases = select_tool_request_cases(
+                discovery[name], spec.name, authenticated_profile=bool(cookies),
+                allow_state_changes=shared.state_changing_tests_allowed(target, state.get('allow_state_changes')),
+            )
             get_count = sum((str(case.get('method', 'GET')).upper() == 'GET' for case in cases))
             selection_summary[name][spec.name] = [{'method': str(case.get('method', 'GET')).upper(), 'url': str(case.get('url', '')), 'parameters': list(case.get('parameters', [])), 'priority_score': case.get('priority_score'), 'adaptive_budget': bool(case.get('adaptive_budget')), 'adaptive_budget_evidence': list(case.get('adaptive_budget_evidence', []))} for case in cases]
             budget = shared.specialist_budget_diagnostics(spec.name, cases)
-            print(f"    [INFO   ] {spec.name}: casi selezionati={len(cases)} (GET={get_count}, POST={len(cases) - get_count}); base={budget['base']}; adaptive={budget['adaptive_used']}; adaptive max={budget['adaptive_max']}")
+            budget_detail = f"base={budget['base']}; adaptive={budget['adaptive_used']}; adaptive max={budget['adaptive_max']}"
+            if spec.name == 'traversal':
+                budget_detail += f"; routing reserve={budget['coverage_reserve_used']}/{budget['coverage_reserve_max']}; effective max={budget['effective_max']}"
+            print(f"    [INFO   ] {spec.name}: casi selezionati={len(cases)} (GET={get_count}, POST={len(cases) - get_count}); {budget_detail}")
             tasks.extend(((spec, case, asyncio.create_task(run_case(spec, case, cookies, probe_url))) for case in cases))
         for spec, case, task in tasks:
             result = await task
@@ -708,12 +719,15 @@ async def deterministic_report_node(state: DeterministicState) -> dict[str, Any]
     verification_selection_summary = state.get('verification_selection_summary', {})
     authorization_selection_summary = state.get('authorization_selection_summary', {})
     context = {'profiles': [{'name': profile['name'], 'authenticated': bool(profile.get('cookies')) and discovery.get(profile['name'], {}).get('authentication_effective') is not False} for profile in profiles],
+        'explicit_entry_points': list(state.get('entry_points') or []),
+        'priority_discovery_seeds': list(state.get('discovery_seeds') or []),
         'expected_tools': [spec.name for spec in (*BASE_TOOLS, ARJUN_TOOL, *PARAMETER_TOOLS, AUTHORIZATION_TOOL, *WORKFLOW_TOOLS, OPTIONAL_TOOLS[0], OPTIONAL_TOOLS[1])],
         'discovery': discovery,
         'endpoint_selection': {
             profile['name']: shared.endpoint_selection_decisions(
                 discovery.get(profile['name'], {}), target,
                 authenticated_profile=bool(profile.get('cookies')) and discovery.get(profile['name'], {}).get('authentication_effective') is not False,
+                allow_state_changes=shared.state_changing_tests_allowed(target, state.get('allow_state_changes')),
             )
             for profile in profiles
         },
@@ -747,9 +761,9 @@ async def deterministic_report_node(state: DeterministicState) -> dict[str, Any]
     return {'assessment_context': context, 'report_status': report}
 
 # The deterministic pipeline executes the full graph and returns the state produced by its final node.
-async def run_pipeline(target: str, profiles: list[dict[str, str]], injection_url: str, allow_state_changes: bool | None=None, secondary_cookies: str='') -> dict[str, Any]:
+async def run_pipeline(target: str, profiles: list[dict[str, str]], injection_url: str, allow_state_changes: bool | None=None, secondary_cookies: str='', entry_points: list[str] | None=None, discovery_seeds: list[str] | None=None) -> dict[str, Any]:
     # The deterministic graph starts from a fresh state containing discovery, results, and scan settings.
-    initial: DeterministicState = {'target': target, 'profiles': profiles, 'injection_url': injection_url, 'allow_state_changes': allow_state_changes, 'secondary_cookies': secondary_cookies}
+    initial: DeterministicState = {'target': target, 'entry_points': list(entry_points or []), 'discovery_seeds': list(discovery_seeds or []), 'profiles': profiles, 'injection_url': injection_url, 'allow_state_changes': allow_state_changes, 'secondary_cookies': secondary_cookies}
     final = await build_deterministic_graph().ainvoke(initial)
     return {'results': final['results'], 'discovery': final['discovery'], 'diagnostics': final['diagnostics'], 'report_status': final['report_status']}
 
@@ -758,7 +772,7 @@ def _parse_parameter_argument(value: str) -> list[str]:
     return [item.strip() for item in str(value or '').split(',') if item.strip()]
 
 # Selects one request case for an isolated tool run.
-def _single_tool_case(discovery: dict[str, Any], tool: str, target: str, explicit_url: str, method: str, data: str, parameters: list[str], authenticated_profile: bool=False) -> dict[str, Any] | None:
+def _single_tool_case(discovery: dict[str, Any], tool: str, target: str, explicit_url: str, method: str, data: str, parameters: list[str], authenticated_profile: bool=False, allow_state_changes: bool=True) -> dict[str, Any] | None:
     if explicit_url:
         url = normalize_url(explicit_url)
         if not shared.url_in_authorized_scope(target, url):
@@ -780,7 +794,7 @@ def _single_tool_case(discovery: dict[str, Any], tool: str, target: str, explici
     if tool == 'workflow':
         cases = select_workflow_request_cases(discovery, limit=1)
         return cases[0] if cases else None
-    cases = select_tool_request_cases(discovery, tool, limit=1, authenticated_profile=authenticated_profile)
+    cases = select_tool_request_cases(discovery, tool, limit=1, authenticated_profile=authenticated_profile, allow_state_changes=allow_state_changes)
     return cases[0] if cases else None
 
 # Tool-specific preflight filtering keeps only errors relevant to the requested isolated run.
@@ -808,12 +822,15 @@ async def run_single_tool_debug(*, tool: str, target: str, cookies: str, mode: s
     elif tool in {'arjun', 'sqlmap', 'dalfox', 'commix', 'traversal', 'idor', 'authorization', 'browser', 'workflow'}:
         if tool == 'authorization' and (not cookies):
             return make_skipped_result(tool, target, 'A primary authenticated Cookie header is required for authorization comparison.')
-        case = _single_tool_case(discovery, tool, target, explicit_url, method, data, parameters, authenticated_profile=bool(cookies))
+        case = _single_tool_case(discovery, tool, target, explicit_url, method, data, parameters, authenticated_profile=bool(cookies), allow_state_changes=state_changes)
         if not case:
             messages = {'arjun': 'No suitable endpoint was discovered for Arjun.', 'authorization': 'No discovered read-only request contained a plausible identity, object or privileged-resource signal.', 'browser': "No discovered request matched browser's workflow class.", 'workflow': "No discovered request matched workflow's workflow class."}
             return make_skipped_result(tool, target, messages.get(tool, f"No request matched {tool}'s vulnerability class."))
         selected_target = str(case.get('url') or target)
         effective_case = {**case, 'method': str(case.get('method') or method).upper(), 'data': str(case.get('data') or data), 'parameters': list(case.get('parameters') or parameters)}
+        state_change_reason = shared.request_case_state_change_reason(effective_case)
+        if (not state_changes) and state_change_reason and tool not in {'arjun', 'authorization'}:
+            return make_skipped_result(tool, selected_target, f'State-changing request blocked by policy: {state_change_reason}.')
         if tool == 'authorization':
             arguments = build_tool_arguments(tool, selected_target, cookies, discovery, case=effective_case, secondary_cookies=secondary_cookies, timeout_override=timeout_override)
         else:
@@ -946,6 +963,12 @@ def main() -> int:
     target, profiles, cookie, secondary_cookie, injection_url = prepare_cli_context(
         parser, args
     )
+    entry_points = prepare_cli_entry_points(parser, args, target)
+    discovery_seeds = prepare_cli_discovery_seeds(parser, args, target)
+    if entry_points:
+        print(f"[*] Explicit entry points: {len(entry_points)} URL(s) will be forced into initial discovery.")
+    if discovery_seeds:
+        print(f"[*] Priority discovery seeds: {len(discovery_seeds)} URL(s) will be explored under normal discovery limits.")
     if args.tool:
         try:
             result = asyncio.run(
@@ -996,6 +1019,8 @@ def main() -> int:
                 injection_url,
                 allow_state_changes=args.allow_state_changes,
                 secondary_cookies=secondary_cookie,
+                entry_points=entry_points,
+                discovery_seeds=discovery_seeds,
             )
         )
     except KeyboardInterrupt:

@@ -435,6 +435,80 @@ def _resolve_job_cookie(
     return value
 
 
+# Coalesces equivalent same-route services into one scan while preserving every configured URL as a forced seed.
+def _coalesce_same_route_jobs(jobs: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    grouped: dict[tuple[Any, ...], list[dict[str, Any]]] = {}
+    order: list[tuple[Any, ...]] = []
+    passthrough_positions: list[tuple[int, dict[str, Any]]] = []
+    for position, job in enumerate(jobs):
+        target = str(job.get('target') or '').strip()
+        if not job.get('enabled') or not job.get('supported') or not target:
+            passthrough_positions.append((position, dict(job)))
+            continue
+        try:
+            parsed = urlparse(target)
+            route = parsed.path.rstrip('/') or '/'
+            origin = (parsed.scheme.lower(), (parsed.hostname or '').lower(), parsed.port or (443 if parsed.scheme.lower() == 'https' else 80))
+        except ValueError:
+            passthrough_positions.append((position, dict(job)))
+            continue
+        key = (
+            str(job.get('asset_id') or ''), origin, route,
+            str(job.get('credential_ref') or ''), str(job.get('secondary_credential_ref') or ''),
+            bool(job.get('auth_only')), job.get('allow_state_changes'), str(job.get('interactsh_injection_url') or ''),
+        )
+        if key not in grouped:
+            grouped[key] = []
+            order.append(key)
+        grouped[key].append(dict(job))
+
+    merged_rows: list[tuple[int, dict[str, Any]]] = list(passthrough_positions)
+    source_positions = {str(job.get('id') or ''): index for index, job in enumerate(jobs)}
+    for key in order:
+        bucket = grouped[key]
+        first = dict(bucket[0])
+        if len(bucket) == 1:
+            merged_rows.append((source_positions.get(str(first.get('id') or ''), len(jobs)), first))
+            continue
+        entry_points: list[str] = []
+        service_ids: list[str] = []
+        for item in bucket:
+            service_ids.append(str(item.get('service_id') or ''))
+            for value in [str(item.get('target') or ''), *[str(seed) for seed in item.get('entry_points') or []]]:
+                if value and value not in entry_points:
+                    entry_points.append(value)
+        first['entry_points'] = entry_points
+        first['merged_service_ids'] = service_ids
+        first['coalesced_service_count'] = len(bucket)
+        first['notes'] = (str(first.get('notes') or '') + f' Runtime coalescing: {len(bucket)} same-route service entries are assessed once with every configured URL retained as a forced discovery seed.').strip()
+        merged_rows.append((source_positions.get(str(bucket[0].get('id') or ''), len(jobs)), first))
+    merged_rows.sort(key=lambda item: item[0])
+    return [row for _, row in merged_rows]
+
+
+# Uses existing credential validation/login paths as ordinary discovery seeds without changing target configuration.
+def _credential_discovery_seeds(config: dict[str, Any], job: dict[str, Any]) -> list[str]:
+    reference = str(job.get('credential_ref') or '').strip()
+    credential = (config.get('credentials') or {}).get(reference) if reference else None
+    if not isinstance(credential, dict):
+        return []
+    target = str(job.get('target') or '').strip()
+    if not target:
+        return []
+    selected: list[str] = []
+    for key in ('validation_path', 'login_path'):
+        raw = str(credential.get(key) or '').strip()
+        if not raw:
+            continue
+        try:
+            candidate = urljoin(target, raw)
+        except Exception:
+            continue
+        if candidate and same_origin(target, candidate) and candidate not in selected:
+            selected.append(candidate)
+    return selected
+
+
 # Builds one existing orchestrator command from a normalized service job.
 def _build_command(
     config: dict[str, Any], job: dict[str, Any], *, resolve_secrets: bool = True, force_auth_only: bool = False,
@@ -449,6 +523,10 @@ def _build_command(
         "--target", job["target"],
         "--mode", str(execution.get("mode") or "balanced"),
     ]
+    for entry_point in job.get("entry_points") or []:
+        command.extend(["--entry-point", str(entry_point)])
+    for discovery_seed in _credential_discovery_seeds(config, job):
+        command.extend(["--discovery-seed", discovery_seed])
 
     cache = credential_cache if credential_cache is not None else {}
     primary_ref = str(job.get("credential_ref") or "")
@@ -1030,6 +1108,17 @@ def main() -> int:
         jobs = [job for job in jobs if job["id"] == args.only]
         if not jobs:
             parser.error(f"No service job matches --only {args.only!r}.")
+    else:
+        original_job_count = len(jobs)
+        jobs = _coalesce_same_route_jobs(jobs)
+        removed_jobs = original_job_count - len(jobs)
+        merged_groups = [job for job in jobs if int(job.get('coalesced_service_count') or 1) > 1]
+        if removed_jobs > 0:
+            merged_service_count = sum(int(job.get('coalesced_service_count') or 1) for job in merged_groups)
+            print(
+                f"[PLAN] Coalesced {merged_service_count} same-route service entries into {len(merged_groups)} logical job(s); "
+                f"{removed_jobs} duplicate full-pipeline run(s) were removed. Every configured URL remains a forced discovery seed and each logical job is reported once."
+            )
 
     REPORTS_DIR.mkdir(parents=True, exist_ok=True)
     stamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
@@ -1064,6 +1153,9 @@ def main() -> int:
             "protocol": job["protocol"],
             "port": job["port"],
             "target": job["target"] or None,
+            "entry_points": list(job.get("entry_points") or []),
+            "merged_service_ids": list(job.get("merged_service_ids") or []),
+            "coalesced_service_count": int(job.get("coalesced_service_count") or 1),
             "credential_ref": job.get("credential_ref") or None,
             "secondary_credential_ref": job.get("secondary_credential_ref") or None,
             "notes": job.get("notes") or "",

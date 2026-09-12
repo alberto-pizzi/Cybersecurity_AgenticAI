@@ -24,7 +24,7 @@ from orchestratorShared import (
     run_preflight_checks, select_tool_request_cases, select_browser_request_cases,
     select_workflow_request_cases, select_authorization_request_cases,
     select_oast_request_cases, tool_action_limit, broad_tool_order,
-    add_common_cli_arguments, prepare_cli_context,
+    add_common_cli_arguments, prepare_cli_context, prepare_cli_entry_points, prepare_cli_discovery_seeds,
 )
 
 REGISTRY = deterministic_core.agentic_registry()
@@ -130,6 +130,12 @@ def main() -> int:
     target, profiles, _, secondary_cookie, injection = (
         prepare_cli_context(parser, args)
     )
+    entry_points = prepare_cli_entry_points(parser, args, target)
+    discovery_seeds = prepare_cli_discovery_seeds(parser, args, target)
+    if entry_points:
+        print(f"[*] Explicit entry points: {len(entry_points)} URL(s) will be forced into initial discovery.")
+    if discovery_seeds:
+        print(f"[*] Priority discovery seeds: {len(discovery_seeds)} URL(s) will be explored under normal discovery limits.")
     planner_timeout = args.ai_timeout or AI_PLANNER_TIMEOUTS[args.mode]
     selected_provider, requested_model, selection_diagnostics = resolve_ai_model(args.model)
     print(
@@ -205,6 +211,8 @@ def main() -> int:
     ai_diagnostics['selection'] = selection_diagnostics
     initial: AgentState = {
         "target": target,
+        "entry_points": entry_points,
+        "discovery_seeds": discovery_seeds,
         "profiles": profiles,
         "discovery": {},
         "plan": [],
