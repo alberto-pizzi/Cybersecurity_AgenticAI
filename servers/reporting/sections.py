@@ -156,6 +156,38 @@ def _context_summary_html(context: dict[str, Any], toc: list[tuple[int, str, str
         if counts:
             rows.append(("Discovered surface", _esc(" | ".join(counts))))
 
+        budget = data.get("budget_diagnostics") if isinstance(data.get("budget_diagnostics"), dict) else {}
+        if budget:
+            http_base = int(budget.get("http_page_budget", 0) or 0)
+            http_max = int(budget.get("http_page_max_budget", http_base) or http_base)
+            http_done = int(budget.get("http_pages_processed", 0) or 0)
+            http_overflow = int(budget.get("http_adaptive_overflow_used", 0) or 0)
+            http_left = int(budget.get("http_remaining_candidates", 0) or 0)
+            browser_base = int(budget.get("browser_page_budget", 0) or 0)
+            browser_max = int(budget.get("browser_page_max_budget", browser_base) or browser_base)
+            browser_done = int(budget.get("browser_pages_attempted", 0) or 0)
+            browser_overflow = int(budget.get("browser_adaptive_overflow_used", 0) or 0)
+            browser_left = int(budget.get("browser_remaining_candidates", 0) or 0)
+            script_done = int(budget.get("scripts_processed", 0) or 0)
+            script_budget = int(budget.get("script_budget", 0) or 0)
+            families = int(budget.get("application_families_visited", 0) or 0)
+            pieces = [
+                f"HTTP useful pages {http_done}/{http_base} base, max {http_max}, overflow {http_overflow}, queued {http_left}",
+                f"Chromium {browser_done}/{browser_base} base, max {browser_max}, overflow {browser_overflow}, queued {browser_left}",
+                f"scripts {script_done}/{script_budget}",
+            ]
+            if families:
+                pieces.append(f"application families visited {families}")
+            rows.append(("Discovery budget", _esc(" | ".join(pieces))))
+
+        sibling_auth = data.get("runtime_sibling_authentication") if isinstance(data.get("runtime_sibling_authentication"), list) else []
+        if sibling_auth:
+            sibling_counts = Counter(str(item.get("status") or "unknown") for item in sibling_auth if isinstance(item, dict))
+            rows.append((
+                "Runtime sibling authentication",
+                _esc(", ".join(f"{key}={value}" for key, value in sorted(sibling_counts.items()))),
+            ))
+
         skipped = data.get("destructive_urls_skipped")
         if isinstance(skipped, list) and skipped:
             rows.append((

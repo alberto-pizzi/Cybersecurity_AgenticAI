@@ -157,6 +157,7 @@ def snap4city_browser_login_session(
     storage_state: dict[str, Any] | None = None,
     candidate_urls: Iterable[str] | None = None,
     initial_login: bool = False,
+    include_configured_fallbacks: bool = True,
 ) -> dict[str, Any]:
     """Obtain one origin-scoped application session without ever prompting for credentials.
 
@@ -189,7 +190,7 @@ def snap4city_browser_login_session(
             validation_path,
             origin + "/",
         ],
-    )
+    ) if include_configured_fallbacks else []
     candidates = []
     for value in [*explicit_candidates, *configured_candidates]:
         if value not in candidates:
@@ -220,12 +221,20 @@ def snap4city_browser_login_session(
             context_kwargs["storage_state"] = storage_state
         context = browser.new_context(**context_kwargs)
         page = context.new_page()
+        observed_auth_requests: list[str] = []
+        page.on(
+            "request",
+            lambda request: observed_auth_requests.append(str(request.url or ""))
+            if looks_like_oidc_login_url(str(request.url or ""))
+            else None,
+        )
         try:
             for candidate in candidates:
                 if time.monotonic() >= deadline:
                     break
                 used_credentials = False
-                flow_observed = _looks_like_application_login_entry(candidate)
+                auth_request_offset = len(observed_auth_requests)
+                flow_observed = False
                 try:
                     page.goto(candidate, wait_until="domcontentloaded", timeout=_remaining_ms(deadline))
                     page.wait_for_timeout(250)
@@ -235,7 +244,11 @@ def snap4city_browser_login_session(
 
                 # Reused SSO state may have already created an application session during navigation.
                 current_url = str(page.url or "")
-                flow_observed = flow_observed or looks_like_oidc_login_url(current_url)
+                flow_observed = (
+                    flow_observed
+                    or looks_like_oidc_login_url(current_url)
+                    or len(observed_auth_requests) > auth_request_offset
+                )
                 password_field = _first_visible_locator(page, PASSWORD_SELECTORS)
                 username_field = _first_visible_locator(page, USERNAME_SELECTORS)
                 login_trigger = _first_visible_locator(page, LOGIN_TRIGGER_SELECTORS)

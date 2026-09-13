@@ -343,7 +343,7 @@ def install_idor_forge() -> dict[str, Any]:
     runtime_requirements = _idor_forge_runtime_requirements(requirements)
     print('[*] IDOR-Forge runtime dependencies: ' + ', '.join(runtime_requirements))
     run([str(venv_python), '-m', 'pip', 'install', '--disable-pip-version-check', *runtime_requirements], timeout=3600, cwd=IDOR_FORGE_DIR)
-    probe = run([str(venv_python), '-c', "from core.IDORChecker import IDORChecker; print('IDOR-Forge import OK')"], required=False, capture=True, show_output=False, timeout=120, cwd=IDOR_FORGE_DIR, env_overrides={'MPLBACKEND': 'Agg'})
+    probe = run([str(venv_python), '-c', "import matplotlib; from core.IDORChecker import IDORChecker; print('IDOR-Forge import OK')"], required=False, capture=True, show_output=False, timeout=120, cwd=IDOR_FORGE_DIR, env_overrides={'MPLBACKEND': 'Agg'})
     if probe.returncode:
         detail = '\n'.join(filter(None, ((probe.stdout or '').strip(), (probe.stderr or '').strip())))
         raise RuntimeError('IDOR-Forge dependency preflight failed.\n' + detail[-2500:])

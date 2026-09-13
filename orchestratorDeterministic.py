@@ -110,9 +110,15 @@ async def deterministic_discovery_node(state: DeterministicState) -> dict[str, A
             print(f"      [DISCOVERY] {dead_count} risposte HTTP 404/410 conservate come diagnostica e escluse dal budget utile; tentativi HTTP={budget.get('http_requests_attempted', 0)}/{budget.get('http_attempt_budget', 0)}")
         http_pages = int(budget.get('http_pages_processed', 0) or 0)
         http_page_budget = int(budget.get('http_page_budget', 0) or 0)
+        http_page_max_budget = int(budget.get('http_page_max_budget', http_page_budget) or http_page_budget)
+        http_overflow = int(budget.get('http_adaptive_overflow_used', 0) or 0)
         http_remaining = int(budget.get('http_remaining_candidates', 0) or 0)
-        if http_remaining and budget.get('http_page_budget_saturated'):
-            print(f"      [DISCOVERY] Budget pagine HTTP utili saturo: {http_pages}/{http_page_budget}; restano {http_remaining} candidati in coda.")
+        if http_overflow:
+            print(f"      [DISCOVERY] Budget adattivo pagine HTTP: base={http_page_budget}, overflow={http_overflow}, elaborate={http_pages}/{http_page_max_budget}.")
+        if http_remaining and budget.get('http_page_max_budget_saturated'):
+            print(f"      [DISCOVERY] Budget massimo pagine HTTP utili saturo: {http_pages}/{http_page_max_budget}; restano {http_remaining} candidati in coda.")
+        elif http_remaining and budget.get('http_page_budget_saturated') and not http_overflow:
+            print(f"      [DISCOVERY] Budget base pagine HTTP raggiunto: {http_pages}/{http_page_budget}; il ranking adattivo si è fermato prima del massimo {http_page_max_budget}; restano {http_remaining} candidati in coda.")
         elif http_remaining and budget.get('http_attempt_budget_saturated'):
             print(f"      [DISCOVERY] Budget tentativi HTTP saturo: {budget.get('http_requests_attempted', 0)}/{budget.get('http_attempt_budget', 0)}; restano {http_remaining} candidati in coda.")
         browser_budget = int(budget.get('browser_page_budget', 0) or 0)
@@ -173,8 +179,11 @@ async def deterministic_broad_scan_node(state: DeterministicState) -> dict[str, 
                 if name == 'anonymous':
                     sibling_origins = selected_siblings
                 elif cookies:
-                    authenticated_siblings = [origin for origin in selected_siblings if shared.scope_cookie_header(origin, cookies)]
-                    sibling_origins = authenticated_siblings if anonymous_available else selected_siblings
+                    authenticated_siblings = [
+                        target_url for origin in selected_siblings
+                        if (target_url := shared.authenticated_broad_target(discovery[name], origin, cookies))
+                    ]
+                    sibling_origins = authenticated_siblings
                 elif not anonymous_available:
                     sibling_origins = selected_siblings
                 if sibling_ranking and sibling_origins:
@@ -253,12 +262,14 @@ async def deterministic_broad_scan_node(state: DeterministicState) -> dict[str, 
                 if empty_limits >= limit_threshold:
                     result = make_skipped_result('arjun', endpoint, 'Adaptive budget reallocation: earlier high-priority Arjun runs reached their full budget without discovering a parameter, so lower-priority repeats were skipped.') | {'diagnosis': 'adaptive_budget_reallocated'}
                 else:
-                    effective_cookies = shared.scope_cookie_header(endpoint, cookies)
-                    endpoint_probe = probe_url if shared.same_origin(endpoint, probe_url) else endpoint
-                    refresh = refresh_authenticated_session_state(endpoint, effective_cookies, endpoint_probe) if effective_cookies else {'performed': False, 'usable': True, 'credential_applied': False}
-                    arguments = build_tool_arguments('arjun', endpoint, cookies, discovery[name], case=case)
-                    result = await call_mcp_with_progress(ARJUN_TOOL, arguments)
-                    result['session_state_refresh'] = refresh
+                    endpoint_probe = shared.select_application_session_probe_url(discovery[name], endpoint, str(case.get('source_url') or ''))
+                    refresh = refresh_authenticated_session_state(endpoint, cookies, endpoint_probe) if cookies else {'performed': False, 'usable': True, 'credential_applied': False}
+                    if refresh.get('usable') is False or (cookies and not refresh.get('credential_applied')):
+                        result = make_skipped_result('arjun', endpoint, 'The authenticated application session could not be restored before hidden-parameter discovery.') | {'session_state_refresh': refresh}
+                    else:
+                        arguments = build_tool_arguments('arjun', endpoint, cookies, discovery[name], case=case)
+                        result = await call_mcp_with_progress(ARJUN_TOOL, arguments)
+                        result['session_state_refresh'] = refresh
                     found = int(result.get('phase_parameters', 0) or 0)
                     timed_out_empty = result.get('diagnosis') in TIME_LIMIT_DIAGNOSES and (not result.get('vulnerabilities')) and (found == 0)
                     empty_limits = empty_limits + 1 if timed_out_empty else 0
@@ -287,17 +298,18 @@ async def deterministic_parameter_scan_node(state: DeterministicState) -> dict[s
     async def run_case(spec: ToolSpec, case: dict[str, Any], cookies: str, probe_url: str) -> dict[str, Any]:
         url = str(case.get('url', ''))
         effective_cookies = shared.scope_cookie_header(url, cookies)
-        skip_reason = _tool_case_skip_reason(spec.name, case, authenticated_profile=bool(effective_cookies))
+        skip_reason = _tool_case_skip_reason(spec.name, case, authenticated_profile=bool(effective_cookies or cookies))
         if skip_reason:
             return _tag_coverage_action(make_skipped_result(spec.name, url, skip_reason), spec.name, target_url=url, method=str(case.get('method', 'GET')), parameters=list(case.get('parameters', [])), source_url=str(case.get('source_url', '')))
         timeout = PARAMETER_TOOL_TIMEOUTS.get(spec.name, 120)
-        arguments = build_tool_arguments(spec.name, url, cookies, {}, case=case, allow_state_changes=allow_state_changes, timeout_override=timeout)
-        case_probe = probe_url if shared.same_origin(url, probe_url) else url
+        method = str(case.get('method', 'GET')).upper()
+        case_probe = url if method in {'GET', 'HEAD'} else shared.select_application_session_probe_url(discovery.get('authenticated', {}) if cookies else {}, url, str(case.get('source_url') or ''))
         async with semaphore:
-            refresh = refresh_authenticated_session_state(url, effective_cookies, case_probe) if effective_cookies else {'performed': False, 'usable': True, 'credential_applied': False}
-            if refresh.get('usable') is False:
-                skipped = make_skipped_result(spec.name, url, 'The authenticated session could not be restored before this scanner.') | {'session_state_refresh': refresh}
+            refresh = refresh_authenticated_session_state(url, cookies, case_probe) if cookies else {'performed': False, 'usable': True, 'credential_applied': False}
+            if refresh.get('usable') is False or (cookies and not refresh.get('credential_applied')):
+                skipped = make_skipped_result(spec.name, url, 'The authenticated application session could not be restored before this scanner.') | {'session_state_refresh': refresh}
                 return _tag_coverage_action(skipped, spec.name, target_url=url, method=str(case.get('method', 'GET')), parameters=list(case.get('parameters', [])), source_url=str(case.get('source_url', '')))
+            arguments = build_tool_arguments(spec.name, url, cookies, {}, case=case, allow_state_changes=allow_state_changes, timeout_override=timeout)
             result = await call_mcp_with_progress(spec, arguments, timeout_seconds=timeout + 35)
             result['session_state_refresh'] = refresh
             return _tag_coverage_action(result, spec.name, target_url=url, method=str(case.get('method', 'GET')), parameters=list(case.get('parameters', [])), source_url=str(case.get('source_url', '')))
@@ -382,10 +394,9 @@ async def deterministic_authorization_node(state: DeterministicState) -> dict[st
         probe_url = select_session_probe_url(discovery[name], target)
         for case in cases:
             case_url = str(case.get('url', target))
-            effective_cookies = shared.scope_cookie_header(case_url, cookies)
-            case_probe = probe_url if shared.same_origin(case_url, probe_url) else case_url
-            state_refresh = refresh_authenticated_session_state(case_url, effective_cookies, case_probe)
-            if state_refresh.get('usable') is False:
+            case_probe = case_url
+            state_refresh = refresh_authenticated_session_state(case_url, cookies, case_probe)
+            if state_refresh.get('usable') is False or not state_refresh.get('credential_applied'):
                 result = make_skipped_result('authorization', case_url, 'The primary authenticated session could not be restored before authorization comparison.') | {'session_state_refresh': state_refresh}
             else:
                 arguments = build_tool_arguments('authorization', case_url, cookies, discovery[name], case=case, secondary_cookies=secondary_cookies, timeout_override=PARAMETER_TOOL_TIMEOUTS.get('authorization', 40))
@@ -414,11 +425,11 @@ async def deterministic_browser_workflow_node(state: DeterministicState) -> dict
     # A selected request case is executed and converted into the common tool-result format.
     async def run_case(tool: str, case: dict[str, Any], cookies: str, profile_discovery: dict[str, Any], probe_url: str) -> dict[str, Any]:
         url = str(case.get('url', target))
-        effective_cookies = shared.scope_cookie_header(url, cookies)
-        case_probe = probe_url if shared.same_origin(url, probe_url) else url
-        refresh = refresh_authenticated_session_state(url, effective_cookies, case_probe) if effective_cookies else {'performed': False, 'usable': True, 'credential_applied': False}
-        if refresh.get('usable') is False:
-            return _tag_coverage_action(make_skipped_result(tool, url, f'The authenticated session could not be restored before {tool} verification.'), tool, target_url=url, method=str(case.get('method', 'GET')), parameters=list(case.get('parameters', [])), source_url=str(case.get('source_url', '')))
+        method = str(case.get('method', 'GET')).upper()
+        case_probe = url if method in {'GET', 'HEAD'} else shared.select_application_session_probe_url(profile_discovery, url, str(case.get('source_url') or ''))
+        refresh = refresh_authenticated_session_state(url, cookies, case_probe) if cookies else {'performed': False, 'usable': True, 'credential_applied': False}
+        if refresh.get('usable') is False or (cookies and not refresh.get('credential_applied')):
+            return _tag_coverage_action(make_skipped_result(tool, url, f'The authenticated application session could not be restored before {tool} verification.'), tool, target_url=url, method=str(case.get('method', 'GET')), parameters=list(case.get('parameters', [])), source_url=str(case.get('source_url', '')))
         arguments = build_tool_arguments(tool, url, cookies, profile_discovery, case=case, allow_state_changes=allow_state_changes)
         result = await call_mcp_with_progress(specs[tool], arguments, timeout_seconds=PARAMETER_TOOL_TIMEOUTS[tool] + 35)
         result['session_state_refresh'] = refresh
@@ -702,12 +713,11 @@ async def deterministic_verification_node(state: DeterministicState) -> dict[str
             if browser_unavailable:
                 result = make_skipped_result('browser', url, 'Playwright was unavailable in the first final-verification run; remaining Chromium cases were not repeated.')
             else:
-                probe_url = select_session_probe_url(profile_discovery, target)
-                effective_cookies = shared.scope_cookie_header(url, cookies)
-                case_probe = probe_url if shared.same_origin(url, probe_url) else url
-                refresh = refresh_authenticated_session_state(url, effective_cookies, case_probe) if effective_cookies else {'performed': False, 'usable': True, 'credential_applied': False}
-                if refresh.get('usable') is False:
-                    result = make_skipped_result('browser', url, 'The authenticated session could not be restored before final Chromium verification.')
+                method = str(case.get('method', 'GET')).upper()
+                case_probe = url if method in {'GET', 'HEAD'} else shared.select_application_session_probe_url(profile_discovery, url, str(case.get('source_url') or ''))
+                refresh = refresh_authenticated_session_state(url, cookies, case_probe) if cookies else {'performed': False, 'usable': True, 'credential_applied': False}
+                if refresh.get('usable') is False or (cookies and not refresh.get('credential_applied')):
+                    result = make_skipped_result('browser', url, 'The authenticated application session could not be restored before final Chromium verification.')
                 else:
                     arguments = build_tool_arguments('browser', url, cookies, profile_discovery, case=case, allow_state_changes=state.get('allow_state_changes'))
                     result = await call_mcp_with_progress(browser_spec, arguments, timeout_seconds=PARAMETER_TOOL_TIMEOUTS['browser'] + 35)
@@ -896,10 +906,10 @@ async def run_single_tool_debug(*, tool: str, target: str, cookies: str, mode: s
             arguments = build_tool_arguments(tool, selected_target, cookies, discovery, case=effective_case, secondary_cookies=secondary_cookies, timeout_override=timeout_override)
         else:
             effective_cookies = shared.scope_cookie_header(selected_target, cookies)
-            if tool not in {'arjun', 'authorization'} and effective_cookies:
-                selected_probe = select_session_probe_url(discovery, selected_target)
-                refresh = refresh_authenticated_session_state(selected_target, effective_cookies, selected_probe)
-                if refresh.get('usable') is False:
+            if tool not in {'arjun', 'authorization'} and cookies:
+                selected_probe = shared.select_application_session_probe_url(discovery, selected_target, str(effective_case.get('source_url') or '') if isinstance(effective_case, dict) else '')
+                refresh = refresh_authenticated_session_state(selected_target, cookies, selected_probe)
+                if refresh.get('usable') is False or not refresh.get('credential_applied'):
                     if tool in {'browser', 'workflow'}:
                         return make_skipped_result(tool, selected_target, 'The authenticated session could not be restored before the isolated workflow run.')
                     return {'tool': tool, 'status': 'partial', 'target': selected_target, 'output': 'The authenticated session could not be restored before the isolated scanner run.', 'vulnerabilities': [], 'diagnosis': 'authentication_precheck_failed', 'state_refresh': refresh}

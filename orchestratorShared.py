@@ -29,7 +29,7 @@ from datetime import datetime, timezone
 from html.parser import HTMLParser
 from pathlib import Path
 from typing import Any, Iterator
-from urllib.parse import parse_qsl, unquote, urlencode, urlparse, urlunparse
+from urllib.parse import parse_qsl, unquote, urlencode, urljoin, urlparse, urlunparse
 warnings.filterwarnings('ignore', message='.*authlib\\.jose.*deprecated.*')
 import requests
 with warnings.catch_warnings():
@@ -86,13 +86,13 @@ def compact_log_url(value: Any, max_length: int | None=None) -> str:
         pass
     return text[:limit - 3] + '...'
 MAX_ARJUN_ENDPOINTS = max(1, int(os.getenv('SECOPS_MAX_ARJUN_ENDPOINTS', '12')))
-MAX_CRAWL_PAGES = max(10, int(os.getenv('SECOPS_MAX_CRAWL_PAGES', '180')))
-MAX_SCRIPT_ASSETS = max(4, int(os.getenv('SECOPS_MAX_SCRIPT_ASSETS', '72')))
+MAX_CRAWL_PAGES = max(10, int(os.getenv('SECOPS_MAX_CRAWL_PAGES', '650')))
+MAX_SCRIPT_ASSETS = max(4, int(os.getenv('SECOPS_MAX_SCRIPT_ASSETS', '192')))
 SCANNER_PROGRESS_INTERVAL = max(10, int(os.getenv('SECOPS_PROGRESS_INTERVAL', '30')))
 DISCOVERY_LIMITS = {
-    'fast': {'crawl_pages': 50, 'browser_pages': 28, 'browser_pages_max': 50, 'browser_per_origin_pages': 50, 'browser_menu_clicks_per_page': 4, 'scripts': 18, 'route_variants': 4, 'per_origin_pages': 40},
-    'balanced': {'crawl_pages': 180, 'browser_pages': 120, 'browser_pages_max': 220, 'browser_per_origin_pages': 220, 'browser_menu_clicks_per_page': 12, 'scripts': 64, 'route_variants': 8, 'per_origin_pages': 160},
-    'deep': {'crawl_pages': 180, 'browser_pages': 180, 'browser_pages_max': 320, 'browser_per_origin_pages': 320, 'browser_menu_clicks_per_page': 20, 'scripts': 72, 'route_variants': 12, 'per_origin_pages': 220},
+    'fast': {'crawl_pages': 70, 'crawl_pages_max': 110, 'browser_pages': 36, 'browser_pages_max': 80, 'browser_per_origin_pages': 80, 'browser_menu_clicks_per_page': 6, 'scripts': 32, 'route_variants': 4, 'per_origin_pages': 100},
+    'balanced': {'crawl_pages': 280, 'crawl_pages_max': 420, 'browser_pages': 160, 'browser_pages_max': 400, 'browser_per_origin_pages': 370, 'browser_menu_clicks_per_page': 18, 'scripts': 128, 'route_variants': 8, 'per_origin_pages': 380},
+    'deep': {'crawl_pages': 420, 'crawl_pages_max': 650, 'browser_pages': 240, 'browser_pages_max': 600, 'browser_per_origin_pages': 560, 'browser_menu_clicks_per_page': 28, 'scripts': 192, 'route_variants': 12, 'per_origin_pages': 600},
 }
 FINAL_BROWSER_VERIFICATION_LIMITS = {'fast': 8, 'balanced': 40, 'deep': 120}
 FINAL_BROWSER_VERIFICATION_MAX_LIMITS = {'fast': 12, 'balanced': 64, 'deep': 180}
@@ -151,7 +151,10 @@ PRIMARY_SCOPE_TARGET = ''
 AUTHENTICATED_ORIGIN_COOKIES: dict[str, str] = {}
 RUNTIME_TARGET_AUTH: dict[str, Any] = {}
 RUNTIME_AUTH_ORIGIN_LIMITS = {'fast': 12, 'balanced': 32, 'deep': 64}
-RUNTIME_AUTH_RECRAWL_PAGES = {'fast': 28, 'balanced': 60, 'deep': 120}
+RUNTIME_AUTH_RECRAWL_PAGES = {'fast': 36, 'balanced': 90, 'deep': 180}
+RUNTIME_AUTH_APPLICATION_LIMITS = {'fast': 6, 'balanced': 18, 'deep': 36}
+RUNTIME_AUTH_APPLICATION_RECRAWL_PAGES = {'fast': 24, 'balanced': 72, 'deep': 150}
+RUNTIME_AUTH_APPLICATION_ATTEMPTS: dict[str, dict[str, Any]] = {}
 CURRENT_SCAN_MODE = 'balanced'
 BROAD_SCANNER_TIMEOUTS = dict(SCAN_MODES[CURRENT_SCAN_MODE]['broad'])
 PARAMETER_TOOL_TIMEOUTS = dict(SCAN_MODES[CURRENT_SCAN_MODE]['parameter'])
@@ -191,15 +194,100 @@ def authenticated_origin_cookie(origin_or_url: str) -> str:
     return AUTHENTICATED_ORIGIN_COOKIES.get(normalized_origin(origin_or_url), '')
 
 
-# A raw Cookie header does not carry browser Domain/Path metadata. It remains exact-origin. When
-# runtime OIDC/SSO has explicitly created a different application session for a discovered sibling,
-# that separately obtained cookie is returned only for that sibling origin.
-def scope_cookie_header(candidate: str, cookies: str) -> str:
-    if not cookies:
+def _runtime_storage_cookie_header(candidate: str) -> str:
+    """Build the Cookie header a browser would send to this exact URL from saved storage state.
+
+    Unlike a raw ``Cookie:`` string, Playwright storage state retains Domain, Path, Secure and
+    expiry metadata. That lets the runtime reuse legitimate parent-domain/path-scoped SSO cookies
+    without assuming that every authorized sibling accepts the primary application's PHP session.
+    For duplicate names the longest matching cookie path wins, mirroring the application-specific
+    value that a browser places first.
+    """
+    storage = RUNTIME_TARGET_AUTH.get('storage_state') if isinstance(RUNTIME_TARGET_AUTH.get('storage_state'), dict) else None
+    if not storage:
         return ''
+    try:
+        parsed = urlparse(str(candidate or ''))
+        host = str(parsed.hostname or '').lower().rstrip('.')
+        request_path = str(parsed.path or '/') or '/'
+        secure_request = str(parsed.scheme or '').lower() == 'https'
+    except ValueError:
+        return ''
+    if not host:
+        return ''
+
+    now = time.time()
+    selected: dict[str, tuple[int, str, str]] = {}
+    for row in storage.get('cookies') or []:
+        if not isinstance(row, dict):
+            continue
+        name = str(row.get('name') or '').strip()
+        value = str(row.get('value') or '')
+        raw_domain = str(row.get('domain') or '').strip().lower().rstrip('.')
+        domain_cookie = raw_domain.startswith('.')
+        domain = raw_domain.lstrip('.')
+        cookie_path = str(row.get('path') or '/') or '/'
+        if not name or not domain:
+            continue
+        # Playwright preserves the leading dot used by domain cookies. A host-only cookie must
+        # never be widened to sibling hosts merely because its textual domain is a suffix.
+        if domain_cookie:
+            if host != domain and not host.endswith('.' + domain):
+                continue
+        elif host != domain:
+            continue
+        if bool(row.get('secure')) and not secure_request:
+            continue
+        try:
+            expires = float(row.get('expires') or -1)
+        except (TypeError, ValueError):
+            expires = -1
+        if expires > 0 and expires <= now:
+            continue
+        normalized_path = cookie_path if cookie_path.startswith('/') else '/' + cookie_path
+        if request_path != normalized_path and not request_path.startswith(normalized_path.rstrip('/') + '/'):
+            continue
+        key = name.lower()
+        candidate_row = (len(normalized_path), name, value)
+        if key not in selected or candidate_row[0] > selected[key][0]:
+            selected[key] = candidate_row
+    ordered = sorted(selected.values(), key=lambda item: (-item[0], item[1].lower()))
+    if not ordered:
+        return ''
+    return canonical_cookie_header('; '.join(f'{name}={value}' for _, name, value in ordered))
+
+
+def _merge_cookie_headers(base_header: str, overlay_header: str) -> str:
+    values: dict[str, tuple[str, str]] = {}
+    for header in (base_header, overlay_header):
+        if not header:
+            continue
+        try:
+            pairs = parse_cookie_header(header)
+        except ValueError:
+            continue
+        for name, value in pairs:
+            values[name.lower()] = (name, value)
+    return canonical_cookie_header('; '.join(f'{name}={value}' for name, value in values.values())) if values else ''
+
+
+# A raw Cookie header does not carry browser Domain/Path metadata and therefore remains exact-origin.
+# When an OIDC browser state is available, cookie applicability is instead reconstructed from the
+# preserved browser metadata. Browser-derived values override same-name raw values for the concrete
+# URL, while unrelated raw cookies remain available on the primary origin.
+def scope_cookie_header(candidate: str, cookies: str) -> str:
+    runtime_header = _runtime_storage_cookie_header(candidate)
     base = PRIMARY_SCOPE_TARGET or candidate
-    if same_origin(base, candidate):
-        return cookies
+    if cookies and same_origin(base, candidate):
+        return _merge_cookie_headers(cookies, runtime_header)
+
+    # An origin registry entry is a compatibility marker/fallback for sessions obtained without a
+    # browser storage state. Once storage-state cookie metadata exists, it is authoritative for
+    # sibling requests: falling back to the flattened origin header when no cookie matches this path
+    # would silently widen a path-scoped cookie.
+    storage = RUNTIME_TARGET_AUTH.get('storage_state') if isinstance(RUNTIME_TARGET_AUTH.get('storage_state'), dict) else None
+    if storage and storage.get('cookies'):
+        return runtime_header
     return authenticated_origin_cookie(candidate)
 
 
@@ -222,6 +310,7 @@ def _load_runtime_target_auth_state() -> dict[str, Any]:
 def configure_runtime_target_auth(primary_target: str, primary_cookie: str) -> None:
     AUTHENTICATED_ORIGIN_COOKIES.clear()
     RUNTIME_TARGET_AUTH.clear()
+    RUNTIME_AUTH_APPLICATION_ATTEMPTS.clear()
     if primary_cookie:
         register_authenticated_origin_cookie(primary_target, primary_cookie)
     payload = _load_runtime_target_auth_state()
@@ -1215,12 +1304,67 @@ def _discovery_url_score(url: str) -> int:
         score -= 18
     return score
 
+EPHEMERAL_IDENTITY_QUERY_KEYS = {
+    'state', 'nonce', 'session_code', 'tab_id', 'execution', 'code_challenge',
+    'auth_session_id', 'kc_action', 'iss',
+}
+
+
+def _ephemeral_identity_flow_url(url: str) -> bool:
+    """Recognize volatile OAuth/OIDC navigation plumbing without suppressing real application login pages."""
+    try:
+        parsed = urlparse(str(url or ''))
+    except ValueError:
+        return False
+    path = str(parsed.path or '').lower()
+    protocol_path = (
+        ('/auth/realms/' in path and ('/protocol/openid-connect/' in path or '/login-actions/' in path))
+        or '/oauth2/authorize' in path or '/oauth/authorize' in path
+    )
+    if not protocol_path:
+        return False
+    names = {str(name).lower() for name, _ in parse_qsl(parsed.query, keep_blank_values=True)}
+    return bool(names & EPHEMERAL_IDENTITY_QUERY_KEYS)
+
+
+def _discovery_variant_limit(url: str, default_limit: int) -> int:
+    # One representative OAuth/OIDC state/nonce/session-code variant is enough for discovery and
+    # workflow classification; retaining many volatile values starves unrelated application routes.
+    return 1 if _ephemeral_identity_flow_url(url) else max(1, int(default_limit))
+
+
 # Queue ranking protects the primary target surface without excluding explicitly authorized sibling origins.
 def _discovery_queue_score(target: str, url: str) -> int:
     score = _discovery_url_score(url)
     if same_origin(target, url):
         score += 24
+    if _ephemeral_identity_flow_url(url):
+        score -= 90
     return score
+
+
+def _application_family_key(url: str) -> tuple[str, str]:
+    """Return a generic origin + top-level application family for discovery diversification.
+
+    Large portals often host several applications behind one origin. Ranking only by raw URL score can
+    let the first large menu or SPA monopolize a bounded crawl. The first path segment is deliberately
+    generic and does not encode any target-specific application name.
+    """
+    try:
+        parsed = urlparse(str(url or ''))
+    except ValueError:
+        return ('', '/')
+    segments = [segment for segment in str(parsed.path or '/').split('/') if segment]
+    return (normalized_origin(url), '/' + (segments[0].lower() if segments else ''))
+
+
+def _discovery_diversity_score(target: str, url: str, family_visits: Counter[tuple[str, str]]) -> int:
+    """Favor underrepresented application families without imposing a hard per-family cutoff."""
+    visits = int(family_visits.get(_application_family_key(url), 0) or 0)
+    # New families receive a modest boost; the bonus decays smoothly over the first ten useful visits.
+    # Security-relevant URL scoring remains dominant, so this broadens discovery rather than replacing it.
+    diversity_bonus = max(0, 30 - min(30, visits * 3))
+    return _discovery_queue_score(target, url) + diversity_bonus
 
 # Script scoring favors application/API code while still allowing a bounded amount of framework/vendor code.
 def _script_value_score(url: str) -> int:
@@ -1517,11 +1661,22 @@ def xss_verification_context_score(finding_url: str, case_url: str, parameter: s
 # receives no scanner cookie also receives no cookie during preparation or session probing.
 def refresh_authenticated_session_state(target: str, cookies: str, probe_url: str='') -> dict[str, Any]:
 
-    effective_cookies = scope_cookie_header(target, cookies)
-    if not effective_cookies:
-        return {'performed': False, 'authenticated': False, 'usable': True, 'credential_applied': False}
     selected_probe = probe_url or target
-    probe_cookies = scope_cookie_header(selected_probe, effective_cookies)
+    effective_cookies = scope_cookie_header(target, cookies)
+    runtime_reauth: dict[str, Any] | None = None
+    if not effective_cookies and runtime_target_auth_available():
+        runtime_reauth = ensure_runtime_authenticated_request(target, cookies, selected_probe)
+        effective_cookies = scope_cookie_header(target, cookies) or str(runtime_reauth.get('cookie_header') or '')
+    if not effective_cookies:
+        return {
+            'performed': bool(runtime_reauth and runtime_reauth.get('attempted')),
+            'authenticated': False,
+            'usable': True,
+            'credential_applied': False,
+            'runtime_reauthentication': runtime_reauth or {},
+        }
+
+    probe_cookies = scope_cookie_header(selected_probe, cookies) or effective_cookies
     if not probe_cookies:
         selected_probe = target
         probe_cookies = effective_cookies
@@ -1529,13 +1684,43 @@ def refresh_authenticated_session_state(target: str, cookies: str, probe_url: st
     # request can still be the scanner/probe target, but preparation must retain the configured
     # base path rather than accidentally looking up a per-endpoint runtime profile.
     preparation_target = PRIMARY_SCOPE_TARGET if PRIMARY_SCOPE_TARGET and same_origin(target, PRIMARY_SCOPE_TARGET) else target
-    preparation = apply_runtime_target_preparation(preparation_target, effective_cookies)
+    preparation_cookies = scope_cookie_header(preparation_target, cookies) or effective_cookies
+    preparation = apply_runtime_target_preparation(preparation_target, preparation_cookies)
     probe = scanner_session_probe(selected_probe, probe_cookies, timeout=10, attempts=3)
     probe_invalid = probe.get('conclusive') is True and probe.get('authenticated') is False
     prep_invalid = preparation.get('conclusive', True) is True and preparation.get('usable', True) is False
     usable = not (probe_invalid or prep_invalid)
+
+    # A valid dashboard session may still be invalid for another application under the same host.
+    # When the concrete probe redirects to login, establish that application's own session through
+    # saved SSO state instead of treating exact-origin equality as proof that one PHP session is enough.
+    if not usable and runtime_target_auth_available() and not (runtime_reauth and runtime_reauth.get('attempted')):
+        runtime_reauth = ensure_runtime_authenticated_request(target, effective_cookies, selected_probe)
+        repaired_cookie = scope_cookie_header(target, cookies) or str(runtime_reauth.get('cookie_header') or '')
+        if runtime_reauth.get('usable') and repaired_cookie:
+            effective_cookies = repaired_cookie
+            selected_probe = str(runtime_reauth.get('probe_url') or target)
+            probe_cookies = scope_cookie_header(selected_probe, cookies) or effective_cookies
+            preparation_cookies = scope_cookie_header(preparation_target, cookies) or effective_cookies
+            preparation = apply_runtime_target_preparation(preparation_target, preparation_cookies)
+            probe = scanner_session_probe(selected_probe, probe_cookies, timeout=10, attempts=3)
+            probe_invalid = probe.get('conclusive') is True and probe.get('authenticated') is False
+            prep_invalid = preparation.get('conclusive', True) is True and preparation.get('usable', True) is False
+            usable = not (probe_invalid or prep_invalid)
+
     conclusive = bool(probe_invalid or prep_invalid or probe.get('conclusive') is True)
-    return {'performed': True, 'authenticated': probe.get('authenticated'), 'conclusive': conclusive, 'preparation': preparation, 'probe': probe, 'usable': usable, 'transient_error': bool(probe.get('transient_error') or preparation.get('transient_error')), 'credential_applied': True}
+    return {
+        'performed': True,
+        'authenticated': probe.get('authenticated'),
+        'conclusive': conclusive,
+        'preparation': preparation,
+        'probe': probe,
+        'usable': usable,
+        'transient_error': bool(probe.get('transient_error') or preparation.get('transient_error')),
+        'credential_applied': True,
+        'runtime_reauthentication': runtime_reauth or {},
+        'effective_cookie_names': cookie_names(effective_cookies),
+    }
 
 # Records simple client-side source and sink clues for browser checks.
 def _client_side_source_sink_evidence(text: str) -> tuple[list[str], list[str]]:
@@ -1725,6 +1910,7 @@ def _browser_network_discovery(target: str, cookies: str, html_urls: list[str], 
     queued_signatures: Counter[tuple[str, str, tuple[str, ...]]] = Counter()
     visited_signatures: Counter[tuple[str, str, tuple[str, ...]]] = Counter()
     origin_visits: Counter[str] = Counter()
+    family_visits: Counter[tuple[str, str]] = Counter()
     navigated: list[str] = []
     visited: set[str] = set()
     observed: list[dict[str, Any]] = []
@@ -1745,14 +1931,15 @@ def _browser_network_discovery(target: str, cookies: str, html_urls: list[str], 
             return
         signature = _discovery_route_signature(candidate)
         origin = normalized_origin(candidate)
-        if not force and queued_signatures[signature] >= route_variant_limit:
+        variant_limit = _discovery_variant_limit(candidate, route_variant_limit)
+        if not force and queued_signatures[signature] >= variant_limit:
             return
         if origin_visits[origin] >= per_origin_limit:
             return
         queued.add(candidate)
         queued_signatures[signature] += 1
         queue.append(candidate)
-        queue.sort(key=lambda value: (0 if value in priority_set else 1, -_discovery_queue_score(target, value), value))
+        queue.sort(key=lambda value: (0 if value in priority_set else 1, -_discovery_diversity_score(target, value, family_visits), value))
 
     enqueue_dynamic(target_url, force=True)
     for value in sorted(forced_set):
@@ -1765,12 +1952,23 @@ def _browser_network_discovery(target: str, cookies: str, html_urls: list[str], 
     try:
         with sync_playwright() as playwright:
             browser = playwright.chromium.launch(headless=True)
-            context = browser.new_context(ignore_https_errors=True, user_agent='SecOps-Browser-Discovery/1.0')
+            context_kwargs: dict[str, Any] = {
+                'ignore_https_errors': True,
+                'user_agent': 'SecOps-Browser-Discovery/1.0',
+            }
+            runtime_storage = RUNTIME_TARGET_AUTH.get('storage_state') if cookies and isinstance(RUNTIME_TARGET_AUTH.get('storage_state'), dict) else None
+            if runtime_storage and (runtime_storage.get('cookies') or runtime_storage.get('origins')):
+                # Preserve real Domain/Path/Secure cookie metadata and browser storage for authenticated
+                # discovery. This is materially more accurate than flattening an OIDC session into one
+                # origin-wide Cookie header, especially for multi-application portals and SPAs.
+                context_kwargs['storage_state'] = runtime_storage
+            context = browser.new_context(**context_kwargs)
             parsed_target = urlparse(target)
             origin = urlunparse(parsed_target._replace(path='/', query='', fragment=''))
-            cookie_rows = [{'name': name, 'value': value, 'url': origin} for name, value in parse_cookie_header(cookies)]
-            if cookie_rows:
-                context.add_cookies(cookie_rows)
+            if not runtime_storage:
+                cookie_rows = [{'name': name, 'value': value, 'url': origin} for name, value in parse_cookie_header(cookies)]
+                if cookie_rows:
+                    context.add_cookies(cookie_rows)
 
             def route_guard(route: Any) -> None:
                 request_url = str(route.request.url or '')
@@ -1842,8 +2040,9 @@ def _browser_network_discovery(target: str, cookies: str, html_urls: list[str], 
             base_scores: list[int] = []
             adaptive_threshold: int | None = None
             while queue and len(visited) < navigation_max_budget:
+                queue.sort(key=lambda candidate: (0 if candidate in priority_set else 1, -_discovery_diversity_score(target, candidate, family_visits), candidate))
                 value = queue[0]
-                value_score = _discovery_queue_score(target, value)
+                value_score = _discovery_diversity_score(target, value, family_visits)
                 if len(visited) >= navigation_budget:
                     if adaptive_threshold is None:
                         cutoff_score = min(base_scores) if base_scores else value_score
@@ -1856,11 +2055,13 @@ def _browser_network_discovery(target: str, cookies: str, html_urls: list[str], 
                 signature = _discovery_route_signature(value)
                 origin_key = normalized_origin(value)
                 forced_value = value in forced_set
-                if (not forced_value and visited_signatures[signature] >= route_variant_limit) or origin_visits[origin_key] >= per_origin_limit:
+                variant_limit = _discovery_variant_limit(value, route_variant_limit)
+                if (not forced_value and visited_signatures[signature] >= variant_limit) or origin_visits[origin_key] >= per_origin_limit:
                     continue
                 visited.add(value)
                 visited_signatures[signature] += 1
                 origin_visits[origin_key] += 1
+                family_visits[_application_family_key(value)] += 1
                 if len(visited) <= navigation_budget and _discovery_route_signature(value) != _discovery_route_signature(target_url):
                     base_scores.append(value_score)
                 current_source['url'] = value
@@ -1947,7 +2148,16 @@ def _browser_network_discovery(target: str, cookies: str, html_urls: list[str], 
                 remaining_candidates=len(queue),
                 adaptive_threshold=adaptive_threshold,
                 max_saturated=bool(queue and len(visited) >= navigation_max_budget),
+                application_families_visited=len([count for count in family_visits.values() if count > 0]),
             )
+            if cookies and runtime_storage is not None:
+                try:
+                    # The context started from the previous state, so replacing it with the final state
+                    # preserves old entries and also captures cookies/localStorage created by silent SSO
+                    # while Chromium traversed newly reached application roots.
+                    RUNTIME_TARGET_AUTH['storage_state'] = context.storage_state()
+                except Exception:
+                    pass
             browser.close()
     except Exception as exc:
         errors.append({'url': target, 'type': 'BrowserDiscoveryRuntime', 'message': f'{type(exc).__name__}: {exc}'})
@@ -1980,6 +2190,11 @@ def discover_target(target: str, cookies: str, max_pages: int=MAX_CRAWL_PAGES, s
     initial = list(dict.fromkeys([_clean_url(target), *sorted(priority_seed_urls)]))
     explicit_seed_count = len(explicit_seed_urls)
     page_budget = max(min(max(1, int(max_pages)), int(limits['crawl_pages'])), min(256, explicit_seed_count))
+    page_max_budget = max(
+        page_budget,
+        min(max(1, int(max_pages)), int(limits.get('crawl_pages_max', limits['crawl_pages']))),
+        min(256, explicit_seed_count),
+    )
     script_budget = min(MAX_SCRIPT_ASSETS, int(limits['scripts']))
     route_variant_limit = int(limits['route_variants'])
     per_origin_limit = max(int(limits['per_origin_pages']), min(256, explicit_seed_count))
@@ -1991,13 +2206,14 @@ def discover_target(target: str, cookies: str, max_pages: int=MAX_CRAWL_PAGES, s
     queued_signatures: Counter[tuple[str, str, tuple[str, ...]]] = Counter()
     visited_signatures: Counter[tuple[str, str, tuple[str, ...]]] = Counter()
     origin_useful_visits: Counter[str] = Counter()
+    family_useful_visits: Counter[tuple[str, str]] = Counter()
     origin_attempts: Counter[str] = Counter()
     skipped_route_variants = 0
     skipped_origin_budget = 0
     skipped_out_of_scope = 0
     http_attempts = 0
     dead_http_responses = 0
-    attempt_budget = max(page_budget, (page_budget * 3 + 1) // 2)
+    attempt_budget = max(page_max_budget, (page_max_budget * 3 + 1) // 2)
     per_origin_attempt_limit = max(per_origin_limit, (per_origin_limit * 3 + 1) // 2)
 
     def record_coverage_skip(raw_url: str, reason_code: str, reason: str, *, method: str='GET', source_url: str='') -> None:
@@ -2034,7 +2250,8 @@ def discover_target(target: str, cookies: str, max_pages: int=MAX_CRAWL_PAGES, s
             return
         signature = _discovery_route_signature(value)
         origin = normalized_origin(value)
-        if not force and queued_signatures[signature] >= route_variant_limit:
+        variant_limit = _discovery_variant_limit(value, route_variant_limit)
+        if not force and queued_signatures[signature] >= variant_limit:
             skipped_route_variants += 1
             record_coverage_skip(value, 'DUPLICATE_ROUTE_VARIANT', 'Additional value variant of the same route and parameter-name shape was omitted by the anti-saturation limit.', source_url=source_url)
             return
@@ -2045,7 +2262,7 @@ def discover_target(target: str, cookies: str, max_pages: int=MAX_CRAWL_PAGES, s
         queued.add(value)
         queued_signatures[signature] += 1
         queue.append(value)
-        queue.sort(key=lambda candidate: (0 if candidate in priority_seed_urls else 1, -_discovery_queue_score(target, candidate), candidate))
+        queue.sort(key=lambda candidate: (0 if candidate in priority_seed_urls else 1, -_discovery_diversity_score(target, candidate, family_useful_visits), candidate))
 
     for value in initial:
         enqueue(value, force=value in explicit_seed_urls)
@@ -2063,15 +2280,27 @@ def discover_target(target: str, cookies: str, max_pages: int=MAX_CRAWL_PAGES, s
     errors: list[dict[str, Any]] = []
     initial_login_detected = False
     pages_processed = 0
+    http_base_scores: list[int] = []
+    http_adaptive_threshold: int | None = None
 
-    while queue and pages_processed < page_budget and http_attempts < attempt_budget:
+    while queue and pages_processed < page_max_budget and http_attempts < attempt_budget:
+        queue.sort(key=lambda candidate: (0 if candidate in priority_seed_urls else 1, -_discovery_diversity_score(target, candidate, family_useful_visits), candidate))
+        requested = queue[0]
+        requested_score = _discovery_diversity_score(target, requested, family_useful_visits)
+        if pages_processed >= page_budget and requested not in explicit_seed_urls:
+            if http_adaptive_threshold is None:
+                cutoff_score = min(http_base_scores) if http_base_scores else requested_score
+                http_adaptive_threshold = max(1, int(cutoff_score * 0.75))
+            if requested_score < http_adaptive_threshold:
+                break
         requested = queue.pop(0)
         if requested in visited:
             continue
         signature = _discovery_route_signature(requested)
         origin = normalized_origin(requested)
         forced_requested = requested in explicit_seed_urls
-        if not forced_requested and visited_signatures[signature] >= route_variant_limit:
+        variant_limit = _discovery_variant_limit(requested, route_variant_limit)
+        if not forced_requested and visited_signatures[signature] >= variant_limit:
             skipped_route_variants += 1
             record_coverage_skip(requested, 'DUPLICATE_ROUTE_VARIANT', 'Additional value variant of the same route and parameter-name shape was omitted by the anti-saturation limit.')
             continue
@@ -2138,6 +2367,9 @@ def discover_target(target: str, cookies: str, max_pages: int=MAX_CRAWL_PAGES, s
             continue
         pages_processed += 1
         origin_useful_visits[final_origin] += 1
+        family_useful_visits[_application_family_key(final)] += 1
+        if pages_processed <= page_budget and _discovery_route_signature(final) != _discovery_route_signature(_clean_url(target)):
+            http_base_scores.append(requested_score)
         content_type = response.headers.get('content-type', '').lower()
         if 'html' not in content_type and (not response.text.lstrip().startswith(('<', '<!'))):
             continue
@@ -2326,11 +2558,15 @@ def discover_target(target: str, cookies: str, max_pages: int=MAX_CRAWL_PAGES, s
     budget_diagnostics = {
         'mode': CURRENT_SCAN_MODE,
         'http_page_budget': page_budget,
+        'http_page_max_budget': page_max_budget,
         'http_pages_processed': pages_processed,
+        'http_adaptive_overflow_used': max(0, pages_processed - page_budget),
+        'http_adaptive_threshold': http_adaptive_threshold,
         'http_attempt_budget': attempt_budget,
         'http_requests_attempted': http_attempts,
         'http_remaining_candidates': len(queue),
         'http_page_budget_saturated': bool(queue and pages_processed >= page_budget),
+        'http_page_max_budget_saturated': bool(queue and pages_processed >= page_max_budget),
         'http_attempt_budget_saturated': bool(queue and http_attempts >= attempt_budget),
         'dead_http_404_410': dead_http_responses,
         'browser_page_budget': int(browser_budget_info.get('base_budget', limits['browser_pages'])),
@@ -2346,6 +2582,7 @@ def discover_target(target: str, cookies: str, max_pages: int=MAX_CRAWL_PAGES, s
         'per_origin_page_limit': per_origin_limit,
         'per_origin_attempt_limit': per_origin_attempt_limit,
         'route_variants_skipped': skipped_route_variants,
+        'application_families_visited': len([count for count in family_useful_visits.values() if count > 0]),
         'origin_budget_skipped': skipped_origin_budget,
         'out_of_scope_urls_skipped': skipped_out_of_scope,
         'authorized_origins': sorted(AUTHORIZED_SCOPE_ORIGINS),
@@ -2495,6 +2732,45 @@ def sibling_broad_origin_limit() -> int:
     return sibling_broad_origin_limits()[1]
 
 
+def authenticated_broad_target(discovery: dict[str, Any], origin: str, raw_profile_cookie: str='') -> str:
+    """Return a safe application URL on an origin where the authenticated cookie is actually applicable.
+
+    Browser sessions can be path-scoped. Treating ``https://host/`` as authenticated merely because
+    another path on that host has a valid session either drops coverage or widens a cookie incorrectly.
+    Broad authenticated scanners therefore start from the highest-value discovered non-static URL for
+    which the same concrete cookie-scope function used by specialists returns a credential.
+    """
+    normalized = normalized_origin(origin)
+    if not normalized:
+        return ''
+    candidates: list[str] = [normalized + '/']
+    for key in ('html_urls', 'browser_navigation_urls', 'parameterized_urls', 'urls'):
+        for value in discovery.get(key, []) or []:
+            url = str(value or '').strip()
+            if url and same_origin(normalized, url):
+                candidates.append(url)
+    for key in ('request_cases', 'browser_network_requests'):
+        for row in discovery.get(key, []) or []:
+            if not isinstance(row, dict):
+                continue
+            url = str(row.get('url') or '').strip()
+            if url and same_origin(normalized, url):
+                candidates.append(url)
+
+    unique: list[str] = []
+    seen: set[str] = set()
+    for url in candidates:
+        if url in seen or _browser_static_resource(url) or _destructive_crawl_url(url) or _ephemeral_identity_flow_url(url):
+            continue
+        seen.add(url)
+        unique.append(url)
+    unique.sort(key=lambda url: (0 if url.rstrip('/') == normalized else 1, -_discovery_url_score(url), len(url), url))
+    for url in unique:
+        if scope_cookie_header(url, raw_profile_cookie):
+            return url
+    return ''
+
+
 def sibling_broad_timeout(tool: str, base_timeout: float | int | None=None) -> int:
     scanner = str(tool or '').lower()
     if base_timeout is None:
@@ -2598,6 +2874,203 @@ def _runtime_auth_probe(origin: str, cookie: str, probe_url: str) -> dict[str, A
     }
 
 
+
+def _runtime_application_scope_key(url: str) -> str:
+    """Group authentication attempts by generic application root, not by one whole origin.
+
+    Different applications can share scheme/host/port while maintaining independent server-side
+    sessions. The first path segment is a conservative, application-agnostic boundary that avoids
+    treating every individual endpoint as a separate login while allowing /appA and /appB to obtain
+    different sessions when the platform's SSO flow requires it.
+    """
+    try:
+        parsed = urlparse(str(url or ''))
+    except ValueError:
+        return ''
+    origin = normalized_origin(url)
+    if not origin:
+        return ''
+    segments = [segment for segment in str(parsed.path or '/').split('/') if segment]
+    scope_path = '/' if not segments else f'/{segments[0]}/'
+    return origin + scope_path
+
+
+def ensure_runtime_authenticated_request(request_url: str, current_cookie: str='', probe_url: str='') -> dict[str, Any]:
+    """Establish or refresh an application session for one concrete authorized request.
+
+    This is the just-in-time complement to sibling discovery authentication. It also handles two
+    applications living on the same origin: if /appA is authenticated but /appB redirects to login,
+    the saved browser SSO state (and, if necessary, the credentials resolved once by the runner) is
+    used to obtain the cookie that a browser would actually send to /appB. No console prompt occurs.
+    """
+    url = str(request_url or '').strip()
+    if not url or not runtime_target_auth_available() or not url_in_authorized_scope(PRIMARY_SCOPE_TARGET or url, url):
+        return {'attempted': False, 'usable': bool(scope_cookie_header(url, current_cookie)), 'cookie_header': scope_cookie_header(url, current_cookie)}
+    if _destructive_crawl_url(url) or _browser_static_resource(url) or _ephemeral_identity_flow_url(url):
+        return {'attempted': False, 'usable': bool(scope_cookie_header(url, current_cookie)), 'cookie_header': scope_cookie_header(url, current_cookie), 'reason': 'request_not_runtime_auth_candidate'}
+
+    scope_key = _runtime_application_scope_key(url)
+    if not scope_key:
+        return {'attempted': False, 'usable': False, 'cookie_header': '', 'reason': 'invalid_request_origin'}
+
+    cached = RUNTIME_AUTH_APPLICATION_ATTEMPTS.get(scope_key)
+    cached_cookie = scope_cookie_header(url, current_cookie)
+    if isinstance(cached, dict) and cached.get('status') == 'authenticated' and cached_cookie:
+        return {**cached, 'attempted': False, 'reused': True, 'cookie_header': cached_cookie}
+    previous_attempts = int(cached.get('attempt_count', 0) or 0) if isinstance(cached, dict) else 0
+    previous_urls = {str(value) for value in (cached.get('attempted_urls') or [])} if isinstance(cached, dict) else set()
+    if isinstance(cached, dict) and cached.get('status') == 'failed' and (previous_attempts >= 3 or url in previous_urls):
+        return {**cached, 'attempted': False, 'reused': True, 'cookie_header': cached_cookie}
+
+    credential = RUNTIME_TARGET_AUTH.get('credential') if isinstance(RUNTIME_TARGET_AUTH.get('credential'), dict) else {}
+    username = str(RUNTIME_TARGET_AUTH.get('username') or '')
+    password = str(RUNTIME_TARGET_AUTH.get('password') or '')
+    storage_state = RUNTIME_TARGET_AUTH.get('storage_state') if isinstance(RUNTIME_TARGET_AUTH.get('storage_state'), dict) else None
+    candidate_urls = [url]
+    if probe_url and same_origin(url, probe_url) and str(probe_url) != url:
+        candidate_urls.append(str(probe_url))
+
+    try:
+        login = snap4city_browser_login_session(
+            normalized_origin(url),
+            username,
+            password,
+            credential,
+            storage_state=storage_state,
+            candidate_urls=candidate_urls,
+            initial_login=False,
+            include_configured_fallbacks=False,
+        )
+    except RuntimeError as exc:
+        result = {
+            'attempted': True,
+            'usable': False,
+            'status': 'failed',
+            'scope_key': scope_key,
+            'request_url': url,
+            'reason': str(exc)[:1200],
+            'cookie_header': '',
+            'attempt_count': previous_attempts + 1,
+            'attempted_urls': sorted(previous_urls | {url}),
+        }
+        RUNTIME_AUTH_APPLICATION_ATTEMPTS[scope_key] = dict(result)
+        return result
+
+    if isinstance(login.get('storage_state'), dict):
+        RUNTIME_TARGET_AUTH['storage_state'] = login['storage_state']
+    returned_cookie = str(login.get('cookie_header') or '')
+    origin = normalized_origin(url)
+    if returned_cookie and origin and not same_origin(PRIMARY_SCOPE_TARGET or origin, origin):
+        register_authenticated_origin_cookie(origin, returned_cookie)
+
+    effective_cookie = _runtime_storage_cookie_header(url) or returned_cookie
+    if not effective_cookie:
+        result = {
+            'attempted': True,
+            'usable': False,
+            'status': 'failed',
+            'scope_key': scope_key,
+            'request_url': url,
+            'reason': 'browser authentication completed without a cookie applicable to the concrete request URL',
+            'cookie_header': '',
+            'attempt_count': previous_attempts + 1,
+            'attempted_urls': sorted(previous_urls | {url}),
+        }
+        RUNTIME_AUTH_APPLICATION_ATTEMPTS[scope_key] = dict(result)
+        return result
+
+    validation_url = str(login.get('final_url') or '')
+    if not validation_url or not same_origin(origin, validation_url) or _browser_static_resource(validation_url):
+        validation_url = url
+    probe = _runtime_auth_probe(origin, effective_cookie, validation_url)
+    flow_observed = bool(login.get('authentication_flow_observed'))
+    usable = probe.get('usable') is not False and (probe.get('distinguished_from_anonymous') is True or flow_observed)
+    result = {
+        'attempted': True,
+        'usable': bool(usable),
+        'status': 'authenticated' if usable else 'failed',
+        'scope_key': scope_key,
+        'request_url': url,
+        'entry_url': str(login.get('entry_url') or ''),
+        'final_url': str(login.get('final_url') or ''),
+        'probe_url': validation_url,
+        'cookie_header': effective_cookie if usable else '',
+        'cookie_names': cookie_names(effective_cookie) if usable else [],
+        'sso_reused': bool(login.get('sso_reused')),
+        'credentials_reused': bool(login.get('used_credentials')),
+        'authentication_flow_observed': flow_observed,
+        'distinguished_from_anonymous': probe.get('distinguished_from_anonymous'),
+        'probe': probe,
+        'attempt_count': previous_attempts + 1,
+        'attempted_urls': sorted(previous_urls | {url}),
+    }
+    if not usable:
+        result['reason'] = 'runtime authentication did not produce a usable application session'
+    RUNTIME_AUTH_APPLICATION_ATTEMPTS[scope_key] = dict(result)
+    return result
+
+
+
+def _same_origin_application_auth_candidates(discovery: dict[str, Any], target: str) -> list[tuple[str, int, list[str]]]:
+    """Rank same-origin application roots that expose their own login/SSO entry points."""
+    primary_origin = normalized_origin(target)
+    credential = RUNTIME_TARGET_AUTH.get('credential') if isinstance(RUNTIME_TARGET_AUTH.get('credential'), dict) else {}
+    configured_login = urljoin(target.rstrip('/') + '/', str(credential.get('login_path') or '/').lstrip('/'))
+    configured_scope = _runtime_application_scope_key(configured_login)
+    buckets: dict[str, dict[str, Any]] = {}
+
+    def add(raw: Any, bonus: int=0) -> None:
+        url = str(raw or '').strip()
+        if not url or not same_origin(primary_origin, url) or _destructive_crawl_url(url):
+            return
+        if _browser_static_resource(url) or _ephemeral_identity_flow_url(url):
+            return
+        scope_key = _runtime_application_scope_key(url)
+        if not scope_key or scope_key == configured_scope:
+            return
+        try:
+            path = str(urlparse(url).path or '/').lower()
+        except ValueError:
+            return
+        login_signal = ('ssologin' in path) or any(token in path for token in ('/login', '/signin', '/sign-in'))
+        bucket = buckets.setdefault(scope_key, {'score': -1000, 'candidates': [], 'login_signal': False})
+        score = _discovery_url_score(url) + int(bonus) + (220 if 'ssologin' in path else 120 if login_signal else 0)
+        bucket['score'] = max(int(bucket['score']), score)
+        bucket['login_signal'] = bool(bucket['login_signal'] or login_signal)
+        if url not in bucket['candidates']:
+            bucket['candidates'].append(url)
+
+    for value in discovery.get('html_urls', []):
+        add(value, 45)
+    for value in discovery.get('browser_navigation_urls', []):
+        add(value, 55)
+    for row in discovery.get('request_cases', []):
+        if isinstance(row, dict):
+            add(row.get('url'), 65)
+    for row in discovery.get('browser_network_requests', []):
+        if isinstance(row, dict):
+            resource_type = str(row.get('resource_type') or '').lower()
+            add(row.get('url'), 70 if resource_type in {'document', 'xhr', 'fetch'} else 20)
+
+    ranked: list[tuple[str, int, list[str]]] = []
+    for scope_key, bucket in buckets.items():
+        # Proactive authentication is reserved for roots with an observed login/SSO entry point.
+        # Other roots remain eligible for just-in-time reauthentication if a concrete scanner precheck
+        # later demonstrates that the current session is not valid there.
+        if not bucket.get('login_signal'):
+            continue
+        candidates = sorted(
+            bucket['candidates'],
+            key=lambda value: (
+                0 if 'ssologin' in urlparse(value).path.lower() else 1,
+                -_discovery_url_score(value),
+                value,
+            ),
+        )[:8]
+        ranked.append((scope_key, int(bucket['score']), candidates))
+    return sorted(ranked, key=lambda item: (-item[1], item[0]))
+
+
 def authenticate_discovered_sibling_origins(discovery: dict[str, Any], target: str, primary_cookies: str) -> dict[str, Any]:
     """Create independent sessions for authorized sibling origins observed by authenticated discovery.
 
@@ -2660,11 +3133,10 @@ def authenticate_discovered_sibling_origins(discovery: dict[str, Any], target: s
             runtime_rows.append({'origin': origin, 'status': 'reused', 'cookie_names': cookie_names(existing), 'score': score})
             known_authenticated.add(origin)
 
+    attempted_count = 0
     for origin, score, candidates in selected:
-        if RUNTIME_TARGET_AUTH.get('credentials_rejected'):
-            runtime_rows.append({'origin': origin, 'status': 'skipped', 'reason': 'credentials_rejected_on_previous_origin', 'score': score})
-            continue
         print(f'    [AUTH SSO] {origin}: attempting origin-specific SSO/session establishment from {len(candidates)} observed application entry point(s).', flush=True)
+        attempted_count += 1
         try:
             login = snap4city_browser_login_session(
                 origin,
@@ -2674,12 +3146,13 @@ def authenticate_discovered_sibling_origins(discovery: dict[str, Any], target: s
                 storage_state=storage_state,
                 candidate_urls=candidates,
                 initial_login=False,
+                include_configured_fallbacks=False,
             )
         except RuntimeError as exc:
             message = str(exc)
-            lowered = message.lower()
-            if 'rejected the supplied target credentials' in lowered or 'additional authentication step' in lowered:
-                RUNTIME_TARGET_AUTH['credentials_rejected'] = True
+            # Authentication is origin/application specific. A credential rejection or extra step on one
+            # origin must not suppress independent attempts on other authorized origins, which may use a
+            # different client, realm, session bridge or already-valid SSO path.
             runtime_rows.append({'origin': origin, 'status': 'failed', 'reason': message[:1000], 'score': score, 'candidate_count': len(candidates)})
             print(f'    [AUTH SSO] {origin}: automatic sibling authentication failed: {message}', file=sys.stderr, flush=True)
             continue
@@ -2743,12 +3216,59 @@ def authenticate_discovered_sibling_origins(discovery: dict[str, Any], target: s
             runtime_rows[-1]['recrawl_error'] = f'{type(exc).__name__}: {exc}'
             print(f'    [AUTH SSO] {origin}: authenticated re-discovery failed but the validated origin cookie remains available: {type(exc).__name__}: {exc}', file=sys.stderr, flush=True)
 
+
+    # Applications can also keep independent sessions while sharing the same origin. Proactively
+    # revisit application roots that exposed their own login/SSO wrapper; all other paths still have
+    # the just-in-time fallback in refresh_authenticated_session_state().
+    application_rows: list[dict[str, Any]] = list(discovery.get('runtime_application_authentication') or [])
+    app_limit = max(1, int(RUNTIME_AUTH_APPLICATION_LIMITS.get(CURRENT_SCAN_MODE, 18)))
+    app_recrawl_pages = max(10, int(RUNTIME_AUTH_APPLICATION_RECRAWL_PAGES.get(CURRENT_SCAN_MODE, 72)))
+    app_ranked = _same_origin_application_auth_candidates(merged, target)
+    app_attempted = 0
+    app_authenticated = 0
+    for scope_key, score, candidates in app_ranked[:app_limit]:
+        if not candidates:
+            continue
+        entry_url = candidates[0]
+        result = ensure_runtime_authenticated_request(entry_url, primary_cookies, entry_url)
+        app_attempted += 1 if result.get('attempted') else 0
+        row = {
+            'application_scope': scope_key,
+            'status': str(result.get('status') or ('authenticated' if result.get('usable') else 'failed')),
+            'score': score,
+            'entry_url': entry_url,
+            'candidate_count': len(candidates),
+            'cookie_names': list(result.get('cookie_names') or []),
+            'sso_reused': bool(result.get('sso_reused')),
+            'credentials_reused': bool(result.get('credentials_reused')),
+            'reason': str(result.get('reason') or '')[:1000],
+        }
+        application_rows.append(row)
+        if not result.get('usable'):
+            continue
+        app_authenticated += 1
+        app_cookie = scope_cookie_header(entry_url, primary_cookies) or str(result.get('cookie_header') or '')
+        if not app_cookie:
+            row['status'] = 'failed_validation'
+            row['reason'] = 'No application/path cookie remained applicable after runtime authentication.'
+            continue
+        try:
+            recrawl = discover_target(scope_key, app_cookie, max_pages=app_recrawl_pages, seeds=candidates)
+            recrawl = discovery_for_origin(recrawl, normalized_origin(target))
+            recrawl['authentication_effective'] = True
+            recrawl['authentication_note'] = 'Application-specific runtime OIDC/SSO session established and used for same-origin authenticated re-discovery.'
+            recrawl['authentication_probe'] = result.get('probe') if isinstance(result.get('probe'), dict) else {}
+            merged = merge_discovery(merged, recrawl)
+        except Exception as exc:
+            row['recrawl_error'] = f'{type(exc).__name__}: {exc}'
+
     # Sibling recrawls must not overwrite the authentication verdict or the discovery budget of the
     # primary profile. Their state is reported separately below.
     merged['authentication_effective'] = primary_auth_effective
     merged['authentication_note'] = primary_auth_note
     merged['authentication_probe'] = primary_auth_probe
     merged['runtime_sibling_authentication'] = runtime_rows
+    merged['runtime_application_authentication'] = application_rows
     auth_origins = {
         str(row.get('origin') or '') for row in runtime_rows
         if isinstance(row, dict) and row.get('status') in {'authenticated', 'reused'} and str(row.get('origin') or '')
@@ -2757,8 +3277,12 @@ def authenticate_discovered_sibling_origins(discovery: dict[str, Any], target: s
         **primary_budget,
         'runtime_auth_origin_limit': limit,
         'runtime_auth_origins_eligible': len(eligible),
-        'runtime_auth_origins_attempted': len(selected),
+        'runtime_auth_origins_attempted': attempted_count,
         'runtime_auth_origins_authenticated': len(auth_origins),
+        'runtime_auth_application_limit': app_limit,
+        'runtime_auth_applications_eligible': len(app_ranked),
+        'runtime_auth_applications_attempted': app_attempted,
+        'runtime_auth_applications_authenticated': app_authenticated,
     }
     return merged
 
@@ -4466,6 +4990,27 @@ def select_session_probe_url(discovery: dict[str, Any], target: str) -> str:
 
     discovered = [str(value) for value in discovery.get('html_urls', []) if isinstance(value, str) and same_origin(target, value) and (not _is_auto_index_url(value))]
     return _stable_auth_probe_url(target, discovered)
+
+
+def select_application_session_probe_url(discovery: dict[str, Any], request_url: str, source_url: str='') -> str:
+    """Choose an authentication probe from the same generic application root as a concrete request."""
+    scope_key = _runtime_application_scope_key(request_url)
+    candidates = [
+        str(value) for value in discovery.get('html_urls', [])
+        if isinstance(value, str)
+        and same_origin(request_url, value)
+        and _runtime_application_scope_key(value) == scope_key
+        and not _is_auto_index_url(value)
+        and not _ephemeral_identity_flow_url(value)
+    ]
+    if source_url and same_origin(request_url, source_url) and _runtime_application_scope_key(source_url) == scope_key:
+        candidates.insert(0, str(source_url))
+    if str(request_url or '').upper().startswith(('HTTP://', 'HTTPS://')):
+        method_safe_target = request_url
+    else:
+        method_safe_target = normalized_origin(request_url) or request_url
+    return _stable_auth_probe_url(method_safe_target, candidates) if candidates else method_safe_target
+
 
 # Safety policy decides whether state-changing tests are allowed for the current target.
 def state_changing_tests_allowed(target: str, explicit: bool | None=None) -> bool:

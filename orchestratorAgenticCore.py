@@ -1733,9 +1733,15 @@ def discovery_node(state: AgentState) -> dict[str, Any]:
             print(f"      [DISCOVERY] {dead_count} HTTP 404/410 responses kept as diagnostics and excluded from the useful-page budget; HTTP attempts={budget.get('http_requests_attempted', 0)}/{budget.get('http_attempt_budget', 0)}")
         http_pages = int(budget.get('http_pages_processed', 0) or 0)
         http_page_budget = int(budget.get('http_page_budget', 0) or 0)
+        http_page_max_budget = int(budget.get('http_page_max_budget', http_page_budget) or http_page_budget)
+        http_overflow = int(budget.get('http_adaptive_overflow_used', 0) or 0)
         http_remaining = int(budget.get('http_remaining_candidates', 0) or 0)
-        if http_remaining and budget.get('http_page_budget_saturated'):
-            print(f"      [DISCOVERY] HTTP useful-page budget saturated: {http_pages}/{http_page_budget}; {http_remaining} queued candidate(s) remain.")
+        if http_overflow:
+            print(f"      [DISCOVERY] HTTP adaptive useful-page budget: base={http_page_budget}, overflow={http_overflow}, processed={http_pages}/{http_page_max_budget}.")
+        if http_remaining and budget.get('http_page_max_budget_saturated'):
+            print(f"      [DISCOVERY] HTTP useful-page max budget saturated: {http_pages}/{http_page_max_budget}; {http_remaining} queued candidate(s) remain.")
+        elif http_remaining and budget.get('http_page_budget_saturated') and not http_overflow:
+            print(f"      [DISCOVERY] HTTP useful-page base budget reached: {http_pages}/{http_page_budget}; adaptive ranking stopped before the max {http_page_max_budget}; {http_remaining} queued candidate(s) remain.")
         elif http_remaining and budget.get('http_attempt_budget_saturated'):
             print(f"      [DISCOVERY] HTTP attempt budget saturated: {budget.get('http_requests_attempted', 0)}/{budget.get('http_attempt_budget', 0)}; {http_remaining} queued candidate(s) remain.")
         browser_budget = int(budget.get('browser_page_budget', 0) or 0)
@@ -1793,11 +1799,15 @@ def discovery_candidate_actions(state: AgentState) -> list[dict[str, Any]]:
         sibling_selection = shared.select_sibling_broad_origins(state['discovery'].get(name, {}), state['target'])
         raw_profile_cookie = _profile_cookie(state, name)
         for sibling_origin, sibling_score in sibling_selection['selected']:
-            sibling_cookie = shared.scope_cookie_header(sibling_origin, raw_profile_cookie)
-            if name != 'anonymous' and anonymous_available and not sibling_cookie:
+            broad_target = sibling_origin
+            sibling_cookie = shared.scope_cookie_header(broad_target, raw_profile_cookie)
+            if name != 'anonymous' and not sibling_cookie:
+                broad_target = shared.authenticated_broad_target(state['discovery'].get(name, {}), sibling_origin, raw_profile_cookie)
+                sibling_cookie = shared.scope_cookie_header(broad_target, raw_profile_cookie) if broad_target else ''
+            if name != 'anonymous' and not sibling_cookie:
                 continue
             reason = (
-                'Ranked broad authenticated coverage using an origin-specific runtime OIDC/SSO session.'
+                'Ranked broad authenticated coverage using a runtime OIDC/SSO session that is valid for the concrete application URL.'
                 if sibling_cookie else
                 'Ranked broad no-cookie coverage for a high-value explicitly authorized sibling origin observed during discovery.'
             )
@@ -1805,7 +1815,7 @@ def discovery_candidate_actions(state: AgentState) -> list[dict[str, Any]]:
                 actions.append({
                     'profile': name,
                     'tool': tool,
-                    'target_url': sibling_origin,
+                    'target_url': broad_target,
                     'jwt_token': '',
                     'injection_url': '',
                     'sibling_broad': True,
@@ -2308,17 +2318,22 @@ async def execute_action(action: dict[str, Any], cookies: dict[str, str], discov
     raw_profile_cookie = cookies.get(profile, '')
     request_url = _action_request_url(action, action['target_url'])
     effective_action_cookie = shared.scope_cookie_header(request_url, raw_profile_cookie)
-    if effective_action_cookie and tool in authenticated_specialists:
-        parsed_target = urlparse(request_url)
-        refresh_target = f'{parsed_target.scheme}://{parsed_target.netloc}'
+    if profile == 'authenticated' and tool in authenticated_specialists:
         profile_discovery = discovery.get(profile, {})
-        probe_url = shared.select_session_probe_url(profile_discovery, refresh_target)
+        source_url = str(action.get('source_url') or '')
+        method = str(action.get('method') or 'GET').upper()
+        probe_url = request_url if method in {'GET', 'HEAD'} else shared.select_application_session_probe_url(profile_discovery, request_url, source_url)
         print(f'    [PRECHECK] {tool}: validating authenticated session with {shared.compact_log_url(probe_url)}', flush=True)
-        state_refresh = shared.refresh_authenticated_session_state(refresh_target, effective_action_cookie, probe_url)
-        if state_refresh.get('usable') is False:
+        state_refresh = shared.refresh_authenticated_session_state(request_url, raw_profile_cookie, probe_url)
+        if state_refresh.get('usable') is False or not state_refresh.get('credential_applied'):
             print(f'    [PARTIAL ] {tool}: authenticated session precheck failed', flush=True)
-            return (action, {'tool': tool, 'status': 'partial', 'target': action['target_url'], 'output': 'The authenticated session could not be re-established before the scanner.', 'vulnerabilities': [], 'diagnosis': 'authentication_precheck_failed', 'state_refresh': state_refresh})
-        print(f'    [SESSION ] {tool}: authenticated session usable', flush=True)
+            return (action, {'tool': tool, 'status': 'partial', 'target': action['target_url'], 'output': 'The authenticated application session could not be re-established before the scanner.', 'vulnerabilities': [], 'diagnosis': 'authentication_precheck_failed', 'state_refresh': state_refresh})
+        effective_action_cookie = shared.scope_cookie_header(request_url, raw_profile_cookie)
+        # build_tool_arguments ran before the just-in-time refresh; update the concrete scanner
+        # arguments so a newly established application/path session is actually used by the tool.
+        if isinstance(arguments, dict) and 'cookies' in arguments:
+            arguments['cookies'] = effective_action_cookie
+        print(f'    [SESSION ] {tool}: authenticated application session usable', flush=True)
     try:
         scanner_limit = float(arguments.get('timeout', 180))
         spec = next((item for item in shared.ALL_TOOLS if item.name == tool), None)
