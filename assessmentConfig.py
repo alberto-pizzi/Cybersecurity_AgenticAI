@@ -201,6 +201,14 @@ def _validate_credentials(credentials: Any) -> None:
                     raise ValueError(f"Credential {name!r} field {field} must be a string when supplied.")
             if "headless" in credential and not isinstance(credential.get("headless"), bool):
                 raise ValueError(f"Credential {name!r} headless must be true or false when supplied.")
+            if "reuse_on_authorized_siblings" in credential and not isinstance(credential.get("reuse_on_authorized_siblings"), bool):
+                raise ValueError(f"Credential {name!r} reuse_on_authorized_siblings must be true or false when supplied.")
+            sibling_paths = credential.get("sibling_login_paths")
+            if sibling_paths is not None and (
+                not isinstance(sibling_paths, list)
+                or not all(isinstance(item, str) and item.strip() for item in sibling_paths)
+            ):
+                raise ValueError(f"Credential {name!r} sibling_login_paths must be a list of non-empty strings.")
             if "timeout_seconds" in credential:
                 try:
                     timeout_seconds = int(credential.get("timeout_seconds"))

@@ -22,7 +22,8 @@
       "headless": true,
       "timeout_seconds": 60,
       "optional": true,
-      "purpose": "Authorized Snap4City dashboard login. Existing cookie env overrides browser login; otherwise username/password env or interactive console input are used."
+      "purpose": "Authorized Snap4City dashboard login. Existing cookie env applies only to its exact origin. Username/password are resolved once and reused automatically for authorized sibling-origin OIDC/SSO reauthentication when needed.",
+      "reuse_on_authorized_siblings": true
     }
   },
   "assets": [

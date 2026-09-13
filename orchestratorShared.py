@@ -36,6 +36,7 @@ with warnings.catch_warnings():
     warnings.simplefilter('ignore')
     from fastmcp import Client
 from utils import apply_runtime_target_preparation, absolute_url, canonical_cookie_header, cookie_names, load_runtime_config, normalize_url, normalized_origin, parse_cookie_header, ROOT_DIR, same_origin, sanitize_discovered_url, scanner_session_probe, SERVERS_DIR, target_runtime_profile, url_in_authorized_scope as _url_in_explicit_scope, MCP_UNIFIED_SERVICE, mcp_http_port, mcp_http_url
+from targetAuth import snap4city_browser_login_session
 ROOT = Path(ROOT_DIR).resolve()
 SERVERS = Path(SERVERS_DIR).resolve()
 RUNTIME_FILE = ROOT / '.secops_runtime.json'
@@ -139,10 +140,18 @@ ADAPTIVE_SPECIALIST_OVERFLOW = {
 # A separate bounded reserve prevents large menus from starving these contracts behind unrelated
 # request variants while retaining the normal specialist ranking for every other case.
 ROUTING_TRAVERSAL_RESERVE = {'fast': 16, 'balanced': 48, 'deep': 96}
+# Discovery may retain more value variants so later reasoning can see them, while request-level
+# scanners use a smaller cap for equivalent method/path/parameter shapes. Traversal is the explicit
+# exception because routing values that select different local resources receive distinct signatures.
+SPECIALIST_ROUTE_VARIANT_LIMITS = {'fast': 2, 'balanced': 3, 'deep': 4}
 ADAPTIVE_HIGH_VALUE_PATH_HINTS = ('/api/', '/admin/', 'management', 'search', 'query', 'upload', 'download', 'callback', 'webhook', 'config', 'settings', 'profile', 'account')
 AUTHORIZED_SCOPE_ORIGINS: set[str] = set()
 AUTHORIZED_SCOPE_HOST_SUFFIXES: set[str] = set()
 PRIMARY_SCOPE_TARGET = ''
+AUTHENTICATED_ORIGIN_COOKIES: dict[str, str] = {}
+RUNTIME_TARGET_AUTH: dict[str, Any] = {}
+RUNTIME_AUTH_ORIGIN_LIMITS = {'fast': 12, 'balanced': 32, 'deep': 64}
+RUNTIME_AUTH_RECRAWL_PAGES = {'fast': 28, 'balanced': 60, 'deep': 120}
 CURRENT_SCAN_MODE = 'balanced'
 BROAD_SCANNER_TIMEOUTS = dict(SCAN_MODES[CURRENT_SCAN_MODE]['broad'])
 PARAMETER_TOOL_TIMEOUTS = dict(SCAN_MODES[CURRENT_SCAN_MODE]['parameter'])
@@ -169,12 +178,77 @@ def configure_authorized_scope(target: str, origins: list[str] | None=None, host
 def url_in_authorized_scope(target: str, candidate: str) -> bool:
     return _url_in_explicit_scope(target, candidate, AUTHORIZED_SCOPE_ORIGINS, AUTHORIZED_SCOPE_HOST_SUFFIXES)
 
-# Keeps target cookies on the primary origin; sibling origins are discovered and tested without credential leakage.
+# Registers one application cookie for the exact origin that created it. The authenticated profile
+# can therefore carry several independent sibling sessions without ever copying the primary raw header.
+def register_authenticated_origin_cookie(origin_or_url: str, cookies: str) -> None:
+    origin = normalized_origin(origin_or_url)
+    if not origin or not cookies:
+        return
+    AUTHENTICATED_ORIGIN_COOKIES[origin] = canonical_cookie_header(cookies)
+
+
+def authenticated_origin_cookie(origin_or_url: str) -> str:
+    return AUTHENTICATED_ORIGIN_COOKIES.get(normalized_origin(origin_or_url), '')
+
+
+# A raw Cookie header does not carry browser Domain/Path metadata. It remains exact-origin. When
+# runtime OIDC/SSO has explicitly created a different application session for a discovered sibling,
+# that separately obtained cookie is returned only for that sibling origin.
 def scope_cookie_header(candidate: str, cookies: str) -> str:
     if not cookies:
         return ''
     base = PRIMARY_SCOPE_TARGET or candidate
-    return cookies if same_origin(base, candidate) else ''
+    if same_origin(base, candidate):
+        return cookies
+    return authenticated_origin_cookie(candidate)
+
+
+def _load_runtime_target_auth_state() -> dict[str, Any]:
+    path = str(os.environ.get('SECOPS_RUNTIME_AUTH_STATE') or '').strip()
+    if not path:
+        return {}
+    try:
+        candidate = Path(path).expanduser().resolve()
+        payload = json.loads(candidate.read_text(encoding='utf-8'))
+    except (OSError, json.JSONDecodeError, ValueError) as exc:
+        print(f'[AUTH] Runtime target-auth state could not be loaded: {type(exc).__name__}: {exc}', file=sys.stderr)
+        return {}
+    if not isinstance(payload, dict) or str(payload.get('kind') or '') != 'snap4city_oidc':
+        print('[AUTH] Runtime target-auth state is missing a supported snap4city_oidc credential.', file=sys.stderr)
+        return {}
+    return payload
+
+
+def configure_runtime_target_auth(primary_target: str, primary_cookie: str) -> None:
+    AUTHENTICATED_ORIGIN_COOKIES.clear()
+    RUNTIME_TARGET_AUTH.clear()
+    if primary_cookie:
+        register_authenticated_origin_cookie(primary_target, primary_cookie)
+    payload = _load_runtime_target_auth_state()
+    if not payload:
+        return
+    primary_origin = normalized_origin(primary_target)
+    declared_primary = normalized_origin(str(payload.get('primary_origin') or primary_target))
+    if declared_primary and primary_origin and declared_primary != primary_origin:
+        print(
+            f'[AUTH] Runtime target-auth state belongs to {declared_primary}, not {primary_origin}; dynamic sibling authentication is disabled.',
+            file=sys.stderr,
+        )
+        return
+    RUNTIME_TARGET_AUTH.update(payload)
+    storage = payload.get('storage_state')
+    if not isinstance(storage, dict):
+        RUNTIME_TARGET_AUTH['storage_state'] = None
+    print('[AUTH] Runtime OIDC/SSO state loaded for automatic sibling-origin authentication; no further console credential prompts will be used.')
+
+
+def runtime_target_auth_available() -> bool:
+    credential = RUNTIME_TARGET_AUTH.get('credential') if isinstance(RUNTIME_TARGET_AUTH.get('credential'), dict) else {}
+    return (
+        bool(RUNTIME_TARGET_AUTH)
+        and str(RUNTIME_TARGET_AUTH.get('kind') or '') == 'snap4city_oidc'
+        and bool(credential.get('reuse_on_authorized_siblings', False))
+    )
 
 # Loads the timeouts and case limits for the selected scan profile.
 def configure_scan_mode(mode: str) -> None:
@@ -1087,6 +1161,23 @@ def _discovery_route_signature(url: str) -> tuple[str, str, tuple[str, ...]]:
             tokens.add(f'@{lowered_name}:{semantic}')
     return (normalized_origin(url), parsed.path.rstrip('/') or '/', tuple(sorted(tokens)))
 
+# Request-level injection scanners normally care about method/path/parameter shape, not ordinary
+# parameter values. Semantic routing values remain distinct only for traversal/LFI, where the value
+# can literally choose a different server-side file/module and therefore represents distinct risk.
+def _structural_route_signature(url: str) -> tuple[str, str, tuple[str, ...]]:
+    parsed = urlparse(str(url or ''))
+    names = tuple(sorted({name.lower() for name, _ in parse_qsl(parsed.query, keep_blank_values=True)}))
+    return (normalized_origin(url), parsed.path.rstrip('/') or '/', names)
+
+def _specialist_route_signature(tool: str, url: str) -> tuple[str, str, tuple[str, ...]]:
+    return _discovery_route_signature(url) if str(tool or '').lower() == 'traversal' else _structural_route_signature(url)
+
+# Request-level scanners need fewer value-only variants than discovery. Keeping this limit separate
+# preserves broad discovery evidence without repeatedly executing the same scanner against ephemeral
+# values of an otherwise identical request shape.
+def _specialist_variant_cap() -> int:
+    return max(1, int(SPECIALIST_ROUTE_VARIANT_LIMITS.get(CURRENT_SCAN_MODE, 3)))
+
 # Extracts safe internal navigation destinations carried inside routing parameters.
 def _nested_navigation_targets(url: str) -> list[str]:
     parsed = urlparse(str(url or ''))
@@ -1421,19 +1512,30 @@ def xss_verification_context_score(finding_url: str, case_url: str, parameter: s
         score += 20
     return score
 
-# Rechecks whether an authenticated profile is still valid.
+# Rechecks whether an authenticated profile is still valid without allowing the precheck itself to
+# widen credential scope. This deliberately mirrors build_tool_arguments(): a sibling request that
+# receives no scanner cookie also receives no cookie during preparation or session probing.
 def refresh_authenticated_session_state(target: str, cookies: str, probe_url: str='') -> dict[str, Any]:
 
-    if not cookies:
-        return {'performed': False, 'authenticated': False, 'usable': True}
-    preparation = apply_runtime_target_preparation(target, cookies)
+    effective_cookies = scope_cookie_header(target, cookies)
+    if not effective_cookies:
+        return {'performed': False, 'authenticated': False, 'usable': True, 'credential_applied': False}
     selected_probe = probe_url or target
-    probe = scanner_session_probe(selected_probe, cookies, timeout=10, attempts=3)
+    probe_cookies = scope_cookie_header(selected_probe, effective_cookies)
+    if not probe_cookies:
+        selected_probe = target
+        probe_cookies = effective_cookies
+    # Target preparation is configured against the assessment entry point. A concrete same-origin
+    # request can still be the scanner/probe target, but preparation must retain the configured
+    # base path rather than accidentally looking up a per-endpoint runtime profile.
+    preparation_target = PRIMARY_SCOPE_TARGET if PRIMARY_SCOPE_TARGET and same_origin(target, PRIMARY_SCOPE_TARGET) else target
+    preparation = apply_runtime_target_preparation(preparation_target, effective_cookies)
+    probe = scanner_session_probe(selected_probe, probe_cookies, timeout=10, attempts=3)
     probe_invalid = probe.get('conclusive') is True and probe.get('authenticated') is False
     prep_invalid = preparation.get('conclusive', True) is True and preparation.get('usable', True) is False
     usable = not (probe_invalid or prep_invalid)
     conclusive = bool(probe_invalid or prep_invalid or probe.get('conclusive') is True)
-    return {'performed': True, 'authenticated': probe.get('authenticated'), 'conclusive': conclusive, 'preparation': preparation, 'probe': probe, 'usable': usable, 'transient_error': bool(probe.get('transient_error') or preparation.get('transient_error'))}
+    return {'performed': True, 'authenticated': probe.get('authenticated'), 'conclusive': conclusive, 'preparation': preparation, 'probe': probe, 'usable': usable, 'transient_error': bool(probe.get('transient_error') or preparation.get('transient_error')), 'credential_applied': True}
 
 # Records simple client-side source and sink clues for browser checks.
 def _client_side_source_sink_evidence(text: str) -> tuple[list[str], list[str]]:
@@ -2408,6 +2510,259 @@ def discovered_scope_origins(discovery: dict[str, Any], target: str, limit: int 
     return [origin for origin, _ in ranking[:max(0, int(limit))]]
 
 
+def _runtime_auth_candidate_urls(discovery: dict[str, Any], origin: str, *, limit: int=8) -> list[str]:
+    scored: dict[str, int] = {}
+
+    def add(value: Any, bonus: int=0) -> None:
+        url = str(value or '').strip()
+        if not url or not same_origin(origin, url) or _destructive_crawl_url(url):
+            return
+        try:
+            parsed = urlparse(url)
+        except ValueError:
+            return
+        path = str(parsed.path or '/').lower()
+        suffix = Path(path).suffix.lower()
+        if suffix in PARAMETER_SCANNER_STATIC_SUFFIXES or suffix in {'.html.map'}:
+            return
+        # Keycloak/OIDC state, nonce and login-action URLs are ephemeral authentication plumbing,
+        # not stable application entry points. Prefer the application's own SSO/login wrapper instead.
+        if '/auth/realms/' in path and ('/protocol/openid-connect/' in path or '/login-actions/' in path):
+            return
+        score = _discovery_url_score(url) + int(bonus)
+        if 'ssologin' in path:
+            score += 220
+        elif any(token in path for token in ('/login', '/signin', '/sign-in')):
+            score += 140
+        if any(token in path for token in ('management', 'dashboard', 'editor', 'admin')):
+            score += 35
+        if parsed.query:
+            score += min(20, len(parse_qsl(parsed.query, keep_blank_values=True)) * 3)
+        scored[url] = max(scored.get(url, -10_000), score)
+
+    for value in discovery.get('html_urls', []):
+        add(value, 45)
+    for value in discovery.get('browser_navigation_urls', []):
+        add(value, 55)
+    for row in discovery.get('request_cases', []):
+        if isinstance(row, dict):
+            add(row.get('url'), 65)
+    for row in discovery.get('browser_network_requests', []):
+        if isinstance(row, dict):
+            resource_type = str(row.get('resource_type') or '').lower()
+            add(row.get('url'), 60 if resource_type in {'document', 'xhr', 'fetch'} else 20)
+    for value in discovery.get('urls', []):
+        add(value, 10)
+    return [url for url, _ in sorted(scored.items(), key=lambda item: (-item[1], item[0]))[:max(1, int(limit))]]
+
+
+def _runtime_auth_probe(origin: str, cookie: str, probe_url: str) -> dict[str, Any]:
+    authenticated = scanner_session_probe(probe_url, cookie, timeout=12, attempts=2)
+    if authenticated.get('conclusive') and authenticated.get('authenticated') is False:
+        return {
+            'usable': False,
+            'distinguished_from_anonymous': False,
+            'authenticated_probe': authenticated,
+            'anonymous_probe': {},
+        }
+    anonymous: dict[str, Any] = {}
+    distinguished: bool | None = None
+    try:
+        response = requests.get(
+            probe_url,
+            headers={'Cache-Control': 'no-cache', 'User-Agent': 'SecOps-Runtime-Auth-Anonymous/1.0'},
+            timeout=(4, 12),
+            allow_redirects=True,
+        )
+        anonymous = {
+            'status': int(response.status_code),
+            'final_url': str(response.url),
+            'login_detected': _looks_like_login(response),
+            'bytes': len(response.content),
+        }
+        auth_status = int(authenticated.get('status') or 0)
+        auth_final = str(authenticated.get('final_url') or '')
+        if anonymous['login_detected'] or (response.status_code in {401, 403} and 0 < auth_status < 400):
+            distinguished = True
+        elif auth_final and same_origin(origin, auth_final) and same_origin(origin, str(response.url)) and _clean_url(auth_final) != _clean_url(str(response.url)):
+            distinguished = True
+        else:
+            distinguished = None
+    except requests.RequestException as exc:
+        anonymous = {'error': f'{type(exc).__name__}: {exc}', 'conclusive': False}
+    return {
+        'usable': authenticated.get('authenticated') is not False,
+        'distinguished_from_anonymous': distinguished,
+        'authenticated_probe': authenticated,
+        'anonymous_probe': anonymous,
+    }
+
+
+def authenticate_discovered_sibling_origins(discovery: dict[str, Any], target: str, primary_cookies: str) -> dict[str, Any]:
+    """Create independent sessions for authorized sibling origins observed by authenticated discovery.
+
+    This function never copies the primary Cookie header. It first imports the original browser SSO
+    storage state. If the IdP asks for credentials again, it reuses only the username/password already
+    resolved by assessmentRunner and never prompts from inside the orchestrator process.
+    """
+    if not primary_cookies or not runtime_target_auth_available():
+        return discovery
+
+    evidence = _discovered_scope_origin_evidence(discovery, target)
+    ranking = discovered_scope_origin_ranking(discovery, target)
+    limit = max(1, int(RUNTIME_AUTH_ORIGIN_LIMITS.get(CURRENT_SCAN_MODE, 32)))
+    eligible: list[tuple[str, int, list[str]]] = []
+    for origin, score in ranking:
+        if not url_in_authorized_scope(target, origin):
+            continue
+        bucket = evidence.get(origin, {})
+        candidates = _runtime_auth_candidate_urls(discovery, origin)
+        if not candidates:
+            continue
+        # Static-only sibling origins do not trigger a login. Any interactive evidence or an actual
+        # non-static application candidate is sufficient; this remains generic and site-independent.
+        if int(bucket.get('interactive', 0) or 0) <= 0 and int(bucket.get('observations', 0) or 0) <= 1:
+            continue
+        eligible.append((origin, score, candidates))
+
+    runtime_rows: list[dict[str, Any]] = list(discovery.get('runtime_sibling_authentication') or [])
+    known_authenticated = {
+        str(row.get('origin') or '') for row in runtime_rows
+        if isinstance(row, dict) and row.get('status') in {'authenticated', 'reused'} and str(row.get('origin') or '')
+    }
+    pending = [item for item in eligible if not authenticated_origin_cookie(item[0])]
+    selected = pending[:limit]
+    if len(pending) > limit:
+        runtime_rows.append({
+            'status': 'limit',
+            'eligible_origins': len(eligible),
+            'pending_origins': len(pending),
+            'attempted_origin_limit': limit,
+            'message': f'Runtime sibling authentication origin limit reached in {CURRENT_SCAN_MODE}; {len(pending) - limit} lower-ranked unauthenticated origin(s) were not attempted in this pass.',
+        })
+
+    credential = RUNTIME_TARGET_AUTH.get('credential') if isinstance(RUNTIME_TARGET_AUTH.get('credential'), dict) else {}
+    username = str(RUNTIME_TARGET_AUTH.get('username') or '')
+    password = str(RUNTIME_TARGET_AUTH.get('password') or '')
+    storage_state = RUNTIME_TARGET_AUTH.get('storage_state') if isinstance(RUNTIME_TARGET_AUTH.get('storage_state'), dict) else None
+    merged = discovery
+    primary_auth_effective = discovery.get('authentication_effective')
+    primary_auth_note = discovery.get('authentication_note')
+    primary_auth_probe = discovery.get('authentication_probe')
+    primary_budget = dict(discovery.get('budget_diagnostics') or {})
+    recrawl_pages = max(10, int(RUNTIME_AUTH_RECRAWL_PAGES.get(CURRENT_SCAN_MODE, 60)))
+
+    # Existing origin-specific cookies are retained across repeated enrichment passes without consuming
+    # the current authentication-attempt budget.
+    for origin, score, _ in eligible:
+        existing = authenticated_origin_cookie(origin)
+        if existing and origin not in known_authenticated:
+            runtime_rows.append({'origin': origin, 'status': 'reused', 'cookie_names': cookie_names(existing), 'score': score})
+            known_authenticated.add(origin)
+
+    for origin, score, candidates in selected:
+        if RUNTIME_TARGET_AUTH.get('credentials_rejected'):
+            runtime_rows.append({'origin': origin, 'status': 'skipped', 'reason': 'credentials_rejected_on_previous_origin', 'score': score})
+            continue
+        print(f'    [AUTH SSO] {origin}: attempting origin-specific SSO/session establishment from {len(candidates)} observed application entry point(s).', flush=True)
+        try:
+            login = snap4city_browser_login_session(
+                origin,
+                username,
+                password,
+                credential,
+                storage_state=storage_state,
+                candidate_urls=candidates,
+                initial_login=False,
+            )
+        except RuntimeError as exc:
+            message = str(exc)
+            lowered = message.lower()
+            if 'rejected the supplied target credentials' in lowered or 'additional authentication step' in lowered:
+                RUNTIME_TARGET_AUTH['credentials_rejected'] = True
+            runtime_rows.append({'origin': origin, 'status': 'failed', 'reason': message[:1000], 'score': score, 'candidate_count': len(candidates)})
+            print(f'    [AUTH SSO] {origin}: automatic sibling authentication failed: {message}', file=sys.stderr, flush=True)
+            continue
+
+        sibling_cookie = str(login.get('cookie_header') or '')
+        if not sibling_cookie:
+            runtime_rows.append({'origin': origin, 'status': 'failed', 'reason': 'browser login returned no origin cookie', 'score': score})
+            continue
+        register_authenticated_origin_cookie(origin, sibling_cookie)
+        if isinstance(login.get('storage_state'), dict):
+            storage_state = login['storage_state']
+            RUNTIME_TARGET_AUTH['storage_state'] = storage_state
+
+        probe_url = str(login.get('final_url') or '')
+        if not probe_url or not same_origin(origin, probe_url) or _browser_static_resource(probe_url):
+            origin_view = discovery_for_origin(merged, origin)
+            probe_url = select_session_probe_url(origin_view, origin)
+        probe = _runtime_auth_probe(origin, sibling_cookie, probe_url)
+        flow_observed = bool(login.get('authentication_flow_observed'))
+        if probe.get('usable') is False or (probe.get('distinguished_from_anonymous') is not True and not flow_observed):
+            AUTHENTICATED_ORIGIN_COOKIES.pop(normalized_origin(origin), None)
+            runtime_rows.append({
+                'origin': origin,
+                'status': 'failed_validation',
+                'score': score,
+                'probe_url': probe_url,
+                'authentication_flow_observed': flow_observed,
+                'probe': probe,
+                'reason': 'HTTP validation failed or no authentication-flow evidence distinguished this cookie from an incidental public cookie.',
+            })
+            print(f'    [AUTH SSO] {origin}: browser state did not provide sufficient evidence for an authenticated application session.', file=sys.stderr, flush=True)
+            continue
+
+        runtime_rows.append({
+            'origin': origin,
+            'status': 'authenticated',
+            'score': score,
+            'entry_url': str(login.get('entry_url') or ''),
+            'probe_url': probe_url,
+            'cookie_names': cookie_names(sibling_cookie),
+            'sso_reused': bool(login.get('sso_reused')),
+            'credentials_reused': bool(login.get('used_credentials')),
+            'authentication_flow_observed': flow_observed,
+            'distinguished_from_anonymous': probe.get('distinguished_from_anonymous'),
+            'probe': probe,
+        })
+        mode = 'existing SSO state' if login.get('sso_reused') else 'the original username/password'
+        print(f'    [AUTH SSO] {origin}: origin session established using {mode}; cookie names: {", ".join(cookie_names(sibling_cookie)) or "none"}.', flush=True)
+
+        # Revisit the sibling with its own session so protected menus/pages can contribute request
+        # contracts that the first anonymous sibling pass could not see. Only evidence from this
+        # sibling is merged back, preventing a recursive cross-origin expansion loop.
+        try:
+            recrawl = discover_target(origin, sibling_cookie, max_pages=recrawl_pages, seeds=candidates)
+            recrawl = discovery_for_origin(recrawl, origin)
+            recrawl['authentication_effective'] = probe.get('distinguished_from_anonymous') if probe.get('distinguished_from_anonymous') is not None else True
+            recrawl['authentication_note'] = 'Origin-specific runtime OIDC/SSO session established and used for authenticated sibling re-discovery.'
+            recrawl['authentication_probe'] = probe
+            merged = merge_discovery(merged, recrawl)
+        except Exception as exc:
+            runtime_rows[-1]['recrawl_error'] = f'{type(exc).__name__}: {exc}'
+            print(f'    [AUTH SSO] {origin}: authenticated re-discovery failed but the validated origin cookie remains available: {type(exc).__name__}: {exc}', file=sys.stderr, flush=True)
+
+    # Sibling recrawls must not overwrite the authentication verdict or the discovery budget of the
+    # primary profile. Their state is reported separately below.
+    merged['authentication_effective'] = primary_auth_effective
+    merged['authentication_note'] = primary_auth_note
+    merged['authentication_probe'] = primary_auth_probe
+    merged['runtime_sibling_authentication'] = runtime_rows
+    auth_origins = {
+        str(row.get('origin') or '') for row in runtime_rows
+        if isinstance(row, dict) and row.get('status') in {'authenticated', 'reused'} and str(row.get('origin') or '')
+    }
+    merged['budget_diagnostics'] = {
+        **primary_budget,
+        'runtime_auth_origin_limit': limit,
+        'runtime_auth_origins_eligible': len(eligible),
+        'runtime_auth_origins_attempted': len(selected),
+        'runtime_auth_origins_authenticated': len(auth_origins),
+    }
+    return merged
+
+
 # Filters discovery evidence to one origin so broad scanners can test sibling origins independently without sharing cookies.
 def discovery_for_origin(discovery: dict[str, Any], origin: str) -> dict[str, Any]:
     filtered: dict[str, Any] = {}
@@ -2425,8 +2780,9 @@ def discovery_for_origin(discovery: dict[str, Any], origin: str) -> dict[str, An
     filtered['jwt_tokens'] = list(discovery.get('jwt_tokens', []))
     filtered['errors'] = []
     filtered['destructive_urls_skipped'] = [value for value in discovery.get('destructive_urls_skipped', []) if isinstance(value, str) and same_origin(origin, value)]
-    filtered['authentication_effective'] = None
-    filtered['authentication_note'] = 'Sibling authorized origin is scanned without reusing the primary-origin cookie.'
+    sibling_cookie = authenticated_origin_cookie(origin)
+    filtered['authentication_effective'] = True if sibling_cookie else None
+    filtered['authentication_note'] = 'Sibling authorized origin uses its own runtime OIDC/SSO session.' if sibling_cookie else 'Sibling authorized origin is scanned without reusing the primary-origin cookie.'
     filtered['authentication_probe'] = {}
     filtered['target_preparation'] = {'performed': False, 'configured': False, 'usable': True}
     filtered['budget_diagnostics'] = dict(discovery.get('budget_diagnostics') or {})
@@ -2580,6 +2936,51 @@ TRAVERSAL_HINTS = {'file', 'filename', 'path', 'page', 'include', 'template', 'd
 IDOR_HINTS = {'id', 'uid', 'user_id', 'userid', 'account_id', 'accountid', 'object_id', 'objectid', 'item_id', 'itemid', 'order_id', 'orderid', 'document_id', 'documentid', 'file_id', 'fileid', 'profile_id', 'profileid', 'dashboardid', 'widgetid', 'deviceid', 'modelid'}
 NAVIGATION_PARAMETERS = {'pagetitle', 'linkid', 'fromsubmenu', 'showframe', 'redirect', 'linkurl'}
 
+PARAMETER_SCANNER_STATIC_SUFFIXES = {
+    '.css', '.js', '.mjs', '.map', '.png', '.jpg', '.jpeg', '.gif', '.webp', '.svg', '.ico',
+    '.woff', '.woff2', '.ttf', '.otf', '.eot', '.mp3', '.wav', '.mp4', '.webm',
+}
+DALFOX_NON_HTML_STATIC_SUFFIXES = PARAMETER_SCANNER_STATIC_SUFFIXES - {'.js', '.mjs'}
+STATIC_CACHE_PARAMETER_NAMES = {
+    'v', 'ver', 'version', 'rev', 'revision', 'hash', 'cb', 'cache', 'cachebust', 'cachebuster',
+    'timestamp', 'ts', 't', '_',
+}
+IDENTITY_PROTOCOL_PARAMETERS = {
+    'client_id', 'redirect_uri', 'response_type', 'response_mode', 'scope', 'state', 'nonce',
+    'code_challenge', 'code_challenge_method', 'prompt', 'tab_id', 'execution', 'session_code',
+    'auth_session_id', 'kc_action', 'kc_locale', 'iss', 'skip_logout',
+}
+
+# Static browser assets remain useful discovery evidence. Only obvious cache/version variants are
+# globally excluded from request-level injection scanners: a script such as app.js?resource=... can
+# still represent a dynamic application surface, while app.js?v=1 or style.css?<blank-cache-key>
+# cannot consume specialist breadth merely because the browser recorded it.
+def _parameter_scanner_static_asset(case: dict[str, Any]) -> bool:
+    url = str(case.get('url') or '')
+    suffix = Path(urlparse(url).path.lower()).suffix
+    if suffix not in PARAMETER_SCANNER_STATIC_SUFFIXES:
+        return False
+    pairs = parse_qsl(urlparse(url).query, keep_blank_values=True)
+    if not pairs:
+        return True
+    return all((not str(value).strip()) or str(name).lower() in STATIC_CACHE_PARAMETER_NAMES for name, value in pairs)
+
+# Dalfox specifically needs an HTML/JavaScript execution context. CSS/font/image/media responses are
+# not direct XSS targets even when they expose a functional query parameter; JavaScript with a real
+# application parameter remains eligible because reflected script-context injection can be relevant.
+def _dalfox_non_html_static_asset(case: dict[str, Any]) -> bool:
+    suffix = Path(urlparse(str(case.get('url') or '')).path.lower()).suffix
+    return suffix in DALFOX_NON_HTML_STATIC_SUFFIXES
+
+# OAuth/OIDC protocol metadata can contain many volatile values and absolute callback URLs. Keep
+# actual login/form inputs eligible, but do not spend injection-scanner budgets on a pure protocol
+# negotiation request made only of standard identity metadata.
+def _identity_protocol_metadata_only(case: dict[str, Any]) -> bool:
+    path = urlparse(str(case.get('url') or '')).path.lower()
+    parameters = _case_parameters(case)
+    protocol_path = any(token in path for token in ('/protocol/openid-connect/', '/oauth2/', '/oauth/', '/authorize', '/login-actions/'))
+    return bool(protocol_path and parameters and parameters <= IDENTITY_PROTOCOL_PARAMETERS)
+
 # Very large generated table/filter requests are poor specialist targets: they create huge
 # command lines and long scans while mostly exercising framework/navigation controls.
 def _oversized_generated_request(case: dict[str, Any]) -> bool:
@@ -2612,15 +3013,61 @@ def _parameter_values_reference_internal_resource(case: dict[str, Any]) -> bool:
             values.append(str(field['value']))
     for raw in values:
         try:
-            value = unquote(unquote(str(raw or ''))).lower()
+            value = unquote(unquote(str(raw or ''))).strip()
         except Exception:
-            value = str(raw or '').lower()
-        if not value:
+            value = str(raw or '').strip()
+        lowered = value.lower()
+        if not lowered:
             continue
-        if INTERNAL_RESOURCE_VALUE_PATTERN.search(value):
+        if lowered.startswith('file:'):
             return True
-        if '../' in value or '..%2f' in value or '..\\' in value or value.startswith('/etc/') or value.startswith('file:'):
+        # Absolute/protocol-relative web URLs are navigation or remote-fetch values rather than
+        # local-file selectors. Local paths, encoded traversal sequences and file: values remain eligible.
+        parsed_value = urlparse(value)
+        if lowered.startswith('//') or parsed_value.scheme.lower() in {'http', 'https'} or parsed_value.netloc:
+            continue
+        if INTERNAL_RESOURCE_VALUE_PATTERN.search(lowered):
             return True
+        if '../' in lowered or '..%2f' in lowered or '..\\' in lowered or lowered.startswith('/etc/'):
+            return True
+    return False
+
+# A redirect/link wrapper whose routing values are exclusively absolute web URLs belongs to open-
+# redirect/SSRF/navigation analysis, not local-file traversal. Relative/local values are deliberately
+# left eligible because they may still select application resources without a filename extension.
+def _traversal_absolute_web_routing_only(case: dict[str, Any]) -> bool:
+    routing_names = {'redirect', 'linkurl'}
+    pairs = [(name.lower(), str(value or '').strip()) for name, value in parse_qsl(urlparse(str(case.get('url', ''))).query, keep_blank_values=True) if name.lower() in routing_names]
+    for field in case.get('fields', []) if isinstance(case.get('fields'), list) else []:
+        if isinstance(field, dict) and str(field.get('name') or '').lower() in routing_names:
+            pairs.append((str(field.get('name') or '').lower(), str(field.get('value') or '').strip()))
+    if not pairs:
+        return False
+    saw_absolute = False
+    for _, raw in pairs:
+        try:
+            value = unquote(unquote(raw)).strip()
+        except Exception:
+            value = raw.strip()
+        parsed = urlparse(value)
+        if value.startswith('//') or parsed.scheme.lower() in {'http', 'https'} or parsed.netloc:
+            saw_absolute = True
+            continue
+        return False
+    return saw_absolute
+
+# Traversal/LFI execution requires a parameter-level file/path/routing signal. Generic route risk alone
+# is intentionally insufficient: mutating an unrelated dashboard id, role or sort parameter with file
+# payloads wastes the reserve without improving LFI coverage. Unknown parameter names remain eligible
+# when their observed value already looks like a local resource or traversal sequence.
+def _traversal_case_signal(case: dict[str, Any]) -> bool:
+    if _parameter_values_reference_internal_resource(case):
+        return True
+    parameters = _case_parameters(case)
+    if parameters & (TRAVERSAL_HINTS - {'redirect', 'linkurl'}):
+        return True
+    if parameters & {'redirect', 'linkurl'}:
+        return not _traversal_absolute_web_routing_only(case)
     return False
 
 # XSS routing sends DOM-oriented cases to the browser when that gives better coverage.
@@ -2645,6 +3092,12 @@ def _tool_case_priority(tool: str, case: dict[str, Any], authenticated_profile: 
     path = parsed.path.lower()
     method = str(case.get('method', 'GET')).upper()
     parameters = _case_parameters(case)
+    if tool in {'sqlmap', 'dalfox', 'commix', 'traversal', 'idor'} and _parameter_scanner_static_asset(case):
+        return -1000
+    if tool == 'dalfox' and _dalfox_non_html_static_asset(case):
+        return -1000
+    if tool in {'sqlmap', 'dalfox', 'commix', 'traversal'} and _identity_protocol_metadata_only(case):
+        return -1000
     text = ' '.join((path, ' '.join(sorted(parameters))))
     score = _risk_terms(text)
     if method == 'POST':
@@ -2708,6 +3161,8 @@ def _tool_case_priority(tool: str, case: dict[str, Any], authenticated_profile: 
         return max(score, 12) if anonymous_login_flow else score
     if tool == 'traversal':
         internal_resource_value = _parameter_values_reference_internal_resource(case)
+        if not _traversal_case_signal(case):
+            return -1000
         if authenticated_profile and _is_login_case(case) and not internal_resource_value:
             return -1000
         score += 55 if any((token in path for token in ('include', 'download', 'file', 'template', 'document', 'view'))) else 0
@@ -2742,6 +3197,16 @@ def _tool_case_skip_reason(tool: str, case: dict[str, Any], authenticated_profil
         return 'The request has no testable application parameter for this parameter scanner.'
     if _is_auto_index_case(case):
         return 'Directory-index sorting parameters are navigation controls, not application inputs.'
+    if tool in {'sqlmap', 'dalfox', 'commix', 'traversal', 'idor'} and _parameter_scanner_static_asset(case):
+        return 'Static cache/version asset variants are retained for discovery/source analysis but are not direct request-level injection targets.'
+    if tool == 'dalfox' and _dalfox_non_html_static_asset(case):
+        return 'Non-HTML CSS/font/image/media assets are retained for discovery but are not direct Dalfox XSS targets.'
+    if tool in {'sqlmap', 'dalfox', 'commix', 'traversal'} and _identity_protocol_metadata_only(case):
+        return 'Pure OAuth/OIDC protocol metadata is excluded from generic injection scanning; concrete application login/form inputs remain eligible.'
+    if tool == 'traversal' and not _traversal_case_signal(case):
+        if _traversal_absolute_web_routing_only(case):
+            return 'Absolute HTTP(S) redirect/link values are navigation/SSRF-style inputs, not local-file traversal targets.'
+        return 'Traversal/LFI requires a file/path/routing parameter or an observed local-resource value; unrelated ids, roles, sorting and other generic inputs are left to their matching specialist.'
     if tool == 'dalfox' and _prefer_browser_for_xss_case(case):
         return 'Stored or DOM-oriented XSS contracts are delegated to the Chromium verifier, which can execute JavaScript and revisit state.'
     if tool in {'sqlmap', 'dalfox', 'commix', 'traversal'} and _is_logout_case(case):
@@ -2798,7 +3263,7 @@ def _family_fair_ranked_cases(ranked: list[tuple[int, dict[str, Any]]]) -> list[
 
 
 # Chooses the best request cases for one scanner and scan profile.
-def select_tool_request_cases(discovery: dict[str, Any], tool: str, limit: int | None=None, authenticated_profile: bool=False, allow_state_changes: bool=True) -> list[dict[str, Any]]:
+def select_tool_request_cases(discovery: dict[str, Any], tool: str, limit: int | None=None, authenticated_profile: bool=False, allow_state_changes: bool=True, credential_cookies: str='') -> list[dict[str, Any]]:
 
     effective_limit = int(limit or PARAMETER_TOOL_CASE_LIMITS.get(tool, MAX_PARAMETER_ENDPOINTS))
     cases = [case for case in discovery.get('request_cases', []) if isinstance(case, dict)]
@@ -2817,19 +3282,21 @@ def select_tool_request_cases(discovery: dict[str, Any], tool: str, limit: int |
             continue
         if not [value for value in case.get('parameters', []) if str(value)]:
             continue
-        score = _tool_case_priority(tool, case, authenticated_profile=authenticated_profile)
+        case_url = str(case.get('url') or '')
+        case_authenticated = authenticated_profile and (not credential_cookies or bool(scope_cookie_header(case_url, credential_cookies)))
+        score = _tool_case_priority(tool, case, authenticated_profile=case_authenticated)
         if score > 0:
             ranked.append((score, -index, case))
     unique_ranked: list[tuple[int, dict[str, Any]]] = []
     seen: set[tuple[str, str, tuple[str, ...]]] = set()
     shape_counts: dict[tuple[str, tuple[str, str, tuple[str, ...]], tuple[str, ...]], int] = {}
-    variant_cap = max(1, int(DISCOVERY_LIMITS.get(CURRENT_SCAN_MODE, {}).get('route_variants', 2)))
+    variant_cap = _specialist_variant_cap()
     for score, _, case in sorted(ranked, key=lambda item: (-item[0], -item[1])):
         method = str(case.get('method', 'GET')).upper()
         url = str(case.get('url', ''))
         params = tuple(sorted((str(value).lower() for value in case.get('parameters', []) if str(value))))
         key = (method, url, params)
-        shape = (method, _discovery_route_signature(url), params)
+        shape = (method, _specialist_route_signature(tool, url), params)
         if key in seen or shape_counts.get(shape, 0) >= variant_cap:
             continue
         seen.add(key)
@@ -2848,15 +3315,18 @@ def select_tool_request_cases(discovery: dict[str, Any], tool: str, limit: int |
             params = [str(value) for value in case.get('parameters', []) if str(value)]
             if method != 'GET' or not url or not params or _is_auto_index_case(case) or _destructive_crawl_url(url):
                 continue
+            if _parameter_scanner_static_asset(case) or _identity_protocol_metadata_only(case) or (tool == 'dalfox' and _dalfox_non_html_static_asset(case)):
+                continue
             if any(token in path for token in ('logout', 'setup', 'reset', 'delete', 'security.php')):
                 continue
-            if tool == 'sqlmap' and (_is_login_case(case) or 'brute' in path):
+            case_authenticated = authenticated_profile and (not credential_cookies or bool(scope_cookie_header(url, credential_cookies)))
+            if tool == 'sqlmap' and ((case_authenticated and _is_login_case(case)) or 'brute' in path):
                 continue
-            if tool == 'dalfox' and _prefer_browser_for_xss_case(case):
+            if tool == 'dalfox' and (_prefer_browser_for_xss_case(case) or (case_authenticated and _is_login_case(case))):
                 continue
             param_key = tuple(sorted(value.lower() for value in params))
             key = (method, url, param_key)
-            shape = (method, _discovery_route_signature(url), param_key)
+            shape = (method, _specialist_route_signature(tool, url), param_key)
             if key in seen or shape_counts.get(shape, 0) >= variant_cap:
                 continue
             generic_score = _risk_terms(path + ' ' + ' '.join(params)) + min(18, len(params) * 4)
@@ -2866,7 +3336,7 @@ def select_tool_request_cases(discovery: dict[str, Any], tool: str, limit: int |
             url = str(case.get('url', ''))
             param_key = tuple(sorted((str(value).lower() for value in case.get('parameters', []) if str(value))))
             key = (method, url, param_key)
-            shape = (method, _discovery_route_signature(url), param_key)
+            shape = (method, _specialist_route_signature(tool, url), param_key)
             if shape_counts.get(shape, 0) >= variant_cap:
                 continue
             seen.add(key)
@@ -2897,7 +3367,8 @@ def select_tool_request_cases(discovery: dict[str, Any], tool: str, limit: int |
             key = (str(case.get('method', 'GET')).upper(), str(case.get('url') or ''))
             if key in known or key[0] != 'GET' or not _parameter_values_reference_internal_resource(case):
                 continue
-            if _destructive_crawl_url(key[1]) or _tool_case_skip_reason('traversal', case, authenticated_profile=authenticated_profile):
+            case_authenticated = authenticated_profile and (not credential_cookies or bool(scope_cookie_header(key[1], credential_cookies)))
+            if _destructive_crawl_url(key[1]) or _tool_case_skip_reason('traversal', case, authenticated_profile=case_authenticated):
                 continue
             selected.append({
                 **case,
@@ -3118,7 +3589,7 @@ def select_browser_request_cases(discovery: dict[str, Any], limit: int | None=No
     unique_ranked: list[tuple[int, dict[str, Any]]] = []
     seen: set[tuple[str, str, tuple[str, ...]]] = set()
     shape_counts: dict[tuple[str, tuple[str, str, int, str], tuple[str, ...]], int] = {}
-    variant_cap = max(1, int(DISCOVERY_LIMITS.get(CURRENT_SCAN_MODE, {}).get('route_variants', 2)))
+    variant_cap = _specialist_variant_cap()
     for score, _, case in ranked:
         if score <= 0:
             continue
@@ -3216,13 +3687,13 @@ def select_workflow_request_cases(discovery: dict[str, Any], limit: int | None=N
     unique_ranked: list[tuple[int, dict[str, Any]]] = []
     seen: set[tuple[str, str, tuple[str, ...]]] = set()
     shape_counts: dict[tuple[str, tuple[str, str, tuple[str, ...]], tuple[str, ...]], int] = {}
-    variant_cap = max(1, int(DISCOVERY_LIMITS.get(CURRENT_SCAN_MODE, {}).get('route_variants', 2)))
+    variant_cap = _specialist_variant_cap()
     for score, _, case in sorted(ranked, key=lambda item: (-item[0], -item[1])):
         method = str(case.get('method', 'POST')).upper()
         url = str(case.get('url', ''))
         fields = tuple(sorted(_case_field_names(case)))
         key = (method, url, fields)
-        shape = (method, _discovery_route_signature(url), fields)
+        shape = (method, _structural_route_signature(url), fields)
         if key in seen or shape_counts.get(shape, 0) >= variant_cap:
             continue
         seen.add(key)
@@ -3333,11 +3804,11 @@ def select_authorization_request_cases(discovery: dict[str, Any], limit: int | N
     unique_ranked: list[tuple[int, dict[str, Any]]] = []
     seen: set[str] = set()
     shape_counts: dict[tuple[tuple[str, str, tuple[str, ...]], tuple[str, ...]], int] = {}
-    variant_cap = max(1, int(DISCOVERY_LIMITS.get(CURRENT_SCAN_MODE, {}).get('route_variants', 2)))
+    variant_cap = _specialist_variant_cap()
     for score, _, case in sorted(ranked, key=lambda item: (-item[0], -item[1])):
         url = str(case.get('url') or '')
         params = tuple(sorted(str(value).lower() for value in case.get('parameters', []) if str(value)))
-        shape = (_discovery_route_signature(url), params)
+        shape = (_structural_route_signature(url), params)
         if not url or url in seen or shape_counts.get(shape, 0) >= variant_cap:
             continue
         seen.add(url)
@@ -3358,7 +3829,7 @@ def select_authorization_request_cases(discovery: dict[str, Any], limit: int | N
             if not list(case.get('parameters') or []) and not urlparse(url).query:
                 continue
             params = tuple(sorted(str(value).lower() for value in case.get('parameters', []) if str(value)))
-            shape = (_discovery_route_signature(url), params)
+            shape = (_structural_route_signature(url), params)
             if shape_counts.get(shape, 0) >= variant_cap:
                 continue
             score = _risk_terms(path) + (12 if urlparse(url).query else 0)
@@ -3366,7 +3837,7 @@ def select_authorization_request_cases(discovery: dict[str, Any], limit: int | N
         for score, case in sorted(extras, key=lambda item: (-item[0], str(item[1].get('url') or '')))[:max(0, min(6, effective_limit - len(unique_ranked)))]:
             url = str(case.get('url') or '')
             params = tuple(sorted(str(value).lower() for value in case.get('parameters', []) if str(value)))
-            shape = (_discovery_route_signature(url), params)
+            shape = (_structural_route_signature(url), params)
             if url in seen or shape_counts.get(shape, 0) >= variant_cap:
                 continue
             seen.add(url)
@@ -3452,7 +3923,7 @@ def select_arjun_request_cases(discovery: dict[str, Any], target: str, limit: in
 
 # Builds report-facing reasons for discovered request contracts that were not selected for
 # request-level security testing. The result is deterministic and shared by both orchestrators.
-def endpoint_selection_decisions(discovery: dict[str, Any], target: str, authenticated_profile: bool=False, allow_state_changes: bool=True) -> list[dict[str, Any]]:
+def endpoint_selection_decisions(discovery: dict[str, Any], target: str, authenticated_profile: bool=False, allow_state_changes: bool=True, credential_cookies: str='') -> list[dict[str, Any]]:
     cases = [dict(case) for case in discovery.get('request_cases', []) if isinstance(case, dict) and str(case.get('url') or '')]
     if not cases:
         return []
@@ -3460,25 +3931,35 @@ def endpoint_selection_decisions(discovery: dict[str, Any], target: str, authent
     def key(case: dict[str, Any]) -> tuple[str, str]:
         return (str(case.get('method') or 'GET').upper(), _clean_url(str(case.get('url') or '')))
 
-    def shape(case: dict[str, Any]) -> tuple[str, tuple[str, str, tuple[str, ...]], tuple[str, ...]]:
+    def shape(tool: str, case: dict[str, Any]) -> tuple[str, tuple[Any, ...], tuple[str, ...]]:
         method = str(case.get('method') or 'GET').upper()
         url = str(case.get('url') or '')
         fields = tuple(sorted(_case_field_names(case)))
-        return (method, _discovery_route_signature(url), fields)
+        lowered = str(tool or '').lower()
+        if lowered == 'browser':
+            route: tuple[Any, ...] = _browser_url_key(url)
+        elif lowered == 'traversal':
+            route = _discovery_route_signature(url)
+        else:
+            route = _structural_route_signature(url)
+        return (method, route, fields)
 
     selected_by_tool: dict[str, set[tuple[str, str]]] = {}
-    selected_shapes_by_tool: dict[str, set[tuple[str, tuple[str, str, tuple[str, ...]], tuple[str, ...]]]] = {}
+    selected_shapes_by_tool: dict[str, set[tuple[str, tuple[Any, ...], tuple[str, ...]]]] = {}
     selected_counts: dict[str, int] = {}
 
     for tool in ('sqlmap', 'dalfox', 'commix', 'traversal', 'idor'):
-        selected = select_tool_request_cases(discovery, tool, authenticated_profile=authenticated_profile, allow_state_changes=allow_state_changes)
+        selected = select_tool_request_cases(discovery, tool, authenticated_profile=authenticated_profile, allow_state_changes=allow_state_changes, credential_cookies=credential_cookies)
         selected_by_tool[tool] = {key(case) for case in selected}
-        selected_shapes_by_tool[tool] = {shape(case) for case in selected}
+        selected_shapes_by_tool[tool] = {shape(tool, case) for case in selected}
         selected_counts[tool] = len(selected)
 
     browser_selected = select_browser_request_cases(discovery)
     workflow_selected = select_workflow_request_cases(discovery)
-    authorization_selected = select_authorization_request_cases(discovery) if authenticated_profile else []
+    authorization_selected = [
+        case for case in select_authorization_request_cases(discovery)
+        if authenticated_profile and (not credential_cookies or scope_cookie_header(str(case.get('url') or ''), credential_cookies))
+    ]
     arjun_selected = select_arjun_request_cases(discovery, target)
     for tool, selected in (
         ('browser', browser_selected),
@@ -3487,13 +3968,13 @@ def endpoint_selection_decisions(discovery: dict[str, Any], target: str, authent
         ('arjun', arjun_selected),
     ):
         selected_by_tool[tool] = {key(case) for case in selected}
-        selected_shapes_by_tool[tool] = {shape(case) for case in selected}
+        selected_shapes_by_tool[tool] = {shape(tool, case) for case in selected}
         selected_counts[tool] = len(selected)
 
     raw_client = [item for item in discovery.get('client_side_candidates', []) if isinstance(item, dict)]
     client_keys = {_browser_url_key(str(item.get('url') or '')) for item in raw_client if str(item.get('url') or '')}
-    variant_cap = max(1, int(DISCOVERY_LIMITS.get(CURRENT_SCAN_MODE, {}).get('route_variants', 2)))
-    shape_frequency: Counter[tuple[str, tuple[str, str, tuple[str, ...]], tuple[str, ...]]] = Counter(shape(case) for case in cases)
+    variant_cap = _specialist_variant_cap()
+    shape_frequency_by_tool = {tool: Counter(shape(tool, case) for case in cases) for tool in selected_by_tool}
 
     decisions: list[dict[str, Any]] = []
     for case in cases:
@@ -3504,8 +3985,9 @@ def endpoint_selection_decisions(discovery: dict[str, Any], target: str, authent
 
         state_change_reason = request_case_state_change_reason(case) if not allow_state_changes else ''
         if method in {'GET', 'POST'} and not _destructive_crawl_url(url) and not state_change_reason:
+            case_authenticated = authenticated_profile and (not credential_cookies or bool(scope_cookie_header(url, credential_cookies)))
             for tool in ('sqlmap', 'dalfox', 'commix', 'traversal', 'idor'):
-                if not _tool_case_skip_reason(tool, case, authenticated_profile=authenticated_profile):
+                if not _tool_case_skip_reason(tool, case, authenticated_profile=case_authenticated):
                     eligible_tools.append(tool)
             if _browser_case_priority(case, client_keys) > 0:
                 eligible_tools.append('browser')
@@ -3516,7 +3998,7 @@ def endpoint_selection_decisions(discovery: dict[str, Any], target: str, authent
                 path = urlparse(url).path.lower()
                 if (any(token in path for token in ('brute', 'login', 'signin', 'auth')) or {'username', 'password'} <= fields) and not _destructive_crawl_url(url):
                     eligible_tools.append('workflow')
-            if authenticated_profile and _authorization_case_priority(case) > 0:
+            if case_authenticated and _authorization_case_priority(case) > 0:
                 eligible_tools.append('authorization')
             if (method, url) in selected_by_tool.get('arjun', set()):
                 eligible_tools.append('arjun')
@@ -3536,8 +4018,11 @@ def endpoint_selection_decisions(discovery: dict[str, Any], target: str, authent
             reason_code = 'NO_COMPATIBLE_PARAMETERS'
             reason = 'No compatible application parameter, form field or client-side input was available for request-level specialist testing.'
         else:
-            current_shape = shape(case)
-            duplicate_tools = [tool for tool in eligible_tools if current_shape in selected_shapes_by_tool.get(tool, set()) and shape_frequency[current_shape] > variant_cap]
+            duplicate_tools = [
+                tool for tool in eligible_tools
+                if shape(tool, case) in selected_shapes_by_tool.get(tool, set())
+                and shape_frequency_by_tool.get(tool, Counter())[shape(tool, case)] > variant_cap
+            ]
             if duplicate_tools:
                 reason_code = 'DUPLICATE_ROUTE_VARIANT'
                 reason = 'A higher-ranked value variant with the same method, route and parameter-name shape was retained; this variant was omitted by the anti-saturation cap.'
@@ -4062,6 +4547,7 @@ def prepare_cli_context(parser: argparse.ArgumentParser, args: argparse.Namespac
         if secondary_cookie == normalized_cookie:
             parser.error('--secondary-cookies must represent a different authenticated identity.')
         print('[*] Secondary identity cookie names: ' + ', '.join(cookie_names(secondary_cookie)))
+    configure_runtime_target_auth(target, normalized_cookie)
     return (target, profiles, normalized_cookie, secondary_cookie, injection_url)
 
 # Normalizes explicit assessment entry points after the primary target and scope are configured.
@@ -4161,7 +4647,7 @@ def build_tool_arguments(tool: str, target_url: str, cookies: str, discovery: di
         if tool == 'dalfox':
             arguments['allow_state_changes'] = state_changing_tests_allowed(target_url, allow_state_changes)
     elif tool == 'authorization':
-        arguments.update({'secondary_cookies': secondary_cookies, 'method': 'GET', 'data': '', 'parameters': parameters, 'timeout': timeout_override or PARAMETER_TOOL_TIMEOUTS[tool]})
+        arguments.update({'secondary_cookies': scope_cookie_header(target_url, secondary_cookies), 'method': 'GET', 'data': '', 'parameters': parameters, 'timeout': timeout_override or PARAMETER_TOOL_TIMEOUTS[tool]})
     elif tool in {'browser', 'workflow'}:
         default_method = 'POST' if tool == 'workflow' else 'GET'
         arguments.update({'method': method if case.get('method') else default_method, 'data': data, 'parameters': parameters, 'source_url': str(case.get('source_url') or ''), 'allow_state_changes': state_changing_tests_allowed(target_url, allow_state_changes), 'timeout': timeout_override or PARAMETER_TOOL_TIMEOUTS[tool]})

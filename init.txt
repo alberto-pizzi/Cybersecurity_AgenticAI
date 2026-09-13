@@ -181,7 +181,10 @@ python .\initScript.py --commands-only
 
 L'initializer installa o verifica gli scanner e aggiorna IDOR-Forge da
 https://github.com/errorfiathck/IDOR-Forge.git in ~/.local/opt/idor-forge.
-Le dipendenze upstream di IDOR-Forge restano nella .venv del repository.
+Le dipendenze upstream di IDOR-Forge restano nella .venv del repository. Matplotlib viene
+installato esplicitamente con una versione compatibile con il Python in uso anche se una revisione
+upstream di requirements.txt lo omette; il wrapper verifica inoltre l'import di IDORChecker prima
+del test. Su una VM gia' inizializzata, rieseguire initScript.py senza --skip-scanners ripara la venv.
 Percorsi, interprete e launcher vengono salvati in .secops_runtime.json e
 verificati dal preflight.
 
@@ -244,14 +247,16 @@ configs/dashboard-test.json contiene HTTP/80 e HTTPS/443. Il run autorizzato del
 HTTP/80 con base_path=/, quindi http-80 e' gia' enabled; HTTPS/443 resta disabled finche' non viene verificato.
 Usa soltanto un account Snap4City autorizzato per questo test.
 configs/dashboard-test.json usa credential_ref=dashboard_session con login browser automatico Snap4City/Keycloak.
-Lo stesso config autorizza anche il suffisso snap4city.org: eventuali origini sorelle scoperte possono essere testate, ma il cookie di dashboard-test non viene copiato su tali host.
+Lo stesso config autorizza anche il suffisso snap4city.org. Il Cookie header grezzo di dashboard-test resta confinato alla sua origin esatta: non viene copiato su host diversi. La credenziale OIDC imposta pero' reuse_on_authorized_siblings=true, quindi una sibling origin autorizzata e realmente osservata puo' ottenere una propria sessione tramite SSO/reauthentication.
 Ordine di risoluzione della sessione:
-  1. Se DASHBOARD_TEST_COOKIE e' valorizzato, riusa quella sessione e non esegue il login browser.
-  2. Altrimenti legge DASHBOARD_TEST_USERNAME e DASHBOARD_TEST_PASSWORD.
-  3. Se una variabile manca e la console e' interattiva, chiede soltanto il valore mancante. La password non viene mostrata.
-  4. Chromium apre /dashboardSmartCity/. Se compare la pagina pubblica, attiva il controllo login e completa il flusso OIDC/Keycloak. Dopo il ritorno verifica lo stato autenticato e passa i cookie agli orchestratori.
-  5. Se la credenziale opzionale non e' disponibile o il login fallisce, il job continua solo anonimo. Con --auth-only il job viene bloccato.
-Le credenziali e il cookie ottenuto non vengono scritti nel JSON di configurazione o nei Results Data.
+  1. Se DASHBOARD_TEST_COOKIE e' valorizzato, lo usa soltanto per la origin primaria esatta; non lo propaga alle sibling.
+  2. Legge DASHBOARD_TEST_USERNAME e DASHBOARD_TEST_PASSWORD e conserva in memoria i valori disponibili per l'intero assessment.
+  3. Se una variabile manca e la console del runner e' interattiva, chiede soltanto il valore mancante UNA VOLTA. La password non viene mostrata. I processi orchestrator figli non aprono altri prompt per le stesse credenziali.
+  4. Per il target primario, se serve, Chromium apre /dashboardSmartCity/, attiva il controllo login e completa il flusso OIDC/Keycloak. Il browser storage state dell'identity provider viene conservato in memoria insieme alla sessione applicativa.
+  5. Se la discovery authenticated trova una nuova sibling autorizzata con evidenza applicativa, Chromium prova prima il vero SSO riusando quello storage state. Se Keycloak mostra di nuovo username/password, vengono reinseriti automaticamente gli stessi valori risolti al punto 2/3: non vengono richiesti di nuovo in console.
+  6. La sibling e' considerata authenticated soltanto se il flusso produce un cookie proprio di quella origin e il probe di sessione lo valida. In caso positivo viene eseguita anche una rediscovery authenticated bounded della sibling; precheck e scanner usano poi quel cookie origin-specifico.
+  7. Se SSO/reauthentication non riesce, la sibling resta no-cookie/anonymous e la copia authenticated equivalente viene deduplicata. Se la credenziale primaria opzionale non e' disponibile o il login primario fallisce, il job continua solo anonimo; con --auth-only il job viene bloccato.
+Le credenziali, lo storage state e i cookie ottenuti non vengono scritti nel JSON di configurazione o nei Results Data. Il runner li passa al processo figlio solo tramite un file temporaneo mode 0600 indicato da SECOPS_RUNTIME_AUTH_STATE e lo elimina subito dopo il job.
 Esempio non interattivo:
   export DASHBOARD_TEST_USERNAME='authorized-user'
   export DASHBOARD_TEST_PASSWORD='authorized-password'
@@ -386,8 +391,7 @@ route/file/moduli interni; applica quote per origin e penalizza asset statici, v
 Il runner puo' usare login_path/validation_path gia' presenti nella credenziale come discovery seed ordinari,
 soggetti ai normali budget: non vengono considerati entry point forniti e nessuna lista benchmark esterna viene
 iniettata nel config o nel crawler.
-Le origini sorelle autorizzate possono essere sottoposte a ZAP/Nuclei/Nikto come target separati, ma la copertura broad e' ordinata per rilevanza per evitare che fast/balanced spendano gran parte del tempo su host secondari. Il ranking per origine usa route applicative, form, request contract, navigazioni/reti browser e parametri realmente osservati; il broad sweep completo usa una quota adattiva: 1/3/8 sibling origin base in fast/balanced/deep, con overflow fino a 2/5/12 soltanto per origini aggiuntive con punteggio almeno pari al 75% del cutoff base e con evidenza applicativa interattiva osservata. I timeout delle broad sibling run sono ridotti rispettivamente al 50%/60%/75% del timeout broad del target principale, con minimo 45s. Questi limiti riguardano solo ZAP/Nuclei/Nikto broad: gli specialisti continuano a poter scegliere request contract ad alto valore su qualunque sibling origin osservata e autorizzata. Quando anonymous e authenticated sono entrambi presenti, la stessa broad scan senza cookie viene eseguita una sola volta sotto anonymous. Il cookie della
-origine principale non viene inoltrato automaticamente a host diversi; i probe di sessione restano exact-origin.
+Le origini sorelle autorizzate possono essere sottoposte a ZAP/Nuclei/Nikto come target separati, ma la copertura broad e' ordinata per rilevanza per evitare che fast/balanced spendano gran parte del tempo su host secondari. Il ranking per origine usa route applicative, form, request contract, navigazioni/reti browser e parametri realmente osservati; il broad sweep completo usa una quota adattiva: 1/3/8 sibling origin base in fast/balanced/deep, con overflow fino a 2/5/12 soltanto per origini aggiuntive con punteggio almeno pari al 75% del cutoff base e con evidenza applicativa interattiva osservata. I timeout delle broad sibling run sono ridotti rispettivamente al 50%/60%/75% del timeout broad del target principale, con minimo 45s. Questi limiti riguardano solo ZAP/Nuclei/Nikto broad: gli specialisti continuano a poter scegliere request contract ad alto valore su qualunque sibling origin osservata e autorizzata. Il cookie della origin principale non viene inoltrato automaticamente a host diversi. Con una credenziale OIDC che abilita reuse_on_authorized_siblings, il profilo authenticated prova invece a creare una sessione separata per ogni sibling applicativa selezionata: prima usa lo storage SSO esistente, poi, solo se il provider mostra nuovamente il form, riusa automaticamente username/password gia' acquisiti dal runner senza un nuovo prompt. Le sessioni riuscite sono validate e registrate per origin esatta; una sibling senza sessione propria riceve la broad no-cookie una sola volta sotto anonymous quando quel profilo esiste.
 Deterministic esegue la discovery Playwright sincrona in worker thread quando il nodo LangGraph e' dentro asyncio. Agentic usa inoltre discover_target_sync_safe(): il percorso CLI normale e' sincrono, ma se la stessa discovery viene riusata dentro un event loop viene spostata automaticamente in un worker prima di entrare nella Playwright Sync API.
 
 ZAP: fast=targeted, balanced=prioritized, deep=full bounded; la modalita' passiva resta per i soli
@@ -412,7 +416,8 @@ I GET scoperti in cui un valore seleziona direttamente un file/modulo interno ha
 Traversal/LFI bounded di 16/48/96 in fast/balanced/deep. Queste azioni sono baseline deterministiche e vengono
 consumate PRIMA del round-robin discrezionale del planner, quindi non possono sparire solo perche' molti altri
 tool group hanno saturato il budget globale.
-Il catalogo compatto mostrato all'AI contiene al massimo 32/40/48 tool group complessivi ed e' costruito equamente tra i profili. La breadth review e' anch'essa per profilo: valuta la scarsita' sulle sole capability non-baseline e puo' aggiungere al massimo 3/6/8 tool group, senza superare il tetto totale 12/16/18 di quel profilo. La console separa concrete_pool, group_pool/tool_groups, baseline_groups, ai_groups, review_groups e concrete_actions e mostra base, tetto adattivo e numero di azioni rinviate per ogni profilo. Le scansioni broad su sibling origin non vengono duplicate sotto authenticated quando anonymous e' disponibile, perche' su tali origini il cookie del target principale viene comunque rimosso. Inoltre il pool broad delle sibling usa il ranking condiviso con base 1/3/8 e massimo adattivo 2/5/12 in fast/balanced/deep; gli specialisti non ereditano questo cap e restano liberi di usare i loro request contract autorizzati.
+Il catalogo compatto mostrato all'AI contiene al massimo 32/40/48 tool group complessivi ed e' costruito equamente tra i profili. La breadth review e' anch'essa per profilo: valuta la scarsita' sulle sole capability non-baseline e puo' aggiungere al massimo 3/6/8 tool group, senza superare il tetto totale 12/16/18 di quel profilo. La console separa concrete_pool, group_pool/tool_groups, baseline_groups, ai_groups, review_groups e concrete_actions e mostra base, tetto adattivo e numero di azioni rinviate per ogni profilo. Il pool broad delle sibling usa il ranking condiviso con base 1/3/8 e massimo adattivo 2/5/12 in fast/balanced/deep; gli specialisti non ereditano questo cap. Una sibling senza sessione origin-specifica non viene duplicata sotto authenticated quando anonymous e' disponibile; una sibling con sessione OIDC/SSO validata puo' invece ricevere vera copertura authenticated.
+Lo scope autorizzato e lo scope delle credenziali sono separati: allowed_origins/allowed_host_suffixes possono rendere testabile una sibling, ma un Cookie header grezzo viene applicato solo alla origin primaria esatta (schema+host+porta), perche' non conserva gli attributi browser Domain/Path. Precheck, refresh, scanner e richiesta Interactsh usano la stessa decisione. Se reuse_on_authorized_siblings=true, assessmentRunner conserva browser storage state e le credenziali OIDC risolte una sola volta; il processo figlio puo' quindi tentare SSO sulle sibling autorizzate e, se il login form ricompare, riusare automaticamente quegli stessi username/password senza interrogare di nuovo la console. Solo un cookie ottenuto e validato per la sibling esatta rende authenticated le relative azioni. Se il tentativo fallisce, la copertura resta no-cookie e viene deduplicata rispetto all'anonima. Per job esplicitamente configurati con login OIDC, la cache usa comunque credential_ref+origin esatta: path diversi della stessa origin riusano la sessione, mentre schema/host/porta differenti risolvono un cookie applicativo separato.
 Le policy che non dipendono dal planner sono comuni a Deterministic e Agentic e vengono applicate a ogni profilo: scope/cookie isolation, gestione 404/410, limiti Chromium, ranking e overflow specialisti, fallback active ZAP, input Nuclei e verifica XSS finale. Anche la verifica XSS finale Chromium usa base/max 8/12, 40/64 e 120/180 candidati PER PROFILO, quindi anonymous non puo' consumare la quota authenticated. I budget tool-group/azioni restano invece specifici dell'Agentic: il Deterministic non ha un tetto globale del planner e percorre direttamente i casi selezionati per ciascun tool e profilo.
 JWT e' analizzato per profilo su massimo 16/64/192 token unici scoperti in fast/balanced/deep. Il controllo e' economico e locale, per questo il limite e' molto piu' ampio; in Agentic la capability JWT e' baseline quando esistono token. I valori raw restano input locali del verifier e non vengono mostrati nel catalogo compatto del planner AI.
 Gli specialisti sui parametri privilegiano API/dati, identificatori/query, POST/JSON e richieste
@@ -515,12 +520,20 @@ Ampiezza interna Nuclei: BALANCED puo' selezionare fino a 48 template ufficiali 
 con concurrency 8 e rate limit 50 req/s; DEEP fino a 96 template technology, 160 exposure/misconfiguration
 e 256 vulnerability/CVE product-gated, con concurrency 14 e rate limit 90 req/s. Sono massimi di selezione,
 non quote obbligatorie: fingerprint, product gating e timeout possono ridurre il lavoro effettivo.
+In BALANCED la fase official exposure/misconfiguration non ha piu' un timeout interno fisso di 55 s: riceve
+una quota adattiva del medesimo budget Nuclei in funzione del numero di target focalizzati (fino a 150 s),
+mantenendo una quota minima alla fase DAST. Non vengono rimossi template o endpoint per accelerare il run.
 
-Prima del taglio base/adattivo, i selettori limitano le normali varianti value-only per non saturare il budget,
-ma la firma e' semantica per i parametri di routing/resource: redirect=devices.php e redirect=models.php restano
-due superfici distinte. Inoltre i candidati sono riordinati con una prima passata per famiglia applicativa
-(origin + primi segmenti del path) prima di riempire gli slot residui per score, cosi' un singolo modulo enorme
-non puo' assorbire da solo tutta la quota specialistica.
+Prima del taglio base/adattivo, i selettori limitano le normali varianti value-only per non saturare il budget: la discovery conserva 4/8/12 varianti per route in fast/balanced/deep, mentre l'esecuzione request-level degli specialisti usa un cap generico 2/3/4.
+La firma semantica dei valori routing/resource viene mantenuta specificamente per Traversal/LFI: redirect=devices.php
+e redirect=models.php possono restare due superfici distinte quando selezionano risorse interne. SQLMap, Dalfox,
+Commix, IDOR, Browser, Workflow e Authorization usano invece la forma strutturale route+nomi parametri, evitando
+di moltiplicare test equivalenti. Le varianti statiche usate soltanto per cache/versioning restano nella discovery (i JS vengono ancora
+ispezionati per endpoint) ma non consumano budget request-level; Dalfox esclude anche CSS/font/immagini/media
+non HTML, mantenendo invece eleggibili i JavaScript con parametri applicativi reali. Callback HTTP(S) assoluti e
+pura negoziazione OAuth/OIDC (compresi metadati effimeri login-actions come execution/tab_id/skip_logout) non entrano nella reserve LFI. Traversal richiede inoltre un segnale specifico file/path/routing o un valore locale osservato: id, ruolo e ordinamento generici non vengono mutati con payload LFI soltanto perche' la route ha uno score alto. Inoltre i candidati sono riordinati con una prima passata
+per famiglia applicativa (origin + primi segmenti del path) prima di riempire gli slot residui per score, cosi' un
+singolo modulo enorme non puo' assorbire da solo tutta la quota specialistica.
 
 Budget adattivo specialisti: i valori base/max indicano il limite fisso e il tetto massimo raggiungibile.
 La priorita' non e' decisa dal modello AI: orchestratorShared.py assegna deterministicamente il punteggio

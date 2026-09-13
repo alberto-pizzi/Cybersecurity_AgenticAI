@@ -319,6 +319,12 @@ def _idor_forge_runtime_requirements(requirements: Path) -> list[str]:
                 packages.append(entry)
     if not packages:
         raise RuntimeError('IDOR-Forge requirements.txt did not contain usable runtime dependencies.')
+    # IDORChecker imports matplotlib directly even when some upstream requirement revisions omit it.
+    # Install it explicitly in the isolated IDOR-Forge venv so a fresh/stale checkout cannot pass
+    # setup and then fail at runtime with ModuleNotFoundError.
+    package_names = {Requirement(entry).name.lower().replace('_', '-') for entry in packages}
+    if 'matplotlib' not in package_names:
+        packages.append('matplotlib>=3.10,<4' if sys.version_info >= (3, 13) else 'matplotlib>=3.8,<4')
     return packages
 
 # Installs the upstream IDOR-Forge project and creates its launcher.

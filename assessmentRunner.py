@@ -8,6 +8,7 @@ import os
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -26,7 +27,8 @@ from assessmentConfig import (
     validate_authorization_scope,
 )
 from orchestratorAgenticCore import _model_matches, ensure_ollama_model, resolve_ai_model
-from utils import canonical_cookie_header, cookie_names, same_origin
+from utils import canonical_cookie_header, cookie_names, normalized_origin, same_origin
+from targetAuth import snap4city_browser_login_session
 
 
 ROOT = Path(__file__).resolve().parent
@@ -218,160 +220,31 @@ def _snap4city_browser_login_cookie(
     password: str,
     credential: dict[str, Any],
 ) -> str:
-    try:
-        from playwright.sync_api import sync_playwright
-    except Exception as exc:
-        raise RuntimeError(f"Playwright is unavailable for automatic Snap4City login: {type(exc).__name__}: {exc}") from exc
-
-    login_path = str(credential.get("login_path") or "/").strip() or "/"
-    validation_path = str(credential.get("validation_path") or login_path).strip() or login_path
-    login_url = urljoin(target_url, login_path)
-    validation_url = urljoin(target_url, validation_path)
-    timeout_seconds = int(credential.get("timeout_seconds") or 60)
-    timeout_ms = timeout_seconds * 1000
-    headless = bool(credential.get("headless", True))
-
-    username_selectors = (
-        "#username",
-        "input[name='username']",
-        "input[autocomplete='username']",
-        "input[type='email']",
+    result = snap4city_browser_login_session(
+        target_url, username, password, credential, initial_login=True
     )
-    password_selectors = (
-        "#password",
-        "input[name='password']",
-        "input[autocomplete='current-password']",
-        "input[type='password']",
-    )
-    submit_selectors = (
-        "#kc-login",
-        "input[type='submit']",
-        "button[type='submit']",
-        "button[name='login']",
-    )
-    login_trigger_selectors = (
-        'button:has-text("login")',
-        'a:has-text("login")',
-        '[role="button"]:has-text("login")',
-        "input[type='button'][value='login']",
-        "input[type='button'][value='Login']",
-        "input[type='submit'][value='login']",
-        "input[type='submit'][value='Login']",
-    )
-
-    with sync_playwright() as playwright:
-        browser = playwright.chromium.launch(headless=headless)
-        context = browser.new_context(ignore_https_errors=True, user_agent="SecOps-Snap4City-Login/1.0")
-        page = context.new_page()
-        try:
-            page.goto(login_url, wait_until="domcontentloaded", timeout=timeout_ms)
-            username_field = _first_visible_locator(page, username_selectors)
-            password_field = _first_visible_locator(page, password_selectors)
-            if username_field is None and password_field is None:
-                login_trigger = _first_visible_locator(page, login_trigger_selectors)
-                if login_trigger is None:
-                    raise RuntimeError(
-                        f"Snap4City login form or login control was not found after opening {login_url}; current URL is {page.url}."
-                    )
-                login_trigger.click()
-                form_deadline = time.monotonic() + timeout_seconds
-                while time.monotonic() < form_deadline:
-                    username_field = _first_visible_locator(page, username_selectors)
-                    password_field = _first_visible_locator(page, password_selectors)
-                    if username_field is not None or password_field is not None:
-                        break
-                    page.wait_for_timeout(250)
-                if username_field is None and password_field is None:
-                    raise RuntimeError(
-                        f"Snap4City login control was activated but the OIDC/Keycloak form did not appear within {timeout_seconds}s; "
-                        f"current URL is {page.url}."
-                    )
-            if username_field is not None:
-                username_field.fill(username)
-
-            if password_field is None:
-                submit = _first_visible_locator(page, submit_selectors)
-                if submit is None:
-                    raise RuntimeError("Snap4City login page exposes a username field but no submit control.")
-                submit.click()
-                page.wait_for_load_state("domcontentloaded", timeout=timeout_ms)
-                password_field = _first_visible_locator(page, password_selectors)
-            if password_field is None:
-                raise RuntimeError("Snap4City login flow did not expose a password field.")
-
-            password_field.fill(password)
-            submit = _first_visible_locator(page, submit_selectors)
-            if submit is not None:
-                submit.click()
-            else:
-                password_field.press("Enter")
-
-            deadline = time.monotonic() + timeout_seconds
-            while time.monotonic() < deadline:
-                current_url = str(page.url or "")
-                password_still_visible = _first_visible_locator(page, password_selectors) is not None
-                if same_origin(target_url, current_url) and not _looks_like_oidc_login_url(current_url) and not password_still_visible:
-                    break
-                diagnostic = _keycloak_login_diagnostic(page)
-                if diagnostic.startswith("credentials_rejected:"):
-                    message = diagnostic.split(":", 1)[1].strip()
-                    raise RuntimeError(f"Snap4City/Keycloak rejected the supplied target credentials: {message}")
-                if diagnostic == "additional_authentication_step_required":
-                    raise RuntimeError("Snap4City/Keycloak requires an additional authentication step such as OTP; automatic username/password login cannot complete it.")
-                page.wait_for_timeout(250)
-            else:
-                diagnostic = _keycloak_login_diagnostic(page)
-                password_still_visible = _first_visible_locator(page, password_selectors) is not None
-                if diagnostic.startswith("credentials_rejected:"):
-                    message = diagnostic.split(":", 1)[1].strip()
-                    raise RuntimeError(f"Snap4City/Keycloak rejected the supplied target credentials: {message}")
-                if password_still_visible and _looks_like_oidc_login_url(str(page.url or "")):
-                    raise RuntimeError(
-                        "Snap4City login remained on the Keycloak password form; the credentials may be invalid or the account may require an additional login step. "
-                        f"Current URL is {page.url}."
-                    )
-                raise RuntimeError(f"Snap4City login did not return to the assessed application within {timeout_seconds}s; current URL is {page.url}.")
-
-            page.goto(validation_url, wait_until="domcontentloaded", timeout=timeout_ms)
-            page.wait_for_timeout(300)
-            final_url = str(page.url or "")
-            if not same_origin(target_url, final_url) or _looks_like_oidc_login_url(final_url):
-                raise RuntimeError(f"Snap4City authenticated validation returned to the login flow: {final_url}")
-            if _first_visible_locator(page, password_selectors) is not None:
-                raise RuntimeError("Snap4City authenticated validation still exposes the login password form.")
-            if _first_visible_locator(page, login_trigger_selectors) is not None:
-                raise RuntimeError("Snap4City authenticated validation still exposes the anonymous login control.")
-
-            cookie_rows = list(context.cookies([validation_url]))
-            if not cookie_rows:
-                raise RuntimeError("Snap4City login completed in Chromium but no target cookie was available for the HTTP orchestrators.")
-            cookie_rows.sort(key=lambda row: len(str(row.get("path") or "/")), reverse=True)
-            selected: dict[str, tuple[str, str]] = {}
-            for row in cookie_rows:
-                name = str(row.get("name") or "").strip()
-                value = str(row.get("value") or "")
-                if name and name.lower() not in selected:
-                    selected[name.lower()] = (name, value)
-            header = canonical_cookie_header("; ".join(f"{name}={value}" for name, value in selected.values()))
-            required = {str(name).strip().lower() for name in credential.get("required_cookie_names") or [] if str(name).strip()}
-            present = {name.lower() for name in cookie_names(header)}
-            missing = sorted(required - present)
-            if missing:
-                raise RuntimeError("Snap4City login completed but required target cookie(s) are missing: " + ", ".join(missing))
-            return header
-        finally:
-            browser.close()
+    return str(result.get("cookie_header") or "")
 
 
-# Resolves an authenticated target session from a manual cookie or from the configured Snap4City OIDC browser login.
+# Credential reuse is scoped by origin. The same credential reference can serve multiple paths on
+# one origin, while a different origin resolves its own cookie/login session.
+def _credential_cache_key(reference: str, target_url: str) -> tuple[str, str]:
+    return str(reference or ''), normalized_origin(target_url)
+
+
+# Resolves one target session. Username/password entered for the first OIDC login are cached only in
+# process memory and reused for every later origin using the same credential reference, so the runner
+# never asks for the same target credentials again during a multi-origin assessment.
 def _resolve_job_cookie(
     config: dict[str, Any],
     reference: str,
     target_url: str,
-    cache: dict[str, str],
+    cache: dict[tuple[str, str], str],
+    runtime_auth_cache: dict[str, dict[str, Any]] | None = None,
 ) -> str:
-    if reference in cache:
-        return cache[reference]
+    cache_key = _credential_cache_key(reference, target_url)
+    if cache_key in cache:
+        return cache[cache_key]
     credentials = config.get("credentials") or {}
     credential = credentials.get(reference)
     if not isinstance(credential, dict):
@@ -381,38 +254,60 @@ def _resolve_job_cookie(
         value = resolve_cookie_credential(config, reference)
         if not value:
             print(f"[AUTH] Optional credential {reference!r} is unavailable; the job will run the anonymous profile only.")
-        cache[reference] = value
+        cache[cache_key] = value
         return value
     if kind != "snap4city_oidc":
         raise ValueError(f"Credential {reference!r} has unsupported web credential kind={kind!r}.")
 
-    cookie_env = str(credential.get("cookie_env") or "").strip()
-    if cookie_env:
-        manual_cookie = os.environ.get(cookie_env, "").strip()
-        if manual_cookie:
-            value = canonical_cookie_header(manual_cookie)
-            print(f"[AUTH] Using existing target session from {cookie_env}; cookie names: {', '.join(cookie_names(value)) or 'none'}")
-            cache[reference] = value
-            return value
+    runtime_cache = runtime_auth_cache if runtime_auth_cache is not None else {}
+    runtime = runtime_cache.setdefault(reference, {
+        "reference": reference,
+        "kind": kind,
+        "credential": copy.deepcopy(credential),
+        "username": "",
+        "password": "",
+        "storage_state": None,
+        "manual_cookie_origin": "",
+        "prompt_attempted": False,
+    })
 
     username_env = str(credential.get("username_env") or "DASHBOARD_TEST_USERNAME").strip()
     password_env = str(credential.get("password_env") or "DASHBOARD_TEST_PASSWORD").strip()
-    username = os.environ.get(username_env, "").strip() if username_env else ""
-    password = os.environ.get(password_env, "") if password_env else ""
-    interactive = bool(getattr(sys.stdin, "isatty", lambda: False)())
+    if not runtime.get("username") and username_env:
+        runtime["username"] = os.environ.get(username_env, "").strip()
+    if not runtime.get("password") and password_env:
+        runtime["password"] = os.environ.get(password_env, "")
 
-    if not username and interactive:
-        username = input(f"[AUTH] Snap4City username ({username_env} not set): ").strip()
-    if not password and interactive:
-        password = getpass.getpass(f"[AUTH] Snap4City password ({password_env} not set): ")
+    cookie_env = str(credential.get("cookie_env") or "").strip()
+    manual_cookie = os.environ.get(cookie_env, "").strip() if cookie_env else ""
+    target_origin = normalized_origin(target_url)
+    manual_origin = str(runtime.get("manual_cookie_origin") or "")
+    if manual_cookie and (not manual_origin or manual_origin == target_origin):
+        value = canonical_cookie_header(manual_cookie)
+        runtime["manual_cookie_origin"] = target_origin
+        print(f"[AUTH] Using existing target session from {cookie_env}; cookie names: {', '.join(cookie_names(value)) or 'none'}")
+        cache[cache_key] = value
+        return value
+
+    # A raw Cookie header has no trustworthy Domain/Path metadata. Never copy the same manual cookie
+    # to a different origin. A different origin must obtain its own application session through SSO/login.
+    username = str(runtime.get("username") or "")
+    password = str(runtime.get("password") or "")
+    interactive = bool(getattr(sys.stdin, "isatty", lambda: False)())
+    if (not username or not password) and not bool(runtime.get("prompt_attempted")):
+        runtime["prompt_attempted"] = True
+        if not username and interactive:
+            username = input(f"[AUTH] Snap4City username ({username_env} not set): ").strip()
+        if not password and interactive:
+            password = getpass.getpass(f"[AUTH] Snap4City password ({password_env} not set): ")
+        runtime["username"] = username
+        runtime["password"] = password
 
     if not username or not password:
         if bool(credential.get("optional", False)):
-            print(
-                f"[AUTH] Optional credential {reference!r} has no usable Snap4City username/password; "
-                "the job will run the anonymous profile only."
-            )
-            cache[reference] = ""
+            detail = "different-origin manual cookie is intentionally not reused" if manual_cookie and manual_origin and manual_origin != target_origin else "no usable Snap4City username/password is available"
+            print(f"[AUTH] Optional credential {reference!r}: {detail}; the job will run the anonymous profile only.")
+            cache[cache_key] = ""
             return ""
         missing = []
         if not username:
@@ -423,16 +318,76 @@ def _resolve_job_cookie(
 
     print(f"[AUTH] Performing automatic Snap4City login for {target_url} with Chromium.")
     try:
-        value = _snap4city_browser_login_cookie(target_url, username, password, credential)
+        login_result = snap4city_browser_login_session(
+            target_url,
+            username,
+            password,
+            credential,
+            storage_state=runtime.get("storage_state") if isinstance(runtime.get("storage_state"), dict) else None,
+            initial_login=True,
+        )
+        value = str(login_result.get("cookie_header") or "")
+        if not value:
+            raise RuntimeError("Automatic login returned no application cookie.")
+        runtime["storage_state"] = login_result.get("storage_state") if isinstance(login_result.get("storage_state"), dict) else runtime.get("storage_state")
     except RuntimeError as exc:
         if bool(credential.get("optional", False)):
             print(f"[AUTH] Automatic Snap4City login failed: {exc}; the job will run the anonymous profile only.")
-            cache[reference] = ""
+            cache[cache_key] = ""
             return ""
         raise ValueError(str(exc)) from exc
-    print(f"[AUTH] Automatic Snap4City login succeeded; target cookie names: {', '.join(cookie_names(value)) or 'none'}")
-    cache[reference] = value
+    reuse_note = " (existing SSO state reused)" if login_result.get("sso_reused") else ""
+    print(f"[AUTH] Automatic Snap4City login succeeded{reuse_note}; target cookie names: {', '.join(cookie_names(value)) or 'none'}")
+    cache[cache_key] = value
     return value
+
+
+def _runtime_auth_payload(config: dict[str, Any], job: dict[str, Any], runtime_auth_cache: dict[str, dict[str, Any]]) -> dict[str, Any]:
+    reference = str(job.get("credential_ref") or "").strip()
+    runtime = runtime_auth_cache.get(reference) if reference else None
+    if not isinstance(runtime, dict) or str(runtime.get("kind") or "") != "snap4city_oidc":
+        return {}
+    credential_options = runtime.get("credential") if isinstance(runtime.get("credential"), dict) else {}
+    if not bool(credential_options.get("reuse_on_authorized_siblings", False)):
+        return {}
+    username = str(runtime.get("username") or "")
+    password = str(runtime.get("password") or "")
+    storage_state = runtime.get("storage_state") if isinstance(runtime.get("storage_state"), dict) else None
+    if not username or not password:
+        # SSO-only propagation is still useful when a browser state exists; if it later asks for credentials,
+        # the child reports that it cannot reauthenticate instead of opening a new console prompt.
+        if not storage_state:
+            return {}
+    authorization = config.get("authorization") or {}
+    return {
+        "schema_version": 1,
+        "kind": "snap4city_oidc",
+        "reference": reference,
+        "primary_origin": normalized_origin(str(job.get("target") or "")),
+        "username": username,
+        "password": password,
+        "credential": copy.deepcopy(credential_options),
+        "storage_state": storage_state,
+        "allowed_origins": list(authorization.get("allowed_origins") or []),
+        "allowed_host_suffixes": list(authorization.get("allowed_host_suffixes") or []),
+    }
+
+
+def _runtime_auth_environment(base_env: dict[str, str], payload: dict[str, Any]) -> tuple[dict[str, str], str]:
+    env = dict(base_env)
+    if not payload:
+        env.pop("SECOPS_RUNTIME_AUTH_STATE", None)
+        return env, ""
+    handle = tempfile.NamedTemporaryFile("w", encoding="utf-8", prefix="secops-target-auth-", suffix=".json", delete=False)
+    try:
+        json.dump(payload, handle, ensure_ascii=False)
+        handle.flush()
+        os.fchmod(handle.fileno(), 0o600)
+        path = handle.name
+    finally:
+        handle.close()
+    env["SECOPS_RUNTIME_AUTH_STATE"] = path
+    return env, path
 
 
 # Coalesces equivalent same-route services into one scan while preserving every configured URL as a forced seed.
@@ -512,7 +467,8 @@ def _credential_discovery_seeds(config: dict[str, Any], job: dict[str, Any]) -> 
 # Builds one existing orchestrator command from a normalized service job.
 def _build_command(
     config: dict[str, Any], job: dict[str, Any], *, resolve_secrets: bool = True, force_auth_only: bool = False,
-    credential_cache: dict[str, str] | None = None,
+    credential_cache: dict[tuple[str, str], str] | None = None,
+    runtime_auth_cache: dict[str, dict[str, Any]] | None = None,
 ) -> list[str]:
     execution = config.get("execution") or {}
     orchestrator = str(execution.get("orchestrator") or "deterministic").lower()
@@ -532,12 +488,12 @@ def _build_command(
     primary_ref = str(job.get("credential_ref") or "")
     primary_value = ""
     if primary_ref:
-        primary_value = _resolve_job_cookie(config, primary_ref, job["target"], cache) if resolve_secrets else f"<credential:{primary_ref}>"
+        primary_value = _resolve_job_cookie(config, primary_ref, job["target"], cache, runtime_auth_cache) if resolve_secrets else f"<credential:{primary_ref}>"
         if primary_value:
             command.extend(["--cookies", primary_value])
     secondary_ref = str(job.get("secondary_credential_ref") or "")
     if secondary_ref:
-        secondary_value = _resolve_job_cookie(config, secondary_ref, job["target"], cache) if resolve_secrets else f"<credential:{secondary_ref}>"
+        secondary_value = _resolve_job_cookie(config, secondary_ref, job["target"], cache, runtime_auth_cache) if resolve_secrets else f"<credential:{secondary_ref}>"
         if secondary_value:
             command.extend(["--secondary-cookies", secondary_value])
     if force_auth_only or job.get("auth_only"):
@@ -1142,7 +1098,8 @@ def main() -> int:
     }
 
     exit_code = 0
-    credential_cache: dict[str, str] = {}
+    credential_cache: dict[tuple[str, str], str] = {}
+    runtime_auth_cache: dict[str, dict[str, Any]] = {}
     for job in jobs:
         record: dict[str, Any] = {
             "id": job["id"],
@@ -1172,7 +1129,7 @@ def main() -> int:
             continue
         try:
             command = _build_command(
-                config, job, resolve_secrets=not args.dry_run, force_auth_only=args.auth_only, credential_cache=credential_cache
+                config, job, resolve_secrets=not args.dry_run, force_auth_only=args.auth_only, credential_cache=credential_cache, runtime_auth_cache=runtime_auth_cache
             )
         except ValueError as exc:
             record.update(status="blocked", reason=str(exc))
@@ -1190,7 +1147,16 @@ def main() -> int:
         else:
             print(f"\n[RUN] {job['id']} -> {job['target']}")
             job_started_ns = time.time_ns()
-            completed = subprocess.run(command, cwd=ROOT, check=False)
+            runtime_payload = _runtime_auth_payload(config, job, runtime_auth_cache)
+            child_env, runtime_state_path = _runtime_auth_environment(os.environ, runtime_payload)
+            try:
+                completed = subprocess.run(command, cwd=ROOT, check=False, env=child_env)
+            finally:
+                if runtime_state_path:
+                    try:
+                        Path(runtime_state_path).unlink(missing_ok=True)
+                    except OSError:
+                        pass
             record["returncode"] = completed.returncode
             record["status"] = "success" if completed.returncode == 0 else "error"
             if completed.returncode != 0:

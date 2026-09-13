@@ -814,6 +814,46 @@ def action_id(action: dict[str, Any]) -> str:
         str(action.get('jwt_token', '')), str(action.get('injection_url', '')),
     ))
 
+# Execution equivalence intentionally ignores the profile label. It is used only when neither
+# profile can apply a credential to the concrete target, so an "authenticated" sibling action and
+# the anonymous action are literally the same HTTP security test.
+def action_execution_id(action: dict[str, Any]) -> str:
+    return action_id({**action, 'profile': ''})
+
+def _profile_cookie(state: AgentState, profile_name: str) -> str:
+    profile = next((item for item in state.get('profiles', []) if str(item.get('name') or '') == profile_name), None)
+    return str(profile.get('cookies') or '') if isinstance(profile, dict) else ''
+
+# Most tools issue their concrete HTTP request to target_url. Interactsh records the assessment
+# target separately but sends the injection request to injection_url, so credential scoping must use
+# that destination instead of the reporting target.
+def _action_request_url(action: dict[str, Any], fallback_target: str='') -> str:
+    if str(action.get('tool') or '') == 'interactsh' and str(action.get('injection_url') or ''):
+        return str(action.get('injection_url') or '').replace('FUZZ', 'secops-oast-placeholder')
+    return str(action.get('target_url') or fallback_target or '')
+
+def _dedupe_no_cookie_profile_actions(state: AgentState, actions: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    output: list[dict[str, Any]] = []
+    anonymous_equivalent: dict[str, int] = {}
+    for action in actions:
+        profile = str(action.get('profile') or '')
+        request_url = _action_request_url(action, str(state.get('target') or ''))
+        effective_cookie = shared.scope_cookie_header(request_url, _profile_cookie(state, profile))
+        if effective_cookie:
+            output.append(action)
+            continue
+        identifier = action_execution_id(action)
+        previous_index = anonymous_equivalent.get(identifier)
+        if previous_index is None:
+            anonymous_equivalent[identifier] = len(output)
+            output.append(action)
+            continue
+        # Prefer the explicit anonymous label for reporting when the concrete execution is no-cookie.
+        previous = output[previous_index]
+        if profile == 'anonymous' and str(previous.get('profile') or '') != 'anonymous':
+            output[previous_index] = action
+    return output
+
 
 # Treat a profile as authenticated only while discovery has not disproved its supplied session.
 def _profile_has_effective_auth(state: AgentState, profile_name: str) -> bool:
@@ -1682,6 +1722,8 @@ def discovery_node(state: AgentState) -> dict[str, Any]:
             seeds=list(state.get('discovery_seeds') or []),
             forced_seeds=list(state.get('entry_points') or []),
         )
+        if profile.get('cookies') and found.get('authentication_effective') is not False:
+            found = shared.authenticate_discovered_sibling_origins(found, state['target'], profile['cookies'])
         discovery[profile['name']] = found
         diagnostics.extend(({'phase': 'discovery', 'profile': profile['name'], **item} for item in found['errors']))
         print(f"    {profile['name']}: {len(found.get('html_urls', []))} HTML pages, {len(found.get('request_cases', []))} request contracts, {len(found.get('browser_network_requests', []))} browser network requests, {len(found.get('browser_navigation_urls', []))} Chromium navigations, {len(found['jwt_tokens'])} JWTs")
@@ -1745,34 +1787,45 @@ def discovery_candidate_actions(state: AgentState) -> list[dict[str, Any]]:
             str(item.get('name') or '') == 'anonymous' and _profile_is_plannable(state, 'anonymous')
             for item in state['profiles']
         )
-        # Sibling origins never receive the primary target cookie. When an anonymous profile exists,
-        # scan each sibling broad surface only once there instead of duplicating an identical no-cookie
-        # ZAP/Nuclei/Nikto run under the authenticated profile label.
-        if name == 'anonymous' or not anonymous_available:
-            sibling_selection = shared.select_sibling_broad_origins(state['discovery'].get(name, {}), state['target'])
-            for sibling_origin, sibling_score in sibling_selection['selected']:
-                for tool in ('zap', 'nuclei', 'nikto'):
-                    actions.append({
-                        'profile': name,
-                        'tool': tool,
-                        'target_url': sibling_origin,
-                        'jwt_token': '',
-                        'injection_url': '',
-                        'sibling_broad': True,
-                        'sibling_origin_score': sibling_score,
-                        'reason': 'Ranked broad no-cookie coverage for a high-value explicitly authorized sibling origin observed during discovery.',
-                    })
+        # The primary raw Cookie header is never copied to siblings. A sibling broad scan is repeated
+        # under the authenticated profile only when runtime OIDC/SSO established an independent cookie
+        # for that exact origin; otherwise the existing anonymous scan remains the single no-cookie run.
+        sibling_selection = shared.select_sibling_broad_origins(state['discovery'].get(name, {}), state['target'])
+        raw_profile_cookie = _profile_cookie(state, name)
+        for sibling_origin, sibling_score in sibling_selection['selected']:
+            sibling_cookie = shared.scope_cookie_header(sibling_origin, raw_profile_cookie)
+            if name != 'anonymous' and anonymous_available and not sibling_cookie:
+                continue
+            reason = (
+                'Ranked broad authenticated coverage using an origin-specific runtime OIDC/SSO session.'
+                if sibling_cookie else
+                'Ranked broad no-cookie coverage for a high-value explicitly authorized sibling origin observed during discovery.'
+            )
+            for tool in ('zap', 'nuclei', 'nikto'):
+                actions.append({
+                    'profile': name,
+                    'tool': tool,
+                    'target_url': sibling_origin,
+                    'jwt_token': '',
+                    'injection_url': '',
+                    'sibling_broad': True,
+                    'sibling_origin_score': sibling_score,
+                    'reason': reason,
+                })
         for case in select_arjun_request_cases(state['discovery'].get(name, {}), state['target'], limit=shared.ARJUN_ENDPOINT_LIMIT):
             adaptive = bool(case.get('adaptive_budget'))
             actions.append({'profile': name, 'tool': 'arjun', 'target_url': case['url'], 'method': case.get('method', 'GET'), 'data': case.get('data', ''), 'parameters': case.get('parameters', []), 'jwt_token': '', 'injection_url': '', 'adaptive_budget': adaptive, 'priority_score': case.get('priority_score'), 'reason': ('Adaptive high-value overflow selected by deterministic ranking: ' if adaptive else '') + 'Hidden-parameter discovery using the real request method and body.'})
         for tool in ('sqlmap', 'dalfox', 'commix', 'traversal', 'idor'):
-            for case in select_tool_request_cases(state['discovery'].get(name, {}), tool, limit=shared.PARAMETER_TOOL_CASE_LIMITS.get(tool, 1), authenticated_profile=authenticated, allow_state_changes=state_changes_allowed):
+            for case in select_tool_request_cases(state['discovery'].get(name, {}), tool, limit=shared.PARAMETER_TOOL_CASE_LIMITS.get(tool, 1), authenticated_profile=authenticated, allow_state_changes=state_changes_allowed, credential_cookies=_profile_cookie(state, name)):
                 adaptive = bool(case.get('adaptive_budget'))
                 coverage_reserve = bool(case.get('coverage_reserve'))
                 prefix = f'Adaptive high-value overflow selected by deterministic ranking for {tool}. ' if adaptive else 'Routing-value coverage reserve selected for direct traversal/LFI validation. ' if coverage_reserve else ''
                 actions.append({'profile': name, 'tool': tool, 'target_url': case['url'], 'method': case.get('method', 'GET'), 'data': case.get('data', ''), 'parameters': case.get('parameters', []), 'jwt_token': '', 'injection_url': '', 'adaptive_budget': adaptive, 'coverage_reserve': coverage_reserve, 'priority_score': case.get('priority_score'), 'reason': prefix + f'Highest-value discovered request for {tool}.'})
         if authenticated:
+            raw_cookie = _profile_cookie(state, name)
             for case in select_authorization_request_cases(state['discovery'].get(name, {}), limit=shared.tool_action_limit('authorization')):
+                if not shared.scope_cookie_header(str(case.get('url') or ''), raw_cookie):
+                    continue
                 adaptive = bool(case.get('adaptive_budget'))
                 actions.append({'profile': name, 'tool': 'authorization', 'target_url': case['url'], 'method': 'GET', 'data': '', 'parameters': case.get('parameters', []), 'jwt_token': '', 'injection_url': '', 'adaptive_budget': adaptive, 'priority_score': case.get('priority_score'), 'reason': ('Adaptive high-value overflow selected by deterministic ranking for authorization. ' if adaptive else '') + 'Read-only authorization differential candidate derived from an identity, object or privileged-resource signal.'})
         for case in select_browser_request_cases(state['discovery'].get(name, {}), limit=shared.tool_action_limit('browser')):
@@ -1816,7 +1869,7 @@ def discovery_candidate_actions(state: AgentState) -> list[dict[str, Any]]:
         else:
             for case in select_oast_request_cases(state['discovery'].get(name, {}), state['target'], limit=shared.tool_action_limit('interactsh')):
                 actions.append({'profile': name, 'tool': 'interactsh', 'target_url': state['target'], 'method': case.get('method', 'GET'), 'data': case.get('data', ''), 'parameters': case.get('parameters', []), 'jwt_token': '', 'injection_url': case.get('injection_url', ''), 'oast_class': case.get('oast_class', 'remote-fetch'), 'reason': f"Automatically selected OAST-capable parameter: {case.get('parameter', 'unknown')}."})
-    return actions
+    return _dedupe_no_cookie_profile_actions(state, actions)
 
 # Planner validation compares proposed actions with target scope, discovery evidence, and safety rules.
 def validate_plan(state: AgentState, proposed: Any) -> list[dict[str, Any]]:
@@ -1874,14 +1927,15 @@ def validate_plan(state: AgentState, proposed: Any) -> list[dict[str, Any]]:
             data = str(selected.get('data', ''))
             parameters = [str(value) for value in selected.get('parameters', [])]
         elif scope in {'parameterized', 'numeric'}:
-            cases = select_tool_request_cases(found, tool, limit=shared.PARAMETER_TOOL_CASE_LIMITS.get(tool, 1), authenticated_profile=profile_has_cookie, allow_state_changes=shared.state_changing_tests_allowed(state['target'], state.get('allow_state_changes')))
+            cases = select_tool_request_cases(found, tool, limit=shared.PARAMETER_TOOL_CASE_LIMITS.get(tool, 1), authenticated_profile=profile_has_cookie, allow_state_changes=shared.state_changing_tests_allowed(state['target'], state.get('allow_state_changes')), credential_cookies=_profile_cookie(state, profile))
             matching = [case for case in cases if str(case.get('url', '')) == target_url]
             if method:
                 matching = [case for case in matching if str(case.get('method', 'GET')).upper() == method]
             if not matching:
                 continue
             selected = matching[0]
-            if _tool_case_skip_reason(tool, selected, authenticated_profile=profile_has_cookie):
+            selected_cookie = shared.scope_cookie_header(str(selected.get('url') or ''), _profile_cookie(state, profile))
+            if _tool_case_skip_reason(tool, selected, authenticated_profile=bool(selected_cookie)):
                 continue
             if (not shared.state_changing_tests_allowed(state['target'], state.get('allow_state_changes'))) and shared.request_case_state_change_reason(selected):
                 continue
@@ -1891,7 +1945,7 @@ def validate_plan(state: AgentState, proposed: Any) -> list[dict[str, Any]]:
             if scope == 'numeric' and (method != 'GET' or not any((value.isdigit() for _, value in parse_qsl(urlparse(target_url).query, keep_blank_values=True)))):
                 continue
         elif scope == 'authorization':
-            if not profile_has_cookie:
+            if not profile_has_cookie or not shared.scope_cookie_header(target_url, _profile_cookie(state, profile)):
                 continue
             cases = select_authorization_request_cases(found, limit=shared.tool_action_limit('authorization'))
             matching = [case for case in cases if str(case.get('url', '')) == target_url]
@@ -2077,11 +2131,13 @@ def _missing_tool_reason(state: AgentState, profile_name: str, tool: str) -> str
     if tool == 'arjun':
         return '' if select_arjun_request_cases(found, state['target'], limit=1) else 'No suitable discovered GET/POST request was available for hidden-parameter discovery.'
     if tool in PARAMETER_COVERAGE_TOOLS:
-        return '' if select_tool_request_cases(found, tool, limit=1, authenticated_profile=profile_has_cookie, allow_state_changes=shared.state_changing_tests_allowed(state['target'], state.get('allow_state_changes'))) else f"No discovered policy-eligible request matched {tool}'s vulnerability class."
+        return '' if select_tool_request_cases(found, tool, limit=1, authenticated_profile=profile_has_cookie, allow_state_changes=shared.state_changing_tests_allowed(state['target'], state.get('allow_state_changes')), credential_cookies=_profile_cookie(state, profile_name)) else f"No discovered policy-eligible request matched {tool}'s vulnerability class."
     if tool == 'authorization':
         if not profile_has_cookie:
             return 'Authorization comparison requires a primary authenticated profile.'
-        return '' if select_authorization_request_cases(found, limit=1) else 'No discovered read-only request contained a plausible identity, object or privileged-resource signal.'
+        raw_cookie = _profile_cookie(state, profile_name)
+        credentialed_cases = [case for case in select_authorization_request_cases(found, limit=shared.tool_action_limit('authorization')) if shared.scope_cookie_header(str(case.get('url') or ''), raw_cookie)]
+        return '' if credentialed_cases else 'No credentialed exact-origin read-only request contained a plausible identity, object or privileged-resource signal.'
     if tool == 'browser':
         return '' if select_browser_request_cases(found, limit=1) else 'No discovered request or client-side page matched browser XSS verification.'
     if tool == 'workflow':
@@ -2238,7 +2294,8 @@ async def execute_action(action: dict[str, Any], cookies: dict[str, str], discov
         timeout_by_class = {'explicit': (120, 75), 'command': (75, 55), 'remote-fetch': (60, 45)}
         deep_timeout, normal_timeout = timeout_by_class.get(oast_class, timeout_by_class['remote-fetch'])
         oast_timeout = deep_timeout if shared.CURRENT_SCAN_MODE == 'deep' else normal_timeout
-        arguments = {'target_url': action['target_url'], 'injection_url': action['injection_url'], 'cookies': shared.scope_cookie_header(action['target_url'], cookies.get(profile, '')), 'method': action.get('method', 'GET'), 'data': action.get('data', ''), 'parameter': (action.get('parameters') or [''])[0], 'timeout': oast_timeout}
+        request_url = _action_request_url(action, action['target_url'])
+        arguments = {'target_url': action['target_url'], 'injection_url': action['injection_url'], 'cookies': shared.scope_cookie_header(request_url, cookies.get(profile, '')), 'method': action.get('method', 'GET'), 'data': action.get('data', ''), 'parameter': (action.get('parameters') or [''])[0], 'timeout': oast_timeout}
     else:
         profile_discovery = discovery.get(profile, {})
         arguments = shared.build_tool_arguments(tool, action['target_url'], cookies.get(profile, ''), profile_discovery, case=action, secondary_cookies=secondary_cookies, allow_state_changes=allow_state_changes)
@@ -2248,13 +2305,16 @@ async def execute_action(action: dict[str, Any], cookies: dict[str, str], discov
             arguments.pop('session_probe_url', None)
     state_refresh: dict[str, Any] | None = None
     authenticated_specialists = {'sqlmap', 'dalfox', 'commix', 'traversal', 'idor', 'authorization', 'interactsh', 'arjun', 'browser', 'workflow'}
-    if cookies.get(profile, '') and tool in authenticated_specialists:
-        parsed_target = urlparse(action['target_url'])
+    raw_profile_cookie = cookies.get(profile, '')
+    request_url = _action_request_url(action, action['target_url'])
+    effective_action_cookie = shared.scope_cookie_header(request_url, raw_profile_cookie)
+    if effective_action_cookie and tool in authenticated_specialists:
+        parsed_target = urlparse(request_url)
         refresh_target = f'{parsed_target.scheme}://{parsed_target.netloc}'
         profile_discovery = discovery.get(profile, {})
         probe_url = shared.select_session_probe_url(profile_discovery, refresh_target)
         print(f'    [PRECHECK] {tool}: validating authenticated session with {shared.compact_log_url(probe_url)}', flush=True)
-        state_refresh = shared.refresh_authenticated_session_state(refresh_target, cookies[profile], probe_url)
+        state_refresh = shared.refresh_authenticated_session_state(refresh_target, effective_action_cookie, probe_url)
         if state_refresh.get('usable') is False:
             print(f'    [PARTIAL ] {tool}: authenticated session precheck failed', flush=True)
             return (action, {'tool': tool, 'status': 'partial', 'target': action['target_url'], 'output': 'The authenticated session could not be re-established before the scanner.', 'vulnerabilities': [], 'diagnosis': 'authentication_precheck_failed', 'state_refresh': state_refresh})
@@ -2351,6 +2411,8 @@ def _record_execution_batch(executed: list[tuple[dict[str, Any], dict[str, Any]]
                 recrawl = discover_target_sync_safe(state['target'], profile_cookies.get(profile, ''), seeds=urls)
                 enriched = merge_discovery(enriched, recrawl)
                 print(f"    [DISCOVERY] {profile}: FFUF re-crawl expanded the surface to {len(enriched.get('html_urls', []))} HTML pages and {len(enriched.get('request_cases', []))} request cases.", flush=True)
+            if profile_cookies.get(profile, '') and enriched.get('authentication_effective') is not False:
+                enriched = shared.authenticate_discovered_sibling_origins(enriched, state['target'], profile_cookies[profile])
             discovery[profile] = enriched
             new_attack_surface += max(0, len(enriched.get('request_cases', [])) - before)
         if tool == 'arjun' and result.get('status') in {'success', 'partial'}:
@@ -2514,11 +2576,14 @@ async def _final_logout_checks(state: AgentState, results: dict[str, dict[str, A
         if not cookies or not _profile_has_effective_auth(state, name):
             continue
         discovery = state.get('discovery', {}).get(name, {})
-        logout_cases = select_logout_request_cases(discovery, limit=3)
+        logout_cases = [
+            case for case in select_logout_request_cases(discovery, limit=3)
+            if shared.scope_cookie_header(str(case.get('url') or ''), cookies)
+        ]
         if not logout_cases:
             skipped = make_skipped_result(
                 'session-logout', state['target'],
-                'No logout/signout/logoff endpoint was discovered safely for the authenticated profile.',
+                'No credentialed exact-origin logout/signout/logoff endpoint was discovered safely for the authenticated profile.',
             )
             results.setdefault(name, {})['session_logout_final'] = skipped
             log_result(name, 'session-logout', skipped, state['target'])
@@ -2526,12 +2591,14 @@ async def _final_logout_checks(state: AgentState, results: dict[str, dict[str, A
         probe_url = select_session_probe_url(discovery, state['target'])
         for index, logout_case in enumerate(logout_cases, start=1):
             logout_url = str(logout_case.get('url') or '')
+            logout_cookies = shared.scope_cookie_header(logout_url, cookies)
+            logout_probe = probe_url if shared.same_origin(logout_url, probe_url) else logout_url
             print(f'    [RUNNING ] session-logout: {shared.compact_log_url(logout_url)}', flush=True)
             result = await call_mcp(
                 'custom_checks/sessionServer.py', 'run_logout_check',
                 {
-                    'target_url': state['target'], 'logout_url': logout_url, 'cookies': cookies,
-                    'probe_url': probe_url, 'method': str(logout_case.get('method') or 'GET'),
+                    'target_url': state['target'], 'logout_url': logout_url, 'cookies': logout_cookies,
+                    'probe_url': logout_probe, 'method': str(logout_case.get('method') or 'GET'),
                     'data': str(logout_case.get('data') or ''), 'timeout': 25,
                 },
                 timeout_seconds=30,
@@ -2620,6 +2687,7 @@ def report_node(state: AgentState) -> dict[str, Any]:
                 state['discovery'].get(profile['name'], {}), state['target'],
                 authenticated_profile=_profile_has_effective_auth(state, str(profile.get('name') or '')),
                 allow_state_changes=shared.state_changing_tests_allowed(state['target'], state.get('allow_state_changes')),
+                credential_cookies=str(profile.get('cookies') or ''),
             )
             for profile in state['profiles']
         },
