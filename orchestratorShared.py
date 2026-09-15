@@ -1878,6 +1878,26 @@ def _client_side_source_sink_evidence(text: str) -> tuple[list[str], list[str]]:
     sink_hits = sorted(set(re.findall('(?:innerHTML|outerHTML|insertAdjacentHTML|document\\.write(?:ln)?|eval\\s*\\(|setTimeout\\s*\\(\\s*[\'\\"]|setInterval\\s*\\(\\s*[\'\\"])', value, re.I)))
     return (source_hits[:12], sink_hits[:12])
 
+# Normalizes URL-like string literals before they are resolved against a page/script URL.
+# JavaScript found in the wild sometimes contains escaped separators such as ``http\\://`` or
+# malformed fragments such as ``http\\:/``. A complete escaped HTTP(S) absolute URL is repaired;
+# an incomplete scheme-only fragment is rejected instead of being treated as a relative path.
+def _normalize_literal_url_token(raw: str) -> str:
+
+    value = str(raw or '').strip().replace('\\/', '/')
+    if not value:
+        return ''
+    if re.match(r'(?i)^https?\\:', value):
+        escaped_scheme = re.match(r'(?i)^(https?)\\://([^/?#][^\\s]*)$', value)
+        if not escaped_scheme:
+            # A broken scheme marker such as ``http\\:/`` or ``http\\:/relative`` is parser
+            # noise. Only the unambiguous two-slash absolute form is repaired.
+            return ''
+        value = f'{escaped_scheme.group(1).lower()}://{escaped_scheme.group(2)}'
+    elif re.match(r'(?i)^https?:/*$', value):
+        return ''
+    return value
+
 # Extracts literal authorized-scope endpoint hints from JavaScript without executing the script.
 def _javascript_endpoint_hints(text: str, base_url: str, target: str) -> list[dict[str, str]]:
 
@@ -1901,7 +1921,8 @@ def _javascript_endpoint_hints(text: str, base_url: str, target: str) -> list[di
                 raw_url, method = match.group(1), 'GET'
             else:
                 method, raw_url = match.group(1).upper(), match.group(2)
-            if raw_url.startswith(('data:', 'javascript:', '#')) or '{' in raw_url or '}' in raw_url:
+            raw_url = _normalize_literal_url_token(raw_url)
+            if not raw_url or raw_url.startswith(('data:', 'javascript:', '#')) or '{' in raw_url or '}' in raw_url:
                 continue
             try:
                 url = _normalize_redundant_base_path_link(target, _clean_url(absolute_url(base_url, raw_url)))
@@ -1930,7 +1951,7 @@ def _literal_navigation_hints(text: str, base_url: str, target: str, limit: int=
         lambda match: html.unescape(match.group(0)),
         raw_value,
         flags=re.I,
-    ).replace('\\/', '/')
+    )
     keyed = re.compile(
         r'''(?ix)\b(?:href|url|uri|link|linkurl|redirect|redirect_uri|page|path|route|target|endpoint|src|action)\b\s*[:=]\s*["']([^"']{1,420})["']'''
     )
@@ -1968,8 +1989,8 @@ def _literal_navigation_hints(text: str, base_url: str, target: str, limit: int=
     hints: list[dict[str, str]] = []
     seen: set[str] = set()
     for raw in raw_values:
-        raw = str(raw or '').strip()
-        if not plausible(raw):
+        raw = _normalize_literal_url_token(raw)
+        if not raw or not plausible(raw):
             continue
         try:
             candidate = _normalize_redundant_base_path_link(target, _clean_url(absolute_url(base_url, raw)))
@@ -2463,7 +2484,9 @@ def discover_target(target: str, cookies: str, max_pages: int=MAX_CRAWL_PAGES, s
                 origin = normalized_origin(value)
             except Exception:
                 origin = ''
-            if origin:
+            # Coverage diagnostics must never label an authorized source URL as an external origin.
+            # This is a secondary guard around callers that report a blocked redirect destination.
+            if origin and not url_in_authorized_scope(target, value):
                 out_of_scope_origins.add(origin)
 
     def enqueue(raw_url: str, *, force: bool=False, source_url: str='') -> None:
@@ -2572,7 +2595,13 @@ def discover_target(target: str, cookies: str, max_pages: int=MAX_CRAWL_PAGES, s
             errors.append({'url': requested, 'type': 'SafeRedirectGuard', 'message': redirect_issue})
             if redirect_issue.startswith(('destructive_', 'out_of_scope_')):
                 code = 'STATE_CHANGE_BLOCKED' if redirect_issue.startswith('destructive_') else 'OUT_OF_SCOPE'
-                record_coverage_skip(requested, code, 'Redirect target was blocked by the discovery safety/scope guard.')
+                # _safe_crawl_get encodes the blocked destination after the first colon. Record that
+                # destination, not the authorized page that emitted the redirect, so scope summaries
+                # contain only the external/blocked origin that was actually rejected.
+                blocked_target = redirect_issue.split(':', 1)[1].strip() if ':' in redirect_issue else final
+                if code == 'OUT_OF_SCOPE':
+                    skipped_out_of_scope += 1
+                record_coverage_skip(blocked_target or final, code, 'Redirect target was blocked by the discovery safety/scope guard.', source_url=requested)
                 continue
             if redirect_issue == 'redirect_limit_reached':
                 # `final` is the next authorized hop but it has not been requested yet. Re-queue it

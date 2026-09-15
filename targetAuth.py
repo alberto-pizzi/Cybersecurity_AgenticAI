@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 import shutil
 import time
 from typing import Any, Iterable
@@ -110,6 +111,139 @@ def _looks_like_application_login_entry(url: str) -> bool:
         return False
     return any(token in path for token in ('login', 'signin', 'sign-in', 'session', 'authenticate'))
 
+def _preauth_safe_candidate(target_url: str, candidate: str) -> bool:
+    """Keep generic pre-auth browsing same-origin, HTTP(S), GET-like and non-destructive."""
+    try:
+        parsed = urlparse(str(candidate or ""))
+    except ValueError:
+        return False
+    if parsed.scheme.lower() not in {"http", "https"} or not same_origin(target_url, candidate):
+        return False
+    path_words = {part for part in re.split(r"[^a-z0-9]+", str(parsed.path or "").lower()) if part}
+    blocked_actions = {"logout", "signout", "delete", "remove", "destroy", "install", "uninstall", "purge", "wipe", "drop", "truncate"}
+    if path_words & blocked_actions:
+        return False
+    action_keys = {"action", "operation", "op", "task", "command"}
+    for name, value in parse_qsl(parsed.query, keep_blank_values=True):
+        if str(name).lower() in action_keys and str(value).lower() in blocked_actions:
+            return False
+    return True
+
+
+def _preauth_link_score(url: str, label: str = "") -> int:
+    """Rank same-origin pre-auth links without making any path application-specific."""
+    try:
+        parsed = urlparse(str(url or ""))
+    except ValueError:
+        return -10_000
+    path = str(parsed.path or "/").lower()
+    text = (path + " " + str(label or "").lower()).replace("_", "-")
+    words = {part for part in re.split(r"[^a-z0-9]+", text) if part}
+    score = 0
+    if _looks_like_application_login_entry(url):
+        score += 180
+    if "login" in words:
+        score += 160
+    if "signin" in words or ("sign" in words and "in" in words):
+        score += 150
+    if words & {"auth", "authenticate", "authentication"}:
+        score += 110
+    if "account" in words:
+        score += 70
+    if "portal" in words:
+        score += 55
+    if words & {"app", "application"}:
+        score += 35
+    depth = len([part for part in path.split("/") if part])
+    score += max(0, 30 - depth * 6)
+    score -= min(30, len(path) // 12)
+    if parsed.query:
+        score -= 5
+    return score
+
+
+def _discover_pre_auth_candidates(page: Any, target_url: str, deadline: float, *, max_pages: int = 8, max_candidates: int = 12) -> list[str]:
+    """Bounded same-origin browser discovery used only when login_path is not configured.
+
+    It does not submit forms or click controls. It follows a small number of ordinary same-origin
+    GET navigation links and stops early when a login form/control or an OIDC redirect is observed.
+    """
+    origin = normalized_origin(target_url)
+    if not origin:
+        return []
+    seeds = _same_origin_candidates(target_url, [target_url, origin + "/"])
+    queue: list[tuple[int, str]] = [(10_000 - index, value) for index, value in enumerate(seeds)]
+    queued = {value for _, value in queue}
+    visited: set[str] = set()
+    selected: list[str] = []
+
+    while queue and len(visited) < max(1, int(max_pages)) and time.monotonic() < deadline:
+        queue.sort(key=lambda row: (-row[0], len(row[1]), row[1]))
+        _, candidate = queue.pop(0)
+        if candidate in visited or not _preauth_safe_candidate(target_url, candidate):
+            continue
+        visited.add(candidate)
+        try:
+            page.goto(candidate, wait_until="domcontentloaded", timeout=_remaining_ms(deadline, cap_ms=8000))
+            page.wait_for_timeout(120)
+        except Exception:
+            continue
+
+        current_url = str(page.url or "")
+        if looks_like_oidc_login_url(current_url):
+            selected.append(candidate)
+            break
+        if not same_origin(target_url, current_url):
+            # A same-origin entry point that redirects to another non-OIDC origin is not a login
+            # discovery candidate and is never followed further here.
+            continue
+
+        username_field = _first_visible_locator(page, USERNAME_SELECTORS)
+        password_field = _first_visible_locator(page, PASSWORD_SELECTORS)
+        login_trigger = _first_visible_locator(page, LOGIN_TRIGGER_SELECTORS)
+        if username_field is not None or password_field is not None or login_trigger is not None:
+            selected.append(current_url)
+            break
+
+        try:
+            rows = page.locator("a[href], [data-href], [data-url]").evaluate_all(
+                """elements => elements.slice(0, 240).map(element => ({
+                    url: element.href || element.getAttribute('data-href') || element.getAttribute('data-url') || '',
+                    label: (element.innerText || element.textContent || '').trim().slice(0, 160)
+                }))"""
+            )
+        except Exception:
+            rows = []
+
+        ranked: list[tuple[int, str]] = []
+        for row in rows or []:
+            if not isinstance(row, dict):
+                continue
+            raw = str(row.get("url") or "").strip()
+            if not raw:
+                continue
+            try:
+                resolved = raw if urlparse(raw).scheme else urljoin(current_url, raw)
+            except Exception:
+                continue
+            resolved_values = _same_origin_candidates(target_url, [resolved])
+            if not resolved_values:
+                continue
+            resolved = resolved_values[0]
+            if resolved in visited or resolved in queued or not _preauth_safe_candidate(target_url, resolved):
+                continue
+            score = _preauth_link_score(resolved, str(row.get("label") or ""))
+            ranked.append((score, resolved))
+
+        for score, resolved in sorted(ranked, key=lambda row: (-row[0], len(row[1]), row[1]))[:max_candidates]:
+            if resolved in queued:
+                continue
+            queued.add(resolved)
+            queue.append((score, resolved))
+
+    return list(dict.fromkeys(selected))
+
+
 def _same_origin_candidates(target_url: str, values: Iterable[str]) -> list[str]:
     selected: list[str] = []
     for raw in values:
@@ -192,19 +326,16 @@ def browser_oidc_login_session(
 
     timeout_seconds = max(15, int(credential.get("timeout_seconds") or 60))
     headless = bool(credential.get("headless", True))
-    login_path = str(credential.get("login_path") or "/").strip() or "/"
-    validation_path = str(credential.get("validation_path") or login_path).strip() or login_path
-
+    configured_login_path = str(credential.get("login_path") or "").strip()
+    configured_validation_path = str(credential.get("validation_path") or "").strip()
     explicit_candidates = _same_origin_candidates(target_url, candidate_urls or [])
-    configured_candidates = _same_origin_candidates(
-        target_url,
-        [
-            *[str(value) for value in credential.get("sibling_login_paths") or []],
-            login_path,
-            validation_path,
-            origin + "/",
-        ],
-    ) if include_configured_fallbacks else []
+    configured_values = [*[str(value) for value in credential.get("sibling_login_paths") or []]]
+    if configured_login_path:
+        configured_values.append(configured_login_path)
+    if configured_validation_path:
+        configured_values.append(configured_validation_path)
+    configured_values.extend([target_url, origin + "/"])
+    configured_candidates = _same_origin_candidates(target_url, configured_values) if include_configured_fallbacks else []
     candidates = []
     for value in [*explicit_candidates, *configured_candidates]:
         if value not in candidates:
@@ -266,6 +397,28 @@ def browser_oidc_login_session(
 
         page.on("request", record_auth_request)
         try:
+            # login_path is an optional optimization, not a requirement. For the initial target only,
+            # when it is omitted, spend a small fraction of the existing login deadline on generic
+            # same-origin pre-auth discovery. Explicit/configured entry points still take priority.
+            if initial_login and not configured_login_path and time.monotonic() < deadline:
+                remaining = max(0.0, deadline - time.monotonic())
+                preauth_seconds = min(8.0, max(2.0, remaining * 0.20))
+                preauth_deadline = min(deadline, time.monotonic() + preauth_seconds)
+                discovered_candidates = _discover_pre_auth_candidates(page, target_url, preauth_deadline)
+                if discovered_candidates:
+                    print(
+                        f"[AUTH] login_path not configured; bounded same-origin pre-auth discovery found "
+                        f"{len(discovered_candidates)} candidate login entry point(s)."
+                    )
+                    merged_candidates: list[str] = []
+                else:
+                    print("[AUTH] login_path not configured; bounded same-origin pre-auth discovery found no stronger entry point, using normal root/target fallbacks.")
+                if discovered_candidates:
+                    for value in [*explicit_candidates, *discovered_candidates, *candidates]:
+                        if value not in merged_candidates:
+                            merged_candidates.append(value)
+                    candidates = merged_candidates
+
             for candidate in candidates:
                 if time.monotonic() >= deadline:
                     break
