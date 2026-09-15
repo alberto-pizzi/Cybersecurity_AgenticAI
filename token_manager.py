@@ -66,7 +66,7 @@ class TokenManager:
         header = {'Content-Type': 'application/x-www-form-urlencoded'}
         url_token = "https://www.snap4city.org/auth/realms/master/protocol/openid-connect/token"
         try:
-            response = requests.post(url_token, data=payload, headers=header, timeout=TOKEN_HTTP_TIMEOUT)
+            response = requests.post(url_token, data=payload, headers=header, timeout=TOKEN_HTTP_TIMEOUT, allow_redirects=False)
             print(f"[GET_TOKEN_VIA_USER_CREDENTIALS] - Response status code: {response.status_code}")
             return response.json()
         except (requests.RequestException, ValueError) as exc:
@@ -85,7 +85,7 @@ class TokenManager:
         url_token = ("https://www.snap4city.org/auth/realms/master/protocol/openid-connect/token"
                      "")
         try:
-            response = requests.post(url_token, data=payload, headers=header, timeout=TOKEN_HTTP_TIMEOUT)
+            response = requests.post(url_token, data=payload, headers=header, timeout=TOKEN_HTTP_TIMEOUT, allow_redirects=False)
             print(f"[GET_TOKEN_VIA_REFRESH_TOKEN] - Status code response: {response.status_code}")
             return response.json()
         except (requests.RequestException, ValueError) as exc:

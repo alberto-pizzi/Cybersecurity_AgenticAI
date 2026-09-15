@@ -49,6 +49,28 @@ def _context_summary_html(context: dict[str, Any], toc: list[tuple[int, str, str
         ))
     if context.get("expected_tools"):
         run_rows.append(("Expected tools", _esc(", ".join(str(t) for t in context["expected_tools"]))))
+    rate_policy = context.get("request_rate_policy") if isinstance(context.get("request_rate_policy"), dict) else {}
+    if rate_policy:
+        effective = rate_policy.get("effective", "")
+        requested = rate_policy.get("requested", "")
+        source = "configured" if rate_policy.get("configured") else "default"
+        rate_text = f"{effective:g} requests/second ({source}; accepted integer range 1-50)" if isinstance(effective, (int, float)) else f"{effective} requests/second ({source}; accepted integer range 1-50)"
+        if rate_policy.get("fallback_applied"):
+            rate_text += f"; requested {requested!r} was rejected and the default was used: {rate_policy.get('fallback_reason') or 'invalid value'}"
+        run_rows.append(("Active-scanner request rate", _esc(rate_text)))
+    if context.get("allow_same_host_ports") is not None:
+        run_rows.append((
+            "Same-host multi-port authorization",
+            "Enabled - other ports on an already-authorized exact hostname may be discovered/tested on the same scheme"
+            if bool(context.get("allow_same_host_ports"))
+            else "Disabled - additional ports require an explicit authorized origin/service",
+        ))
+    auth_scope_policy = str(context.get("authentication_scope_policy") or "").strip()
+    if auth_scope_policy:
+        run_rows.append(("Authentication reuse policy", _esc(auth_scope_policy)))
+    redirect_policy = str(context.get("redirect_scope_policy") or "").strip()
+    if redirect_policy:
+        run_rows.append(("Redirect / active-scope policy", _esc(redirect_policy)))
     if run_rows:
         parts.append(_heading(3, "Run configuration", toc) + dl(run_rows))
 
@@ -163,22 +185,64 @@ def _context_summary_html(context: dict[str, Any], toc: list[tuple[int, str, str
             http_done = int(budget.get("http_pages_processed", 0) or 0)
             http_overflow = int(budget.get("http_adaptive_overflow_used", 0) or 0)
             http_left = int(budget.get("http_remaining_candidates", 0) or 0)
+            http_attempts = int(budget.get("http_requests_attempted", 0) or 0)
+            http_attempt_budget = int(budget.get("http_attempt_budget", 0) or 0)
+            dead_http = int(budget.get("dead_http_404_410", 0) or 0)
             browser_base = int(budget.get("browser_page_budget", 0) or 0)
             browser_max = int(budget.get("browser_page_max_budget", browser_base) or browser_base)
             browser_done = int(budget.get("browser_pages_attempted", 0) or 0)
             browser_overflow = int(budget.get("browser_adaptive_overflow_used", 0) or 0)
             browser_left = int(budget.get("browser_remaining_candidates", 0) or 0)
+            browser_nav_retries = int(budget.get("browser_navigation_retries", 0) or 0)
+            browser_dom_retries = int(budget.get("browser_dom_retries", 0) or 0)
+            dead_browser = int(budget.get("browser_dead_404_410", 0) or 0)
             script_done = int(budget.get("scripts_processed", 0) or 0)
             script_budget = int(budget.get("script_budget", 0) or 0)
+            script_attempts = int(budget.get("script_requests_attempted", 0) or 0)
+            script_attempt_budget = int(budget.get("script_attempt_budget", 0) or 0)
+            script_deferred = int(budget.get("script_candidates_deferred", 0) or 0)
+            route_variants_skipped = int(budget.get("route_variants_skipped", 0) or 0)
+            origin_budget_skipped = int(budget.get("origin_budget_skipped", 0) or 0)
             families = int(budget.get("application_families_visited", 0) or 0)
             pieces = [
                 f"HTTP useful pages {http_done}/{http_base} base, max {http_max}, overflow {http_overflow}, queued {http_left}",
                 f"Chromium {browser_done}/{browser_base} base, max {browser_max}, overflow {browser_overflow}, queued {browser_left}",
-                f"scripts {script_done}/{script_budget}",
+                f"scripts inspected {script_done}/{script_budget}",
             ]
+            if http_attempt_budget:
+                pieces.append(f"HTTP attempts {http_attempts}/{http_attempt_budget}, dead 404/410 {dead_http}")
+            if browser_nav_retries or browser_dom_retries or dead_browser:
+                pieces.append(f"Chromium retries navigation/DOM {browser_nav_retries}/{browser_dom_retries}, dead 404/410 {dead_browser}")
+            if script_attempt_budget:
+                pieces.append(f"script attempts {script_attempts}/{script_attempt_budget}, deferred {script_deferred}")
+            if route_variants_skipped or origin_budget_skipped:
+                pieces.append(f"deduplicated route variants {route_variants_skipped}, origin-budget skips {origin_budget_skipped}")
             if families:
                 pieces.append(f"application families visited {families}")
             rows.append(("Discovery budget", _esc(" | ".join(pieces))))
+            out_scope_count = int(budget.get("out_of_scope_urls_skipped", 0) or 0)
+            out_scope_origins = budget.get("out_of_scope_origins_observed") if isinstance(budget.get("out_of_scope_origins_observed"), list) else []
+            if out_scope_count or out_scope_origins:
+                preview = ", ".join(str(value) for value in out_scope_origins[:6])
+                suffix = f", +{len(out_scope_origins) - 6} more" if len(out_scope_origins) > 6 else ""
+                text = f"{out_scope_count} URL(s) across {len(out_scope_origins)} origin(s) observed but not queued for active testing"
+                if preview:
+                    text += f": {preview}{suffix}"
+                rows.append(("Out-of-scope observations", _esc(text)))
+            browser_external_origins = budget.get("browser_external_origins_observed") if isinstance(budget.get("browser_external_origins_observed"), list) else []
+            browser_external_requests = int(budget.get("browser_external_subresource_requests", 0) or 0)
+            browser_blocked_navigations = int(budget.get("browser_external_navigation_requests_blocked", 0) or 0)
+            if browser_external_origins or browser_external_requests or browser_blocked_navigations:
+                preview = ", ".join(str(value) for value in browser_external_origins[:6])
+                suffix = f", +{len(browser_external_origins) - 6} more" if len(browser_external_origins) > 6 else ""
+                text = (
+                    f"{browser_external_requests} ordinary external Chromium subresource request(s); "
+                    f"{browser_blocked_navigations} external top-level navigation(s) blocked. "
+                    "These origins were browser dependencies only and were not queued for active testing"
+                )
+                if preview:
+                    text += f": {preview}{suffix}"
+                rows.append(("Browser external-origin traffic", _esc(text)))
 
         sibling_auth = data.get("runtime_sibling_authentication") if isinstance(data.get("runtime_sibling_authentication"), list) else []
         if sibling_auth:

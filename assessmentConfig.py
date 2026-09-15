@@ -13,6 +13,7 @@ SUPPORTED_WEB_PROTOCOLS = {"http", "https"}
 SUPPORTED_ORCHESTRATORS = {"deterministic", "agentic"}
 SUPPORTED_MODES = {"fast", "balanced", "deep"}
 SUPPORTED_MODELS = {"snap4city", "llama", "qwen"}
+SUPPORTED_CREDENTIAL_KINDS = {"cookie", "browser_oidc", "snap4city_oidc"}
 
 
 # Loads and validates the platform-level assessment configuration.
@@ -51,9 +52,17 @@ def load_assessment_config(path: str | Path) -> dict[str, Any]:
     execution["model"] = model
     if "allow_state_changes" in execution and not isinstance(execution.get("allow_state_changes"), bool):
         raise ValueError("execution.allow_state_changes must be true or false when supplied.")
+    if "require_ai" in execution and not isinstance(execution.get("require_ai"), bool):
+        raise ValueError("execution.require_ai must be true or false when supplied.")
+    if "max_rounds" in execution:
+        value = execution.get("max_rounds")
+        if isinstance(value, bool) or not isinstance(value, int) or value not in {1, 2, 3}:
+            raise ValueError("execution.max_rounds must be one of 1, 2 or 3 when supplied.")
     _validate_authorization(payload.get("authorization") or {})
     _validate_assets(assets)
-    _validate_credentials(payload.get("credentials") or {})
+    credentials = payload.get("credentials") or {}
+    _validate_credentials(credentials)
+    _validate_credential_references(assets, credentials)
     _validate_reporting(payload.get("reporting"))
     return payload
 
@@ -75,6 +84,8 @@ def _validate_authorization(authorization: Any) -> None:
         raise ValueError("authorization must be a JSON object when supplied.")
     if "confirmed" in authorization and not isinstance(authorization.get("confirmed"), bool):
         raise ValueError("authorization.confirmed must be true or false when supplied.")
+    if "allow_same_host_ports" in authorization and not isinstance(authorization.get("allow_same_host_ports"), bool):
+        raise ValueError("authorization.allow_same_host_ports must be true or false when supplied.")
     origins = authorization.get("allowed_origins", [])
     if origins is not None:
         if not isinstance(origins, list) or not all(isinstance(value, str) and value.strip() for value in origins):
@@ -90,15 +101,13 @@ def _validate_authorization(authorization: Any) -> None:
             except ValueError as exc:
                 raise ValueError(f"Invalid port in authorization.allowed_origins entry: {value!r}") from exc
     suffixes = authorization.get("allowed_host_suffixes", [])
-    if suffixes is not None:
-        if not isinstance(suffixes, list) or not all(isinstance(value, str) and value.strip() for value in suffixes):
-            raise ValueError("authorization.allowed_host_suffixes must be a list of non-empty DNS suffixes.")
-        for value in suffixes:
-            suffix = value.strip().lower().lstrip(".").rstrip(".")
-            if not suffix or "://" in suffix or "/" in suffix or ":" in suffix or " " in suffix:
-                raise ValueError(f"Invalid authorization.allowed_host_suffixes entry: {value!r}")
-    if (origins or suffixes) and authorization.get("confirmed") is not True:
-        raise ValueError("authorization.allowed_origins/allowed_host_suffixes require authorization.confirmed=true.")
+    if suffixes:
+        raise ValueError(
+            "authorization.allowed_host_suffixes is not accepted for active testing. "
+            "Authorize additional HTTP origins explicitly with authorization.allowed_origins, or enable authorization.allow_same_host_ports only when site-level authorization covers discovered ports of the same hostname/scheme."
+        )
+    if origins and authorization.get("confirmed") is not True:
+        raise ValueError("authorization.allowed_origins requires authorization.confirmed=true.")
 
 
 # Public validation entry point used by the runner after applying CLI scope overrides.
@@ -133,8 +142,9 @@ def _validate_assets(assets: list[Any]) -> None:
             if global_id in seen_services:
                 raise ValueError(f"Duplicate service id: {global_id}")
             seen_services.add(global_id)
-            if "allow_state_changes" in service and not isinstance(service.get("allow_state_changes"), bool):
-                raise ValueError(f"allow_state_changes for {global_id} must be true or false when supplied.")
+            for field in ("enabled", "auth_only", "allow_state_changes"):
+                if field in service and not isinstance(service.get(field), bool):
+                    raise ValueError(f"{field} for {global_id} must be true or false when supplied.")
 
             absolute_url = str(service.get("url") or "").strip()
             if absolute_url:
@@ -181,6 +191,22 @@ def _validate_assets(assets: list[Any]) -> None:
                     raise ValueError(f"Port out of range for {global_id}: {numeric_port}")
 
 
+# Validates that every service credential reference resolves before a dry-run can be accepted.
+def _validate_credential_references(assets: list[Any], credentials: dict[str, Any]) -> None:
+    for asset in assets:
+        asset_id = str(asset.get("id") or "").strip()
+        for service in asset.get("services") or []:
+            service_id = str(service.get("id") or "").strip()
+            global_id = f"{asset_id}/{service_id}"
+            primary_ref = str(service.get("credential_ref") or "").strip()
+            secondary_ref = str(service.get("secondary_credential_ref") or "").strip()
+            for field, reference in (("credential_ref", primary_ref), ("secondary_credential_ref", secondary_ref)):
+                if reference and reference not in credentials:
+                    raise ValueError(f"Unknown {field} {reference!r} for service {global_id}.")
+            if service.get("auth_only") is True and not primary_ref:
+                raise ValueError(f"Service {global_id} sets auth_only=true but has no credential_ref.")
+
+
 # Validates secret references without resolving or persisting the secret values.
 def _validate_credentials(credentials: Any) -> None:
     if not isinstance(credentials, dict):
@@ -191,11 +217,13 @@ def _validate_credentials(credentials: Any) -> None:
         kind = str(credential.get("kind") or "").strip().lower()
         if not kind:
             raise ValueError(f"Credential {name!r} requires kind.")
+        if kind not in SUPPORTED_CREDENTIAL_KINDS:
+            raise ValueError(f"Credential {name!r} kind must be one of {sorted(SUPPORTED_CREDENTIAL_KINDS)}.")
         if "optional" in credential and not isinstance(credential.get("optional"), bool):
             raise ValueError(f"Credential {name!r} optional must be true or false when supplied.")
         if kind == "cookie" and not (credential.get("env") or credential.get("value")):
             raise ValueError(f"Cookie credential {name!r} requires env or value.")
-        if kind == "snap4city_oidc":
+        if kind in {"browser_oidc", "snap4city_oidc"}:
             for field in ("username_env", "password_env", "cookie_env", "login_path", "validation_path"):
                 if field in credential and not isinstance(credential.get(field), str):
                     raise ValueError(f"Credential {name!r} field {field} must be a string when supplied.")

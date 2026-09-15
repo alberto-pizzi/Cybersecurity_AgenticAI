@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import re
 import shutil
 import subprocess
+import threading
 import time
 from pathlib import Path
 from typing import Any, Iterable
@@ -17,6 +19,92 @@ SERVERS_DIR = ROOT_DIR / "servers"
 REPORTS_DIR = ROOT_DIR / "reports"
 WORDLISTS_DIR = ROOT_DIR / "wordlists"
 LOCAL_BIN = Path.home() / ".local" / "bin"
+
+# Shared assessment traffic policy. The assessment configuration selects the effective
+# per-active-scanner request rate. Ten requests/second is the project default. Integer values
+# from 1 through 50 are accepted. Invalid, fractional, non-finite, non-positive or above-cap values fall back
+# to the default instead of being silently clamped, so an accidental value cannot create a
+# substantially different traffic profile than the operator intended.
+DEFAULT_REQUEST_RATE = 10.0
+REQUEST_RATE_HARD_CAP = 50.0
+_REQUEST_RATE_UNSET = object()
+
+def scanner_request_rate_policy(value: Any = _REQUEST_RATE_UNSET) -> dict[str, Any]:
+    use_environment = value is _REQUEST_RATE_UNSET
+    env_value = os.getenv("SECOPS_MAX_REQUEST_RATE") if use_environment else None
+    raw = env_value if env_value not in (None, "") else (DEFAULT_REQUEST_RATE if use_environment else value)
+    fallback_reason = ""
+    try:
+        if isinstance(raw, bool):
+            raise ValueError("boolean request rate is not valid")
+        rate = float(raw)
+    except (TypeError, ValueError):
+        rate = DEFAULT_REQUEST_RATE
+        fallback_reason = "invalid request-rate value"
+    if not math.isfinite(rate):
+        rate = DEFAULT_REQUEST_RATE
+        fallback_reason = "non-finite request-rate value"
+    elif not rate.is_integer():
+        rate = DEFAULT_REQUEST_RATE
+        fallback_reason = "request rate must be an integer number of requests/second"
+    elif rate < 1.0:
+        rate = DEFAULT_REQUEST_RATE
+        fallback_reason = "request rate must be at least 1 request/second"
+    elif rate > REQUEST_RATE_HARD_CAP:
+        rate = DEFAULT_REQUEST_RATE
+        fallback_reason = f"request rate exceeds the maximum of {REQUEST_RATE_HARD_CAP:g} requests/second"
+    return {
+        "requested": raw,
+        "effective": rate,
+        "default": DEFAULT_REQUEST_RATE,
+        "hard_cap": REQUEST_RATE_HARD_CAP,
+        "fallback_applied": bool(fallback_reason),
+        "fallback_reason": fallback_reason,
+    }
+
+def scanner_request_rate(value: Any = _REQUEST_RATE_UNSET) -> float:
+    return float(scanner_request_rate_policy(value)["effective"])
+
+
+class RequestRatePacer:
+    """Per-tool-call HTTP pacer shared by project-controlled request helpers.
+
+    The orchestrators execute specialist tools sequentially, but one custom checker can issue
+    several requests of its own. Reusing one pacer for the whole checker keeps those requests
+    under the configured assessment rate, including each redirect hop and retry.
+    """
+
+    def __init__(self, request_rate: Any = _REQUEST_RATE_UNSET) -> None:
+        self.rate = scanner_request_rate(request_rate)
+        self.interval_seconds = 1.0 / self.rate
+        self._last_request_at = 0.0
+        self._lock = threading.Lock()
+
+    def wait(self) -> None:
+        with self._lock:
+            now = time.monotonic()
+            delay = self.interval_seconds - (now - self._last_request_at)
+            if delay > 0:
+                time.sleep(delay)
+            self._last_request_at = time.monotonic()
+
+
+def runtime_request_rate_policy() -> dict[str, Any]:
+    policy = scanner_request_rate_policy()
+    requested = os.getenv("SECOPS_REQUEST_RATE_REQUESTED")
+    if requested not in (None, ""):
+        policy["requested"] = requested
+    configured = os.getenv("SECOPS_REQUEST_RATE_CONFIGURED")
+    if configured is not None:
+        policy["configured"] = configured == "1"
+        policy["source"] = "execution.request_rate" if policy["configured"] else "default"
+    fallback = os.getenv("SECOPS_REQUEST_RATE_FALLBACK")
+    if fallback is not None:
+        policy["fallback_applied"] = fallback == "1"
+    reason = os.getenv("SECOPS_REQUEST_RATE_FALLBACK_REASON")
+    if reason is not None:
+        policy["fallback_reason"] = reason
+    return policy
 
 
 MCP_HTTP_HOST = "127.0.0.1"
@@ -138,7 +226,10 @@ def _url_origin_parts(url: str) -> tuple[str, str, int] | None:
     try:
         parsed = urlparse(str(url or "").strip())
         scheme = str(parsed.scheme or "").lower()
-        host = str(parsed.hostname or "").lower()
+        # A terminal DNS dot denotes the same absolute hostname (example.com. == example.com).
+        # Normalize it centrally so exact-origin and same-host-port decisions do not disagree with
+        # browser/DNS semantics merely because one discovered URL used the absolute form.
+        host = str(parsed.hostname or "").lower().rstrip(".")
         if scheme not in {"http", "https"} or not host:
             return None
         port = parsed.port or (443 if scheme == "https" else 80)
@@ -220,17 +311,19 @@ def apply_runtime_target_preparation(target: str, cookies: str) -> dict[str, Any
             outcomes.append({"url": url, "error": "cross-origin preparation request rejected"})
             continue
         try:
-            response = session.request(
-                method, url, data=str(item.get("data") or "") if method == "POST" else None,
-                timeout=(4, 15), allow_redirects=True,
+            response = request_same_origin_redirects(
+                method, url, session=session, data=str(item.get("data") or "") if method == "POST" else None,
+                timeout=(4, 15),
             )
             accepted = item.get("accepted_statuses", [200, 204, 302])
             accepted_set = {int(value) for value in accepted if str(value).isdigit()}
-            ok = response.status_code in accepted_set if accepted_set else response.status_code < 400
+            redirect_guard = str(response.headers.get("X-SecOps-Redirect-Guard") or "")
+            ok = (not redirect_guard) and (response.status_code in accepted_set if accepted_set else response.status_code < 400)
             usable = usable and ok
             outcomes.append({
                 "method": method, "url": url, "status": response.status_code,
                 "final_url": str(response.url), "accepted": ok,
+                "redirect_guard": redirect_guard,
             })
         except requests.RequestException as exc:
 
@@ -253,13 +346,22 @@ def request_with_retries(
     *,
     attempts: int = 3,
     backoff_seconds: float = 0.65,
+    pacer: RequestRatePacer | None = None,
+    request_rate: Any = _REQUEST_RATE_UNSET,
     **kwargs: Any,
 ) -> tuple[requests.Response | None, list[str]]:
 
 
     errors: list[str] = []
+    active_pacer = pacer or RequestRatePacer(request_rate)
     for attempt in range(max(1, int(attempts))):
         try:
+            if kwargs.get("allow_redirects"):
+                return request_same_origin_redirects(method, url, pacer=active_pacer, **kwargs), errors
+            # Scanner helpers never inherit Requests' method-dependent redirect defaults. A caller
+            # must opt in explicitly; opt-in follow is always routed through the same-origin guard.
+            kwargs["allow_redirects"] = False
+            active_pacer.wait()
             return requests.request(method=method, url=url, **kwargs), errors
         except (requests.Timeout, requests.ConnectionError) as exc:
             errors.append(f"{type(exc).__name__}: {exc}")
@@ -279,6 +381,9 @@ def scanner_session_probe(
     data: str = "",
     timeout: int = 12,
     attempts: int = 3,
+    *,
+    pacer: RequestRatePacer | None = None,
+    request_rate: Any = _REQUEST_RATE_UNSET,
 ) -> dict[str, Any]:
 
 
@@ -292,6 +397,8 @@ def scanner_session_probe(
         headers={"Cookie": cookies, "Cache-Control": "no-cache"},
         timeout=(4, max(6, int(timeout))),
         allow_redirects=True,
+        pacer=pacer,
+        request_rate=request_rate,
     )
     if response is None:
         return {
@@ -302,7 +409,24 @@ def scanner_session_probe(
             "errors": errors,
             "error": errors[-1] if errors else "request failed",
         }
+    redirect_guard = str(response.headers.get("X-SecOps-Redirect-Guard") or "")
     login = response_looks_like_login(response)
+    if redirect_guard:
+        diagnosis = "cross_origin_redirect_blocked" if redirect_guard == "cross-origin-blocked" else "redirect_limit_reached"
+        return {
+            "performed": True,
+            "authenticated": None,
+            "conclusive": False,
+            "transient_error": False,
+            "diagnosis": diagnosis,
+            "status": int(response.status_code),
+            "final_url": str(response.url),
+            "login_detected": login,
+            "redirect_guard": redirect_guard,
+            "location": str(response.headers.get("Location") or ""),
+            "bytes": len(response.content),
+            "attempt_errors": errors,
+        }
     authenticated = response.status_code < 400 and not login
     return {
         "performed": True,
@@ -366,13 +490,78 @@ def normalized_origin(url: str) -> str:
     return f"{scheme}://{host_fragment}{port_fragment}"
 
 
-# Host-suffix matching is boundary-aware so example.org never authorizes notexample.org.
-def host_matches_authorized_suffix(host: str, suffix: str) -> bool:
-    candidate = str(host or "").strip().lower().rstrip(".")
-    allowed = str(suffix or "").strip().lower().lstrip(".").rstrip(".")
-    if not candidate or not allowed or "/" in allowed or "://" in allowed:
-        return False
-    return candidate == allowed or candidate.endswith("." + allowed)
+# Builds an anchored regular expression for exactly one HTTP origin. Default ports are
+# accepted in both implicit and explicit form because they represent the same effective origin.
+def exact_origin_authority_regex(url: str) -> str:
+    parts = _url_origin_parts(url)
+    if parts is None:
+        return r"(?!)"
+    scheme, host, port = parts
+    host_fragment = f"[{host}]" if ":" in host and not host.startswith("[") else host
+    default_port = 80 if scheme == "http" else 443
+    port_fragment = rf"(?::{port})?" if port == default_port else re.escape(f":{port}")
+    return rf"(?i:{re.escape(scheme)}://{re.escape(host_fragment)}{port_fragment})"
+
+
+# Matches only URLs on the exact scheme/host/effective-port origin, never hostname prefixes.
+def exact_origin_url_regex(url: str) -> str:
+    return rf"^{exact_origin_authority_regex(url)}(?:[/?#].*)?$"
+
+
+# Follows redirect chains only while every hop remains on the starting origin.
+def request_same_origin_redirects(
+    method: str, url: str, *, max_redirects: int = 5, session: requests.Session | None = None,
+    pacer: RequestRatePacer | None = None, request_rate: Any = _REQUEST_RATE_UNSET, **kwargs: Any,
+) -> requests.Response:
+    """Send one HTTP request and follow redirects only while they remain on the starting origin.
+
+    A redirect to another origin is returned as the final response and is never requested. This keeps
+    normal application redirects working without allowing a scanner helper to escape the authorized
+    target merely because the server emitted a Location header.
+    """
+    start = str(url or '')
+    current = start
+    kwargs = dict(kwargs)
+    kwargs.pop('allow_redirects', None)
+    response: requests.Response | None = None
+    active_pacer = pacer or RequestRatePacer(request_rate)
+    for _ in range(max(0, int(max_redirects)) + 1):
+        requester = session.request if session is not None else requests.request
+        active_pacer.wait()
+        response = requester(method, current, allow_redirects=False, **kwargs)
+        if response.status_code not in {301, 302, 303, 307, 308}:
+            return response
+        location = str(response.headers.get('Location') or '').strip()
+        if not location:
+            return response
+        candidate = urljoin(current, location)
+        if not same_origin(start, candidate):
+            response.headers['X-SecOps-Redirect-Guard'] = 'cross-origin-blocked'
+            return response
+        method_upper = str(method).upper()
+        # Match Requests/browser redirect method rebuilding: 303 and 302 become GET for every
+        # non-HEAD method; historical 301 changes POST to GET; 307/308 preserve method/body.
+        switch_to_get = (
+            (response.status_code == 303 and method_upper != 'HEAD')
+            or (response.status_code == 302 and method_upper != 'HEAD')
+            or (response.status_code == 301 and method_upper == 'POST')
+        )
+        if switch_to_get:
+            method = 'GET'
+            kwargs.pop('data', None)
+            kwargs.pop('json', None)
+            headers = kwargs.get('headers')
+            if isinstance(headers, dict):
+                # A redirected GET must not inherit entity headers from the original request.
+                headers = dict(headers)
+                for header_name in list(headers):
+                    if str(header_name).lower() in {'content-length', 'content-type', 'transfer-encoding'}:
+                        headers.pop(header_name, None)
+                kwargs['headers'] = headers
+        current = candidate
+    assert response is not None
+    response.headers['X-SecOps-Redirect-Guard'] = 'redirect-limit-reached'
+    return response
 
 
 # Explicit assessment scope may extend beyond one origin without implicitly trusting unrelated external hosts.
@@ -380,7 +569,7 @@ def url_in_authorized_scope(
     target: str,
     candidate: str,
     authorized_origins: list[str] | tuple[str, ...] | set[str] | None = None,
-    authorized_host_suffixes: list[str] | tuple[str, ...] | set[str] | None = None,
+    allow_same_host_ports: bool = False,
 ) -> bool:
     if same_origin(target, candidate):
         return True
@@ -391,8 +580,22 @@ def url_in_authorized_scope(
     exact_origins = {normalized_origin(value) for value in (authorized_origins or []) if normalized_origin(value)}
     if candidate_origin in exact_origins:
         return True
-    host = candidate_parts[1]
-    return any(host_matches_authorized_suffix(host, suffix) for suffix in (authorized_host_suffixes or []))
+    if allow_same_host_ports:
+        candidate_scheme, candidate_host, _ = candidate_parts
+        bases = [target, *(authorized_origins or [])]
+        for value in bases:
+            parts = _url_origin_parts(str(value or ''))
+            if parts is None:
+                continue
+            scheme, host, _ = parts
+            # Multi-port authorization expands only the port for an already authorized exact
+            # hostname on the same HTTP scheme. It never authorizes sibling/prefix domains or
+            # an HTTP<->HTTPS protocol change implicitly.
+            if scheme == candidate_scheme and host == candidate_host:
+                return True
+    # DNS suffixes are intentionally not an active-attack authorization mechanism.
+    # A discovered sibling host must be listed as an exact authorized origin before it can be tested.
+    return False
 
 
 # Response previews keep a short printable body excerpt for diagnostics.

@@ -19,6 +19,7 @@ import subprocess
 import sys
 import sysconfig
 import time
+import threading
 import traceback
 import uuid
 import warnings
@@ -35,8 +36,8 @@ import requests
 with warnings.catch_warnings():
     warnings.simplefilter('ignore')
     from fastmcp import Client
-from utils import apply_runtime_target_preparation, absolute_url, canonical_cookie_header, cookie_names, load_runtime_config, normalize_url, normalized_origin, parse_cookie_header, ROOT_DIR, same_origin, sanitize_discovered_url, scanner_session_probe, SERVERS_DIR, target_runtime_profile, url_in_authorized_scope as _url_in_explicit_scope, MCP_UNIFIED_SERVICE, mcp_http_port, mcp_http_url
-from targetAuth import snap4city_browser_login_session
+from utils import apply_runtime_target_preparation, absolute_url, canonical_cookie_header, cookie_names, load_runtime_config, normalize_url, normalized_origin, parse_cookie_header, request_same_origin_redirects, ROOT_DIR, same_origin, sanitize_discovered_url, scanner_session_probe, SERVERS_DIR, target_runtime_profile, url_in_authorized_scope as _url_in_explicit_scope, MCP_UNIFIED_SERVICE, mcp_http_port, mcp_http_url, scanner_request_rate, runtime_request_rate_policy
+from targetAuth import _looks_like_application_login_entry, browser_oidc_login_session
 ROOT = Path(ROOT_DIR).resolve()
 SERVERS = Path(SERVERS_DIR).resolve()
 RUNTIME_FILE = ROOT / '.secops_runtime.json'
@@ -56,6 +57,23 @@ MCP_REPORT_RENDER_SECONDS_PER_MIB = max(0.0, float(os.getenv('SECOPS_MCP_REPORT_
 MCP_REPORT_RENDER_TIMEOUT_MAX = max(MCP_REPORT_RENDER_TIMEOUT, float(os.getenv('SECOPS_MCP_REPORT_RENDER_TIMEOUT_MAX', '7200')))
 MAX_PARAMETER_ENDPOINTS = max(1, int(os.getenv('SECOPS_MAX_PARAMETER_ENDPOINTS', '5')))
 TERMINAL_URL_MAX = max(120, int(os.getenv('SECOPS_TERMINAL_URL_MAX', '240')))
+
+MAX_REQUEST_RATE = scanner_request_rate()
+REQUEST_INTERVAL_SECONDS = 1.0 / MAX_REQUEST_RATE
+_LAST_HTTP_REQUEST_AT = 0.0
+_HTTP_PACE_LOCK = threading.Lock()
+
+def _pace_http_request() -> None:
+    global _LAST_HTTP_REQUEST_AT
+    # Discovery can run from worker threads. Serialize the pacer itself so two callers cannot
+    # both observe the same timestamp and emit an unintended short burst.
+    with _HTTP_PACE_LOCK:
+        now = time.monotonic()
+        wait = REQUEST_INTERVAL_SECONDS - (now - _LAST_HTTP_REQUEST_AT)
+        if wait > 0:
+            time.sleep(wait)
+        _LAST_HTTP_REQUEST_AT = time.monotonic()
+
 
 # Keeps terminal output readable without altering the full URL stored in results, JSON or reports.
 def compact_log_url(value: Any, max_length: int | None=None) -> str:
@@ -87,23 +105,25 @@ def compact_log_url(value: Any, max_length: int | None=None) -> str:
     return text[:limit - 3] + '...'
 MAX_ARJUN_ENDPOINTS = max(1, int(os.getenv('SECOPS_MAX_ARJUN_ENDPOINTS', '12')))
 MAX_CRAWL_PAGES = max(10, int(os.getenv('SECOPS_MAX_CRAWL_PAGES', '650')))
-MAX_SCRIPT_ASSETS = max(4, int(os.getenv('SECOPS_MAX_SCRIPT_ASSETS', '192')))
+MAX_SCRIPT_ASSETS = max(4, int(os.getenv('SECOPS_MAX_SCRIPT_ASSETS', '384')))
 SCANNER_PROGRESS_INTERVAL = max(10, int(os.getenv('SECOPS_PROGRESS_INTERVAL', '30')))
 DISCOVERY_LIMITS = {
-    'fast': {'crawl_pages': 70, 'crawl_pages_max': 110, 'browser_pages': 36, 'browser_pages_max': 80, 'browser_per_origin_pages': 80, 'browser_menu_clicks_per_page': 6, 'scripts': 32, 'route_variants': 4, 'per_origin_pages': 100},
-    'balanced': {'crawl_pages': 280, 'crawl_pages_max': 420, 'browser_pages': 160, 'browser_pages_max': 400, 'browser_per_origin_pages': 370, 'browser_menu_clicks_per_page': 18, 'scripts': 128, 'route_variants': 8, 'per_origin_pages': 380},
-    'deep': {'crawl_pages': 420, 'crawl_pages_max': 650, 'browser_pages': 240, 'browser_pages_max': 600, 'browser_per_origin_pages': 560, 'browser_menu_clicks_per_page': 28, 'scripts': 192, 'route_variants': 12, 'per_origin_pages': 600},
+    'fast': {'crawl_pages': 70, 'crawl_pages_max': 110, 'browser_pages': 36, 'browser_pages_max': 90, 'browser_per_origin_pages': 90, 'browser_menu_clicks_per_page': 6, 'scripts': 48, 'route_variants': 6, 'per_origin_pages': 100},
+    'balanced': {'crawl_pages': 280, 'crawl_pages_max': 420, 'browser_pages': 160, 'browser_pages_max': 520, 'browser_per_origin_pages': 480, 'browser_menu_clicks_per_page': 18, 'scripts': 256, 'route_variants': 12, 'per_origin_pages': 380},
+    'deep': {'crawl_pages': 420, 'crawl_pages_max': 650, 'browser_pages': 240, 'browser_pages_max': 720, 'browser_per_origin_pages': 660, 'browser_menu_clicks_per_page': 28, 'scripts': 384, 'route_variants': 16, 'per_origin_pages': 600},
 }
+HTTP_ATTEMPT_BUDGET_FACTORS = {'fast': 1.75, 'balanced': 2.0, 'deep': 2.0}
+SCRIPT_ATTEMPT_BUDGET_FACTORS = {'fast': 1.5, 'balanced': 1.75, 'deep': 1.75}
 FINAL_BROWSER_VERIFICATION_LIMITS = {'fast': 8, 'balanced': 40, 'deep': 120}
 FINAL_BROWSER_VERIFICATION_MAX_LIMITS = {'fast': 12, 'balanced': 64, 'deep': 180}
 JWT_TOKEN_LIMITS = {'fast': 16, 'balanced': 64, 'deep': 192}
 # Broad sibling coverage is deliberately smaller than primary-origin coverage in fast/balanced.
 # Authorized siblings remain available to specialist selectors even when they are not selected for
 # the full ZAP/Nuclei/Nikto baseline. Deep preserves the wider broad sweep.
-BROAD_SIBLING_ORIGIN_BASE_LIMITS = {'fast': 1, 'balanced': 3, 'deep': 8}
-BROAD_SIBLING_ORIGIN_MAX_LIMITS = {'fast': 2, 'balanced': 5, 'deep': 12}
+BROAD_SIBLING_ORIGIN_BASE_LIMITS = {'fast': 2, 'balanced': 5, 'deep': 10}
+BROAD_SIBLING_ORIGIN_MAX_LIMITS = {'fast': 3, 'balanced': 8, 'deep': 16}
 BROAD_SIBLING_ADAPTIVE_RATIO = 0.75
-BROAD_SIBLING_TIMEOUT_FACTORS = {'fast': 0.50, 'balanced': 0.60, 'deep': 0.75}
+BROAD_SIBLING_TIMEOUT_FACTORS = {'fast': 0.55, 'balanced': 0.75, 'deep': 0.85}
 SCAN_MODES = {
     'fast': {
         'broad': {'zap': 120, 'nuclei': 360, 'nikto': 60, 'ffuf': 50, 'session': 25},
@@ -112,45 +132,53 @@ SCAN_MODES = {
         'arjun': 45, 'arjun_limit': 3,
     },
     'balanced': {
-        'broad': {'zap': 540, 'nuclei': 900, 'nikto': 150, 'ffuf': 120, 'session': 50},
+        'broad': {'zap': 600, 'nuclei': 1200, 'nikto': 180, 'ffuf': 120, 'session': 50},
         'parameter': {'sqlmap': 180, 'dalfox': 120, 'commix': 180, 'traversal': 75, 'idor': 45, 'authorization': 70, 'browser': 120, 'workflow': 105},
         # Raised from the previous 8-12 ceiling: each case already runs with its own independent
         # per-case timeout (the 'parameter' timeouts above), so more selected cases means more total
         # wall-clock time for this phase, not less time per case. The previous ceiling was small
         # enough that, on an application with hundreds of discovered parameterized endpoints, only a
         # small fraction of the real attack surface ever reached a specialist tool in 'balanced' mode.
-        'limits': {'sqlmap': 15, 'dalfox': 15, 'commix': 12, 'traversal': 15, 'idor': 14, 'authorization': 17, 'browser': 15, 'workflow': 15},
-        'arjun': 120, 'arjun_limit': 15,
+        'limits': {'sqlmap': 24, 'dalfox': 24, 'commix': 18, 'traversal': 24, 'idor': 20, 'authorization': 28, 'browser': 24, 'workflow': 24},
+        'arjun': 120, 'arjun_limit': 24,
     },
     'deep': {
-        'broad': {'zap': 900, 'nuclei': 1500, 'nikto': 240, 'ffuf': 210, 'session': 90},
+        'broad': {'zap': 1080, 'nuclei': 1800, 'nikto': 300, 'ffuf': 210, 'session': 90},
         'parameter': {'sqlmap': 300, 'dalfox': 210, 'commix': 300, 'traversal': 120, 'idor': 90, 'authorization': 120, 'browser': 210, 'workflow': 180},
-        'limits': {'sqlmap': 18, 'dalfox': 18, 'commix': 14, 'traversal': 18, 'idor': 20, 'authorization': 24, 'browser': 20, 'workflow': 20},
-        'arjun': 180, 'arjun_limit': 18,
+        'limits': {'sqlmap': 36, 'dalfox': 36, 'commix': 24, 'traversal': 36, 'idor': 32, 'authorization': 40, 'browser': 36, 'workflow': 36},
+        'arjun': 180, 'arjun_limit': 36,
     },
 }
 # Specialist budgets have a fixed base and a bounded adaptive overflow. The overflow is
 # available only to high-value deferred request contracts selected by deterministic ranking.
 ADAPTIVE_SPECIALIST_OVERFLOW = {
     'fast': {'arjun': 1, 'sqlmap': 1, 'dalfox': 1, 'commix': 1, 'traversal': 1, 'idor': 1, 'authorization': 1, 'browser': 1, 'workflow': 1},
-    'balanced': {'arjun': 6, 'sqlmap': 6, 'dalfox': 6, 'commix': 5, 'traversal': 6, 'idor': 6, 'authorization': 6, 'browser': 6, 'workflow': 6},
-    'deep': {'arjun': 6, 'sqlmap': 6, 'dalfox': 6, 'commix': 5, 'traversal': 6, 'idor': 8, 'authorization': 8, 'browser': 6, 'workflow': 6},
+    'balanced': {'arjun': 12, 'sqlmap': 16, 'dalfox': 16, 'commix': 12, 'traversal': 16, 'idor': 12, 'authorization': 12, 'browser': 16, 'workflow': 12},
+    'deep': {'arjun': 18, 'sqlmap': 24, 'dalfox': 24, 'commix': 16, 'traversal': 24, 'idor': 16, 'authorization': 24, 'browser': 24, 'workflow': 18},
 }
 # Routing parameters that select internal files/modules are a high-confidence traversal/LFI class.
 # A separate bounded reserve prevents large menus from starving these contracts behind unrelated
 # request variants while retaining the normal specialist ranking for every other case.
-ROUTING_TRAVERSAL_RESERVE = {'fast': 16, 'balanced': 48, 'deep': 96}
+ROUTING_TRAVERSAL_RESERVE = {'fast': 16, 'balanced': 64, 'deep': 112}
 # Discovery may retain more value variants so later reasoning can see them, while request-level
 # scanners use a smaller cap for equivalent method/path/parameter shapes. Traversal is the explicit
 # exception because routing values that select different local resources receive distinct signatures.
-SPECIALIST_ROUTE_VARIANT_LIMITS = {'fast': 2, 'balanced': 3, 'deep': 4}
+SPECIALIST_ROUTE_VARIANT_LIMITS = {'fast': 2, 'balanced': 4, 'deep': 6}
 ADAPTIVE_HIGH_VALUE_PATH_HINTS = ('/api/', '/admin/', 'management', 'search', 'query', 'upload', 'download', 'callback', 'webhook', 'config', 'settings', 'profile', 'account')
 AUTHORIZED_SCOPE_ORIGINS: set[str] = set()
-AUTHORIZED_SCOPE_HOST_SUFFIXES: set[str] = set()
+ALLOW_SAME_HOST_PORTS = False
 PRIMARY_SCOPE_TARGET = ''
 AUTHENTICATED_ORIGIN_COOKIES: dict[str, str] = {}
+# A raw Cookie header tried speculatively on another authorized port can be rejected there even
+# though it remains valid on the primary origin. Cache that conclusive rejection per cookie value
+# and destination origin so later scanners do not repeat the same invalid session attempt.
+REJECTED_SPECULATIVE_RAW_COOKIE_KEYS: set[tuple[str, str]] = set()
 RUNTIME_TARGET_AUTH: dict[str, Any] = {}
 RUNTIME_AUTH_ORIGIN_LIMITS = {'fast': 12, 'balanced': 32, 'deep': 64}
+# Candidate application entry points are bounded per origin/root, but the login helper shares one
+# total deadline across all entries. This keeps authentication bounded while avoiding an arbitrary
+# fixed top-8 window on larger applications.
+RUNTIME_AUTH_ENTRY_CANDIDATE_LIMITS = {'fast': 6, 'balanced': 12, 'deep': 16}
 RUNTIME_AUTH_RECRAWL_PAGES = {'fast': 36, 'balanced': 90, 'deep': 180}
 RUNTIME_AUTH_APPLICATION_LIMITS = {'fast': 6, 'balanced': 18, 'deep': 36}
 RUNTIME_AUTH_APPLICATION_RECRAWL_PAGES = {'fast': 24, 'balanced': 72, 'deep': 150}
@@ -163,23 +191,25 @@ ARJUN_TIMEOUT = int(SCAN_MODES[CURRENT_SCAN_MODE]['arjun'])
 ARJUN_ENDPOINT_LIMIT = int(SCAN_MODES[CURRENT_SCAN_MODE].get('arjun_limit', 1))
 
 # Configures the explicit HTTP scope extension for this process; same-origin remains allowed by default.
-def configure_authorized_scope(target: str, origins: list[str] | None=None, host_suffixes: list[str] | None=None) -> None:
-    global PRIMARY_SCOPE_TARGET
+def configure_authorized_scope(
+    target: str, origins: list[str] | None=None, *, allow_same_host_ports: bool=False,
+) -> None:
+    global PRIMARY_SCOPE_TARGET, ALLOW_SAME_HOST_PORTS
     PRIMARY_SCOPE_TARGET = normalize_url(target)
+    ALLOW_SAME_HOST_PORTS = bool(allow_same_host_ports)
     AUTHORIZED_SCOPE_ORIGINS.clear()
-    AUTHORIZED_SCOPE_HOST_SUFFIXES.clear()
+    REJECTED_SPECULATIVE_RAW_COOKIE_KEYS.clear()
     for value in origins or []:
         origin = normalized_origin(str(value or '').strip())
         if origin:
             AUTHORIZED_SCOPE_ORIGINS.add(origin)
-    for value in host_suffixes or []:
-        suffix = str(value or '').strip().lower().lstrip('.').rstrip('.')
-        if suffix and '://' not in suffix and '/' not in suffix:
-            AUTHORIZED_SCOPE_HOST_SUFFIXES.add(suffix)
 
-# Returns true only for the primary origin or an explicitly authorized origin/host suffix.
+# Returns true for the primary origin, an explicitly authorized exact origin, or (when enabled)
+# another port on an already-authorized exact hostname using the same HTTP scheme.
 def url_in_authorized_scope(target: str, candidate: str) -> bool:
-    return _url_in_explicit_scope(target, candidate, AUTHORIZED_SCOPE_ORIGINS, AUTHORIZED_SCOPE_HOST_SUFFIXES)
+    return _url_in_explicit_scope(
+        target, candidate, AUTHORIZED_SCOPE_ORIGINS, allow_same_host_ports=ALLOW_SAME_HOST_PORTS,
+    )
 
 # Registers one application cookie for the exact origin that created it. The authenticated profile
 # can therefore carry several independent sibling sessions without ever copying the primary raw header.
@@ -271,15 +301,84 @@ def _merge_cookie_headers(base_header: str, overlay_header: str) -> str:
     return canonical_cookie_header('; '.join(f'{name}={value}' for name, value in values.values())) if values else ''
 
 
-# A raw Cookie header does not carry browser Domain/Path metadata and therefore remains exact-origin.
-# When an OIDC browser state is available, cookie applicability is instead reconstructed from the
-# preserved browser metadata. Browser-derived values override same-name raw values for the concrete
-# URL, while unrelated raw cookies remain available on the primary origin.
+def _raw_cookie_reuse_key(candidate: str, cookies: str) -> tuple[str, str]:
+    origin = normalized_origin(candidate)
+    try:
+        canonical = canonical_cookie_header(cookies) if cookies else ''
+    except ValueError:
+        canonical = str(cookies or '')
+    digest = hashlib.sha256(canonical.encode('utf-8', errors='replace')).hexdigest() if canonical else ''
+    return origin, digest
+
+
+def _speculative_same_host_port_raw_cookie(candidate: str, cookies: str) -> bool:
+    """True only when the primary raw Cookie header is being tried on another authorized port.
+
+    Browser storage-state cookies and origin-specific sessions are not speculative: they retain
+    enough metadata or validation evidence to select the concrete destination correctly.
+    """
+    if not cookies or not ALLOW_SAME_HOST_PORTS:
+        return False
+    base = PRIMARY_SCOPE_TARGET or candidate
+    if same_origin(base, candidate) or not url_in_authorized_scope(base, candidate):
+        return False
+    try:
+        base_parts = urlparse(base)
+        candidate_parts = urlparse(candidate)
+    except ValueError:
+        return False
+    same_host_port_extension = (
+        str(base_parts.scheme or '').lower() == str(candidate_parts.scheme or '').lower()
+        and str(base_parts.hostname or '').lower().rstrip('.') == str(candidate_parts.hostname or '').lower().rstrip('.')
+        and bool(base_parts.hostname)
+        and bool(candidate_parts.hostname)
+    )
+    if not same_host_port_extension:
+        return False
+    if _runtime_storage_cookie_header(candidate) or authenticated_origin_cookie(candidate):
+        return False
+    return _raw_cookie_reuse_key(candidate, cookies) not in REJECTED_SPECULATIVE_RAW_COOKIE_KEYS
+
+
+# A raw Cookie header does not carry browser Domain/Path metadata. It is therefore never copied to a
+# different hostname. When same-host multi-port scope is explicitly enabled, however, the raw header
+# may be tried on another authorized port of the exact same hostname and scheme because HTTP cookies
+# themselves are not port-scoped. The session precheck validates that attempt and runtime browser SSO
+# or the original username/password can repair it if the application rejects the session on that port.
+# Browser storage state remains authoritative whenever Domain/Path/Secure metadata is available.
 def scope_cookie_header(candidate: str, cookies: str) -> str:
+    # Runtime OIDC state belongs to an authenticated profile, not to the assessment process as a
+    # whole. An explicit no-cookie profile must stay anonymous even when another profile has already
+    # established sibling/application sessions in this process.
+    if not str(cookies or '').strip():
+        return ''
     runtime_header = _runtime_storage_cookie_header(candidate)
     base = PRIMARY_SCOPE_TARGET or candidate
-    if cookies and same_origin(base, candidate):
-        return _merge_cookie_headers(cookies, runtime_header)
+    raw_cookie_allowed = same_origin(base, candidate)
+    raw_reuse_key = _raw_cookie_reuse_key(candidate, cookies) if cookies else ('', '')
+    if cookies and not raw_cookie_allowed and ALLOW_SAME_HOST_PORTS and url_in_authorized_scope(base, candidate):
+        try:
+            base_parts = urlparse(base)
+            candidate_parts = urlparse(candidate)
+            raw_cookie_allowed = (
+                str(base_parts.scheme or '').lower() == str(candidate_parts.scheme or '').lower()
+                and str(base_parts.hostname or '').lower().rstrip('.') == str(candidate_parts.hostname or '').lower().rstrip('.')
+                and bool(base_parts.hostname)
+                and bool(candidate_parts.hostname)
+                and raw_reuse_key not in REJECTED_SPECULATIVE_RAW_COOKIE_KEYS
+            )
+        except ValueError:
+            raw_cookie_allowed = False
+    if cookies and raw_cookie_allowed:
+        registered = authenticated_origin_cookie(candidate)
+        # A validated session created specifically for another authorized port/origin must replace
+        # the speculative raw-cookie reuse if that first attempt failed. Browser storage metadata
+        # remains strongest because it can select path/domain-specific values for the concrete URL.
+        if runtime_header:
+            return _merge_cookie_headers(cookies, runtime_header)
+        if registered and not same_origin(base, candidate):
+            return registered
+        return canonical_cookie_header(cookies)
 
     # An origin registry entry is a compatibility marker/fallback for sessions obtained without a
     # browser storage state. Once storage-state cookie metadata exists, it is authoritative for
@@ -301,8 +400,8 @@ def _load_runtime_target_auth_state() -> dict[str, Any]:
     except (OSError, json.JSONDecodeError, ValueError) as exc:
         print(f'[AUTH] Runtime target-auth state could not be loaded: {type(exc).__name__}: {exc}', file=sys.stderr)
         return {}
-    if not isinstance(payload, dict) or str(payload.get('kind') or '') != 'snap4city_oidc':
-        print('[AUTH] Runtime target-auth state is missing a supported snap4city_oidc credential.', file=sys.stderr)
+    if not isinstance(payload, dict) or str(payload.get('kind') or '') not in {'browser_oidc', 'snap4city_oidc'}:
+        print('[AUTH] Runtime target-auth state is missing a supported browser_oidc credential.', file=sys.stderr)
         return {}
     return payload
 
@@ -320,7 +419,7 @@ def configure_runtime_target_auth(primary_target: str, primary_cookie: str) -> N
     declared_primary = normalized_origin(str(payload.get('primary_origin') or primary_target))
     if declared_primary and primary_origin and declared_primary != primary_origin:
         print(
-            f'[AUTH] Runtime target-auth state belongs to {declared_primary}, not {primary_origin}; dynamic sibling authentication is disabled.',
+            f'[AUTH] Runtime target-auth state belongs to {declared_primary}, not {primary_origin}; additional-origin runtime authentication is disabled.',
             file=sys.stderr,
         )
         return
@@ -328,14 +427,14 @@ def configure_runtime_target_auth(primary_target: str, primary_cookie: str) -> N
     storage = payload.get('storage_state')
     if not isinstance(storage, dict):
         RUNTIME_TARGET_AUTH['storage_state'] = None
-    print('[AUTH] Runtime OIDC/SSO state loaded for automatic sibling-origin authentication; no further console credential prompts will be used.')
+    print('[AUTH] Runtime browser/OIDC state loaded for explicitly authorized additional-origin authentication; no further console credential prompts will be used.')
 
 
 def runtime_target_auth_available() -> bool:
     credential = RUNTIME_TARGET_AUTH.get('credential') if isinstance(RUNTIME_TARGET_AUTH.get('credential'), dict) else {}
     return (
         bool(RUNTIME_TARGET_AUTH)
-        and str(RUNTIME_TARGET_AUTH.get('kind') or '') == 'snap4city_oidc'
+        and str(RUNTIME_TARGET_AUTH.get('kind') or '') in {'browser_oidc', 'snap4city_oidc'}
         and bool(credential.get('reuse_on_authorized_siblings', False))
     )
 
@@ -504,11 +603,12 @@ def tool_action_limit(tool: str, include_adaptive: bool=False) -> int:
     if name == 'arjun':
         return adaptive_tool_max_limit(name) if include_adaptive else ARJUN_ENDPOINT_LIMIT
     if name == 'interactsh':
-        return 3 if CURRENT_SCAN_MODE == 'deep' else 2 if CURRENT_SCAN_MODE == 'balanced' else 1
+        return 4 if CURRENT_SCAN_MODE == 'deep' else 3 if CURRENT_SCAN_MODE == 'balanced' else 1
     if name == 'jwt':
         return jwt_token_limit()
     if name in {'zap', 'nuclei', 'nikto'}:
-        return 13 if CURRENT_SCAN_MODE == 'deep' else 7 if CURRENT_SCAN_MODE == 'balanced' else 3
+        # One primary-origin run plus the maximum bounded sibling page for this round.
+        return 17 if CURRENT_SCAN_MODE == 'deep' else 9 if CURRENT_SCAN_MODE == 'balanced' else 4
     if name in PARAMETER_TOOL_CASE_LIMITS:
         limit = adaptive_tool_max_limit(name) if include_adaptive else PARAMETER_TOOL_CASE_LIMITS[name]
         if name == 'traversal' and include_adaptive:
@@ -978,7 +1078,17 @@ async def call_mcp(server_file: str, tool_name: str, arguments: dict[str, Any], 
             return _extract_response(await client.call_tool(tool_name, effective_arguments))
     try:
         url = await asyncio.to_thread(_ensure_http_server)
-        operation_timeout = timeout_seconds + MCP_CONNECT_TIMEOUT
+        try:
+            scanner_timeout_hint = float(effective_arguments.get('timeout') or 0)
+        except (TypeError, ValueError):
+            scanner_timeout_hint = 0.0
+        # The transport watchdog must never be shorter than the bounded scanner budget that was
+        # deliberately selected for this invocation. Otherwise long DEEP/BALANCED scans can be
+        # aborted by MCP even though the scanner itself still has valid time remaining.
+        operation_timeout = max(
+            float(timeout_seconds) + MCP_CONNECT_TIMEOUT,
+            scanner_timeout_hint + MCP_CONNECT_TIMEOUT + 60.0 if scanner_timeout_hint else 0.0,
+        )
         if spec.name == 'report':
             operation_timeout = MCP_REPORT_TRANSFER_TIMEOUT + MCP_REPORT_RENDER_TIMEOUT_MAX + (2 * MCP_CONNECT_TIMEOUT)
         try:
@@ -1229,14 +1339,17 @@ def _semantic_routing_value(raw: str) -> str:
     lowered = value.lower().strip()
     if not lowered or lowered.startswith(('javascript:', 'data:', 'mailto:', 'tel:')):
         return ''
-    if not (lowered.startswith(('/', './', '../')) or SEMANTIC_ROUTING_VALUE_RE.search(lowered)):
-        return ''
     parsed = urlparse(value)
+    absolute_http = parsed.scheme.lower() in {'http', 'https'} and bool(parsed.netloc)
+    if not (absolute_http or lowered.startswith(('/', './', '../')) or SEMANTIC_ROUTING_VALUE_RE.search(lowered)):
+        return ''
     path = parsed.path or value.split('?', 1)[0]
     query = parsed.query if parsed.query else (value.split('?', 1)[1] if '?' in value else '')
     names = sorted({name.lower() for name, _ in parse_qsl(query, keep_blank_values=True)})
     normalized_path = re.sub(r'/+', '/', path.strip()) or '/'
     suffix = '?' + '&'.join(names) if names else ''
+    if absolute_http:
+        return f"{parsed.scheme.lower()}://{parsed.netloc.lower()}{normalized_path.lower()}{suffix}"
     return normalized_path.lower() + suffix
 
 def _discovery_route_signature(url: str) -> tuple[str, str, tuple[str, ...]]:
@@ -1308,29 +1421,36 @@ EPHEMERAL_IDENTITY_QUERY_KEYS = {
     'state', 'nonce', 'session_code', 'tab_id', 'execution', 'code_challenge',
     'auth_session_id', 'kc_action', 'iss',
 }
+IDENTITY_CALLBACK_QUERY_KEYS = {'state', 'session_state', 'iss', 'code', 'auth_session_id', 'session_code', 'tab_id', 'execution'}
 
 
 def _ephemeral_identity_flow_url(url: str) -> bool:
-    """Recognize volatile OAuth/OIDC navigation plumbing without suppressing real application login pages."""
+    """Recognize one-shot OAuth/OIDC protocol instances without naming a provider or application."""
     try:
         parsed = urlparse(str(url or ''))
     except ValueError:
         return False
-    path = str(parsed.path or '').lower()
-    protocol_path = (
-        ('/auth/realms/' in path and ('/protocol/openid-connect/' in path or '/login-actions/' in path))
-        or '/oauth2/authorize' in path or '/oauth/authorize' in path
-    )
-    if not protocol_path:
-        return False
     names = {str(name).lower() for name, _ in parse_qsl(parsed.query, keep_blank_values=True)}
-    return bool(names & EPHEMERAL_IDENTITY_QUERY_KEYS)
+    protocol_names = {'client_id', 'redirect_uri', 'response_type', 'scope', 'code_challenge', 'code_challenge_method'}
+    transient = names & EPHEMERAL_IDENTITY_QUERY_KEYS
+    # Require both protocol context and a transient value. A stable application login/SSO URL
+    # such as /login or ?redirect=/app remains a normal in-scope attack surface.
+    return bool(transient and (names & protocol_names or {'state', 'nonce'} <= names or 'session_code' in names))
 
+
+def _volatile_identity_callback_url(url: str) -> bool:
+    """Recognize one-shot OAuth/OIDC callback instances from protocol parameters only."""
+    try:
+        names = {str(name).lower() for name, _ in parse_qsl(urlparse(str(url or '')).query, keep_blank_values=True)}
+    except ValueError:
+        return False
+    hits = names & IDENTITY_CALLBACK_QUERY_KEYS
+    return len(hits) >= 2 and bool(hits & {'state', 'code', 'session_state'})
 
 def _discovery_variant_limit(url: str, default_limit: int) -> int:
     # One representative OAuth/OIDC state/nonce/session-code variant is enough for discovery and
     # workflow classification; retaining many volatile values starves unrelated application routes.
-    return 1 if _ephemeral_identity_flow_url(url) else max(1, int(default_limit))
+    return 1 if (_ephemeral_identity_flow_url(url) or _volatile_identity_callback_url(url)) else max(1, int(default_limit))
 
 
 # Queue ranking protects the primary target surface without excluding explicitly authorized sibling origins.
@@ -1340,6 +1460,8 @@ def _discovery_queue_score(target: str, url: str) -> int:
         score += 24
     if _ephemeral_identity_flow_url(url):
         score -= 90
+    elif _volatile_identity_callback_url(url):
+        score -= 70
     return score
 
 
@@ -1409,6 +1531,8 @@ def _request_case_state_change_reason(case: dict[str, Any]) -> str:
     method = str(case.get('method') or 'GET').upper()
     if _destructive_crawl_url(url):
         return 'destructive URL or query action'
+    if method in {'DELETE', 'PUT', 'PATCH'}:
+        return f'state-changing {method} request method'
     if method != 'POST':
         return ''
     path = urlparse(url).path.lower()
@@ -1434,8 +1558,21 @@ def _request_case_state_change_reason(case: dict[str, Any]) -> str:
                 payload = json.loads(raw_data)
             except Exception:
                 payload = None
-            if isinstance(payload, dict):
-                pairs.extend((str(name).lower(), str(value).lower()) for name, value in payload.items())
+            if isinstance(payload, (dict, list)):
+                def add_json_pairs(value: Any, prefix: str='', depth: int=0) -> None:
+                    if depth > 5:
+                        return
+                    if isinstance(value, dict):
+                        for name, nested in value.items():
+                            key = f'{prefix}.{name}' if prefix else str(name)
+                            if isinstance(nested, (dict, list)):
+                                add_json_pairs(nested, key, depth + 1)
+                            else:
+                                pairs.append((key.lower(), str(nested or '').lower()))
+                    elif isinstance(value, list):
+                        for index, nested in enumerate(value[:40]):
+                            add_json_pairs(nested, f'{prefix}[{index}]' if prefix else f'[{index}]', depth + 1)
+                add_json_pairs(payload)
         else:
             pairs.extend((str(name).lower(), str(value).lower()) for name, value in parse_qsl(raw_data, keep_blank_values=True))
     for field in case.get('fields', []) if isinstance(case.get('fields'), list) else []:
@@ -1443,11 +1580,12 @@ def _request_case_state_change_reason(case: dict[str, Any]) -> str:
             pairs.append((str(field.get('name')).lower(), str(field.get('value') or '').lower()))
 
     names = {name for name, _ in pairs}
+    leaf_names = {re.split(r'[.\[]', name)[-1].rstrip(']') for name in names}
     mutating_names = {
         'password_new', 'password_conf', 'new_password', 'confirm_password', 'newpassword',
         'upload', 'file', 'filename', 'security', 'role_update', 'permission_update',
     }
-    if names & mutating_names:
+    if names & mutating_names or leaf_names & mutating_names:
         return 'state-changing POST field'
     if {'username', 'password'} <= names or {'user', 'password'} <= names:
         return 'authentication POST contract'
@@ -1458,7 +1596,8 @@ def _request_case_state_change_reason(case: dict[str, Any]) -> str:
         'purge', 'wipe', 'logout', 'signout', 'logoff', 'submit',
     }
     for name, value in pairs:
-        if name in action_names and any(token in mutating_values for token in re.split(r'[^a-z0-9]+', value) if token):
+        leaf_name = re.split(r'[.\[]', name)[-1].rstrip(']')
+        if (name in action_names or leaf_name in action_names) and any(token in mutating_values for token in re.split(r'[^a-z0-9]+', value) if token):
             return 'state-changing POST action'
     return ''
 
@@ -1494,6 +1633,7 @@ def _safe_crawl_get(session: requests.Session, requested: str, target: str, *, t
         if _destructive_crawl_url(current):
             return (response, current, f'destructive_url_blocked:{current}')
         request_headers = {'Cookie': scope_cookie_header(current, cookies)} if scope_cookie_header(current, cookies) else {}
+        _pace_http_request()
         response = session.get(current, timeout=timeout, allow_redirects=False, headers=request_headers)
         if response.status_code not in {301, 302, 303, 307, 308}:
             return (response, current, '')
@@ -1662,6 +1802,7 @@ def xss_verification_context_score(finding_url: str, case_url: str, parameter: s
 def refresh_authenticated_session_state(target: str, cookies: str, probe_url: str='') -> dict[str, Any]:
 
     selected_probe = probe_url or target
+    speculative_raw_cookie = _speculative_same_host_port_raw_cookie(target, cookies)
     effective_cookies = scope_cookie_header(target, cookies)
     runtime_reauth: dict[str, Any] | None = None
     if not effective_cookies and runtime_target_auth_available():
@@ -1691,12 +1832,19 @@ def refresh_authenticated_session_state(target: str, cookies: str, probe_url: st
     prep_invalid = preparation.get('conclusive', True) is True and preparation.get('usable', True) is False
     usable = not (probe_invalid or prep_invalid)
 
+    # A conclusive rejection on another explicitly allowed port means this raw header is not a
+    # usable session for that service. Remember the result before browser/SSO repair so later tools
+    # do not repeatedly send the same invalid cookie. This cache is keyed by a SHA-256 digest of the
+    # cookie plus destination origin and therefore does not affect another authenticated identity.
+    if (probe_invalid or prep_invalid) and speculative_raw_cookie:
+        REJECTED_SPECULATIVE_RAW_COOKIE_KEYS.add(_raw_cookie_reuse_key(target, cookies))
+
     # A valid dashboard session may still be invalid for another application under the same host.
     # When the concrete probe redirects to login, establish that application's own session through
     # saved SSO state instead of treating exact-origin equality as proof that one PHP session is enough.
     if not usable and runtime_target_auth_available() and not (runtime_reauth and runtime_reauth.get('attempted')):
         runtime_reauth = ensure_runtime_authenticated_request(target, effective_cookies, selected_probe)
-        repaired_cookie = scope_cookie_header(target, cookies) or str(runtime_reauth.get('cookie_header') or '')
+        repaired_cookie = str(runtime_reauth.get('cookie_header') or '') or scope_cookie_header(target, cookies)
         if runtime_reauth.get('usable') and repaired_cookie:
             effective_cookies = repaired_cookie
             selected_probe = str(runtime_reauth.get('probe_url') or target)
@@ -1773,7 +1921,16 @@ def _javascript_endpoint_hints(text: str, base_url: str, target: str) -> list[di
 # Extracts literal navigation targets embedded in HTML, inline JavaScript, JSON menu data, and event handlers.
 def _literal_navigation_hints(text: str, base_url: str, target: str, limit: int=320) -> list[dict[str, str]]:
 
-    value = html.unescape(str(text or '')[:1000000]).replace('\\/', '/')
+    # html.unescape() accepts several legacy named entities without a terminating semicolon. On raw
+    # JavaScript/JSON this corrupts perfectly valid query names such as "&param=" into "¶m=". Decode
+    # only explicit semicolon-terminated entities while preserving ordinary ampersands in URLs.
+    raw_value = str(text or '')[:1000000]
+    value = re.sub(
+        r'&(?:#\d+|#x[0-9a-fA-F]+|amp|quot|apos|lt|gt);',
+        lambda match: html.unescape(match.group(0)),
+        raw_value,
+        flags=re.I,
+    ).replace('\\/', '/')
     keyed = re.compile(
         r'''(?ix)\b(?:href|url|uri|link|linkurl|redirect|redirect_uri|page|path|route|target|endpoint|src|action)\b\s*[:=]\s*["']([^"']{1,420})["']'''
     )
@@ -1893,6 +2050,11 @@ def _browser_network_discovery(target: str, cookies: str, html_urls: list[str], 
         'attempted': 0, 'adaptive_overflow_used': 0, 'remaining_candidates': 0,
         'adaptive_threshold': None, 'max_saturated': False,
         'menu_controls_clicked': 0, 'dom_navigation_candidates': 0,
+        'navigation_retries': 0, 'dom_retries': 0,
+        'dead_404_410': 0,
+        'external_subresource_requests': 0,
+        'external_navigation_requests_blocked': 0,
+        'external_origins_observed': [],
     }
     try:
         from playwright.sync_api import sync_playwright
@@ -1919,6 +2081,7 @@ def _browser_network_discovery(target: str, cookies: str, html_urls: list[str], 
     current_source = {'url': target_url}
     request_rows: dict[int, dict[str, Any]] = {}
     request_cases_by_id: dict[int, dict[str, Any]] = {}
+    external_browser_origins: set[str] = set()
 
     def enqueue_dynamic(raw_url: str, *, force: bool=False) -> None:
         try:
@@ -1973,9 +2136,22 @@ def _browser_network_discovery(target: str, cookies: str, html_urls: list[str], 
             def route_guard(route: Any) -> None:
                 request_url = str(route.request.url or '')
                 request_method = str(route.request.method or 'GET').upper()
-                if _destructive_crawl_url(request_url) or request_method not in {'GET', 'HEAD', 'OPTIONS'}:
+                in_scope = url_in_authorized_scope(target, request_url)
+                if not in_scope:
+                    observed_origin = normalized_origin(request_url)
+                    if observed_origin:
+                        external_browser_origins.add(observed_origin)
+                # External GET/HEAD/OPTIONS subresources may be required to render an in-scope page,
+                # but they remain dependency traffic only. Top-level navigation to an unauthorized
+                # origin is blocked and neither kind of request is converted into an active scan case.
+                if route.request.is_navigation_request() and not in_scope:
+                    budget_info['external_navigation_requests_blocked'] = int(budget_info.get('external_navigation_requests_blocked', 0) or 0) + 1
+                    route.abort()
+                elif _destructive_crawl_url(request_url) or request_method not in {'GET', 'HEAD', 'OPTIONS'}:
                     route.abort()
                 else:
+                    if not in_scope:
+                        budget_info['external_subresource_requests'] = int(budget_info.get('external_subresource_requests', 0) or 0) + 1
                     route.continue_()
 
             context.route('**/*', route_guard)
@@ -2037,6 +2213,37 @@ def _browser_network_discovery(target: str, cookies: str, html_urls: list[str], 
             page.on('request', record_request)
             page.on('response', record_response)
             page.on('requestfailed', record_failed)
+
+            def transient_browser_error(exc: Exception) -> bool:
+                text = f'{type(exc).__name__}: {exc}'.lower()
+                return any(token in text for token in (
+                    'net::err_aborted', 'timeout', 'execution context was destroyed',
+                    'cannot find context with specified id', 'target page, context or browser has been closed',
+                ))
+
+            def navigate_with_retry(value: str) -> Any:
+                try:
+                    # Pace top-level browser navigations with the same shared policy used by the
+                    # HTTP crawler. Subresources required by the page are still allowed to load.
+                    _pace_http_request()
+                    return page.goto(value, wait_until='domcontentloaded', timeout=12000)
+                except Exception as first_exc:
+                    if not transient_browser_error(first_exc):
+                        raise
+                    budget_info['navigation_retries'] = int(budget_info.get('navigation_retries', 0) or 0) + 1
+                    try:
+                        page.wait_for_timeout(250)
+                    except Exception:
+                        pass
+                    # A second navigation waits only for the response commit. Pages with continuous
+                    # SPA/XHR activity can otherwise exhaust the discovery timeout despite being usable.
+                    _pace_http_request()
+                    response = page.goto(value, wait_until='commit', timeout=16000)
+                    try:
+                        page.wait_for_load_state('domcontentloaded', timeout=4000)
+                    except Exception:
+                        pass
+                    return response
             base_scores: list[int] = []
             adaptive_threshold: int | None = None
             while queue and len(visited) < navigation_max_budget:
@@ -2066,17 +2273,34 @@ def _browser_network_discovery(target: str, cookies: str, html_urls: list[str], 
                     base_scores.append(value_score)
                 current_source['url'] = value
                 try:
-                    response = page.goto(value, wait_until='domcontentloaded', timeout=12000)
+                    response = navigate_with_retry(value)
                     page.wait_for_timeout(650)
                     response_type = str((response.headers if response else {}).get('content-type') or '').lower()
+                    response_status = int(response.status) if response is not None else 0
+                    if response_status in {404, 410}:
+                        budget_info['dead_404_410'] = int(budget_info.get('dead_404_410', 0) or 0) + 1
+                        continue
                     if not response_type or 'html' in response_type:
                         navigated.append(value)
 
                     def collect_dom_navigation() -> None:
-                        raw_values = page.eval_on_selector_all(
-                            '[href],[src],[action],[formaction],[data-href],[data-url],[data-link],[data-src]',
-                            """elements => elements.flatMap(element => ['href','src','action','formaction','data-href','data-url','data-link','data-src'].map(name => element.getAttribute(name)).filter(Boolean))""",
-                        )
+                        raw_values: list[Any] = []
+                        for dom_attempt in range(2):
+                            try:
+                                raw_values = page.eval_on_selector_all(
+                                    '[href],[src],[action],[formaction],[data-href],[data-url],[data-link],[data-src]',
+                                    """elements => elements.flatMap(element => ['href','src','action','formaction','data-href','data-url','data-link','data-src'].map(name => element.getAttribute(name)).filter(Boolean))""",
+                                )
+                                break
+                            except Exception as dom_exc:
+                                if dom_attempt or not transient_browser_error(dom_exc):
+                                    raise
+                                budget_info['dom_retries'] = int(budget_info.get('dom_retries', 0) or 0) + 1
+                                try:
+                                    page.wait_for_load_state('domcontentloaded', timeout=3000)
+                                except Exception:
+                                    pass
+                                page.wait_for_timeout(180)
                         for raw in raw_values:
                             text = str(raw or '').strip()
                             if not text or text.startswith('#'):
@@ -2174,6 +2398,7 @@ def _browser_network_discovery(target: str, cookies: str, html_urls: list[str], 
         adaptive_overflow_used=max(int(budget_info.get('adaptive_overflow_used', 0) or 0), max(0, len(visited) - navigation_budget)),
         remaining_candidates=max(int(budget_info.get('remaining_candidates', 0) or 0), len(queue)),
         max_saturated=bool(budget_info.get('max_saturated')) or bool(queue and len(visited) >= navigation_max_budget),
+        external_origins_observed=sorted(external_browser_origins),
     )
     return (_dedupe_request_cases(cases), unique_observed, list(dict.fromkeys(navigated)), errors, budget_info)
 
@@ -2196,6 +2421,8 @@ def discover_target(target: str, cookies: str, max_pages: int=MAX_CRAWL_PAGES, s
         min(256, explicit_seed_count),
     )
     script_budget = min(MAX_SCRIPT_ASSETS, int(limits['scripts']))
+    script_attempt_factor = max(1.0, float(SCRIPT_ATTEMPT_BUDGET_FACTORS.get(CURRENT_SCAN_MODE, 1.5)))
+    script_attempt_budget = max(script_budget, int(math.ceil(script_budget * script_attempt_factor)))
     route_variant_limit = int(limits['route_variants'])
     per_origin_limit = max(int(limits['per_origin_pages']), min(256, explicit_seed_count))
     destructive_skipped: set[str] = set()
@@ -2211,10 +2438,12 @@ def discover_target(target: str, cookies: str, max_pages: int=MAX_CRAWL_PAGES, s
     skipped_route_variants = 0
     skipped_origin_budget = 0
     skipped_out_of_scope = 0
+    out_of_scope_origins: set[str] = set()
     http_attempts = 0
     dead_http_responses = 0
-    attempt_budget = max(page_max_budget, (page_max_budget * 3 + 1) // 2)
-    per_origin_attempt_limit = max(per_origin_limit, (per_origin_limit * 3 + 1) // 2)
+    attempt_factor = max(1.0, float(HTTP_ATTEMPT_BUDGET_FACTORS.get(CURRENT_SCAN_MODE, 1.5)))
+    attempt_budget = max(page_max_budget, int(math.ceil(page_max_budget * attempt_factor)))
+    per_origin_attempt_limit = max(per_origin_limit, int(math.ceil(per_origin_limit * attempt_factor)))
 
     def record_coverage_skip(raw_url: str, reason_code: str, reason: str, *, method: str='GET', source_url: str='') -> None:
         value = str(raw_url or '').strip()
@@ -2229,6 +2458,13 @@ def discover_target(target: str, cookies: str, max_pages: int=MAX_CRAWL_PAGES, s
         }
         if row not in coverage_skipped_cases:
             coverage_skipped_cases.append(row)
+        if row['reason_code'] == 'OUT_OF_SCOPE':
+            try:
+                origin = normalized_origin(value)
+            except Exception:
+                origin = ''
+            if origin:
+                out_of_scope_origins.add(origin)
 
     def enqueue(raw_url: str, *, force: bool=False, source_url: str='') -> None:
         nonlocal skipped_route_variants, skipped_origin_budget, skipped_out_of_scope
@@ -2275,7 +2511,11 @@ def discover_target(target: str, cookies: str, max_pages: int=MAX_CRAWL_PAGES, s
     client_side_candidates: list[dict[str, Any]] = []
     script_urls: set[str] = set()
     script_endpoint_hints: list[dict[str, str]] = []
+    # Attempt and useful-script budgets are separate. Broken/redirected/404 assets must not consume
+    # a slot that is intended for a JavaScript body that can actually be inspected for endpoints.
+    attempted_script_urls: set[str] = set()
     scanned_script_urls: set[str] = set()
+    deferred_script_urls: set[str] = set()
     tokens: set[str] = set()
     errors: list[dict[str, Any]] = []
     initial_login_detected = False
@@ -2316,16 +2556,6 @@ def discover_target(target: str, cookies: str, max_pages: int=MAX_CRAWL_PAGES, s
         visited_signatures[signature] += 1
         origin_attempts[origin] += 1
         http_attempts += 1
-        if urlparse(requested).query:
-            parameterized.add(requested)
-            query_parameters = [name for name, _ in parse_qsl(urlparse(requested).query, keep_blank_values=True)]
-            if query_parameters:
-                request_cases.append({
-                    'url': requested, 'method': 'GET', 'data': '', 'parameters': query_parameters,
-                    'file_parameters': [], 'token_parameters': [], 'fields': [],
-                    'source_url': requested,
-                    'discovery_source': 'explicit_entry_point' if forced_requested else 'crawler_url',
-                })
         for nested in _nested_navigation_targets(requested):
             if url_in_authorized_scope(target, nested) and _crawlable_url(nested) and not _destructive_crawl_url(nested):
                 enqueue(nested, force=forced_requested, source_url=requested)
@@ -2344,6 +2574,14 @@ def discover_target(target: str, cookies: str, max_pages: int=MAX_CRAWL_PAGES, s
                 code = 'STATE_CHANGE_BLOCKED' if redirect_issue.startswith('destructive_') else 'OUT_OF_SCOPE'
                 record_coverage_skip(requested, code, 'Redirect target was blocked by the discovery safety/scope guard.')
                 continue
+            if redirect_issue == 'redirect_limit_reached':
+                # `final` is the next authorized hop but it has not been requested yet. Re-queue it
+                # instead of pairing the previous 3xx response with an unrequested URL. This keeps
+                # long in-scope redirect chains discoverable without making one request helper unbounded.
+                enqueue(final, force=forced_requested, source_url=requested)
+                continue
+            if redirect_issue.startswith('redirect_loop:') or redirect_issue == 'invalid_redirect_location':
+                continue
         if not url_in_authorized_scope(target, final):
             errors.append({'url': requested, 'type': 'OutOfScopeRedirect', 'message': final})
             record_coverage_skip(final, 'OUT_OF_SCOPE', 'Redirected URL was outside the explicitly authorized HTTP scope.', source_url=requested)
@@ -2360,6 +2598,16 @@ def discover_target(target: str, cookies: str, max_pages: int=MAX_CRAWL_PAGES, s
         if response.status_code in {404, 410}:
             dead_http_responses += 1
             continue
+        if urlparse(requested).query:
+            parameterized.add(requested)
+            query_parameters = [name for name, _ in parse_qsl(urlparse(requested).query, keep_blank_values=True)]
+            if query_parameters:
+                request_cases.append({
+                    'url': requested, 'method': 'GET', 'data': '', 'parameters': query_parameters,
+                    'file_parameters': [], 'token_parameters': [], 'fields': [],
+                    'source_url': requested,
+                    'discovery_source': 'explicit_entry_point' if forced_requested else 'crawler_url',
+                })
         final_origin = normalized_origin(final)
         if origin_useful_visits[final_origin] >= per_origin_limit:
             skipped_origin_budget += 1
@@ -2413,14 +2661,15 @@ def discover_target(target: str, cookies: str, max_pages: int=MAX_CRAWL_PAGES, s
                 script_url = _normalize_redundant_base_path_link(target, _clean_url(absolute_url(final, source)))
             except Exception:
                 continue
-            if not url_in_authorized_scope(target, script_url) or _destructive_crawl_url(script_url) or script_url in scanned_script_urls:
+            if not url_in_authorized_scope(target, script_url) or _destructive_crawl_url(script_url) or script_url in attempted_script_urls:
                 continue
             ranked_scripts.append(script_url)
         ranked_scripts = sorted(set(ranked_scripts), key=lambda value: (-_script_value_score(value), value))
-        for script_url in ranked_scripts:
-            if len(scanned_script_urls) >= script_budget:
+        for script_index, script_url in enumerate(ranked_scripts):
+            if len(scanned_script_urls) >= script_budget or len(attempted_script_urls) >= script_attempt_budget:
+                deferred_script_urls.update(ranked_scripts[script_index:])
                 break
-            scanned_script_urls.add(script_url)
+            attempted_script_urls.add(script_url)
             try:
                 script_response, script_final, script_issue = _safe_crawl_get(session, script_url, target, timeout=(4, 12), max_redirects=4, cookies=cookies)
             except requests.RequestException as exc:
@@ -2431,6 +2680,7 @@ def discover_target(target: str, cookies: str, max_pages: int=MAX_CRAWL_PAGES, s
             script_final = _clean_url(script_final)
             if not url_in_authorized_scope(target, script_final):
                 continue
+            scanned_script_urls.add(script_final)
             script_urls.add(script_final)
             script_hints = _javascript_endpoint_hints(script_response.text, script_final, target)
             generic_hints = _literal_navigation_hints(script_response.text, script_final, target)
@@ -2563,6 +2813,7 @@ def discover_target(target: str, cookies: str, max_pages: int=MAX_CRAWL_PAGES, s
         'http_adaptive_overflow_used': max(0, pages_processed - page_budget),
         'http_adaptive_threshold': http_adaptive_threshold,
         'http_attempt_budget': attempt_budget,
+        'http_attempt_budget_factor': attempt_factor,
         'http_requests_attempted': http_attempts,
         'http_remaining_candidates': len(queue),
         'http_page_budget_saturated': bool(queue and pages_processed >= page_budget),
@@ -2576,8 +2827,20 @@ def discover_target(target: str, cookies: str, max_pages: int=MAX_CRAWL_PAGES, s
         'browser_remaining_candidates': int(browser_budget_info.get('remaining_candidates', 0) or 0),
         'browser_adaptive_threshold': browser_budget_info.get('adaptive_threshold'),
         'browser_max_budget_saturated': bool(browser_budget_info.get('max_saturated', False)),
+        'browser_navigation_retries': int(browser_budget_info.get('navigation_retries', 0) or 0),
+        'browser_dom_retries': int(browser_budget_info.get('dom_retries', 0) or 0),
+        'browser_dead_404_410': int(browser_budget_info.get('dead_404_410', 0) or 0),
+        'browser_external_subresource_requests': int(browser_budget_info.get('external_subresource_requests', 0) or 0),
+        'browser_external_navigation_requests_blocked': int(browser_budget_info.get('external_navigation_requests_blocked', 0) or 0),
+        'browser_external_origins_observed': list(browser_budget_info.get('external_origins_observed') or []),
         'script_budget': script_budget,
         'scripts_processed': len(scanned_script_urls),
+        'script_attempt_budget': script_attempt_budget,
+        'script_attempt_budget_factor': script_attempt_factor,
+        'script_requests_attempted': len(attempted_script_urls),
+        'script_candidates_deferred': len(deferred_script_urls),
+        'script_budget_saturated': bool(deferred_script_urls and len(scanned_script_urls) >= script_budget),
+        'script_attempt_budget_saturated': bool(deferred_script_urls and len(attempted_script_urls) >= script_attempt_budget),
         'route_variant_limit': route_variant_limit,
         'per_origin_page_limit': per_origin_limit,
         'per_origin_attempt_limit': per_origin_attempt_limit,
@@ -2585,11 +2848,34 @@ def discover_target(target: str, cookies: str, max_pages: int=MAX_CRAWL_PAGES, s
         'application_families_visited': len([count for count in family_useful_visits.values() if count > 0]),
         'origin_budget_skipped': skipped_origin_budget,
         'out_of_scope_urls_skipped': skipped_out_of_scope,
+        'out_of_scope_origins_observed': sorted(out_of_scope_origins),
         'authorized_origins': sorted(AUTHORIZED_SCOPE_ORIGINS),
-        'authorized_host_suffixes': sorted(AUTHORIZED_SCOPE_HOST_SUFFIXES),
+        'allow_same_host_ports': ALLOW_SAME_HOST_PORTS,
         'explicit_entry_points': len(explicit_seed_urls),
         'priority_discovery_seeds': len(ordinary_seed_urls),
     }
+    if skipped_out_of_scope:
+        preview = ', '.join(sorted(out_of_scope_origins)[:4]) or 'external origin(s)'
+        extra = max(0, len(out_of_scope_origins) - 4)
+        suffix = f', +{extra} more' if extra else ''
+        print(
+            f'[SCOPE] Observed {skipped_out_of_scope} out-of-scope URL(s) across '
+            f'{len(out_of_scope_origins)} external origin(s); they were NOT queued for active testing: {preview}{suffix}'
+        )
+    browser_external_origins = list(browser_budget_info.get('external_origins_observed') or [])
+    browser_external_requests = int(browser_budget_info.get('external_subresource_requests', 0) or 0)
+    browser_blocked_navigations = int(browser_budget_info.get('external_navigation_requests_blocked', 0) or 0)
+    if browser_external_origins or browser_external_requests or browser_blocked_navigations:
+        preview = ', '.join(browser_external_origins[:4]) or 'external origin(s)'
+        extra = max(0, len(browser_external_origins) - 4)
+        suffix = f', +{extra} more' if extra else ''
+        print(
+            f'[SCOPE] Chromium observed {browser_external_requests} ordinary out-of-scope subresource request(s) '
+            f'across {len(browser_external_origins)} external origin(s); these were rendering/auth dependencies only '
+            f'and were NOT queued for active testing. Blocked external top-level navigations: '
+            f'{browser_blocked_navigations}. Origins: {preview}{suffix}'
+        )
+
     return {'urls': sorted(visited), 'html_urls': sorted(html_urls), 'form_urls': sorted(form_urls), 'parameterized_urls': sorted(parameterized), 'request_cases': _dedupe_request_cases(request_cases), 'script_urls': sorted(script_urls), 'script_endpoint_hints': script_endpoint_hints, 'browser_network_requests': browser_network_requests, 'browser_navigation_urls': browser_navigation_urls, 'client_side_candidates': client_side_candidates, 'jwt_tokens': sorted(tokens), 'errors': errors, 'authentication_effective': auth_effective, 'authentication_note': auth_note, 'authentication_probe': auth_probe, 'target_preparation': target_preparation, 'destructive_urls_skipped': sorted(destructive_skipped), 'destructive_request_cases': _dedupe_request_cases(destructive_request_cases), 'coverage_skipped_cases': coverage_skipped_cases, 'budget_diagnostics': budget_diagnostics, 'explicit_entry_points': sorted(explicit_seed_urls), 'priority_discovery_seeds': sorted(ordinary_seed_urls)}
 
 # Orders discovery diagnostics so browser/runtime failures are visible before ordinary dead-link HTTP errors.
@@ -2691,8 +2977,17 @@ def sibling_broad_origin_limits() -> tuple[int, int]:
     return base, maximum
 
 
-def select_sibling_broad_origins(discovery: dict[str, Any], target: str) -> dict[str, Any]:
+def select_sibling_broad_origins(
+    discovery: dict[str, Any], target: str, *,
+    allowed_origins: set[str] | None=None, exclude_origins: set[str] | None=None,
+) -> dict[str, Any]:
     ranking = discovered_scope_origin_ranking(discovery, target)
+    allowed = {normalized_origin(value) for value in (allowed_origins or set()) if normalized_origin(value)} if allowed_origins is not None else None
+    excluded = {normalized_origin(value) for value in (exclude_origins or set()) if normalized_origin(value)}
+    if allowed is not None:
+        ranking = [(origin, score) for origin, score in ranking if origin in allowed]
+    if excluded:
+        ranking = [(origin, score) for origin, score in ranking if origin not in excluded]
     base_limit, max_limit = sibling_broad_origin_limits()
     if not ranking or base_limit <= 0:
         return {'selected': [], 'ranking': ranking, 'base_limit': base_limit, 'max_limit': max_limit, 'overflow': 0, 'cutoff_score': None, 'threshold_score': None}
@@ -2786,7 +3081,7 @@ def discovered_scope_origins(discovery: dict[str, Any], target: str, limit: int 
     return [origin for origin, _ in ranking[:max(0, int(limit))]]
 
 
-def _runtime_auth_candidate_urls(discovery: dict[str, Any], origin: str, *, limit: int=8) -> list[str]:
+def _runtime_auth_candidate_urls(discovery: dict[str, Any], origin: str, *, limit: int | None=None) -> list[str]:
     scored: dict[str, int] = {}
 
     def add(value: Any, bonus: int=0) -> None:
@@ -2797,19 +3092,22 @@ def _runtime_auth_candidate_urls(discovery: dict[str, Any], origin: str, *, limi
             parsed = urlparse(url)
         except ValueError:
             return
+        if _volatile_identity_callback_url(url):
+            # The callback values are one-time, but the application login route itself is a useful
+            # stable SSO entry point for a fresh browser context.
+            url = urlunparse(parsed._replace(query='', fragment=''))
+            parsed = urlparse(url)
         path = str(parsed.path or '/').lower()
         suffix = Path(path).suffix.lower()
         if suffix in PARAMETER_SCANNER_STATIC_SUFFIXES or suffix in {'.html.map'}:
             return
-        # Keycloak/OIDC state, nonce and login-action URLs are ephemeral authentication plumbing,
-        # not stable application entry points. Prefer the application's own SSO/login wrapper instead.
-        if '/auth/realms/' in path and ('/protocol/openid-connect/' in path or '/login-actions/' in path):
+        # One-shot OAuth/OIDC transaction URLs are poor reauthentication entry points;
+        # keep stable application login/SSO routes instead.
+        if _ephemeral_identity_flow_url(url):
             return
         score = _discovery_url_score(url) + int(bonus)
-        if 'ssologin' in path:
-            score += 220
-        elif any(token in path for token in ('/login', '/signin', '/sign-in')):
-            score += 140
+        if _looks_like_application_login_entry(url):
+            score += 160
         if any(token in path for token in ('management', 'dashboard', 'editor', 'admin')):
             score += 35
         if parsed.query:
@@ -2829,7 +3127,8 @@ def _runtime_auth_candidate_urls(discovery: dict[str, Any], origin: str, *, limi
             add(row.get('url'), 60 if resource_type in {'document', 'xhr', 'fetch'} else 20)
     for value in discovery.get('urls', []):
         add(value, 10)
-    return [url for url, _ in sorted(scored.items(), key=lambda item: (-item[1], item[0]))[:max(1, int(limit))]]
+    effective_limit = max(1, int(limit if limit is not None else RUNTIME_AUTH_ENTRY_CANDIDATE_LIMITS.get(CURRENT_SCAN_MODE, 12)))
+    return [url for url, _ in sorted(scored.items(), key=lambda item: (-item[1], item[0]))[:effective_limit]]
 
 
 def _runtime_auth_probe(origin: str, cookie: str, probe_url: str) -> dict[str, Any]:
@@ -2844,11 +3143,11 @@ def _runtime_auth_probe(origin: str, cookie: str, probe_url: str) -> dict[str, A
     anonymous: dict[str, Any] = {}
     distinguished: bool | None = None
     try:
-        response = requests.get(
-            probe_url,
+        _pace_http_request()
+        response = request_same_origin_redirects(
+            'GET', probe_url,
             headers={'Cache-Control': 'no-cache', 'User-Agent': 'SecOps-Runtime-Auth-Anonymous/1.0'},
             timeout=(4, 12),
-            allow_redirects=True,
         )
         anonymous = {
             'status': int(response.status_code),
@@ -2931,7 +3230,7 @@ def ensure_runtime_authenticated_request(request_url: str, current_cookie: str='
         candidate_urls.append(str(probe_url))
 
     try:
-        login = snap4city_browser_login_session(
+        login = browser_oidc_login_session(
             normalized_origin(url),
             username,
             password,
@@ -2940,6 +3239,7 @@ def ensure_runtime_authenticated_request(request_url: str, current_cookie: str='
             candidate_urls=candidate_urls,
             initial_login=False,
             include_configured_fallbacks=False,
+            expected_oidc_issuer=str(RUNTIME_TARGET_AUTH.get('oidc_issuer') or ''),
         )
     except RuntimeError as exc:
         result = {
@@ -2958,6 +3258,8 @@ def ensure_runtime_authenticated_request(request_url: str, current_cookie: str='
 
     if isinstance(login.get('storage_state'), dict):
         RUNTIME_TARGET_AUTH['storage_state'] = login['storage_state']
+    if login.get('oidc_issuer') and not RUNTIME_TARGET_AUTH.get('oidc_issuer'):
+        RUNTIME_TARGET_AUTH['oidc_issuer'] = str(login.get('oidc_issuer') or '')
     returned_cookie = str(login.get('cookie_header') or '')
     origin = normalized_origin(url)
     if returned_cookie and origin and not same_origin(PRIMARY_SCOPE_TARGET or origin, origin):
@@ -3025,6 +3327,9 @@ def _same_origin_application_auth_candidates(discovery: dict[str, Any], target: 
             return
         if _browser_static_resource(url) or _ephemeral_identity_flow_url(url):
             return
+        if _volatile_identity_callback_url(url):
+            parsed_callback = urlparse(url)
+            url = urlunparse(parsed_callback._replace(query='', fragment=''))
         scope_key = _runtime_application_scope_key(url)
         if not scope_key or scope_key == configured_scope:
             return
@@ -3066,7 +3371,7 @@ def _same_origin_application_auth_candidates(discovery: dict[str, Any], target: 
                 -_discovery_url_score(value),
                 value,
             ),
-        )[:8]
+        )[:max(1, int(RUNTIME_AUTH_ENTRY_CANDIDATE_LIMITS.get(CURRENT_SCAN_MODE, 12)))]
         ranked.append((scope_key, int(bucket['score']), candidates))
     return sorted(ranked, key=lambda item: (-item[1], item[0]))
 
@@ -3084,6 +3389,9 @@ def authenticate_discovered_sibling_origins(discovery: dict[str, Any], target: s
     evidence = _discovered_scope_origin_evidence(discovery, target)
     ranking = discovered_scope_origin_ranking(discovery, target)
     limit = max(1, int(RUNTIME_AUTH_ORIGIN_LIMITS.get(CURRENT_SCAN_MODE, 32)))
+    broad_priority_origins = {
+        origin for origin, _ in ranking[:max(1, int(BROAD_SIBLING_ORIGIN_MAX_LIMITS.get(CURRENT_SCAN_MODE, 5)))]
+    }
     eligible: list[tuple[str, int, list[str]]] = []
     for origin, score in ranking:
         if not url_in_authorized_scope(target, origin):
@@ -3096,6 +3404,14 @@ def authenticate_discovered_sibling_origins(discovery: dict[str, Any], target: s
         # non-static application candidate is sufficient; this remains generic and site-independent.
         if int(bucket.get('interactive', 0) or 0) <= 0 and int(bucket.get('observations', 0) or 0) <= 1:
             continue
+        login_signal = any(_looks_like_application_login_entry(url) for url in candidates)
+        storage_signal = any(bool(_runtime_storage_cookie_header(url)) for url in candidates)
+        # Do not launch a browser-login attempt for every public sibling merely because it was linked
+        # by a large portal. High-ranked broad origins, explicit login/SSO entries and origins already
+        # touched by browser SSO state remain eligible; lower-ranked public-only origins can still use
+        # the just-in-time path if a concrete authenticated scanner later demonstrates a login gate.
+        if origin not in broad_priority_origins and not login_signal and not storage_signal:
+            continue
         eligible.append((origin, score, candidates))
 
     runtime_rows: list[dict[str, Any]] = list(discovery.get('runtime_sibling_authentication') or [])
@@ -3103,7 +3419,24 @@ def authenticate_discovered_sibling_origins(discovery: dict[str, Any], target: s
         str(row.get('origin') or '') for row in runtime_rows
         if isinstance(row, dict) and row.get('status') in {'authenticated', 'reused'} and str(row.get('origin') or '')
     }
-    pending = [item for item in eligible if not authenticated_origin_cookie(item[0])]
+    failed_attempted_urls: dict[str, set[str]] = {}
+    for row in runtime_rows:
+        if not isinstance(row, dict) or str(row.get('status') or '') not in {'failed', 'failed_validation'}:
+            continue
+        origin = str(row.get('origin') or '')
+        if not origin:
+            continue
+        values = row.get('attempted_candidates') if isinstance(row.get('attempted_candidates'), list) else []
+        failed_attempted_urls.setdefault(origin, set()).update(str(value) for value in values if str(value))
+    pending: list[tuple[str, int, list[str]]] = []
+    for item in eligible:
+        origin, _, candidates = item
+        if authenticated_origin_cookie(origin):
+            continue
+        attempted = failed_attempted_urls.get(origin, set())
+        if attempted and all(candidate in attempted for candidate in candidates):
+            continue
+        pending.append(item)
     selected = pending[:limit]
     if len(pending) > limit:
         runtime_rows.append({
@@ -3138,7 +3471,7 @@ def authenticate_discovered_sibling_origins(discovery: dict[str, Any], target: s
         print(f'    [AUTH SSO] {origin}: attempting origin-specific SSO/session establishment from {len(candidates)} observed application entry point(s).', flush=True)
         attempted_count += 1
         try:
-            login = snap4city_browser_login_session(
+            login = browser_oidc_login_session(
                 origin,
                 username,
                 password,
@@ -3147,24 +3480,27 @@ def authenticate_discovered_sibling_origins(discovery: dict[str, Any], target: s
                 candidate_urls=candidates,
                 initial_login=False,
                 include_configured_fallbacks=False,
+                expected_oidc_issuer=str(RUNTIME_TARGET_AUTH.get('oidc_issuer') or ''),
             )
         except RuntimeError as exc:
             message = str(exc)
             # Authentication is origin/application specific. A credential rejection or extra step on one
             # origin must not suppress independent attempts on other authorized origins, which may use a
             # different client, realm, session bridge or already-valid SSO path.
-            runtime_rows.append({'origin': origin, 'status': 'failed', 'reason': message[:1000], 'score': score, 'candidate_count': len(candidates)})
+            runtime_rows.append({'origin': origin, 'status': 'failed', 'reason': message[:1000], 'score': score, 'candidate_count': len(candidates), 'attempted_candidates': list(candidates)})
             print(f'    [AUTH SSO] {origin}: automatic sibling authentication failed: {message}', file=sys.stderr, flush=True)
             continue
 
         sibling_cookie = str(login.get('cookie_header') or '')
         if not sibling_cookie:
-            runtime_rows.append({'origin': origin, 'status': 'failed', 'reason': 'browser login returned no origin cookie', 'score': score})
+            runtime_rows.append({'origin': origin, 'status': 'failed', 'reason': 'browser login returned no origin cookie', 'score': score, 'attempted_candidates': list(candidates)})
             continue
         register_authenticated_origin_cookie(origin, sibling_cookie)
         if isinstance(login.get('storage_state'), dict):
             storage_state = login['storage_state']
             RUNTIME_TARGET_AUTH['storage_state'] = storage_state
+        if login.get('oidc_issuer') and not RUNTIME_TARGET_AUTH.get('oidc_issuer'):
+            RUNTIME_TARGET_AUTH['oidc_issuer'] = str(login.get('oidc_issuer') or '')
 
         probe_url = str(login.get('final_url') or '')
         if not probe_url or not same_origin(origin, probe_url) or _browser_static_resource(probe_url):
@@ -3182,6 +3518,7 @@ def authenticate_discovered_sibling_origins(discovery: dict[str, Any], target: s
                 'authentication_flow_observed': flow_observed,
                 'probe': probe,
                 'reason': 'HTTP validation failed or no authentication-flow evidence distinguished this cookie from an incidental public cookie.',
+                'attempted_candidates': list(candidates),
             })
             print(f'    [AUTH SSO] {origin}: browser state did not provide sufficient evidence for an authenticated application session.', file=sys.stderr, flush=True)
             continue
@@ -3377,15 +3714,14 @@ def _risk_terms(value: str) -> int:
 
 # Request classification marks cases that belong to an authentication flow.
 def _is_login_case(case: dict[str, Any]) -> bool:
-    path = urlparse(str(case.get('url', ''))).path.lower().rstrip('/')
+    parsed = urlparse(str(case.get('url', '')))
+    path = str(parsed.path or '').lower()
     parameters = {str(value).lower() for value in case.get('parameters', [])}
-    identity_provider = (
-        '/protocol/openid-connect/' in path
-        or '/oauth2/' in path
-        or '/oauth/' in path
-        or '/auth/realms/' in path
-    )
-    return path.endswith(('/login', '/login.php', '/signin', '/sign-in', '/auth', '/authorize', '/ssologin', '/ssologin.php', '/sso/login')) or identity_provider or bool({'username', 'password'} <= parameters)
+    path_tokens = {token for token in re.split(r'[^a-z0-9]+', path) if token}
+    protocol_parameters = {str(name).lower() for name, _ in parse_qsl(parsed.query, keep_blank_values=True)}
+    login_tokens = {'login', 'signin', 'authenticate', 'authorize', 'sso'}
+    protocol_signal = bool(protocol_parameters & {'client_id', 'redirect_uri', 'response_type', 'code_challenge'})
+    return bool(path_tokens & login_tokens) or protocol_signal or bool({'username', 'password'} <= parameters)
 
 # Logout endpoints are kept out of ordinary fuzzing and are tested only as an authenticated
 # session-lifecycle action at the end of the assessment.
@@ -3502,6 +3838,8 @@ def _dalfox_non_html_static_asset(case: dict[str, Any]) -> bool:
 def _identity_protocol_metadata_only(case: dict[str, Any]) -> bool:
     path = urlparse(str(case.get('url') or '')).path.lower()
     parameters = _case_parameters(case)
+    if _volatile_identity_callback_url(str(case.get('url') or '')):
+        return True
     protocol_path = any(token in path for token in ('/protocol/openid-connect/', '/oauth2/', '/oauth/', '/authorize', '/login-actions/'))
     return bool(protocol_path and parameters and parameters <= IDENTITY_PROTOCOL_PARAMETERS)
 
@@ -3645,8 +3983,6 @@ def _tool_case_priority(tool: str, case: dict[str, Any], authenticated_profile: 
         elif status >= 500:
             score += 4
     if tool == 'sqlmap':
-        if authenticated_profile and _is_login_case(case):
-            return -1000
         score += 45 if any((token in path for token in ('sql', 'query', 'database', 'search'))) else 0
         score += 18 if any((token in path for token in ('/api', 'data', 'device', 'model', 'dashboard', 'widget'))) else 0
         score += 14 * len(parameters & SQL_HINTS)
@@ -3655,39 +3991,29 @@ def _tool_case_priority(tool: str, case: dict[str, Any], authenticated_profile: 
         score += 8 if case.get('discovery_source') == 'playwright_network' else 0
         if parameters and parameters <= NAVIGATION_PARAMETERS and not (parameters & SQL_HINTS) and not anonymous_login_flow:
             score -= 65
-        if authenticated_profile and _is_login_case(case) and (not any((token in path for token in ('sql', 'query', 'database')))):
-            score -= 100
         if 'brute' in path and (not any((token in path for token in ('sql', 'query', 'database')))):
             score -= 90
         if any((token in path for token in ('xss', '/exec', '/csp'))) and (not parameters & SQL_HINTS):
             score -= 35
         return max(score, 12) if anonymous_login_flow else score
     if tool == 'dalfox':
-        if _prefer_browser_for_xss_case(case) or (authenticated_profile and _is_login_case(case)):
+        if _prefer_browser_for_xss_case(case):
             return -1000
         score += 45 if any((token in path for token in ('xss', 'comment', 'message', 'search', 'feedback'))) else 0
         score += 12 * len(parameters & XSS_HINTS)
         score += 10 if case.get('discovery_source') == 'playwright_network' else 0
         if any((token in path for token in ('sqli', '/exec', '/csp'))) and (not parameters & XSS_HINTS):
             score -= 35
-        if authenticated_profile and _is_login_case(case):
-            score -= 30
         return max(score, 12) if anonymous_login_flow else score
     if tool == 'commix':
-        if authenticated_profile and _is_login_case(case):
-            return -1000
         score += 55 if any((token in path for token in ('/exec', 'command', 'cmd'))) else 0
         score += 13 * len(parameters & COMMAND_HINTS)
         if any((token in path for token in ('sqli', 'xss', '/csp'))) and (not parameters & COMMAND_HINTS):
             score -= 45
-        if authenticated_profile and _is_login_case(case):
-            score -= 40
         return max(score, 12) if anonymous_login_flow else score
     if tool == 'traversal':
         internal_resource_value = _parameter_values_reference_internal_resource(case)
         if not _traversal_case_signal(case):
-            return -1000
-        if authenticated_profile and _is_login_case(case) and not internal_resource_value:
             return -1000
         score += 55 if any((token in path for token in ('include', 'download', 'file', 'template', 'document', 'view'))) else 0
         score += 15 * len(parameters & TRAVERSAL_HINTS)
@@ -3698,8 +4024,6 @@ def _tool_case_priority(tool: str, case: dict[str, Any], authenticated_profile: 
             score += 40
         if any((token in path for token in ('sqli', 'xss', '/exec', '/csp'))) and (not parameters & TRAVERSAL_HINTS):
             score -= 45
-        if authenticated_profile and _is_login_case(case) and not internal_resource_value:
-            score -= 40
         return max(score, 12) if anonymous_login_flow else score
     if tool == 'idor':
         if method != 'GET':
@@ -3735,9 +4059,6 @@ def _tool_case_skip_reason(tool: str, case: dict[str, Any], authenticated_profil
         return 'Stored or DOM-oriented XSS contracts are delegated to the Chromium verifier, which can execute JavaScript and revisit state.'
     if tool in {'sqlmap', 'dalfox', 'commix', 'traversal'} and _is_logout_case(case):
         return f'{tool} is not sent to logout endpoints; anonymous profiles ignore logout and authenticated profiles validate logout only in the final session-lifecycle check.'
-    if authenticated_profile and tool in {'sqlmap', 'dalfox', 'commix', 'traversal'} and _is_login_case(case):
-        if tool != 'traversal' or not _parameter_values_reference_internal_resource(case):
-            return f'{tool} is not sent to identity-provider/login/SSO endpoints in the authenticated profile; the anonymous profile remains eligible to test those public flows.'
     if tool in {'sqlmap', 'dalfox', 'commix', 'traversal'} and _oversized_generated_request(case):
         return f'{tool} is not sent to oversized generated table/filter requests; specialist testing is reserved for concise application parameters.'
     if tool == 'sqlmap' and 'brute' in urlparse(str(case.get('url', ''))).path.lower():
@@ -3802,6 +4123,9 @@ def select_tool_request_cases(discovery: dict[str, Any], tool: str, limit: int |
     for index, case in enumerate(cases):
         if not isinstance(case, dict):
             continue
+        browser_response = case.get('browser_response') if isinstance(case.get('browser_response'), dict) else {}
+        if browser_response.get('observed') is True and int(browser_response.get('status') or 0) in {404, 410}:
+            continue
         if str(case.get('method', 'GET')).upper() not in {'GET', 'POST'}:
             continue
         if not [value for value in case.get('parameters', []) if str(value)]:
@@ -3844,9 +4168,9 @@ def select_tool_request_cases(discovery: dict[str, Any], tool: str, limit: int |
             if any(token in path for token in ('logout', 'setup', 'reset', 'delete', 'security.php')):
                 continue
             case_authenticated = authenticated_profile and (not credential_cookies or bool(scope_cookie_header(url, credential_cookies)))
-            if tool == 'sqlmap' and ((case_authenticated and _is_login_case(case)) or 'brute' in path):
+            if tool == 'sqlmap' and 'brute' in path:
                 continue
-            if tool == 'dalfox' and (_prefer_browser_for_xss_case(case) or (case_authenticated and _is_login_case(case))):
+            if tool == 'dalfox' and _prefer_browser_for_xss_case(case):
                 continue
             param_key = tuple(sorted(value.lower() for value in params))
             key = (method, url, param_key)
@@ -4080,8 +4404,6 @@ def _browser_case_priority(case: dict[str, Any], client_keys: set[tuple[str, str
         score -= 35
     if case.get('parameters'):
         score += 20
-    if _is_login_case(case):
-        score -= 60
     return score
 
 # Chooses pages and requests that are useful for browser checks.
@@ -4196,6 +4518,11 @@ def select_workflow_request_cases(discovery: dict[str, Any], limit: int | None=N
     ranked: list[tuple[int, int, dict[str, Any]]] = []
     for index, case in enumerate(discovery.get('request_cases', [])):
         if not isinstance(case, dict):
+            continue
+        if _ephemeral_identity_flow_url(str(case.get('url') or '')) or _volatile_identity_callback_url(str(case.get('url') or '')):
+            # OAuth/OIDC state, session_code, nonce and execution URLs are one-time protocol
+            # plumbing, not stable application workflows. Testing them wastes the workflow budget
+            # and can invalidate a live login transaction.
             continue
         score = _workflow_case_priority(case)
         if score > 0:
@@ -4345,7 +4672,7 @@ def select_authorization_request_cases(discovery: dict[str, Any], limit: int | N
             url = str(case.get('url') or '')
             if not url or url in seen or str(case.get('method', 'GET')).upper() != 'GET':
                 continue
-            if _is_auto_index_case(case) or _destructive_crawl_url(url) or _is_login_case(case):
+            if _is_auto_index_case(case) or _destructive_crawl_url(url):
                 continue
             path = urlparse(url).path.lower()
             if any(token in path for token in ('logout', 'setup', 'reset', 'delete', 'csrf', 'captcha')):
@@ -4395,13 +4722,16 @@ def select_arjun_request_cases(discovery: dict[str, Any], target: str, limit: in
         fully_modelled_form = bool(fields and parameters)
         if file_parameters or 'multipart/form-data' in enctype:
             continue
-        if method == 'POST' and fully_modelled_form:
-            continue
         score = _risk_terms(path)
         score += 18 if any((token in path for token in ('/api/', 'callback', 'webhook', 'debug', 'admin'))) else 0
         score += 8 if not parameters else -min(16, len(parameters) * 4)
         if method == 'POST':
             score += 4
+            # A modelled POST form can still expose undocumented server-side parameters. Keep it
+            # eligible but rank it below an otherwise equivalent endpoint whose parameter surface
+            # is still unknown; blanket exclusion was an unnecessary coverage loss.
+            if fully_modelled_form:
+                score -= 6
         if score < 12:
             continue
         ranked.append((score, {'url': url, 'method': method, 'data': str(case.get('data') or ''), 'parameters': parameters}))
@@ -4484,7 +4814,7 @@ def endpoint_selection_decisions(discovery: dict[str, Any], target: str, authent
         case for case in select_authorization_request_cases(discovery)
         if authenticated_profile and (not credential_cookies or scope_cookie_header(str(case.get('url') or ''), credential_cookies))
     ]
-    arjun_selected = select_arjun_request_cases(discovery, target)
+    arjun_selected = select_arjun_request_cases(discovery, target, limit=ARJUN_ENDPOINT_LIMIT)
     for tool, selected in (
         ('browser', browser_selected),
         ('workflow', workflow_selected),
@@ -4593,8 +4923,6 @@ def select_request_cases(discovery: dict[str, Any], limit: int=MAX_PARAMETER_END
         seen.add(key)
         score = _risk_terms(path + ' ' + ' '.join(parameters))
         score += 12 if method == 'POST' else 3
-        if _is_login_case(case):
-            score -= 20
         score += min(8, len(parameters) * 2)
         ranked.append((score, {**case, 'method': method, 'parameters': list(parameters), 'priority_score': score}))
     ranked.sort(key=lambda item: (-item[0], str(item[1].get('url', ''))))
@@ -5031,7 +5359,8 @@ def add_common_cli_arguments(parser: argparse.ArgumentParser, *, require_target:
     parser.add_argument('--auth-only', action='store_true')
     parser.add_argument('--authorized', action='store_true')
     parser.add_argument('--authorized-origin', action='append', default=[], help='Additional exact HTTP/HTTPS origin explicitly included in the authorized assessment scope. Repeat as needed.')
-    parser.add_argument('--authorized-host-suffix', action='append', default=[], help='Additional authorized host suffix, for example example.org; matches the suffix itself and its subdomains. Repeat as needed.')
+    parser.add_argument('--allow-same-host-ports', action='store_true', help='Authorize discovered HTTP/HTTPS URLs on other ports of an already-authorized exact hostname, without authorizing sibling hostnames or protocol changes.')
+    parser.add_argument('--authorized-host-suffix', action='append', default=[], help=argparse.SUPPRESS)
     parser.add_argument('--entry-point', action='append', default=[], help='Explicit authorized HTTP/HTTPS entry point that must be included in initial discovery. Repeat as needed.')
     parser.add_argument('--discovery-seed', action='append', default=[], help='Authorized high-priority discovery seed. Unlike --entry-point it remains subject to normal route/budget limits and is not reported as a supplied entry point.')
     state_change_group = parser.add_mutually_exclusive_group()
@@ -5060,13 +5389,16 @@ def prepare_cli_context(parser: argparse.ArgumentParser, args: argparse.Namespac
             parser.error(f'Invalid --authorized-origin value: {value!r}. Use an absolute HTTP/HTTPS origin.')
         if (not normalized_origin(raw_origin)) or parsed_origin.path not in {'', '/'} or parsed_origin.query or parsed_origin.fragment or parsed_origin.username or parsed_origin.password:
             parser.error(f'Invalid --authorized-origin value: {value!r}. Use only scheme, host and optional port.')
-    for value in getattr(args, 'authorized_host_suffix', []) or []:
-        suffix = str(value or '').strip().lower().lstrip('.').rstrip('.')
-        if not suffix or '://' in suffix or '/' in suffix or ':' in suffix or any(ch.isspace() for ch in suffix):
-            parser.error(f'Invalid --authorized-host-suffix value: {value!r}. Use only a DNS host suffix such as example.org.')
-    configure_authorized_scope(target, list(getattr(args, 'authorized_origin', []) or []), list(getattr(args, 'authorized_host_suffix', []) or []))
-    if AUTHORIZED_SCOPE_ORIGINS or AUTHORIZED_SCOPE_HOST_SUFFIXES:
-        print('[*] Authorized scope extensions: origins=' + (', '.join(sorted(AUTHORIZED_SCOPE_ORIGINS)) or 'none') + '; host suffixes=' + (', '.join(sorted(AUTHORIZED_SCOPE_HOST_SUFFIXES)) or 'none'))
+    if getattr(args, 'authorized_host_suffix', None):
+        parser.error('--authorized-host-suffix is disabled for active testing; use repeated --authorized-origin with exact origins.')
+    configure_authorized_scope(
+        target, list(getattr(args, 'authorized_origin', []) or []),
+        allow_same_host_ports=bool(getattr(args, 'allow_same_host_ports', False)),
+    )
+    if AUTHORIZED_SCOPE_ORIGINS:
+        print('[*] Authorized scope extensions: exact origins=' + ', '.join(sorted(AUTHORIZED_SCOPE_ORIGINS)))
+    if ALLOW_SAME_HOST_PORTS:
+        print('[*] Authorized scope extension: same-host multi-port discovery/testing ENABLED (same scheme only).')
     injection_url = str(getattr(args, 'interactsh_injection_url', '') or '').strip()
     if injection_url and (not url_in_authorized_scope(target, injection_url)):
         parser.error('--interactsh-injection-url must be inside the explicitly authorized assessment scope.')
@@ -5143,10 +5475,19 @@ def build_tool_arguments(tool: str, target_url: str, cookies: str, discovery: di
     case = case or {}
     effective_cookies = scope_cookie_header(target_url, cookies)
     arguments: dict[str, Any] = {'target_url': target_url, 'cookies': effective_cookies}
+    if tool in {'ffuf', 'nikto', 'nuclei', 'zap', 'arjun', 'sqlmap', 'dalfox', 'commix', 'session', 'traversal', 'authorization', 'workflow', 'browser', 'idor'}:
+        # Pass the normalized rate in every MCP call. This keeps per-assessment configuration
+        # correct even if a unified MCP process is already listening from another local run.
+        arguments['request_rate'] = MAX_REQUEST_RATE
+    if tool == 'browser':
+        # Browser verification may traverse only exact origins that were explicitly authorized before the run.
+        arguments['authorized_origins'] = sorted(AUTHORIZED_SCOPE_ORIGINS)
+        arguments['allow_same_host_ports'] = ALLOW_SAME_HOST_PORTS
     if tool in BROAD_SCANNER_TIMEOUTS:
         arguments['timeout'] = timeout_override or BROAD_SCANNER_TIMEOUTS[tool]
         if tool == 'ffuf':
             arguments['session_probe_url'] = select_session_probe_url(discovery, target_url)
+            arguments['allow_same_host_ports'] = ALLOW_SAME_HOST_PORTS
         elif tool == 'session':
             sample_count = 7 if CURRENT_SCAN_MODE == 'deep' else 5 if CURRENT_SCAN_MODE == 'balanced' else 3
             arguments.update({'probe_url': select_session_probe_url(discovery, target_url), 'sample_count': sample_count})
@@ -5177,20 +5518,28 @@ def build_tool_arguments(tool: str, target_url: str, cookies: str, discovery: di
                 'request_cases': safe_request_cases,
                 'allow_state_changes': state_changes_allowed,
                 'scan_profile': CURRENT_SCAN_MODE,
-                'max_targets': 120 if CURRENT_SCAN_MODE == 'deep' else 60 if CURRENT_SCAN_MODE == 'balanced' else 16,
+                'max_targets': 160 if CURRENT_SCAN_MODE == 'deep' else 96 if CURRENT_SCAN_MODE == 'balanced' else 20,
             })
         elif tool == 'nikto':
             arguments['scan_profile'] = CURRENT_SCAN_MODE
+            arguments['allow_same_host_ports'] = ALLOW_SAME_HOST_PORTS
         return arguments
     method = str(case.get('method') or 'GET').upper()
     data = str(case.get('data') or '')
     parameters = list(case.get('parameters') or [])
     if tool == 'arjun':
-        arguments.update({'method': method, 'data': data, 'known_parameters': parameters, 'timeout': timeout_override or ARJUN_TIMEOUT})
+        arguments.update({
+            'method': method, 'data': data, 'known_parameters': parameters,
+            'timeout': timeout_override or ARJUN_TIMEOUT,
+            'authorized_origins': sorted(AUTHORIZED_SCOPE_ORIGINS),
+            'allow_same_host_ports': ALLOW_SAME_HOST_PORTS,
+        })
     elif tool in {'sqlmap', 'dalfox', 'commix', 'traversal', 'idor'}:
         arguments.update({'method': method, 'data': data, 'parameters': parameters, 'timeout': timeout_override or PARAMETER_TOOL_TIMEOUTS[tool]})
         if tool == 'dalfox':
             arguments['allow_state_changes'] = state_changing_tests_allowed(target_url, allow_state_changes)
+        elif tool == 'traversal':
+            arguments['scan_profile'] = CURRENT_SCAN_MODE
     elif tool == 'authorization':
         arguments.update({'secondary_cookies': scope_cookie_header(target_url, secondary_cookies), 'method': 'GET', 'data': '', 'parameters': parameters, 'timeout': timeout_override or PARAMETER_TOOL_TIMEOUTS[tool]})
     elif tool in {'browser', 'workflow'}:

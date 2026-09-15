@@ -6,14 +6,12 @@
   },
   "authorization": {
     "confirmed": true,
-    "reference": "Authorized assessment target: 192.168.1.81 mapped as dashboard-test",
-    "allowed_host_suffixes": [
-      "snap4city.org"
-    ]
+    "reference": "Authorized assessment target: 192.168.1.81 mapped as dashboard-test; configured web origins plus discovered same-host/same-scheme ports are active-test scope when allow_same_host_ports=true.",
+    "allow_same_host_ports": true
   },
   "credentials": {
     "dashboard_session": {
-      "kind": "snap4city_oidc",
+      "kind": "browser_oidc",
       "cookie_env": "DASHBOARD_TEST_COOKIE",
       "username_env": "DASHBOARD_TEST_USERNAME",
       "password_env": "DASHBOARD_TEST_PASSWORD",
@@ -22,8 +20,8 @@
       "headless": true,
       "timeout_seconds": 60,
       "optional": true,
-      "purpose": "Authorized Snap4City dashboard login. Existing cookie env applies only to its exact origin. Username/password are resolved once and reused automatically for authorized sibling-origin OIDC/SSO reauthentication when needed.",
-      "reuse_on_authorized_siblings": true
+      "reuse_on_authorized_siblings": true,
+      "purpose": "Authorized browser-based dashboard identity. An existing cookie is tried first on the configured origin and, when allow_same_host_ports=true, on another discovered port of the same hostname/scheme because HTTP cookies are not port-scoped. Each use is validated; if the session is not usable, saved browser/OIDC state is tried next and the original username/password are reused only if the same issuer/realm requests them. No second console prompt is opened."
     }
   },
   "assets": [
@@ -60,6 +58,7 @@
   "execution": {
     "orchestrator": "agentic",
     "mode": "balanced",
+    "request_rate": 10,
     "model": "snap4city",
     "max_rounds": 2,
     "require_ai": true,

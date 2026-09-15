@@ -363,6 +363,7 @@ def _write_dvwa_assessment_config(cookie_header: str, agentic_model: str, mode: 
         "execution": {
             "orchestrator": "agentic",
             "mode": mode,
+            "request_rate": 10,
             "model": agentic_model,
             "max_rounds": 3 if mode == "deep" else 2,
             "require_ai": True,

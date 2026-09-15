@@ -11,7 +11,7 @@ import requests
 
 from fastmcp import FastMCP
 
-from utils import ROOT_DIR, runtime_container_route
+from utils import ROOT_DIR, RequestRatePacer, request_same_origin_redirects, runtime_container_route
 
 # Creates a composable child FastMCP registry; only secopsServer.py owns the HTTP listener.
 def service(label: str, key: str) -> tuple[FastMCP, Callable[[], None]]:
@@ -124,12 +124,20 @@ def mutate_parameter(
 
 # Retry transient transport failures and re-raise the last Requests error.
 def request_retry(
-    method: str, url: str, *, attempts: int = 3, backoff: float = 0.7, **kwargs: Any,
+    method: str, url: str, *, attempts: int = 3, backoff: float = 0.7,
+    pacer: RequestRatePacer | None = None, request_rate: Any = None, **kwargs: Any,
 ) -> requests.Response:
 
     last: requests.RequestException | None = None
+    active_pacer = pacer or RequestRatePacer(request_rate)
     for attempt in range(max(1, int(attempts))):
         try:
+            if kwargs.get("allow_redirects"):
+                return request_same_origin_redirects(method, url, pacer=active_pacer, **kwargs)
+            # Keep retry behavior deterministic: no implicit Requests redirect follow. Callers that
+            # opt in to redirects are handled above by the project same-origin guard.
+            kwargs["allow_redirects"] = False
+            active_pacer.wait()
             return requests.request(method, url, **kwargs)
         except (requests.Timeout, requests.ConnectionError) as exc:
             last = exc

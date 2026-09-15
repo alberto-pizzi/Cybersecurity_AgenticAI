@@ -6,10 +6,8 @@
   },
   "authorization": {
     "confirmed": true,
-    "reference": "Authorized tourist-dashboard URLs supplied for the assessment.",
-    "allowed_host_suffixes": [
-      "snap4city.org"
-    ]
+    "reference": "Authorized Snap4City tourist-dashboard site assessment; supplied entry URLs are seeds and discovered same-host/same-scheme ports are active-test scope when allow_same_host_ports=true.",
+    "allow_same_host_ports": true
   },
   "assets": [
     {
@@ -86,6 +84,7 @@
   "execution": {
     "orchestrator": "agentic",
     "mode": "balanced",
+    "request_rate": 10,
     "model": "snap4city",
     "max_rounds": 2,
     "require_ai": true,

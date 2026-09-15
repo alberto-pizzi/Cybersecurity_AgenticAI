@@ -7,7 +7,7 @@ from urllib.parse import parse_qsl, urljoin, urlparse
 
 import requests
 
-from utils import partial, skipped, success
+from utils import RequestRatePacer, partial, skipped, success
 
 from utils import same_origin
 
@@ -55,7 +55,7 @@ def _authorization_relevance(target_url: str, parameters: list[str] | None) -> t
     return score, reasons
 
 # Issue a read-only GET for one identity while keeping the request bounded and same-origin.
-def _safe_get(url: str, cookies: str, timeout: int) -> tuple[requests.Response | None, str]:
+def _safe_get(url: str, cookies: str, timeout: int, pacer: RequestRatePacer) -> tuple[requests.Response | None, str]:
     session = requests.Session()
     session.headers.update({
         "User-Agent": "SecOps-Authorization-Differential/1.0",
@@ -69,6 +69,7 @@ def _safe_get(url: str, cookies: str, timeout: int) -> tuple[requests.Response |
         if not same_origin(url, current):
             return None, "cross_origin_blocked"
         try:
+            pacer.wait()
             response = session.get(current, timeout=(2, read_timeout), allow_redirects=False)
         except requests.RequestException as exc:
             return None, f"transport_unavailable:{type(exc).__name__}"
@@ -175,7 +176,7 @@ def _finding(
 @mcp.tool()
 def run_authorization_scan(
     target_url: str, cookies: str = "", secondary_cookies: str = "", method: str = "GET",
-    data: str = "", parameters: list[str] | None = None, timeout: int = 30,
+    data: str = "", parameters: list[str] | None = None, timeout: int = 30, request_rate: float | None = None,
 ) -> dict:
 
     method = str(method or "GET").upper()
@@ -193,7 +194,8 @@ def run_authorization_scan(
         return skipped(
             "Authorization Differential Verifier", target_url, "Destructive logout, setup, reset or deletion routes are excluded.",
         )
-    timeout = max(5, min(int(timeout), 60))
+    timeout = max(5, min(int(timeout), 180))
+    pacer = RequestRatePacer(request_rate)
     relevance_score, relevance_reasons = _authorization_relevance(target_url, parameters)
     if relevance_score <= 0 and not secondary_cookies:
         return skipped(
@@ -201,11 +203,11 @@ def run_authorization_scan(
             "The request resembles public/static documentation and has no object or identity reference suitable for an authorization differential.",
             diagnosis="authorization_candidate_not_relevant", relevance_score=relevance_score, relevance_reasons=relevance_reasons,
         )
-    primary, primary_guard = _safe_get(target_url, cookies, timeout)
-    anonymous, anonymous_guard = _safe_get(target_url, "", timeout)
+    primary, primary_guard = _safe_get(target_url, cookies, timeout, pacer)
+    anonymous, anonymous_guard = _safe_get(target_url, "", timeout, pacer)
     secondary = secondary_guard = None
     if secondary_cookies:
-        secondary, secondary_guard = _safe_get(target_url, secondary_cookies, timeout)
+        secondary, secondary_guard = _safe_get(target_url, secondary_cookies, timeout, pacer)
 
     if primary is None or primary.status_code >= 400 or looks_like_login(primary, text_limit=80_000):
         return partial(

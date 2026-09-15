@@ -1,14 +1,13 @@
 from __future__ import annotations
 
+import asyncio
 import re
 import secrets
 import shutil
 from typing import Any
 from urllib.parse import quote, urlparse
 
-from utils import failure, parse_cookie_header, skipped, success
-
-from utils import same_origin
+from utils import RequestRatePacer, failure, parse_cookie_header, scanner_request_rate, skipped, success, same_origin, url_in_authorized_scope
 
 from core.scannerCommon import mutate_parameter, service
 
@@ -404,6 +403,7 @@ async def _run_browser_scan_core(
     parameters: list[str] | None = None, fields: list[dict[str, Any]] | None = None,
     source_url: str = "", client_sources: list[str] | None = None,
     client_sinks: list[str] | None = None, timeout: int = 60, allow_state_changes: bool = False,
+    request_rate: float | None = None, authorized_origins: list[str] | None = None, allow_same_host_ports: bool = False,
 ) -> dict[str, Any]:
     try:
         from playwright.async_api import Error as PlaywrightError
@@ -423,13 +423,18 @@ async def _run_browser_scan_core(
     fields = [dict(value) for value in (fields or []) if isinstance(value, dict)]
     client_sources = [str(value) for value in (client_sources or []) if str(value)]
     client_sinks = [str(value) for value in (client_sinks or []) if str(value)]
-    timeout = max(15, min(int(timeout), 180))
+    authorized_origins = [str(value) for value in (authorized_origins or []) if str(value)]
+    timeout = max(15, min(int(timeout), 300))
     timeout_ms = timeout * 1000
     findings: list[dict[str, Any]] = []
+    effective_request_rate = scanner_request_rate(request_rate)
+    navigation_pacer = RequestRatePacer(effective_request_rate)
+    blocked_top_level_urls: list[str] = []
     diagnostics: dict[str, Any] = {
         "method": str(method or "GET").upper(), "parameters": parameters, "fields": fields, "source_url": source_url,
         "client_sources": client_sources, "client_sinks": client_sinks,
         "allow_state_changes": bool(allow_state_changes), "playwright_api": "async",
+        "request_rate": effective_request_rate, "authorized_navigation_origins": authorized_origins, "allow_same_host_ports": bool(allow_same_host_ports),
     }
 
     try:
@@ -453,6 +458,26 @@ async def _run_browser_scan_core(
                 diagnostics["managed_browser_error"] = str(exc)
             context = await browser.new_context(ignore_https_errors=True)
             try:
+                async def scope_route(route: Any, request: Any) -> None:
+                    # Permit third-party assets needed to render the authorized application, but never
+                    # allow this verification browser to turn a redirect/navigation into a new active target.
+                    try:
+                        is_navigation = bool(request.is_navigation_request())
+                    except Exception:
+                        is_navigation = str(getattr(request, "resource_type", "") or "") == "document"
+                    if is_navigation:
+                        request_url = str(getattr(request, "url", "") or "")
+                        if request_url and not url_in_authorized_scope(
+                            target_url, request_url, authorized_origins, allow_same_host_ports=bool(allow_same_host_ports),
+                        ):
+                            if request_url not in blocked_top_level_urls:
+                                blocked_top_level_urls.append(request_url)
+                            await route.abort("blockedbyclient")
+                            return
+                        await asyncio.to_thread(navigation_pacer.wait)
+                    await route.continue_()
+
+                await context.route("**/*", scope_route)
                 if cookies:
                     await context.add_cookies(_browser_cookies(target_url, cookies))
                 page = await context.new_page()
@@ -479,6 +504,8 @@ async def _run_browser_scan_core(
                     diagnostics["stored"] = stored_diag
                 else:
                     diagnostics["stored"] = {"attempted": False, "reason": "request method is not POST"}
+                diagnostics["blocked_external_top_level_navigations"] = len(blocked_top_level_urls)
+                diagnostics["blocked_external_top_level_urls"] = blocked_top_level_urls[:20]
             finally:
                 await context.close()
                 await browser.close()
@@ -512,12 +539,13 @@ async def run_browser_scan(
     parameters: list[str] | None = None, fields: list[dict[str, Any]] | None = None,
     source_url: str = "", client_sources: list[str] | None = None,
     client_sinks: list[str] | None = None, timeout: int = 60, allow_state_changes: bool = False,
+    request_rate: float | None = None, authorized_origins: list[str] | None = None, allow_same_host_ports: bool = False,
 ) -> dict:
 
     return await _run_browser_scan_core(
         target_url=target_url, cookies=cookies, method=method, data=data,
         parameters=parameters, fields=fields, source_url=source_url, client_sources=client_sources,
-        client_sinks=client_sinks, timeout=timeout, allow_state_changes=allow_state_changes,
+        client_sinks=client_sinks, timeout=timeout, allow_state_changes=allow_state_changes, request_rate=request_rate, authorized_origins=authorized_origins, allow_same_host_ports=allow_same_host_ports,
     )
 
 if __name__ == "__main__":

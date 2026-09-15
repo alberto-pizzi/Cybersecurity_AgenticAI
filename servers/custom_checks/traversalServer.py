@@ -5,7 +5,7 @@ from typing import Any
 
 import requests
 
-from utils import partial, scanner_session_probe, success
+from utils import RequestRatePacer, request_same_origin_redirects, partial, scanner_session_probe, success
 
 from core.scannerCommon import mutate_parameter, service
 
@@ -23,13 +23,13 @@ PROBES = (
 )
 
 # Send one bounded traversal request while preserving the discovered request contract.
-def _request(url: str, cookies: str, method: str, data: str, read_timeout: float = 7.0) -> requests.Response:
+def _request(url: str, cookies: str, method: str, data: str, pacer: RequestRatePacer, read_timeout: float = 7.0) -> requests.Response:
     headers = {"Cache-Control": "no-cache", "User-Agent": "SecOps-Path-Traversal-Verifier/1.0"}
     if cookies:
         headers["Cookie"] = cookies
-    return requests.request(
+    return request_same_origin_redirects(
         method, url, data=data if method != "GET" else None, headers=headers,
-        timeout=(3, max(3.0, read_timeout)), allow_redirects=True,
+        timeout=(3, max(3.0, read_timeout)), pacer=pacer,
     )
 
 # Extract a compact response excerpt around the marker used for LFI verification.
@@ -44,11 +44,17 @@ def _excerpt(text: str, match: re.Match[str] | None, limit: int = 1000) -> str:
 @mcp.tool()
 def run_traversal_scan(
     target_url: str, cookies: str = "", method: str = "GET", data: str = "", parameters: list[str] | None = None, timeout: int = 30,
+    scan_profile: str = "balanced", request_rate: float | None = None,
 ) -> dict:
 
     method = str(method or "GET").upper()
     timeout = max(10, min(int(timeout), 120))
+    profile = str(scan_profile or "balanced").lower()
+    if profile not in {"fast", "balanced", "deep"}:
+        profile = "balanced"
+    parameter_limit = 2 if profile == "fast" else 3 if profile == "balanced" else 5
     read_timeout = max(4.0, min(7.0, (timeout - 5.0) / 4.0))
+    pacer = RequestRatePacer(request_rate)
     if method not in {"GET", "POST"}:
         return partial(
             "Path Traversal/LFI", target_url, f"Unsupported HTTP method for bounded traversal verification: {method}.",
@@ -64,7 +70,7 @@ def run_traversal_scan(
             vulnerabilities=[], applicable=False,
         )
 
-    session_probe = scanner_session_probe(target_url, cookies, method, data, timeout=4, attempts=1)
+    session_probe = scanner_session_probe(target_url, cookies, method, data, timeout=4, attempts=1, pacer=pacer)
     if cookies and session_probe.get("performed") and session_probe.get("conclusive") and session_probe.get("authenticated") is False:
         return partial(
             "Path Traversal/LFI", target_url,
@@ -76,18 +82,18 @@ def run_traversal_scan(
     baseline: requests.Response | None = None
     baseline_error = ""
     try:
-        baseline = _request(target_url, cookies, method, data, read_timeout)
+        baseline = _request(target_url, cookies, method, data, pacer, read_timeout)
     except requests.RequestException as exc:
         baseline_error = f"{type(exc).__name__}: {exc}"
 
     attempts: list[dict[str, Any]] = []
     findings: list[dict[str, Any]] = []
     # Confirm only known file markers that are absent from the benign response.
-    for parameter in candidates[:2]:
+    for parameter in candidates[:parameter_limit]:
         for payload, marker, label in PROBES:
             probe_url, probe_data = mutate_parameter(target_url, method, data, parameter, payload, case_insensitive=True)
             try:
-                response = _request(probe_url, cookies, method, probe_data, read_timeout)
+                response = _request(probe_url, cookies, method, probe_data, pacer, read_timeout)
             except requests.RequestException as exc:
                 attempts.append({
                     "parameter": parameter, "payload": payload, "source": label, "error": f"{type(exc).__name__}: {exc}",
@@ -146,6 +152,7 @@ def run_traversal_scan(
         "vulnerabilities": findings, "attempts": attempts, "applicable": True,
         "authenticated": bool(cookies), "session_probe": session_probe,
         "execution_mode": "bounded_known_file_markers", "request_timeout": round(read_timeout, 2),
+        "scan_profile": profile, "parameter_limit": parameter_limit,
         "baseline_available": baseline is not None, "baseline_error": baseline_error,
     }
     return success(

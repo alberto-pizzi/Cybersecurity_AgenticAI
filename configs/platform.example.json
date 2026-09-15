@@ -6,13 +6,22 @@
   },
   "authorization": {
     "confirmed": false,
-    "reference": "Replace with the real authorization/ticket/reference and set confirmed=true before executing a real assessment"
+    "reference": "Replace with the real authorization/ticket/reference and set confirmed=true before executing a real assessment. This example enables discovered same-host/same-scheme multi-port scope.",
+    "allow_same_host_ports": true
   },
   "credentials": {
     "portal_primary": {
-      "kind": "cookie",
-      "env": "SECOPS_PORTAL_PRIMARY_COOKIE",
-      "purpose": "Primary authenticated web identity"
+      "kind": "browser_oidc",
+      "cookie_env": "SECOPS_PORTAL_PRIMARY_COOKIE",
+      "username_env": "SECOPS_PORTAL_PRIMARY_USERNAME",
+      "password_env": "SECOPS_PORTAL_PRIMARY_PASSWORD",
+      "login_path": "/app/",
+      "validation_path": "/app/",
+      "headless": true,
+      "timeout_seconds": 60,
+      "optional": true,
+      "reuse_on_authorized_siblings": true,
+      "purpose": "Primary OIDC web identity. An existing cookie is tried first on its configured origin and on discovered same-host/same-scheme ports only when allow_same_host_ports=true; it is never copied to a different hostname. If validation fails, saved browser/OIDC state is tried and the original username/password may be reused only after the browser reaches the same issuer/realm. No second console prompt is opened."
     },
     "portal_secondary": {
       "kind": "cookie",
@@ -33,7 +42,7 @@
           "secondary_credential_ref": "portal_secondary",
           "auth_only": true,
           "allow_state_changes": false,
-          "notes": "Absolute-URL form. When url is set it takes precedence over asset.host, service.port, protocol and base_path for the target URL."
+          "notes": "Absolute-URL form. When url is set it takes precedence over asset.host, service.port, protocol and base_path. portal_primary opts into authorized-sibling OIDC/SSO reuse: saved SSO state is tried first and the initially resolved username/password are reused automatically only after the browser reaches the same primary OIDC issuer/realm."
         },
         {
           "id": "http-redirect",
@@ -48,7 +57,7 @@
     },
     {
       "id": "admin-api",
-      "host": "10.20.0.11",
+      "host": "api.example.internal",
       "address": "10.20.0.11",
       "services": [
         {
@@ -59,7 +68,7 @@
           "credential_ref": "portal_primary",
           "auth_only": true,
           "allow_state_changes": false,
-          "notes": "Host/IP + port form with explicit HTTPS because 8443 is a non-standard HTTPS port."
+          "notes": "Host/IP + port form with explicit HTTPS because 8443 is a non-standard HTTPS port. It reuses portal_primary as an identity reference, but the runner obtains/validates a separate exact-origin application session for this sibling rather than copying the primary Cookie header."
         },
         {
           "id": "ssh-inventory",
@@ -74,6 +83,7 @@
   "execution": {
     "orchestrator": "agentic",
     "mode": "balanced",
+    "request_rate": 10,
     "model": "llama",
     "max_rounds": 2,
     "require_ai": true,

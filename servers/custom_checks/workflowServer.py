@@ -9,7 +9,7 @@ from urllib.parse import parse_qsl, urljoin, urlparse
 
 import requests
 
-from utils import skipped, success
+from utils import RequestRatePacer, request_same_origin_redirects, skipped, success
 
 from utils import same_origin
 
@@ -72,6 +72,7 @@ def _session(cookies: str) -> requests.Session:
 def _csrf_check(
     target_url: str, source_url: str, cookies: str, data: str,
     fields: list[dict[str, str]], token_parameters: list[str], timeout: int, allow_state_changes: bool,
+    pacer: RequestRatePacer,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     findings: list[dict[str, Any]] = []
     diagnostic: dict[str, Any] = {"applicable": False}
@@ -108,13 +109,10 @@ def _csrf_check(
 
     session = _session(cookies)
     try:
-        baseline = session.post(
-            target_url, data=original, timeout=(4, timeout), allow_redirects=True,
+        baseline = request_same_origin_redirects("POST", target_url, session=session, data=original, timeout=(4, timeout), pacer=pacer,
             headers={"Referer": source_url or target_url, "Origin": f"{parsed.scheme}://{parsed.netloc}"},
         )
-        without_token = session.post(
-            target_url, data=stripped, timeout=(4, timeout), allow_redirects=True, headers={"Sec-Fetch-Site": "cross-site"},
-        )
+        without_token = request_same_origin_redirects("POST", target_url, session=session, data=stripped, timeout=(4, timeout), pacer=pacer, headers={"Sec-Fetch-Site": "cross-site"})
     except requests.RequestException as exc:
         diagnostic["error"] = f"{type(exc).__name__}: {exc}"
         return findings, diagnostic
@@ -150,7 +148,8 @@ def _csrf_check(
 # Exercise a bounded file-upload workflow and verify whether uploaded content becomes web-accessible.
 def _upload_check(
     target_url: str, source_url: str, cookies: str, fields: list[dict[str, str]],
-    file_parameters: list[str], timeout: int, allow_state_changes: bool, known_urls: list[str] | None = None,
+    file_parameters: list[str], timeout: int, allow_state_changes: bool, known_urls: list[str] | None,
+    pacer: RequestRatePacer,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     findings: list[dict[str, Any]] = []
     diagnostic: dict[str, Any] = {"applicable": bool(file_parameters)}
@@ -172,10 +171,7 @@ def _upload_check(
     files = {file_parameters[0]: (filename, content, "text/html")}
     session = _session(cookies)
     try:
-        response = session.post(
-            target_url, data=form_data, files=files, timeout=(4, timeout),
-            allow_redirects=True, headers={"Referer": source_url or target_url},
-        )
+        response = request_same_origin_redirects("POST", target_url, session=session, data=form_data, files=files, timeout=(4, timeout), pacer=pacer, headers={"Referer": source_url or target_url})
     except requests.RequestException as exc:
         diagnostic["error"] = f"{type(exc).__name__}: {exc}"
         return findings, diagnostic
@@ -215,7 +211,7 @@ def _upload_check(
     directory_searches: list[dict[str, Any]] = []
     for directory in list(dict.fromkeys(directory_candidates))[:10]:
         try:
-            listing = session.get(directory, timeout=(4, timeout), allow_redirects=True)
+            listing = request_same_origin_redirects("GET", directory, session=session, timeout=(4, timeout), pacer=pacer)
         except requests.RequestException as exc:
             directory_searches.append({"url": directory, "error": f"{type(exc).__name__}: {exc}"})
             continue
@@ -235,7 +231,7 @@ def _upload_check(
     retrieved: list[dict[str, Any]] = []
     for candidate in candidates[:8]:
         try:
-            probe = session.get(candidate, timeout=(4, timeout), allow_redirects=True)
+            probe = request_same_origin_redirects("GET", candidate, session=session, timeout=(4, timeout), pacer=pacer)
         except requests.RequestException:
             continue
         present = marker in probe.text
@@ -279,7 +275,7 @@ def _upload_check(
 
 # Run bounded authentication attempts to detect missing throttling or challenge behavior.
 def _authentication_check(
-    target_url: str, fields: list[dict[str, str]], timeout: int, method: str = "POST",
+    target_url: str, fields: list[dict[str, str]], timeout: int, method: str, pacer: RequestRatePacer,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     findings: list[dict[str, Any]] = []
     names = {field["name"].lower(): field for field in fields}
@@ -306,9 +302,9 @@ def _authentication_check(
             payload[password_name] = secrets.token_urlsafe(12)
         try:
             if str(method or "POST").upper() == "GET":
-                response = session.get(target_url, params=payload, timeout=(4, timeout), allow_redirects=True)
+                response = request_same_origin_redirects("GET", target_url, session=session, params=payload, timeout=(4, timeout), pacer=pacer)
             else:
-                response = session.post(target_url, data=payload, timeout=(4, timeout), allow_redirects=True)
+                response = request_same_origin_redirects("POST", target_url, session=session, data=payload, timeout=(4, timeout), pacer=pacer)
         except requests.RequestException as exc:
             attempts.append({"error": f"{type(exc).__name__}: {exc}"})
             break
@@ -340,6 +336,7 @@ def _authentication_check(
 # Inspect the CAPTCHA workflow for recognizable challenge fields and bypass indicators.
 def _captcha_check(
     target_url: str, cookies: str, data: str, fields: list[dict[str, str]], timeout: int, allow_state_changes: bool,
+    pacer: RequestRatePacer,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     names = [field["name"] for field in fields]
     applicable = bool(CAPTCHA_RE.search(" ".join([urlparse(target_url).path, *names])))
@@ -364,7 +361,7 @@ def _captcha_check(
     stripped = [(name, value) for name, value in pairs if name not in set(captcha_names)]
     session = _session(cookies)
     try:
-        response = session.post(target_url, data=stripped, timeout=(4, timeout), allow_redirects=True)
+        response = request_same_origin_redirects("POST", target_url, session=session, data=stripped, timeout=(4, timeout), pacer=pacer)
     except requests.RequestException as exc:
         diagnostic["error"] = f"{type(exc).__name__}: {exc}"
         return findings, diagnostic
@@ -390,7 +387,7 @@ def run_workflow_scan(
     parameters: list[str] | None = None, fields: list[dict[str, Any]] | None = None,
     file_parameters: list[str] | None = None, token_parameters: list[str] | None = None,
     source_url: str = "", enctype: str = "", timeout: int = 45, allow_state_changes: bool = False,
-    known_urls: list[str] | None = None,
+    known_urls: list[str] | None = None, request_rate: float | None = None,
 ) -> dict:
 
     method = str(method or "GET").upper()
@@ -407,7 +404,8 @@ def run_workflow_scan(
         ]
     file_parameters = [str(value) for value in (file_parameters or []) if str(value)]
     token_parameters = [str(value) for value in (token_parameters or []) if str(value)]
-    timeout = max(5, min(int(timeout), 90))
+    timeout = max(5, min(int(timeout), 240))
+    pacer = RequestRatePacer(request_rate)
     if method not in {"GET", "POST"}:
         return skipped("Web Workflow Verifier", target_url, "The current workflow checks require a discovered GET/POST form contract.")
     if DESTRUCTIVE_RE.search(urlparse(target_url).path):
@@ -422,13 +420,13 @@ def run_workflow_scan(
 
     if method == "POST":
         csrf_findings, csrf_diag = _csrf_check(
-            target_url, source_url, cookies, data, rows, token_parameters, timeout, allow_state_changes,
+            target_url, source_url, cookies, data, rows, token_parameters, timeout, allow_state_changes, pacer,
         )
         upload_findings, upload_diag = _upload_check(
-            target_url, source_url, cookies, rows, file_parameters, timeout, allow_state_changes, known_urls,
+            target_url, source_url, cookies, rows, file_parameters, timeout, allow_state_changes, known_urls, pacer,
         )
         captcha_findings, captcha_diag = _captcha_check(
-            target_url, cookies, data, rows, timeout, allow_state_changes,
+            target_url, cookies, data, rows, timeout, allow_state_changes, pacer,
         )
     else:
         csrf_findings, csrf_diag = [], {"applicable": False, "reason": "GET authentication workflow"}
@@ -441,7 +439,7 @@ def run_workflow_scan(
     diagnostics["upload"] = upload_diag
     diagnostics["captcha"] = captcha_diag
 
-    auth_findings, auth_diag = _authentication_check(target_url, rows, timeout, method)
+    auth_findings, auth_diag = _authentication_check(target_url, rows, timeout, method, pacer)
     findings.extend(auth_findings)
     diagnostics["authentication"] = auth_diag
 

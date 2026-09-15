@@ -11,7 +11,7 @@ from urllib.parse import parse_qsl, urlparse
 
 import requests
 
-from utils import parse_cookie_header, partial, skipped, success
+from utils import RequestRatePacer, parse_cookie_header, partial, request_same_origin_redirects, skipped, success
 
 from utils import same_origin
 
@@ -120,13 +120,15 @@ def _cookie_attribute_findings(url: str, rows: list[dict[str, Any]], https: bool
 @mcp.tool()
 def run_session_scan(
     target_url: str, cookies: str = "", probe_url: str = "", timeout: int = 30, sample_count: int = 5,
+    request_rate: float | None = None,
 ) -> dict:
 
     selected_probe = probe_url or target_url
     if not same_origin(target_url, selected_probe):
         selected_probe = target_url
-    timeout = max(5, min(int(timeout), 60))
+    timeout = max(5, min(int(timeout), 180))
     sample_count = max(3, min(int(sample_count), 10))
+    pacer = RequestRatePacer(request_rate)
 
     deadline = time.monotonic() + max(4.0, timeout - 5.0)
     request_timeout = max(2.0, min(3.0, (timeout - 6.0) / max(5, sample_count + 3)))
@@ -139,7 +141,7 @@ def run_session_scan(
     try:
         baseline = request_retry(
             "GET", selected_probe, attempts=2, backoff=0.25, timeout=(2, request_timeout), allow_redirects=True,
-            headers={"User-Agent": "SecOps-Session-Analyzer/1.0", "Cache-Control": "no-cache"},
+            headers={"User-Agent": "SecOps-Session-Analyzer/1.0", "Cache-Control": "no-cache"}, pacer=pacer,
         )
     except requests.RequestException as exc:
         diagnostics["anonymous_probe_error"] = f"{type(exc).__name__}: {exc}"
@@ -159,7 +161,7 @@ def run_session_scan(
         try:
             authenticated = request_retry(
                 "GET", selected_probe, attempts=2, backoff=0.2, timeout=(2, request_timeout), allow_redirects=True,
-                headers={"User-Agent": "SecOps-Session-Analyzer/1.0", "Cache-Control": "no-cache", "Cookie": cookies},
+                headers={"User-Agent": "SecOps-Session-Analyzer/1.0", "Cache-Control": "no-cache", "Cookie": cookies}, pacer=pacer,
             )
             authenticated_rows: list[dict[str, Any]] = []
             for header in _set_cookie_headers(authenticated):
@@ -180,9 +182,8 @@ def run_session_scan(
             break
         session = requests.Session()
         try:
-            response = session.get(
-                selected_probe, timeout=(2, request_timeout), allow_redirects=True,
-                headers={"User-Agent": "SecOps-Session-Analyzer/1.0", "Cache-Control": "no-cache"},
+            response = request_same_origin_redirects("GET", selected_probe, session=session, timeout=(2, request_timeout),
+                headers={"User-Agent": "SecOps-Session-Analyzer/1.0", "Cache-Control": "no-cache"}, pacer=pacer,
             )
         except requests.RequestException:
             continue
@@ -229,11 +230,10 @@ def run_session_scan(
                 break
             chosen = "SECOPS" + secrets.token_hex(12)
             try:
-                response = requests.get(
-                    selected_probe, timeout=(2, request_timeout), allow_redirects=True,
+                response = request_same_origin_redirects("GET", selected_probe, timeout=(2, request_timeout),
                     headers={
                         "User-Agent": "SecOps-Session-Analyzer/1.0", "Cache-Control": "no-cache", "Cookie": f"{name}={chosen}",
-                    },
+                    }, pacer=pacer,
                 )
             except requests.RequestException:
                 continue
@@ -275,7 +275,7 @@ def run_session_scan(
 @mcp.tool()
 def run_logout_check(
     target_url: str, logout_url: str, cookies: str = "", probe_url: str = "",
-    method: str = "GET", data: str = "", timeout: int = 20,
+    method: str = "GET", data: str = "", timeout: int = 20, request_rate: float | None = None,
 ) -> dict:
 
     selected_probe = probe_url or target_url
@@ -300,13 +300,14 @@ def run_logout_check(
 
     timeout = max(8, min(int(timeout), 40))
     request_timeout = max(3.0, min(8.0, timeout / 4.0))
+    pacer = RequestRatePacer(request_rate)
     common_headers = {"User-Agent": "SecOps-Session-Logout-Verifier/1.0", "Cache-Control": "no-cache"}
     auth_headers = {**common_headers, "Cookie": cookies}
 
     def fetch(url: str, *, authenticated: bool) -> requests.Response:
-        return requests.get(
-            url, headers=auth_headers if authenticated else common_headers,
-            timeout=(3, request_timeout), allow_redirects=True,
+        return request_same_origin_redirects(
+            "GET", url, headers=auth_headers if authenticated else common_headers,
+            timeout=(3, request_timeout), pacer=pacer,
         )
 
     diagnostics: dict[str, Any] = {"logout_url": logout_url, "probe_url": selected_probe, "method": method}
@@ -346,9 +347,9 @@ def run_logout_check(
         )
 
     try:
-        logout_response = requests.request(
+        logout_response = request_same_origin_redirects(
             method, logout_url, data=data if method == "POST" else None, headers=auth_headers,
-            timeout=(3, request_timeout), allow_redirects=True,
+            timeout=(3, request_timeout), pacer=pacer,
         )
     except requests.RequestException as exc:
         return partial(
@@ -356,11 +357,23 @@ def run_logout_check(
             f"The logout request could not be completed: {type(exc).__name__}: {exc}",
             diagnosis="logout_request_failed", vulnerabilities=[], diagnostics=diagnostics,
         )
+    logout_redirect_guard = str(logout_response.headers.get("X-SecOps-Redirect-Guard") or "")
     diagnostics["logout"] = {
         "status": logout_response.status_code, "final_url": str(logout_response.url),
         "login_detected": looks_like_login(logout_response, text_limit=80_000),
         "set_cookie": _set_cookie_headers(logout_response)[:6],
+        "redirect_guard": logout_redirect_guard,
+        "location": str(logout_response.headers.get("Location") or ""),
     }
+    if logout_redirect_guard:
+        cross_origin = logout_redirect_guard == "cross-origin-blocked"
+        return partial(
+            "Session Logout Verifier", logout_url,
+            ("Logout verification stopped because the endpoint redirected to a different origin; the external redirect was not followed."
+             if cross_origin else "Logout verification stopped after the bounded same-origin redirect limit was reached."),
+            diagnosis=("logout_cross_origin_redirect_blocked" if cross_origin else "logout_redirect_limit_reached"),
+            vulnerabilities=[], diagnostics=diagnostics,
+        )
     if logout_response.status_code >= 400:
         return partial(
             "Session Logout Verifier", logout_url,

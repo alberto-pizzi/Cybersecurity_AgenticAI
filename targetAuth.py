@@ -3,7 +3,7 @@ from __future__ import annotations
 import shutil
 import time
 from typing import Any, Iterable
-from urllib.parse import urljoin, urlparse
+from urllib.parse import parse_qsl, urljoin, urlparse
 
 from utils import canonical_cookie_header, cookie_names, normalized_origin, same_origin
 
@@ -21,7 +21,6 @@ PASSWORD_SELECTORS = (
     "input[type='password']",
 )
 SUBMIT_SELECTORS = (
-    "#kc-login",
     "input[type='submit']",
     "button[type='submit']",
     "button[name='login']",
@@ -39,8 +38,6 @@ LOGIN_TRIGGER_SELECTORS = (
 )
 ERROR_SELECTORS = (
     "#input-error",
-    "#kc-error-message",
-    ".kc-feedback-text",
     ".alert-error",
     "[role='alert']",
     ".pf-c-alert__title",
@@ -51,7 +48,6 @@ ADDITIONAL_STEP_SELECTORS = (
     "input[name='totp']",
     "input[autocomplete='one-time-code']",
     "#otp",
-    "#kc-otp-login-form",
 )
 
 
@@ -66,7 +62,7 @@ def _first_visible_locator(page: Any, selectors: Iterable[str]) -> Any | None:
     return None
 
 
-def _keycloak_login_diagnostic(page: Any) -> str:
+def _login_diagnostic(page: Any) -> str:
     for selector in ERROR_SELECTORS:
         try:
             locator = page.locator(selector).first
@@ -82,20 +78,37 @@ def _keycloak_login_diagnostic(page: Any) -> str:
 
 
 def looks_like_oidc_login_url(url: str) -> bool:
+    """Detect an OAuth/OIDC authorization step using generic protocol signals."""
     try:
-        path = str(urlparse(str(url or "")).path or "").lower().rstrip("/")
+        parsed = urlparse(str(url or ""))
     except ValueError:
         return False
-    return "/auth/realms/" in path or path.endswith(("/login", "/signin", "/sign-in"))
+    path = str(parsed.path or "").lower().rstrip("/")
+    names = {str(name).lower() for name, _ in parse_qsl(parsed.query, keep_blank_values=True)}
+    protocol = {'client_id', 'redirect_uri', 'response_type'}
+    return bool(names & protocol) or path.endswith(('/authorize', '/oauth2/authorize', '/oidc/authorize'))
 
+
+def oidc_issuer_key(url: str) -> str:
+    """Return a provider-agnostic authorization-endpoint key used only for credential-reuse safety."""
+    try:
+        parsed = urlparse(str(url or ""))
+    except ValueError:
+        return ""
+    origin = normalized_origin(str(url or ""))
+    if not origin:
+        return ""
+    path = str(parsed.path or '/').rstrip('/') or '/'
+    # Keep the stable authorization endpoint path while discarding all one-shot query values.
+    return origin + path
 
 def _looks_like_application_login_entry(url: str) -> bool:
+    """Heuristic used only to prioritize browser authentication attempts, never to decide attack scope."""
     try:
         path = str(urlparse(str(url or "")).path or "").lower()
     except ValueError:
         return False
-    return "ssologin" in path or path.endswith(("/login", "/signin", "/sign-in")) or "/login/" in path
-
+    return any(token in path for token in ('login', 'signin', 'sign-in', 'session', 'authenticate'))
 
 def _same_origin_candidates(target_url: str, values: Iterable[str]) -> list[str]:
     selected: list[str] = []
@@ -138,7 +151,7 @@ def _target_cookie_header(context: Any, url: str, credential: dict[str, Any], *,
         missing = sorted(required - present)
         if missing:
             raise RuntimeError(
-                "Snap4City login completed but required target cookie(s) are missing: " + ", ".join(missing)
+                "Browser login completed but required target cookie(s) are missing: " + ", ".join(missing)
             )
     return header
 
@@ -148,7 +161,7 @@ def _remaining_ms(deadline: float, *, cap_ms: int = 20_000, floor_ms: int = 1_00
     return max(floor_ms, min(cap_ms, int(remaining * 1000)))
 
 
-def snap4city_browser_login_session(
+def browser_oidc_login_session(
     target_url: str,
     username: str,
     password: str,
@@ -158,10 +171,11 @@ def snap4city_browser_login_session(
     candidate_urls: Iterable[str] | None = None,
     initial_login: bool = False,
     include_configured_fallbacks: bool = True,
+    expected_oidc_issuer: str = "",
 ) -> dict[str, Any]:
     """Obtain one origin-scoped application session without ever prompting for credentials.
 
-    A previous Playwright storage state is imported first so an existing Keycloak/OIDC SSO session can
+    A previous Playwright storage state is imported first so an existing browser/OIDC SSO session can
     silently create an application cookie for a newly discovered sibling origin. If the identity provider
     asks for credentials again, the username/password already resolved by assessmentRunner are reused.
     """
@@ -169,7 +183,7 @@ def snap4city_browser_login_session(
         from playwright.sync_api import sync_playwright
     except Exception as exc:
         raise RuntimeError(
-            f"Playwright is unavailable for automatic Snap4City login: {type(exc).__name__}: {exc}"
+            f"Playwright is unavailable for automatic browser login: {type(exc).__name__}: {exc}"
         ) from exc
 
     origin = normalized_origin(target_url)
@@ -215,19 +229,42 @@ def snap4city_browser_login_session(
             browser = playwright.chromium.launch(headless=headless, executable_path=system_chromium)
         context_kwargs: dict[str, Any] = {
             "ignore_https_errors": True,
-            "user_agent": "SecOps-Snap4City-Login/2.0",
+            "user_agent": "SecOps-Browser-Login/3.0",
         }
         if isinstance(storage_state, dict) and (storage_state.get("cookies") or storage_state.get("origins")):
             context_kwargs["storage_state"] = storage_state
         context = browser.new_context(**context_kwargs)
         page = context.new_page()
         observed_auth_requests: list[str] = []
-        page.on(
-            "request",
-            lambda request: observed_auth_requests.append(str(request.url or ""))
-            if looks_like_oidc_login_url(str(request.url or ""))
-            else None,
-        )
+
+        def record_auth_request(request: Any) -> None:
+            request_url = str(request.url or "")
+            if looks_like_oidc_login_url(request_url):
+                observed_auth_requests.append(request_url)
+
+        def current_issuer(offset: int=0) -> str:
+            direct = oidc_issuer_key(str(page.url or ""))
+            if direct:
+                return direct
+            for request_url in reversed(observed_auth_requests[offset:]):
+                issuer = oidc_issuer_key(request_url)
+                if issuer:
+                    return issuer
+            return ""
+
+        def issuer_allowed(offset: int=0) -> tuple[bool, str]:
+            issuer = current_issuer(offset)
+            expected = str(expected_oidc_issuer or "").strip().rstrip("/")
+            if expected:
+                # Credentials resolved for the primary application may be reused only while the top-level
+                # browser page itself is on the same OIDC issuer/realm. Merely observing a background request
+                # to that issuer is not enough to authorize filling an unrelated application's local form.
+                direct_issuer = oidc_issuer_key(str(page.url or ""))
+                if not direct_issuer or direct_issuer.rstrip("/") != expected:
+                    return False, issuer
+            return True, issuer
+
+        page.on("request", record_auth_request)
         try:
             for candidate in candidates:
                 if time.monotonic() >= deadline:
@@ -261,6 +298,7 @@ def snap4city_browser_login_session(
                         enforce_required=bool(initial_login),
                     )
                     if existing_header and storage_state and flow_observed and password_field is None and username_field is None:
+                        issuer = current_issuer(auth_request_offset)
                         return {
                             "cookie_header": existing_header,
                             "storage_state": context.storage_state(),
@@ -269,6 +307,7 @@ def snap4city_browser_login_session(
                             "used_credentials": False,
                             "sso_reused": True,
                             "authentication_flow_observed": flow_observed,
+                            "oidc_issuer": issuer,
                         }
 
                 if username_field is None and password_field is None and login_trigger is not None:
@@ -293,6 +332,7 @@ def snap4city_browser_login_session(
                                 enforce_required=bool(initial_login),
                             )
                             if header:
+                                issuer = current_issuer(auth_request_offset)
                                 return {
                                     "cookie_header": header,
                                     "storage_state": context.storage_state(),
@@ -301,10 +341,11 @@ def snap4city_browser_login_session(
                                     "used_credentials": False,
                                     "sso_reused": True,
                                     "authentication_flow_observed": flow_observed,
+                                    "oidc_issuer": issuer,
                                 }
                         page.wait_for_timeout(250)
 
-                # Some explicit SSO endpoints immediately redirect to Keycloak and therefore expose the form
+                # Some explicit SSO endpoints immediately redirect to an external identity provider and therefore expose the form
                 # without a local login control.
                 username_field = username_field or _first_visible_locator(page, USERNAME_SELECTORS)
                 password_field = password_field or _first_visible_locator(page, PASSWORD_SELECTORS)
@@ -319,9 +360,10 @@ def snap4city_browser_login_session(
                             enforce_required=bool(initial_login),
                         )
                         # On the initial target, do not mistake a public page with incidental cookies for a
-                        # successful login when no login interaction happened. On sibling origins a non-empty
+                        # successful login when no login interaction happened. On additional explicitly authorized origins a non-empty
                         # imported SSO state is allowed to establish the application session silently.
                         if header and storage_state and flow_observed:
+                            issuer = current_issuer(auth_request_offset)
                             return {
                                 "cookie_header": header,
                                 "storage_state": context.storage_state(),
@@ -330,6 +372,7 @@ def snap4city_browser_login_session(
                                 "used_credentials": False,
                                 "sso_reused": True,
                                 "authentication_flow_observed": flow_observed,
+                                "oidc_issuer": issuer,
                             }
                     failures.append(f"{candidate}: login form/control not found")
                     continue
@@ -337,9 +380,17 @@ def snap4city_browser_login_session(
                 if username_field is not None or password_field is not None:
                     flow_observed = True
 
+                allowed_issuer, observed_issuer = issuer_allowed(auth_request_offset)
+                if not allowed_issuer:
+                    failures.append(
+                        f"{candidate}: credential reuse blocked because OIDC issuer {observed_issuer!r} "
+                        f"differs from the primary issuer {str(expected_oidc_issuer)!r}"
+                    )
+                    continue
+
                 if not username or not password:
                     raise RuntimeError(
-                        "Snap4City/Keycloak requested username/password again, but the initial target credentials are not available for automatic reuse."
+                        "The authentication provider requested username/password again, but the initial target credentials are not available for automatic reuse."
                     )
 
                 if username_field is not None:
@@ -358,10 +409,10 @@ def snap4city_browser_login_session(
                         pass
                     password_field = _first_visible_locator(page, PASSWORD_SELECTORS)
                 if password_field is None:
-                    diagnostic = _keycloak_login_diagnostic(page)
+                    diagnostic = _login_diagnostic(page)
                     if diagnostic == "additional_authentication_step_required":
                         raise RuntimeError(
-                            "Snap4City/Keycloak requires an additional authentication step such as OTP; automatic username/password login cannot complete it."
+                            "The authentication provider requires an additional step such as OTP; automatic username/password login cannot complete it."
                         )
                     failures.append(f"{candidate}: password field not exposed")
                     continue
@@ -385,6 +436,7 @@ def snap4city_browser_login_session(
                             enforce_required=bool(initial_login),
                         )
                         if header:
+                            issuer = current_issuer(auth_request_offset)
                             return {
                                 "cookie_header": header,
                                 "storage_state": context.storage_state(),
@@ -393,14 +445,15 @@ def snap4city_browser_login_session(
                                 "used_credentials": used_credentials,
                                 "sso_reused": False,
                                 "authentication_flow_observed": flow_observed,
+                                "oidc_issuer": issuer,
                             }
-                    diagnostic = _keycloak_login_diagnostic(page)
+                    diagnostic = _login_diagnostic(page)
                     if diagnostic.startswith("credentials_rejected:"):
                         message = diagnostic.split(":", 1)[1].strip()
-                        raise RuntimeError(f"Snap4City/Keycloak rejected the supplied target credentials: {message}")
+                        raise RuntimeError(f"The authentication provider rejected the supplied target credentials: {message}")
                     if diagnostic == "additional_authentication_step_required":
                         raise RuntimeError(
-                            "Snap4City/Keycloak requires an additional authentication step such as OTP; automatic username/password login cannot complete it."
+                            "The authentication provider requires an additional step such as OTP; automatic username/password login cannot complete it."
                         )
                     page.wait_for_timeout(250)
 
@@ -408,7 +461,11 @@ def snap4city_browser_login_session(
 
             detail = "; ".join(failures[-4:]) if failures else "no usable login entry point was found"
             raise RuntimeError(
-                f"Snap4City automatic login could not establish an application session for {origin} within {timeout_seconds}s: {detail}"
+                f"Automatic browser login could not establish an application session for {origin} within {timeout_seconds}s: {detail}"
             )
         finally:
             browser.close()
+
+
+# Backward-compatible alias for older configs/imports; new code uses the provider-neutral name.
+snap4city_browser_login_session = browser_oidc_login_session

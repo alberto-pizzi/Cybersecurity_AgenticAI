@@ -26,17 +26,49 @@ from assessmentConfig import (
     target_is_local,
     validate_authorization_scope,
 )
-from orchestratorAgenticCore import _model_matches, ensure_ollama_model, resolve_ai_model
-from utils import canonical_cookie_header, cookie_names, normalized_origin, same_origin
-from targetAuth import snap4city_browser_login_session
+from utils import canonical_cookie_header, cookie_names, normalized_origin, same_origin, scanner_request_rate_policy
+from targetAuth import browser_oidc_login_session
 
 
 ROOT = Path(__file__).resolve().parent
 REPORTS_DIR = ROOT / "reports"
 
 
+# Resolves execution.request_rate without widening the accepted traffic envelope silently.
+def _resolve_request_rate(config: dict[str, Any]) -> dict[str, Any]:
+    execution = config.setdefault("execution", {})
+    configured = "request_rate" in execution
+    raw_value = execution.get("request_rate", 10)
+    # The JSON contract accepts an actual integer, not a numeric string/float. Internal wrappers and
+    # environment propagation may still use normalized float/string representations after this boundary.
+    if configured and (isinstance(raw_value, bool) or not isinstance(raw_value, int)):
+        policy = scanner_request_rate_policy(None)
+        policy["requested"] = raw_value
+        policy["fallback_applied"] = True
+        policy["fallback_reason"] = "execution.request_rate must be a JSON integer between 1 and 50"
+    else:
+        policy = scanner_request_rate_policy(raw_value)
+    policy["configured"] = configured
+    policy["source"] = "execution.request_rate" if configured else "default"
+    execution["request_rate"] = policy["effective"]
+    return policy
+
+
+# Propagates the normalized traffic policy to every child orchestrator/scanner process.
+def _request_rate_environment(base_env: dict[str, str], policy: dict[str, Any]) -> dict[str, str]:
+    env = dict(base_env)
+    env["SECOPS_MAX_REQUEST_RATE"] = str(policy.get("effective", 10))
+    env["SECOPS_REQUEST_RATE_REQUESTED"] = str(policy.get("requested", ""))
+    env["SECOPS_REQUEST_RATE_CONFIGURED"] = "1" if policy.get("configured") else "0"
+    env["SECOPS_REQUEST_RATE_FALLBACK"] = "1" if policy.get("fallback_applied") else "0"
+    env["SECOPS_REQUEST_RATE_FALLBACK_REASON"] = str(policy.get("fallback_reason") or "")
+    return env
+
+
 # Builds one ephemeral single-target assessment without requiring a JSON configuration file.
 def _direct_assessment(args: argparse.Namespace) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    if args.authorized_host_suffix:
+        raise ValueError("--authorized-host-suffix is disabled; authorize each additional origin explicitly with --authorized-origin.")
     try:
         parsed = urlparse(str(args.target or "").strip())
         protocol = str(parsed.scheme or "").lower()
@@ -86,7 +118,7 @@ def _direct_assessment(args: argparse.Namespace) -> tuple[dict[str, Any], list[d
             "confirmed": bool(args.authorized),
             "reference": "Command-line --authorized confirmation" if args.authorized else "",
             "allowed_origins": list(args.authorized_origin or []),
-            "allowed_host_suffixes": list(args.authorized_host_suffix or []),
+            "allow_same_host_ports": bool(args.allow_same_host_ports),
         },
         "credentials": credentials,
         "assets": [],
@@ -149,12 +181,19 @@ def _apply_execution_overrides(config: dict[str, Any], args: argparse.Namespace)
     authorization = config.setdefault("authorization", {})
     if args.authorized_origin:
         authorization["allowed_origins"] = list(dict.fromkeys([*(authorization.get("allowed_origins") or []), *args.authorized_origin]))
+    if args.allow_same_host_ports is not None:
+        authorization["allow_same_host_ports"] = bool(args.allow_same_host_ports)
     if args.authorized_host_suffix:
-        authorization["allowed_host_suffixes"] = list(dict.fromkeys([*(authorization.get("allowed_host_suffixes") or []), *args.authorized_host_suffix]))
+        raise ValueError("--authorized-host-suffix is disabled; authorize each additional origin explicitly with --authorized-origin.")
 
 
 # Verifies that an explicitly selected local Agentic model is already installed before any service job starts.
 def _verify_selected_agentic_model(config: dict[str, Any]) -> None:
+    # Agentic model helpers pull in the MCP runtime. Keep that dependency lazy so
+    # configuration-only operations (notably --dry-run) remain usable before the
+    # full scanner stack is installed.
+    from orchestratorAgenticCore import _model_matches, ensure_ollama_model, resolve_ai_model
+
     execution = config.get("execution") or {}
     if str(execution.get("orchestrator") or "deterministic").lower() != "agentic":
         return
@@ -171,70 +210,34 @@ def _verify_selected_agentic_model(config: dict[str, Any]) -> None:
         )
 
 
-# Returns the first visible locator among a small set of login-form selectors.
-def _first_visible_locator(page: Any, selectors: tuple[str, ...]) -> Any | None:
-    for selector in selectors:
-        try:
-            locator = page.locator(selector).first
-            if locator.count() and locator.is_visible():
-                return locator
-        except Exception:
-            continue
-    return None
-
-
-# Returns a short visible Keycloak diagnostic without exposing entered credentials.
-def _keycloak_login_diagnostic(page: Any) -> str:
-    error_selectors = (
-        "#input-error", "#kc-error-message", ".kc-feedback-text", ".alert-error",
-        "[role='alert']", ".pf-c-alert__title", ".pf-v5-c-alert__title",
-    )
-    for selector in error_selectors:
-        try:
-            locator = page.locator(selector).first
-            if locator.count() and locator.is_visible():
-                text = " ".join(str(locator.inner_text() or "").split())
-                if text:
-                    return "credentials_rejected: " + text[:240]
-        except Exception:
-            continue
-    additional_step_selectors = (
-        "input[name='otp']", "input[name='totp']", "input[autocomplete='one-time-code']",
-        "#otp", "#kc-otp-login-form",
-    )
-    if _first_visible_locator(page, additional_step_selectors) is not None:
-        return "additional_authentication_step_required"
-    return ""
-
-
-# Reports whether a browser URL still belongs to the Keycloak/OIDC login flow rather than the assessed application.
-def _looks_like_oidc_login_url(url: str) -> bool:
-    path = str(urlparse(str(url or "")).path or "").lower().rstrip("/")
-    return "/auth/realms/" in path or path.endswith(("/login", "/signin", "/sign-in"))
-
-
-# Performs the real Snap4City browser login and returns only the target cookies consumed by the existing orchestrators.
-def _snap4city_browser_login_cookie(
-    target_url: str,
-    username: str,
-    password: str,
-    credential: dict[str, Any],
-) -> str:
-    result = snap4city_browser_login_session(
-        target_url, username, password, credential, initial_login=True
-    )
-    return str(result.get("cookie_header") or "")
-
-
-# Credential reuse is scoped by origin. The same credential reference can serve multiple paths on
-# one origin, while a different origin resolves its own cookie/login session.
+# Credential cache entries are origin-specific. Browser/OIDC credentials may still reuse one raw
+# cookie across another port of the exact same hostname when the config explicitly enables
+# allow_same_host_ports, because HTTP cookies themselves are not port-scoped.
 def _credential_cache_key(reference: str, target_url: str) -> tuple[str, str]:
     return str(reference or ''), normalized_origin(target_url)
 
 
-# Resolves one target session. Username/password entered for the first OIDC login are cached only in
-# process memory and reused for every later origin using the same credential reference, so the runner
-# never asks for the same target credentials again during a multi-origin assessment.
+def _same_host_port_authorized(config: dict[str, Any], left_url: str, right_url: str) -> bool:
+    authorization = config.get("authorization") or {}
+    if not bool(authorization.get("allow_same_host_ports", False)):
+        return False
+    try:
+        left = urlparse(str(left_url or ""))
+        right = urlparse(str(right_url or ""))
+        return (
+            str(left.scheme or "").lower() in {"http", "https"}
+            and str(left.scheme or "").lower() == str(right.scheme or "").lower()
+            and str(left.hostname or "").lower().rstrip(".") == str(right.hostname or "").lower().rstrip(".")
+            and bool(left.hostname)
+            and bool(right.hostname)
+        )
+    except ValueError:
+        return False
+
+
+# Resolves one target session in this order: an existing cookie when it is applicable, saved browser
+# SSO/storage state, then the username/password already resolved for this credential reference. The
+# prompt path is attempted at most once for the whole assessment; later origins/ports never prompt again.
 def _resolve_job_cookie(
     config: dict[str, Any],
     reference: str,
@@ -245,6 +248,7 @@ def _resolve_job_cookie(
     cache_key = _credential_cache_key(reference, target_url)
     if cache_key in cache:
         return cache[cache_key]
+
     credentials = config.get("credentials") or {}
     credential = credentials.get(reference)
     if not isinstance(credential, dict):
@@ -254,25 +258,49 @@ def _resolve_job_cookie(
         value = resolve_cookie_credential(config, reference)
         if not value:
             print(f"[AUTH] Optional credential {reference!r} is unavailable; the job will run the anonymous profile only.")
+        else:
+            value = canonical_cookie_header(value)
+            # A raw Cookie header has lost Domain/Path/Secure metadata. Remember the first hostname/origin
+            # on which this credential is used and never copy it to a different hostname merely because
+            # another job reuses the same credential reference. Same-host/same-scheme port reuse is the
+            # only implicit expansion and is allowed only when the config explicitly enables it.
+            runtime_cache = runtime_auth_cache if runtime_auth_cache is not None else {}
+            runtime = runtime_cache.setdefault(reference, {
+                "reference": reference,
+                "kind": "cookie",
+                "manual_cookie_origin": "",
+            })
+            target_origin = normalized_origin(target_url)
+            manual_origin = str(runtime.get("manual_cookie_origin") or "")
+            if not manual_origin:
+                runtime["manual_cookie_origin"] = target_origin
+            elif manual_origin != target_origin and not _same_host_port_authorized(config, manual_origin, target_origin):
+                print(
+                    f"[AUTH WARNING] Raw cookie credential {reference!r} is scoped to {manual_origin}; "
+                    f"it will not be copied to different hostname/origin {target_origin}. "
+                    "Use a separate credential reference or browser/OIDC storage for that destination."
+                )
+                value = ""
         cache[cache_key] = value
         return value
-    if kind != "snap4city_oidc":
+    if kind not in {"browser_oidc", "snap4city_oidc"}:
         raise ValueError(f"Credential {reference!r} has unsupported web credential kind={kind!r}.")
 
     runtime_cache = runtime_auth_cache if runtime_auth_cache is not None else {}
     runtime = runtime_cache.setdefault(reference, {
         "reference": reference,
-        "kind": kind,
+        "kind": "browser_oidc",
         "credential": copy.deepcopy(credential),
         "username": "",
         "password": "",
         "storage_state": None,
+        "oidc_issuer": "",
         "manual_cookie_origin": "",
         "prompt_attempted": False,
     })
 
-    username_env = str(credential.get("username_env") or "DASHBOARD_TEST_USERNAME").strip()
-    password_env = str(credential.get("password_env") or "DASHBOARD_TEST_PASSWORD").strip()
+    username_env = str(credential.get("username_env") or "").strip()
+    password_env = str(credential.get("password_env") or "").strip()
     if not runtime.get("username") and username_env:
         runtime["username"] = os.environ.get(username_env, "").strip()
     if not runtime.get("password") and password_env:
@@ -282,30 +310,65 @@ def _resolve_job_cookie(
     manual_cookie = os.environ.get(cookie_env, "").strip() if cookie_env else ""
     target_origin = normalized_origin(target_url)
     manual_origin = str(runtime.get("manual_cookie_origin") or "")
-    if manual_cookie and (not manual_origin or manual_origin == target_origin):
-        value = canonical_cookie_header(manual_cookie)
-        runtime["manual_cookie_origin"] = target_origin
-        print(f"[AUTH] Using existing target session from {cookie_env}; cookie names: {', '.join(cookie_names(value)) or 'none'}")
-        cache[cache_key] = value
-        return value
-
-    # A raw Cookie header has no trustworthy Domain/Path metadata. Never copy the same manual cookie
-    # to a different origin. A different origin must obtain its own application session through SSO/login.
+    manual_cookie_allowed = bool(
+        manual_cookie
+        and (
+            not manual_origin
+            or manual_origin == target_origin
+            or _same_host_port_authorized(config, manual_origin, target_origin)
+        )
+    )
+    storage_state = runtime.get("storage_state") if isinstance(runtime.get("storage_state"), dict) else None
     username = str(runtime.get("username") or "")
     password = str(runtime.get("password") or "")
     interactive = bool(getattr(sys.stdin, "isatty", lambda: False)())
-    if (not username or not password) and not bool(runtime.get("prompt_attempted")):
+
+    if manual_cookie_allowed:
+        # The cookie is still the first authentication mechanism actually sent to the target.
+        # Prepare missing fallback credentials once in the runner, however, so that if the child
+        # later proves the cookie invalid it can continue with saved browser state and finally the
+        # original username/password without opening a second console prompt. Empty answers remain
+        # valid for optional credentials and simply make the final fallback unavailable.
+        if not storage_state and (not username or not password) and not bool(runtime.get("prompt_attempted")):
+            runtime["prompt_attempted"] = True
+            if not username and interactive:
+                username = input(f"[AUTH] Target username ({username_env or 'environment variable'} not set; optional fallback after cookie/SSO): ").strip()
+            if not password and interactive:
+                password = getpass.getpass(f"[AUTH] Target password ({password_env or 'environment variable'} not set; optional fallback after cookie/SSO): ")
+            runtime["username"] = username
+            runtime["password"] = password
+
+        value = canonical_cookie_header(manual_cookie)
+        if not manual_origin:
+            runtime["manual_cookie_origin"] = target_origin
+            reuse_note = ""
+        elif manual_origin != target_origin:
+            reuse_note = " on another explicitly authorized port of the same hostname"
+        else:
+            reuse_note = ""
+        print(
+            f"[AUTH] Trying existing target session from {cookie_env}{reuse_note}; "
+            f"cookie names: {', '.join(cookie_names(value)) or 'none'}. "
+            "The child orchestrator will validate it, then try saved browser/SSO state, then the original username/password if needed."
+        )
+        cache[cache_key] = value
+        return value
+
+    # With no saved browser session, resolve the initial username/password once before the first login.
+    # With a saved session, browser_oidc_login_session tries that state first and asks for credentials
+    # only if the IdP actually presents a login form.
+    if not storage_state and (not username or not password) and not bool(runtime.get("prompt_attempted")):
         runtime["prompt_attempted"] = True
         if not username and interactive:
-            username = input(f"[AUTH] Snap4City username ({username_env} not set): ").strip()
+            username = input(f"[AUTH] Target username ({username_env or 'environment variable'} not set): ").strip()
         if not password and interactive:
-            password = getpass.getpass(f"[AUTH] Snap4City password ({password_env} not set): ")
+            password = getpass.getpass(f"[AUTH] Target password ({password_env or 'environment variable'} not set): ")
         runtime["username"] = username
         runtime["password"] = password
 
-    if not username or not password:
+    if not storage_state and (not username or not password):
         if bool(credential.get("optional", False)):
-            detail = "different-origin manual cookie is intentionally not reused" if manual_cookie and manual_origin and manual_origin != target_origin else "no usable Snap4City username/password is available"
+            detail = "existing cookie is not applicable to this authorized origin/port and no reusable browser session or complete username/password is available"
             print(f"[AUTH] Optional credential {reference!r}: {detail}; the job will run the anonymous profile only.")
             cache[cache_key] = ""
             return ""
@@ -314,30 +377,65 @@ def _resolve_job_cookie(
             missing.append(username_env or "username")
         if not password:
             missing.append(password_env or "password")
-        raise ValueError("Missing Snap4City login credential(s): " + ", ".join(missing))
+        raise ValueError("Missing target login credential(s): " + ", ".join(missing))
 
-    print(f"[AUTH] Performing automatic Snap4City login for {target_url} with Chromium.")
+    print(f"[AUTH] Trying browser SSO/session for {target_url}; stored username/password are used only if the login flow requests them.")
     try:
-        login_result = snap4city_browser_login_session(
+        login_result = browser_oidc_login_session(
             target_url,
             username,
             password,
             credential,
-            storage_state=runtime.get("storage_state") if isinstance(runtime.get("storage_state"), dict) else None,
+            storage_state=storage_state,
             initial_login=True,
+            expected_oidc_issuer=str(runtime.get("oidc_issuer") or ""),
         )
-        value = str(login_result.get("cookie_header") or "")
-        if not value:
-            raise RuntimeError("Automatic login returned no application cookie.")
-        runtime["storage_state"] = login_result.get("storage_state") if isinstance(login_result.get("storage_state"), dict) else runtime.get("storage_state")
-    except RuntimeError as exc:
+    except RuntimeError as first_exc:
+        # A saved SSO state may expire after the initial job. If no credentials were available yet,
+        # allow one prompt now, then retry once; never prompt again later in the assessment.
+        if storage_state and (not username or not password) and not bool(runtime.get("prompt_attempted")) and interactive:
+            runtime["prompt_attempted"] = True
+            if not username:
+                username = input(f"[AUTH] Target username ({username_env or 'environment variable'} not set): ").strip()
+            if not password:
+                password = getpass.getpass(f"[AUTH] Target password ({password_env or 'environment variable'} not set): ")
+            runtime["username"] = username
+            runtime["password"] = password
+            if username and password:
+                try:
+                    login_result = browser_oidc_login_session(
+                        target_url,
+                        username,
+                        password,
+                        credential,
+                        storage_state=storage_state,
+                        initial_login=True,
+                        expected_oidc_issuer=str(runtime.get("oidc_issuer") or ""),
+                    )
+                except RuntimeError as exc:
+                    first_exc = exc
+                else:
+                    first_exc = None
+        if first_exc is not None:
+            if bool(credential.get("optional", False)):
+                print(f"[AUTH] Automatic browser login failed: {first_exc}; the job will run the anonymous profile only.")
+                cache[cache_key] = ""
+                return ""
+            raise ValueError(str(first_exc)) from first_exc
+
+    value = str(login_result.get("cookie_header") or "")
+    if not value:
         if bool(credential.get("optional", False)):
-            print(f"[AUTH] Automatic Snap4City login failed: {exc}; the job will run the anonymous profile only.")
+            print(f"[AUTH] Browser authentication for {reference!r} returned no application cookie; the job will run the anonymous profile only.")
             cache[cache_key] = ""
             return ""
-        raise ValueError(str(exc)) from exc
-    reuse_note = " (existing SSO state reused)" if login_result.get("sso_reused") else ""
-    print(f"[AUTH] Automatic Snap4City login succeeded{reuse_note}; target cookie names: {', '.join(cookie_names(value)) or 'none'}")
+        raise ValueError("Automatic browser login returned no application cookie.")
+    runtime["storage_state"] = login_result.get("storage_state") if isinstance(login_result.get("storage_state"), dict) else runtime.get("storage_state")
+    runtime["oidc_issuer"] = str(login_result.get("oidc_issuer") or runtime.get("oidc_issuer") or "")
+    runtime["username"] = username
+    runtime["password"] = password
+    reuse_note = "existing browser/SSO state" if login_result.get("sso_reused") else "the original username/password"
+    print(f"[AUTH] Browser authentication succeeded using {reuse_note}; target cookie names: {', '.join(cookie_names(value)) or 'none'}.")
     cache[cache_key] = value
     return value
 
@@ -345,7 +443,7 @@ def _resolve_job_cookie(
 def _runtime_auth_payload(config: dict[str, Any], job: dict[str, Any], runtime_auth_cache: dict[str, dict[str, Any]]) -> dict[str, Any]:
     reference = str(job.get("credential_ref") or "").strip()
     runtime = runtime_auth_cache.get(reference) if reference else None
-    if not isinstance(runtime, dict) or str(runtime.get("kind") or "") != "snap4city_oidc":
+    if not isinstance(runtime, dict) or str(runtime.get("kind") or "") not in {"browser_oidc", "snap4city_oidc"}:
         return {}
     credential_options = runtime.get("credential") if isinstance(runtime.get("credential"), dict) else {}
     if not bool(credential_options.get("reuse_on_authorized_siblings", False)):
@@ -361,15 +459,15 @@ def _runtime_auth_payload(config: dict[str, Any], job: dict[str, Any], runtime_a
     authorization = config.get("authorization") or {}
     return {
         "schema_version": 1,
-        "kind": "snap4city_oidc",
+        "kind": "browser_oidc",
         "reference": reference,
         "primary_origin": normalized_origin(str(job.get("target") or "")),
         "username": username,
         "password": password,
         "credential": copy.deepcopy(credential_options),
         "storage_state": storage_state,
+        "oidc_issuer": str(runtime.get("oidc_issuer") or ""),
         "allowed_origins": list(authorization.get("allowed_origins") or []),
-        "allowed_host_suffixes": list(authorization.get("allowed_host_suffixes") or []),
     }
 
 
@@ -508,8 +606,8 @@ def _build_command(
         command.append("--authorized")
         for value in authorization.get("allowed_origins") or []:
             command.extend(["--authorized-origin", str(value)])
-        for value in authorization.get("allowed_host_suffixes") or []:
-            command.extend(["--authorized-host-suffix", str(value)])
+        if bool(authorization.get("allow_same_host_ports", False)):
+            command.append("--allow-same-host-ports")
     elif not target_is_local(job["target"]):
         raise ValueError(
             f"Job {job['id']} targets a non-local service, but authorization.confirmed is not true."
@@ -854,6 +952,20 @@ def _aggregate_report_inputs(results_data: dict[str, Any], config: dict[str, Any
         "reporting_scope": "aggregate logical target",
         "secondary_identity_supplied": secondary_identity_supplied,
         "scan_mode": str((config.get("execution") or {}).get("mode") or "balanced"),
+        "request_rate_policy": dict(results_data.get("traffic_policy") or {}),
+        "allow_same_host_ports": bool((config.get("authorization") or {}).get("allow_same_host_ports", False)),
+        "authentication_scope_policy": (
+            "authenticated destinations try an applicable existing cookie first; when same-host multi-port is enabled, "
+            "the raw cookie may be tried on another authorized port of the exact same hostname and scheme and must validate; "
+            "if rejected, saved browser/OIDC state is tried, followed by the username/password resolved once by the runner if the login flow requests them; "
+            "a conclusively rejected speculative raw cookie is remembered per cookie+origin so later scanners do not retry it; "
+            "raw cookies are never copied to a different hostname and no second child-console prompt is opened"
+        ),
+        "redirect_scope_policy": (
+            "active scanners use explicit-origin authorization; same-host multi-port expansion is "
+            + ("enabled (same scheme, exact hostname, any discovered HTTP/HTTPS port)" if bool((config.get("authorization") or {}).get("allow_same_host_ports", False)) else "disabled")
+            + "; project discovery follows bounded redirects only while each hop remains authorized; external scanner processes do not autonomously follow redirects, so scanner-internal redirect-dependent behavior is conservatively suppressed unless the destination was independently discovered; unauthorized destinations are observed but not queued"
+        ),
         "allow_state_changes": (config.get("execution") or {}).get("allow_state_changes"),
         "orchestration": {
             "engine": "assessmentRunner aggregate",
@@ -1032,7 +1144,10 @@ def main() -> int:
     parser.add_argument("--auth-only", action="store_true", help="Run only the authenticated profile. With a cookie and without this flag, both anonymous and authenticated profiles are run.")
     parser.add_argument("--authorized", action="store_true", help="Confirm that the configured non-local targets are explicitly authorized for assessment.")
     parser.add_argument("--authorized-origin", action="append", default=[], help="Additional exact HTTP/HTTPS origin included in the authorized scope; repeat as needed.")
-    parser.add_argument("--authorized-host-suffix", action="append", default=[], help="Additional authorized DNS suffix included in the scope; repeat as needed.")
+    port_scope_group = parser.add_mutually_exclusive_group()
+    port_scope_group.add_argument("--allow-same-host-ports", dest="allow_same_host_ports", action="store_true", default=None, help="Allow discovered URLs on other ports of the same already-authorized hostname (same scheme only).")
+    port_scope_group.add_argument("--no-allow-same-host-ports", dest="allow_same_host_ports", action="store_false", help="Keep authorization exact-origin/explicit-origin only; this is the default when the config field is absent.")
+    parser.add_argument("--authorized-host-suffix", action="append", default=[], help=argparse.SUPPRESS)
     state_change_group = parser.add_mutually_exclusive_group()
     state_change_group.add_argument("--allow-state-changes", dest="allow_state_changes", action="store_true", default=None, help="Explicitly allow bounded state-changing probes for this run.")
     state_change_group.add_argument("--no-allow-state-changes", dest="allow_state_changes", action="store_false", help="Explicitly disable bounded state-changing probes, including on local targets.")
@@ -1056,9 +1171,23 @@ def main() -> int:
         else:
             config, jobs = _direct_assessment(args)
             validate_authorization_scope(config.get("authorization") or {})
-        _verify_selected_agentic_model(config)
+        request_rate_policy = _resolve_request_rate(config)
+        if not args.dry_run:
+            _verify_selected_agentic_model(config)
     except (ValueError, RuntimeError) as exc:
         parser.error(str(exc))
+
+    effective_rate = float(request_rate_policy["effective"])
+    if request_rate_policy.get("fallback_applied"):
+        print(
+            f"[RATE WARNING] execution.request_rate={request_rate_policy.get('requested')!r} is not accepted: "
+            f"{request_rate_policy.get('fallback_reason')}. Using the default {effective_rate:g} requests/second.",
+            file=sys.stderr,
+        )
+    elif request_rate_policy.get("configured"):
+        print(f"[RATE] Active-scanner request rate: {effective_rate:g} requests/second (configured; maximum 50).")
+    else:
+        print(f"[RATE] Active-scanner request rate: {effective_rate:g} requests/second (default; execution.request_rate not specified).")
 
     if args.only:
         jobs = [job for job in jobs if job["id"] == args.only]
@@ -1092,6 +1221,7 @@ def main() -> int:
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "source_config": str(Path(args.config).expanduser().resolve()) if args.config else None,
         "configuration": redacted_configuration(config),
+        "traffic_policy": dict(request_rate_policy),
         "jobs": [],
         "report_artifacts": [],
         "reports_data": [],
@@ -1148,7 +1278,8 @@ def main() -> int:
             print(f"\n[RUN] {job['id']} -> {job['target']}")
             job_started_ns = time.time_ns()
             runtime_payload = _runtime_auth_payload(config, job, runtime_auth_cache)
-            child_env, runtime_state_path = _runtime_auth_environment(os.environ, runtime_payload)
+            rate_env = _request_rate_environment(os.environ, request_rate_policy)
+            child_env, runtime_state_path = _runtime_auth_environment(rate_env, runtime_payload)
             try:
                 completed = subprocess.run(command, cwd=ROOT, check=False, env=child_env)
             finally:

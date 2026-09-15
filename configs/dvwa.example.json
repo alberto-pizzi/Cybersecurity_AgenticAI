@@ -36,6 +36,7 @@
   "execution": {
     "orchestrator": "agentic",
     "mode": "balanced",
+    "request_rate": 10,
     "model": "snap4city",
     "max_rounds": 2,
     "require_ai": true,
