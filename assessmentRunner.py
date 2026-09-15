@@ -9,7 +9,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
-import time
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -26,7 +26,7 @@ from assessmentConfig import (
     target_is_local,
     validate_authorization_scope,
 )
-from utils import canonical_cookie_header, cookie_names, normalized_origin, same_origin, scanner_request_rate_policy
+from utils import atomic_write_text, canonical_cookie_header, cookie_names, normalized_origin, same_origin, scanner_request_rate_policy
 from targetAuth import browser_oidc_login_session
 
 
@@ -480,7 +480,11 @@ def _runtime_auth_environment(base_env: dict[str, str], payload: dict[str, Any])
     try:
         json.dump(payload, handle, ensure_ascii=False)
         handle.flush()
-        os.fchmod(handle.fileno(), 0o600)
+        if hasattr(os, "fchmod"):
+            try:
+                os.fchmod(handle.fileno(), 0o600)
+            except OSError:
+                pass
         path = handle.name
     finally:
         handle.close()
@@ -644,9 +648,14 @@ def _build_command(
 
 
 # Writes redacted assessment result data that can be reviewed without exposing target credentials.
+def _unique_run_stamp() -> str:
+    # Microseconds + PID + random suffix make IDs collision-resistant even when separate assessment
+    # processes start in the same second on the same host. No process-global coordination is needed.
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S_%f")
+    return f"{timestamp}_{os.getpid()}_{uuid.uuid4().hex[:8]}"
+
 def _write_results_data(path: Path, payload: dict[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(payload, indent=2, ensure_ascii=False, default=str), encoding="utf-8")
+    atomic_write_text(path, json.dumps(payload, indent=2, ensure_ascii=False, default=str))
 
 
 # Loads one JSON artifact when present; malformed or missing artifacts stay explicit instead of aborting the runner.
@@ -1029,9 +1038,9 @@ def _generate_aggregate_report(results_data: dict[str, Any], config: dict[str, A
         "report_version": "1.0",
         "report_id": base,
     }
-    json_path.write_text(json.dumps(payload, indent=2, ensure_ascii=False, default=str), encoding="utf-8")
-    review_path.write_text(json.dumps(build_review_snapshot(payload), indent=2, ensure_ascii=False, default=str), encoding="utf-8")
-    html_path.write_text(_render_html(payload), encoding="utf-8")
+    atomic_write_text(json_path, json.dumps(payload, indent=2, ensure_ascii=False, default=str))
+    atomic_write_text(review_path, json.dumps(build_review_snapshot(payload), indent=2, ensure_ascii=False, default=str))
+    atomic_write_text(html_path, _render_html(payload))
     # PDF rendering is wrapped in its own try/except (mirroring servers/reporting/reportServer.py's
     # _generate_report) so that a PDF failure - e.g. WeasyPrint/its native Pango/Harfbuzz libraries
     # missing, or the Docker fallback being unavailable - degrades to "no PDF" instead of raising and
@@ -1041,7 +1050,7 @@ def _generate_aggregate_report(results_data: dict[str, Any], config: dict[str, A
     # orphaning the aggregate HTML/JSON already on disk with no reference to them anywhere.
     pdf_error: str | None = None
     try:
-        pdf_source_path.write_text(_render_html(payload, for_pdf=True), encoding="utf-8")
+        atomic_write_text(pdf_source_path, _render_html(payload, for_pdf=True))
         html2pdf(pdf_source_path, pdf_path)
     except Exception as exc:
         pdf_error = f"{type(exc).__name__}: {exc}"
@@ -1206,7 +1215,7 @@ def main() -> int:
             )
 
     REPORTS_DIR.mkdir(parents=True, exist_ok=True)
-    stamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+    stamp = _unique_run_stamp()
     platform_name = str((config.get("platform") or {}).get("name") or "platform")
     safe_name = "".join(ch if ch.isalnum() or ch in "_.-" else "_" for ch in platform_name).strip("._") or "platform"
     assessment_id = f"{safe_name}_{stamp}"
@@ -1230,7 +1239,10 @@ def main() -> int:
     exit_code = 0
     credential_cache: dict[tuple[str, str], str] = {}
     runtime_auth_cache: dict[str, dict[str, Any]] = {}
-    for job in jobs:
+    orchestrator_kind = str((config.get("execution") or {}).get("orchestrator") or "deterministic").lower()
+    for job_index, job in enumerate(jobs, start=1):
+        report_prefix = "SecOps_Agentic_Assessment" if orchestrator_kind == "agentic" else "SecOps_Assessment"
+        expected_report_id = f"{report_prefix}_{stamp}_j{job_index:03d}"
         record: dict[str, Any] = {
             "id": job["id"],
             "asset_id": job["asset_id"],
@@ -1240,6 +1252,7 @@ def main() -> int:
             "protocol": job["protocol"],
             "port": job["port"],
             "target": job["target"] or None,
+            "expected_report_id": expected_report_id,
             "entry_points": list(job.get("entry_points") or []),
             "merged_service_ids": list(job.get("merged_service_ids") or []),
             "coalesced_service_count": int(job.get("coalesced_service_count") or 1),
@@ -1276,9 +1289,9 @@ def main() -> int:
             print("[PLAN] " + " ".join(record["command"]))
         else:
             print(f"\n[RUN] {job['id']} -> {job['target']}")
-            job_started_ns = time.time_ns()
             runtime_payload = _runtime_auth_payload(config, job, runtime_auth_cache)
             rate_env = _request_rate_environment(os.environ, request_rate_policy)
+            rate_env["SECOPS_REPORT_RUN_ID"] = expected_report_id
             child_env, runtime_state_path = _runtime_auth_environment(rate_env, runtime_payload)
             try:
                 completed = subprocess.run(command, cwd=ROOT, check=False, env=child_env)
@@ -1292,43 +1305,33 @@ def main() -> int:
             record["status"] = "success" if completed.returncode == 0 else "error"
             if completed.returncode != 0:
                 record["reason"] = f"orchestrator exited with return code {completed.returncode}"
-            generated_pdfs = sorted(
-                (path.resolve() for path in REPORTS_DIR.glob("*.pdf") if path.stat().st_mtime_ns >= job_started_ns),
-                key=lambda path: path.stat().st_mtime_ns,
-            )
-            generated_html = sorted(
-                (
-                    path.resolve()
-                    for path in REPORTS_DIR.glob("*.html")
-                    if path.stat().st_mtime_ns >= job_started_ns and not path.name.endswith(".pdf-source.html")
-                ),
-                key=lambda path: path.stat().st_mtime_ns,
-            )
+            # Correlate artifacts by the unique per-job report id supplied to the child. Do not scan
+            # every file modified since job start: another assessment process may be writing to the
+            # same reports directory at the same time. Emergency fallbacks are tied to the same prefix.
             report_bases: dict[str, dict[str, Path | None]] = {}
-            for pdf_path in generated_pdfs:
-                report_bases[pdf_path.stem] = {"pdf": pdf_path, "html": pdf_path.with_suffix(".html")}
-            for html_path in generated_html:
-                report_bases.setdefault(html_path.stem, {"pdf": None, "html": html_path})
+            for path in REPORTS_DIR.glob(f"{expected_report_id}*"):
+                if not path.is_file() or path.name.endswith(".pdf-source.html"):
+                    continue
+                suffix = path.suffix.lower()
+                report_id = path.name[:-len(".review.json")] if path.name.endswith(".review.json") else path.stem
+                if suffix == ".pdf":
+                    report_bases.setdefault(report_id, {"pdf": None, "html": None})["pdf"] = path.resolve()
+                elif suffix == ".html":
+                    report_bases.setdefault(report_id, {"pdf": None, "html": None})["html"] = path.resolve()
+                elif suffix in {".json"}:
+                    report_bases.setdefault(report_id, {"pdf": None, "html": None})
             artifact_candidates: list[dict[str, Any]] = []
-            for report_id, paths in sorted(
-                report_bases.items(),
-                key=lambda item: max(
-                    path.stat().st_mtime_ns for path in item[1].values() if isinstance(path, Path) and path.is_file()
-                ),
-            ):
+            for report_id, paths in sorted(report_bases.items()):
                 pdf_path = paths.get("pdf")
                 html_path = paths.get("html")
-                base_path = pdf_path if isinstance(pdf_path, Path) else html_path
-                if not isinstance(base_path, Path):
-                    continue
-                json_path = base_path.with_suffix(".json")
-                review_path = base_path.with_name(f"{report_id}.review.json")
+                json_path = REPORTS_DIR / f"{report_id}.json"
+                review_path = REPORTS_DIR / f"{report_id}.review.json"
                 artifact_candidates.append({
                     "job_id": job["id"],
                     "report_id": report_id,
                     "pdf_path": str(pdf_path) if isinstance(pdf_path, Path) and pdf_path.is_file() else None,
                     "json_path": str(json_path.resolve()) if json_path.is_file() else None,
-                    "html_path": str(html_path.resolve()) if isinstance(html_path, Path) and html_path.is_file() else None,
+                    "html_path": str(html_path) if isinstance(html_path, Path) and html_path.is_file() else None,
                     "review_snapshot_path": str(review_path.resolve()) if review_path.is_file() else None,
                 })
             primary_artifact, suppressed_artifacts = _select_primary_job_report_artifact(artifact_candidates)

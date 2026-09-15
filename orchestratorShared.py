@@ -36,7 +36,7 @@ import requests
 with warnings.catch_warnings():
     warnings.simplefilter('ignore')
     from fastmcp import Client
-from utils import apply_runtime_target_preparation, absolute_url, canonical_cookie_header, cookie_names, load_runtime_config, normalize_url, normalized_origin, parse_cookie_header, request_same_origin_redirects, ROOT_DIR, same_origin, sanitize_discovered_url, scanner_session_probe, SERVERS_DIR, target_runtime_profile, url_in_authorized_scope as _url_in_explicit_scope, MCP_UNIFIED_SERVICE, mcp_http_port, mcp_http_url, scanner_request_rate, runtime_request_rate_policy
+from utils import apply_runtime_target_preparation, absolute_url, atomic_write_text, canonical_cookie_header, cookie_names, load_runtime_config, normalize_url, normalized_origin, parse_cookie_header, request_same_origin_redirects, ROOT_DIR, same_origin, sanitize_discovered_url, scanner_session_probe, secops_source_fingerprint, SERVERS_DIR, target_runtime_profile, url_in_authorized_scope as _url_in_explicit_scope, MCP_UNIFIED_SERVICE, mcp_http_port, mcp_http_url, scanner_request_rate, runtime_request_rate_policy
 from targetAuth import _looks_like_application_login_entry, browser_oidc_login_session
 ROOT = Path(ROOT_DIR).resolve()
 SERVERS = Path(SERVERS_DIR).resolve()
@@ -346,13 +346,16 @@ def _speculative_same_host_port_raw_cookie(candidate: str, cookies: str) -> bool
 # themselves are not port-scoped. The session precheck validates that attempt and runtime browser SSO
 # or the original username/password can repair it if the application rejects the session on that port.
 # Browser storage state remains authoritative whenever Domain/Path/Secure metadata is available.
-def scope_cookie_header(candidate: str, cookies: str) -> str:
+def scope_cookie_header(candidate: str, cookies: str, *, use_runtime_auth: bool=True) -> str:
     # Runtime OIDC state belongs to an authenticated profile, not to the assessment process as a
     # whole. An explicit no-cookie profile must stay anonymous even when another profile has already
     # established sibling/application sessions in this process.
     if not str(cookies or '').strip():
         return ''
-    runtime_header = _runtime_storage_cookie_header(candidate)
+    # Secondary/BOLA identities must never inherit the primary profile's browser storage state or
+    # authenticated-origin registry. They are deliberately scoped from their own explicit Cookie
+    # header only. This prevents an A-vs-B comparison from degenerating into A-vs-A.
+    runtime_header = _runtime_storage_cookie_header(candidate) if use_runtime_auth else ''
     base = PRIMARY_SCOPE_TARGET or candidate
     raw_cookie_allowed = same_origin(base, candidate)
     raw_reuse_key = _raw_cookie_reuse_key(candidate, cookies) if cookies else ('', '')
@@ -370,6 +373,8 @@ def scope_cookie_header(candidate: str, cookies: str) -> str:
         except ValueError:
             raw_cookie_allowed = False
     if cookies and raw_cookie_allowed:
+        if not use_runtime_auth:
+            return canonical_cookie_header(cookies)
         registered = authenticated_origin_cookie(candidate)
         # A validated session created specifically for another authorized port/origin must replace
         # the speculative raw-cookie reuse if that first attempt failed. Browser storage metadata
@@ -384,6 +389,8 @@ def scope_cookie_header(candidate: str, cookies: str) -> str:
     # browser storage state. Once storage-state cookie metadata exists, it is authoritative for
     # sibling requests: falling back to the flattened origin header when no cookie matches this path
     # would silently widen a path-scoped cookie.
+    if not use_runtime_auth:
+        return ''
     storage = RUNTIME_TARGET_AUTH.get('storage_state') if isinstance(RUNTIME_TARGET_AUTH.get('storage_state'), dict) else None
     if storage and storage.get('cookies'):
         return runtime_header
@@ -741,6 +748,7 @@ def _server_env() -> dict[str, str]:
     env.update({'PATH': os.environ.get('PATH', ''), 'PYTHONPATH': os.pathsep.join(paths), 'PYTHONUNBUFFERED': '1', 'PYTHONIOENCODING': 'utf-8', 'PYTHONWARNINGS': ','.join(warning_filters), 'SECOPS_PROJECT_ROOT': str(ROOT)})
     return env
 _HTTP_SERVER_PROCESSES: dict[str, subprocess.Popen] = {}
+_VERIFIED_MCP_FINGERPRINTS: dict[str, str] = {}
 _HTTP_SERVER_LOGS: dict[str, Path] = {}
 
 # Port probing detects whether the unified MCP endpoint is already listening locally.
@@ -759,6 +767,7 @@ def _http_server_log() -> Path:
 
 # Stops the single MCP server process started by this orchestrator.
 def _stop_owned_http_server() -> None:
+    _VERIFIED_MCP_FINGERPRINTS.pop(mcp_http_url(MCP_UNIFIED_SERVICE), None)
     process = _HTTP_SERVER_PROCESSES.pop(MCP_UNIFIED_SERVICE, None)
     if process is not None and process.poll() is None:
         try:
@@ -832,6 +841,42 @@ async def _await_report_tool(client: Client, tool_name: str, arguments: dict[str
             task.cancel()
             await asyncio.gather(task, return_exceptions=True)
 
+# Verify that a listening MCP endpoint was started from the same SecOps source tree as this
+# orchestrator. This is intentionally an MCP-level check rather than a port/PID heuristic, so it
+# works consistently on Linux, macOS and Windows and cannot mistake an unrelated process for SecOps.
+async def _mcp_runtime_identity(url: str) -> tuple[bool, str]:
+    expected = secops_source_fingerprint()
+    try:
+        async with Client(url) as client:
+            tools = await asyncio.wait_for(client.list_tools(), timeout=MCP_CONNECT_TIMEOUT)
+            names = {str(getattr(tool, 'name', '')) for tool in tools}
+            if 'secops_runtime_identity' not in names:
+                return (False, 'runtime identity tool is missing (server is stale or incompatible with this SecOps checkout)')
+            response = await asyncio.wait_for(client.call_tool('secops_runtime_identity', {}), timeout=MCP_CONNECT_TIMEOUT)
+        data, is_error, _ = _extract_response(response)
+        if is_error or not isinstance(data, dict):
+            return (False, f'runtime identity call returned an invalid payload: {data!r}')
+        observed = str(data.get('source_fingerprint') or '')
+        if observed != expected:
+            return (False, f'source fingerprint mismatch: expected={expected[:16]} observed={observed[:16] or "missing"}; server_root={data.get("root") or "unknown"}')
+        return (True, f'fingerprint={expected[:16]}; server_root={data.get("root") or "unknown"}; pid={data.get("pid") or "unknown"}')
+    except Exception as exc:
+        return (False, f'{type(exc).__name__}: {exc}')
+
+def _verify_mcp_runtime_identity(url: str, *, force: bool=False) -> tuple[bool, str]:
+    expected = secops_source_fingerprint()
+    if not force and _VERIFIED_MCP_FINGERPRINTS.get(url) == expected:
+        return (True, f'fingerprint={expected[:16]} (cached)')
+    try:
+        matched, detail = asyncio.run(_mcp_runtime_identity(url))
+    except RuntimeError as exc:
+        # _ensure_http_server normally runs in a worker thread. Keep a clear failure mode if a
+        # future caller invokes it directly from an event-loop thread.
+        return (False, f'identity verification could not start its isolated event loop: {exc}')
+    if matched:
+        _VERIFIED_MCP_FINGERPRINTS[url] = expected
+    return (matched, detail)
+
 # Starts the one MCP process that imports and exposes the complete tool catalogue.
 def _ensure_http_server(*, restart: bool=False) -> str:
     server = resolve_server_path(UNIFIED_MCP_SERVER)
@@ -840,9 +885,21 @@ def _ensure_http_server(*, restart: bool=False) -> str:
     if not server.is_file():
         raise FileNotFoundError(f'Unified MCP server not found: {server}')
     if restart:
+        _VERIFIED_MCP_FINGERPRINTS.pop(url, None)
         _stop_owned_http_server()
     if _port_open('127.0.0.1', port):
-        return url
+        matched, detail = _verify_mcp_runtime_identity(url, force=restart)
+        if matched:
+            return url
+        existing = _HTTP_SERVER_PROCESSES.get(MCP_UNIFIED_SERVICE)
+        if existing is not None and existing.poll() is None:
+            _stop_owned_http_server()
+        else:
+            raise RuntimeError(
+                f'Port {port} is already occupied by an incompatible or stale MCP service. {detail}. '
+                'Stop the old SecOps process (or the unrelated service using this port) and rerun the command; '
+                'the current assessment will not silently use code from another checkout/version.'
+            )
     existing = _HTTP_SERVER_PROCESSES.get(MCP_UNIFIED_SERVICE)
     if existing is not None and existing.poll() is None:
         process = existing
@@ -856,15 +913,18 @@ def _ensure_http_server(*, restart: bool=False) -> str:
         log_handle.close()
         _HTTP_SERVER_PROCESSES[MCP_UNIFIED_SERVICE] = process
     deadline = time.monotonic() + max(3.0, MCP_CONNECT_TIMEOUT)
+    last_identity_detail = ''
     while time.monotonic() < deadline:
         if _port_open('127.0.0.1', port):
-            return url
+            matched, last_identity_detail = _verify_mcp_runtime_identity(url, force=True)
+            if matched:
+                return url
         if process.poll() is not None:
             detail = _server_startup_log()
             raise RuntimeError('Unified SecOps HTTP MCP server exited during startup' + (f': {detail}' if detail else '.'))
         time.sleep(0.15)
     detail = _server_startup_log()
-    raise TimeoutError(f'Timed out waiting for unified MCP HTTP service at {url}' + (f'. Server log: {detail}' if detail else ''))
+    raise TimeoutError(f'Timed out waiting for unified MCP HTTP service at {url}' + (f'. Identity: {last_identity_detail}' if last_identity_detail else '') + (f'. Server log: {detail}' if detail else ''))
 
 # Transport diagnosis recognizes failures raised by the MCP HTTP layer.
 def _http_transport_failure(exc: BaseException) -> bool:
@@ -1218,7 +1278,13 @@ async def _run_live_checks() -> list[dict[str, str]]:
         async with Client(url) as client:
             tools = await asyncio.wait_for(client.list_tools(), timeout=MCP_CONNECT_TIMEOUT)
         names = {str(getattr(tool, 'name', '')) for tool in tools}
-        return [_tool_live_check(spec, url, names) for spec in ALL_TOOLS]
+        identity_ok, identity_detail = await _mcp_runtime_identity(url)
+        identity_check = {
+            'level': 'ok' if identity_ok else 'error', 'component': 'mcp',
+            'cause': 'mcp_runtime_identity_ok' if identity_ok else 'mcp_runtime_identity_mismatch',
+            'detail': identity_detail,
+        }
+        return [identity_check, *[_tool_live_check(spec, url, names) for spec in ALL_TOOLS]]
     except Exception as exc:
         detail = _server_startup_log()
         message = f'{type(exc).__name__}: {exc}' + (f' | server log: {detail}' if detail else '')
@@ -5478,8 +5544,8 @@ def write_emergency_json_report(target: str, results: dict[str, Any], diagnostic
         path = directory / f'{stem}_{datetime.now():%Y%m%d_%H%M%S}.json'
         payload = {'generated_at': datetime.now(timezone.utc).isoformat(), 'target': target, 'reason': reason, 'diagnostics': diagnostics, 'results': results}
         text = json.dumps(payload, indent=2, ensure_ascii=False, default=str)
-        path.write_text(text, encoding='utf-8')
-        path.with_suffix('.html').write_text(f"<!doctype html><meta charset='utf-8'><title>SecOps preview</title><style>body{{font-family:Segoe UI;margin:2rem}}pre{{white-space:pre-wrap;background:#111923;color:#e7eef7;padding:1rem}}</style><h1>SecOps emergency preview</h1><pre>{html.escape(text)}</pre>", encoding='utf-8')
+        atomic_write_text(path, text)
+        atomic_write_text(path.with_suffix('.html'), f"<!doctype html><meta charset='utf-8'><title>SecOps preview</title><style>body{{font-family:Segoe UI;margin:2rem}}pre{{white-space:pre-wrap;background:#111923;color:#e7eef7;padding:1rem}}</style><h1>SecOps emergency preview</h1><pre>{html.escape(text)}</pre>")
         return str(path.resolve())
     except Exception as exc:
         print(f'[REPORT FALLBACK ERROR] {exc}', file=sys.stderr)
@@ -5713,7 +5779,7 @@ def build_tool_arguments(tool: str, target_url: str, cookies: str, discovery: di
         elif tool == 'traversal':
             arguments['scan_profile'] = CURRENT_SCAN_MODE
     elif tool == 'authorization':
-        arguments.update({'secondary_cookies': scope_cookie_header(target_url, secondary_cookies), 'method': 'GET', 'data': '', 'parameters': parameters, 'timeout': timeout_override or PARAMETER_TOOL_TIMEOUTS[tool]})
+        arguments.update({'secondary_cookies': scope_cookie_header(target_url, secondary_cookies, use_runtime_auth=False), 'method': 'GET', 'data': '', 'parameters': parameters, 'timeout': timeout_override or PARAMETER_TOOL_TIMEOUTS[tool]})
     elif tool in {'browser', 'workflow'}:
         default_method = 'POST' if tool == 'workflow' else 'GET'
         arguments.update({'method': method if case.get('method') else default_method, 'data': data, 'parameters': parameters, 'source_url': str(case.get('source_url') or ''), 'allow_state_changes': state_changing_tests_allowed(target_url, allow_state_changes), 'timeout': timeout_override or PARAMETER_TOOL_TIMEOUTS[tool]})

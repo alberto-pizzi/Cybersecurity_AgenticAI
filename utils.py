@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 import os
 import re
 import shutil
 import subprocess
+import tempfile
 import threading
 import time
 from pathlib import Path
@@ -19,6 +21,57 @@ SERVERS_DIR = ROOT_DIR / "servers"
 REPORTS_DIR = ROOT_DIR / "reports"
 WORDLISTS_DIR = ROOT_DIR / "wordlists"
 LOCAL_BIN = Path.home() / ".local" / "bin"
+
+_SOURCE_FINGERPRINT_CACHE: str | None = None
+
+# Fingerprint the active SecOps Python source tree so an orchestrator never silently reuses an
+# MCP server that was started from stale code. The value is cached per process: the server keeps
+# the fingerprint of the files it actually loaded at startup, while a newly started orchestrator
+# computes the fingerprint of its own checkout. Identical source trees may live at different paths.
+def secops_source_fingerprint() -> str:
+    global _SOURCE_FINGERPRINT_CACHE
+    if _SOURCE_FINGERPRINT_CACHE is not None:
+        return _SOURCE_FINGERPRINT_CACHE
+    digest = hashlib.sha256()
+    candidates = [path for path in ROOT_DIR.glob("*.py") if path.is_file()]
+    if SERVERS_DIR.is_dir():
+        candidates.extend(path for path in SERVERS_DIR.rglob("*.py") if path.is_file() and "__pycache__" not in path.parts)
+    for path in sorted(candidates, key=lambda item: item.relative_to(ROOT_DIR).as_posix().lower()):
+        relative = path.relative_to(ROOT_DIR).as_posix()
+        digest.update(relative.encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(path.read_bytes())
+        digest.update(b"\0")
+    _SOURCE_FINGERPRINT_CACHE = digest.hexdigest()
+    return _SOURCE_FINGERPRINT_CACHE
+
+# Persist text artifacts atomically on Linux, macOS and Windows. A crash can therefore leave the
+# previous complete file or the new complete file, rather than a half-written Results Data/report.
+def atomic_write_text(path: str | Path, text: str, *, encoding: str = "utf-8") -> Path:
+    destination = Path(path)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    temporary_name = ""
+    try:
+        with tempfile.NamedTemporaryFile(
+            "w", encoding=encoding, dir=str(destination.parent),
+            prefix=f".{destination.name}.", suffix=".tmp", delete=False, newline="",
+        ) as handle:
+            temporary_name = handle.name
+            handle.write(text)
+            handle.flush()
+            try:
+                os.fsync(handle.fileno())
+            except OSError:
+                pass
+        os.replace(temporary_name, destination)
+        temporary_name = ""
+        return destination
+    finally:
+        if temporary_name:
+            try:
+                Path(temporary_name).unlink(missing_ok=True)
+            except OSError:
+                pass
 
 # Shared assessment traffic policy. The assessment configuration selects the effective
 # per-active-scanner request rate. Ten requests/second is the project default. Integer values

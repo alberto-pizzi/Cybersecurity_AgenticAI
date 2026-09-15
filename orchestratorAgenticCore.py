@@ -4,10 +4,12 @@ import asyncio
 import copy
 import getpass
 import json
+import os
 import re
 import platform
 import socket
 import sys
+import uuid
 import time
 import traceback
 import warnings
@@ -3024,7 +3026,7 @@ def route_after_execution(state: AgentState) -> Literal['planner', 'verification
 # Once execution is complete, reporting receives the collected state and produces the final assessment.
 def report_node(state: AgentState) -> dict[str, Any]:
     print('\n[*] Creating final PDF, HTML preview and JSON report...')
-    output_name = f'SecOps_Agentic_Assessment_{datetime.now():%Y%m%d_%H%M%S}'
+    output_name = str(os.environ.get('SECOPS_REPORT_RUN_ID') or f'SecOps_Agentic_Assessment_{datetime.now():%Y%m%d_%H%M%S_%f}_{os.getpid()}_{uuid.uuid4().hex[:8]}')
     report_results = _materialize_unselected_actions(state)
     remaining = _remaining_eligible_actions({**state, 'results': report_results})
     context = {'profiles': [{'name': profile['name'], 'authenticated': _profile_has_effective_auth(state, str(profile.get('name') or ''))} for profile in state['profiles']],
@@ -3075,7 +3077,7 @@ def report_node(state: AgentState) -> dict[str, Any]:
         if report.get('status') != 'success':
             print(f"[REPORT ERROR] {report.get('diagnosis') or 'report_failed'} — {report.get('output') or 'No report error detail returned.'}", file=sys.stderr, flush=True)
     if report.get('status') != 'success' and not any((report.get('json_filename'), report.get('html_filename'), report.get('pdf_filename'), report.get('review_snapshot_filename'))):
-        fallback = write_emergency_json_report(state['target'], state['results'], state['diagnostics'], str(report.get('output', 'Report MCP failed.')), 'SecOps_Agentic_Emergency')
+        fallback = write_emergency_json_report(state['target'], state['results'], state['diagnostics'], str(report.get('output', 'Report MCP failed.')), f'{output_name}_Emergency')
         if fallback:
             report.update(json_filename=fallback, html_filename=str(Path(fallback).with_suffix('.html')), local_json_fallback=True, emergency_report=True)
     return {'report_status': report, 'results': report_results}

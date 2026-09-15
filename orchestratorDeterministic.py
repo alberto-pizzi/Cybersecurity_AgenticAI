@@ -4,7 +4,9 @@ import argparse
 import asyncio
 import copy
 import json
+import os
 import sys
+import uuid
 import time
 import traceback
 from datetime import datetime
@@ -877,7 +879,7 @@ async def deterministic_report_node(state: DeterministicState) -> dict[str, Any]
         'damage_recovery_policy': 'Confirmed findings retain scanner evidence and receive conservative consequence and recovery/restoration guidance when the originating tool does not provide it. Potential damage is never reported as observed damage without supporting evidence.'}
     context['orchestration'] = {'engine': 'langgraph', 'mode': 'deterministic', 'nodes': ['discovery', 'broad_scan', 'parameter_scan', 'authorization', 'browser_workflow', 'special_checks', 'verification', 'report']}
     print('\n[*] Generazione report...')
-    output_name = f'SecOps_Assessment_{datetime.now():%Y%m%d_%H%M%S}'
+    output_name = str(os.environ.get('SECOPS_REPORT_RUN_ID') or f'SecOps_Assessment_{datetime.now():%Y%m%d_%H%M%S_%f}_{os.getpid()}_{uuid.uuid4().hex[:8]}')
     report = await call_mcp('reporting/reportServer.py', 'generate_report', {'findings_summary': results, 'target_url': target, 'output_name': output_name, 'assessment_context': context})
     if report.get('status') != 'success':
         if not any((report.get('json_filename'), report.get('html_filename'), report.get('pdf_filename'), report.get('review_snapshot_filename'))):
@@ -885,7 +887,7 @@ async def deterministic_report_node(state: DeterministicState) -> dict[str, Any]
             if report.get('normal_report_artifacts_recovered'):
                 print(f'[REPORT RECOVERY] Reusing normal report artifacts already written for {output_name}; emergency report not required.')
     if report.get('status') != 'success' and not any((report.get('json_filename'), report.get('html_filename'), report.get('pdf_filename'), report.get('review_snapshot_filename'))):
-        fallback = write_emergency_json_report(target, results, diagnostics, str(report.get('output', 'Report MCP failed.')))
+        fallback = write_emergency_json_report(target, results, diagnostics, str(report.get('output', 'Report MCP failed.')), f'{output_name}_Emergency')
         if fallback:
             report.update(json_filename=fallback, html_filename=str(Path(fallback).with_suffix('.html')), local_json_fallback=True, emergency_report=True)
     return {'assessment_context': context, 'report_status': report}

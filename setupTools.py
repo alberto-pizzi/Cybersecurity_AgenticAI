@@ -282,12 +282,19 @@ def clone_or_update(url: str, destination: Path) -> None:
 
 # Installs a scanner directly from its upstream Git repository.
 def install_repository_tool(name: str, repository: str, script_name: str) -> None:
-    if command_path(name):
-        print(f'[+] {name} already available: {command_path(name)}')
-        return
     destination = LOCAL_OPT / name
-    clone_or_update(repository, destination)
     script = destination / script_name
+    external = command_path(name)
+    # SQLMap needs sqlmapapi.py and Commix uses the repository entry script directly. A PATH-only
+    # install is therefore not sufficient proof that the runtime wrapper can find what it needs.
+    # Keep one initializer-managed checkout on every OS and make the launcher point to that checkout.
+    if script.is_file():
+        print(f'[+] {name} managed repository available: {script}')
+        write_launcher(name, [sys.executable, str(script)])
+        return
+    if external:
+        print(f'[+] {name} exists on PATH at {external}, but the SecOps wrapper requires its managed repository script; installing {destination}.')
+    clone_or_update(repository, destination)
     if not script.is_file():
         raise RuntimeError(f'Missing {script_name} after cloning {name}.')
     write_launcher(name, [sys.executable, str(script)])
@@ -1010,10 +1017,18 @@ def validate_scanner_cli_contracts() -> dict[str, Any]:
     nuclei = command_path('nuclei')
     if nuclei and nuclei_mode != 'docker_official_image':
         results['nuclei'] = _validate_cli_contract(
-            'Nuclei', [nuclei, '-h'], ('-l', '-jsonl', '-o', '-c', '-bs', '-pc', '-rl', '-timeout', '-retries', '-dr', '-H', '-t'),
+            'Nuclei', [nuclei, '-h'], ('-l', '-jsonl', '-silent', '-nc', '-o', '-duc', '-no-stdin', '-c', '-bs', '-pc', '-rl', '-timeout', '-retries', '-dr', '-H', '-dast', '-im', '-fm', '-fa', '-fuzz-param-frequency', '-t', '-severity', '-ni', '-tags', '-etags'),
         )
     elif nuclei_mode == 'docker_official_image':
-        results['nuclei'] = {'validated_by': 'official_docker_dast_runtime'}
+        docker = command_path('docker')
+        image = str(_NUCLEI_ENGINE_STATE.get('docker_image') or NUCLEI_DOCKER_IMAGE)
+        if not docker:
+            raise RuntimeError('Nuclei Docker mode is selected but docker is not available for CLI contract validation.')
+        results['nuclei'] = _validate_cli_contract(
+            'Nuclei Docker', [docker, 'run', '--rm', image, '-h'],
+            ('-l', '-jsonl', '-silent', '-nc', '-o', '-duc', '-no-stdin', '-c', '-bs', '-pc', '-rl', '-timeout', '-retries', '-dr', '-H', '-dast', '-im', '-fm', '-fa', '-fuzz-param-frequency', '-t', '-severity', '-ni', '-tags', '-etags'),
+        )
+        results['nuclei']['validated_by'] = 'official_docker_help_and_dast_runtime'
     nikto = command_path('nikto')
     if nikto:
         try:

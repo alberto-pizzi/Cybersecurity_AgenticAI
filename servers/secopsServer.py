@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import sys
 from pathlib import Path
 
@@ -13,7 +14,7 @@ for path in (ROOT_DIR, SERVERS_DIR):
 
 from fastmcp import FastMCP
 
-from utils import run_mcp_http
+from utils import run_mcp_http, secops_source_fingerprint
 
 from custom_checks.authorizationServer import mcp as authorization_mcp
 from custom_checks.browserServer import mcp as browser_mcp
@@ -41,6 +42,20 @@ mcp = FastMCP(
         "targeted verification, authorization/workflow checks, OAST/JWT analysis and report generation."
     ),
 )
+
+# Freeze the source fingerprint when this process starts. If files are updated while an older MCP
+# process remains alive, a new orchestrator can detect that the process is stale instead of silently
+# using wrappers loaded from the previous checkout.
+_SERVER_SOURCE_FINGERPRINT = secops_source_fingerprint()
+
+@mcp.tool()
+def secops_runtime_identity() -> dict[str, str | int]:
+    return {
+        "source_fingerprint": _SERVER_SOURCE_FINGERPRINT,
+        "root": str(ROOT_DIR.resolve()),
+        "python": sys.executable,
+        "pid": os.getpid(),
+    }
 
 # Child modules remain independently maintainable, but only this parent owns an HTTP listener.
 for child in (

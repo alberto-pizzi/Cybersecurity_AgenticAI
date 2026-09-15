@@ -13,7 +13,7 @@ from pathlib import Path
 import requests
 from fastmcp import FastMCP
 
-from utils import REPORTS_DIR, failure, run_mcp_http, success
+from utils import REPORTS_DIR, atomic_write_text, failure, run_mcp_http, success
 
 from reporting.coverage import _executive_text, build_coverage, build_endpoint_coverage, summarize, summarize_endpoint_coverage
 from reporting.findings import _finding_groups, _human_readable_findings, flatten_findings
@@ -224,12 +224,12 @@ def _generate_report(
 
     try:
         print(f"[REPORT SERVER] report {base}: writing JSON, review snapshot and HTML artifacts.", flush=True)
-        json_path.write_text(json.dumps(payload, indent=2, ensure_ascii=False, default=str), encoding="utf-8")
-        review_snapshot_path.write_text(
+        atomic_write_text(json_path, json.dumps(payload, indent=2, ensure_ascii=False, default=str))
+        atomic_write_text(
+            review_snapshot_path,
             json.dumps(build_review_snapshot(payload), indent=2, ensure_ascii=False, default=str),
-            encoding="utf-8",
         )
-        html_path.write_text(_render_html(payload), encoding="utf-8")
+        atomic_write_text(html_path, _render_html(payload))
     except Exception as exc:
         return failure("Report Generator", target_url, f"JSON/HTML/review snapshot creation failed: {type(exc).__name__}: {exc}", diagnosis="report_serialization_failed")
 
@@ -241,7 +241,7 @@ def _generate_report(
     pdf_source_path = html_path.with_name(f"{html_path.stem}.pdf-source.html")
     try:
         print(f"[REPORT SERVER] report {base}: JSON/review/HTML ready; preparing PDF-only HTML.", flush=True)
-        pdf_source_path.write_text(_render_html(payload, for_pdf=True), encoding="utf-8")
+        atomic_write_text(pdf_source_path, _render_html(payload, for_pdf=True))
         print(f"[REPORT SERVER] report {base}: starting PDF rendering.", flush=True)
         html2pdf(pdf_source_path, pdf_path)
         print(f"[REPORT SERVER] report {base}: PDF rendering completed; file={pdf_path}.", flush=True)
