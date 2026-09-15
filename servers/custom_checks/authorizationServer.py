@@ -11,9 +11,11 @@ from utils import RequestRatePacer, partial, skipped, success
 
 from utils import same_origin
 
-from core.scannerCommon import bounded_text_similarity, looks_like_login, service
+from core.scannerCommon import bounded_text_similarity, looks_like_login, proportional_budget, remaining_budget, service, wall_clock_deadline
 
 mcp, _serve = service("Authorization Differential Verifier", "authorization")
+
+AUTHORIZATION_IDENTITY_RATIO = 0.30
 
 DESTRUCTIVE_RE = re.compile(
     r"(?:logout|signout|logoff|setup|install|delete|remove|drop|truncate|purge|wipe|reset)", re.I,
@@ -55,7 +57,7 @@ def _authorization_relevance(target_url: str, parameters: list[str] | None) -> t
     return score, reasons
 
 # Issue a read-only GET for one identity while keeping the request bounded and same-origin.
-def _safe_get(url: str, cookies: str, timeout: int, pacer: RequestRatePacer) -> tuple[requests.Response | None, str]:
+def _safe_get(url: str, cookies: str, timeout: int, pacer: RequestRatePacer, deadline: float) -> tuple[requests.Response | None, str]:
     session = requests.Session()
     session.headers.update({
         "User-Agent": "SecOps-Authorization-Differential/1.0",
@@ -64,13 +66,16 @@ def _safe_get(url: str, cookies: str, timeout: int, pacer: RequestRatePacer) -> 
     if cookies:
         session.headers["Cookie"] = cookies
     current, seen = url, set()
-    read_timeout = max(3.0, min(6.0, timeout / 4.0))
+    request_budget = proportional_budget(timeout, AUTHORIZATION_IDENTITY_RATIO)
     for _ in range(3):
+        if remaining_budget(deadline) <= 0:
+            return None, "time_limit_reached"
         if not same_origin(url, current):
             return None, "cross_origin_blocked"
         try:
             pacer.wait()
-            response = session.get(current, timeout=(2, read_timeout), allow_redirects=False)
+            left = max(1.0, min(float(request_budget), remaining_budget(deadline)))
+            response = session.get(current, timeout=(max(1.0, left * 0.25), left), allow_redirects=False)
         except requests.RequestException as exc:
             return None, f"transport_unavailable:{type(exc).__name__}"
         if response.status_code not in {301, 302, 303, 307, 308}:
@@ -195,6 +200,7 @@ def run_authorization_scan(
             "Authorization Differential Verifier", target_url, "Destructive logout, setup, reset or deletion routes are excluded.",
         )
     timeout = max(5, min(int(timeout), 180))
+    deadline = wall_clock_deadline(timeout)
     pacer = RequestRatePacer(request_rate)
     relevance_score, relevance_reasons = _authorization_relevance(target_url, parameters)
     if relevance_score <= 0 and not secondary_cookies:
@@ -203,18 +209,20 @@ def run_authorization_scan(
             "The request resembles public/static documentation and has no object or identity reference suitable for an authorization differential.",
             diagnosis="authorization_candidate_not_relevant", relevance_score=relevance_score, relevance_reasons=relevance_reasons,
         )
-    primary, primary_guard = _safe_get(target_url, cookies, timeout, pacer)
-    anonymous, anonymous_guard = _safe_get(target_url, "", timeout, pacer)
+    primary, primary_guard = _safe_get(target_url, cookies, timeout, pacer, deadline)
+    anonymous, anonymous_guard = _safe_get(target_url, "", timeout, pacer, deadline)
     secondary = secondary_guard = None
     if secondary_cookies:
-        secondary, secondary_guard = _safe_get(target_url, secondary_cookies, timeout, pacer)
+        secondary, secondary_guard = _safe_get(target_url, secondary_cookies, timeout, pacer, deadline)
 
     if primary is None or primary.status_code >= 400 or looks_like_login(primary, text_limit=80_000):
+        timed_out = primary_guard == "time_limit_reached"
         return partial(
             "Authorization Differential Verifier", target_url,
+            "The authorization action reached its shared time budget before the primary identity could be checked." if timed_out else
             "The primary authenticated identity did not obtain a usable protected response.",
-            diagnosis="authentication_precheck_failed", timed_out=False,
-            vulnerabilities=[], primary=_summary(primary, primary_guard),
+            diagnosis="time_limit_reached" if timed_out else "authentication_precheck_failed", timed_out=timed_out,
+            time_limit_reached=timed_out, vulnerabilities=[], primary=_summary(primary, primary_guard),
         )
 
     findings: list[dict[str, Any]] = []
@@ -222,6 +230,7 @@ def run_authorization_scan(
         "parameters": [str(value) for value in (parameters or [])], "primary": _summary(primary, primary_guard),
         "anonymous": _summary(anonymous, anonymous_guard), "secondary_supplied": bool(secondary_cookies),
         "relevance_score": relevance_score, "relevance_reasons": relevance_reasons,
+        "tool_timeout_seconds": timeout, "phase_ratio_policy": {"identity_request": AUTHORIZATION_IDENTITY_RATIO},
     }
     if anonymous is not None:
         accepted, similarity, length_ratio = _matching_access(primary, anonymous)
@@ -243,6 +252,12 @@ def run_authorization_scan(
                 target_url, "secondary_authenticated", primary, secondary, similarity, length_ratio,
             ))
 
+    if remaining_budget(deadline) <= 0 or anonymous_guard == "time_limit_reached" or secondary_guard == "time_limit_reached":
+        return partial(
+            "Authorization Differential Verifier", target_url,
+            f"Authorization differential reached its shared action time budget. Findings preserved: {len(findings)}.",
+            diagnosis="time_limit_reached", timed_out=True, time_limit_reached=True, vulnerabilities=findings, diagnostics=diagnostics,
+        )
     return success(
         "Authorization Differential Verifier", target_url,
         f"Read-only authorization differential completed. Findings: {len(findings)}.", vulnerabilities=findings,

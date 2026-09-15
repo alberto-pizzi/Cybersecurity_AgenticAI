@@ -41,7 +41,7 @@ FASTMCP_VERSION = '3.4.5'
 FASTMCP_REQUIREMENT = f'fastmcp=={FASTMCP_VERSION}'
 LANGGRAPH_REQUIREMENT = 'langgraph==1.2.10'
 COMPATIBILITY_REQUIREMENTS = ('websockets>=15.0.1,<16', 'jsonschema-path>=0.4.5,<0.5.0')
-PYTHON_PACKAGES = (FASTMCP_REQUIREMENT, LANGGRAPH_REQUIREMENT, *COMPATIBILITY_REQUIREMENTS, 'requests>=2.32,<3', 'beautifulsoup4>=4.13,<5', 'zaproxy>=0.5,<0.6', 'PyJWT>=2.10,<3', 'arjun>=2.2,<3', 'playwright>=1.54,<2')
+PYTHON_PACKAGES = (FASTMCP_REQUIREMENT, LANGGRAPH_REQUIREMENT, *COMPATIBILITY_REQUIREMENTS, 'requests>=2.32,<3', 'beautifulsoup4>=4.13,<5', 'zaproxy>=0.5,<0.6', 'PyJWT>=2.10,<3', 'arjun==2.2.7', 'playwright>=1.54,<2')
 SCANNERS = ('nuclei', 'nikto', 'ffuf', 'dalfox', 'commix', 'sqlmap', 'arjun', 'idor-forge', 'interactsh-client')
 REPOSITORY_TOOLS = {'sqlmap': ('https://github.com/sqlmapproject/sqlmap.git', 'sqlmap.py'), 'commix': ('https://github.com/commixproject/commix.git', 'commix.py')}
 IDOR_FORGE_REPOSITORY = 'https://github.com/errorfiathck/IDOR-Forge.git'
@@ -704,6 +704,29 @@ def _patch_arjun_status_code_bug() -> bool:
         print(f'[!] Arjun compatibility patch could not be applied: {type(exc).__name__}: {exc}', file=sys.stderr)
         return False
 
+# Match one command-line option as a standalone token in argparse-style help text.
+def _help_has_flag(help_text: str, flag: str) -> bool:
+    return re.search(rf"(?<![A-Za-z0-9_-]){re.escape(flag)}(?=$|[\s,=\]\[])", str(help_text or "")) is not None
+
+# Validate the exact Arjun CLI contract used by the runtime wrapper.
+def _validate_arjun_cli(executable: str) -> dict[str, Any]:
+    result = run([executable, '--help'], required=False, capture=True, show_output=False, timeout=60)
+    help_text = _process_output(result, 12000)
+    required = ('-u', '-m', '-w', '-t', '-T', '-c', '--disable-redirects')
+    missing = [flag for flag in required if not _help_has_flag(help_text, flag)]
+    output_flag = '-oJ' if _help_has_flag(help_text, '-oJ') else '-o' if _help_has_flag(help_text, '-o') else ''
+    rate_flag = '--rate-limit' if _help_has_flag(help_text, '--rate-limit') else '--ratelimit' if _help_has_flag(help_text, '--ratelimit') else ''
+    if result.returncode not in (0, 1, 2) or missing or not output_flag or not rate_flag:
+        detail = []
+        if missing:
+            detail.append('missing required flags: ' + ', '.join(missing))
+        if not output_flag:
+            detail.append('missing JSON output flag (-o/-oJ)')
+        if not rate_flag:
+            detail.append('missing rate-limit flag (--rate-limit/--ratelimit)')
+        raise RuntimeError('Arjun CLI contract validation failed: ' + '; '.join(detail) + '\n' + help_text[-2400:])
+    return {'output_flag': output_flag, 'rate_flag': rate_flag, 'required_flags': list(required), 'returncode': result.returncode}
+
 # Ensures Arjun is installed, patched and available on PATH.
 def ensure_arjun() -> None:
     executable = command_path('arjun')
@@ -713,7 +736,12 @@ def ensure_arjun() -> None:
     if not executable and not module_ok:
         raise RuntimeError('Arjun is installed but no executable/module entry point is available.')
     patched = _patch_arjun_status_code_bug()
-    print(f"[+] arjun ready: {command_path('arjun') or executable}; upstream-status-fix={'present' if patched else 'not-required-or-unavailable'}")
+    resolved = str(command_path('arjun') or executable)
+    contract = _validate_arjun_cli(resolved)
+    print(
+        f"[+] arjun ready: {resolved}; upstream-status-fix={'present' if patched else 'not-required-or-unavailable'}; "
+        f"output={contract['output_flag']}; rate={contract['rate_flag']}"
+    )
 
 # Reads the latest release metadata for an upstream GitHub project.
 def github_release(repository: str) -> dict[str, Any]:
@@ -944,6 +972,60 @@ def verify_nuclei_dast_runtime(engine: dict[str, Any], templates: dict[str, Any]
     print(f'[+] Nuclei DAST runtime ready: {len(listed)} template entries loadable.')
     return state
 
+# Validate option names used by CLI wrappers so incompatible releases fail during initialization, not mid-assessment.
+def _validate_cli_contract(name: str, command: list[str], required_flags: tuple[str, ...], *, accepted_codes: tuple[int, ...]=(0, 1, 2)) -> dict[str, Any]:
+    result = run(command, required=False, capture=True, show_output=False, timeout=90)
+    help_text = _process_output(result, 20000)
+    missing = [flag for flag in required_flags if not _help_has_flag(help_text, flag)]
+    if result.returncode not in accepted_codes or missing:
+        raise RuntimeError(
+            f"{name} CLI contract validation failed; missing flags: {', '.join(missing) if missing else 'none'}\n"
+            + help_text[-3000:]
+        )
+    return {'name': name, 'command': command, 'required_flags': list(required_flags), 'returncode': result.returncode}
+
+def validate_scanner_cli_contracts() -> dict[str, Any]:
+    results: dict[str, Any] = {}
+    ffuf = command_path('ffuf')
+    if ffuf:
+        results['ffuf'] = _validate_cli_contract(
+            'FFUF', [ffuf, '-h'], ('-u', '-w', '-of', '-o', '-t', '-rate', '-timeout', '-maxtime', '-noninteractive'),
+        )
+    interactsh = command_path('interactsh-client')
+    if interactsh:
+        results['interactsh-client'] = _validate_cli_contract(
+            'Interactsh', [interactsh, '-h'], ('-n', '-pi', '-json', '-psf', '-o'),
+        )
+    dalfox = command_path('dalfox')
+    if dalfox:
+        scan = run([dalfox, 'scan', '--help'], required=False, capture=True, show_output=False, timeout=90)
+        legacy = run([dalfox, 'url', '--help'], required=False, capture=True, show_output=False, timeout=90)
+        scan_help, legacy_help = _process_output(scan, 16000), _process_output(legacy, 16000)
+        v3_ok = all(_help_has_flag(scan_help, flag) for flag in ('--format', '--output', '--param'))
+        v2_ok = bool(legacy_help) and (scan.returncode in (0, 1, 2) or legacy.returncode in (0, 1, 2))
+        if not (v3_ok or v2_ok):
+            raise RuntimeError('Dalfox CLI contract validation failed: neither supported scan-mode nor legacy URL-mode help was detected.')
+        results['dalfox'] = {'v3': v3_ok, 'v2': v2_ok}
+    nuclei_mode = str(_NUCLEI_ENGINE_STATE.get('execution_mode') or '')
+    nuclei = command_path('nuclei')
+    if nuclei and nuclei_mode != 'docker_official_image':
+        results['nuclei'] = _validate_cli_contract(
+            'Nuclei', [nuclei, '-h'], ('-l', '-jsonl', '-o', '-c', '-bs', '-pc', '-rl', '-timeout', '-retries', '-dr', '-H', '-t'),
+        )
+    elif nuclei_mode == 'docker_official_image':
+        results['nuclei'] = {'validated_by': 'official_docker_dast_runtime'}
+    nikto = command_path('nikto')
+    if nikto:
+        try:
+            results['nikto'] = _validate_cli_contract(
+                'Nikto', [nikto, '-Help'], ('-h', '-maxtime', '-Pause', '-Format', '-o', '-Tuning'),
+            )
+        except RuntimeError as exc:
+            # Some distro launchers emit reduced help; runtime still has a structured native/Docker fallback.
+            results['nikto'] = {'warning': str(exc)[-1200:]}
+            print('[!] Nikto CLI help could not prove every wrapper option; runtime fallback remains enabled.', file=sys.stderr)
+    return results
+
 # Installs or updates every external scanner required by the project.
 def install_scanners() -> None:
     print('\n=== Installing/verifying security scanners ===')
@@ -963,6 +1045,8 @@ def install_scanners() -> None:
     nuclei_templates['engine'] = nuclei_engine
     nuclei_templates['dast_runtime'] = verify_nuclei_dast_runtime(nuclei_engine, nuclei_templates)
     _NUCLEI_TEMPLATE_STATE.update(nuclei_templates)
+    cli_contracts = validate_scanner_cli_contracts()
+    print(f"[+] Scanner CLI contracts validated: {', '.join(sorted(cli_contracts))}")
 
 # Scanner resolution locates the executable or launcher that will actually be invoked.
 def scanner_status() -> dict[str, str | None]:

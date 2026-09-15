@@ -9,7 +9,7 @@ import subprocess
 import threading
 import time
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Callable, Iterable
 from urllib.parse import urljoin, urlparse, urlunparse
 
 import requests
@@ -348,6 +348,7 @@ def request_with_retries(
     backoff_seconds: float = 0.65,
     pacer: RequestRatePacer | None = None,
     request_rate: Any = _REQUEST_RATE_UNSET,
+    deadline: float | None = None,
     **kwargs: Any,
 ) -> tuple[requests.Response | None, list[str]]:
 
@@ -356,8 +357,20 @@ def request_with_retries(
     active_pacer = pacer or RequestRatePacer(request_rate)
     for attempt in range(max(1, int(attempts))):
         try:
+            if deadline is not None:
+                left = float(deadline) - time.monotonic()
+                if left <= 0:
+                    errors.append("Timeout: shared scanner deadline reached")
+                    break
+                configured = kwargs.get("timeout")
+                if isinstance(configured, tuple) and len(configured) == 2:
+                    kwargs["timeout"] = (min(float(configured[0]), left), min(float(configured[1]), left))
+                elif configured is not None:
+                    kwargs["timeout"] = min(float(configured), left)
+                else:
+                    kwargs["timeout"] = left
             if kwargs.get("allow_redirects"):
-                return request_same_origin_redirects(method, url, pacer=active_pacer, **kwargs), errors
+                return request_same_origin_redirects(method, url, pacer=active_pacer, deadline=deadline, **kwargs), errors
             # Scanner helpers never inherit Requests' method-dependent redirect defaults. A caller
             # must opt in explicitly; opt-in follow is always routed through the same-origin guard.
             kwargs["allow_redirects"] = False
@@ -366,7 +379,11 @@ def request_with_retries(
         except (requests.Timeout, requests.ConnectionError) as exc:
             errors.append(f"{type(exc).__name__}: {exc}")
             if attempt + 1 < attempts:
-                time.sleep(backoff_seconds * (attempt + 1))
+                delay = backoff_seconds * (attempt + 1)
+                if deadline is not None:
+                    delay = min(delay, max(0.0, float(deadline) - time.monotonic()))
+                if delay > 0:
+                    time.sleep(delay)
         except requests.RequestException as exc:
             errors.append(f"{type(exc).__name__}: {exc}")
             break
@@ -384,6 +401,7 @@ def scanner_session_probe(
     *,
     pacer: RequestRatePacer | None = None,
     request_rate: Any = _REQUEST_RATE_UNSET,
+    deadline: float | None = None,
 ) -> dict[str, Any]:
 
 
@@ -399,6 +417,7 @@ def scanner_session_probe(
         allow_redirects=True,
         pacer=pacer,
         request_rate=request_rate,
+        deadline=deadline,
     )
     if response is None:
         return {
@@ -511,7 +530,8 @@ def exact_origin_url_regex(url: str) -> str:
 # Follows redirect chains only while every hop remains on the starting origin.
 def request_same_origin_redirects(
     method: str, url: str, *, max_redirects: int = 5, session: requests.Session | None = None,
-    pacer: RequestRatePacer | None = None, request_rate: Any = _REQUEST_RATE_UNSET, **kwargs: Any,
+    pacer: RequestRatePacer | None = None, request_rate: Any = _REQUEST_RATE_UNSET,
+    deadline: float | None = None, **kwargs: Any,
 ) -> requests.Response:
     """Send one HTTP request and follow redirects only while they remain on the starting origin.
 
@@ -523,11 +543,24 @@ def request_same_origin_redirects(
     current = start
     kwargs = dict(kwargs)
     kwargs.pop('allow_redirects', None)
+    configured_timeout = kwargs.get('timeout')
     response: requests.Response | None = None
     active_pacer = pacer or RequestRatePacer(request_rate)
     for _ in range(max(0, int(max_redirects)) + 1):
         requester = session.request if session is not None else requests.request
+        if deadline is not None and float(deadline) - time.monotonic() <= 0:
+            raise requests.Timeout("shared scanner deadline reached")
         active_pacer.wait()
+        if deadline is not None:
+            left = float(deadline) - time.monotonic()
+            if left <= 0:
+                raise requests.Timeout("shared scanner deadline reached")
+            if isinstance(configured_timeout, tuple) and len(configured_timeout) == 2:
+                kwargs['timeout'] = (min(float(configured_timeout[0]), left), min(float(configured_timeout[1]), left))
+            elif configured_timeout is not None:
+                kwargs['timeout'] = min(float(configured_timeout), left)
+            else:
+                kwargs['timeout'] = left
         response = requester(method, current, allow_redirects=False, **kwargs)
         if response.status_code not in {301, 302, 303, 307, 308}:
             return response
@@ -624,6 +657,12 @@ def sanitize_discovered_url(url: str) -> str:
     if not raw:
         return ""
     parsed = urlparse(raw)
+    basename = str(parsed.path or '').rstrip('/').rsplit('/', 1)[-1]
+    if re.fullmatch(r'\.(?:php|phtml|jsp|jspx|asp|aspx|html?|cgi|pl|py|rb)', basename, re.I):
+        # Dynamic source extraction can occasionally concatenate an empty route stem with a file
+        # extension (for example '/.php'). Such a path is a synthetic artefact, not a meaningful
+        # endpoint. Reject only the extension-only basename; legitimate dotfiles remain untouched.
+        return ""
     netloc = str(parsed.netloc or "").strip()
     if netloc:
         userinfo = ""
@@ -734,6 +773,8 @@ def run_process(
     timeout: int = 180,
     accepted_codes: Iterable[int] = (0,),
     cwd: Path | None = None,
+    progress_callback: Callable[[], None] | None = None,
+    progress_interval: float = 5.0,
 ) -> dict[str, Any]:
 
     executable = find_executable(command[0])
@@ -746,21 +787,62 @@ def run_process(
     env.setdefault("PYTHONIOENCODING", "utf-8")
     started = time.monotonic()
     try:
-        completed = subprocess.run(
-            resolved_command,
-            cwd=str(cwd) if cwd else None,
-            env=env,
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            timeout=max(1, int(timeout)),
-            shell=False,
-        )
+        if progress_callback is None:
+            completed = subprocess.run(
+                resolved_command,
+                cwd=str(cwd) if cwd else None,
+                env=env,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=max(1, int(timeout)),
+                shell=False,
+            )
+        else:
+            # A progress callback is used by scanners such as Nuclei that write structured
+            # findings incrementally to disk. Polling communicate() lets the wrapper snapshot
+            # those artifacts while the child is still running without introducing scanner
+            # concurrency or changing its stdout/stderr contract.
+            process = subprocess.Popen(
+                resolved_command,
+                cwd=str(cwd) if cwd else None,
+                env=env,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                shell=False,
+            )
+            stdout = stderr = ""
+            timeout_seconds = max(1.0, float(timeout))
+            interval = max(0.5, min(float(progress_interval), timeout_seconds))
+            while True:
+                remaining = timeout_seconds - (time.monotonic() - started)
+                if remaining <= 0:
+                    process.kill()
+                    stdout, stderr = process.communicate()
+                    raise subprocess.TimeoutExpired(resolved_command, timeout_seconds, output=stdout, stderr=stderr)
+                try:
+                    stdout, stderr = process.communicate(timeout=min(interval, remaining))
+                    break
+                except subprocess.TimeoutExpired:
+                    try:
+                        progress_callback()
+                    except Exception:
+                        # Checkpointing/telemetry must never abort the scanner itself.
+                        pass
+            completed = subprocess.CompletedProcess(resolved_command, process.returncode, stdout or "", stderr or "")
     # A timeout keeps any useful output instead of hiding work the scanner already completed.
     except subprocess.TimeoutExpired as exc:
         stdout = _decode_timeout_output(exc.stdout)
         stderr = _decode_timeout_output(exc.stderr)
+        if progress_callback is not None:
+            try:
+                progress_callback()
+            except Exception:
+                pass
         return failure(
             tool,
             target,

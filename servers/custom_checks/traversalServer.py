@@ -7,9 +7,12 @@ import requests
 
 from utils import RequestRatePacer, request_same_origin_redirects, partial, scanner_session_probe, success
 
-from core.scannerCommon import mutate_parameter, service
+from core.scannerCommon import mutate_parameter, proportional_budget, remaining_budget, service, wall_clock_deadline
 
 mcp, _serve = service("Path Traversal and LFI Verifier", "traversal")
+
+TRAVERSAL_SESSION_RATIO = 0.08
+TRAVERSAL_REQUEST_RATIO = 0.12
 
 CONTROL_PARAMETERS = {"submit", "button", "change", "login", "user_token", "csrf"}
 PATH_PARAMETERS = {
@@ -23,13 +26,13 @@ PROBES = (
 )
 
 # Send one bounded traversal request while preserving the discovered request contract.
-def _request(url: str, cookies: str, method: str, data: str, pacer: RequestRatePacer, read_timeout: float = 7.0) -> requests.Response:
+def _request(url: str, cookies: str, method: str, data: str, pacer: RequestRatePacer, read_timeout: float, deadline: float) -> requests.Response:
     headers = {"Cache-Control": "no-cache", "User-Agent": "SecOps-Path-Traversal-Verifier/1.0"}
     if cookies:
         headers["Cookie"] = cookies
     return request_same_origin_redirects(
         method, url, data=data if method != "GET" else None, headers=headers,
-        timeout=(3, max(3.0, read_timeout)), pacer=pacer,
+        timeout=(max(1.0, read_timeout * 0.25), max(1.0, read_timeout)), pacer=pacer, deadline=deadline,
     )
 
 # Extract a compact response excerpt around the marker used for LFI verification.
@@ -53,7 +56,8 @@ def run_traversal_scan(
     if profile not in {"fast", "balanced", "deep"}:
         profile = "balanced"
     parameter_limit = 2 if profile == "fast" else 3 if profile == "balanced" else 5
-    read_timeout = max(4.0, min(7.0, (timeout - 5.0) / 4.0))
+    deadline = wall_clock_deadline(timeout)
+    request_budget = proportional_budget(timeout, TRAVERSAL_REQUEST_RATIO)
     pacer = RequestRatePacer(request_rate)
     if method not in {"GET", "POST"}:
         return partial(
@@ -70,7 +74,7 @@ def run_traversal_scan(
             vulnerabilities=[], applicable=False,
         )
 
-    session_probe = scanner_session_probe(target_url, cookies, method, data, timeout=4, attempts=1, pacer=pacer)
+    session_probe = scanner_session_probe(target_url, cookies, method, data, timeout=min(proportional_budget(timeout, TRAVERSAL_SESSION_RATIO), max(1, int(remaining_budget(deadline)))), attempts=1, pacer=pacer, deadline=deadline)
     if cookies and session_probe.get("performed") and session_probe.get("conclusive") and session_probe.get("authenticated") is False:
         return partial(
             "Path Traversal/LFI", target_url,
@@ -82,18 +86,22 @@ def run_traversal_scan(
     baseline: requests.Response | None = None
     baseline_error = ""
     try:
-        baseline = _request(target_url, cookies, method, data, pacer, read_timeout)
+        baseline = _request(target_url, cookies, method, data, pacer, min(request_budget, max(1.0, remaining_budget(deadline))), deadline)
     except requests.RequestException as exc:
         baseline_error = f"{type(exc).__name__}: {exc}"
 
     attempts: list[dict[str, Any]] = []
     findings: list[dict[str, Any]] = []
     # Confirm only known file markers that are absent from the benign response.
+    budget_exhausted = False
     for parameter in candidates[:parameter_limit]:
         for payload, marker, label in PROBES:
+            if remaining_budget(deadline) <= 0:
+                budget_exhausted = True
+                break
             probe_url, probe_data = mutate_parameter(target_url, method, data, parameter, payload, case_insensitive=True)
             try:
-                response = _request(probe_url, cookies, method, probe_data, pacer, read_timeout)
+                response = _request(probe_url, cookies, method, probe_data, pacer, min(request_budget, max(1.0, remaining_budget(deadline))), deadline)
             except requests.RequestException as exc:
                 attempts.append({
                     "parameter": parameter, "payload": payload, "source": label, "error": f"{type(exc).__name__}: {exc}",
@@ -148,13 +156,23 @@ def run_traversal_scan(
         if findings:
             break
 
+        if budget_exhausted:
+            break
+
     common = {
         "vulnerabilities": findings, "attempts": attempts, "applicable": True,
         "authenticated": bool(cookies), "session_probe": session_probe,
-        "execution_mode": "bounded_known_file_markers", "request_timeout": round(read_timeout, 2),
+        "execution_mode": "bounded_known_file_markers", "per_request_budget_seconds": request_budget,
+        "tool_timeout_seconds": timeout, "phase_ratio_policy": {"session": TRAVERSAL_SESSION_RATIO, "request": TRAVERSAL_REQUEST_RATIO},
         "scan_profile": profile, "parameter_limit": parameter_limit,
         "baseline_available": baseline is not None, "baseline_error": baseline_error,
     }
+    if budget_exhausted:
+        return partial(
+            "Path Traversal/LFI", target_url,
+            f"Traversal verification reached its shared action time budget. Confirmed findings preserved: {len(findings)}.",
+            diagnosis="time_limit_reached", timed_out=True, time_limit_reached=True, **common,
+        )
     return success(
         "Path Traversal/LFI", target_url, f"Bounded traversal verification completed. Confirmed findings: {len(findings)}.",
         **common,

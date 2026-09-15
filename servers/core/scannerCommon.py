@@ -31,6 +31,25 @@ def unique_strings(values: Iterable[Any] | None) -> list[str]:
 
     return list(dict.fromkeys(str(value).strip() for value in (values or []) if str(value).strip()))
 
+# Convert one tool-level timeout into phase budgets without scattering absolute second values.
+def proportional_budget(total_seconds: int | float, ratio: float, *, minimum: int = 1, maximum: int | None = None) -> int:
+
+    total = max(1.0, float(total_seconds))
+    value = max(int(minimum), int(round(total * max(0.0, float(ratio)))))
+    if maximum is not None:
+        value = min(value, int(maximum))
+    return max(1, value)
+
+# Create one monotonic wall-clock deadline shared by all phases/fallbacks of a scanner action.
+def wall_clock_deadline(total_seconds: int | float) -> float:
+
+    return time.monotonic() + max(1.0, float(total_seconds))
+
+# Return the seconds still available before a shared scanner deadline.
+def remaining_budget(deadline: float, *, minimum: float = 0.0) -> float:
+
+    return max(float(minimum), float(deadline) - time.monotonic())
+
 # Compare two response bodies with bounded work so proxy/session validation does not depend on full-page byte equality.
 def bounded_text_similarity(left: Any, right: Any, *, text_limit: int = 80_000, chunk_size: int = 128) -> float:
 
@@ -125,15 +144,26 @@ def mutate_parameter(
 # Retry transient transport failures and re-raise the last Requests error.
 def request_retry(
     method: str, url: str, *, attempts: int = 3, backoff: float = 0.7,
-    pacer: RequestRatePacer | None = None, request_rate: Any = None, **kwargs: Any,
+    pacer: RequestRatePacer | None = None, request_rate: Any = None, deadline: float | None = None, **kwargs: Any,
 ) -> requests.Response:
 
     last: requests.RequestException | None = None
     active_pacer = pacer or RequestRatePacer(request_rate)
     for attempt in range(max(1, int(attempts))):
         try:
+            if deadline is not None:
+                left = remaining_budget(deadline)
+                if left <= 0:
+                    raise requests.Timeout("shared scanner deadline reached")
+                configured = kwargs.get("timeout")
+                if isinstance(configured, tuple) and len(configured) == 2:
+                    kwargs["timeout"] = (min(float(configured[0]), left), min(float(configured[1]), left))
+                elif configured is not None:
+                    kwargs["timeout"] = min(float(configured), left)
+                else:
+                    kwargs["timeout"] = left
             if kwargs.get("allow_redirects"):
-                return request_same_origin_redirects(method, url, pacer=active_pacer, **kwargs)
+                return request_same_origin_redirects(method, url, pacer=active_pacer, deadline=deadline, **kwargs)
             # Keep retry behavior deterministic: no implicit Requests redirect follow. Callers that
             # opt in to redirects are handled above by the project same-origin guard.
             kwargs["allow_redirects"] = False

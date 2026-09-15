@@ -7,9 +7,9 @@ import shutil
 from typing import Any
 from urllib.parse import quote, urlparse
 
-from utils import RequestRatePacer, failure, parse_cookie_header, scanner_request_rate, skipped, success, same_origin, url_in_authorized_scope
+from utils import RequestRatePacer, failure, parse_cookie_header, partial, scanner_request_rate, skipped, success, same_origin, url_in_authorized_scope
 
-from core.scannerCommon import mutate_parameter, service
+from core.scannerCommon import proportional_budget, service
 
 mcp, _serve = service("Browser XSS and Workflow Verifier", "browser")
 
@@ -22,6 +22,12 @@ XSS_NAME_RE = re.compile(
 )
 POSITIVE_SUBMIT_RE = re.compile(r"(?:submit|send|save|post|publish|sign|add|create|update|upload|change)", re.I)
 NEGATIVE_SUBMIT_RE = re.compile(r"(?:clear|delete|remove|reset|cancel|logout|drop|purge)", re.I)
+
+# Chromium sub-operations share one asyncio deadline. Individual navigations use only a fraction
+# of the total action timeout so a slow page cannot restart the full budget on each probe.
+BROWSER_NAVIGATION_RATIO = 0.25
+BROWSER_SETTLE_RATIO_OF_NAV = 0.02
+BROWSER_POST_SUBMIT_SETTLE_RATIO_OF_NAV = 0.04
 
 # Process browser cookies for authenticated scanner requests and session analysis.
 def _browser_cookies(target_url: str, cookies: str) -> list[dict[str, Any]]:
@@ -93,7 +99,7 @@ async def _reflection_present(page: Any, marker: str) -> bool:
 async def _safe_goto(page: Any, url: str, timeout_ms: int) -> tuple[bool, str]:
     try:
         response = await page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
-        await page.wait_for_timeout(700)
+        await page.wait_for_timeout(max(1, int(timeout_ms * BROWSER_SETTLE_RATIO_OF_NAV)))
         return True, f"status={response.status if response else 'unknown'}"
     except Exception as exc:
         return False, f"{type(exc).__name__}: {exc}"
@@ -189,7 +195,7 @@ async def _client_source_checks(
         if not executed and ok:
             try:
                 await page.reload(wait_until="domcontentloaded", timeout=timeout_ms)
-                await page.wait_for_timeout(700)
+                await page.wait_for_timeout(max(1, int(timeout_ms * BROWSER_SETTLE_RATIO_OF_NAV)))
                 executed = await _executed(page, marker)
             except Exception:
                 pass
@@ -350,7 +356,7 @@ async def _stored_check(
                         continue
 
                 submitted, submit_detail = await _submit_form(form)
-                await page.wait_for_timeout(1200)
+                await page.wait_for_timeout(max(1, int(timeout_ms * BROWSER_POST_SUBMIT_SETTLE_RATIO_OF_NAV)))
                 executed_url = ""
                 revisit_urls = list(dict.fromkeys([start_url, target_url, str(page.url)]))
                 verification_page = await context.new_page()
@@ -425,7 +431,8 @@ async def _run_browser_scan_core(
     client_sinks = [str(value) for value in (client_sinks or []) if str(value)]
     authorized_origins = [str(value) for value in (authorized_origins or []) if str(value)]
     timeout = max(15, min(int(timeout), 300))
-    timeout_ms = timeout * 1000
+    navigation_timeout = proportional_budget(timeout, BROWSER_NAVIGATION_RATIO)
+    timeout_ms = navigation_timeout * 1000
     findings: list[dict[str, Any]] = []
     effective_request_rate = scanner_request_rate(request_rate)
     navigation_pacer = RequestRatePacer(effective_request_rate)
@@ -435,80 +442,88 @@ async def _run_browser_scan_core(
         "client_sources": client_sources, "client_sinks": client_sinks,
         "allow_state_changes": bool(allow_state_changes), "playwright_api": "async",
         "request_rate": effective_request_rate, "authorized_navigation_origins": authorized_origins, "allow_same_host_ports": bool(allow_same_host_ports),
+        "tool_timeout_seconds": timeout, "navigation_timeout_seconds": navigation_timeout,
+        "phase_ratio_policy": {"navigation": BROWSER_NAVIGATION_RATIO},
     }
 
+    timed_out = False
     try:
-        async with async_playwright() as playwright:
-            try:
-                browser = await playwright.chromium.launch(headless=True)
-                diagnostics["browser_executable"] = "playwright-managed"
-            except PlaywrightError as exc:
-                system_browser = next((
-                    value for name in ("chromium", "chromium-browser", "google-chrome", "google-chrome-stable", "msedge")
-                    if (value := shutil.which(name))
-                ), None)
-                if not system_browser:
-                    return skipped(
-                        "Browser XSS and Workflow Verifier", target_url,
-                        f"Playwright Chromium is not installed: {exc}. Run: python -m playwright install chromium",
-                        diagnosis="missing_playwright_browser",
+        async with asyncio.timeout(timeout):
+            async with async_playwright() as playwright:
+                try:
+                    browser = await playwright.chromium.launch(headless=True)
+                    diagnostics["browser_executable"] = "playwright-managed"
+                except PlaywrightError as exc:
+                    system_browser = next((
+                        value for name in ("chromium", "chromium-browser", "google-chrome", "google-chrome-stable", "msedge")
+                        if (value := shutil.which(name))
+                    ), None)
+                    if not system_browser:
+                        return skipped(
+                            "Browser XSS and Workflow Verifier", target_url,
+                            f"Playwright Chromium is not installed: {exc}. Run: python -m playwright install chromium",
+                            diagnosis="missing_playwright_browser",
+                        )
+                    browser = await playwright.chromium.launch(headless=True, executable_path=system_browser)
+                    diagnostics["browser_executable"] = system_browser
+                    diagnostics["managed_browser_error"] = str(exc)
+                context = await browser.new_context(ignore_https_errors=True)
+                try:
+                    async def scope_route(route: Any, request: Any) -> None:
+                        # Permit third-party assets needed to render the authorized application, but never
+                        # allow this verification browser to turn a redirect/navigation into a new active target.
+                        try:
+                            is_navigation = bool(request.is_navigation_request())
+                        except Exception:
+                            is_navigation = str(getattr(request, "resource_type", "") or "") == "document"
+                        if is_navigation:
+                            request_url = str(getattr(request, "url", "") or "")
+                            if request_url and not url_in_authorized_scope(
+                                target_url, request_url, authorized_origins, allow_same_host_ports=bool(allow_same_host_ports),
+                            ):
+                                if request_url not in blocked_top_level_urls:
+                                    blocked_top_level_urls.append(request_url)
+                                await route.abort("blockedbyclient")
+                                return
+                            await asyncio.to_thread(navigation_pacer.wait)
+                        await route.continue_()
+
+                    await context.route("**/*", scope_route)
+                    if cookies:
+                        await context.add_cookies(_browser_cookies(target_url, cookies))
+                    page = await context.new_page()
+                    page.set_default_timeout(timeout_ms)
+
+                    query_findings, query_attempts = await _query_checks(page, target_url, parameters, timeout_ms)
+                    findings.extend(query_findings)
+                    source_findings, source_attempts = await _client_source_checks(
+                        page, target_url, timeout_ms, client_sources, client_sinks
                     )
-                browser = await playwright.chromium.launch(headless=True, executable_path=system_browser)
-                diagnostics["browser_executable"] = system_browser
-                diagnostics["managed_browser_error"] = str(exc)
-            context = await browser.new_context(ignore_https_errors=True)
-            try:
-                async def scope_route(route: Any, request: Any) -> None:
-                    # Permit third-party assets needed to render the authorized application, but never
-                    # allow this verification browser to turn a redirect/navigation into a new active target.
-                    try:
-                        is_navigation = bool(request.is_navigation_request())
-                    except Exception:
-                        is_navigation = str(getattr(request, "resource_type", "") or "") == "document"
-                    if is_navigation:
-                        request_url = str(getattr(request, "url", "") or "")
-                        if request_url and not url_in_authorized_scope(
-                            target_url, request_url, authorized_origins, allow_same_host_ports=bool(allow_same_host_ports),
-                        ):
-                            if request_url not in blocked_top_level_urls:
-                                blocked_top_level_urls.append(request_url)
-                            await route.abort("blockedbyclient")
-                            return
-                        await asyncio.to_thread(navigation_pacer.wait)
-                    await route.continue_()
+                    findings.extend(source_findings)
+                    diagnostics["dom_attempts"] = [*query_attempts, *source_attempts]
+                    diagnostics["verified_parameters"] = sorted({
+                        str(item.get("parameter") or "") for item in query_attempts
+                        if isinstance(item, dict) and str(item.get("parameter") or "")
+                    })
+                    diagnostics["query_attempt_count"] = len(query_attempts)
 
-                await context.route("**/*", scope_route)
-                if cookies:
-                    await context.add_cookies(_browser_cookies(target_url, cookies))
-                page = await context.new_page()
-                page.set_default_timeout(timeout_ms)
-
-                query_findings, query_attempts = await _query_checks(page, target_url, parameters, timeout_ms)
-                findings.extend(query_findings)
-                source_findings, source_attempts = await _client_source_checks(
-                    page, target_url, timeout_ms, client_sources, client_sinks
-                )
-                findings.extend(source_findings)
-                diagnostics["dom_attempts"] = [*query_attempts, *source_attempts]
-                diagnostics["verified_parameters"] = sorted({
-                    str(item.get("parameter") or "") for item in query_attempts
-                    if isinstance(item, dict) and str(item.get("parameter") or "")
-                })
-                diagnostics["query_attempt_count"] = len(query_attempts)
-
-                if str(method or "GET").upper() == "POST":
-                    stored_findings, stored_diag = await _stored_check(
-                        context, page, target_url, source_url, parameters, fields, timeout_ms, allow_state_changes,
-                    )
-                    findings.extend(stored_findings)
-                    diagnostics["stored"] = stored_diag
-                else:
-                    diagnostics["stored"] = {"attempted": False, "reason": "request method is not POST"}
-                diagnostics["blocked_external_top_level_navigations"] = len(blocked_top_level_urls)
-                diagnostics["blocked_external_top_level_urls"] = blocked_top_level_urls[:20]
-            finally:
-                await context.close()
-                await browser.close()
+                    if str(method or "GET").upper() == "POST":
+                        stored_findings, stored_diag = await _stored_check(
+                            context, page, target_url, source_url, parameters, fields, timeout_ms, allow_state_changes,
+                        )
+                        findings.extend(stored_findings)
+                        diagnostics["stored"] = stored_diag
+                    else:
+                        diagnostics["stored"] = {"attempted": False, "reason": "request method is not POST"}
+                    diagnostics["blocked_external_top_level_navigations"] = len(blocked_top_level_urls)
+                    diagnostics["blocked_external_top_level_urls"] = blocked_top_level_urls[:20]
+                finally:
+                    await context.close()
+                    await browser.close()
+    except TimeoutError:
+        timed_out = True
+        diagnostics["time_limit_reached"] = True
+        diagnostics["time_limit_phase"] = "browser_verification"
     except Exception as exc:
         return failure(
             "Browser XSS and Workflow Verifier", target_url,
@@ -525,11 +540,20 @@ async def _run_browser_scan_core(
         if key not in seen:
             seen.add(key)
             unique.append(item)
+    result_kwargs = {
+        "vulnerabilities": unique, "diagnostics": diagnostics,
+        "verified_parameters": list(diagnostics.get("verified_parameters") or []),
+        "query_attempt_count": int(diagnostics.get("query_attempt_count") or 0),
+    }
+    if timed_out:
+        return partial(
+            "Browser XSS and Workflow Verifier", target_url,
+            f"Browser verification reached its shared time budget. Findings preserved: {len(unique)}.",
+            diagnosis="time_limit_reached", timed_out=True, time_limit_reached=True, **result_kwargs,
+        )
     return success(
         "Browser XSS and Workflow Verifier", target_url,
-        f"Browser verification completed. Findings: {len(unique)}.", vulnerabilities=unique, diagnostics=diagnostics,
-        verified_parameters=list(diagnostics.get("verified_parameters") or []),
-        query_attempt_count=int(diagnostics.get("query_attempt_count") or 0),
+        f"Browser verification completed. Findings: {len(unique)}.", **result_kwargs,
     )
 
 # Use async Chromium to verify DOM, reflected and stored XSS with harmless markers.

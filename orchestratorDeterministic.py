@@ -236,7 +236,7 @@ async def deterministic_broad_scan_node(state: DeterministicState) -> dict[str, 
                     sibling_refresh: dict[str, Any] | None = None
                     if cookies:
                         sibling_probe = shared.select_session_probe_url(sibling_discovery, sibling_origin)
-                        sibling_refresh = refresh_authenticated_session_state(sibling_origin, cookies, sibling_probe)
+                        sibling_refresh = await asyncio.to_thread(refresh_authenticated_session_state, sibling_origin, cookies, sibling_probe)
                         if sibling_refresh.get('usable') is False or not sibling_refresh.get('credential_applied'):
                             sibling_result = make_skipped_result(
                                 spec.name,
@@ -264,7 +264,7 @@ async def deterministic_broad_scan_node(state: DeterministicState) -> dict[str, 
                 log_zap_session_diagnostics(result)
                 if cookies:
                     recovery = scanner_session_probe(probe_url, cookies, timeout=10, attempts=4)
-                    refresh = refresh_authenticated_session_state(target, cookies, probe_url)
+                    refresh = await asyncio.to_thread(refresh_authenticated_session_state, target, cookies, probe_url)
                     result['downstream_session_recovery'] = recovery
                     result['downstream_session_state_refresh'] = refresh
                     if refresh.get('usable') is False:
@@ -302,7 +302,7 @@ async def deterministic_broad_scan_node(state: DeterministicState) -> dict[str, 
                     result = make_skipped_result('arjun', endpoint, 'Adaptive budget reallocation: earlier high-priority Arjun runs reached their full budget without discovering a parameter, so lower-priority repeats were skipped.') | {'diagnosis': 'adaptive_budget_reallocated'}
                 else:
                     endpoint_probe = shared.select_application_session_probe_url(discovery[name], endpoint, str(case.get('source_url') or ''))
-                    refresh = refresh_authenticated_session_state(endpoint, cookies, endpoint_probe) if cookies else {'performed': False, 'usable': True, 'credential_applied': False}
+                    refresh = (await asyncio.to_thread(refresh_authenticated_session_state, endpoint, cookies, endpoint_probe)) if cookies else {'performed': False, 'usable': True, 'credential_applied': False}
                     if refresh.get('usable') is False or (cookies and not refresh.get('credential_applied')):
                         result = make_skipped_result('arjun', endpoint, 'The authenticated application session could not be restored before hidden-parameter discovery.') | {'session_state_refresh': refresh}
                     else:
@@ -345,7 +345,7 @@ async def deterministic_parameter_scan_node(state: DeterministicState) -> dict[s
         timeout = PARAMETER_TOOL_TIMEOUTS.get(spec.name, 120)
         method = str(case.get('method', 'GET')).upper()
         case_probe = url if method in {'GET', 'HEAD'} else shared.select_application_session_probe_url(discovery.get('authenticated', {}) if cookies else {}, url, str(case.get('source_url') or ''))
-        refresh = refresh_authenticated_session_state(url, cookies, case_probe) if cookies else {'performed': False, 'usable': True, 'credential_applied': False}
+        refresh = (await asyncio.to_thread(refresh_authenticated_session_state, url, cookies, case_probe)) if cookies else {'performed': False, 'usable': True, 'credential_applied': False}
         if refresh.get('usable') is False or (cookies and not refresh.get('credential_applied')):
             skipped = make_skipped_result(spec.name, url, 'The authenticated application session could not be restored before this scanner.') | {'session_state_refresh': refresh}
             return _tag_coverage_action(skipped, spec.name, target_url=url, method=str(case.get('method', 'GET')), parameters=list(case.get('parameters', [])), source_url=str(case.get('source_url', '')))
@@ -421,9 +421,11 @@ async def deterministic_authorization_node(state: DeterministicState) -> dict[st
             results[name]['authorization'] = result
             log_result(name, 'authorization', result, target)
             continue
+        state_changes_allowed = bool(state.get('workflow_state_changes', False))
         cases = [
             case for case in select_authorization_request_cases(discovery[name])
             if shared.scope_cookie_header(str(case.get('url') or ''), cookies)
+            and (state_changes_allowed or not shared.request_case_state_change_reason(case))
         ]
         authorization_selection_summary[name] = [{'method': 'GET', 'url': str(case.get('url', '')), 'parameters': list(case.get('parameters', [])), 'priority_score': case.get('priority_score'), 'adaptive_budget': bool(case.get('adaptive_budget')), 'adaptive_budget_evidence': list(case.get('adaptive_budget_evidence', []))} for case in cases]
         authorization_budget = shared.specialist_budget_diagnostics('authorization', cases)
@@ -433,7 +435,7 @@ async def deterministic_authorization_node(state: DeterministicState) -> dict[st
         for case in cases:
             case_url = str(case.get('url', target))
             case_probe = case_url
-            state_refresh = refresh_authenticated_session_state(case_url, cookies, case_probe)
+            state_refresh = await asyncio.to_thread(refresh_authenticated_session_state, case_url, cookies, case_probe)
             if state_refresh.get('usable') is False or not state_refresh.get('credential_applied'):
                 result = make_skipped_result('authorization', case_url, 'The primary authenticated session could not be restored before authorization comparison.') | {'session_state_refresh': state_refresh}
             else:
@@ -465,7 +467,7 @@ async def deterministic_browser_workflow_node(state: DeterministicState) -> dict
         url = str(case.get('url', target))
         method = str(case.get('method', 'GET')).upper()
         case_probe = url if method in {'GET', 'HEAD'} else shared.select_application_session_probe_url(profile_discovery, url, str(case.get('source_url') or ''))
-        refresh = refresh_authenticated_session_state(url, cookies, case_probe) if cookies else {'performed': False, 'usable': True, 'credential_applied': False}
+        refresh = (await asyncio.to_thread(refresh_authenticated_session_state, url, cookies, case_probe)) if cookies else {'performed': False, 'usable': True, 'credential_applied': False}
         if refresh.get('usable') is False or (cookies and not refresh.get('credential_applied')):
             return _tag_coverage_action(make_skipped_result(tool, url, f'The authenticated application session could not be restored before {tool} verification.'), tool, target_url=url, method=str(case.get('method', 'GET')), parameters=list(case.get('parameters', [])), source_url=str(case.get('source_url', '')))
         arguments = build_tool_arguments(tool, url, cookies, profile_discovery, case=case, allow_state_changes=allow_state_changes)
@@ -485,8 +487,14 @@ async def deterministic_browser_workflow_node(state: DeterministicState) -> dict
             continue
         profile_discovery = discovery[name]
         probe_url = select_session_probe_url(profile_discovery, target)
-        browser_cases = select_browser_request_cases(profile_discovery)
-        workflow_cases = select_workflow_request_cases(profile_discovery)
+        browser_cases = [
+            case for case in select_browser_request_cases(profile_discovery)
+            if allow_state_changes or not shared.request_case_state_change_reason(case)
+        ]
+        workflow_cases = [
+            case for case in select_workflow_request_cases(profile_discovery)
+            if allow_state_changes or not shared.request_case_state_change_reason(case)
+        ]
         def dedupe_no_cookie_cases(tool: str, cases: list[dict[str, Any]]) -> list[dict[str, Any]]:
             selected: list[dict[str, Any]] = []
             for case in cases:
@@ -762,7 +770,7 @@ async def deterministic_verification_node(state: DeterministicState) -> dict[str
             else:
                 method = str(case.get('method', 'GET')).upper()
                 case_probe = url if method in {'GET', 'HEAD'} else shared.select_application_session_probe_url(profile_discovery, url, str(case.get('source_url') or ''))
-                refresh = refresh_authenticated_session_state(url, cookies, case_probe) if cookies else {'performed': False, 'usable': True, 'credential_applied': False}
+                refresh = (await asyncio.to_thread(refresh_authenticated_session_state, url, cookies, case_probe)) if cookies else {'performed': False, 'usable': True, 'credential_applied': False}
                 if refresh.get('usable') is False or (cookies and not refresh.get('credential_applied')):
                     result = make_skipped_result('browser', url, 'The authenticated application session could not be restored before final Chromium verification.')
                 else:
@@ -959,7 +967,7 @@ async def run_single_tool_debug(*, tool: str, target: str, cookies: str, mode: s
             effective_cookies = shared.scope_cookie_header(selected_target, cookies)
             if tool not in {'arjun', 'authorization'} and cookies:
                 selected_probe = shared.select_application_session_probe_url(discovery, selected_target, str(effective_case.get('source_url') or '') if isinstance(effective_case, dict) else '')
-                refresh = refresh_authenticated_session_state(selected_target, cookies, selected_probe)
+                refresh = await asyncio.to_thread(refresh_authenticated_session_state, selected_target, cookies, selected_probe)
                 if refresh.get('usable') is False or not refresh.get('credential_applied'):
                     if tool in {'browser', 'workflow'}:
                         return make_skipped_result(tool, selected_target, 'The authenticated session could not be restored before the isolated workflow run.')

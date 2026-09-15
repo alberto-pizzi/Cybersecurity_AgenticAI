@@ -1,5 +1,5 @@
 
-POLICY SCOPE, AUTENTICAZIONE E RATE (v31.75)
+POLICY SCOPE, AUTENTICAZIONE E RATE (v31.76)
 ---------------------------
 - Lo scope attivo usa origin esplicite; authorization.allow_same_host_ports (default false) puo' ammettere porte HTTP(S) diverse gia' scoperte sullo stesso hostname/schema, senza port scan.
 - Un href, iframe, script, XHR/fetch o redirect verso un altro host NON estende lo scope. I suffissi DNS non autorizzano attacchi.
@@ -199,10 +199,7 @@ https://github.com/errorfiathck/IDOR-Forge.git in ~/.local/opt/idor-forge.
 Le dipendenze upstream di IDOR-Forge restano nella .venv del repository. Matplotlib viene
 installato esplicitamente con una versione compatibile con il Python in uso anche se una revisione
 upstream di requirements.txt lo omette; il preflight post-install importa sia matplotlib sia
-IDORChecker. Anche il wrapper ripete il controllo prima del test e, se una vecchia venv e' valida ma
-manca solo matplotlib, prova una singola riparazione bounded via pip prima di fallire. Impostare
-SECOPS_IDOR_AUTO_REPAIR=0 per disabilitare questo fallback. Per dipendenze piu' ampie, rieseguire
-initScript.py senza --skip-scanners ripara la venv.
+IDORChecker. Anche il wrapper ripete un controllo bounded prima del test, ma non installa o modifica pacchetti durante l'assessment. Se la venv e' stale o manca una dipendenza, il tool fallisce rapidamente con diagnostica e la riparazione viene demandata a initScript.py senza --skip-scanners.
 Percorsi, interprete e launcher vengono salvati in .secops_runtime.json e
 verificati dal preflight.
 
@@ -438,7 +435,7 @@ in YAML MultiDoc Proxify. Solo se entrambi i formati request-shaped falliscono s
 i POST non rappresentabili restano esplicitamente non coperti invece di essere dichiarati testati.
 Prima del prompt Agentic, Python costruisce e valida tutte le azioni concrete discovery-derived, poi le raggruppa per coppia (profilo, tool). Il modello NON sceglie i singoli URL di SQLMap/ZAP/Browser: sceglie capability group come anonymous/sqlmap o authenticated/zap; Python espande ogni gruppo scelto nei request contract esatti usando ranking deterministico, compatibilita' e budget adattivi. L'espansione ruota tra i tool scelti dello stesso profilo, quindi un gruppo con molti URL non puo' consumare tutto il budget prima degli altri tool selezionati.
 
-I budget Agentic sono separati per profilo. In fast/balanced/deep ogni profilo attivo dispone rispettivamente di 12/16/18 tool group. FFUF, ZAP, Nuclei, Session, Nikto e JWT, quando eleggibile, sono baseline deterministiche e non dipendono dalla scelta del modello. Le azioni concrete sono anch'esse per profilo e per round: il base normale e' 48/144/288. Un overflow adattivo piccolo e' disponibile gia' al round 1: +6/+24/+40, quindi i massimi del primo round sono 54/168/328. A ogni round successivo il cap cresce di +4/+16/+24 fino ai tetti configurati +14/+56/+88: round 2 = 58/184/352 e round 3+ = 62/200/376. L'overflow non viene riempito automaticamente perche' esistono azioni disponibili: Python ammette soltanto coverage-reserve ad alta confidenza o casi adaptive gia' marcati dal ranking deterministico; finding precedenti o nuovi parametri Arjun aumentano la priorita' del follow-up. Con anonymous+authenticated le quote restano indipendenti. Una azione concreta e' una invocazione scanner/request contract, non un singolo campo: piu' parametri dello stesso request contract possono essere testati nella stessa azione. Nella identita' Agentic entrano anche i nomi dei parametri/file/token/campi, evitando che due contratti con set di input diversi vengano collassati solo perche' hanno lo stesso URL/metodo. Le azioni gia' generate e validate ma non entrate nel tetto del round rimangono eleggibili nel round successivo. I selettori Agentic avanzano oltre le azioni gia' completate: il round successivo riceve la finestra successiva del ranking, non gli stessi top-N da scartare come duplicati. Il prompt dei round successivi richiede inoltre una motivazione di follow-up: la sola presenza di contratti lower-ranked differiti non basta a giustificare un nuovo batch specialistico.
+I budget Agentic sono separati per profilo. In fast/balanced/deep ogni profilo attivo dispone rispettivamente di 12/16/18 tool group. FFUF, ZAP, Nuclei, Session, Nikto e JWT, quando eleggibile, sono baseline deterministiche e non dipendono dalla scelta del modello. Le azioni concrete sono anch'esse per profilo e per round: il base normale e' 48/144/288. Un overflow adattivo piccolo e' disponibile gia' al round 1: +6/+24/+40, quindi i massimi del primo round sono 54/168/328. A ogni round successivo il cap cresce di +4/+16/+24 fino ai tetti configurati +14/+56/+88: round 2 = 58/184/352 e round 3+ = 62/200/376. L'overflow non viene riempito automaticamente perche' esistono azioni disponibili: Python ammette soltanto coverage-reserve ad alta confidenza o casi adaptive gia' marcati dal ranking deterministico; finding precedenti o nuovi parametri Arjun aumentano la priorita' del follow-up. Con anonymous+authenticated le quote restano indipendenti. Una azione concreta e' una invocazione scanner/request contract, non un singolo campo: piu' parametri dello stesso request contract possono essere testati nella stessa azione. Nella identita' Agentic entrano anche i nomi dei parametri/file/token/campi, evitando che due contratti con set di input diversi vengano collassati solo perche' hanno lo stesso URL/metodo. Le azioni gia' generate e validate ma non entrate nel tetto del round rimangono eleggibili nel round successivo. I selettori Agentic avanzano oltre le azioni gia' completate: il round successivo riceve la finestra successiva del ranking, non gli stessi top-N da scartare come duplicati. I contratti differiti ma mai eseguiti possono continuare a usare il normale budget base anche senza nuova superficie o finding: questi ultimi aumentano la priorita' del follow-up ma non sono prerequisiti. Vengono invece esclusi equivalenti semantici gia' completati, casi unsafe/incompatibili o chiaramente a basso valore; il solo fatto che esistano deferred non concede l'overflow adattivo.
 I GET scoperti in cui un valore seleziona direttamente un file/modulo interno hanno inoltre una coverage reserve
 Traversal/LFI bounded di 16/64/112 in fast/balanced/deep. Le reserve restano prioritarie dentro il gruppo Traversal,
 ma l'espansione Agentic usa round-robin tra capability e ne prende una per gruppo a ogni passata: la reserve non puo'
@@ -549,7 +546,7 @@ Sono ceiling conservativi, non quote attese: dedup cross-profile, assenza di sib
 Timeout principali (secondi):
                          FAST   BALANCED   DEEP
   ZAP                    120      600     1080
-  Nuclei                 360     1200     1800
+  Nuclei                 240      720     1200
   SQLMap                  75      180      300
   Dalfox                  45      120      210
   Commix                  90      180      300
@@ -563,9 +560,19 @@ Ampiezza interna Nuclei: BALANCED puo' selezionare fino a 48 template ufficiali 
 con concurrency interna massima 2 (-c 2, -bs 1, -pc 1) sia quando viene invocato dal Deterministic sia dall'Agentic e rate limit globale derivato da execution.request_rate. La pipeline corrente non usa -as automatic-scan: seleziona template HTTP custom/ufficiali e request contract HTTP per DAST. Il flag Nuclei -pt e' un filtro sul TIPO DI PROTOCOLLO DEI TEMPLATE (es. http, headless, workflow, tcp, dns, ssl), non una barriera di scope o di porte: -pt http significherebbe eseguire soltanto template di tipo HTTP. Non viene aggiunto globalmente perche' le fasi correnti selezionano gia' esplicitamente alberi/template HTTP e un filtro blanket potrebbe escludere in futuro una fase headless/workflow scelta intenzionalmente. Il rate e' derivato da execution.request_rate (default 10 req/s, massimo configurabile 50); DEEP fino a 96 template technology, 160 exposure/misconfiguration
 e 256 vulnerability/CVE product-gated, con la stessa policy di rate conservativa. Sono massimi di selezione,
 non quote obbligatorie: fingerprint, product gating e timeout possono ridurre il lavoro effettivo.
-In BALANCED la fase official exposure/misconfiguration non ha piu' un timeout interno fisso di 55 s: riceve
-una quota adattiva del medesimo budget Nuclei in funzione del numero di target focalizzati (fino a 150 s),
-mantenendo una quota minima alla fase DAST. Non vengono rimossi template o endpoint per accelerare il run.
+I timeout Nuclei sono un unico budget wall-clock per azione: 240/720/1200 s in fast/balanced/deep.
+Le fasi non usano secondi hardcoded ma quote del timeout totale, interpolate in base al carico reale. L'inventario ufficiale dei template viene riverificato all'avvio della singola azione: se il path registrato e' stale il wrapper cerca in sola lettura un inventario locale gia' esistente. Se l'inventario ufficiale manca ma sono disponibili i template SecOps bundled, la direct evidence continua e il risultato e' PARTIAL con coverage gap esplicito; se manca soltanto il sottoalbero DAST, le altre fasi continuano. Solo l'assenza contemporanea di inventario ufficiale e template bundled produce un hard failure. Se un timeout MCP esterno chiude la chiamata prima che Nuclei restituisca i propri metadati, la console mostra inventory=unknown invece di falsi valori total=0/directory=not-resolved. FAST seleziona ed esegue realmente fino a 10 DAST request case; v31.76 corregge il vecchio percorso che li selezionava senza avviare la fase DAST.
+FAST: direct evidence 38-45%, DAST 45-55%. BALANCED: direct 8-10%, exposure/misconfiguration 22-30%, DAST 34-48%.
+DEEP: direct 6-8%, technology 8-10%, exposure/misconfiguration 16-20%, vulnerability/CVE 22-28%, DAST 22-28%.
+Cambiare il timeout totale ridimensiona quindi automaticamente tutte le fasi. I fallback DAST JSONL -> YAML -> lista GET
+condividono lo stesso deadline DAST: nessun fallback riparte con un timeout pieno. La parte non assegnata resta riserva
+per fingerprint/startup/cleanup e per il tempo gia' consumato dalle fasi precedenti; non vengono rimossi template o endpoint.
+
+La stessa regola di deadline unico vale per i wrapper multi-fase Arjun, FFUF, Interactsh, Commix, Dalfox, SQLMap, Nikto, Traversal, Authorization, Session, Browser, Workflow e IDOR-Forge.
+Le loro sottofasi/preflight/fallback ricevono quote proporzionali oppure soltanto il tempo residuo del tool; un fallback non puo'
+sommare un secondo timeout completo. ZAP possedeva gia' un deadline globale; in v31.76 anche seed, passive/spider, proxy verification, active scan, reserve e recovery espongono quote del timeout totale. IDOR-Forge non installa piu' dipendenze durante l'assessment: il runtime esegue soltanto preflight bounded e rimanda le riparazioni a initScript/setupTools.
+Arjun usa capability detection sulla CLI installata: riconosce -o/-oJ e --rate-limit/--ratelimit, mentre setupTools.py
+verifica preventivamente il contratto CLI dei principali scanner per intercettare flag incompatibili prima di un assessment. Il refresh JIT della sessione authenticated richiesto prima degli specialisti viene eseguito fuori dall'event loop Agentic quando usa Playwright sincrono: evita gli errori 'Playwright Sync API inside the asyncio loop' senza rendere concorrenti gli scanner. SQLMap semina con un valore neutro soltanto i parametri selezionati ma vuoti nella copia destinata allo scanner e, dopo il quick probe bounded, salta il motore pesante se quella stessa richiesta risulta 404/410 senza evidenza candidata; URL originale e attribuzione restano invariati.
 
 Prima del taglio base/adattivo, i selettori limitano le normali varianti value-only per non saturare il budget: la discovery conserva 6/12/16 varianti per route in fast/balanced/deep, mentre l'esecuzione request-level degli specialisti usa un cap generico 2/4/6. Le destinazioni routing HTTP(S) assolute conservano host/path nella firma semantica.
 La firma semantica dei valori routing/resource viene mantenuta specificamente per Traversal/LFI: redirect=devices.php
@@ -675,7 +682,7 @@ docker run --rm projectdiscovery/nuclei:latest -version
 (Get-ChildItem "$HOME\nuclei-templates" -Recurse -File -Include *.yaml,*.yml | Measure-Object).Count
 
 DAST: FAST=10 request contract bounded; BALANCED=64 request contract, fuzz aggression medium, fuzz-param-frequency 100;
-      con allow_state_changes=false i POST read-only restano eleggibili, mentre DELETE/PUT/PATCH, route/action mutative (anche annidate in JSON), cambio credenziali e upload vengono esclusi prima del replay ZAP/Nuclei e prima del ranking/esecuzione degli specialisti request-level, cosi' i casi bloccati non consumano slot che possono essere usati da contract sicuri; la stessa verifica vale anche per --only-tool.
+      con allow_state_changes=false i POST read-only restano eleggibili, mentre DELETE/PUT/PATCH, route/action mutative (anche annidate in JSON), cambio credenziali e upload vengono esclusi prima del replay ZAP/Nuclei e prima del ranking/esecuzione degli specialisti request-level, cosi' i casi bloccati non consumano slot che possono essere usati da contract sicuri; per i GET una parola mutativa dentro un normale valore di ricerca/filtro (es. q=delete) non basta a bloccare il caso, mentre action/navigation selector come action/operation/redirect/page/url e query key/path con verbo mutativo restano bloccati; la stessa verifica vale anche per --only-tool.
 DEEP=112 request contract, fuzz aggression high, fuzz-param-frequency 1000. Il wrapper prova gli
 input request-shaped in ordine JSONL Proxify -> YAML MultiDoc Proxify -> lista URL per i soli GET
 se entrambi i parser request-shaped falliscono. Non esiste un piccolo limite aggiuntivo al numero

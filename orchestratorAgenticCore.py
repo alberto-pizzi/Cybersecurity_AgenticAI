@@ -485,13 +485,18 @@ def _expand_planner_groups(
             if action.get('adaptive_budget'):
                 adaptive_used += 1
 
-        # Fixed base: one action per selected capability on every pass. The deterministic ordering
-        # inside each capability is preserved, but no capability can consume its whole reserve first.
+        # Fixed base: one NON-adaptive action per selected capability on every pass. Candidate pools
+        # contain both the normal per-tool allocation and actions marked adaptive_budget beyond that
+        # allocation. Older code eventually consumed those adaptive rows while filling the global
+        # base, making logs report overflow=0 even when a tool had already exceeded its base selector
+        # budget. Adaptive rows now enter only through the explicit overflow stage below.
         while used < base_target:
             added = False
             for index, (_, _, _, actions) in enumerate(prepared):
                 offset = offsets[index]
-                while offset < len(actions) and (index, offset) in consumed:
+                while offset < len(actions) and (
+                    (index, offset) in consumed or bool(actions[offset].get('adaptive_budget'))
+                ):
                     offset += 1
                 offsets[index] = offset
                 if offset >= len(actions):
@@ -503,6 +508,7 @@ def _expand_planner_groups(
                     break
             if not added:
                 break
+        base_selected = used
 
         # Overflow is available from round 1, but only to deterministic high-confidence reserve or
         # adaptive specialist cases. Later rounds receive a larger cap; prior findings/Arjun parameter
@@ -534,7 +540,7 @@ def _expand_planner_groups(
                     if overflow_priority(action, tool) is not None:
                         overflow_eligible += 1
 
-        overflow_target = min(maximum, base + min(overflow_cap, overflow_eligible), available)
+        overflow_target = min(maximum, base_selected + min(overflow_cap, overflow_eligible), available)
         while used < overflow_target:
             added = False
             # Preserve capability fairness. Within one pass, reserve and prior-signal follow-up cases
@@ -567,9 +573,10 @@ def _expand_planner_groups(
             'configured_overflow_max': max(0, maximum - base),
             'available': available,
             'selected': used,
+            'base_selected': base_selected,
             'coverage_reserve_available': reserve_available,
             'coverage_reserve_selected': reserve_used,
-            'execution_overflow_used': max(0, used - base),
+            'execution_overflow_used': max(0, used - base_selected),
             'adaptive_cases_available': adaptive_available,
             'adaptive_cases_selected': adaptive_used,
             'overflow_eligible': overflow_eligible,
@@ -900,8 +907,9 @@ def action_id(action: dict[str, Any]) -> str:
         for field in action.get('fields', [])
         if isinstance(field, dict) and str(field.get('name') or '')
     })
+    target_identity = shared.semantic_request_identity_url(str(action.get('target_url', '')))
     return '|'.join((
-        str(action.get('profile', '')), str(action.get('tool', '')), str(action.get('target_url', '')),
+        str(action.get('profile', '')), str(action.get('tool', '')), target_identity,
         str(action.get('method', '')), str(action.get('data', '')), ','.join(parameter_names),
         ','.join(file_names), ','.join(token_names), ','.join(field_names),
         str(action.get('jwt_token', '')), str(action.get('injection_url', '')),
@@ -1004,7 +1012,7 @@ def _planner_system_message() -> str:
         '- DEFER only for a concrete reason: real duplication, already completed equivalent work, unsupported discovery, incompatible input, unsafe action, or clearly very low expected value.\n'
         '- Broad scanners and targeted tools are complementary; neither category replaces the other by default.\n'
         '- A confirmed finding does not stop exploration of unrelated attack surfaces.\n'
-        '- On rounds after the first, select another specialist group batch only when previous results, newly exposed attack surface, unresolved high-confidence candidates or materially distinct request families justify more work. Do not select a group merely because lower-ranked deferred contracts still exist.\n'
+        '- On rounds after the first, previously deferred request contracts that have never been executed remain valid base-budget work even when no new surface appeared. Continue a specialist group when it still contains useful, in-scope, non-equivalent unexecuted contracts; previous results or newly exposed surface should raise priority but are not prerequisites for consuming normal base capacity. Do not repeat semantically equivalent completed work, and do not use adaptive overflow merely because deferred contracts remain.\n'
         '- Use IDOR only for suitable numeric references, authorization only for read-only identity/object/resource signals, and Interactsh only for compatible OAST inputs.\n'
         '- tool_group_budget_per_profile is an independent maximum for each active profile, not a shared quota. Never add groups merely to reach a count.\n'
         '- Concrete request execution is bounded separately by a fixed base and a small selective overflow for each profile. A bounded overflow is already available in round 1 and grows gradually on later rounds. Python, not the model, admits it only for deterministic high-confidence coverage-reserve or adaptive specialist cases; prior findings raise follow-up priority.\n'
@@ -1641,22 +1649,44 @@ def _ai_analysis_batch_adaptive(
     timeout: int,
     *,
     label: str,
+    deadline: float | None = None,
 ) -> list[dict[str, Any]]:
+    # Every retry/split belongs to one original batch budget. Older code restarted the full
+    # timeout for each child batch, so a malformed four-finding response could multiply a
+    # 900-second Balanced budget across several retries. A shared deadline keeps the whole
+    # adaptive tree bounded while still allowing smaller rescue batches.
+    if deadline is None:
+        deadline = time.monotonic() + max(1, int(timeout))
+    remaining = max(0, int(deadline - time.monotonic()))
+    if remaining < 45:
+        raise TimeoutError(f'{label} exhausted its shared analysis batch budget before another AI attempt could start.')
     try:
-        return _ai_analysis_batch(state, batch, all_candidates, timeout)
-    except Exception as exc:
+        return _ai_analysis_batch(state, batch, all_candidates, remaining)
+    except Exception:
         if len(batch) <= 1:
             raise
         midpoint = max(1, len(batch) // 2)
         left = batch[:midpoint]
         right = batch[midpoint:]
+        remaining = max(0, int(deadline - time.monotonic()))
+        if remaining < 90:
+            raise
         print(
-            f'    AI analysis: {label} did not complete cleanly; retrying as smaller AI batches ({len(left)} + {len(right)} findings).',
+            f'    AI analysis: {label} did not complete cleanly; retrying as smaller AI batches '
+            f'({len(left)} + {len(right)} findings) within the same {timeout}s batch deadline.',
             flush=True,
         )
         rows: list[dict[str, Any]] = []
-        rows.extend(_ai_analysis_batch_adaptive(state, left, all_candidates, timeout, label=f'{label}.1'))
-        rows.extend(_ai_analysis_batch_adaptive(state, right, all_candidates, timeout, label=f'{label}.2'))
+        # Allocate the first child only its proportional share of the remaining wall-clock time;
+        # the second child receives whatever remains under the same parent deadline.
+        left_share = max(45, int(remaining * (len(left) / max(1, len(batch)))))
+        left_deadline = min(deadline, time.monotonic() + left_share)
+        rows.extend(_ai_analysis_batch_adaptive(
+            state, left, all_candidates, timeout, label=f'{label}.1', deadline=left_deadline,
+        ))
+        rows.extend(_ai_analysis_batch_adaptive(
+            state, right, all_candidates, timeout, label=f'{label}.2', deadline=deadline,
+        ))
         return rows
 
 
@@ -1787,7 +1817,11 @@ def analysis_node(state: AgentState) -> dict[str, Any]:
         for batch_index in range(batch_count):
             batch = candidates[batch_index * batch_size:(batch_index + 1) * batch_size]
             try:
-                rows = _ai_analysis_batch_adaptive(state, batch, candidates, batch_budget, label=f'batch {batch_index + 1}/{batch_count}')
+                batch_deadline = time.monotonic() + batch_budget
+                rows = _ai_analysis_batch_adaptive(
+                    state, batch, candidates, batch_budget,
+                    label=f'batch {batch_index + 1}/{batch_count}', deadline=batch_deadline,
+                )
                 batch_analyzed, batch_changed = _apply_analysis(rows, finding_map, state['model'], str(state.get('ai_provider') or 'ollama'))
                 analyzed += batch_analyzed
                 changed += batch_changed
@@ -2015,12 +2049,16 @@ def discovery_candidate_actions(state: AgentState) -> list[dict[str, Any]]:
             raw_cookie = _profile_cookie(state, name)
             authorization_pool_limit = _agentic_selector_pool_limit(state, name, 'authorization')
             for case in select_authorization_request_cases(state['discovery'].get(name, {}), limit=authorization_pool_limit):
+                if (not state_changes_allowed) and shared.request_case_state_change_reason(case):
+                    continue
                 if not shared.scope_cookie_header(str(case.get('url') or ''), raw_cookie):
                     continue
                 adaptive = bool(case.get('adaptive_budget'))
                 actions.append({'profile': name, 'tool': 'authorization', 'target_url': case['url'], 'method': 'GET', 'data': '', 'parameters': case.get('parameters', []), 'jwt_token': '', 'injection_url': '', 'adaptive_budget': adaptive, 'priority_score': case.get('priority_score'), 'reason': ('Adaptive high-value overflow selected by deterministic ranking for authorization. ' if adaptive else '') + 'Read-only authorization differential candidate derived from an identity, object or privileged-resource signal.'})
         browser_pool_limit = _agentic_selector_pool_limit(state, name, 'browser')
         for case in select_browser_request_cases(state['discovery'].get(name, {}), limit=browser_pool_limit):
+            if (not state_changes_allowed) and shared.request_case_state_change_reason(case):
+                continue
             actions.append({'profile': name,
                 'tool': 'browser',
                 'target_url': case['url'],
@@ -2038,6 +2076,8 @@ def discovery_candidate_actions(state: AgentState) -> list[dict[str, Any]]:
                 'reason': ('Adaptive high-value overflow selected by deterministic ranking. ' if case.get('adaptive_budget') else '') + 'Browser verification candidate derived from XSS-like parameters or client-side source/sink evidence.'})
         workflow_pool_limit = _agentic_selector_pool_limit(state, name, 'workflow')
         for case in select_workflow_request_cases(state['discovery'].get(name, {}), limit=workflow_pool_limit):
+            if (not state_changes_allowed) and shared.request_case_state_change_reason(case):
+                continue
             actions.append({'profile': name,
                 'tool': 'workflow',
                 'target_url': case['url'],
@@ -2151,6 +2191,8 @@ def validate_plan(state: AgentState, proposed: Any) -> list[dict[str, Any]]:
             if not matching:
                 continue
             selected = matching[0]
+            if (not shared.state_changing_tests_allowed(state['target'], state.get('allow_state_changes'))) and shared.request_case_state_change_reason(selected):
+                continue
             method = 'GET'
             data = ''
             parameters = [str(value) for value in selected.get('parameters', [])]
@@ -2162,6 +2204,8 @@ def validate_plan(state: AgentState, proposed: Any) -> list[dict[str, Any]]:
             if not matching:
                 continue
             selected = matching[0]
+            if (not shared.state_changing_tests_allowed(state['target'], state.get('allow_state_changes'))) and shared.request_case_state_change_reason(selected):
+                continue
             method = str(selected.get('method', 'GET')).upper()
             data = str(selected.get('data', ''))
             parameters = [str(value) for value in selected.get('parameters', [])]
@@ -2177,6 +2221,8 @@ def validate_plan(state: AgentState, proposed: Any) -> list[dict[str, Any]]:
             if not matching:
                 continue
             selected = matching[0]
+            if (not shared.state_changing_tests_allowed(state['target'], state.get('allow_state_changes'))) and shared.request_case_state_change_reason(selected):
+                continue
             method = str(selected.get('method', 'POST')).upper()
             data = str(selected.get('data', ''))
             parameters = [str(value) for value in selected.get('parameters', [])]
@@ -2431,6 +2477,7 @@ def planner_node(state: AgentState) -> dict[str, Any]:
             for profile_name in sorted(selected_groups_by_profile):
                 details = execution_budget_diagnostics.get(profile_name, {}) if isinstance(execution_budget_diagnostics, dict) else {}
                 selected_actions = int(details.get('selected', 0) or 0) if isinstance(details, dict) else 0
+                base_selected_actions = int(details.get('base_selected', min(selected_actions, budget_per_profile)) or 0) if isinstance(details, dict) else min(selected_actions, budget_per_profile)
                 available_actions = int(details.get('available', selected_actions) or selected_actions) if isinstance(details, dict) else selected_actions
                 deferred_actions = int(details.get('deferred', 0) or 0) if isinstance(details, dict) else 0
                 overflow_used = int(details.get('execution_overflow_used', 0) or 0) if isinstance(details, dict) else 0
@@ -2438,7 +2485,7 @@ def planner_node(state: AgentState) -> dict[str, Any]:
                 overflow_eligible = int(details.get('overflow_eligible', 0) or 0) if isinstance(details, dict) else 0
                 print(
                     f"    [PLANNER BUDGET] {profile_name}: tool groups={selected_groups_by_profile.get(profile_name, 0)}/{PROFILE_TOOL_GROUP_BUDGETS.get(shared.CURRENT_SCAN_MODE, 12)}; "
-                    f"concrete actions={selected_actions}/{budget_per_profile} base, round max={max_budget_per_profile}, configured ceiling={configured_max_budget_per_profile}; "
+                    f"base actions={base_selected_actions}/{budget_per_profile}; total actions={selected_actions}/{max_budget_per_profile} round max; configured ceiling={configured_max_budget_per_profile}; "
                     f"overflow={overflow_used}/{overflow_cap} (eligible={overflow_eligible}); "
                     f"selected-group pool={available_actions}; deferred={deferred_actions}",
                     flush=True,
@@ -2521,7 +2568,15 @@ async def execute_action(action: dict[str, Any], cookies: dict[str, str], discov
         method = str(action.get('method') or 'GET').upper()
         probe_url = request_url if method in {'GET', 'HEAD'} else shared.select_application_session_probe_url(profile_discovery, request_url, source_url)
         print(f'    [PRECHECK] {tool}: validating authenticated session with {shared.compact_log_url(probe_url)}', flush=True)
-        state_refresh = shared.refresh_authenticated_session_state(request_url, raw_profile_cookie, probe_url)
+        # refresh_authenticated_session_state may use the synchronous Playwright authentication
+        # helper when an application/path session must be repaired. execute_action runs inside the
+        # Agentic asyncio loop, so execute the synchronous precheck in a worker thread instead of
+        # invoking Playwright Sync API on the event-loop thread. Actions are still globally
+        # sequential, therefore shared runtime-auth state is not concurrently mutated by scanners.
+        state_refresh = await asyncio.to_thread(
+            shared.refresh_authenticated_session_state,
+            request_url, raw_profile_cookie, probe_url,
+        )
         if state_refresh.get('usable') is False or not state_refresh.get('credential_applied'):
             print(f'    [PARTIAL ] {tool}: authenticated session precheck failed', flush=True)
             return (action, {'tool': tool, 'status': 'partial', 'target': action['target_url'], 'output': 'The authenticated application session could not be re-established before the scanner.', 'vulnerabilities': [], 'diagnosis': 'authentication_precheck_failed', 'state_refresh': state_refresh})
@@ -2549,11 +2604,44 @@ async def execute_action(action: dict[str, Any], cookies: dict[str, str], discov
             result['state_refresh'] = state_refresh
         return (action, result)
 
+# Orders one sequential round fairly across profile/tool buckets. This does not introduce scanner
+# concurrency or reduce coverage; it prevents a slow capability such as SQLMap from occupying the
+# first several hours of a large round before any faster complementary capability gets a chance.
+def _fair_sequential_action_order(plan: list[dict[str, Any]], cookies: dict[str, str]) -> list[dict[str, Any]]:
+    profile_order = {name: index for index, name in enumerate(cookies)}
+    buckets: dict[tuple[str, str], list[dict[str, Any]]] = {}
+    for action in plan:
+        key = (str(action.get('profile') or ''), str(action.get('tool') or ''))
+        buckets.setdefault(key, []).append(action)
+    keys = sorted(
+        buckets,
+        key=lambda key: (
+            profile_order.get(key[0], 999),
+            shared.tool_execution_rank(key[1], bool(cookies.get(key[0], ''))),
+            key[1],
+        ),
+    )
+    offsets = {key: 0 for key in keys}
+    ordered: list[dict[str, Any]] = []
+    while True:
+        added = False
+        for key in keys:
+            index = offsets[key]
+            bucket = buckets[key]
+            if index >= len(bucket):
+                continue
+            ordered.append(bucket[index])
+            offsets[key] = index + 1
+            added = True
+        if not added:
+            break
+    return ordered
+
+
 # Within each planner round, validated actions run before the model is asked to plan again.
 async def execute_plan(plan: list[dict[str, Any]], cookies: dict[str, str], discovery: dict[str, dict[str, Any]], allow_state_changes: bool | None=None, secondary_cookies: str='') -> list[tuple[dict[str, Any], dict[str, Any]]]:
 
-    profile_order = {name: index for index, name in enumerate(cookies)}
-    ordered = sorted(plan, key=lambda action: (profile_order.get(action['profile'], 999), shared.tool_execution_rank(action['tool'], bool(cookies.get(action['profile'], '')))))
+    ordered = _fair_sequential_action_order(plan, cookies)
     total = len(ordered)
     print(f'\n[*] Executing {total} validated action(s) sequentially. Progress heartbeat: every {shared.SCANNER_PROGRESS_INTERVAL}s.', flush=True)
     executed: list[tuple[dict[str, Any], dict[str, Any]]] = []
@@ -2606,6 +2694,7 @@ async def execute_plan(plan: list[dict[str, Any]], cookies: dict[str, str], disc
 def _record_execution_batch(executed: list[tuple[dict[str, Any], dict[str, Any]]], *, state: AgentState, results: dict[str, dict[str, Any]], discovery: dict[str, dict[str, Any]], completed: list[str], profile_cookies: dict[str, str]) -> int:
 
     new_attack_surface = 0
+    batch_summary: dict[tuple[str, str], dict[str, int]] = {}
     for action, result in executed:
         profile, tool = (action['profile'], action['tool'])
         profile_results = results.setdefault(profile, {})
@@ -2621,7 +2710,38 @@ def _record_execution_batch(executed: list[tuple[dict[str, Any], dict[str, Any]]
         }
         profile_results[f'{tool}:{number}'] = {**result, **metadata, 'coverage_action': coverage_action, 'planner_reason': action['reason'], 'planner_round': state['round']}
         completed.append(action_id(action))
-        log_result(profile, tool, result, action['target_url'])
+        status = str(result.get('status') or 'unknown').lower()
+        vulnerabilities = result.get('vulnerabilities') if isinstance(result.get('vulnerabilities'), list) else []
+        actionable_findings = sum(
+            1 for finding in vulnerabilities
+            if isinstance(finding, dict)
+            and (
+                str(finding.get('category') or '').lower() in {'candidate', 'vulnerability'}
+                or str(finding.get('risk') or 'info').lower() not in {'', 'info'}
+            )
+        )
+        summary_key = (profile, tool)
+        counters = batch_summary.setdefault(summary_key, {
+            'actions': 0, 'success': 0, 'partial': 0, 'error': 0, 'skipped': 0,
+            'findings': 0, 'actionable_findings': 0,
+        })
+        counters['actions'] += 1
+        if status in counters:
+            counters[status] += 1
+        counters['findings'] += len(vulnerabilities)
+        counters['actionable_findings'] += actionable_findings
+
+        # execute_plan() already emitted one [FINISHED] line for every action. Reprinting every
+        # zero-finding success here made the post-round "results" section hundreds of lines long
+        # and noticeably slow over SSH/tmux. Keep detailed diagnostics for incomplete/error runs,
+        # broad scanners and real security candidates; aggregate routine successes below.
+        detailed_result = (
+            status != 'success'
+            or actionable_findings > 0
+            or tool in {'ffuf', 'zap', 'nuclei', 'session', 'nikto', 'interactsh'}
+        )
+        if detailed_result:
+            log_result(profile, tool, result, action['target_url'])
         if tool == 'zap':
             log_zap_session_diagnostics(result)
         if tool == 'ffuf' and result.get('status') in {'success', 'partial'}:
@@ -2638,6 +2758,16 @@ def _record_execution_batch(executed: list[tuple[dict[str, Any], dict[str, Any]]
         if tool == 'arjun' and result.get('status') in {'success', 'partial'}:
             discovery[profile], generated = enrich_discovery_with_arjun(discovery.get(profile, {}), result, action['target_url'])
             new_attack_surface += len(generated)
+
+    if batch_summary:
+        print('    [ROUND RESULT SUMMARY] routine zero-finding successes are aggregated; detailed findings/partials/errors are printed above.', flush=True)
+        for (profile, tool), counters in sorted(batch_summary.items()):
+            print(
+                f"      {profile}/{tool}: actions={counters['actions']}; success={counters['success']}; "
+                f"partial={counters['partial']}; error={counters['error']}; skipped={counters['skipped']}; "
+                f"findings={counters['findings']}; actionable={counters['actionable_findings']}",
+                flush=True,
+            )
     return new_attack_surface
 
 # After validation, the selected actions run and their results are written back to shared state.

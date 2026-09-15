@@ -15,9 +15,12 @@ from utils import RequestRatePacer, parse_cookie_header, partial, request_same_o
 
 from utils import same_origin
 
-from core.scannerCommon import bounded_text_similarity, looks_like_login, request_retry, service
+from core.scannerCommon import bounded_text_similarity, looks_like_login, proportional_budget, remaining_budget, request_retry, service, wall_clock_deadline
 
 mcp, _serve = service("Session Security Analyzer", "session")
+
+SESSION_REQUEST_RATIO = 0.12
+LOGOUT_REQUEST_RATIO = 0.22
 
 SESSION_COOKIE_RE = re.compile(
     r"(?:^|[_\-.])(?:session|sess|sid|phpsessid|jsessionid|connect\.sid|auth|identity|remember|login)(?:$|[_\-.])", re.I,
@@ -130,17 +133,16 @@ def run_session_scan(
     sample_count = max(3, min(int(sample_count), 10))
     pacer = RequestRatePacer(request_rate)
 
-    deadline = time.monotonic() + max(4.0, timeout - 5.0)
-    request_timeout = max(2.0, min(3.0, (timeout - 6.0) / max(5, sample_count + 3)))
-    request_cost = 2.0 + request_timeout
+    deadline = wall_clock_deadline(timeout)
+    request_timeout = proportional_budget(timeout, SESSION_REQUEST_RATIO)
     findings: list[dict[str, Any]] = []
-    diagnostics: dict[str, Any] = {"probe_url": selected_probe, "sample_count": sample_count, "request_timeout": round(request_timeout, 2)}
+    diagnostics: dict[str, Any] = {"probe_url": selected_probe, "sample_count": sample_count, "request_timeout": request_timeout, "tool_timeout_seconds": timeout, "phase_ratio_policy": {"request": SESSION_REQUEST_RATIO}}
 
     # Evaluate cookie attributes first, then use bounded samples for uniqueness and fixation indicators.
     baseline: requests.Response | None = None
     try:
         baseline = request_retry(
-            "GET", selected_probe, attempts=2, backoff=0.25, timeout=(2, request_timeout), allow_redirects=True,
+            "GET", selected_probe, attempts=2, backoff=0.25, timeout=(max(1.0, request_timeout * 0.25), request_timeout), allow_redirects=True, deadline=deadline,
             headers={"User-Agent": "SecOps-Session-Analyzer/1.0", "Cache-Control": "no-cache"}, pacer=pacer,
         )
     except requests.RequestException as exc:
@@ -160,7 +162,7 @@ def run_session_scan(
     if cookies:
         try:
             authenticated = request_retry(
-                "GET", selected_probe, attempts=2, backoff=0.2, timeout=(2, request_timeout), allow_redirects=True,
+                "GET", selected_probe, attempts=2, backoff=0.2, timeout=(max(1.0, request_timeout * 0.25), request_timeout), allow_redirects=True, deadline=deadline,
                 headers={"User-Agent": "SecOps-Session-Analyzer/1.0", "Cache-Control": "no-cache", "Cookie": cookies}, pacer=pacer,
             )
             authenticated_rows: list[dict[str, Any]] = []
@@ -178,11 +180,11 @@ def run_session_scan(
     # Sample fresh anonymous sessions to detect obvious reuse, short identifiers or weak entropy.
     samples: dict[str, list[str]] = {}
     for _ in range(sample_count):
-        if time.monotonic() + request_cost >= deadline:
+        if remaining_budget(deadline) <= 0:
             break
         session = requests.Session()
         try:
-            response = request_same_origin_redirects("GET", selected_probe, session=session, timeout=(2, request_timeout),
+            response = request_same_origin_redirects("GET", selected_probe, session=session, timeout=(max(1.0, request_timeout * 0.25), request_timeout), deadline=deadline,
                 headers={"User-Agent": "SecOps-Session-Analyzer/1.0", "Cache-Control": "no-cache"}, pacer=pacer,
             )
         except requests.RequestException:
@@ -226,11 +228,11 @@ def run_session_scan(
     if supplied_session_names:
         fixation_rows: list[dict[str, Any]] = []
         for name in supplied_session_names[:3]:
-            if time.monotonic() + request_cost >= deadline:
+            if remaining_budget(deadline) <= 0:
                 break
             chosen = "SECOPS" + secrets.token_hex(12)
             try:
-                response = request_same_origin_redirects("GET", selected_probe, timeout=(2, request_timeout),
+                response = request_same_origin_redirects("GET", selected_probe, timeout=(max(1.0, request_timeout * 0.25), request_timeout), deadline=deadline,
                     headers={
                         "User-Agent": "SecOps-Session-Analyzer/1.0", "Cache-Control": "no-cache", "Cookie": f"{name}={chosen}",
                     }, pacer=pacer,
@@ -258,7 +260,7 @@ def run_session_scan(
         diagnostics["fixation_indicators"] = fixation_rows
 
     diagnostics["completed_anonymous_samples"] = sum(len(values) for values in samples.values())
-    diagnostics["budget_exhausted"] = time.monotonic() >= deadline
+    diagnostics["budget_exhausted"] = remaining_budget(deadline) <= 0
 
     if not _session_rows(set_cookie_rows) and not any(_is_session_cookie_name(name) for name in samples) and not supplied_session_names:
         return skipped("Session Security Analyzer", target_url, "No cookie or session identifier was observed or supplied.")
@@ -299,7 +301,8 @@ def run_logout_check(
         return skipped("Session Logout Verifier", logout_url, "The discovered logout contract is not a bounded GET/POST request.")
 
     timeout = max(8, min(int(timeout), 40))
-    request_timeout = max(3.0, min(8.0, timeout / 4.0))
+    deadline = wall_clock_deadline(timeout)
+    request_timeout = proportional_budget(timeout, LOGOUT_REQUEST_RATIO)
     pacer = RequestRatePacer(request_rate)
     common_headers = {"User-Agent": "SecOps-Session-Logout-Verifier/1.0", "Cache-Control": "no-cache"}
     auth_headers = {**common_headers, "Cookie": cookies}
@@ -307,10 +310,10 @@ def run_logout_check(
     def fetch(url: str, *, authenticated: bool) -> requests.Response:
         return request_same_origin_redirects(
             "GET", url, headers=auth_headers if authenticated else common_headers,
-            timeout=(3, request_timeout), pacer=pacer,
+            timeout=(max(1.0, request_timeout * 0.25), request_timeout), pacer=pacer, deadline=deadline,
         )
 
-    diagnostics: dict[str, Any] = {"logout_url": logout_url, "probe_url": selected_probe, "method": method}
+    diagnostics: dict[str, Any] = {"logout_url": logout_url, "probe_url": selected_probe, "method": method, "tool_timeout_seconds": timeout, "phase_ratio_policy": {"request": LOGOUT_REQUEST_RATIO}}
     try:
         baseline = fetch(selected_probe, authenticated=True)
         anonymous = fetch(selected_probe, authenticated=False)
@@ -349,7 +352,7 @@ def run_logout_check(
     try:
         logout_response = request_same_origin_redirects(
             method, logout_url, data=data if method == "POST" else None, headers=auth_headers,
-            timeout=(3, request_timeout), pacer=pacer,
+            timeout=(max(1.0, request_timeout * 0.25), request_timeout), pacer=pacer, deadline=deadline,
         )
     except requests.RequestException as exc:
         return partial(

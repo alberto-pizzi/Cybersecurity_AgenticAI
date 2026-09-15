@@ -9,13 +9,21 @@ from urllib.parse import parse_qsl, urljoin, urlparse
 
 import requests
 
-from utils import RequestRatePacer, request_same_origin_redirects, skipped, success
+from utils import RequestRatePacer, partial, request_same_origin_redirects, skipped, success
 
 from utils import same_origin
 
-from core.scannerCommon import bounded_text_similarity, looks_like_login, service
+from core.scannerCommon import bounded_text_similarity, looks_like_login, proportional_budget, remaining_budget, service, wall_clock_deadline
 
 mcp, _serve = service("Web Workflow Verifier", "workflow")
+
+WORKFLOW_PHASE_RATIOS = {
+    "csrf": 0.24,
+    "upload": 0.34,
+    "captcha": 0.16,
+    "authentication": 0.24,
+}
+WORKFLOW_CONNECT_RATIO = 0.25
 
 TOKEN_RE = re.compile(r"(?:csrf|xsrf|token|nonce|authenticity|request[_-]?verification)", re.I)
 DESTRUCTIVE_RE = re.compile(r"(?:logout|signout|logoff|setup|install|delete|remove|drop|truncate|purge|wipe|reset)", re.I)
@@ -72,7 +80,7 @@ def _session(cookies: str) -> requests.Session:
 def _csrf_check(
     target_url: str, source_url: str, cookies: str, data: str,
     fields: list[dict[str, str]], token_parameters: list[str], timeout: int, allow_state_changes: bool,
-    pacer: RequestRatePacer,
+    pacer: RequestRatePacer, deadline: float,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     findings: list[dict[str, Any]] = []
     diagnostic: dict[str, Any] = {"applicable": False}
@@ -109,10 +117,10 @@ def _csrf_check(
 
     session = _session(cookies)
     try:
-        baseline = request_same_origin_redirects("POST", target_url, session=session, data=original, timeout=(4, timeout), pacer=pacer,
+        baseline = request_same_origin_redirects("POST", target_url, session=session, data=original, timeout=(max(1.0, timeout * WORKFLOW_CONNECT_RATIO), timeout), pacer=pacer, deadline=deadline,
             headers={"Referer": source_url or target_url, "Origin": f"{parsed.scheme}://{parsed.netloc}"},
         )
-        without_token = request_same_origin_redirects("POST", target_url, session=session, data=stripped, timeout=(4, timeout), pacer=pacer, headers={"Sec-Fetch-Site": "cross-site"})
+        without_token = request_same_origin_redirects("POST", target_url, session=session, data=stripped, timeout=(max(1.0, timeout * WORKFLOW_CONNECT_RATIO), timeout), pacer=pacer, deadline=deadline, headers={"Sec-Fetch-Site": "cross-site"})
     except requests.RequestException as exc:
         diagnostic["error"] = f"{type(exc).__name__}: {exc}"
         return findings, diagnostic
@@ -149,7 +157,7 @@ def _csrf_check(
 def _upload_check(
     target_url: str, source_url: str, cookies: str, fields: list[dict[str, str]],
     file_parameters: list[str], timeout: int, allow_state_changes: bool, known_urls: list[str] | None,
-    pacer: RequestRatePacer,
+    pacer: RequestRatePacer, deadline: float,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     findings: list[dict[str, Any]] = []
     diagnostic: dict[str, Any] = {"applicable": bool(file_parameters)}
@@ -171,7 +179,7 @@ def _upload_check(
     files = {file_parameters[0]: (filename, content, "text/html")}
     session = _session(cookies)
     try:
-        response = request_same_origin_redirects("POST", target_url, session=session, data=form_data, files=files, timeout=(4, timeout), pacer=pacer, headers={"Referer": source_url or target_url})
+        response = request_same_origin_redirects("POST", target_url, session=session, data=form_data, files=files, timeout=(max(1.0, timeout * WORKFLOW_CONNECT_RATIO), timeout), pacer=pacer, deadline=deadline, headers={"Referer": source_url or target_url})
     except requests.RequestException as exc:
         diagnostic["error"] = f"{type(exc).__name__}: {exc}"
         return findings, diagnostic
@@ -210,8 +218,10 @@ def _upload_check(
 
     directory_searches: list[dict[str, Any]] = []
     for directory in list(dict.fromkeys(directory_candidates))[:10]:
+        if remaining_budget(deadline) <= 0:
+            break
         try:
-            listing = request_same_origin_redirects("GET", directory, session=session, timeout=(4, timeout), pacer=pacer)
+            listing = request_same_origin_redirects("GET", directory, session=session, timeout=(max(1.0, timeout * WORKFLOW_CONNECT_RATIO), timeout), pacer=pacer, deadline=deadline)
         except requests.RequestException as exc:
             directory_searches.append({"url": directory, "error": f"{type(exc).__name__}: {exc}"})
             continue
@@ -230,8 +240,10 @@ def _upload_check(
     candidates = [value for value in dict.fromkeys(candidates) if same_origin(target_url, value)]
     retrieved: list[dict[str, Any]] = []
     for candidate in candidates[:8]:
+        if remaining_budget(deadline) <= 0:
+            break
         try:
-            probe = request_same_origin_redirects("GET", candidate, session=session, timeout=(4, timeout), pacer=pacer)
+            probe = request_same_origin_redirects("GET", candidate, session=session, timeout=(max(1.0, timeout * WORKFLOW_CONNECT_RATIO), timeout), pacer=pacer, deadline=deadline)
         except requests.RequestException:
             continue
         present = marker in probe.text
@@ -276,6 +288,7 @@ def _upload_check(
 # Run bounded authentication attempts to detect missing throttling or challenge behavior.
 def _authentication_check(
     target_url: str, fields: list[dict[str, str]], timeout: int, method: str, pacer: RequestRatePacer,
+    allow_state_changes: bool, deadline: float,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     findings: list[dict[str, Any]] = []
     names = {field["name"].lower(): field for field in fields}
@@ -285,12 +298,20 @@ def _authentication_check(
     diagnostic: dict[str, Any] = {"applicable": applicable}
     if not applicable:
         return findings, diagnostic
+    # Invalid-login attempts can increment lockout/rate-limit counters and are therefore treated as
+    # state-affecting. Under the binding allow_state_changes=false policy, keep the structural
+    # workflow observation but do not submit credential-guessing probes.
+    if not allow_state_changes:
+        diagnostic['active_probe_skipped'] = 'allow_state_changes_false'
+        return findings, diagnostic
 
     session = _session("")
     attempts: list[dict[str, Any]] = []
     throttled = False
     challenge = False
     for index in range(3):
+        if remaining_budget(deadline) <= 0:
+            break
         payload: dict[str, str] = {}
         for field in fields:
             if field["type"] in {"file", "reset"}:
@@ -302,9 +323,9 @@ def _authentication_check(
             payload[password_name] = secrets.token_urlsafe(12)
         try:
             if str(method or "POST").upper() == "GET":
-                response = request_same_origin_redirects("GET", target_url, session=session, params=payload, timeout=(4, timeout), pacer=pacer)
+                response = request_same_origin_redirects("GET", target_url, session=session, params=payload, timeout=(max(1.0, timeout * WORKFLOW_CONNECT_RATIO), timeout), pacer=pacer, deadline=deadline)
             else:
-                response = request_same_origin_redirects("POST", target_url, session=session, data=payload, timeout=(4, timeout), pacer=pacer)
+                response = request_same_origin_redirects("POST", target_url, session=session, data=payload, timeout=(max(1.0, timeout * WORKFLOW_CONNECT_RATIO), timeout), pacer=pacer, deadline=deadline)
         except requests.RequestException as exc:
             attempts.append({"error": f"{type(exc).__name__}: {exc}"})
             break
@@ -336,7 +357,7 @@ def _authentication_check(
 # Inspect the CAPTCHA workflow for recognizable challenge fields and bypass indicators.
 def _captcha_check(
     target_url: str, cookies: str, data: str, fields: list[dict[str, str]], timeout: int, allow_state_changes: bool,
-    pacer: RequestRatePacer,
+    pacer: RequestRatePacer, deadline: float,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     names = [field["name"] for field in fields]
     applicable = bool(CAPTCHA_RE.search(" ".join([urlparse(target_url).path, *names])))
@@ -361,7 +382,7 @@ def _captcha_check(
     stripped = [(name, value) for name, value in pairs if name not in set(captcha_names)]
     session = _session(cookies)
     try:
-        response = request_same_origin_redirects("POST", target_url, session=session, data=stripped, timeout=(4, timeout), pacer=pacer)
+        response = request_same_origin_redirects("POST", target_url, session=session, data=stripped, timeout=(max(1.0, timeout * WORKFLOW_CONNECT_RATIO), timeout), pacer=pacer, deadline=deadline)
     except requests.RequestException as exc:
         diagnostic["error"] = f"{type(exc).__name__}: {exc}"
         return findings, diagnostic
@@ -405,6 +426,8 @@ def run_workflow_scan(
     file_parameters = [str(value) for value in (file_parameters or []) if str(value)]
     token_parameters = [str(value) for value in (token_parameters or []) if str(value)]
     timeout = max(5, min(int(timeout), 240))
+    action_deadline = wall_clock_deadline(timeout)
+    phase_budgets = {name: proportional_budget(timeout, ratio) for name, ratio in WORKFLOW_PHASE_RATIOS.items()}
     pacer = RequestRatePacer(request_rate)
     if method not in {"GET", "POST"}:
         return skipped("Web Workflow Verifier", target_url, "The current workflow checks require a discovered GET/POST form contract.")
@@ -416,17 +439,21 @@ def run_workflow_scan(
         "method": method, "source_url": source_url, "enctype": enctype, "allow_state_changes": bool(allow_state_changes),
         "parameters": list(parameters or []), "file_parameters": file_parameters,
         "token_parameters": token_parameters, "known_url_count": len(known_urls or []),
+        "tool_timeout_seconds": timeout, "phase_ratio_policy": dict(WORKFLOW_PHASE_RATIOS), "phase_budgets_seconds": phase_budgets,
     }
 
     if method == "POST":
         csrf_findings, csrf_diag = _csrf_check(
-            target_url, source_url, cookies, data, rows, token_parameters, timeout, allow_state_changes, pacer,
+            target_url, source_url, cookies, data, rows, token_parameters, phase_budgets["csrf"], allow_state_changes, pacer,
+            min(action_deadline, wall_clock_deadline(phase_budgets["csrf"])),
         )
         upload_findings, upload_diag = _upload_check(
-            target_url, source_url, cookies, rows, file_parameters, timeout, allow_state_changes, known_urls, pacer,
+            target_url, source_url, cookies, rows, file_parameters, phase_budgets["upload"], allow_state_changes, known_urls, pacer,
+            min(action_deadline, wall_clock_deadline(phase_budgets["upload"])),
         )
         captcha_findings, captcha_diag = _captcha_check(
-            target_url, cookies, data, rows, timeout, allow_state_changes, pacer,
+            target_url, cookies, data, rows, phase_budgets["captcha"], allow_state_changes, pacer,
+            min(action_deadline, wall_clock_deadline(phase_budgets["captcha"])),
         )
     else:
         csrf_findings, csrf_diag = [], {"applicable": False, "reason": "GET authentication workflow"}
@@ -439,13 +466,19 @@ def run_workflow_scan(
     diagnostics["upload"] = upload_diag
     diagnostics["captcha"] = captcha_diag
 
-    auth_findings, auth_diag = _authentication_check(target_url, rows, timeout, method, pacer)
+    auth_findings, auth_diag = _authentication_check(target_url, rows, phase_budgets["authentication"], method, pacer, allow_state_changes, min(action_deadline, wall_clock_deadline(phase_budgets["authentication"])))
     findings.extend(auth_findings)
     diagnostics["authentication"] = auth_diag
 
     applicable = any(bool(value.get("applicable")) for value in (csrf_diag, upload_diag, auth_diag, captcha_diag))
     if not applicable:
         return skipped("Web Workflow Verifier", target_url, "The discovered form did not match CSRF, upload, authentication or CAPTCHA workflow classes.")
+    if remaining_budget(action_deadline) <= 0:
+        return partial(
+            "Web Workflow Verifier", target_url,
+            f"Workflow verification reached its shared action time budget. Findings preserved: {len(findings)}.",
+            diagnosis="time_limit_reached", timed_out=True, time_limit_reached=True, vulnerabilities=findings, diagnostics=diagnostics,
+        )
 
     return success(
         "Web Workflow Verifier", target_url,

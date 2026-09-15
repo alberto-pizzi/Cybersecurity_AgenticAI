@@ -126,13 +126,13 @@ BROAD_SIBLING_ADAPTIVE_RATIO = 0.75
 BROAD_SIBLING_TIMEOUT_FACTORS = {'fast': 0.55, 'balanced': 0.75, 'deep': 0.85}
 SCAN_MODES = {
     'fast': {
-        'broad': {'zap': 120, 'nuclei': 360, 'nikto': 60, 'ffuf': 50, 'session': 25},
+        'broad': {'zap': 120, 'nuclei': 240, 'nikto': 60, 'ffuf': 50, 'session': 25},
         'parameter': {'sqlmap': 75, 'dalfox': 45, 'commix': 90, 'traversal': 35, 'idor': 18, 'authorization': 30, 'browser': 45, 'workflow': 40},
         'limits': {'sqlmap': 3, 'dalfox': 3, 'commix': 3, 'traversal': 3, 'idor': 3, 'authorization': 4, 'browser': 3, 'workflow': 3},
         'arjun': 45, 'arjun_limit': 3,
     },
     'balanced': {
-        'broad': {'zap': 600, 'nuclei': 1200, 'nikto': 180, 'ffuf': 120, 'session': 50},
+        'broad': {'zap': 600, 'nuclei': 720, 'nikto': 180, 'ffuf': 120, 'session': 50},
         'parameter': {'sqlmap': 180, 'dalfox': 120, 'commix': 180, 'traversal': 75, 'idor': 45, 'authorization': 70, 'browser': 120, 'workflow': 105},
         # Raised from the previous 8-12 ceiling: each case already runs with its own independent
         # per-case timeout (the 'parameter' timeouts above), so more selected cases means more total
@@ -143,7 +143,7 @@ SCAN_MODES = {
         'arjun': 120, 'arjun_limit': 24,
     },
     'deep': {
-        'broad': {'zap': 1080, 'nuclei': 1800, 'nikto': 300, 'ffuf': 210, 'session': 90},
+        'broad': {'zap': 1080, 'nuclei': 1200, 'nikto': 300, 'ffuf': 210, 'session': 90},
         'parameter': {'sqlmap': 300, 'dalfox': 210, 'commix': 300, 'traversal': 120, 'idor': 90, 'authorization': 120, 'browser': 210, 'workflow': 180},
         'limits': {'sqlmap': 36, 'dalfox': 36, 'commix': 24, 'traversal': 36, 'idor': 32, 'authorization': 40, 'browser': 36, 'workflow': 36},
         'arjun': 180, 'arjun_limit': 36,
@@ -960,6 +960,42 @@ def _normalize_result(data: Any, spec: ToolSpec, target: str, elapsed: float, is
         result.setdefault('diagnosis', diagnose_error(str(result.get('output', ''))))
     return _normalize_time_limit(result, spec.name, target)
 
+# Loads the latest Nuclei sidecar checkpoint written by the scanner process. This is used only
+# when the outer MCP transport times out before the tool can return its normal structured result.
+def _recover_nuclei_checkpoint(output_path: Path | None, target: str) -> dict[str, Any] | None:
+    if output_path is None:
+        return None
+    checkpoint = output_path.with_name(output_path.name + '.checkpoint.json')
+    if not checkpoint.is_file():
+        return None
+    try:
+        payload = json.loads(checkpoint.read_text(encoding='utf-8', errors='replace'))
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    recovered = dict(payload)
+    vulnerabilities = recovered.get('vulnerabilities')
+    if not isinstance(vulnerabilities, list):
+        recovered['vulnerabilities'] = []
+    recovered.update({
+        'tool': 'nuclei',
+        'target': target,
+        'status': 'partial',
+        'diagnosis': 'time_limit_reached',
+        'timed_out': True,
+        'time_limit_reached': True,
+        'checkpoint_recovered': True,
+    })
+    phase = str(recovered.get('active_phase') or recovered.get('checkpoint_stage') or 'unknown')
+    recovered['output'] = (
+        'Nuclei reached the outer MCP time budget. The latest incremental checkpoint was recovered '
+        f'instead of discarding completed phase metadata/findings; last checkpoint stage={phase}; '
+        f"preserved findings={len(recovered.get('vulnerabilities') or [])}."
+    )
+    return recovered
+
+
 # Calls one MCP tool and returns a normalized result.
 async def call_mcp(server_file: str, tool_name: str, arguments: dict[str, Any], timeout_seconds: float=MCP_TOOL_TIMEOUT) -> dict[str, Any]:
     spec = next((item for item in ALL_TOOLS if item.server == server_file and item.tool == tool_name), ToolSpec(tool_name, server_file, tool_name))
@@ -977,6 +1013,12 @@ async def call_mcp(server_file: str, tool_name: str, arguments: dict[str, Any], 
         temporary_dir.mkdir(parents=True, exist_ok=True)
         temporary_output = temporary_dir / f'nuclei-{uuid.uuid4().hex}.jsonl'
         effective_arguments['output_file'] = str(temporary_output)
+    nuclei_output_path: Path | None = None
+    if spec.name == 'nuclei' and str(effective_arguments.get('output_file') or '').strip():
+        try:
+            nuclei_output_path = Path(str(effective_arguments.get('output_file'))).expanduser().resolve()
+        except OSError:
+            nuclei_output_path = Path(str(effective_arguments.get('output_file'))).expanduser()
 
     async def invoke_report_chunked(client: Client, encoded: bytes) -> tuple[Any, bool, str]:
         if len(encoded) > MCP_REPORT_MAX_BYTES:
@@ -1115,6 +1157,19 @@ async def call_mcp(server_file: str, tool_name: str, arguments: dict[str, Any], 
                 if progress:
                     message += f' Last report-server progress:\n{progress}'
                 result = _result(spec.name, target, 'partial', message, 'report_time_limit_reached', timed_out=True, time_limit_reached=True, traceback=traceback.format_exc(), _meta={'server': str(server), 'duration_seconds': round(time.monotonic() - started, 3), 'mcp_transport': 'streamable_http', 'mcp_url': mcp_http_url(MCP_UNIFIED_SERVICE)})
+            elif spec.name == 'nuclei':
+                recovered = _recover_nuclei_checkpoint(nuclei_output_path, target)
+                if recovered is not None:
+                    result = recovered
+                    result.setdefault('_meta', {}).update({
+                        'server': str(server),
+                        'duration_seconds': round(time.monotonic() - started, 3),
+                        'mcp_transport': 'streamable_http',
+                        'mcp_url': mcp_http_url(MCP_UNIFIED_SERVICE),
+                        'checkpoint_recovered_after_outer_timeout': True,
+                    })
+                else:
+                    result = _result(spec.name, target, 'partial', 'Nuclei reached the orchestrator/MCP HTTP time budget before a recoverable checkpoint was available. Coverage is incomplete; this is not classified as a scanner error.', 'time_limit_reached', timed_out=True, time_limit_reached=True, traceback=traceback.format_exc(), _meta={'server': str(server), 'duration_seconds': round(time.monotonic() - started, 3), 'mcp_transport': 'streamable_http', 'mcp_url': mcp_http_url(MCP_UNIFIED_SERVICE)})
             else:
                 result = _result(spec.name, target, 'partial', f'{spec.name} reached the orchestrator/MCP HTTP time budget. Coverage is incomplete; this is not classified as a scanner error.', 'time_limit_reached', timed_out=True, time_limit_reached=True, traceback=traceback.format_exc(), _meta={'server': str(server), 'duration_seconds': round(time.monotonic() - started, 3), 'mcp_transport': 'streamable_http', 'mcp_url': mcp_http_url(MCP_UNIFIED_SERVICE)})
         else:
@@ -1126,6 +1181,8 @@ async def call_mcp(server_file: str, tool_name: str, arguments: dict[str, Any], 
     finally:
         if temporary_output:
             temporary_output.unlink(missing_ok=True)
+            temporary_output.with_name(temporary_output.name + '.checkpoint.json').unlink(missing_ok=True)
+            temporary_output.with_name(temporary_output.name + '.checkpoint.json.tmp').unlink(missing_ok=True)
     result = _normalize_time_limit(result, spec.name, target)
     if result.get('status') == 'error':
         print(f"\n[SCANNER ERROR] {spec.name}: {display_target}\n  {result.get('output', '')}", file=sys.stderr)
@@ -1371,6 +1428,23 @@ def _structural_route_signature(url: str) -> tuple[str, str, tuple[str, ...]]:
     names = tuple(sorted({name.lower() for name, _ in parse_qsl(parsed.query, keep_blank_values=True)}))
     return (normalized_origin(url), parsed.path.rstrip('/') or '/', names)
 
+# Canonicalizes only query *encoding*, not semantic values. This collapses equivalent specialist
+# actions such as `pageTitle=External+Services` and `pageTitle=External%20Services` while preserving
+# different values, duplicate parameters, paths, methods and origins as distinct attack surfaces.
+# It is deliberately narrower than the anti-saturation route signature because scanners may need
+# multiple value variants when those values are genuinely different.
+def _semantic_request_url_key(url: str) -> tuple[str, str, tuple[tuple[str, str], ...]]:
+    parsed = urlparse(str(url or ''))
+    pairs = tuple(sorted((str(name), str(value)) for name, value in parse_qsl(parsed.query, keep_blank_values=True)))
+    return (normalized_origin(url), parsed.path or '/', pairs)
+
+# Public stable representation used by orchestrator action IDs. It canonicalizes only equivalent
+# URL encodings (+ vs %20 etc.) while preserving actual parameter names/values and duplicate pairs.
+def semantic_request_identity_url(url: str) -> str:
+    origin, path, pairs = _semantic_request_url_key(url)
+    query = urlencode(list(pairs), doseq=True)
+    return f'{origin}{path}' + (f'?{query}' if query else '')
+
 def _specialist_route_signature(tool: str, url: str) -> tuple[str, str, tuple[str, ...]]:
     return _discovery_route_signature(url) if str(tool or '').lower() == 'traversal' else _structural_route_signature(url)
 
@@ -1504,20 +1578,57 @@ def _script_value_score(url: str) -> int:
 DESTRUCTIVE_CRAWL_TOKENS = ('logout', 'log-out', 'signout', 'sign-out', 'logoff', 'disconnect', 'end-session', 'destroy-session', 'session-destroy', 'reinstall', 'uninstall', 'reset', 'delete', 'remove', 'destroy', 'create_db', 'create-database', 'createdb', 'drop_db', 'drop-database', 'truncate', 'purge', 'wipe')
 STATE_CHANGING_QUERY_KEYS = {'create_db', 'reset', 'delete', 'remove', 'logout', 'signout', 'logoff', 'disconnect', 'destroy', 'install', 'setup', 'password_new', 'password_conf', 'new_password', 'confirm_password'}
 
+# High-confidence action verbs at the start of an endpoint basename. This catches state-changing
+# GET routes such as addThing.php/changeThing.php without hardcoding any application path. Read-only
+# pages containing these words later in the name are not blocked solely by this heuristic.
+MUTATING_ROUTE_PREFIXES = {
+    'add', 'create', 'del', 'delete', 'remove', 'destroy', 'change', 'update', 'save', 'modify',
+    'upload', 'submit', 'assign', 'grant', 'revoke', 'switch', 'toggle', 'enable', 'disable',
+    'activate', 'deactivate', 'set',
+}
+
+def _mutating_route_prefix(url: str) -> bool:
+    path = unquote(urlparse(str(url or '')).path or '')
+    basename = path.rstrip('/').rsplit('/', 1)[-1]
+    stem = basename.rsplit('.', 1)[0]
+    separated = re.sub(r'([a-z0-9])([A-Z])', r'\1 \2', stem)
+    tokens = [token.lower() for token in re.split(r'[^A-Za-z0-9]+', separated) if token]
+    return bool(tokens and tokens[0] in MUTATING_ROUTE_PREFIXES)
+
+def _mutating_identifier_prefix(value: str) -> bool:
+    text = str(value or '').strip()
+    separated = re.sub(r'([a-z0-9])([A-Z])', r'\1 \2', text)
+    tokens = [token.lower() for token in re.split(r'[^A-Za-z0-9]+', separated) if token]
+    return bool(tokens and tokens[0] in MUTATING_ROUTE_PREFIXES)
+
 # Detects logout, reset, and other destructive URLs; read-only setup/install pages are not blocked by name alone.
 def _destructive_crawl_url(url: str) -> bool:
     parsed = urlparse(str(url or ''))
     path_text = parsed.path.lower()
     if any((token in path_text for token in DESTRUCTIVE_CRAWL_TOKENS)):
         return True
+    if _mutating_route_prefix(url):
+        return True
     pairs = parse_qsl(parsed.query, keep_blank_values=True)
     benign_control_values = {'0', 'false', 'no', 'off', 'view', 'show', 'list', 'read', 'get'}
+    action_value_keys = {'action', 'operation', 'op', 'task', 'command', 'do', 'event'}
+    navigation_value_keys = SEMANTIC_ROUTING_PARAMETERS | {'url', 'uri', 'href', 'target'}
     for name, value in pairs:
         lowered_name = name.lower()
         lowered_value = value.lower().strip()
+        if _mutating_identifier_prefix(name):
+            return True
         if lowered_name in STATE_CHANGING_QUERY_KEYS and lowered_value not in benign_control_values:
             return True
-        if lowered_value not in benign_control_values and any((token in lowered_value for token in DESTRUCTIVE_CRAWL_TOKENS)):
+        # A destructive word in arbitrary user data (for example `q=delete`) is not evidence of a
+        # state-changing GET. Restrict value-based blocking to parameters that actually select an
+        # action or navigation destination. This keeps search/filter coverage while still blocking
+        # `action=delete`, `redirect=logout.php`, `page=remove.php`, and equivalent routing cases.
+        if (
+            lowered_name in action_value_keys or lowered_name in navigation_value_keys
+        ) and lowered_value not in benign_control_values and any(
+            token in lowered_value for token in DESTRUCTIVE_CRAWL_TOKENS
+        ):
             return True
     return False
 
@@ -1768,7 +1879,7 @@ def _dedupe_request_cases(cases: list[dict[str, Any]]) -> list[dict[str, Any]]:
     seen: set[tuple[str, str, tuple[str, ...]]] = set()
     for case in cases:
         names = [*[str(value) for value in case.get('parameters', []) if value], *[str(value) for value in case.get('file_parameters', []) if value], *[str(value) for value in case.get('token_parameters', []) if value]]
-        key = (str(case.get('method', 'GET')).upper(), str(case.get('url', '')), tuple(sorted(set(names))))
+        key = (str(case.get('method', 'GET')).upper(), _semantic_request_url_key(str(case.get('url', ''))), tuple(sorted(set(names))))
         if not key[1] or not key[2] or key in seen:
             continue
         seen.add(key)
@@ -4172,7 +4283,7 @@ def select_tool_request_cases(discovery: dict[str, Any], tool: str, limit: int |
         method = str(case.get('method', 'GET')).upper()
         url = str(case.get('url', ''))
         params = tuple(sorted((str(value).lower() for value in case.get('parameters', []) if str(value))))
-        key = (method, url, params)
+        key = (method, _semantic_request_url_key(url), params)
         shape = (method, _specialist_route_signature(tool, url), params)
         if key in seen or shape_counts.get(shape, 0) >= variant_cap:
             continue
@@ -4202,7 +4313,7 @@ def select_tool_request_cases(discovery: dict[str, Any], tool: str, limit: int |
             if tool == 'dalfox' and _prefer_browser_for_xss_case(case):
                 continue
             param_key = tuple(sorted(value.lower() for value in params))
-            key = (method, url, param_key)
+            key = (method, _semantic_request_url_key(url), param_key)
             shape = (method, _specialist_route_signature(tool, url), param_key)
             if key in seen or shape_counts.get(shape, 0) >= variant_cap:
                 continue
@@ -4212,7 +4323,7 @@ def select_tool_request_cases(discovery: dict[str, Any], tool: str, limit: int |
             method = str(case.get('method', 'GET')).upper()
             url = str(case.get('url', ''))
             param_key = tuple(sorted((str(value).lower() for value in case.get('parameters', []) if str(value))))
-            key = (method, url, param_key)
+            key = (method, _semantic_request_url_key(url), param_key)
             shape = (method, _specialist_route_signature(tool, url), param_key)
             if shape_counts.get(shape, 0) >= variant_cap:
                 continue
@@ -4471,7 +4582,7 @@ def select_browser_request_cases(discovery: dict[str, Any], limit: int | None=No
         method = str(case.get('method', 'GET')).upper()
         url = str(case.get('url', ''))
         params = tuple(sorted((str(value).lower() for value in case.get('parameters', []) if str(value))))
-        key = (method, url, params)
+        key = (method, _semantic_request_url_key(url), params)
         shape = (method, _browser_url_key(url), params)
         if key in seen or shape_counts.get(shape, 0) >= variant_cap:
             continue
@@ -4489,7 +4600,7 @@ def select_browser_request_cases(discovery: dict[str, Any], limit: int | None=No
             if any(token in path for token in ('logout', 'setup', 'reset', 'delete')):
                 continue
             params = tuple(sorted(str(value).lower() for value in case.get('parameters', []) if str(value)))
-            key = (method, url, params)
+            key = (method, _semantic_request_url_key(url), params)
             shape = (method, _browser_url_key(url), params)
             if key in seen or shape_counts.get(shape, 0) >= variant_cap:
                 continue
@@ -4509,7 +4620,7 @@ def select_browser_request_cases(discovery: dict[str, Any], limit: int | None=No
             if shape_counts.get(shape, 0) >= variant_cap:
                 continue
             unique_ranked.append((int(score), case))
-            seen.add((method, url, params))
+            seen.add((method, _semantic_request_url_key(url), params))
             shape_counts[shape] = shape_counts.get(shape, 0) + 1
     return _select_with_adaptive_specialist_budget('browser', unique_ranked, effective_limit)
 
@@ -4532,7 +4643,15 @@ def _workflow_case_priority(case: dict[str, Any]) -> int:
     if any(('captcha' in value for value in names)) or 'captcha' in path:
         score += 90
     state_hits = {value for value in names if value in WORKFLOW_STATE_HINTS}
-    if state_hits or any((token in path for token in WORKFLOW_STATE_HINTS)):
+    state_path = any((token in path for token in WORKFLOW_STATE_HINTS))
+    auth_shape = _is_login_case(case) or any((token in path for token in ('login', 'signin', 'brute', 'auth')))
+    captcha_shape = any(('captcha' in value for value in names)) or 'captcha' in path
+    # A generic token parameter alone is not a workflow. API calls frequently contain bearer,
+    # pagination or application tokens and were previously spending workflow action slots only to
+    # be SKIPPED by the verifier. Require one real CSRF/upload/auth/CAPTCHA/state-change signal.
+    if not (file_parameters or state_hits or state_path or auth_shape or captcha_shape):
+        return -1000
+    if state_hits or state_path:
         score += 60
     if not token_parameters and (state_hits or file_parameters):
         score += 35
@@ -4572,7 +4691,7 @@ def select_workflow_request_cases(discovery: dict[str, Any], limit: int | None=N
         method = str(case.get('method', 'POST')).upper()
         url = str(case.get('url', ''))
         fields = tuple(sorted(_case_field_names(case)))
-        key = (method, url, fields)
+        key = (method, _semantic_request_url_key(url), fields)
         shape = (method, _structural_route_signature(url), fields)
         if key in seen or shape_counts.get(shape, 0) >= variant_cap:
             continue
@@ -5175,10 +5294,34 @@ def log_result(profile: str, name: str, result: dict[str, Any], target: str='') 
         if session_after.get('performed'):
             print(f"    [FFUF SESSION] post-scan authenticated={session_after.get('authenticated')}; conclusive={session_after.get('conclusive')}")
     if name == 'nuclei':
-        inventory = result.get('template_inventory') if isinstance(result.get('template_inventory'), dict) else {}
-        print(f"    [NUCLEI TEMPLATES] total={inventory.get('count', 0)}; dast={inventory.get('dast_count', 0)}; directory={inventory.get('directory', '') or 'not-resolved'}")
+        if result.get('checkpoint_recovered'):
+            active = result.get('active_phase_snapshot') if isinstance(result.get('active_phase_snapshot'), dict) else {}
+            print(
+                f"    [NUCLEI CHECKPOINT] recovered after outer timeout; stage={result.get('checkpoint_stage', 'unknown')}; "
+                f"active_phase={result.get('active_phase') or active.get('name') or 'unknown'}; "
+                f"active_findings={active.get('findings', 'unknown')}; raw_items={result.get('raw_checkpoint_item_count', 'unknown')}"
+            )
+        inventory_present = isinstance(result.get('template_inventory'), dict)
+        inventory = result.get('template_inventory') if inventory_present else {}
+        if inventory_present:
+            print(
+                f"    [NUCLEI TEMPLATES] total={inventory.get('count', 0)}; "
+                f"dast={inventory.get('dast_count', 0)}; directory={inventory.get('directory', '') or 'not-resolved'}; "
+                f"resolution={inventory.get('resolution', 'runtime-recorded')}"
+            )
+        else:
+            # An outer MCP/watchdog timeout can synthesize a PARTIAL result before the scanner
+            # returns its structured metadata. Do not print missing fields as a real zero-template
+            # inventory: that previously made transport truncation look like an installation bug.
+            print('    [NUCLEI TEMPLATES] inventory=unknown; scanner metadata was not returned before the outer result was finalized')
         fingerprint = result.get('technology_fingerprint') if isinstance(result.get('technology_fingerprint'), dict) else {}
-        print(f"    [NUCLEI STRATEGY] adaptive=True; technologies={','.join(fingerprint.get('tags') or []) or 'unknown'}; dast_cases={result.get('dast_request_count', 0)}; direct_templates={result.get('custom_template_count', 0)}; evidence_targets={len(result.get('evidence_targets') or [])}; stdin_disabled=True; DAST may overlap specialist classes to provide independent template evidence")
+        direct_templates = result.get('custom_template_count') if 'custom_template_count' in result else 'unknown'
+        evidence_targets = len(result.get('evidence_targets') or []) if 'evidence_targets' in result else 'unknown'
+        dast_cases = result.get('dast_request_count') if 'dast_request_count' in result else 'unknown'
+        print(f"    [NUCLEI STRATEGY] adaptive=True; technologies={','.join(fingerprint.get('tags') or []) or 'unknown'}; dast_cases={dast_cases}; direct_templates={direct_templates}; evidence_targets={evidence_targets}; stdin_disabled=True; DAST may overlap specialist classes to provide independent template evidence")
+        for gap in result.get('coverage_gaps') or []:
+            if isinstance(gap, dict):
+                print(f"    [NUCLEI COVERAGE GAP] {gap.get('phase', 'unknown')}: {gap.get('diagnosis', 'partial')} — {gap.get('detail', '')}")
         phases = result.get('phases') if isinstance(result.get('phases'), list) else []
         for phase in phases:
             if not isinstance(phase, dict):
