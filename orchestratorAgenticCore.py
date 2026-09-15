@@ -113,10 +113,29 @@ AGENTIC_BASELINE_TOOLS = ('ffuf', 'zap', 'nuclei', 'session', 'nikto', 'jwt')
 # deterministically afterwards. Both budgets are independent for every active profile so
 # anonymous work cannot consume authenticated capacity, or vice versa.
 PROFILE_EXECUTION_ACTION_BUDGETS = {'fast': 48, 'balanced': 144, 'deep': 288}
-# Concrete execution can grow above the base only when selected capability groups still contain
-# validated request actions. The ceiling is per profile and per round and is intentionally above
-# the concrete capacity needed by the currently selected capability groups, so it normally acts only as an emergency guardrail.
-PROFILE_EXECUTION_ACTION_MAX = {'fast': 80, 'balanced': 360, 'deep': 600}
+# Concrete execution has a small evidence-backed overflow from round 1 and a bounded growth step
+# on later rounds. The base remains the normal capacity; overflow is never filled merely because
+# more actions exist. This preserves adaptive breadth without returning to hundreds of sequential
+# specialist invocations in one balanced round.
+PROFILE_EXECUTION_ACTION_OVERFLOW_INITIAL = {'fast': 6, 'balanced': 24, 'deep': 40}
+PROFILE_EXECUTION_ACTION_OVERFLOW_STEP = {'fast': 4, 'balanced': 16, 'deep': 24}
+PROFILE_EXECUTION_ACTION_OVERFLOW_MAX = {'fast': 14, 'balanced': 56, 'deep': 88}
+PROFILE_EXECUTION_ACTION_MAX = {
+    mode: PROFILE_EXECUTION_ACTION_BUDGETS[mode] + PROFILE_EXECUTION_ACTION_OVERFLOW_MAX[mode]
+    for mode in PROFILE_EXECUTION_ACTION_BUDGETS
+}
+
+def _execution_overflow_cap(mode: str, round_number: int) -> int:
+    name = str(mode or 'balanced')
+    initial = int(PROFILE_EXECUTION_ACTION_OVERFLOW_INITIAL.get(name, 0))
+    step = int(PROFILE_EXECUTION_ACTION_OVERFLOW_STEP.get(name, 0))
+    maximum = int(PROFILE_EXECUTION_ACTION_OVERFLOW_MAX.get(name, initial))
+    growth = max(0, int(round_number) - 1) * max(0, step)
+    return max(0, min(maximum, initial + growth))
+
+def _execution_round_max(mode: str, round_number: int) -> int:
+    base = int(PROFILE_EXECUTION_ACTION_BUDGETS.get(str(mode or 'balanced'), 48))
+    return base + _execution_overflow_cap(mode, round_number)
 PROFILE_TOOL_GROUP_BUDGETS = {'fast': 12, 'balanced': 16, 'deep': 18}
 PROFILE_BREADTH_REVIEW_GROUP_CAPS = {'fast': 3, 'balanced': 6, 'deep': 8}
 # A grouped catalog is much smaller than the concrete request-action pool. The limit is only a
@@ -366,15 +385,39 @@ def _fair_planner_group_catalog(groups: list[dict[str, Any]], limit: int) -> lis
     return selected
 
 
-# Expands AI-selected capability groups back into concrete request actions. The per-profile base
-# grows automatically up to a hard ceiling when selected groups still contain validated cases.
-# Expansion remains round-robin and consumes non-adaptive specialist cases before adaptive overflow,
-# so a large SQLMap/Dalfox family cannot starve the other selected capabilities.
+# Expands AI-selected capability groups back into concrete request actions. Every round fills the
+# fixed per-profile base first, then may use a small evidence-backed overflow. The overflow starts
+# bounded in round 1 and grows gradually on later rounds; prior tool findings raise follow-up
+# priority. All stages use capability-fair round-robin selection.
+def _tool_has_followup_signal(profile_results: dict[str, Any], tool: str) -> bool:
+    prefix = f"{str(tool or '').lower()}:"
+    for key, result in profile_results.items():
+        if not isinstance(result, dict):
+            continue
+        key_text = str(key).lower()
+        result_tool = str(result.get('tool') or '').lower()
+        if result_tool != str(tool or '').lower() and not key_text.startswith(prefix):
+            continue
+        vulnerabilities = result.get('vulnerabilities')
+        if isinstance(vulnerabilities, list) and vulnerabilities:
+            return True
+        if bool(result.get('callback_confirmed')):
+            return True
+        try:
+            if int(result.get('phase_parameters', 0) or 0) > 0:
+                return True
+        except (TypeError, ValueError):
+            pass
+    return False
+
+
 def _expand_planner_groups(
     selected_groups: list[tuple[str, dict[str, Any], str]],
     *,
     per_profile_budget: int,
     per_profile_max: int,
+    round_number: int=1,
+    previous_results: dict[str, dict[str, Any]] | None=None,
 ) -> tuple[list[dict[str, Any]], dict[str, dict[str, int]]]:
     by_profile: dict[str, list[tuple[str, dict[str, Any], str]]] = {}
     profile_order: list[str] = []
@@ -385,6 +428,7 @@ def _expand_planner_groups(
             profile_order.append(profile)
         by_profile[profile].append((candidate_id, group, selection_source))
 
+    previous_results = previous_results or {}
     expanded: list[dict[str, Any]] = []
     diagnostics: dict[str, dict[str, int]] = {}
     for profile in profile_order:
@@ -392,24 +436,35 @@ def _expand_planner_groups(
         prepared: list[tuple[str, dict[str, Any], str, list[dict[str, Any]]]] = []
         available = 0
         adaptive_available = 0
+        reserve_available = 0
         for candidate_id, group, selection_source in groups:
             actions = [item for item in group.get('actions', []) if isinstance(item, dict)]
-            # The specialist selector appends adaptive cases after the base. Make that ordering
-            # explicit here as well so a future producer cannot place overflow ahead of base cases.
-            actions = sorted(actions, key=lambda item: bool(item.get('adaptive_budget')))
+            # Reserve cases remain ahead of ordinary actions inside their own capability, but the
+            # capability itself receives only one action per round-robin pass. This preserves their
+            # priority without allowing Traversal (or any future reserve) to monopolize the profile.
+            actions = sorted(
+                actions,
+                key=lambda item: (
+                    0 if item.get('coverage_reserve') else 1,
+                    1 if item.get('adaptive_budget') else 0,
+                ),
+            )
             prepared.append((candidate_id, group, selection_source, actions))
             available += len(actions)
             adaptive_available += sum(bool(item.get('adaptive_budget')) for item in actions)
+            reserve_available += sum(bool(item.get('coverage_reserve')) for item in actions)
 
         base = max(1, int(per_profile_budget))
         maximum = max(base, int(per_profile_max))
-        effective = min(maximum, available)
+        base_target = min(base, available)
         offsets = [0] * len(prepared)
+        consumed: set[tuple[int, int]] = set()
         used = 0
         reserve_used = 0
+        adaptive_used = 0
 
         def append_action(index: int, offset: int) -> None:
-            nonlocal used, reserve_used
+            nonlocal used, reserve_used, adaptive_used
             candidate_id, group, selection_source, actions = prepared[index]
             action = dict(actions[offset])
             action['planner_group_id'] = candidate_id
@@ -423,43 +478,20 @@ def _expand_planner_groups(
                 prefix = 'AI selected'
             action['reason'] = f"{prefix} {candidate_id} ({group.get('tool')} capability): {str(action.get('reason') or 'discovery-derived candidate')[:380]}"
             expanded.append(action)
+            consumed.add((index, offset))
             used += 1
             if action.get('coverage_reserve'):
                 reserve_used += 1
+            if action.get('adaptive_budget'):
+                adaptive_used += 1
 
-        # Coverage-reserve actions represent high-confidence routing/file selectors that the
-        # deterministic ranking explicitly marked for direct validation. Consume them before
-        # discretionary round-robin expansion so they cannot be diluted by many other tool groups.
-        reserve_offsets: list[list[int]] = []
-        for _, _, _, actions in prepared:
-            reserve_offsets.append([idx for idx, action in enumerate(actions) if bool(action.get('coverage_reserve'))])
-        reserve_positions = [0] * len(prepared)
-        while used < effective:
+        # Fixed base: one action per selected capability on every pass. The deterministic ordering
+        # inside each capability is preserved, but no capability can consume its whole reserve first.
+        while used < base_target:
             added = False
-            for index, indices in enumerate(reserve_offsets):
-                position = reserve_positions[index]
-                if position >= len(indices):
-                    continue
-                offset = indices[position]
-                reserve_positions[index] += 1
-                append_action(index, offset)
-                added = True
-                if used >= effective:
-                    break
-            if not added:
-                break
-
-        # Continue with all non-reserve actions in capability-fair round-robin order.
-        consumed_offsets = {
-            (index, offset)
-            for index, indices in enumerate(reserve_offsets)
-            for offset in indices[:reserve_positions[index]]
-        }
-        while used < effective:
-            added = False
-            for index, (candidate_id, group, selection_source, actions) in enumerate(prepared):
+            for index, (_, _, _, actions) in enumerate(prepared):
                 offset = offsets[index]
-                while offset < len(actions) and ((index, offset) in consumed_offsets or bool(actions[offset].get('coverage_reserve'))):
+                while offset < len(actions) and (index, offset) in consumed:
                     offset += 1
                 offsets[index] = offset
                 if offset >= len(actions):
@@ -467,20 +499,81 @@ def _expand_planner_groups(
                 append_action(index, offset)
                 offsets[index] = offset + 1
                 added = True
-                if used >= effective:
+                if used >= base_target:
                     break
             if not added:
                 break
-        reserve_available = sum(len(indices) for indices in reserve_offsets)
+
+        # Overflow is available from round 1, but only to deterministic high-confidence reserve or
+        # adaptive specialist cases. Later rounds receive a larger cap; prior findings/Arjun parameter
+        # discovery raise a tool's overflow priority without making such evidence mandatory. This keeps
+        # round 1 adaptive while still preventing ordinary lower-ranked actions from filling the overflow.
+        overflow_cap = max(0, maximum - base)
+        signaled_tools = {
+            str(group.get('tool') or '').lower()
+            for _, group, _, _ in prepared
+            if _tool_has_followup_signal(previous_results.get(profile, {}), str(group.get('tool') or ''))
+        }
+
+        def overflow_priority(action: dict[str, Any], tool: str) -> int | None:
+            if action.get('coverage_reserve'):
+                return 0
+            if action.get('adaptive_budget') and tool in signaled_tools:
+                return 1
+            if action.get('adaptive_budget'):
+                return 2
+            return None
+
+        overflow_eligible = 0
+        if overflow_cap > 0:
+            for index, (_, group, _, actions) in enumerate(prepared):
+                tool = str(group.get('tool') or '').lower()
+                for offset, action in enumerate(actions):
+                    if (index, offset) in consumed:
+                        continue
+                    if overflow_priority(action, tool) is not None:
+                        overflow_eligible += 1
+
+        overflow_target = min(maximum, base + min(overflow_cap, overflow_eligible), available)
+        while used < overflow_target:
+            added = False
+            # Preserve capability fairness. Within one pass, reserve and prior-signal follow-up cases
+            # outrank unsignaled adaptive overflow, but every selected capability gets a chance.
+            for priority in (0, 1, 2):
+                for index, (_, group, _, actions) in enumerate(prepared):
+                    tool = str(group.get('tool') or '').lower()
+                    chosen_offset = None
+                    for offset, action in enumerate(actions):
+                        if (index, offset) in consumed:
+                            continue
+                        if overflow_priority(action, tool) == priority:
+                            chosen_offset = offset
+                            break
+                    if chosen_offset is None:
+                        continue
+                    append_action(index, chosen_offset)
+                    added = True
+                    if used >= overflow_target:
+                        break
+                if used >= overflow_target:
+                    break
+            if not added:
+                break
+
         diagnostics[profile] = {
             'base': base,
             'adaptive_max': maximum,
+            'overflow_cap': overflow_cap,
+            'configured_overflow_max': max(0, maximum - base),
             'available': available,
             'selected': used,
             'coverage_reserve_available': reserve_available,
             'coverage_reserve_selected': reserve_used,
-            'execution_overflow_used': max(0, used - min(base, used)),
+            'execution_overflow_used': max(0, used - base),
             'adaptive_cases_available': adaptive_available,
+            'adaptive_cases_selected': adaptive_used,
+            'overflow_eligible': overflow_eligible,
+            'followup_signal_tools': len(signaled_tools),
             'deferred': max(0, available - used),
         }
     return expanded, diagnostics
@@ -881,7 +974,9 @@ def _humanize_planner_reasoning(value: Any) -> str:
         ('reasoning_summary', 'reasoning'),
         ('tool_group_budget_per_profile', 'tool-group budget per profile'),
         ('execution_action_budget_per_profile', 'base concrete execution budget per profile'),
-        ('execution_action_adaptive_max_per_profile', 'adaptive concrete execution ceiling per profile'),
+        ('execution_action_adaptive_max_per_profile', 'selective concrete execution ceiling per profile'),
+        ('execution_action_overflow_per_profile', 'current-round concrete overflow per profile'),
+        ('execution_action_configured_max_per_profile', 'configured concrete execution ceiling per profile'),
         ('remaining_slots_by_profile', 'remaining slots by profile'),
     )
     for internal, readable in replacements:
@@ -909,9 +1004,10 @@ def _planner_system_message() -> str:
         '- DEFER only for a concrete reason: real duplication, already completed equivalent work, unsupported discovery, incompatible input, unsafe action, or clearly very low expected value.\n'
         '- Broad scanners and targeted tools are complementary; neither category replaces the other by default.\n'
         '- A confirmed finding does not stop exploration of unrelated attack surfaces.\n'
+        '- On rounds after the first, select another specialist group batch only when previous results, newly exposed attack surface, unresolved high-confidence candidates or materially distinct request families justify more work. Do not select a group merely because lower-ranked deferred contracts still exist.\n'
         '- Use IDOR only for suitable numeric references, authorization only for read-only identity/object/resource signals, and Interactsh only for compatible OAST inputs.\n'
         '- tool_group_budget_per_profile is an independent maximum for each active profile, not a shared quota. Never add groups merely to reach a count.\n'
-        '- Concrete request execution is bounded separately by a base and an adaptive maximum for each profile. Python, not the model, decides whether selected groups contain enough validated work to use capacity above the base.\n'
+        '- Concrete request execution is bounded separately by a fixed base and a small selective overflow for each profile. A bounded overflow is already available in round 1 and grows gradually on later rounds. Python, not the model, admits it only for deterministic high-confidence coverage-reserve or adaptive specialist cases; prior findings raise follow-up priority.\n'
         '- Do not omit authenticated coverage merely because anonymous groups were selected: the two profiles have separate planning and concrete execution capacity.\n'
         '- Set finish=true only when no remaining candidate is likely to add useful evidence.\n\n'
         '[OUTPUT CONTRACT]\n'
@@ -996,7 +1092,10 @@ def ai_plan(state: AgentState) -> dict[str, Any]:
     profile_names = list(dict.fromkeys(str(group.get('profile') or '') for group in eligible_groups if str(group.get('profile') or '')))
     group_budget = PROFILE_TOOL_GROUP_BUDGETS.get(shared.CURRENT_SCAN_MODE, 12)
     execution_budget = PROFILE_EXECUTION_ACTION_BUDGETS.get(shared.CURRENT_SCAN_MODE, 48)
-    execution_max = PROFILE_EXECUTION_ACTION_MAX.get(shared.CURRENT_SCAN_MODE, execution_budget)
+    current_round = int(state.get('round', 0) or 0) + 1
+    execution_overflow_cap = _execution_overflow_cap(shared.CURRENT_SCAN_MODE, current_round)
+    execution_max = execution_budget + execution_overflow_cap
+    configured_execution_max = PROFILE_EXECUTION_ACTION_MAX.get(shared.CURRENT_SCAN_MODE, execution_max)
     prompt = {
         'target': state['target'],
         'round': state['round'] + 1,
@@ -1004,6 +1103,8 @@ def ai_plan(state: AgentState) -> dict[str, Any]:
         'tool_group_budget_per_profile': group_budget,
         'execution_action_budget_per_profile': execution_budget,
         'execution_action_adaptive_max_per_profile': execution_max,
+        'execution_action_overflow_per_profile': execution_overflow_cap,
+        'execution_action_configured_max_per_profile': configured_execution_max,
         'active_profiles': profile_names,
         'scan_mode': shared.CURRENT_SCAN_MODE,
         'discovery_summary': _planner_discovery_summary(state['discovery']),
@@ -1143,6 +1244,8 @@ def ai_plan(state: AgentState) -> dict[str, Any]:
                     'tool_group_budget_per_profile': group_budget,
                     'execution_action_budget_per_profile': execution_budget,
                     'execution_action_adaptive_max_per_profile': execution_max,
+                    'execution_action_overflow_per_profile': execution_overflow_cap,
+                    'execution_action_configured_max_per_profile': configured_execution_max,
                     'discovery_summary': prompt['discovery_summary'],
                     'previous_results': prompt['previous_results'],
                     'available_tools': registry,
@@ -1207,6 +1310,8 @@ def ai_plan(state: AgentState) -> dict[str, Any]:
                 selected_groups,
                 per_profile_budget=execution_budget,
                 per_profile_max=execution_max,
+                round_number=state['round'] + 1,
+                previous_results=state.get('results', {}),
             )
             concrete_selected_per_profile = {
                 profile: int(values.get('selected', 0))
@@ -1245,6 +1350,8 @@ def ai_plan(state: AgentState) -> dict[str, Any]:
                 'tool_group_budget_per_profile': group_budget,
                 'execution_action_budget_per_profile': execution_budget,
                 'execution_action_adaptive_max_per_profile': execution_max,
+                'execution_action_overflow_per_profile': execution_overflow_cap,
+                'execution_action_configured_max_per_profile': configured_execution_max,
                 'execution_budget_diagnostics_per_profile': execution_diagnostics,
                 'review_seconds': review_seconds,
                 'review_error': review_error,
@@ -2270,7 +2377,9 @@ def planner_node(state: AgentState) -> dict[str, Any]:
     audit = list(state.get('planner_audit', []))
     eligible = _eligible_action_catalog(state)
     budget_per_profile = PROFILE_EXECUTION_ACTION_BUDGETS.get(shared.CURRENT_SCAN_MODE, 48)
-    max_budget_per_profile = PROFILE_EXECUTION_ACTION_MAX.get(shared.CURRENT_SCAN_MODE, budget_per_profile)
+    round_overflow_cap = _execution_overflow_cap(shared.CURRENT_SCAN_MODE, round_number)
+    max_budget_per_profile = budget_per_profile + round_overflow_cap
+    configured_max_budget_per_profile = PROFILE_EXECUTION_ACTION_MAX.get(shared.CURRENT_SCAN_MODE, max_budget_per_profile)
     planner_source = 'ai'
     summary = ''
     endpoint = 'unavailable'
@@ -2324,9 +2433,13 @@ def planner_node(state: AgentState) -> dict[str, Any]:
                 selected_actions = int(details.get('selected', 0) or 0) if isinstance(details, dict) else 0
                 available_actions = int(details.get('available', selected_actions) or selected_actions) if isinstance(details, dict) else selected_actions
                 deferred_actions = int(details.get('deferred', 0) or 0) if isinstance(details, dict) else 0
+                overflow_used = int(details.get('execution_overflow_used', 0) or 0) if isinstance(details, dict) else 0
+                overflow_cap = int(details.get('overflow_cap', max(0, max_budget_per_profile - budget_per_profile)) or 0) if isinstance(details, dict) else max(0, max_budget_per_profile - budget_per_profile)
+                overflow_eligible = int(details.get('overflow_eligible', 0) or 0) if isinstance(details, dict) else 0
                 print(
                     f"    [PLANNER BUDGET] {profile_name}: tool groups={selected_groups_by_profile.get(profile_name, 0)}/{PROFILE_TOOL_GROUP_BUDGETS.get(shared.CURRENT_SCAN_MODE, 12)}; "
-                    f"concrete actions={selected_actions}/{budget_per_profile} base, adaptive max={max_budget_per_profile}; "
+                    f"concrete actions={selected_actions}/{budget_per_profile} base, round max={max_budget_per_profile}, configured ceiling={configured_max_budget_per_profile}; "
+                    f"overflow={overflow_used}/{overflow_cap} (eligible={overflow_eligible}); "
                     f"selected-group pool={available_actions}; deferred={deferred_actions}",
                     flush=True,
                 )
@@ -2356,6 +2469,8 @@ def planner_node(state: AgentState) -> dict[str, Any]:
         'eligible_tools': sorted({str(action.get('tool') or '') for action in eligible}),
         'execution_action_budget_per_profile': budget_per_profile,
         'execution_action_adaptive_max_per_profile': max_budget_per_profile,
+        'execution_action_overflow_per_profile': round_overflow_cap,
+        'execution_action_configured_max_per_profile': configured_max_budget_per_profile,
         'execution_budget_diagnostics_per_profile': dict(LAST_AI_PLAN_DIAGNOSTICS.get('execution_budget_diagnostics_per_profile', {})) if planner_source == 'ai' and isinstance(LAST_AI_PLAN_DIAGNOSTICS.get('execution_budget_diagnostics_per_profile', {}), dict) else {},
         'tool_group_budget_per_profile': PROFILE_TOOL_GROUP_BUDGETS.get(shared.CURRENT_SCAN_MODE, 12),
         'baseline_selected_group_count': len(baseline_selected_ids) if planner_source == 'ai' else 0,
