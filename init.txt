@@ -1,12 +1,12 @@
 
-POLICY SCOPE, AUTENTICAZIONE E RATE (v31.76)
+POLICY SCOPE, AUTENTICAZIONE E RATE (v31.79)
 ---------------------------
-- Lo scope attivo usa origin esplicite; authorization.allow_same_host_ports (default false) puo' ammettere porte HTTP(S) diverse gia' scoperte sullo stesso hostname/schema, senza port scan.
+- Lo scope attivo usa origin esplicite; authorization.allow_same_host_ports (default false) puo' ammettere servizi HTTP/HTTPS su porte diverse dello stesso hostname esatto, anche con cambio HTTP<->HTTPS. Con authorization.discover_same_host_services=true la discovery puo' inoltre cercarli proattivamente con un sweep TCP generico bounded; il flag richiede allow_same_host_ports=true e non autorizza hostname sibling.
 - Un href, iframe, script, XHR/fetch o redirect verso un altro host NON estende lo scope. I suffissi DNS non autorizzano attacchi.
 - La console distingue gli URL esterni scartati dagli scanner dalle normali subresource esterne caricate da Chromium per rendering/autenticazione; queste ultime sono segnalate ma non diventano casi di active testing.
 - Login e SSO sulla stessa origin autorizzata restano testabili; non esistono eccezioni hardcoded per nomi/path di login.
 - Un IdP esterno attraversato dal browser per completare il login non diventa target senza autorizzazione esplicita.
-- Liste Excel/docker-compose usate per valutare la copertura non vengono fornite come seed alla discovery.
+- Qualunque dataset esterno usato per validazione o confronto resta fuori dal runtime: non viene usato come seed, input del planner, source di porte o guida per gli scanner.
 - execution.request_rate e' il parametro configurabile: default=10 req/s se omesso, range intero accettato 1-50. Valori >50, <1, non numerici o non finiti tornano al default 10 con RATE WARNING in console e annotazione nel report/Results Data. SECOPS_MAX_REQUEST_RATE e' il valore normalizzato propagato ai processi child. Il limite vale PER SINGOLO assessment/processo: Deterministic e Agentic eseguono gli specialisti attivi di quel run strettamente in sequenza, ma due assessmentRunner avviati separatamente hanno pacer indipendenti e il progetto non impone un token bucket globale alla VM. Se si lanciano piu' assessment in parallelo, l'operatore puo' abbassare execution.request_rate in ciascun config. La concorrenza interna bounded di singoli tool non equivale a parallelismo tra scanner dello stesso assessment. Cambiare il rate modifica il ritmo, non i budget/ceiling di copertura.
 - Il server MCP unificato espone un fingerprint dei sorgenti congelato all'avvio: prima di riusare una porta MCP gia' aperta, l'orchestratore verifica che il processo serva la stessa versione dei sorgenti. Un server SecOps vecchio o un servizio estraneo sulla porta viene rifiutato, non riusato silenziosamente. La verifica e' portabile Linux/macOS/Windows.
 - La seconda identita' Authorization/BOLA (--secondary-cookies / secondary_credential_ref) e' scorporata dallo stato OIDC della primaria: non eredita storage_state o cookie registry della prima identita'.
@@ -61,9 +61,9 @@ C) NUOVA APPLICAZIONE - CONFIGURAZIONE
    o il base path e la discovery cerca il resto usando link/form, DOM renderizzato, menu dinamici,
    JavaScript e traffico browser osservato. Se invece ricevi un elenco di URL che devono essere
    garantiti come punti di ingresso autorizzati, inserisci un servizio per ciascun URL.
-   configs/tourist-dashboard.json usa questa forma per otto dashboard sulla stessa origine; il
-   runner le normalizza a runtime in un solo assessment senza modificare il JSON. Liste esterne
-   usate soltanto come benchmark della discovery non devono essere inserite nel config.
+   Se piu' entry URL descrivono lo stesso servizio logico e condividono policy di sicurezza/autenticazione,
+   il runner puo' coalescerle a runtime mantenendole tutte come entry point. Dataset esterni usati soltanto
+   per validare i risultati restano fuori dal config e dall'esecuzione.
 
    Prima di avviare gli scanner esegui un dry-run:
      python .\assessmentRunner.py --config .\configs\platform.example.json --orchestrator deterministic --mode balanced --dry-run --authorized
@@ -253,42 +253,26 @@ Override disponibili senza modificare il JSON:
 Per llama/qwen, durante una esecuzione reale il runner verifica il modello esatto gia' installato in Ollama. Non lo scarica e non
 accetta la sostituzione silenziosa con l'altro modello: inizializza prima il modello richiesto. Il --dry-run resta invece una validazione del piano: non richiede FastMCP/scanner installati, non verifica la disponibilita' del modello locale e non risolve i segreti riutilizzabili.
 
-MICROX / DASHBOARD-TEST
-Prima aggiungi nella VM la mappatura autorizzata del target:
-  192.168.1.81 dashboard-test
-Verifica poi:
-  getent hosts dashboard-test
-  curl -v http://dashboard-test/
-  curl -vk https://dashboard-test/
+TARGET REMOTO CONFIG-DRIVEN
+---------------------------
+Mantieni mapping host, servizi autorizzati e riferimenti alle credenziali nel config dell'assessment o
+nell'ambiente dell'operatore. La documentazione e il codice generico non devono incorporare host, IP,
+endpoint, porte o dataset di validazione appartenenti a un target specifico.
 
-configs/dashboard-test.json contiene HTTP/80 e HTTPS/443. Il run autorizzato del 03/09/2026 ha confermato
-HTTP/80 con base_path=/, quindi http-80 e' gia' enabled; HTTPS/443 resta disabled finche' non viene verificato.
-Usa soltanto un account Snap4City autorizzato per questo test.
-configs/dashboard-test.json usa credential_ref=dashboard_session con login browser automatico Snap4City/Keycloak.
-Il config dashboard-test imposta authorization.allow_same_host_ports=true: una porta HTTP differente puo' entrare nello scope solo se la normale discovery espone una URL con hostname dashboard-test e stesso schema; non viene effettuata enumerazione di porte. Nessun suffisso DNS amplia lo scope e nessun endpoint dell'Excel/docker-compose viene usato come seed. Il login browser puo' attraversare una origin esterna per autenticarsi, ma tale hostname non diventa target attivo.
-Ordine di risoluzione della sessione:
-  1. Se DASHBOARD_TEST_COOKIE e' valorizzato, il cookie resta il primo metodo realmente provato. Non viene mai copiato su un hostname diverso; con authorization.allow_same_host_ports=true puo' essere provato anche su un'altra porta autorizzata dello stesso hostname/schema e viene sempre validato.
-  2. Legge DASHBOARD_TEST_USERNAME e DASHBOARD_TEST_PASSWORD e conserva in memoria i valori disponibili per l'intero assessment come fallback dopo cookie e storage browser/OIDC.
-  3. Se una variabile manca e la console del runner e' interattiva, chiede soltanto il valore mancante UNA VOLTA. La password non viene mostrata. I processi orchestrator figli non aprono altri prompt per le stesse credenziali.
-  4. Se il cookie applicabile non supera il session probe, Chromium prova prima l'eventuale storage state browser/OIDC gia' disponibile; se il flusso richiede ancora login, usa gli stessi username/password risolti una sola volta. Per il target primario puo' aprire /dashboardSmartCity/ e completare il flusso OIDC/Keycloak. Il browser storage state dell'identity provider viene conservato in memoria insieme alla sessione applicativa.
-  5. Se la discovery authenticated trova una nuova sibling autorizzata con evidenza applicativa, Chromium prova prima il vero SSO riusando quello storage state. Se Keycloak mostra di nuovo username/password, vengono reinseriti automaticamente gli stessi valori risolti al punto 2/3: non vengono richiesti di nuovo in console.
-  6. La sibling e' considerata authenticated soltanto se il flusso produce un cookie proprio di quella origin e il probe di sessione lo valida. In caso positivo viene eseguita anche una rediscovery authenticated bounded della sibling; precheck e scanner usano poi quel cookie origin-specifico.
-  7. Se SSO/reauthentication non riesce, la sibling resta no-cookie/anonymous e la copia authenticated equivalente viene deduplicata. Se la credenziale primaria opzionale non e' disponibile o il login primario fallisce, il job continua solo anonimo; con --auth-only il job viene bloccato.
-Le credenziali, lo storage state e i cookie ottenuti non vengono scritti nel JSON di configurazione o nei Results Data. Il runner li passa al processo figlio solo tramite un file temporaneo mode 0600 indicato da SECOPS_RUNTIME_AUTH_STATE e lo elimina subito dopo il job.
-Esempio non interattivo:
-  export DASHBOARD_TEST_USERNAME='authorized-user'
-  export DASHBOARD_TEST_PASSWORD='authorized-password'
-Queste sono credenziali dell'account della dashboard target e NON sono snap4city_model_credentials.json, che serve soltanto al provider AI Snap4City.
-I comandi aggiuntivi non sono hardcodati per dashboard-test: vengono generati automaticamente dai JSON reali presenti in configs/.
-Per dashboard-test, per esempio, vengono stampati entrambi:
-  python .\assessmentRunner.py --config .\configs\dashboard-test.json --orchestrator deterministic --mode balanced --authorized
-  python .\assessmentRunner.py --config .\configs\dashboard-test.json --orchestrator agentic --model <MODELLO_EFFETTIVO> --max-rounds 2 --mode balanced --require-ai --authorized
-<MODELLO_EFFETTIVO> e' il modello Agentic selezionato/verificato dall'initializer quando disponibile.
-DASHBOARD_TEST_COOKIE resta un override manuale opzionale per riusare una sessione gia' valida:
-  export DASHBOARD_TEST_COOKIE='PHPSESSID=<SESSION>; ...'
-Se e' presente ha precedenza su username/password e il job esegue anonimo + authenticated senza scrivere il cookie nel JSON.
+Per una credenziale browser_oidc l'ordine di riuso e' generico:
+  1. cookie applicabile alla destinazione, se presente;
+  2. validazione con session probe;
+  3. storage state browser/OIDC gia' disponibile;
+  4. username/password originali gia' risolti dal runner, soltanto se il flusso di login li richiede.
+Le credenziali vengono risolte nel parent runner una sola volta e mantenute in memoria per il job; i child
+non riaprono prompt. Un Cookie header grezzo non viene mai copiato su un hostname diverso. Una diversa
+porta/HTTPS-HTTP dello stesso hostname puo' essere autorizzata dalla policy multi-port, ma il riuso della
+sessione resta subordinato alla normale policy Cookie/Storage e alla validazione.
 
-
+Esempio generico:
+  python .\assessmentRunner.py --config .\configs\<assessment>.json --orchestrator deterministic --mode balanced --dry-run --authorized
+  python .\assessmentRunner.py --config .\configs\<assessment>.json --orchestrator deterministic --mode balanced --authorized
+  python .\assessmentRunner.py --config .\configs\<assessment>.json --orchestrator agentic --model <MODELLO_EFFETTIVO> --max-rounds 2 --mode balanced --require-ai --authorized
 
 Configurazioni target: URL completo oppure host/IP + porta
 --------------------------------------------------------
@@ -303,30 +287,18 @@ Il campo service.url, quando valorizzato, ha precedenza su host/port/base_path. 
 che usano host + protocol + port continuano a funzionare senza modifiche.
 La validazione del config controlla anche i tipi booleani (enabled/auth_only/allow_state_changes/require_ai), max_rounds 1-3 e la validita' dei credential_ref. Un riferimento a una credenziale inesistente o auth_only=true senza credential_ref viene quindi bloccato gia' nel dry-run.
 
-configs/tourist-dashboard.json contiene gia' gli otto URL HTTPS pubblici forniti per la dashboard turistica.
-La configurazione e' volutamente ANONYMOUS-ONLY: i servizi non hanno credential_ref e il file non contiene un
-blocco credentials per il target. assessmentRunner.py quindi non chiede TOURIST_DASHBOARD_COOKIE/_USERNAME/_PASSWORD
-e non avvia alcun login browser/OIDC. auth_only=false mantiene il profilo anonimo; allow_state_changes resta false.
-Il JSON mantiene otto servizi, ma assessmentRunner.py riconosce a runtime che condividono stesso asset, origine,
-path e policy di sicurezza. Li coalesca quindi in UN solo job logico, passando tutti gli otto URL completi come
-entry point forzati della stessa discovery. Discovery, scanner, AI e report vengono eseguiti una volta invece di
-otto; --only <job-id> disattiva volutamente questa coalescenza per permettere la diagnosi di un singolo servizio.
-
-Regola generale per un servizio anonymous-only nel JSON: rimuovere credential_ref (o lasciarlo vuoto). Se quella
-credenziale non e' usata da nessun altro servizio, rimuovere anche la relativa voce dal blocco top-level credentials.
+Regola generale per un servizio anonymous-only nel JSON: rimuovere credential_ref (o lasciarlo vuoto). Se una
+credenziale non e' usata da nessun altro servizio, puo' essere rimossa anche dal blocco top-level credentials.
 auth_only=false da solo NON disabilita l'autenticazione: con un credential_ref valido il runner puo' eseguire sia
 il profilo anonimo sia quello autenticato.
 
-Il blocco reporting aggregate_report=true/keep_job_reports=false resta valido per configurazioni con piu' job
-realmente distinti; nel tourist dashboard, dopo la normalizzazione runtime, rimane direttamente un solo report
-logico. aggregate_report e keep_job_reports devono essere booleani JSON reali (true/false).
-Nel report aggregato ogni finding conserva la provenienza: sono mostrati il tool/scanner, l'URL interessato e
-l'entry point/job da cui deriva l'evidenza. Se finding equivalenti vengono deduplicati, la voce finale mantiene
-tutti gli entry point e i job che l'hanno corroborata.
-
+Quando piu' service entry condividono la stessa origin, path e policy di sicurezza/autenticazione, il runner puo'
+coalescerli in un solo job logico e conservare tutti gli URL come entry point iniziali. --only <job-id> mantiene
+la possibilita' di diagnosticare un servizio singolo. Il reporting aggregato resta utile quando sopravvivono piu'
+job realmente distinti.
 
 Dry-run consigliato:
-  python .\assessmentRunner.py --config .\configs\tourist-dashboard.json --orchestrator deterministic --mode balanced --dry-run --authorized
+  python .\assessmentRunner.py --config .\configs\<assessment>.json --orchestrator deterministic --mode balanced --dry-run --authorized
 
 Esempio architettura complessa:
   configs/platform.example.json
@@ -403,8 +375,7 @@ menu/dropdown/collapse non contenuti in form e privi di etichette distruttive. I
 bloccare navigazioni non GET/HEAD/OPTIONS. I valori di parametri di routing come redirect/linkUrl/page/file/path
 che identificano moduli interni entrano nella firma semantica e la destinazione annidata sicura viene reinserita
 nella coda; due moduli diversi non vengono piu' scartati come semplici varianti dello stesso parametro.
-I budget Chromium sono 36/90, 160/520 e 240/720 (base/massimo) in fast/balanced/deep; i controlli menu per
-pagina sono 6/18/28. Il crawler HTTP usa un budget base/massimo adattivo di 70/110, 280/420 e 420/650 pagine utili; gli asset JavaScript realmente ispezionati sono 48/256/384; i tentativi di fetch hanno un tetto separato 1,5x/1,75x/1,75x, quindi asset 404/timeout non consumano la quota utile. Dopo il budget HTTP base, l'overflow continua solo finché il candidato successivo mantiene almeno il 75% del cutoff del set base. La coda aggiunge inoltre un bonus generico alle famiglie applicative ancora poco visitate, definite da origin + primo segmento del path, così un modulo molto grande non monopolizza il crawl bounded. Il log segnala separatamente base, overflow, massimo, tentativi e candidati rimasti. Gli stessi indicatori principali vengono riportati anche nella Discovery summary del report, insieme al numero di famiglie applicative visitate e all'esito aggregato dell'autenticazione runtime delle sibling. L'origine primaria mantiene un bonus generico nel ranking, così le sibling origin esplicitamente autorizzate restano esplorabili senza sottrarre facilmente le pagine più rilevanti al target principale. Le varianti OAuth/OIDC puramente volatili (state, nonce, session_code, tab_id, execution, challenge) e i callback applicativi con combinazioni transienti state/code/session_state/iss vengono mantenuti come evidenza ma de-prioritizzati e limitati a una sola variante per shape di route durante discovery, cosi' non saturano la coda. I callback transienti non entrano nei pool injection/traversal/workflow, mentre la route login/SSO stabile senza query resta disponibile per l'autenticazione. Nel profilo authenticated Chromium importa direttamente lo storage state browser salvato quando disponibile e, al termine, conserva quello aggiornato: cookie Domain/Path/Secure/host-only e stato SSO/local storage non vengono appiattiti in un Cookie header origin-wide durante la discovery. Le XHR/fetch osservate non consumano un ulteriore budget di pagine e possono generare
+I budget Chromium sono 72/200, 400/1200 e 800/2400 (base/massimo) in fast/balanced/deep; i controlli menu per pagina sono 16/64/112 e, dopo una espansione riuscita, il DOM viene ricontrollato fino a 3/6/9 pass bounded senza ricliccare i controlli. Il crawler HTTP usa 120/220, 600/1100 e 1200/2200 pagine utili; gli asset JavaScript realmente ispezionati sono 128/640/1200. Dopo il budget HTTP base, l'overflow continua solo finché il candidato successivo mantiene almeno il 75% del cutoff del set base. La coda aggiunge inoltre un bonus generico alle famiglie applicative ancora poco visitate, definite da origin + primo segmento del path, così un modulo molto grande non monopolizza il crawl bounded. Il log segnala separatamente base, overflow, massimo, tentativi e candidati rimasti. Gli stessi indicatori principali vengono riportati anche nella Discovery summary del report, insieme al numero di famiglie applicative visitate e all'esito aggregato dell'autenticazione runtime delle sibling. L'origine primaria mantiene un bonus generico nel ranking, così le sibling origin esplicitamente autorizzate restano esplorabili senza sottrarre facilmente le pagine più rilevanti al target principale. Le varianti OAuth/OIDC puramente volatili (state, nonce, session_code, tab_id, execution, challenge) e i callback applicativi con combinazioni transienti state/code/session_state/iss vengono mantenuti come evidenza ma de-prioritizzati e limitati a una sola variante per shape di route durante discovery, cosi' non saturano la coda. I callback transienti non entrano nei pool injection/traversal/workflow, mentre la route login/SSO stabile senza query resta disponibile per l'autenticazione. Nel profilo authenticated Chromium importa direttamente lo storage state browser salvato quando disponibile e, al termine, conserva quello aggiornato: cookie Domain/Path/Secure/host-only e stato SSO/local storage non vengono appiattiti in un Cookie header origin-wide durante la discovery. Le XHR/fetch osservate non consumano un ulteriore budget di pagine e possono generare
 request contract. Per le richieste realmente inviate vengono registrati anche status/content-type della response
 o requestfailed, cosi' il planner distingue endpoint raggiunti da 404/410 senza scartare 401/403. Le risposte HTTP 404/410 restano nei warning e nel report, ma non consumano il budget di pagine utili del crawler, non diventano seed HTML per Chromium/ZAP e, dopo conferma dello status, non generano request contract specialistici. Un limite separato di tentativi HTTP pari a 1,75x/2,0x/2,0x del massimo utile in fast/balanced/deep evita che grandi insiemi di link morti causino richieste non bounded senza troncare prematuramente il crawl utile. Gli abort/timeout/navigation context distrutti di Chromium ricevono al massimo un retry bounded di navigazione o estrazione DOM e i retry sono riportati nei diagnostics. Se esistono pagine HTML ma Chromium conclude con 0 navigazioni, la console mostra un BROWSER WARNING e porta gli errori Playwright/runtime/navigation prima dei normali 404/410. Nel Deterministic la discovery Playwright sincrona viene eseguita in un worker thread, evitando l'uso della Sync API dentro l'event loop asyncio di LangGraph. Se il numero di navigazioni raggiunge il limite del profilo, la console stampa inoltre la saturazione usato/budget. Le richieste
 browser non-GET e le rotte distruttive vengono intercettate prima dell'invio:
@@ -414,12 +385,12 @@ POST e JSON restano request contract di prima classe: non vengono eliminati per 
 La coda deduplica le varianti ordinarie ma conserva valori semanticamente diversi dei parametri che selezionano
 route/file/moduli interni; applica quote per origin e penalizza asset statici, vendor/chunk, paginazioni/archivi.
 Il runner puo' usare login_path/validation_path gia' presenti nella credenziale come discovery seed ordinari,
-soggetti ai normali budget: non vengono considerati entry point forniti e nessuna lista benchmark esterna viene
-iniettata nel config o nel crawler. login_path e' opzionale: quando manca sul target iniziale, Chromium usa una
+soggetti ai normali budget: non vengono considerati entry point forniti e nessun dataset esterno di validazione viene
+iniettato nel config, nella discovery o nel planner. login_path e' opzionale: quando manca sul target iniziale, Chromium usa una
 piccola discovery pre-auth bounded sulla stessa origin, seguendo soltanto candidati GET non distruttivi e cercando
 form/controlli di login o redirect OIDC generici. Se non trova un candidato migliore usa target/root; questa fase
 non invia form, non amplia lo scope e con un login_path esplicito non viene eseguita. Non puo' indovinare una route di login completamente scollegata/non esposta dai pochi link same-origin visitati: in quel caso login_path resta un hint utile.
-Nei credential browser_oidc, reuse_on_authorized_siblings=true abilita il riuso delle credenziali gia' risolte soltanto sulle altre destinazioni gia' autorizzate e dopo conferma dello stesso issuer/realm; non amplia mai lo scope. Schema+hostname+porta effettiva definiscono la origin: http://host e http://host:80 sono equivalenti. Per default una porta diversa richiede una origin/servizio esplicito. Se authorization.allow_same_host_ports=true, una URL HTTP(S) scoperta su una porta differente viene invece ammessa quando mantiene esattamente lo stesso hostname e lo stesso schema di una origin gia' autorizzata. Il flag NON esegue port scanning e non enumera porte: abilita soltanto porte gia' emerse dalla normale discovery. Un cambio HTTP<->HTTPS o un hostname diverso richiedono ancora autorizzazione esplicita. host.evil non e' una parte di host ma un hostname diverso. dashboard-test.json, tourist-dashboard.json e platform.example.json mostrano il flag a true; se il campo manca il default e' false. Un href, iframe, script, XHR/fetch o redirect verso un altro hostname non estende lo scope. Gli scanner attivi sono eseguiti strettamente in sequenza sia dal Deterministic sia dall'Agentic. execution.request_rate vale 10 req/s per default se assente e accetta valori interi 1-50; un valore fuori intervallo/non valido torna a 10 con warning in console e nel report. SECOPS_MAX_REQUEST_RATE contiene il valore effettivo propagato ai wrapper. La policy e' per singolo assessment/processo e non e' un limite globale della VM: due runner indipendenti hanno due pacer indipendenti; per eseguirli contemporaneamente si riduce il rate di ciascun config se necessario. Session probe, target preparation, logout verifier e pre-verifiche HTTP sensibili seguono redirect soltanto sulla origin iniziale; la discovery generale applica invece l'intera policy autorizzativa, incluso allow_same_host_ports quando abilitato. Arjun (con --disable-redirects), Nuclei (-dr), SQLMap (ignoreRedirects) e Commix (--ignore-redirects) non seguono redirect autonomamente; --disable-redirects blocca davvero tutti i redirect interni ad Arjun. Per i casi GET il wrapper Arjun risolve prima una catena bounded same-host/same-scheme con richieste no-follow, ammettendo una porta diversa solo quando la policy multi-port lo consente. Se il Location punta a un hostname diverso ma esplicitamente autorizzato, il wrapper NON trascina il cookie corrente su quell'host: la destinazione resta alla discovery centrale, che puo' applicare la sessione corretta. I non-GET non vengono ripetuti solo per risolvere redirect; la discovery HTTP/Chromium segue invece in modo bounded le catene che restano nella policy autorizzativa: i redirect same-origin sono normali, una origin esplicita e' ammessa e, con allow_same_host_ports=true, e' ammessa anche una porta diversa dello stesso hostname/schema; le destinazioni autorizzate scoperte vengono rimesse nella selezione, quindi il no-follow dei processi esterni conserva le normali destinazioni applicative di redirect scoperte in-scope; i comportamenti interni a un singolo scanner/template che richiedono autonomamente un redirect restano invece intenzionalmente soppressi quando il tool non offre una allow-list exact-origin; ZAP non segue redirect nel seeding diretto, usa un context ancorato alla exact-origin, active scan in-scope-only e Protected mode; Nikto non usa -followredirects e puo' iniziare soltanto dalla destinazione finale raggiunta dal baseline same-origin; FFUF non abilita redirect e Dalfox mantiene il proprio default no-follow. Un session probe bloccato su redirect cross-origin o fermato dal limite bounded di redirect same-origin resta inconclusivo e non viene contato come sessione autenticata. Anche Traversal/LFI usa la stessa guardia redirect degli altri verificatori. La console emette [SCOPE] quando osserva URL/origin esterne e specifica che non sono state messe in coda per active testing. Nei redirect bloccati il riepilogo usa la destinazione esterna rifiutata, non la pagina in-scope che ha emesso il Location. Le stringhe URL letterali complete escapate in HTML/JavaScript vengono normalizzate, mentre frammenti incompleti come http\:/ vengono scartati invece di diventare falsi path relativi. Anche il Browser XSS/workflow verifier riceve execution.request_rate, spazia le navigazioni document e applica la stessa policy di scope (incluse le porte stesso-host quando abilitate), bloccando/diagnosticando le destinazioni non autorizzate; le subresource browser necessarie al rendering non sono un token bucket globale di ogni richiesta di rete.
+Nei credential browser_oidc, reuse_on_authorized_siblings=true abilita il riuso delle credenziali gia' risolte soltanto sulle altre destinazioni gia' autorizzate e dopo conferma dello stesso issuer/realm; non amplia mai lo scope. Schema+hostname+porta effettiva definiscono la origin. authorization.allow_same_host_ports=true ammette altri servizi HTTP/HTTPS soltanto sullo stesso hostname esatto, anche con porta o schema differente; non autorizza sibling DNS. authorization.discover_same_host_services=true, valido solo insieme al flag multi-port, esegue una discovery proattiva bounded sullo stesso hostname: usa database di servizi disponibili a runtime e completa il budget con un ordine stratificato sull'intervallo TCP 1-65535. Fast/balanced/deep provano al massimo 4096/32768/65535 porte candidate. TLS (Transport Layer Security) e' il protocollo crittografico usato da HTTPS per cifrare la connessione e validare il certificato del server. Un servizio entra nella superficie web solo dopo una risposta HTTP riconoscibile; HTTPS viene classificato con handshake TLS bounded e probe HTTP. Porte TCP aperte ma non confermate HTTP/HTTPS restano inventario "open TCP / web unconfirmed": non sono finding e non vengono dichiarate sicuramente non-web. Nessun dataset esterno di validazione viene consultato. Per una root HTTPS autorizzata il crawler prova prima la validazione TLS normale; solo un errore di trust/certificato abilita un singolo retry della stessa URL con verify disabilitato, registrato come diagnostica. Gli errori di protocollo/cipher non attivano questo fallback. Gli scanner attivi sono eseguiti strettamente in sequenza sia dal Deterministic sia dall'Agentic. execution.request_rate vale 10 req/s per default se assente e accetta valori interi 1-50; un valore fuori intervallo/non valido torna a 10 con warning in console e nel report. SECOPS_MAX_REQUEST_RATE contiene il valore effettivo propagato ai wrapper. La policy e' per singolo assessment/processo e non e' un limite globale della VM: due runner indipendenti hanno due pacer indipendenti; per eseguirli contemporaneamente si riduce il rate di ciascun config se necessario. Session probe, target preparation, logout verifier e pre-verifiche HTTP sensibili seguono redirect soltanto sulla origin iniziale; la discovery generale applica invece l'intera policy autorizzativa, incluso allow_same_host_ports quando abilitato. Arjun (con --disable-redirects), Nuclei (-dr), SQLMap (ignoreRedirects) e Commix (--ignore-redirects) non seguono redirect autonomamente; --disable-redirects blocca davvero tutti i redirect interni ad Arjun. Per i casi GET il wrapper Arjun risolve prima una catena bounded no-follow. Lo scope multi-port puo' autorizzare anche HTTP<->HTTPS sullo stesso hostname esatto, ma il resolver non trascina un Cookie grezzo attraverso un cambio di schema/origin: in quel caso rinvia la destinazione alla discovery/runtime-auth centrale. Se il Location punta a un hostname diverso ma esplicitamente autorizzato, il wrapper NON trascina il cookie corrente su quell'host: la destinazione resta alla discovery centrale, che puo' applicare la sessione corretta. I non-GET non vengono ripetuti solo per risolvere redirect; la discovery HTTP/Chromium segue invece in modo bounded le catene che restano nella policy autorizzativa: i redirect same-origin sono normali, una origin esplicita e' ammessa e, con allow_same_host_ports=true, e' ammessa anche una porta o uno schema HTTP/HTTPS differente sullo stesso hostname esatto; le destinazioni autorizzate scoperte vengono rimesse nella selezione, quindi il no-follow dei processi esterni conserva le normali destinazioni applicative di redirect scoperte in-scope; i comportamenti interni a un singolo scanner/template che richiedono autonomamente un redirect restano invece intenzionalmente soppressi quando il tool non offre una allow-list exact-origin; ZAP non segue redirect nel seeding diretto, usa un context ancorato alla exact-origin, active scan in-scope-only e Protected mode; la native active scan viene abilitata solo se ZAP accetta thread-per-host=1 e il delay derivato da execution.request_rate; se uno dei due controlli di pacing non e' disponibile, la native active scan viene disabilitata fail-closed e il risultato resta PARTIAL, mentre la proxy verification con pacer di progetto puo' continuare; Nikto non usa -followredirects e puo' iniziare soltanto dalla destinazione finale raggiunta dal baseline same-origin; FFUF non abilita redirect e Dalfox mantiene il proprio default no-follow. Un session probe bloccato su redirect cross-origin o fermato dal limite bounded di redirect same-origin resta inconclusivo e non viene contato come sessione autenticata. Anche Traversal/LFI usa la stessa guardia redirect degli altri verificatori. La console emette [SCOPE] quando osserva URL/origin esterne e specifica che non sono state messe in coda per active testing. Nei redirect bloccati il riepilogo usa la destinazione esterna rifiutata, non la pagina in-scope che ha emesso il Location. Le stringhe URL letterali complete escapate in HTML/JavaScript vengono normalizzate, mentre frammenti incompleti come http\:/ vengono scartati invece di diventare falsi path relativi. Anche il Browser XSS/workflow verifier riceve execution.request_rate, spazia le navigazioni document e applica la stessa policy di scope (incluse le porte stesso-host quando abilitate), bloccando/diagnosticando le destinazioni non autorizzate; le subresource browser necessarie al rendering non sono un token bucket globale di ogni richiesta di rete.
 Deterministic esegue la discovery Playwright sincrona in worker thread quando il nodo LangGraph e' dentro asyncio. Agentic usa inoltre discover_target_sync_safe(): il percorso CLI normale e' sincrono, ma se la stessa discovery viene riusata dentro un event loop viene spostata automaticamente in un worker prima di entrare nella Playwright Sync API.
 
 ZAP: fast=targeted, balanced=prioritized, deep=full bounded; la modalita' passiva resta per i soli
@@ -431,7 +402,7 @@ non esiste alcun contract parametrizzato compatibile, ZAP prova comunque un fall
 installate per reflected-XSS, SQL injection generica, traversal e command injection. Non viene quindi avviato uno
 spider active ricorsivo dell'intero dominio. PARTIAL/no_active_scan_rules_enabled resta solo quando non esiste
 ne' un piano parametrizzato compatibile ne' una pagina GET sicura con almeno una regola curata effettivamente
-abilitabile. Le observation passive conservate sono 60/220/450 in fast/balanced/deep; i security finding non
+abilitabile. Le observation passive conservate sono 180/800/1400 in fast/balanced/deep; i security finding non
 sono soggetti a questo tetto di observation. Richieste equivalenti con stesso metodo, path e parametri restano deduplicate.
 Nuclei: balanced e deep possono usare request contract per DAST gap checks bounded, distribuiti prima tra famiglie applicative distinte e poi per score. Il DAST prova prima
 l'input Proxify JSONL; se il runtime Nuclei lo rifiuta, gli stessi contract GET/POST vengono ritentati
@@ -439,14 +410,14 @@ in YAML MultiDoc Proxify. Solo se entrambi i formati request-shaped falliscono s
 i POST non rappresentabili restano esplicitamente non coperti invece di essere dichiarati testati.
 Prima del prompt Agentic, Python costruisce e valida tutte le azioni concrete discovery-derived, poi le raggruppa per coppia (profilo, tool). Il modello NON sceglie i singoli URL di SQLMap/ZAP/Browser: sceglie capability group come anonymous/sqlmap o authenticated/zap; Python espande ogni gruppo scelto nei request contract esatti usando ranking deterministico, compatibilita' e budget adattivi. L'espansione ruota tra i tool scelti dello stesso profilo, quindi un gruppo con molti URL non puo' consumare tutto il budget prima degli altri tool selezionati.
 
-I budget Agentic sono separati per profilo. In fast/balanced/deep ogni profilo attivo dispone rispettivamente di 12/16/18 tool group. FFUF, ZAP, Nuclei, Session, Nikto e JWT, quando eleggibile, sono baseline deterministiche e non dipendono dalla scelta del modello. Le azioni concrete sono anch'esse per profilo e per round: il base normale e' 48/144/288. Un overflow adattivo piccolo e' disponibile gia' al round 1: +6/+24/+40, quindi i massimi del primo round sono 54/168/328. A ogni round successivo il cap cresce di +4/+16/+24 fino ai tetti configurati +14/+56/+88: round 2 = 58/184/352 e round 3+ = 62/200/376. L'overflow non viene riempito automaticamente perche' esistono azioni disponibili: Python ammette soltanto coverage-reserve ad alta confidenza o casi adaptive gia' marcati dal ranking deterministico; finding precedenti o nuovi parametri Arjun aumentano la priorita' del follow-up. Con anonymous+authenticated le quote restano indipendenti. Una azione concreta e' una invocazione scanner/request contract, non un singolo campo: piu' parametri dello stesso request contract possono essere testati nella stessa azione. Nella identita' Agentic entrano anche i nomi dei parametri/file/token/campi, evitando che due contratti con set di input diversi vengano collassati solo perche' hanno lo stesso URL/metodo. Le azioni gia' generate e validate ma non entrate nel tetto del round rimangono eleggibili nel round successivo. I selettori Agentic avanzano oltre le azioni gia' completate: il round successivo riceve la finestra successiva del ranking, non gli stessi top-N da scartare come duplicati. I contratti differiti ma mai eseguiti possono continuare a usare il normale budget base anche senza nuova superficie o finding: questi ultimi aumentano la priorita' del follow-up ma non sono prerequisiti. Vengono invece esclusi equivalenti semantici gia' completati, casi unsafe/incompatibili o chiaramente a basso valore; il solo fatto che esistano deferred non concede l'overflow adattivo.
+I tool-group Agentic restano budgetizzati per profilo: in fast/balanced/deep ciascun profilo attivo dispone rispettivamente di 20/30/40 gruppi. Le azioni concrete, invece, usano UN SOLO budget globale per round condiviso fra tutti i profili. Il floor normale totale e' 120/420/760; l'overflow del round 1 porta i massimi ordinari a 144/516/920, il round 2 a 160/580/1016 e il massimo ordinario configurato e' 184/644/1144. In BALANCED Python puo' alzare dinamicamente il base quando il lavoro deterministicamente necessario per i round residui supera 420, ma un hard cap indipendente limita sempre il piano a 800 azioni TOTALI nel round, anonymous+authenticated compresi. La distribuzione e' fair prima tra profili e poi tra capability; la quota inutilizzata da un profilo viene redistribuita. Esempi al cap: 1000 anonymous -> 800; 1000 anonymous + 1000 authenticated -> 400+400; 100 anonymous + 1000 authenticated -> 100+700. Un secondo controllo immediatamente prima dell'executor riapplica lo stesso hard cap anche dopo AI, breadth review, espansione e fallback. Il fallback senza AI segue la medesima regola e non usa piu' un cap artificiale di tre azioni per profilo. FFUF, ZAP, Nuclei, Session, Nikto e JWT quando eleggibile restano baseline deterministiche; le altre capability applicabili ricevono una base deterministica prima dell'overflow. Una azione concreta e' una invocazione scanner/request contract, non un singolo campo. Le azioni differite ma mai eseguite restano eleggibili nei round successivi; equivalenti semantici completati, casi unsafe/incompatibili o chiaramente a basso valore vengono esclusi.
 I GET scoperti in cui un valore seleziona direttamente un file/modulo interno hanno inoltre una coverage reserve
-Traversal/LFI bounded di 16/64/112 in fast/balanced/deep. Le reserve restano prioritarie dentro il gruppo Traversal,
+Traversal/LFI bounded di 32/192/320 in fast/balanced/deep. Le reserve restano prioritarie dentro il gruppo Traversal,
 ma l'espansione Agentic usa round-robin tra capability e ne prende una per gruppo a ogni passata: la reserve non puo'
 piu' occupare da sola il budget del profilo prima che gli altri tool selezionati ricevano la propria quota.
-Il catalogo compatto mostrato all'AI contiene al massimo 32/40/48 tool group complessivi ed e' costruito equamente tra i profili. La breadth review e' anch'essa per profilo: valuta la scarsita' sulle sole capability non-baseline e puo' aggiungere al massimo 3/6/8 tool group, senza superare il tetto totale 12/16/18 di quel profilo. La console separa concrete_pool, group_pool/tool_groups, baseline_groups, ai_groups, review_groups e concrete_actions e mostra base, massimo selettivo, overflow usato/eleggibile e numero di azioni rinviate per ogni profilo. Il pool broad delle sibling usa il ranking condiviso con base 2/5/10 e massimo adattivo 3/8/16 in fast/balanced/deep; gli specialisti non ereditano questo cap. Una sibling senza sessione origin-specifica non viene duplicata sotto authenticated quando anonymous e' disponibile; una sibling con sessione OIDC/SSO validata puo' invece ricevere vera copertura authenticated. Il profilo anonymous con Cookie header vuoto non puo' mai ereditare cookie dal runtime OIDC/storage state costruito dal profilo authenticated nello stesso processo.
+Il catalogo compatto mostrato all'AI contiene al massimo 64/96/128 tool group complessivi ed e' costruito equamente tra i profili. La breadth review e' anch'essa per profilo: valuta la scarsita' sulle sole capability non-baseline e puo' aggiungere al massimo 5/10/14 tool group, senza superare il tetto totale 20/30/40 di quel profilo. La console separa concrete_pool, group_pool/tool_groups, baseline_groups, ai_groups, review_groups e concrete_actions e mostra base, massimo selettivo, overflow usato/eleggibile e numero di azioni rinviate per ogni profilo. Il pool broad delle sibling usa il ranking condiviso con base 6/32/64 e massimo adattivo 12/64/128 in fast/balanced/deep; gli specialisti non ereditano questo cap. Una sibling senza sessione origin-specifica non viene duplicata sotto authenticated quando anonymous e' disponibile; una sibling con sessione OIDC/SSO validata puo' invece ricevere vera copertura authenticated. Il profilo anonymous con Cookie header vuoto non puo' mai ereditare cookie dal runtime OIDC/storage state costruito dal profilo authenticated nello stesso processo.
 Lo scope autorizzato e lo scope delle credenziali sono separati. Un Cookie header grezzo non viene mai copiato su un hostname diverso; se authorization.allow_same_host_ports=true puo' essere provato anche su un'altra porta autorizzata dello stesso hostname/schema, perche' i cookie HTTP non sono port-scoped, ma deve superare il normale session probe. Se viene rifiutato, il sistema prova lo storage browser/OIDC e infine username/password risolti una sola volta dal runner, senza un nuovo prompt nel child. Una sessione riparata specifica per la nuova origin/porta sostituisce il cookie grezzo fallito nei test successivi. Lo storage browser conserva Domain/Path/Secure e non autorizza nuove origin. Login e SSO sulla origin target restano testabili.
-Le policy che non dipendono dal planner sono comuni a Deterministic e Agentic e vengono applicate a ogni profilo: scope/cookie isolation, gestione 404/410, limiti Chromium, ranking e overflow specialisti, fallback active ZAP, input Nuclei e verifica XSS finale. Anche la verifica XSS finale Chromium usa base/max 8/12, 40/64 e 120/180 candidati PER PROFILO, quindi anonymous non puo' consumare la quota authenticated. I budget tool-group/azioni restano invece specifici dell'Agentic: il Deterministic non ha un tetto globale del planner e percorre direttamente i casi selezionati per ciascun tool e profilo.
+Le policy che non dipendono dal planner sono comuni a Deterministic e Agentic e vengono applicate a ogni profilo: scope/cookie isolation, gestione 404/410, limiti Chromium, ranking e overflow specialisti, fallback active ZAP, input Nuclei e verifica XSS finale. Anche la verifica XSS finale Chromium usa base/max 12/20, 96/160 e 200/320 candidati PER PROFILO, quindi anonymous non puo' consumare la quota authenticated. I budget tool-group/azioni restano invece specifici dell'Agentic: il Deterministic non ha un tetto globale del planner e percorre direttamente i casi selezionati per ciascun tool e profilo.
 JWT e' selezionato per profilo su massimo 16/64/192 token unici scoperti in fast/balanced/deep. Il controllo e' economico e locale, per questo il limite e' molto piu' ampio; in Agentic la capability JWT e' baseline quando esistono token. Se lo stesso identico token raw compare in piu' profili/azioni, il verifier viene eseguito una sola volta e il risultato locale viene riusato mantenendo l'attribuzione per profilo. I valori raw restano input locali del verifier e non vengono mostrati nel catalogo compatto del planner AI.
 Gli specialisti sui parametri privilegiano API/dati, identificatori/query, POST/JSON e richieste
 osservate dal browser rispetto a parametri puramente di navigazione. Il routing e' distinto per profilo:
@@ -457,7 +428,7 @@ la corrispondente route login stabile resta utilizzabile dal resolver di autenti
 lo ignora; l'autenticato ne conserva il request contract GET/POST senza eseguirlo durante discovery/scanner e lo
 riserva al controllo finale di lifecycle della sessione.
 Entrambi gli orchestratori eseguono infine una verifica Chromium candidate-driven sugli XSS ancora non confermati.
-Il budget e' separato per profilo e adattivo: base 8/40/120 e massimo 12/64/180 in fast/balanced/deep. L'overflow
+Il budget e' separato per profilo e adattivo: base 12/96/200 e massimo 20/160/320 in fast/balanced/deep. L'overflow
 si apre soltanto quando il base e' saturo e i candidate rinviati restano almeno al 75% del punteggio di cutoff;
 il punteggio deterministico considera corrispondenza del contesto/parametro, evidenza client-side, traffico browser
 osservato e prova scanner disponibile. Il browser riceve solo il parametro del finding sorgente e seleziona il request
@@ -510,53 +481,50 @@ balanced  copertura ampia con priorità ai controlli importanti
 deep      più target, richieste e budget per i controlli specialistici
 
 Limiti di ampiezza principali (casi/target, non numero di richieste HTTP):
-                         FAST   BALANCED   DEEP
-  Crawler HTTP pages     70/110  280/420  420/650  (base/max)
-  HTTP attempt factor      1.75x     2.0x     2.0x  (sul massimo pagine utili)
-  Chromium navigation      36/90   160/520  240/720  (base/max)
-  JavaScript utili         48      256      384
-  JavaScript attempt x      1.5x    1.75x    1.75x
-  ZAP request case         10       32       60
-  Nuclei static target     20       96      160
-  Nuclei DAST case         10       64      112
-  SQLMap base/max          3/4    24/40    36/60
-  Dalfox base/max          3/4    24/40    36/60
-  Commix base/max          3/4    18/30    24/40
-  Traversal base/max       3/4    24/40    36/60
-  Traversal routing reserve 16       64      112
-  Browser base/max         3/4    24/40    36/60
-  Workflow base/max        3/4    24/36    36/54
-  IDOR base/max            3/4    20/32    32/48
-  Authorization base/max   4/5    28/40    40/64
-  Arjun base/max           3/4    24/36    36/54
-  Interactsh Agentic        1        3        4
-  Interactsh Deterministic  1        2        3
-  JWT per profilo           16       64      192
-  Final XSS Chromium      8/12    40/64   120/180
-  Agentic catalogo gruppi  32       40       48
-  Agentic gruppi/profilo   12       16       18
-  Breadth review/profilo   +3       +6       +8
-  Agentic azioni base/R1/R2/R3+ 48/54/58/62  144/168/184/200  288/328/352/376
-  Agentic ceiling con max_rounds=2, per profilo      112      352      680
-  Agentic ceiling con 2 profili attivi, max_rounds=2 224      704     1360
-  (ceiling aritmetici dei round; esclusi final XSS Chromium e logout; non esiste un secondo cap cumulativo nascosto)
+                         FAST         BALANCED       DEEP
+  Crawler HTTP pages     120/220      600/1100       1200/2200  (base/max)
+  Chromium navigation    72/200       400/1200        800/2400  (base/max)
+  Menu / DOM pass        16 / 3       64 / 6          112 / 9
+  JavaScript utili       128          640             1200
+  Same-host TCP cand.    4096         32768           65535  (solo se proactive discovery abilitata)
+  ZAP ranked/proxy       80           320             640
+  ZAP native active      32            96             192
+  ZAP observations       180          800             1400
+  Nuclei static target   128          1024            2048
+  Nuclei DAST case       96           1200            3000
+  SQLMap base/adapt/live 6/+2/+4      72/+48/+96      128/+96/+160
+  Dalfox base/adapt/live 8/+3/+6      96/+64/+128     160/+112/+192
+  Commix base/adapt/live 6/+2/+2      64/+48/+64      112/+96/+96
+  Traversal base/adapt   8/+4         96/+64          160/+112
+  Traversal reserve      32           192             320
+  IDOR base/adapt        6/+2         64/+48          112/+96
+  Authorization base/ad. 10/+4        128/+72         192/+128
+  Browser base/adapt     10/+4        128/+72         192/+128
+  Workflow base/adapt    8/+3         96/+56          160/+112
+  Arjun base/adapt       12/+4        96/+64          160/+112
+  Final XSS Chromium     12/20        96/160          200/320
+  Safe-surface sweep     800          6000            15000
+  Agentic catalogo       64           96              128
+  Agentic gruppi/profilo 20           30              40
+  Breadth review/profilo +5           +10             +14
+  Agentic floor TOTAL/r 120          420             760
+  Agentic R1/R2/max ord. 144/160/184  516/580/644     920/1016/1144
+  Agentic HARD CAP/r     184          800             1144
+  Ceiling ordinario 2r  304          1096            1936
 
 Deterministic non ha un tetto globale del planner: usa direttamente i limiti bounded di ogni tool.
-Tetto lordo teorico di azioni orchestratore per singolo profilo se TUTTI i massimi adattivi/sibling/final-XSS sono saturi:
-  anonymous      FAST 87   BALANCED 477   DEEP 916
-  authenticated  FAST 95   BALANCED 520   DEEP 983  (include fino a 3 logout finali)
-Sono ceiling conservativi, non quote attese: dedup cross-profile, assenza di sibling/candidati, gate adattivi e XSS finali non necessari li riducono. Una azione scanner non equivale a una singola richiesta HTTP.
+Il safe-surface sweep e la verifica Chromium finale sono fasi separate dai budget planner Agentic.
 
 Timeout principali (secondi):
                          FAST   BALANCED   DEEP
-  ZAP                    120      600     1080
-  Nuclei                 240      720     1200
-  SQLMap                  75      180      300
-  Dalfox                  45      120      210
-  Commix                  90      180      300
-  Traversal               35       75      120
-  Browser                  45      120      210
-  Workflow                 40      105      180
+  ZAP                    120      2400     4800
+  Nuclei                 240      3600     7200
+  SQLMap                  75       180      300
+  Dalfox                  45       120      210
+  Commix                  90       180      300
+  Traversal               35        75      120
+  Browser                  45       120      210
+  Workflow                 40       105      180
 
 Il watchdog MCP dei normali scanner viene calcolato sul timeout concreto dello scanner + margine di connessione/trasporto: un timeout DEEP superiore al vecchio default MCP non viene quindi troncato prematuramente.
 
@@ -564,8 +532,8 @@ Ampiezza interna Nuclei: BALANCED puo' selezionare fino a 48 template ufficiali 
 con concurrency interna massima 2 (-c 2, -bs 1, -pc 1) sia quando viene invocato dal Deterministic sia dall'Agentic e rate limit globale derivato da execution.request_rate. La pipeline corrente non usa -as automatic-scan: seleziona template HTTP custom/ufficiali e request contract HTTP per DAST. Il flag Nuclei -pt e' un filtro sul TIPO DI PROTOCOLLO DEI TEMPLATE (es. http, headless, workflow, tcp, dns, ssl), non una barriera di scope o di porte: -pt http significherebbe eseguire soltanto template di tipo HTTP. Non viene aggiunto globalmente perche' le fasi correnti selezionano gia' esplicitamente alberi/template HTTP e un filtro blanket potrebbe escludere in futuro una fase headless/workflow scelta intenzionalmente. Il rate e' derivato da execution.request_rate (default 10 req/s, massimo configurabile 50); DEEP fino a 96 template technology, 160 exposure/misconfiguration
 e 256 vulnerability/CVE product-gated, con la stessa policy di rate conservativa. Sono massimi di selezione,
 non quote obbligatorie: fingerprint, product gating e timeout possono ridurre il lavoro effettivo.
-I timeout Nuclei sono un unico budget wall-clock per azione: 240/720/1200 s in fast/balanced/deep.
-Le fasi non usano secondi hardcoded ma quote del timeout totale, interpolate in base al carico reale. L'inventario ufficiale dei template viene riverificato all'avvio della singola azione: se il path registrato e' stale il wrapper cerca in sola lettura un inventario locale gia' esistente. Se l'inventario ufficiale manca ma sono disponibili i template SecOps bundled, la direct evidence continua e il risultato e' PARTIAL con coverage gap esplicito; se manca soltanto il sottoalbero DAST, le altre fasi continuano. Solo l'assenza contemporanea di inventario ufficiale e template bundled produce un hard failure. Se un timeout MCP esterno chiude la chiamata prima che Nuclei restituisca i propri metadati, la console mostra inventory=unknown invece di falsi valori total=0/directory=not-resolved. FAST seleziona ed esegue realmente fino a 10 DAST request case; v31.76 corregge il vecchio percorso che li selezionava senza avviare la fase DAST.
+I timeout Nuclei sono un unico budget wall-clock per azione: 240/3600/7200 s in fast/balanced/deep.
+Le fasi non usano secondi hardcoded ma quote del timeout totale, interpolate in base al carico reale. L'inventario ufficiale dei template viene riverificato all'avvio della singola azione: se il path registrato e' stale il wrapper cerca in sola lettura un inventario locale gia' esistente. Se l'inventario ufficiale manca ma sono disponibili i template SecOps bundled, la direct evidence continua e il risultato e' PARTIAL con coverage gap esplicito; se manca soltanto il sottoalbero DAST, le altre fasi continuano. Solo l'assenza contemporanea di inventario ufficiale e template bundled produce un hard failure. Se un timeout MCP esterno chiude la chiamata prima che Nuclei restituisca i propri metadati, la console mostra inventory=unknown invece di falsi valori total=0/directory=not-resolved. FAST seleziona fino a 96 DAST request case; balanced/deep fino a 1200/3000, suddivisi in batch 48/160/240; v31.76 corregge il vecchio percorso che li selezionava senza avviare la fase DAST.
 FAST: direct evidence 38-45%, DAST 45-55%. BALANCED: direct 8-10%, exposure/misconfiguration 22-30%, DAST 34-48%.
 DEEP: direct 6-8%, technology 8-10%, exposure/misconfiguration 16-20%, vulnerability/CVE 22-28%, DAST 22-28%.
 Cambiare il timeout totale ridimensiona quindi automaticamente tutte le fasi. I fallback DAST JSONL -> YAML -> lista GET
@@ -608,7 +576,7 @@ poi funzioni Python in orchestratorShared.py assegnano punteggi diversi per cias
   - Arjun usa un ranking endpoint dedicato.
 Il punteggio parte da piccoli pesi generici su path/nomi parametri e viene dominato dai segnali della classe:
 SQL/data e parametri SQL per SQLMap, input XSS e traffico browser per Dalfox/Browser, cmd/host per Commix,
-file/path/download per Traversal, riferimenti numerici per IDOR, campi/route identita-risorsa per Authorization,
+file/path/download per Traversal, riferimenti numerici, UUID, esadecimali o identificatori opachi con cifre per IDOR, campi/route identita-risorsa per Authorization,
 form upload/auth/CAPTCHA/token per Workflow. POST, JSON, XHR/fetch e risposta live 2xx/3xx rafforzano il punteggio.
 Prima dell'ordinamento vengono esclusi i casi incompatibili o non sicuri; i 404/410 osservati vengono esclusi
 dai pool specialistici, le varianti equivalenti vengono deduplicate e solo dopo si applicano base e overflow adattivo.
@@ -617,9 +585,7 @@ per profilo/tool e lascia all'AI la scelta della capability, non la classifica d
 
 ZAP e Nuclei possono generare molte richieste per ciascun caso/target selezionato. I casi Nuclei
 DAST sono scelti dal wrapper Python in modo deterministico usando metodo, path, parametri/body,
-content-type, evidenza API/XHR/fetch e response Chromium; Nell'Agentic Nuclei fa parte della baseline deterministica quando eleggibile; il planner AI non decide i singoli request contract DAST. Per microX, se il login automatico o DASHBOARD_TEST_COOKIE
-producono una sessione valida, gli stessi budget si applicano anche al profilo authenticated; altrimenti
-restano applicati al solo profilo anonimo.
+content-type, evidenza API/XHR/fetch e response Chromium; Nell'Agentic Nuclei fa parte della baseline deterministica quando eleggibile; il planner AI non decide i singoli request contract DAST. Se il login configurato o un cookie autorizzato producono una sessione valida, gli stessi budget si applicano anche al profilo authenticated; altrimenti restano applicati al solo profilo anonimo.
 
 Init: --with-lab --run --prepare-ai --agentic-model --snap4city-credentials --mode
       --skip-scanners --skip-preflight --skip-browser --require-browser --commands-only
@@ -635,8 +601,7 @@ Il gate state-changing usa tre stati. Se allow_state_changes=true nel config o v
 --allow-state-changes, i probe bounded sono abilitati; se allow_state_changes=false oppure viene
 passato --no-allow-state-changes, sono disabilitati anche su un laboratorio locale. Soltanto se
 il valore non e' specificato viene applicato il default automatico: 127.0.0.1, localhost e ::1
-abilitano i probe, mentre qualunque altro host, compresi indirizzi privati/LAN come
-dashboard-test / 192.168.1.81, li mantiene disabilitati. Nel config il valore del singolo servizio
+abilitano i probe, mentre qualunque altro host, compresi indirizzi privati/LAN non loopback, li mantiene disabilitati. Nel config il valore del singolo servizio
 ha precedenza sul valore della sezione execution. Questi flag non abilitano rotte distruttive e
 non disabilitano l'intero scanner: limitano solo le verifiche attive che possono cambiare stato.
 
@@ -685,9 +650,11 @@ docker run --rm projectdiscovery/nuclei:latest -version
 
 (Get-ChildItem "$HOME\nuclei-templates" -Recurse -File -Include *.yaml,*.yml | Measure-Object).Count
 
-DAST: FAST=10 request contract bounded; BALANCED=64 request contract, fuzz aggression medium, fuzz-param-frequency 100;
-      con allow_state_changes=false i POST read-only restano eleggibili, mentre DELETE/PUT/PATCH, route/action mutative (anche annidate in JSON), cambio credenziali e upload vengono esclusi prima del replay ZAP/Nuclei e prima del ranking/esecuzione degli specialisti request-level, cosi' i casi bloccati non consumano slot che possono essere usati da contract sicuri; per i GET una parola mutativa dentro un normale valore di ricerca/filtro (es. q=delete) non basta a bloccare il caso, mentre action/navigation selector come action/operation/redirect/page/url e query key/path con verbo mutativo restano bloccati; la stessa verifica vale anche per --only-tool.
-DEEP=112 request contract, fuzz aggression high, fuzz-param-frequency 1000. Il wrapper prova gli
+DAST request contract: FAST=96, BALANCED=1200, DEEP=3000. I contract vengono eseguiti in batch
+sequenziali da 48/160/240 sotto un unico deadline della fase; selected, attempted e completed restano
+distinti, quindi un batch parziale o in timeout non viene contato come interamente testato. FAST usa
+fuzz aggression low con fuzz-param-frequency 20; BALANCED medium con 100; DEEP high con 1000.
+Con allow_state_changes=false i POST read-only restano eleggibili, mentre DELETE/PUT/PATCH, route/action mutative (anche annidate in JSON), cambio credenziali e upload vengono esclusi prima del replay ZAP/Nuclei e prima del ranking/esecuzione degli specialisti request-level, cosi' i casi bloccati non consumano slot che possono essere usati da contract sicuri; per i GET una parola mutativa dentro un normale valore di ricerca/filtro (es. q=delete) non basta a bloccare il caso, mentre action/navigation selector come action/operation/redirect/page/url e query key/path con verbo mutativo restano bloccati; la stessa verifica vale anche per --only-tool. Il wrapper prova gli
 input request-shaped in ordine JSONL Proxify -> YAML MultiDoc Proxify -> lista URL per i soli GET
 se entrambi i parser request-shaped falliscono. Non esiste un piccolo limite aggiuntivo al numero
 di payload DAST: restano i limiti di request contract, rate/concurrency, template e timeout di profilo.
@@ -708,7 +675,7 @@ Nei finding confermati il report mostra anche conseguenze/danno potenziale e rec
 Deterministic aggiunge una guida conservativa quando il tool non la fornisce; Agentic la produce tramite
 l'analisi AI vincolata alle evidenze. Un danno potenziale non viene presentato come danno realmente avvenuto.
 
-Il PDF/HTML/JSON include inoltre una sezione "Endpoint coverage matrix" nello stesso stile tabellare del resto del report. Per ogni profilo riporta metodo, endpoint/request context scoperto, origine della discovery, tool di sicurezza realmente eseguiti, stato testuale, reason code strutturato e motivazione quando non esiste una prova eseguita. I principali reason code sono DEFERRED_LOW_PRIORITY, BUDGET_LIMIT, NO_COMPATIBLE_PARAMETERS, UNSUPPORTED_METHOD, STATE_CHANGE_BLOCKED, OUT_OF_SCOPE, DUPLICATE_ROUTE_VARIANT, HTTP_404 e HTTP_410; nel percorso Agentic PLANNER_DEFERRED distingue i request contract resi eleggibili dal ranking deterministico ma non eseguiti dopo la pianificazione dei tool-group. Gli stati restano Tested, Discovered only, Skipped, Execution error, HTTP 404 e HTTP 410: una semplice visita del crawler non viene quindi indicata come test di sicurezza. Prima della matrice viene mostrato un riepilogo numerico con request context scoperti, raggiungibili/in-scope, testati da almeno un'esecuzione concreta, solo discovery, saltati intenzionalmente, errori di esecuzione, 404/410 e percentuale di copertura; anonymous e authenticated hanno righe separate e, quando entrambi sono presenti, una riga totale. Nei report multi-entry aggregati la matrice mantiene anche il job/entry point di provenienza. La matrice e endpoint_coverage_summary vengono salvati nel JSON, nello snapshot .review.json e in Assessment_Results_Data_<ID>.json.
+Il PDF/HTML/JSON include inoltre una sezione "Endpoint coverage matrix" nello stesso stile tabellare del resto del report. Per ogni profilo riporta metodo, endpoint/request context scoperto, origine della discovery, tool di sicurezza realmente eseguiti, stato testuale, reason code strutturato e motivazione quando non esiste una prova eseguita. I principali reason code sono DEFERRED_LOW_PRIORITY, BUDGET_LIMIT, NO_COMPATIBLE_PARAMETERS, UNSUPPORTED_METHOD, STATE_CHANGE_BLOCKED, OUT_OF_SCOPE, DUPLICATE_ROUTE_VARIANT, HTTP_404 e HTTP_410; nel percorso Agentic PLANNER_DEFERRED distingue i request contract resi eleggibili dal ranking deterministico ma non eseguiti dopo la pianificazione dei tool-group. Gli stati restano Tested, Discovered only, Skipped, Execution error, HTTP 404 e HTTP 410: una semplice visita del crawler non viene quindi indicata come test di sicurezza. Prima della matrice viene mostrato un riepilogo numerico con request context scoperti, raggiungibili/in-scope, testati da almeno un'esecuzione concreta, testati da broad/specialist, raggiunti soltanto dal safe-surface sweep, solo discovery, saltati intenzionalmente, errori di esecuzione e 404/410. Sono esposte sia la copertura totale testata sia la copertura broad/specialist, cosi' lo sweep finale non puo' far apparire profonda una copertura ottenuta soltanto con replay sicuri; anonymous e authenticated hanno righe separate e, quando entrambi sono presenti, una riga totale. Nei report multi-entry aggregati la matrice mantiene anche il job/entry point di provenienza. La matrice e endpoint_coverage_summary vengono salvati nel JSON, nello snapshot .review.json e in Assessment_Results_Data_<ID>.json.
 
 NOTE DI VALIDAZIONE RUNTIME
 - Un profilo con cookie che la discovery dichiara non autenticato viene escluso dalla pianificazione autenticata; non sopprime la copertura anonima.

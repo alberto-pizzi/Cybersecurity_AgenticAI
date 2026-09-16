@@ -6,8 +6,9 @@
   },
   "authorization": {
     "confirmed": false,
-    "reference": "Replace with the real authorization/ticket/reference and set confirmed=true before executing a real assessment. This example enables discovered same-host/same-scheme multi-port scope.",
-    "allow_same_host_ports": true
+    "reference": "Replace with the real authorization/ticket/reference and set confirmed=true before executing a real assessment. This example enables discovered same-host HTTP/HTTPS multi-port scope.",
+    "allow_same_host_ports": true,
+    "discover_same_host_services": true
   },
   "credentials": {
     "portal_primary": {

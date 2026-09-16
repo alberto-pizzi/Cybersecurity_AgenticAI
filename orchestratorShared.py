@@ -15,6 +15,7 @@ import os
 import re
 import shutil
 import socket
+import ssl
 import subprocess
 import sys
 import sysconfig
@@ -104,70 +105,79 @@ def compact_log_url(value: Any, max_length: int | None=None) -> str:
         pass
     return text[:limit - 3] + '...'
 MAX_ARJUN_ENDPOINTS = max(1, int(os.getenv('SECOPS_MAX_ARJUN_ENDPOINTS', '12')))
-MAX_CRAWL_PAGES = max(10, int(os.getenv('SECOPS_MAX_CRAWL_PAGES', '650')))
-MAX_SCRIPT_ASSETS = max(4, int(os.getenv('SECOPS_MAX_SCRIPT_ASSETS', '384')))
+MAX_CRAWL_PAGES = max(10, int(os.getenv('SECOPS_MAX_CRAWL_PAGES', '2200')))
+MAX_SCRIPT_ASSETS = max(4, int(os.getenv('SECOPS_MAX_SCRIPT_ASSETS', '1200')))
 SCANNER_PROGRESS_INTERVAL = max(10, int(os.getenv('SECOPS_PROGRESS_INTERVAL', '30')))
 DISCOVERY_LIMITS = {
-    'fast': {'crawl_pages': 70, 'crawl_pages_max': 110, 'browser_pages': 36, 'browser_pages_max': 90, 'browser_per_origin_pages': 90, 'browser_menu_clicks_per_page': 6, 'scripts': 48, 'route_variants': 6, 'per_origin_pages': 100},
-    'balanced': {'crawl_pages': 280, 'crawl_pages_max': 420, 'browser_pages': 160, 'browser_pages_max': 520, 'browser_per_origin_pages': 480, 'browser_menu_clicks_per_page': 18, 'scripts': 256, 'route_variants': 12, 'per_origin_pages': 380},
-    'deep': {'crawl_pages': 420, 'crawl_pages_max': 650, 'browser_pages': 240, 'browser_pages_max': 720, 'browser_per_origin_pages': 660, 'browser_menu_clicks_per_page': 28, 'scripts': 384, 'route_variants': 16, 'per_origin_pages': 600},
+    'fast': {'crawl_pages': 120, 'crawl_pages_max': 220, 'browser_pages': 72, 'browser_pages_max': 200, 'browser_per_origin_pages': 180, 'browser_menu_clicks_per_page': 16, 'browser_dom_passes': 3, 'scripts': 128, 'route_variants': 8, 'per_origin_pages': 190, 'same_host_service_candidates': 4096},
+    'balanced': {'crawl_pages': 600, 'crawl_pages_max': 1100, 'browser_pages': 400, 'browser_pages_max': 1200, 'browser_per_origin_pages': 1000, 'browser_menu_clicks_per_page': 64, 'browser_dom_passes': 6, 'scripts': 640, 'route_variants': 20, 'per_origin_pages': 900, 'same_host_service_candidates': 32768},
+    'deep': {'crawl_pages': 1200, 'crawl_pages_max': 2200, 'browser_pages': 800, 'browser_pages_max': 2400, 'browser_per_origin_pages': 2000, 'browser_menu_clicks_per_page': 112, 'browser_dom_passes': 9, 'scripts': 1200, 'route_variants': 32, 'per_origin_pages': 1800, 'same_host_service_candidates': 65535},
 }
 HTTP_ATTEMPT_BUDGET_FACTORS = {'fast': 1.75, 'balanced': 2.0, 'deep': 2.0}
 SCRIPT_ATTEMPT_BUDGET_FACTORS = {'fast': 1.5, 'balanced': 1.75, 'deep': 1.75}
-FINAL_BROWSER_VERIFICATION_LIMITS = {'fast': 8, 'balanced': 40, 'deep': 120}
-FINAL_BROWSER_VERIFICATION_MAX_LIMITS = {'fast': 12, 'balanced': 64, 'deep': 180}
+FINAL_BROWSER_VERIFICATION_LIMITS = {'fast': 12, 'balanced': 96, 'deep': 200}
+FINAL_BROWSER_VERIFICATION_MAX_LIMITS = {'fast': 20, 'balanced': 160, 'deep': 320}
 JWT_TOKEN_LIMITS = {'fast': 16, 'balanced': 64, 'deep': 192}
 # Broad sibling coverage is deliberately smaller than primary-origin coverage in fast/balanced.
 # Authorized siblings remain available to specialist selectors even when they are not selected for
 # the full ZAP/Nuclei/Nikto baseline. Deep preserves the wider broad sweep.
-BROAD_SIBLING_ORIGIN_BASE_LIMITS = {'fast': 2, 'balanced': 5, 'deep': 10}
-BROAD_SIBLING_ORIGIN_MAX_LIMITS = {'fast': 3, 'balanced': 8, 'deep': 16}
+BROAD_SIBLING_ORIGIN_BASE_LIMITS = {'fast': 6, 'balanced': 32, 'deep': 64}
+BROAD_SIBLING_ORIGIN_MAX_LIMITS = {'fast': 12, 'balanced': 64, 'deep': 128}
 BROAD_SIBLING_ADAPTIVE_RATIO = 0.75
 BROAD_SIBLING_TIMEOUT_FACTORS = {'fast': 0.55, 'balanced': 0.75, 'deep': 0.85}
 SCAN_MODES = {
     'fast': {
         'broad': {'zap': 120, 'nuclei': 240, 'nikto': 60, 'ffuf': 50, 'session': 25},
         'parameter': {'sqlmap': 75, 'dalfox': 45, 'commix': 90, 'traversal': 35, 'idor': 18, 'authorization': 30, 'browser': 45, 'workflow': 40},
-        'limits': {'sqlmap': 3, 'dalfox': 3, 'commix': 3, 'traversal': 3, 'idor': 3, 'authorization': 4, 'browser': 3, 'workflow': 3},
-        'arjun': 45, 'arjun_limit': 3,
+        'limits': {'sqlmap': 6, 'dalfox': 8, 'commix': 6, 'traversal': 8, 'idor': 6, 'authorization': 10, 'browser': 10, 'workflow': 8},
+        'arjun': 45, 'arjun_limit': 12,
     },
     'balanced': {
-        'broad': {'zap': 600, 'nuclei': 720, 'nikto': 180, 'ffuf': 120, 'session': 50},
+        'broad': {'zap': 2400, 'nuclei': 3600, 'nikto': 180, 'ffuf': 120, 'session': 50},
         'parameter': {'sqlmap': 180, 'dalfox': 120, 'commix': 180, 'traversal': 75, 'idor': 45, 'authorization': 70, 'browser': 120, 'workflow': 105},
         # Raised from the previous 8-12 ceiling: each case already runs with its own independent
         # per-case timeout (the 'parameter' timeouts above), so more selected cases means more total
         # wall-clock time for this phase, not less time per case. The previous ceiling was small
         # enough that, on an application with hundreds of discovered parameterized endpoints, only a
         # small fraction of the real attack surface ever reached a specialist tool in 'balanced' mode.
-        'limits': {'sqlmap': 24, 'dalfox': 24, 'commix': 18, 'traversal': 24, 'idor': 20, 'authorization': 28, 'browser': 24, 'workflow': 24},
-        'arjun': 120, 'arjun_limit': 24,
+        'limits': {'sqlmap': 72, 'dalfox': 96, 'commix': 64, 'traversal': 96, 'idor': 64, 'authorization': 128, 'browser': 128, 'workflow': 96},
+        'arjun': 120, 'arjun_limit': 96,
     },
     'deep': {
-        'broad': {'zap': 1080, 'nuclei': 1200, 'nikto': 300, 'ffuf': 210, 'session': 90},
+        'broad': {'zap': 4800, 'nuclei': 7200, 'nikto': 300, 'ffuf': 210, 'session': 90},
         'parameter': {'sqlmap': 300, 'dalfox': 210, 'commix': 300, 'traversal': 120, 'idor': 90, 'authorization': 120, 'browser': 210, 'workflow': 180},
-        'limits': {'sqlmap': 36, 'dalfox': 36, 'commix': 24, 'traversal': 36, 'idor': 32, 'authorization': 40, 'browser': 36, 'workflow': 36},
-        'arjun': 180, 'arjun_limit': 36,
+        'limits': {'sqlmap': 128, 'dalfox': 160, 'commix': 112, 'traversal': 160, 'idor': 112, 'authorization': 192, 'browser': 192, 'workflow': 160},
+        'arjun': 180, 'arjun_limit': 160,
     },
 }
 # Specialist budgets have a fixed base and a bounded adaptive overflow. The overflow is
 # available only to high-value deferred request contracts selected by deterministic ranking.
 ADAPTIVE_SPECIALIST_OVERFLOW = {
-    'fast': {'arjun': 1, 'sqlmap': 1, 'dalfox': 1, 'commix': 1, 'traversal': 1, 'idor': 1, 'authorization': 1, 'browser': 1, 'workflow': 1},
-    'balanced': {'arjun': 12, 'sqlmap': 16, 'dalfox': 16, 'commix': 12, 'traversal': 16, 'idor': 12, 'authorization': 12, 'browser': 16, 'workflow': 12},
-    'deep': {'arjun': 18, 'sqlmap': 24, 'dalfox': 24, 'commix': 16, 'traversal': 24, 'idor': 16, 'authorization': 24, 'browser': 24, 'workflow': 18},
+    'fast': {'arjun': 4, 'sqlmap': 2, 'dalfox': 3, 'commix': 2, 'traversal': 4, 'idor': 2, 'authorization': 4, 'browser': 4, 'workflow': 3},
+    'balanced': {'arjun': 64, 'sqlmap': 48, 'dalfox': 64, 'commix': 48, 'traversal': 64, 'idor': 48, 'authorization': 72, 'browser': 72, 'workflow': 56},
+    'deep': {'arjun': 112, 'sqlmap': 96, 'dalfox': 112, 'commix': 96, 'traversal': 112, 'idor': 96, 'authorization': 128, 'browser': 128, 'workflow': 112},
 }
 # Routing parameters that select internal files/modules are a high-confidence traversal/LFI class.
 # A separate bounded reserve prevents large menus from starving these contracts behind unrelated
 # request variants while retaining the normal specialist ranking for every other case.
-ROUTING_TRAVERSAL_RESERVE = {'fast': 16, 'balanced': 64, 'deep': 112}
+ROUTING_TRAVERSAL_RESERVE = {'fast': 32, 'balanced': 192, 'deep': 320}
 # Discovery may retain more value variants so later reasoning can see them, while request-level
 # scanners use a smaller cap for equivalent method/path/parameter shapes. Traversal is the explicit
 # exception because routing values that select different local resources receive distinct signatures.
 SPECIALIST_ROUTE_VARIANT_LIMITS = {'fast': 2, 'balanced': 4, 'deep': 6}
+GENERIC_LIVE_INPUT_RESERVE = {
+    'fast': {'sqlmap': 4, 'dalfox': 6, 'commix': 2},
+    'balanced': {'sqlmap': 96, 'dalfox': 128, 'commix': 64},
+    'deep': {'sqlmap': 160, 'dalfox': 192, 'commix': 96},
+}
+SAFE_SURFACE_SWEEP_LIMITS = {'fast': 800, 'balanced': 6000, 'deep': 15000}
+SAFE_SURFACE_SWEEP_TIMEOUT_FACTOR = 0.25
 ADAPTIVE_HIGH_VALUE_PATH_HINTS = ('/api/', '/admin/', 'management', 'search', 'query', 'upload', 'download', 'callback', 'webhook', 'config', 'settings', 'profile', 'account')
 AUTHORIZED_SCOPE_ORIGINS: set[str] = set()
 ALLOW_SAME_HOST_PORTS = False
+DISCOVER_SAME_HOST_SERVICES = False
 PRIMARY_SCOPE_TARGET = ''
+SAME_HOST_SERVICE_DISCOVERY_CACHE: dict[tuple[str, str], dict[str, Any]] = {}
 AUTHENTICATED_ORIGIN_COOKIES: dict[str, str] = {}
 # A raw Cookie header tried speculatively on another authorized port can be rejected there even
 # though it remains valid on the primary origin. Cache that conclusive rejection per cookie value
@@ -193,19 +203,22 @@ ARJUN_ENDPOINT_LIMIT = int(SCAN_MODES[CURRENT_SCAN_MODE].get('arjun_limit', 1))
 # Configures the explicit HTTP scope extension for this process; same-origin remains allowed by default.
 def configure_authorized_scope(
     target: str, origins: list[str] | None=None, *, allow_same_host_ports: bool=False,
+    discover_same_host_services: bool=False,
 ) -> None:
-    global PRIMARY_SCOPE_TARGET, ALLOW_SAME_HOST_PORTS
+    global PRIMARY_SCOPE_TARGET, ALLOW_SAME_HOST_PORTS, DISCOVER_SAME_HOST_SERVICES
     PRIMARY_SCOPE_TARGET = normalize_url(target)
     ALLOW_SAME_HOST_PORTS = bool(allow_same_host_ports)
+    DISCOVER_SAME_HOST_SERVICES = bool(discover_same_host_services and ALLOW_SAME_HOST_PORTS)
     AUTHORIZED_SCOPE_ORIGINS.clear()
     REJECTED_SPECULATIVE_RAW_COOKIE_KEYS.clear()
+    SAME_HOST_SERVICE_DISCOVERY_CACHE.clear()
     for value in origins or []:
         origin = normalized_origin(str(value or '').strip())
         if origin:
             AUTHORIZED_SCOPE_ORIGINS.add(origin)
 
 # Returns true for the primary origin, an explicitly authorized exact origin, or (when enabled)
-# another port on an already-authorized exact hostname using the same HTTP scheme.
+# another HTTP/HTTPS service on an already-authorized exact hostname.
 def url_in_authorized_scope(target: str, candidate: str) -> bool:
     return _url_in_explicit_scope(
         target, candidate, AUTHORIZED_SCOPE_ORIGINS, allow_same_host_ports=ALLOW_SAME_HOST_PORTS,
@@ -484,8 +497,8 @@ AUTHORIZATION_TOOL = ToolSpec('authorization', 'custom_checks/authorizationServe
 WORKFLOW_TOOLS = (ToolSpec('browser', 'custom_checks/browserServer.py', 'run_browser_scan', module='playwright', required=False), ToolSpec('workflow', 'custom_checks/workflowServer.py', 'run_workflow_scan'))
 OPTIONAL_TOOLS = (ToolSpec('jwt', 'custom_checks/jwtServer.py', 'run_jwt_scan', module='jwt'), ToolSpec('interactsh', 'pentest_tools/discovery/interactshServer.py', 'run_interactsh_client', 'interactsh-client', required=False), ToolSpec('report', 'reporting/reportServer.py', 'generate_report', module='weasyprint'))
 ALL_TOOLS = (*BASE_TOOLS, ARJUN_TOOL, *PARAMETER_TOOLS, AUTHORIZATION_TOOL, *WORKFLOW_TOOLS, *OPTIONAL_TOOLS)
-TOOL_SCOPES = {'ffuf': 'base', 'zap': 'base', 'nuclei': 'base', 'session': 'base', 'nikto': 'base', 'arjun': 'url', 'sqlmap': 'parameterized', 'dalfox': 'parameterized', 'commix': 'parameterized', 'traversal': 'parameterized', 'idor': 'numeric', 'authorization': 'authorization', 'browser': 'browser', 'workflow': 'workflow', 'jwt': 'jwt', 'interactsh': 'oast'}
-TOOL_DESCRIPTIONS = {'ffuf': 'Hidden resource and endpoint discovery with credential-isolated path fuzzing.', 'zap': 'Session-aware crawling, passive analysis and prioritized active testing.', 'nuclei': 'Template-based exposure, misconfiguration, known-vulnerability and bounded DAST checks on discovered parameterized URLs.', 'session': 'Cookie flags, bounded session uniqueness and fixation indicators.', 'nikto': 'Web-server hardening and exposed-resource checks.', 'arjun': 'Hidden GET/POST parameter discovery.', 'sqlmap': 'SQL-injection confirmation on discovered request contracts.', 'dalfox': 'Reflected and stored XSS testing.', 'commix': 'Operating-system command-injection testing.', 'traversal': 'Path-traversal and local-file-inclusion verification.', 'idor': 'Single-reference numeric object differential checks.', 'authorization': 'Read-only anonymous and optional two-account authorization differentials on discovered high-value GET requests.', 'browser': 'Chromium verification of DOM, reflected and stored XSS using harmless markers.', 'workflow': 'Bounded CSRF, upload, authentication-throttling and CAPTCHA workflow checks.', 'jwt': 'JWT structure and claim analysis.', 'interactsh': 'Out-of-band callback confirmation.'}
+TOOL_SCOPES = {'ffuf': 'base', 'zap': 'base', 'nuclei': 'base', 'session': 'base', 'nikto': 'base', 'arjun': 'url', 'sqlmap': 'parameterized', 'dalfox': 'parameterized', 'commix': 'parameterized', 'traversal': 'parameterized', 'idor': 'object-reference', 'authorization': 'authorization', 'browser': 'browser', 'workflow': 'workflow', 'jwt': 'jwt', 'interactsh': 'oast'}
+TOOL_DESCRIPTIONS = {'ffuf': 'Hidden resource and endpoint discovery with credential-isolated path fuzzing.', 'zap': 'Session-aware crawling, passive analysis and prioritized active testing.', 'nuclei': 'Template-based exposure, misconfiguration, known-vulnerability and bounded DAST checks on discovered parameterized URLs.', 'session': 'Cookie flags, bounded session uniqueness and fixation indicators.', 'nikto': 'Web-server hardening and exposed-resource checks.', 'arjun': 'Hidden GET/POST parameter discovery.', 'sqlmap': 'SQL-injection confirmation on discovered request contracts.', 'dalfox': 'Reflected and stored XSS testing.', 'commix': 'Operating-system command-injection testing.', 'traversal': 'Path-traversal and local-file-inclusion verification.', 'idor': 'Single-reference object differential checks for numeric, UUID, hexadecimal and digit-bearing opaque identifiers.', 'authorization': 'Read-only anonymous and optional two-account authorization differentials on discovered high-value GET requests.', 'browser': 'Chromium verification of DOM, reflected and stored XSS using harmless markers.', 'workflow': 'Bounded CSRF, upload, authentication-throttling and CAPTCHA workflow checks.', 'jwt': 'JWT structure and claim analysis.', 'interactsh': 'Out-of-band callback confirmation.'}
 
 # The agentic registry exposes the MCP tools available to the planner.
 def agentic_registry() -> dict[str, tuple[str, str, str, str]]:
@@ -1452,6 +1465,35 @@ SEMANTIC_ROUTING_PARAMETERS = {
 }
 SEMANTIC_ROUTING_VALUE_RE = re.compile(r'\.(?:php\d?|phtml|jsp|jspx|asp|aspx|cgi|pl|do|action|html?)(?:[/?#]|$)', re.I)
 
+# Query strings found in HTML/JavaScript occasionally contain an unescaped ampersand inside a
+# human-readable value (for example pageTitle="A & B"). urllib.parse then interprets the text
+# after that ampersand as a second parameter name. Keep the original URL as evidence, but do not
+# promote whitespace-padded/control-character fragments to scanner parameters or route shapes.
+# Normal application names such as columns[0][data], no_columns[], foo.bar and a:b remain valid.
+def _valid_request_parameter_name(value: Any) -> bool:
+    raw = str(value or '')
+    return bool(raw) and raw == raw.strip() and not any(ord(char) < 32 or ord(char) == 127 for char in raw)
+
+def _filtered_query_pairs(query: str) -> list[tuple[str, str]]:
+    return [(name, value) for name, value in parse_qsl(str(query or ''), keep_blank_values=True) if _valid_request_parameter_name(name)]
+
+def _query_parameter_names(url: str) -> list[str]:
+    return [name for name, _ in _filtered_query_pairs(urlparse(str(url or '')).query)]
+
+def _clean_case_parameter_names(values: Any) -> list[str]:
+    output: list[str] = []
+    seen: set[str] = set()
+    for value in values if isinstance(values, (list, tuple, set)) else []:
+        name = str(value or '')
+        if not _valid_request_parameter_name(name):
+            continue
+        key = name.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        output.append(name)
+    return output
+
 def _semantic_routing_value(raw: str) -> str:
     value = str(raw or '').strip()
     for _ in range(2):
@@ -1468,7 +1510,7 @@ def _semantic_routing_value(raw: str) -> str:
         return ''
     path = parsed.path or value.split('?', 1)[0]
     query = parsed.query if parsed.query else (value.split('?', 1)[1] if '?' in value else '')
-    names = sorted({name.lower() for name, _ in parse_qsl(query, keep_blank_values=True)})
+    names = sorted({name.lower() for name, _ in _filtered_query_pairs(query)})
     normalized_path = re.sub(r'/+', '/', path.strip()) or '/'
     suffix = '?' + '&'.join(names) if names else ''
     if absolute_http:
@@ -1478,7 +1520,7 @@ def _semantic_routing_value(raw: str) -> str:
 def _discovery_route_signature(url: str) -> tuple[str, str, tuple[str, ...]]:
     parsed = urlparse(str(url or ''))
     tokens: set[str] = set()
-    for name, value in parse_qsl(parsed.query, keep_blank_values=True):
+    for name, value in _filtered_query_pairs(parsed.query):
         lowered_name = name.lower()
         tokens.add(lowered_name)
         semantic = _semantic_routing_value(value)
@@ -1491,7 +1533,7 @@ def _discovery_route_signature(url: str) -> tuple[str, str, tuple[str, ...]]:
 # can literally choose a different server-side file/module and therefore represents distinct risk.
 def _structural_route_signature(url: str) -> tuple[str, str, tuple[str, ...]]:
     parsed = urlparse(str(url or ''))
-    names = tuple(sorted({name.lower() for name, _ in parse_qsl(parsed.query, keep_blank_values=True)}))
+    names = tuple(sorted({name.lower() for name, _ in _filtered_query_pairs(parsed.query)}))
     return (normalized_origin(url), parsed.path.rstrip('/') or '/', names)
 
 # Canonicalizes only query *encoding*, not semantic values. This collapses equivalent specialist
@@ -1546,7 +1588,7 @@ def _nested_navigation_targets(url: str) -> list[str]:
 def _discovery_url_score(url: str) -> int:
     parsed = urlparse(str(url or ''))
     path = parsed.path.lower()
-    score = 30 + _risk_terms(path + ' ' + ' '.join(name for name, _ in parse_qsl(parsed.query, keep_blank_values=True)))
+    score = 30 + _risk_terms(path + ' ' + ' '.join(name for name, _ in _filtered_query_pairs(parsed.query)))
     if parsed.query:
         score += 14
     if any(token in path for token in ('/api/', '/graphql', '/admin', '/manage', '/account', '/profile', '/search', '/query', '/upload', '/download', '/callback', '/webhook', '/config', '/settings')):
@@ -1570,7 +1612,7 @@ def _ephemeral_identity_flow_url(url: str) -> bool:
         parsed = urlparse(str(url or ''))
     except ValueError:
         return False
-    names = {str(name).lower() for name, _ in parse_qsl(parsed.query, keep_blank_values=True)}
+    names = {str(name).lower() for name, _ in _filtered_query_pairs(parsed.query)}
     protocol_names = {'client_id', 'redirect_uri', 'response_type', 'scope', 'code_challenge', 'code_challenge_method'}
     transient = names & EPHEMERAL_IDENTITY_QUERY_KEYS
     # Require both protocol context and a transient value. A stable application login/SSO URL
@@ -1581,7 +1623,7 @@ def _ephemeral_identity_flow_url(url: str) -> bool:
 def _volatile_identity_callback_url(url: str) -> bool:
     """Recognize one-shot OAuth/OIDC callback instances from protocol parameters only."""
     try:
-        names = {str(name).lower() for name, _ in parse_qsl(urlparse(str(url or '')).query, keep_blank_values=True)}
+        names = {str(name).lower() for name, _ in _filtered_query_pairs(urlparse(str(url or '')).query)}
     except ValueError:
         return False
     hits = names & IDENTITY_CALLBACK_QUERY_KEYS
@@ -1798,6 +1840,40 @@ def request_case_state_change_reason(case: dict[str, Any]) -> str:
 def filter_request_cases_for_state_policy(cases: list[dict[str, Any]] | None, allow_state_changes: bool) -> list[dict[str, Any]]:
     return _request_cases_for_state_policy(cases, allow_state_changes)
 
+# Returns true only for certificate/trust validation failures. Protocol negotiation errors are not
+# retried with verification disabled, because a wrong-version/cipher failure does not mean that the
+# service merely uses an internal or self-signed certificate.
+def _tls_certificate_trust_failure(exc: BaseException, url: str) -> bool:
+    if urlparse(str(url or '')).scheme.lower() != 'https':
+        return False
+    text = str(exc or '').lower()
+    return any(token in text for token in (
+        'certificate verify failed', 'self signed certificate', 'self-signed certificate',
+        'unable to get local issuer certificate', 'unable to verify the first certificate',
+        'certificate has expired', 'hostname mismatch', 'doesn\'t match', 'does not match',
+    ))
+
+
+def _request_with_tls_trust_retry(
+    session: requests.Session, method: str, url: str, **kwargs: Any,
+) -> tuple[requests.Response, bool, str]:
+    """Execute one request and retry the same authorized HTTPS URL only after trust failure."""
+    try:
+        return session.request(method, url, **kwargs), False, ''
+    except requests.exceptions.SSLError as exc:
+        if not _tls_certificate_trust_failure(exc, url):
+            raise
+        retry_kwargs = dict(kwargs)
+        retry_kwargs['verify'] = False
+        _pace_http_request()
+        with warnings.catch_warnings():
+            warnings.filterwarnings('ignore', message='Unverified HTTPS request.*')
+            response = session.request(method, url, **retry_kwargs)
+        setattr(response, '_secops_tls_trust_retry', True)
+        setattr(response, '_secops_tls_trust_error', str(exc))
+        return response, True, str(exc)
+
+
 # Performs a bounded GET request while blocking destructive navigation.
 def _safe_crawl_get(session: requests.Session, requested: str, target: str, *, timeout: tuple[int, int]=(5, 15), max_redirects: int=5, cookies: str='') -> tuple[requests.Response | None, str, str]:
 
@@ -1811,7 +1887,9 @@ def _safe_crawl_get(session: requests.Session, requested: str, target: str, *, t
             return (response, current, f'destructive_url_blocked:{current}')
         request_headers = {'Cookie': scope_cookie_header(current, cookies)} if scope_cookie_header(current, cookies) else {}
         _pace_http_request()
-        response = session.get(current, timeout=timeout, allow_redirects=False, headers=request_headers)
+        response, _, _ = _request_with_tls_trust_retry(
+            session, 'GET', current, timeout=timeout, allow_redirects=False, headers=request_headers,
+        )
         if response.status_code not in {301, 302, 303, 307, 308}:
             return (response, current, '')
         location = str(response.headers.get('Location') or '').strip()
@@ -2190,7 +2268,7 @@ def _browser_network_case(url: str, method: str, data: str, content_type: str, s
     if method not in {'GET', 'POST', 'PUT', 'PATCH', 'DELETE'}:
         return None
     parsed = urlparse(url)
-    parameters = [name for name, _ in parse_qsl(parsed.query, keep_blank_values=True)]
+    parameters = [name for name, _ in _filtered_query_pairs(parsed.query)]
     fields: list[dict[str, str]] = []
     body = str(data or '')
     lowered_type = str(content_type or '').lower()
@@ -2523,6 +2601,7 @@ def _browser_network_discovery(target: str, cookies: str, html_urls: list[str], 
 
                     collect_dom_navigation()
                     menu_click_limit = max(0, int(limits.get('browser_menu_clicks_per_page', 0) or 0))
+                    dom_pass_limit = max(1, int(limits.get('browser_dom_passes', 1) or 1))
                     if menu_click_limit:
                         selectors = ','.join((
                             '[aria-expanded="false"][aria-controls]',
@@ -2557,7 +2636,15 @@ def _browser_network_discovery(target: str, cookies: str, html_urls: list[str], 
                                 continue
                         if clicked:
                             budget_info['menu_controls_clicked'] = int(budget_info.get('menu_controls_clicked', 0) or 0) + clicked
-                            collect_dom_navigation()
+                            # Re-scan the rendered DOM after expansion. Multiple bounded passes help catch
+                            # asynchronously populated SPA/dropdown content without re-clicking controls or
+                            # issuing state-changing actions. The first collection above counts as pass 1.
+                            completed_dom_passes = 1
+                            while completed_dom_passes < dom_pass_limit:
+                                page.wait_for_timeout(120)
+                                collect_dom_navigation()
+                                completed_dom_passes += 1
+                            budget_info['dom_rescan_passes'] = int(budget_info.get('dom_rescan_passes', 0) or 0) + max(0, completed_dom_passes - 1)
                     for frame in page.frames:
                         frame_url = str(frame.url or '')
                         if frame_url and frame_url != value:
@@ -2600,6 +2687,220 @@ def _browser_network_discovery(target: str, cookies: str, html_urls: list[str], 
     )
     return (_dedupe_request_cases(cases), unique_observed, list(dict.fromkeys(navigated)), errors, budget_info)
 
+
+# Builds a deterministic, target-agnostic port order. Runtime service databases are considered first,
+# then a midpoint walk covers the whole TCP space without biasing discovery toward only low ports.
+def _runtime_service_database_ports() -> list[int]:
+    candidates = [
+        Path('/etc/services'),
+        Path('/usr/share/nmap/nmap-services'),
+        Path('/usr/local/share/nmap/nmap-services'),
+        Path('/opt/homebrew/share/nmap/nmap-services'),
+    ]
+    ports: list[int] = []
+    seen: set[int] = set()
+    service_line = re.compile(r'^\s*[^#\s]+\s+(\d{1,5})/(tcp|udp)\b', re.IGNORECASE)
+    for path in candidates:
+        if not path.is_file():
+            continue
+        try:
+            for line in path.read_text(encoding='utf-8', errors='ignore').splitlines():
+                match = service_line.match(line)
+                if not match or match.group(2).lower() != 'tcp':
+                    continue
+                port = int(match.group(1))
+                if 1 <= port <= 65535 and port not in seen:
+                    seen.add(port)
+                    ports.append(port)
+        except OSError:
+            continue
+    return ports
+
+
+def _stratified_tcp_port_order(limit: int) -> list[int]:
+    cap = max(0, min(65535, int(limit)))
+    if cap <= 0:
+        return []
+    preferred = _runtime_service_database_ports()
+    result: list[int] = []
+    seen: set[int] = set()
+    for port in preferred:
+        if port not in seen:
+            seen.add(port)
+            result.append(port)
+            if len(result) >= cap:
+                return result
+    # Breadth-first interval bisection makes low/mid/high ranges appear early and is deterministic.
+    intervals: list[tuple[int, int]] = [(1, 65535)]
+    cursor = 0
+    while cursor < len(intervals) and len(result) < cap:
+        lo, hi = intervals[cursor]
+        cursor += 1
+        if lo > hi:
+            continue
+        mid = (lo + hi) // 2
+        if mid not in seen:
+            seen.add(mid)
+            result.append(mid)
+            if len(result) >= cap:
+                break
+        if lo <= mid - 1:
+            intervals.append((lo, mid - 1))
+        if mid + 1 <= hi:
+            intervals.append((mid + 1, hi))
+    # If service-database overlap consumed midpoint positions, complete deterministically.
+    if len(result) < cap:
+        for port in range(1, 65536):
+            if port not in seen:
+                result.append(port)
+                seen.add(port)
+                if len(result) >= cap:
+                    break
+    return result
+
+
+def _resolve_service_discovery_address(hostname: str) -> tuple[str, list[str]]:
+    infos = socket.getaddrinfo(hostname, None, type=socket.SOCK_STREAM)
+    addresses: list[str] = []
+    for info in infos:
+        address = str((info[4] or ('',))[0] or '').strip()
+        if address and address not in addresses:
+            addresses.append(address)
+    if not addresses:
+        raise OSError(f'No address resolved for {hostname!r}')
+    # One stable address keeps the bounded port budget meaningful; all resolved addresses remain audit metadata.
+    return addresses[0], addresses
+
+
+def _socket_http_probe(address: str, hostname: str, port: int, *, use_tls: bool, timeout: float=0.45) -> tuple[bool, str]:
+    sock: socket.socket | ssl.SSLSocket | None = None
+    try:
+        _pace_http_request()
+        base = socket.create_connection((address, int(port)), timeout=timeout)
+        base.settimeout(timeout)
+        sock = base
+        if use_tls:
+            context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+            # This is protocol classification only. Certificate trust is assessed by later scanners;
+            # accepting an untrusted/internal certificate here avoids hiding an otherwise reachable HTTPS service.
+            context.check_hostname = False
+            context.verify_mode = ssl.CERT_NONE
+            server_hostname = hostname if not re.fullmatch(r'[0-9a-fA-F:.]+', hostname or '') else None
+            sock = context.wrap_socket(base, server_hostname=server_hostname)
+            sock.settimeout(timeout)
+        host_header = hostname
+        default_port = 443 if use_tls else 80
+        if int(port) != default_port:
+            host_header = f'{hostname}:{port}'
+        request = (
+            f'HEAD / HTTP/1.1\r\nHost: {host_header}\r\nUser-Agent: SecOps-ServiceDiscovery/1.0\r\n'
+            'Accept: */*\r\nConnection: close\r\n\r\n'
+        ).encode('ascii', errors='ignore')
+        sock.sendall(request)
+        data = sock.recv(96)
+        text = data.decode('latin-1', errors='ignore')
+        return bool(re.match(r'^HTTP/\d(?:\.\d)?\s+\d{3}\b', text)), text[:80]
+    except (OSError, ssl.SSLError, ValueError):
+        return False, ''
+    finally:
+        if sock is not None:
+            try:
+                sock.close()
+            except OSError:
+                pass
+
+
+def _tcp_port_open(address: str, port: int, timeout: float=0.30) -> bool:
+    sock: socket.socket | None = None
+    try:
+        _pace_http_request()
+        sock = socket.create_connection((address, int(port)), timeout=timeout)
+        return True
+    except OSError:
+        return False
+    finally:
+        if sock is not None:
+            try:
+                sock.close()
+            except OSError:
+                pass
+
+
+def discover_same_host_web_services(target: str) -> dict[str, Any]:
+    parsed = urlparse(normalize_url(target))
+    hostname = str(parsed.hostname or '').lower().rstrip('.')
+    cap = int(DISCOVERY_LIMITS.get(CURRENT_SCAN_MODE, DISCOVERY_LIMITS['balanced']).get('same_host_service_candidates', 0) or 0)
+    cache_key = (hostname, CURRENT_SCAN_MODE)
+    empty = {
+        'enabled': False, 'hostname': hostname, 'candidate_cap': cap, 'ports_probed': 0,
+        'web_services': [], 'open_web_unconfirmed_ports': [], 'classification_deferred_ports': [],
+        'resolved_addresses': [],
+    }
+    if not DISCOVER_SAME_HOST_SERVICES or not ALLOW_SAME_HOST_PORTS or not hostname or cap <= 0:
+        return empty
+    cached = SAME_HOST_SERVICE_DISCOVERY_CACHE.get(cache_key)
+    if isinstance(cached, dict):
+        result = dict(cached)
+        result['cache_hit'] = True
+        return result
+    started = time.monotonic()
+    try:
+        address, addresses = _resolve_service_discovery_address(hostname)
+    except OSError as exc:
+        result = {
+            **empty, 'enabled': True, 'error': f'{type(exc).__name__}: {exc}',
+            'duration_seconds': round(time.monotonic() - started, 3), 'cache_hit': False,
+        }
+        SAME_HOST_SERVICE_DISCOVERY_CACHE[cache_key] = dict(result)
+        return result
+
+    web_services: list[dict[str, Any]] = []
+    open_unconfirmed: list[int] = []
+    ports = _stratified_tcp_port_order(cap)
+    original_port = parsed.port or (443 if parsed.scheme.lower() == 'https' else 80)
+    # Every TCP-open candidate is classified with BOTH HTTP and HTTPS. A socket being open is only
+    # attack-surface inventory; it is never labelled non-web merely because bounded classification
+    # did not confirm an HTTP protocol.
+    for index, port in enumerate(ports, start=1):
+        if not _tcp_port_open(address, port):
+            continue
+        plain_ok, plain_preview = _socket_http_probe(address, hostname, port, use_tls=False)
+        tls_ok, tls_preview = _socket_http_probe(address, hostname, port, use_tls=True)
+        if plain_ok:
+            root = f'http://{hostname}' + ('' if port == 80 else f':{port}') + '/'
+            web_services.append({
+                'url': root, 'port': port, 'scheme': 'http', 'probe_index': index,
+                'response_preview': plain_preview, 'http_confirmed': True, 'https_confirmed': bool(tls_ok),
+            })
+        if tls_ok:
+            root = f'https://{hostname}' + ('' if port == 443 else f':{port}') + '/'
+            web_services.append({
+                'url': root, 'port': port, 'scheme': 'https', 'probe_index': index,
+                'response_preview': tls_preview, 'http_confirmed': bool(plain_ok), 'https_confirmed': True,
+            })
+        if not plain_ok and not tls_ok:
+            open_unconfirmed.append(port)
+
+    unique_services: list[dict[str, Any]] = []
+    seen_roots: set[str] = set()
+    for row in web_services:
+        root = _clean_url(str(row.get('url') or ''))
+        if not root or root in seen_roots or not url_in_authorized_scope(target, root):
+            continue
+        seen_roots.add(root)
+        copy = dict(row)
+        copy['url'] = root
+        copy['configured_port'] = int(copy.get('port') or 0) == int(original_port) and str(copy.get('scheme') or '') == str(parsed.scheme or '').lower()
+        unique_services.append(copy)
+    result = {
+        'enabled': True, 'hostname': hostname, 'resolved_address': address, 'resolved_addresses': addresses,
+        'candidate_cap': cap, 'ports_probed': len(ports), 'web_services': unique_services,
+        'open_web_unconfirmed_ports': sorted(set(open_unconfirmed)), 'classification_deferred_ports': [],
+        'duration_seconds': round(time.monotonic() - started, 3), 'cache_hit': False,
+    }
+    SAME_HOST_SERVICE_DISCOVERY_CACHE[cache_key] = dict(result)
+    return result
+
 # Crawls the target and records pages, forms, parameters, scripts, browser requests, and auth state.
 def discover_target(target: str, cookies: str, max_pages: int=MAX_CRAWL_PAGES, seeds: list[str] | None=None, forced_seeds: list[str] | None=None) -> dict[str, Any]:
 
@@ -2607,9 +2908,15 @@ def discover_target(target: str, cookies: str, max_pages: int=MAX_CRAWL_PAGES, s
     session.headers.update({'User-Agent': 'SecOps-Discovery/2.0', 'Accept': 'text/html,application/xhtml+xml,application/json;q=0.8,*/*;q=0.5'})
     target_preparation = apply_runtime_target_preparation(target, cookies) if cookies else {'performed': False, 'configured': False, 'usable': True}
     limits = DISCOVERY_LIMITS.get(CURRENT_SCAN_MODE, DISCOVERY_LIMITS['balanced'])
+    same_host_service_discovery = discover_same_host_web_services(target)
+    discovered_service_roots = {
+        _clean_url(str(row.get('url') or ''))
+        for row in same_host_service_discovery.get('web_services', [])
+        if isinstance(row, dict) and row.get('url') and url_in_authorized_scope(target, str(row.get('url')))
+    }
     ordinary_seed_urls = { _clean_url(value) for value in seeds or [] if value and url_in_authorized_scope(target, value) }
     explicit_seed_urls = { _clean_url(value) for value in forced_seeds or [] if value and url_in_authorized_scope(target, value) }
-    priority_seed_urls = ordinary_seed_urls | explicit_seed_urls
+    priority_seed_urls = ordinary_seed_urls | explicit_seed_urls | discovered_service_roots
     initial = list(dict.fromkeys([_clean_url(target), *sorted(priority_seed_urls)]))
     explicit_seed_count = len(explicit_seed_urls)
     page_budget = max(min(max(1, int(max_pages)), int(limits['crawl_pages'])), min(256, explicit_seed_count))
@@ -2718,6 +3025,7 @@ def discover_target(target: str, cookies: str, max_pages: int=MAX_CRAWL_PAGES, s
     deferred_script_urls: set[str] = set()
     tokens: set[str] = set()
     errors: list[dict[str, Any]] = []
+    tls_trust_fallback_urls: set[str] = set()
     initial_login_detected = False
     pages_processed = 0
     http_base_scores: list[int] = []
@@ -2761,6 +3069,8 @@ def discover_target(target: str, cookies: str, max_pages: int=MAX_CRAWL_PAGES, s
                 enqueue(nested, force=forced_requested, source_url=requested)
         try:
             response, final, redirect_issue = _safe_crawl_get(session, requested, target, timeout=(5, 15), max_redirects=5, cookies=cookies)
+            if response is not None and bool(getattr(response, '_secops_tls_trust_retry', False)):
+                tls_trust_fallback_urls.add(str(final or requested))
         except requests.RequestException as exc:
             errors.append({'url': requested, 'type': type(exc).__name__, 'message': str(exc)})
             continue
@@ -2806,7 +3116,7 @@ def discover_target(target: str, cookies: str, max_pages: int=MAX_CRAWL_PAGES, s
             continue
         if urlparse(requested).query:
             parameterized.add(requested)
-            query_parameters = [name for name, _ in parse_qsl(urlparse(requested).query, keep_blank_values=True)]
+            query_parameters = _query_parameter_names(requested)
             if query_parameters:
                 request_cases.append({
                     'url': requested, 'method': 'GET', 'data': '', 'parameters': query_parameters,
@@ -2847,7 +3157,7 @@ def discover_target(target: str, cookies: str, max_pages: int=MAX_CRAWL_PAGES, s
             literal_hint = {'method': 'GET', 'url': hinted_url, 'source': 'html_or_inline_literal'}
             if literal_hint not in script_endpoint_hints:
                 script_endpoint_hints.append(literal_hint)
-            hint_parameters = [name for name, _ in parse_qsl(urlparse(hinted_url).query, keep_blank_values=True)]
+            hint_parameters = _query_parameter_names(hinted_url)
             if hint_parameters:
                 request_cases.append({
                     'url': hinted_url, 'method': 'GET', 'data': '', 'parameters': hint_parameters,
@@ -2878,6 +3188,8 @@ def discover_target(target: str, cookies: str, max_pages: int=MAX_CRAWL_PAGES, s
             attempted_script_urls.add(script_url)
             try:
                 script_response, script_final, script_issue = _safe_crawl_get(session, script_url, target, timeout=(4, 12), max_redirects=4, cookies=cookies)
+                if script_response is not None and bool(getattr(script_response, '_secops_tls_trust_retry', False)):
+                    tls_trust_fallback_urls.add(str(script_final or script_url))
             except requests.RequestException as exc:
                 errors.append({'url': script_url, 'type': type(exc).__name__, 'message': f'JavaScript fetch: {exc}'})
                 continue
@@ -2896,7 +3208,7 @@ def discover_target(target: str, cookies: str, max_pages: int=MAX_CRAWL_PAGES, s
                 recorded_hint = {'method': hint_method, 'url': hinted_url, 'source': 'javascript_literal'}
                 if hinted_url and recorded_hint not in script_endpoint_hints:
                     script_endpoint_hints.append(recorded_hint)
-                hint_parameters = [name for name, _ in parse_qsl(urlparse(hinted_url).query, keep_blank_values=True)]
+                hint_parameters = _query_parameter_names(hinted_url)
                 if hint_parameters and hint_method in {'GET', 'POST'}:
                     request_cases.append({'url': hinted_url, 'method': hint_method, 'data': '', 'parameters': hint_parameters, 'file_parameters': [], 'token_parameters': [], 'fields': [], 'source_url': script_final, 'discovery_source': 'javascript_literal'})
                     if hint_method == 'GET':
@@ -2927,7 +3239,7 @@ def discover_target(target: str, cookies: str, max_pages: int=MAX_CRAWL_PAGES, s
                 record_coverage_skip(candidate, 'STATE_CHANGE_BLOCKED', 'Destructive or state-changing link was excluded by the discovery safety policy.', source_url=final)
                 destructive_request_cases.append({
                     'url': candidate, 'method': 'GET', 'data': '',
-                    'parameters': [name for name, _ in parse_qsl(urlparse(candidate).query, keep_blank_values=True)],
+                    'parameters': _query_parameter_names(candidate),
                     'fields': [], 'source_url': final, 'destructive_kind': 'logout' if _is_logout_url(candidate) else 'other',
                 })
                 continue
@@ -3057,6 +3369,15 @@ def discover_target(target: str, cookies: str, max_pages: int=MAX_CRAWL_PAGES, s
         'out_of_scope_origins_observed': sorted(out_of_scope_origins),
         'authorized_origins': sorted(AUTHORIZED_SCOPE_ORIGINS),
         'allow_same_host_ports': ALLOW_SAME_HOST_PORTS,
+        'discover_same_host_services': DISCOVER_SAME_HOST_SERVICES,
+        'same_host_service_candidate_cap': int(same_host_service_discovery.get('candidate_cap', 0) or 0),
+        'same_host_service_ports_probed': int(same_host_service_discovery.get('ports_probed', 0) or 0),
+        'same_host_web_services_discovered': len(same_host_service_discovery.get('web_services') or []),
+        'same_host_open_web_unconfirmed_ports': len(same_host_service_discovery.get('open_web_unconfirmed_ports') or []),
+        'same_host_classification_deferred_ports': len(same_host_service_discovery.get('classification_deferred_ports') or []),
+        'same_host_service_discovery_seconds': float(same_host_service_discovery.get('duration_seconds', 0.0) or 0.0),
+        'tls_trust_fallback_count': len(tls_trust_fallback_urls),
+        'tls_trust_fallback_urls': sorted(tls_trust_fallback_urls),
         'explicit_entry_points': len(explicit_seed_urls),
         'priority_discovery_seeds': len(ordinary_seed_urls),
     }
@@ -3082,7 +3403,7 @@ def discover_target(target: str, cookies: str, max_pages: int=MAX_CRAWL_PAGES, s
             f'{browser_blocked_navigations}. Origins: {preview}{suffix}'
         )
 
-    return {'urls': sorted(visited), 'html_urls': sorted(html_urls), 'form_urls': sorted(form_urls), 'parameterized_urls': sorted(parameterized), 'request_cases': _dedupe_request_cases(request_cases), 'script_urls': sorted(script_urls), 'script_endpoint_hints': script_endpoint_hints, 'browser_network_requests': browser_network_requests, 'browser_navigation_urls': browser_navigation_urls, 'client_side_candidates': client_side_candidates, 'jwt_tokens': sorted(tokens), 'errors': errors, 'authentication_effective': auth_effective, 'authentication_note': auth_note, 'authentication_probe': auth_probe, 'target_preparation': target_preparation, 'destructive_urls_skipped': sorted(destructive_skipped), 'destructive_request_cases': _dedupe_request_cases(destructive_request_cases), 'coverage_skipped_cases': coverage_skipped_cases, 'budget_diagnostics': budget_diagnostics, 'explicit_entry_points': sorted(explicit_seed_urls), 'priority_discovery_seeds': sorted(ordinary_seed_urls)}
+    return {'urls': sorted(visited), 'html_urls': sorted(html_urls), 'form_urls': sorted(form_urls), 'parameterized_urls': sorted(parameterized), 'request_cases': _dedupe_request_cases(request_cases), 'script_urls': sorted(script_urls), 'script_endpoint_hints': script_endpoint_hints, 'browser_network_requests': browser_network_requests, 'browser_navigation_urls': browser_navigation_urls, 'client_side_candidates': client_side_candidates, 'jwt_tokens': sorted(tokens), 'errors': errors, 'authentication_effective': auth_effective, 'authentication_note': auth_note, 'authentication_probe': auth_probe, 'target_preparation': target_preparation, 'destructive_urls_skipped': sorted(destructive_skipped), 'destructive_request_cases': _dedupe_request_cases(destructive_request_cases), 'coverage_skipped_cases': coverage_skipped_cases, 'budget_diagnostics': budget_diagnostics, 'same_host_service_discovery': same_host_service_discovery, 'explicit_entry_points': sorted(explicit_seed_urls), 'priority_discovery_seeds': sorted(ordinary_seed_urls), 'proactive_service_roots': sorted(discovered_service_roots)}
 
 # Orders discovery diagnostics so browser/runtime failures are visible before ordinary dead-link HTTP errors.
 def prioritized_discovery_errors(errors: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -3963,7 +4284,7 @@ def select_logout_request_cases(discovery: dict[str, Any], limit: int=3) -> list
         known.add(key)
         cases.append({
             'url': url, 'method': 'GET', 'data': '',
-            'parameters': [name for name, _ in parse_qsl(urlparse(url).query, keep_blank_values=True)],
+            'parameters': _query_parameter_names(url),
             'fields': [], 'source_url': url, 'destructive_kind': 'logout',
         })
     selected: list[dict[str, Any]] = []
@@ -4000,6 +4321,45 @@ COMMAND_HINTS = {'cmd', 'command', 'exec', 'shell', 'ip', 'host', 'hostname', 'p
 # inclusion/path-traversal vector, not merely an XSS-reflection surface.
 TRAVERSAL_HINTS = {'file', 'filename', 'path', 'page', 'include', 'template', 'document', 'folder', 'dir', 'directory', 'view', 'resource', 'download', 'redirect', 'linkurl'}
 IDOR_HINTS = {'id', 'uid', 'user_id', 'userid', 'account_id', 'accountid', 'object_id', 'objectid', 'item_id', 'itemid', 'order_id', 'orderid', 'document_id', 'documentid', 'file_id', 'fileid', 'profile_id', 'profileid', 'dashboardid', 'widgetid', 'deviceid', 'modelid'}
+IDOR_PROTOCOL_PARAMETER_NAMES = {'state', 'nonce', 'code', 'session_state', 'execution', 'tab_id', 'auth_session_id', 'session_code'}
+IDOR_UUID_RE = re.compile(r'^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-5][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$')
+IDOR_HEX_RE = re.compile(r'^[0-9a-fA-F]{8,64}$')
+IDOR_DIGIT_RUN_RE = re.compile(r'\d+')
+
+# Returns a deterministic nearby reference only for bounded object-id shapes. It deliberately
+# avoids transient identity-protocol values and does not guess arbitrary free-text identifiers.
+def _mutated_object_reference(name: str, value: str) -> str | None:
+    key = str(name or '').lower()
+    raw = str(value or '')
+    if key not in IDOR_HINTS or key in IDOR_PROTOCOL_PARAMETER_NAMES or not raw:
+        return None
+    if raw.isdigit():
+        return str(int(raw) + 1)
+    if IDOR_UUID_RE.fullmatch(raw):
+        chars = list(raw)
+        for index in range(len(chars) - 1, -1, -1):
+            if chars[index].lower() in '0123456789abcdef':
+                chars[index] = '0' if chars[index].lower() != '0' else '1'
+                return ''.join(chars)
+    if IDOR_HEX_RE.fullmatch(raw) and any(ch.lower() in 'abcdef' for ch in raw):
+        width = len(raw)
+        return format((int(raw, 16) + 1) % (16 ** width), f'0{width}x')
+    matches = list(IDOR_DIGIT_RUN_RE.finditer(raw))
+    if matches:
+        match = matches[-1]
+        digits = match.group(0)
+        replacement = str(int(digits) + 1).zfill(len(digits))
+        return raw[:match.start()] + replacement + raw[match.end():]
+    return None
+
+
+def _object_reference_pairs(url: str) -> list[tuple[str, str, str]]:
+    rows: list[tuple[str, str, str]] = []
+    for name, value in parse_qsl(urlparse(str(url or '')).query, keep_blank_values=True):
+        mutated = _mutated_object_reference(name, value)
+        if mutated is not None and mutated != value:
+            rows.append((str(name), str(value), mutated))
+    return rows
 NAVIGATION_PARAMETERS = {'pagetitle', 'linkid', 'fromsubmenu', 'showframe', 'redirect', 'linkurl'}
 
 PARAMETER_SCANNER_STATIC_SUFFIXES = {
@@ -4061,9 +4421,9 @@ def _oversized_generated_request(case: dict[str, Any]) -> bool:
 
 # Parameter extraction lists the names available in a normalized request case.
 def _case_parameters(case: dict[str, Any]) -> set[str]:
-    parameters = {str(value).lower() for value in case.get('parameters', []) if str(value)}
+    parameters = {value.lower() for value in _clean_case_parameter_names(case.get('parameters', []))}
     parsed = urlparse(str(case.get('url', '')))
-    parameters.update((name.lower() for name, _ in parse_qsl(parsed.query, keep_blank_values=True)))
+    parameters.update((name.lower() for name, _ in _filtered_query_pairs(parsed.query)))
     return parameters
 
 INTERNAL_RESOURCE_VALUE_PATTERN = re.compile(r'\.(php\d?|phtml|jsp|jspx|asp|aspx|cgi|pl|do|action|html?)(?:[/?]|$)')
@@ -4234,20 +4594,17 @@ def _tool_case_priority(tool: str, case: dict[str, Any], authenticated_profile: 
     if tool == 'idor':
         if method != 'GET':
             return -1000
-        numeric_pairs = [(name.lower(), value) for name, value in parse_qsl(parsed.query, keep_blank_values=True) if value.isdigit()]
-        object_pairs = [(name, value) for name, value in numeric_pairs if name in IDOR_HINTS]
+        object_pairs = _object_reference_pairs(str(case.get('url') or ''))
         if not object_pairs or any((token in path for token in ('brute', 'csrf', 'password', 'sqli', 'xss', '/exec', '/csp'))):
             return -1000
         score = 20 + 28 * len(object_pairs)
         score += 25 if any((token in path for token in ('idor', 'object', 'profile', 'account', 'user'))) else 0
-        if any((token in path for token in ('sqli', 'xss', '/exec', '/csp'))):
-            score -= 60
         return score
     return score
 
 # Explains why a request case should not be sent to a scanner.
 def _tool_case_skip_reason(tool: str, case: dict[str, Any], authenticated_profile: bool=False) -> str:
-    if not [value for value in case.get('parameters', []) if str(value)]:
+    if not _clean_case_parameter_names(case.get('parameters', [])):
         return 'The request has no testable application parameter for this parameter scanner.'
     if _is_auto_index_case(case):
         return 'Directory-index sorting parameters are navigation controls, not application inputs.'
@@ -4313,6 +4670,91 @@ def _family_fair_ranked_cases(ranked: list[tuple[int, dict[str, Any]]]) -> list[
     return output
 
 
+# Generic live-input breadth is separate from vulnerability-class ranking. It admits only concrete
+# application traffic so unfamiliar parameter names do not become invisible on large applications.
+def _generic_live_input_case(tool: str, case: dict[str, Any]) -> bool:
+    name = str(tool or '').lower()
+    if name not in {'sqlmap', 'dalfox', 'commix'}:
+        return False
+    url = str(case.get('url') or '')
+    method = str(case.get('method') or 'GET').upper()
+    if method not in {'GET', 'POST'} or not url or not _clean_case_parameter_names(case.get('parameters', [])):
+        return False
+    if _destructive_crawl_url(url) or _is_logout_case(case) or _oversized_generated_request(case):
+        return False
+    if _parameter_scanner_static_asset(case) or _identity_protocol_metadata_only(case):
+        return False
+    if name == 'dalfox' and (_dalfox_non_html_static_asset(case) or _prefer_browser_for_xss_case(case)):
+        return False
+    response = case.get('browser_response') if isinstance(case.get('browser_response'), dict) else {}
+    status = int(response.get('status') or 0)
+    observed_live = response.get('observed') is True and 200 <= status < 400
+    source = str(case.get('discovery_source') or case.get('source') or '').lower()
+    network_live = source in {'playwright_network', 'browser_network', 'xhr', 'fetch'} or any(token in source for token in ('playwright', 'xhr', 'fetch'))
+    structured_post = method == 'POST' and bool(str(case.get('data') or '').strip())
+    content_type = str(case.get('content_type') or case.get('enctype') or '').lower()
+    json_or_form = structured_post and any(token in content_type for token in ('json', 'form'))
+    return bool(observed_live or network_live or json_or_form)
+
+
+def _append_generic_live_input_reserve(
+    tool: str, selected: list[dict[str, Any]], candidates: list[dict[str, Any]], *,
+    authenticated_profile: bool, credential_cookies: str,
+) -> list[dict[str, Any]]:
+    reserve = max(0, int(GENERIC_LIVE_INPUT_RESERVE.get(CURRENT_SCAN_MODE, {}).get(str(tool or '').lower(), 0)))
+    if reserve <= 0:
+        return selected
+    output = list(selected)
+    known: set[tuple[str, tuple[str, str, tuple[str, ...]], tuple[str, ...]]] = set()
+    shape_counts: Counter[tuple[str, tuple[str, str, tuple[str, ...]], tuple[str, ...]]] = Counter()
+    variant_cap = _specialist_variant_cap()
+    for case in output:
+        method = str(case.get('method') or 'GET').upper()
+        params = tuple(sorted(str(v).lower() for v in case.get('parameters', []) if str(v)))
+        key = (method, _semantic_request_url_key(str(case.get('url') or '')), params)
+        known.add(key)
+        shape_counts[(method, _specialist_route_signature(tool, str(case.get('url') or '')), params)] += 1
+    eligible: list[tuple[int, int, dict[str, Any]]] = []
+    for index, raw in enumerate(candidates):
+        if not isinstance(raw, dict):
+            continue
+        params = _clean_case_parameter_names(raw.get('parameters', [])) or _query_parameter_names(str(raw.get('url') or ''))
+        case = {**raw, 'parameters': params}
+        if not _generic_live_input_case(tool, case):
+            continue
+        url = str(case.get('url') or '')
+        method = str(case.get('method') or 'GET').upper()
+        param_key = tuple(sorted(str(v).lower() for v in params if str(v)))
+        key = (method, _semantic_request_url_key(url), param_key)
+        shape = (method, _specialist_route_signature(tool, url), param_key)
+        if key in known or shape_counts[shape] >= variant_cap:
+            continue
+        response = case.get('browser_response') if isinstance(case.get('browser_response'), dict) else {}
+        score = 40
+        score += 20 if response.get('observed') is True and 200 <= int(response.get('status') or 0) < 400 else 0
+        score += 18 if method == 'POST' else 0
+        score += 14 if str(case.get('discovery_source') or '').lower() == 'playwright_network' else 0
+        score += min(16, len(params) * 3)
+        eligible.append((score, -index, case))
+    added = 0
+    for score, _, case in _family_fair_ranked_cases([(a, c) for a, _, c in sorted(eligible, key=lambda row: (-row[0], -row[1]))]):
+        if added >= reserve:
+            break
+        url = str(case.get('url') or '')
+        method = str(case.get('method') or 'GET').upper()
+        params = tuple(sorted(str(v).lower() for v in case.get('parameters', []) if str(v)))
+        key = (method, _semantic_request_url_key(url), params)
+        shape = (method, _specialist_route_signature(tool, url), params)
+        if key in known or shape_counts[shape] >= variant_cap:
+            continue
+        case_authenticated = authenticated_profile and (not credential_cookies or bool(scope_cookie_header(url, credential_cookies)))
+        if _tool_case_skip_reason(tool, case, authenticated_profile=case_authenticated) and _tool_case_priority(tool, case, authenticated_profile=case_authenticated) <= 0:
+            # Generic reserve intentionally bypasses only class-name mismatch, never the hard safety exclusions above.
+            pass
+        output.append({**case, 'priority_score': int(score), 'coverage_reserve': True, 'selection_reason': 'generic-live-input-reserve'})
+        known.add(key); shape_counts[shape] += 1; added += 1
+    return output
+
 # Chooses the best request cases for one scanner and scan profile.
 def select_tool_request_cases(discovery: dict[str, Any], tool: str, limit: int | None=None, authenticated_profile: bool=False, allow_state_changes: bool=True, credential_cookies: str='') -> list[dict[str, Any]]:
 
@@ -4322,19 +4764,23 @@ def select_tool_request_cases(discovery: dict[str, Any], tool: str, limit: int |
     for value in discovery.get('parameterized_urls', []):
         url = str(value or '')
         if url and url not in known:
-            cases.append({'url': url, 'method': 'GET', 'data': '', 'parameters': [name for name, _ in parse_qsl(urlparse(url).query, keep_blank_values=True)], 'source_url': url, 'synthetic_from_parameterized_url': True})
+            cases.append({'url': url, 'method': 'GET', 'data': '', 'parameters': _query_parameter_names(url), 'source_url': url, 'synthetic_from_parameterized_url': True})
     if not allow_state_changes:
         cases = filter_request_cases_for_state_policy(cases, False)
     ranked: list[tuple[int, int, dict[str, Any]]] = []
     for index, case in enumerate(cases):
         if not isinstance(case, dict):
             continue
+        clean_parameters = _clean_case_parameter_names(case.get('parameters', []))
+        if not clean_parameters:
+            clean_parameters = _query_parameter_names(str(case.get('url') or ''))
+        case = {**case, 'parameters': clean_parameters}
         browser_response = case.get('browser_response') if isinstance(case.get('browser_response'), dict) else {}
         if browser_response.get('observed') is True and int(browser_response.get('status') or 0) in {404, 410}:
             continue
         if str(case.get('method', 'GET')).upper() not in {'GET', 'POST'}:
             continue
-        if not [value for value in case.get('parameters', []) if str(value)]:
+        if not case.get('parameters'):
             continue
         case_url = str(case.get('url') or '')
         case_authenticated = authenticated_profile and (not credential_cookies or bool(scope_cookie_header(case_url, credential_cookies)))
@@ -4363,6 +4809,10 @@ def select_tool_request_cases(discovery: dict[str, Any], tool: str, limit: int |
         for index, case in enumerate(cases):
             if not isinstance(case, dict):
                 continue
+            clean_parameters = _clean_case_parameter_names(case.get('parameters', []))
+            if not clean_parameters:
+                clean_parameters = _query_parameter_names(str(case.get('url') or ''))
+            case = {**case, 'parameters': clean_parameters}
             method = str(case.get('method', 'GET')).upper()
             url = str(case.get('url') or '')
             path = urlparse(url).path.lower()
@@ -4398,6 +4848,9 @@ def select_tool_request_cases(discovery: dict[str, Any], tool: str, limit: int |
             unique_ranked.append((int(score), case))
     unique_ranked = _family_fair_ranked_cases(unique_ranked)
     selected = _select_with_adaptive_specialist_budget(tool, unique_ranked, effective_limit)
+    selected = _append_generic_live_input_reserve(
+        tool, selected, cases, authenticated_profile=authenticated_profile, credential_cookies=credential_cookies,
+    )
     if str(tool or '').lower() == 'traversal':
         reserve = max(len(selected), int(ROUTING_TRAVERSAL_RESERVE.get(CURRENT_SCAN_MODE, len(selected))))
         # Any already-selected GET contract whose value names an internal file/module belongs to
@@ -4432,6 +4885,189 @@ def select_tool_request_cases(discovery: dict[str, Any], tool: str, limit: int |
             })
             known.add(key)
     return selected
+
+
+# Structural context for completion accounting. Semantic routing values are retained by
+# _semantic_request_url_key while ordinary value-only changes collapse to one context.
+def _safe_surface_context_key(case: dict[str, Any]) -> tuple[str, tuple[str, str, tuple[tuple[str, str], ...]], tuple[str, ...]]:
+    method = str(case.get('method') or 'GET').upper()
+    url = str(case.get('url') or case.get('target_url') or '')
+    params = _clean_case_parameter_names(case.get('parameters', [])) or _query_parameter_names(url)
+    return method, _semantic_request_url_key(url), tuple(sorted(str(value).lower() for value in params if str(value)))
+
+
+def _tested_surface_contexts(profile_results: dict[str, Any]) -> set[tuple[str, tuple[str, str, tuple[tuple[str, str], ...]], tuple[str, ...]]]:
+    """Return only contexts with concrete evidence that a request-level test completed.
+
+    Generic PARTIAL results do not prove that the attack request ran: partial can mean preflight,
+    authentication, startup or timeout. Broad scanners contribute only their explicit completed
+    lists when partial, while a fully successful Nuclei phase may also contribute focused targets.
+    """
+    tested: set[tuple[str, tuple[str, str, tuple[tuple[str, str], ...]], tuple[str, ...]]] = set()
+    try:
+        leaves = list(iter_leaf_results(profile_results))
+    except Exception:
+        leaves = []
+    for _, result in leaves:
+        if not isinstance(result, dict):
+            continue
+        status = str(result.get('status') or '').lower()
+        if status in {'error', 'skipped'}:
+            continue
+        if status == 'success':
+            action = result.get('coverage_action') if isinstance(result.get('coverage_action'), dict) else {}
+            if action.get('target_url'):
+                tested.add(_safe_surface_context_key(action))
+        for row in result.get('dast_completed_request_cases', []) if isinstance(result.get('dast_completed_request_cases'), list) else []:
+            if isinstance(row, dict) and row.get('url'):
+                tested.add(_safe_surface_context_key(row))
+        if status == 'success':
+            for value in result.get('focused_targets', []) if isinstance(result.get('focused_targets'), list) else []:
+                if str(value):
+                    tested.add(_safe_surface_context_key({'url': str(value), 'method': 'GET', 'parameters': _query_parameter_names(str(value))}))
+        for row in result.get('targeted_active_scans', []) if isinstance(result.get('targeted_active_scans'), list) else []:
+            if isinstance(row, dict) and bool(row.get('completed')) and row.get('url'):
+                tested.add(_safe_surface_context_key({
+                    'url': str(row.get('url')), 'method': str(row.get('method') or 'GET'),
+                    'parameters': list(row.get('parameters') or []),
+                }))
+        for row in result.get('tested_cases', []) if isinstance(result.get('tested_cases'), list) else []:
+            if isinstance(row, dict) and row.get('url'):
+                tested.add(_safe_surface_context_key(row))
+    return tested
+
+
+def _safe_surface_candidate(case: dict[str, Any]) -> bool:
+    url = str(case.get('url') or '')
+    method = str(case.get('method') or 'GET').upper()
+    if method not in {'GET', 'POST'} or not url or not url_in_authorized_scope(PRIMARY_SCOPE_TARGET or url, url):
+        return False
+    if _destructive_crawl_url(url) or _is_logout_case(case) or _oversized_generated_request(case):
+        return False
+    if _identity_protocol_metadata_only(case) or _parameter_scanner_static_asset(case):
+        return False
+    response = case.get('browser_response') if isinstance(case.get('browser_response'), dict) else {}
+    if response.get('observed') is True and int(response.get('status') or 0) in {404, 410}:
+        return False
+    return True
+
+
+def run_safe_surface_sweep(
+    target: str, discovery: dict[str, Any], profile_results: dict[str, Any], cookies: str='', *, limit: int | None=None,
+) -> dict[str, Any]:
+    """Replay still-untested reachable read-only contexts under one bounded completion deadline.
+
+    This is deliberately not a vulnerability specialist. It records response/CORS/security-header
+    observations and completion coverage; reporting keeps sweep-only coverage separate from broad/
+    specialist coverage so this phase cannot inflate the latter metric.
+    """
+    cap = max(0, int(limit if limit is not None else SAFE_SURFACE_SWEEP_LIMITS.get(CURRENT_SCAN_MODE, 0)))
+    total_timeout = max(30.0, float(BROAD_SCANNER_TIMEOUTS.get('nuclei', 240)) * SAFE_SURFACE_SWEEP_TIMEOUT_FACTOR)
+    started = time.monotonic()
+    deadline = started + total_timeout
+    previously_tested = _tested_surface_contexts(profile_results)
+    raw_inputs = discovery.get('request_cases', []) if isinstance(discovery.get('request_cases'), list) else []
+    input_request_cases = len(raw_inputs)
+    skipped_invalid = 0
+    structurally_valid: list[dict[str, Any]] = []
+    for raw in raw_inputs:
+        if not isinstance(raw, dict):
+            skipped_invalid += 1
+            continue
+        url = str(raw.get('url') or '').strip()
+        method = str(raw.get('method') or 'GET').upper().strip()
+        if not url or method not in {'GET', 'POST'}:
+            skipped_invalid += 1
+            continue
+        try:
+            parsed = urlparse(url)
+            _ = parsed.port
+        except (TypeError, ValueError):
+            skipped_invalid += 1
+            continue
+        if parsed.scheme.lower() not in {'http', 'https'} or not parsed.hostname:
+            skipped_invalid += 1
+            continue
+        structurally_valid.append(raw)
+
+    candidates: list[dict[str, Any]] = []
+    seen: set[tuple[str, tuple[str, str, tuple[tuple[str, str], ...]], tuple[str, ...]]] = set()
+    for raw in filter_request_cases_for_state_policy(structurally_valid, False):
+        params = _clean_case_parameter_names(raw.get('parameters', [])) or _query_parameter_names(str(raw.get('url') or ''))
+        case = {**raw, 'parameters': params}
+        if not _safe_surface_candidate(case):
+            continue
+        key = _safe_surface_context_key(case)
+        if key in seen or key in previously_tested:
+            continue
+        seen.add(key)
+        candidates.append(case)
+    ranked = _family_fair_ranked_cases([
+        (_risk_terms(str(case.get('url') or '') + ' ' + ' '.join(case.get('parameters', []))) + (12 if str(case.get('method') or 'GET').upper() == 'POST' else 0), case)
+        for case in candidates
+    ])
+    selected = [case for _, case in ranked[:cap]] if cap else []
+    session = requests.Session()
+    session.headers.update({'User-Agent': 'SecOps-SafeSurface/1.0', 'Accept': '*/*', 'Origin': 'https://secops.invalid'})
+    completed: list[dict[str, Any]] = []
+    errors: list[dict[str, Any]] = []
+    timed_out = False
+    tls_fallbacks = 0
+    for case in selected:
+        if time.monotonic() >= deadline:
+            timed_out = True
+            break
+        url = str(case.get('url') or '')
+        method = str(case.get('method') or 'GET').upper()
+        headers: dict[str, str] = {}
+        applicable_cookie = scope_cookie_header(url, cookies) if cookies else ''
+        if applicable_cookie:
+            headers['Cookie'] = applicable_cookie
+        content_type = str(case.get('content_type') or case.get('enctype') or '').strip()
+        if content_type:
+            headers['Content-Type'] = content_type
+        remaining = max(0.2, deadline - time.monotonic())
+        try:
+            _pace_http_request()
+            response, tls_retry, _ = _request_with_tls_trust_retry(
+                session, method, url, data=str(case.get('data') or '') if method == 'POST' else None,
+                headers=headers, allow_redirects=False, timeout=(min(4.0, remaining), min(12.0, remaining)),
+            )
+            tls_fallbacks += int(tls_retry)
+            completed.append({
+                'url': url, 'method': method, 'parameters': list(case.get('parameters') or []),
+                'status_code': int(response.status_code), 'response_content_type': str(response.headers.get('Content-Type') or ''),
+                'location': str(response.headers.get('Location') or ''),
+                'cors_allow_origin': str(response.headers.get('Access-Control-Allow-Origin') or ''),
+                'cors_allow_credentials': str(response.headers.get('Access-Control-Allow-Credentials') or ''),
+                'content_security_policy': bool(response.headers.get('Content-Security-Policy')),
+                'x_content_type_options': str(response.headers.get('X-Content-Type-Options') or ''),
+                'hsts': str(response.headers.get('Strict-Transport-Security') or ''),
+                'tls_trust_fallback': bool(tls_retry),
+            })
+        except requests.RequestException as exc:
+            errors.append({'url': url, 'method': method, 'error': f'{type(exc).__name__}: {exc}'})
+    elapsed = round(time.monotonic() - started, 3)
+    untouched = max(0, len(selected) - len(completed) - len(errors))
+    status = 'partial' if timed_out or untouched or errors else 'success'
+    diagnosis = 'time_limit_reached' if timed_out else ('partial_completion_sweep' if errors or untouched else '')
+    return {
+        'tool': 'safe-surface', 'status': status, 'diagnosis': diagnosis,
+        'output': (
+            f'Completion-driven safe surface sweep tested {len(completed)}/{len(selected)} selected still-untested context(s); '
+            f'eligible={len(candidates)}, invalid={skipped_invalid}, cap={cap}, errors={len(errors)}, time_limit={timed_out}.'
+        ),
+        'target': target, 'vulnerabilities': [], 'tested_cases': completed, 'errors': errors,
+        'input_request_cases': input_request_cases, 'selected_request_cases': len(selected),
+        'skipped_invalid_request_cases': skipped_invalid, 'tested_request_cases': len(completed),
+        'failed_request_cases': len(errors),
+        'eligible_contexts': len(candidates), 'selected_contexts': len(selected), 'tested_contexts': len(completed),
+        'previously_tested_contexts': len(previously_tested), 'untouched_eligible_contexts': max(0, len(candidates) - len(selected)) + untouched,
+        'coverage_class': 'safe_surface_completion_only', 'broad_specialist_coverage': False,
+        'timed_out': timed_out, 'time_limit_reached': timed_out, 'duration_seconds': elapsed,
+        'tool_timeout_seconds': total_timeout, 'tls_trust_fallback_count': tls_fallbacks,
+        'coverage_action': {'tool': 'safe-surface', 'target_url': target, 'method': 'GET', 'parameters': []},
+    }
 
 BROWSER_STATIC_SUFFIXES = {'.css', '.js', '.mjs', '.map', '.png', '.jpg', '.jpeg', '.gif', '.webp', '.svg', '.ico', '.woff', '.woff2', '.ttf', '.otf', '.eot', '.mp3', '.wav', '.mp4', '.webm', '.pdf', '.zip'}
 
@@ -4636,7 +5272,7 @@ def select_browser_request_cases(discovery: dict[str, Any], limit: int | None=No
         if key in matched_client_keys:
             continue
         url = str(evidence[0].get('url') or '')
-        cases.append({'url': url, 'method': 'GET', 'data': '', 'parameters': [name for name, _ in parse_qsl(urlparse(url).query, keep_blank_values=True)], 'fields': [], 'source_url': url, 'client_side_only': True, 'client_sources': sorted({str(value) for item in evidence for value in item.get('sources', []) if str(value)}), 'client_sinks': sorted({str(value) for item in evidence for value in item.get('sinks', []) if str(value)}), 'client_side_evidence': evidence})
+        cases.append({'url': url, 'method': 'GET', 'data': '', 'parameters': _query_parameter_names(url), 'fields': [], 'source_url': url, 'client_side_only': True, 'client_sources': sorted({str(value) for item in evidence for value in item.get('sources', []) if str(value)}), 'client_sinks': sorted({str(value) for item in evidence for value in item.get('sinks', []) if str(value)}), 'client_side_evidence': evidence})
     ranked = sorted(((_browser_case_priority(case, client_keys), -index, case) for index, case in enumerate(cases)), key=lambda item: (-item[0], -item[1]))
     unique_ranked: list[tuple[int, dict[str, Any]]] = []
     seen: set[tuple[str, str, tuple[str, ...]]] = set()
@@ -4858,7 +5494,7 @@ def select_authorization_request_cases(discovery: dict[str, Any], limit: int | N
     for value in discovery.get('parameterized_urls', []):
         url = str(value or '')
         if url and url not in known:
-            cases.append({'url': url, 'method': 'GET', 'data': '', 'parameters': [name for name, _ in parse_qsl(urlparse(url).query, keep_blank_values=True)], 'source_url': url, 'synthetic_from_parameterized_url': True})
+            cases.append({'url': url, 'method': 'GET', 'data': '', 'parameters': _query_parameter_names(url), 'source_url': url, 'synthetic_from_parameterized_url': True})
 
     ranked: list[tuple[int, int, dict[str, Any]]] = []
     for index, case in enumerate(cases):
@@ -5119,7 +5755,7 @@ def select_request_cases(discovery: dict[str, Any], limit: int=MAX_PARAMETER_END
     known_urls = {str(case.get('url', '')) for case in cases}
     for url in discovery.get('parameterized_urls', []):
         if url not in known_urls:
-            cases.append({'url': url, 'method': 'GET', 'data': '', 'parameters': [name for name, _ in parse_qsl(urlparse(url).query, keep_blank_values=True)], 'source_url': url})
+            cases.append({'url': url, 'method': 'GET', 'data': '', 'parameters': _query_parameter_names(url), 'source_url': url})
     ranked: list[tuple[int, dict[str, Any]]] = []
     seen: set[tuple[str, str, tuple[str, ...]]] = set()
     for case in cases:
@@ -5218,7 +5854,7 @@ def enrich_discovery_with_arjun(discovery: dict[str, Any], result: dict[str, Any
     generated = [urlunparse(parsed._replace(query=urlencode([*existing, (name, '1')]), fragment='')) for name in sorted(parameters) if name and name not in names and re.fullmatch('[A-Za-z0-9_.:-]{1,128}', name)]
     updated = dict(discovery)
     updated['parameterized_urls'] = sorted(set(updated.get('parameterized_urls', [])) | set(generated))
-    generated_cases = [{'url': url, 'method': 'GET', 'data': '', 'parameters': [name for name, _ in parse_qsl(urlparse(url).query, keep_blank_values=True)], 'source_url': base_url} for url in generated]
+    generated_cases = [{'url': url, 'method': 'GET', 'data': '', 'parameters': _query_parameter_names(url), 'source_url': base_url} for url in generated]
     updated['request_cases'] = _dedupe_request_cases([*updated.get('request_cases', []), *generated_cases])
     return (updated, generated)
 
@@ -5597,7 +6233,8 @@ def add_common_cli_arguments(parser: argparse.ArgumentParser, *, require_target:
     parser.add_argument('--auth-only', action='store_true')
     parser.add_argument('--authorized', action='store_true')
     parser.add_argument('--authorized-origin', action='append', default=[], help='Additional exact HTTP/HTTPS origin explicitly included in the authorized assessment scope. Repeat as needed.')
-    parser.add_argument('--allow-same-host-ports', action='store_true', help='Authorize discovered HTTP/HTTPS URLs on other ports of an already-authorized exact hostname, without authorizing sibling hostnames or protocol changes.')
+    parser.add_argument('--allow-same-host-ports', action='store_true', help='Authorize HTTP/HTTPS services on other ports of an already-authorized exact hostname without authorizing sibling hostnames.')
+    parser.add_argument('--discover-same-host-services', action='store_true', help='Proactively discover responsive HTTP/HTTPS services on the exact authorized hostname. Requires --allow-same-host-ports.')
     parser.add_argument('--authorized-host-suffix', action='append', default=[], help=argparse.SUPPRESS)
     parser.add_argument('--entry-point', action='append', default=[], help='Explicit authorized HTTP/HTTPS entry point that must be included in initial discovery. Repeat as needed.')
     parser.add_argument('--discovery-seed', action='append', default=[], help='Authorized high-priority discovery seed. Unlike --entry-point it remains subject to normal route/budget limits and is not reported as a supplied entry point.')
@@ -5616,8 +6253,10 @@ def prepare_cli_context(parser: argparse.ArgumentParser, args: argparse.Namespac
     local_hosts = {'127.0.0.1', 'localhost', '::1'}
     if urlparse(target).hostname not in local_hosts and (not args.authorized):
         parser.error('Remote targets require --authorized.')
-    if (getattr(args, 'authorized_origin', None) or getattr(args, 'authorized_host_suffix', None)) and not args.authorized:
+    if (getattr(args, 'authorized_origin', None) or getattr(args, 'authorized_host_suffix', None) or getattr(args, 'allow_same_host_ports', False) or getattr(args, 'discover_same_host_services', False)) and not args.authorized:
         parser.error('Scope extensions require --authorized.')
+    if getattr(args, 'discover_same_host_services', False) and not getattr(args, 'allow_same_host_ports', False):
+        parser.error('--discover-same-host-services requires --allow-same-host-ports.')
     for value in getattr(args, 'authorized_origin', []) or []:
         raw_origin = str(value or '').strip()
         try:
@@ -5632,11 +6271,14 @@ def prepare_cli_context(parser: argparse.ArgumentParser, args: argparse.Namespac
     configure_authorized_scope(
         target, list(getattr(args, 'authorized_origin', []) or []),
         allow_same_host_ports=bool(getattr(args, 'allow_same_host_ports', False)),
+        discover_same_host_services=bool(getattr(args, 'discover_same_host_services', False)),
     )
     if AUTHORIZED_SCOPE_ORIGINS:
         print('[*] Authorized scope extensions: exact origins=' + ', '.join(sorted(AUTHORIZED_SCOPE_ORIGINS)))
     if ALLOW_SAME_HOST_PORTS:
-        print('[*] Authorized scope extension: same-host multi-port discovery/testing ENABLED (same scheme only).')
+        print('[*] Authorized scope extension: exact-host HTTP/HTTPS multi-port testing ENABLED.')
+    if DISCOVER_SAME_HOST_SERVICES:
+        print('[*] Proactive same-host HTTP/HTTPS service discovery ENABLED (runtime-derived candidates; no external validation data used).')
     injection_url = str(getattr(args, 'interactsh_injection_url', '') or '').strip()
     if injection_url and (not url_in_authorized_scope(target, injection_url)):
         parser.error('--interactsh-injection-url must be inside the explicitly authorized assessment scope.')
@@ -5742,7 +6384,15 @@ def build_tool_arguments(tool: str, target_url: str, cookies: str, discovery: di
                 scan_mode = 'prioritized'
             else:
                 scan_mode = 'targeted'
-            arguments.update({'seed_urls': discovery.get('html_urls', []), 'request_cases': safe_request_cases, 'scan_mode': scan_mode, 'session_probe_url': select_session_probe_url(discovery, target_url), 'max_observations': 450 if CURRENT_SCAN_MODE == 'deep' else 220 if CURRENT_SCAN_MODE == 'balanced' or single_tool else 60})
+            arguments.update({
+                'seed_urls': discovery.get('html_urls', []),
+                'request_cases': safe_request_cases,
+                'scan_mode': scan_mode,
+                'session_probe_url': select_session_probe_url(discovery, target_url),
+                'max_observations': 1400 if CURRENT_SCAN_MODE == 'deep' else 800 if CURRENT_SCAN_MODE == 'balanced' else 180,
+                'max_ranked_cases': 640 if CURRENT_SCAN_MODE == 'deep' else 320 if CURRENT_SCAN_MODE == 'balanced' else 80,
+                'max_active_cases': 192 if CURRENT_SCAN_MODE == 'deep' else 96 if CURRENT_SCAN_MODE == 'balanced' else 32,
+            })
             if single_tool:
                 arguments['diagnostic_only'] = diagnostic_only
             elif diagnostic_only:
@@ -5756,7 +6406,7 @@ def build_tool_arguments(tool: str, target_url: str, cookies: str, discovery: di
                 'request_cases': safe_request_cases,
                 'allow_state_changes': state_changes_allowed,
                 'scan_profile': CURRENT_SCAN_MODE,
-                'max_targets': 160 if CURRENT_SCAN_MODE == 'deep' else 96 if CURRENT_SCAN_MODE == 'balanced' else 20,
+                'max_targets': 2048 if CURRENT_SCAN_MODE == 'deep' else 1024 if CURRENT_SCAN_MODE == 'balanced' else 128,
             })
         elif tool == 'nikto':
             arguments['scan_profile'] = CURRENT_SCAN_MODE

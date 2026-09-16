@@ -745,6 +745,19 @@ async def deterministic_verification_node(state: DeterministicState) -> dict[str
 
     browser_spec = next(spec for spec in WORKFLOW_TOOLS if spec.name == 'browser')
     profile_map = {profile['name']: profile for profile in state['profiles']}
+
+    print('\n[*] Completion-driven safe surface sweep: replaying still-untested reachable non-destructive contexts.')
+    for profile_name, profile in profile_map.items():
+        sweep = await asyncio.to_thread(
+            shared.run_safe_surface_sweep, target, state['discovery'].get(profile_name, {}),
+            results.get(profile_name, {}), str(profile.get('cookies') or ''),
+        )
+        results.setdefault(profile_name, {})['safe_surface_completion'] = sweep
+        print(
+            f"    {profile_name}: tested={sweep.get('tested_contexts', 0)}/"
+            f"{sweep.get('selected_contexts', 0)} selected; eligible={sweep.get('eligible_contexts', 0)}; "
+            f"status={sweep.get('status', 'unknown')}"
+        )
     browser_unavailable = False
     if not rows:
         print('\n[*] Final verification: no unresolved XSS candidate requires an additional Chromium pass.')
@@ -874,8 +887,9 @@ async def deterministic_report_node(state: DeterministicState) -> dict[str, Any]
         'scan_mode': shared.CURRENT_SCAN_MODE,
         'request_rate_policy': shared.runtime_request_rate_policy(),
         'allow_same_host_ports': shared.ALLOW_SAME_HOST_PORTS,
+        'discover_same_host_services': shared.DISCOVER_SAME_HOST_SERVICES,
         'authentication_scope_policy': ('authenticated destinations try an applicable existing cookie first; when same-host multi-port is enabled, the raw cookie may be tried on another authorized port of the exact same hostname and scheme and must validate; if rejected, saved browser/OIDC state is tried, followed by the username/password resolved once by the runner if the login flow requests them; a conclusively rejected speculative raw cookie is remembered per cookie+origin so later scanners do not retry it; raw cookies are never copied to a different hostname and no second child-console prompt is opened'),
-        'redirect_scope_policy': ('active scanners use explicit-origin authorization; same-host multi-port expansion is ' + ('enabled (same scheme, exact hostname, discovered HTTP/HTTPS ports)' if shared.ALLOW_SAME_HOST_PORTS else 'disabled') + '; sensitive HTTP helpers stay same-origin, while project discovery follows bounded redirects only across destinations authorized before the run; external scanner processes do not autonomously follow redirects, so tool-internal redirect-dependent behavior is intentionally conservative; ZAP adds an exact-origin context plus in-scope-only active scans and Protected mode; browser authentication may traverse an external IdP without authorizing it for active testing'),
+        'redirect_scope_policy': ('active scanners use explicit-origin authorization; same-host multi-port expansion is ' + ('enabled (exact hostname, HTTP/HTTPS services across authorized ports)' if shared.ALLOW_SAME_HOST_PORTS else 'disabled') + '; sensitive HTTP helpers stay same-origin, while project discovery follows bounded redirects only across destinations authorized before the run; external scanner processes do not autonomously follow redirects, so tool-internal redirect-dependent behavior is intentionally conservative; ZAP adds an exact-origin context plus in-scope-only active scans and Protected mode; browser authentication may traverse an external IdP without authorizing it for active testing'),
         'damage_recovery_policy': 'Confirmed findings retain scanner evidence and receive conservative consequence and recovery/restoration guidance when the originating tool does not provide it. Potential damage is never reported as observed damage without supporting evidence.'}
     context['orchestration'] = {'engine': 'langgraph', 'mode': 'deterministic', 'nodes': ['discovery', 'broad_scan', 'parameter_scan', 'authorization', 'browser_workflow', 'special_checks', 'verification', 'report']}
     print('\n[*] Generazione report...')

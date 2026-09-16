@@ -86,6 +86,13 @@ def _validate_authorization(authorization: Any) -> None:
         raise ValueError("authorization.confirmed must be true or false when supplied.")
     if "allow_same_host_ports" in authorization and not isinstance(authorization.get("allow_same_host_ports"), bool):
         raise ValueError("authorization.allow_same_host_ports must be true or false when supplied.")
+    if "discover_same_host_services" in authorization and not isinstance(authorization.get("discover_same_host_services"), bool):
+        raise ValueError("authorization.discover_same_host_services must be true or false when supplied.")
+    if bool(authorization.get("discover_same_host_services", False)) and not bool(authorization.get("allow_same_host_ports", False)):
+        raise ValueError(
+            "authorization.discover_same_host_services=true requires authorization.allow_same_host_ports=true "
+            "because proactive service discovery may add HTTP/HTTPS services on other ports of the exact hostname."
+        )
     origins = authorization.get("allowed_origins", [])
     if origins is not None:
         if not isinstance(origins, list) or not all(isinstance(value, str) and value.strip() for value in origins):
@@ -104,7 +111,7 @@ def _validate_authorization(authorization: Any) -> None:
     if suffixes:
         raise ValueError(
             "authorization.allowed_host_suffixes is not accepted for active testing. "
-            "Authorize additional HTTP origins explicitly with authorization.allowed_origins, or enable authorization.allow_same_host_ports only when site-level authorization covers discovered ports of the same hostname/scheme."
+            "Authorize additional HTTP origins explicitly with authorization.allowed_origins, or enable authorization.allow_same_host_ports only when site-level authorization covers discovered ports of the same exact hostname over HTTP/HTTPS."
         )
     if origins and authorization.get("confirmed") is not True:
         raise ValueError("authorization.allowed_origins requires authorization.confirmed=true.")

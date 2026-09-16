@@ -674,10 +674,11 @@ def url_in_authorized_scope(
             if parts is None:
                 continue
             scheme, host, _ = parts
-            # Multi-port authorization expands only the port for an already authorized exact
-            # hostname on the same HTTP scheme. It never authorizes sibling/prefix domains or
-            # an HTTP<->HTTPS protocol change implicitly.
-            if scheme == candidate_scheme and host == candidate_host:
+            # Site-level same-host authorization can cover HTTP/HTTPS services exposed on
+            # other ports of the exact already-authorized hostname. This is intentionally
+            # broader than cookie propagation: credentials are still evaluated separately
+            # against normal scheme/domain/path rules and runtime validation.
+            if scheme in {'http', 'https'} and candidate_scheme in {'http', 'https'} and host == candidate_host:
                 return True
     # DNS suffixes are intentionally not an active-attack authorization mechanism.
     # A discovered sibling host must be listed as an exact authorized origin before it can be tested.

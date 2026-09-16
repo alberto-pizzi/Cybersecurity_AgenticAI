@@ -6,7 +6,7 @@
   },
   "authorization": {
     "confirmed": true,
-    "reference": "Authorized Snap4City tourist-dashboard site assessment; supplied entry URLs are seeds and discovered same-host/same-scheme ports are active-test scope when allow_same_host_ports=true.",
+    "reference": "Authorized Snap4City tourist-dashboard site assessment; supplied entry URLs are seeds and discovered same-host HTTP/HTTPS services are active-test scope when allow_same_host_ports=true.",
     "allow_same_host_ports": true
   },
   "assets": [

@@ -221,6 +221,8 @@ def build_endpoint_coverage(results: dict[str, Any], context: dict[str, Any]) ->
                 "reason": "No concrete request-level security execution was recorded for this endpoint.",
                 "selector_selected_tools": [],
                 "selector_eligible_tools": [],
+                "tested_by_broad_or_specialist": False,
+                "tested_by_safe_surface": False,
             }
             rows[key] = row
         if source and source not in row["discovery_sources"]:
@@ -324,6 +326,29 @@ def build_endpoint_coverage(results: dict[str, Any], context: dict[str, Any]) ->
             continue
         source_job = str(result.get("aggregate_source_job_id") or "")
         source_entry = str(result.get("aggregate_source_entry_point") or "")
+        if tool == "safe-surface":
+            status, _ = _effective_status(result)
+            if status not in {"error", "skipped"}:
+                for tested_case in result.get("tested_cases", []) if isinstance(result.get("tested_cases"), list) else []:
+                    if not isinstance(tested_case, dict) or not str(tested_case.get("url") or ""):
+                        continue
+                    nested = ensure_row(
+                        source_job, profile, str(tested_case.get("method") or "GET"), str(tested_case.get("url")),
+                        entry_point=source_entry, source="Safe-surface completion",
+                    )
+                    label = f"safe-surface completion ({status})"
+                    if label not in nested["tests"]:
+                        nested["tests"].append(label)
+                    nested["tested_by_safe_surface"] = True
+                    if nested["status"] not in {"HTTP 404", "HTTP 410"}:
+                        nested["status"] = "Tested"
+                        if not nested.get("tested_by_broad_or_specialist"):
+                            nested["reason_code"] = "SAFE_SURFACE_COMPLETION"
+                            nested["reason"] = (
+                                "The request context received the final bounded safe-surface completion probe. "
+                                "It is counted in total active coverage but not in broad/specialist tested coverage."
+                            )
+            continue
         action = result.get("coverage_action") if isinstance(result.get("coverage_action"), dict) else {}
         target = str(action.get("target_url") or result.get("target") or "")
         method = str(action.get("method") or "GET").upper()
@@ -354,23 +379,34 @@ def build_endpoint_coverage(results: dict[str, Any], context: dict[str, Any]) ->
                 row["status"] = "Execution error"
                 row["reason_code"] = "EXECUTION_ERROR"
                 row["reason"] = _redact_text(result.get("output") or result.get("diagnosis") or "Scanner execution failed.")[:500]
-        else:
+        elif status == "success":
             if row["status"] not in {"HTTP 404", "HTTP 410"}:
                 row["status"] = "Tested"
+                row["tested_by_broad_or_specialist"] = True
                 row["reason_code"] = "TESTED"
-                row["reason"] = "One or more concrete security-tool executions were recorded for this endpoint."
+                row["reason"] = "One or more broad/specialist security-tool executions completed for this endpoint."
+        else:
+            # PARTIAL can mean preflight/authentication/startup/time-limit before the concrete
+            # attack request ran. Do not count the generic root context as tested without explicit
+            # per-request completion evidence below.
+            if row["status"] not in {"HTTP 404", "HTTP 410", "Tested"}:
+                row["status"] = "Partial"
+                row["reason_code"] = "PARTIAL_EXECUTION"
+                row["reason"] = _redact_text(result.get("output") or result.get("diagnosis") or "Scanner execution was partial; concrete completion is recorded separately.")[:500]
 
         # Broad scanners can test many concrete URLs inside one MCP invocation. Record those exact
         # targets so the endpoint matrix does not attribute all broad coverage only to the root URL.
         # This records execution coverage only; it does not promote broad scans to specialist findings.
         if tool == "nuclei" and status != "skipped":
             nuclei_targets: list[tuple[str, str, str]] = []
-            for value in result.get("focused_targets", []) if isinstance(result.get("focused_targets"), list) else []:
-                if str(value):
-                    nuclei_targets.append(("GET", str(value), "nuclei focused target"))
-            for case in result.get("dast_request_cases", []) if isinstance(result.get("dast_request_cases"), list) else []:
+            if status == "success":
+                for value in result.get("focused_targets", []) if isinstance(result.get("focused_targets"), list) else []:
+                    if str(value):
+                        nuclei_targets.append(("GET", str(value), "nuclei focused target"))
+            completed_dast = result.get("dast_completed_request_cases") if isinstance(result.get("dast_completed_request_cases"), list) else result.get("dast_request_cases")
+            for case in completed_dast if isinstance(completed_dast, list) else []:
                 if isinstance(case, dict) and str(case.get("url") or ""):
-                    nuclei_targets.append((str(case.get("method") or "GET").upper(), str(case.get("url")), "nuclei DAST request"))
+                    nuclei_targets.append((str(case.get("method") or "GET").upper(), str(case.get("url")), "nuclei completed DAST request"))
             for nested_method, nested_url, nested_label in nuclei_targets:
                 nested = ensure_row(source_job, profile, nested_method, nested_url, entry_point=source_entry, source="Scanner evidence")
                 label = f"{nested_label} ({status})"
@@ -383,13 +419,14 @@ def build_endpoint_coverage(results: dict[str, Any], context: dict[str, Any]) ->
                         nested["reason"] = "Nuclei received this target/request context, but the scanner invocation failed."
                 elif nested["status"] not in {"HTTP 404", "HTTP 410"}:
                     nested["status"] = "Tested"
+                    nested["tested_by_broad_or_specialist"] = True
                     nested["reason_code"] = "TESTED"
                     nested["reason"] = "This endpoint/request context was included in an executed Nuclei target or DAST request set."
 
         if tool == "zap" and status != "skipped":
             active_scans = result.get("targeted_active_scans") if isinstance(result.get("targeted_active_scans"), list) else []
             for scan in active_scans:
-                if not isinstance(scan, dict) or not scan.get("started") or not str(scan.get("url") or ""):
+                if not isinstance(scan, dict) or not scan.get("completed") or not str(scan.get("url") or ""):
                     continue
                 nested_method = str(scan.get("method") or "GET").upper()
                 nested_url = str(scan.get("url"))
@@ -404,6 +441,7 @@ def build_endpoint_coverage(results: dict[str, Any], context: dict[str, Any]) ->
                         nested["reason"] = "ZAP started a targeted active scan for this endpoint, but the scanner invocation failed."
                 elif nested["status"] not in {"HTTP 404", "HTTP 410"}:
                     nested["status"] = "Tested"
+                    nested["tested_by_broad_or_specialist"] = True
                     nested["reason_code"] = "TESTED"
                     nested["reason"] = "A targeted ZAP active scan was actually started for this endpoint/request context."
 
@@ -443,10 +481,18 @@ def summarize_endpoint_coverage(rows: list[dict[str, Any]]) -> dict[str, Any]:
         out_scope = sum(str(row.get("reason_code") or "") == "OUT_OF_SCOPE" for row in items)
         reachable = max(0, total - dead - out_scope)
         tested = sum(str(row.get("status") or "") == "Tested" for row in items)
+        broad_specialist_tested = sum(
+            str(row.get("status") or "") == "Tested" and bool(row.get("tested_by_broad_or_specialist")) for row in items
+        )
+        safe_surface_only = sum(
+            str(row.get("status") or "") == "Tested" and bool(row.get("tested_by_safe_surface")) and not bool(row.get("tested_by_broad_or_specialist"))
+            for row in items
+        )
         discovered_only = sum(str(row.get("status") or "") == "Discovered only" for row in items)
         skipped = sum(str(row.get("status") or "") == "Skipped" for row in items)
         errors = sum(str(row.get("status") or "") == "Execution error" for row in items)
         coverage = (100.0 * tested / reachable) if reachable else 0.0
+        broad_specialist_coverage = (100.0 * broad_specialist_tested / reachable) if reachable else 0.0
         explicit = [row for row in items if bool(row.get("configured_entry_point"))]
         explicit_tested = sum(str(row.get("status") or "") == "Tested" for row in explicit)
         explicit_coverage = (100.0 * explicit_tested / len(explicit)) if explicit else 0.0
@@ -454,6 +500,9 @@ def summarize_endpoint_coverage(rows: list[dict[str, Any]]) -> dict[str, Any]:
             "discovered_contexts": total,
             "reachable_in_scope": reachable,
             "tested": tested,
+            "broad_specialist_tested": broad_specialist_tested,
+            "safe_surface_only_tested": safe_surface_only,
+            "broad_specialist_tested_coverage_percent": round(broad_specialist_coverage, 1),
             "configured_entry_points": len(explicit),
             "tested_entry_points": explicit_tested,
             "entry_point_tested_coverage_percent": round(explicit_coverage, 1),
@@ -486,7 +535,10 @@ def _render_endpoint_coverage(rows: list[dict[str, Any]], toc: list[tuple[int, s
     metrics = [
         ("Discovered contexts", "discovered_contexts", False),
         ("Reachable / in scope", "reachable_in_scope", False),
-        ("Tested", "tested", False),
+        ("Tested by any active check", "tested", False),
+        ("Broad/specialist tested", "broad_specialist_tested", False),
+        ("Safe-surface only", "safe_surface_only_tested", False),
+        ("Broad/specialist tested coverage", "broad_specialist_tested_coverage_percent", True),
         ("Configured entry points", "configured_entry_points", False),
         ("Tested entry points", "tested_entry_points", False),
         ("Entry-point tested coverage", "entry_point_tested_coverage_percent", True),
@@ -547,11 +599,12 @@ def _render_endpoint_coverage(rows: list[dict[str, Any]], toc: list[tuple[int, s
     return (
         f"{heading}"
         '<p class="section-note">Each row represents a discovered endpoint/request context for one assessment profile. '
-        '"Tested" means that at least one concrete security-tool execution was recorded for that endpoint; discovery alone does not count as a security test. '
+        '"Tested" means that at least one concrete active execution was recorded for that endpoint; discovery alone does not count as a security test. '
+        'Broad/specialist tested coverage deliberately excludes contexts reached only by the final safe-surface completion probe. '
         'The reason code states why an untested context was deferred or excluded. Anonymous and authenticated coverage are calculated independently. '
         'Configured entry-point coverage counts the supplied URLs themselves: a value such as 0/N means none of those N exact request contexts received a concrete security-tool execution, not that the complete assessment executed zero attacks.</p>'
         f'<table><thead><tr><th>Metric</th>{summary_head}</tr></thead><tbody>{"".join(summary_rows)}</tbody></table>'
-        '<p class="section-note">Tested coverage is the percentage of reachable, in-scope request contexts for which at least one concrete security-tool execution was recorded. Out-of-scope references and HTTP 404/410 responses are excluded from the denominator.</p>'
+        '<p class="section-note">Total tested coverage counts any active check. Broad/specialist tested coverage excludes safe-surface-only contexts, preventing a shallow completion replay from being presented as specialist attack coverage. Out-of-scope references and HTTP 404/410 responses are excluded from both denominators.</p>'
         f'{detail_note}'
         '<table><thead><tr><th>#</th><th>Profile / job</th><th>Method</th><th>Endpoint</th><th>Discovered by</th><th>Security tests</th><th>Status</th><th>Reason code</th><th>Reason</th></tr></thead>'
         f"<tbody>{''.join(body_rows)}</tbody></table>"
@@ -612,7 +665,7 @@ def _coverage_constraints(
     if idor and idor.get("status") == "skipped":
         add(
             "Object-level authorization",
-            "No compatible numeric object reference was discovered. UUID, path-segment, JSON-body and multi-step ownership checks remain outside the bounded IDOR verifier.",
+            "No compatible query-string object reference was discovered. The bounded verifier supports numeric, UUID, hexadecimal and digit-bearing opaque query identifiers; path-segment, JSON-body and multi-step ownership checks remain outside this verifier.",
             "Supply representative object endpoints and two identities, then perform manual ownership validation.",
         )
     jwt = coverage_by_tool.get("jwt")
@@ -710,7 +763,7 @@ def _executive_text(summary: dict[str, Any], findings: list[dict[str, Any]], con
     assessed = int(ai_assessment.get("analyzed_findings", 0) or 0) if isinstance(ai_assessment, dict) else 0
     if assessed:
         assessment_note = (
-            f" Ollama post-assessed {assessed} confirmed/candidate finding(s), independently enriching severity, description, "
+            f" The configured AI provider/model post-assessed {assessed} confirmed/candidate finding(s), independently enriching severity, description, "
             "impact and remediation while the scanner/verifier evidence and confirmation category remained immutable."
         )
     else:

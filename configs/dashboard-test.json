@@ -6,8 +6,9 @@
   },
   "authorization": {
     "confirmed": true,
-    "reference": "Authorized assessment target: 192.168.1.81 mapped as dashboard-test; configured web origins plus discovered same-host/same-scheme ports are active-test scope when allow_same_host_ports=true.",
-    "allow_same_host_ports": true
+    "reference": "Authorized assessment target: 192.168.1.81 mapped as dashboard-test; configured web origins plus discovered same-host HTTP/HTTPS services are active-test scope when allow_same_host_ports=true.",
+    "allow_same_host_ports": true,
+    "discover_same_host_services": true
   },
   "credentials": {
     "dashboard_session": {

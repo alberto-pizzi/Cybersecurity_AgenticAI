@@ -353,7 +353,7 @@ def _render_severity_legend(toc: list[tuple[int, str, str]], context_value: dict
     if assessed:
         methodology = (
             '<p class="section-note">For this agentic run, severity, description, security impact and recommended '
-            'remediation are independently post-assessed by Ollama from the scanner/verifier evidence; each is marked '
+            'remediation are independently post-assessed by the configured AI provider/model from the scanner/verifier evidence; each is marked '
             f'“{AI_SUFFIX}” in the finding below. The original scanner severity and, where the AI rewrote them, the '
             'original scanner description/impact/remediation are preserved and shown in the Original scanner assessment '
             '(secondary audit) box. The AI cannot alter the finding category, verification status, tested request or '
@@ -710,7 +710,12 @@ def _render_agentic_audit(context_value: dict[str, Any], toc: list[tuple[int, st
                 ("Context size (bytes)", item.get("context_bytes", "")),
                 ("Tool-group candidates shown / pool", f"{item.get('planner_candidate_count', 0)} / {item.get('planner_candidate_pool_count', 0)}"),
                 ("Tool-group budget per profile", item.get("tool_group_budget_per_profile", item.get("round_action_budget", ""))),
-                ("Concrete action budget per profile", item.get("execution_action_budget_per_profile", item.get("round_action_budget", ""))),
+                ("Concrete action normal floor, total round", item.get("round_action_normal_base_total", item.get("execution_action_budget_per_profile", ""))),
+                ("Concrete action resolved base, total round", item.get("round_action_resolved_base_total", item.get("execution_action_budget_per_profile", ""))),
+                ("Concrete action adaptive max, total round", item.get("round_action_resolved_max_total", item.get("execution_action_adaptive_max_per_profile", ""))),
+                ("Concrete action hard cap, total round", item.get("round_action_hard_cap_total", "")),
+                ("Actions before final cap", item.get("round_action_count_before_final_cap", "")),
+                ("Required ordinary actions / remaining round", item.get("round_action_required_per_round", "")),
                 ("Eligible tools", ", ".join(str(value) for value in (item.get("eligible_tools") or []))),
                 ("Baseline / AI / breadth-review tool groups", f"{item.get('baseline_selected_group_count', 0)} / {item.get('ai_selected_group_count', 0)} / {item.get('review_selected_group_count', 0)}"),
                 ("Validated concrete actions", item.get('validated_concrete_action_count', item.get('selected_action_count', 0))),

@@ -119,6 +119,7 @@ def _direct_assessment(args: argparse.Namespace) -> tuple[dict[str, Any], list[d
             "reference": "Command-line --authorized confirmation" if args.authorized else "",
             "allowed_origins": list(args.authorized_origin or []),
             "allow_same_host_ports": bool(args.allow_same_host_ports),
+            "discover_same_host_services": bool(args.discover_same_host_services),
         },
         "credentials": credentials,
         "assets": [],
@@ -183,6 +184,8 @@ def _apply_execution_overrides(config: dict[str, Any], args: argparse.Namespace)
         authorization["allowed_origins"] = list(dict.fromkeys([*(authorization.get("allowed_origins") or []), *args.authorized_origin]))
     if args.allow_same_host_ports is not None:
         authorization["allow_same_host_ports"] = bool(args.allow_same_host_ports)
+    if args.discover_same_host_services is not None:
+        authorization["discover_same_host_services"] = bool(args.discover_same_host_services)
     if args.authorized_host_suffix:
         raise ValueError("--authorized-host-suffix is disabled; authorize each additional origin explicitly with --authorized-origin.")
 
@@ -612,6 +615,8 @@ def _build_command(
             command.extend(["--authorized-origin", str(value)])
         if bool(authorization.get("allow_same_host_ports", False)):
             command.append("--allow-same-host-ports")
+        if bool(authorization.get("discover_same_host_services", False)):
+            command.append("--discover-same-host-services")
     elif not target_is_local(job["target"]):
         raise ValueError(
             f"Job {job['id']} targets a non-local service, but authorization.confirmed is not true."
@@ -963,6 +968,7 @@ def _aggregate_report_inputs(results_data: dict[str, Any], config: dict[str, Any
         "scan_mode": str((config.get("execution") or {}).get("mode") or "balanced"),
         "request_rate_policy": dict(results_data.get("traffic_policy") or {}),
         "allow_same_host_ports": bool((config.get("authorization") or {}).get("allow_same_host_ports", False)),
+        "discover_same_host_services": bool((config.get("authorization") or {}).get("discover_same_host_services", False)),
         "authentication_scope_policy": (
             "authenticated destinations try an applicable existing cookie first; when same-host multi-port is enabled, "
             "the raw cookie may be tried on another authorized port of the exact same hostname and scheme and must validate; "
@@ -972,7 +978,7 @@ def _aggregate_report_inputs(results_data: dict[str, Any], config: dict[str, Any
         ),
         "redirect_scope_policy": (
             "active scanners use explicit-origin authorization; same-host multi-port expansion is "
-            + ("enabled (same scheme, exact hostname, any discovered HTTP/HTTPS port)" if bool((config.get("authorization") or {}).get("allow_same_host_ports", False)) else "disabled")
+            + ("enabled (exact hostname, HTTP/HTTPS services on authorized ports)" if bool((config.get("authorization") or {}).get("allow_same_host_ports", False)) else "disabled")
             + "; project discovery follows bounded redirects only while each hop remains authorized; external scanner processes do not autonomously follow redirects, so scanner-internal redirect-dependent behavior is conservatively suppressed unless the destination was independently discovered; unauthorized destinations are observed but not queued"
         ),
         "allow_state_changes": (config.get("execution") or {}).get("allow_state_changes"),
@@ -1154,8 +1160,11 @@ def main() -> int:
     parser.add_argument("--authorized", action="store_true", help="Confirm that the configured non-local targets are explicitly authorized for assessment.")
     parser.add_argument("--authorized-origin", action="append", default=[], help="Additional exact HTTP/HTTPS origin included in the authorized scope; repeat as needed.")
     port_scope_group = parser.add_mutually_exclusive_group()
-    port_scope_group.add_argument("--allow-same-host-ports", dest="allow_same_host_ports", action="store_true", default=None, help="Allow discovered URLs on other ports of the same already-authorized hostname (same scheme only).")
+    port_scope_group.add_argument("--allow-same-host-ports", dest="allow_same_host_ports", action="store_true", default=None, help="Allow HTTP/HTTPS services on other ports of the same already-authorized exact hostname.")
     port_scope_group.add_argument("--no-allow-same-host-ports", dest="allow_same_host_ports", action="store_false", help="Keep authorization exact-origin/explicit-origin only; this is the default when the config field is absent.")
+    service_discovery_group = parser.add_mutually_exclusive_group()
+    service_discovery_group.add_argument("--discover-same-host-services", dest="discover_same_host_services", action="store_true", default=None, help="Proactively discover responsive HTTP/HTTPS services on the exact authorized hostname. Requires same-host multi-port authorization.")
+    service_discovery_group.add_argument("--no-discover-same-host-services", dest="discover_same_host_services", action="store_false", help="Disable proactive same-host service discovery.")
     parser.add_argument("--authorized-host-suffix", action="append", default=[], help=argparse.SUPPRESS)
     state_change_group = parser.add_mutually_exclusive_group()
     state_change_group.add_argument("--allow-state-changes", dest="allow_state_changes", action="store_true", default=None, help="Explicitly allow bounded state-changing probes for this run.")
