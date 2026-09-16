@@ -35,7 +35,7 @@ TOOL_PURPOSES = {
     "commix": "Operating-system command injection confirmation.",
     "traversal": "Bounded path traversal and local-file-inclusion verification on file-like parameters.",
     "idor": "Single-reference numeric object differential checks requiring manual ownership validation.",
-    "authorization": "Read-only anonymous and optional two-account authorization/BOLA differentials on discovered high-value GET requests.",
+    "authorization": "Read-only anonymous and multi-account cross-identity authorization/BOLA differentials on discovered high-value GET requests.",
     "jwt": "JWT structural analysis; it does not prove server acceptance of modified tokens.",
     "interactsh": "Explicit out-of-band callback confirmation for a supplied insertion point.",
 }

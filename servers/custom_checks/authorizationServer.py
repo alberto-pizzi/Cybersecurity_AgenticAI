@@ -57,7 +57,7 @@ def _authorization_relevance(target_url: str, parameters: list[str] | None) -> t
     return score, reasons
 
 # Issue a read-only GET for one identity while keeping the request bounded and same-origin.
-def _safe_get(url: str, cookies: str, timeout: int, pacer: RequestRatePacer, deadline: float) -> tuple[requests.Response | None, str]:
+def _safe_get(url: str, cookies: str, request_budget: float, pacer: RequestRatePacer, deadline: float) -> tuple[requests.Response | None, str]:
     session = requests.Session()
     session.headers.update({
         "User-Agent": "SecOps-Authorization-Differential/1.0",
@@ -66,7 +66,6 @@ def _safe_get(url: str, cookies: str, timeout: int, pacer: RequestRatePacer, dea
     if cookies:
         session.headers["Cookie"] = cookies
     current, seen = url, set()
-    request_budget = proportional_budget(timeout, AUTHORIZATION_IDENTITY_RATIO)
     for _ in range(3):
         if remaining_budget(deadline) <= 0:
             return None, "time_limit_reached"
@@ -180,8 +179,9 @@ def _finding(
 # Compare a read-only GET under primary, secondary and anonymous identities.
 @mcp.tool()
 def run_authorization_scan(
-    target_url: str, cookies: str = "", secondary_cookies: str = "", method: str = "GET",
-    data: str = "", parameters: list[str] | None = None, timeout: int = 30, request_rate: float | None = None,
+    target_url: str, cookies: str = "", secondary_cookies: str = "", identity_cookies: list[str] | None = None,
+    identity_labels: list[str] | None = None, method: str = "GET", data: str = "", parameters: list[str] | None = None,
+    timeout: int = 30, request_rate: float | None = None,
 ) -> dict:
 
     method = str(method or "GET").upper()
@@ -203,17 +203,36 @@ def run_authorization_scan(
     deadline = wall_clock_deadline(timeout)
     pacer = RequestRatePacer(request_rate)
     relevance_score, relevance_reasons = _authorization_relevance(target_url, parameters)
-    if relevance_score <= 0 and not secondary_cookies:
+    supplied_alternates = [str(value or "") for value in (identity_cookies or []) if str(value or "")]
+    if secondary_cookies and secondary_cookies not in supplied_alternates:
+        supplied_alternates.append(secondary_cookies)
+    labels = [str(value or "alternate") for value in (identity_labels or [])]
+    while len(labels) < len(supplied_alternates):
+        labels.append(f"identity_{len(labels) + 2}")
+    if relevance_score <= 0 and not supplied_alternates:
         return skipped(
             "Authorization Differential Verifier", target_url,
             "The request resembles public/static documentation and has no object or identity reference suitable for an authorization differential.",
             diagnosis="authorization_candidate_not_relevant", relevance_score=relevance_score, relevance_reasons=relevance_reasons,
         )
-    primary, primary_guard = _safe_get(target_url, cookies, timeout, pacer, deadline)
-    anonymous, anonymous_guard = _safe_get(target_url, "", timeout, pacer, deadline)
-    secondary = secondary_guard = None
-    if secondary_cookies:
-        secondary, secondary_guard = _safe_get(target_url, secondary_cookies, timeout, pacer, deadline)
+    planned_identity_requests = max(2, 2 + len(supplied_alternates))
+    # Keep the action wall-clock bounded while giving every configured identity a fair chance.
+    # For the historical primary+anonymous(+one alternate) case this stays close to the previous
+    # 30% per-request budget; with many identities it contracts automatically instead of letting
+    # the first accounts consume the entire action timeout.
+    fair_request_budget = max(2.0, min(
+        proportional_budget(timeout, AUTHORIZATION_IDENTITY_RATIO),
+        (float(timeout) * 0.85) / float(planned_identity_requests),
+    ))
+    primary, primary_guard = _safe_get(target_url, cookies, fair_request_budget, pacer, deadline)
+    anonymous, anonymous_guard = _safe_get(target_url, "", fair_request_budget, pacer, deadline)
+    alternate_responses: list[tuple[str, requests.Response | None, str]] = []
+    for index, alternate_cookie in enumerate(supplied_alternates):
+        if remaining_budget(deadline) <= 0:
+            alternate_responses.append((labels[index], None, "time_limit_reached"))
+            break
+        response, guard = _safe_get(target_url, alternate_cookie, fair_request_budget, pacer, deadline)
+        alternate_responses.append((labels[index], response, str(guard or "")))
 
     if primary is None or primary.status_code >= 400 or looks_like_login(primary, text_limit=80_000):
         timed_out = primary_guard == "time_limit_reached"
@@ -228,9 +247,13 @@ def run_authorization_scan(
     findings: list[dict[str, Any]] = []
     diagnostics: dict[str, Any] = {
         "parameters": [str(value) for value in (parameters or [])], "primary": _summary(primary, primary_guard),
-        "anonymous": _summary(anonymous, anonymous_guard), "secondary_supplied": bool(secondary_cookies),
+        "anonymous": _summary(anonymous, anonymous_guard), "secondary_supplied": bool(supplied_alternates),
+        "identity_comparison_count": len(supplied_alternates),
+        "identity_labels": labels[:len(supplied_alternates)],
         "relevance_score": relevance_score, "relevance_reasons": relevance_reasons,
-        "tool_timeout_seconds": timeout, "phase_ratio_policy": {"identity_request": AUTHORIZATION_IDENTITY_RATIO},
+        "tool_timeout_seconds": timeout,
+        "identity_request_budget_seconds": round(fair_request_budget, 3),
+        "phase_ratio_policy": {"identity_request_max_ratio": AUTHORIZATION_IDENTITY_RATIO, "shared_budget_fraction": 0.85},
     }
     if anonymous is not None:
         accepted, similarity, length_ratio = _matching_access(primary, anonymous)
@@ -241,18 +264,25 @@ def run_authorization_scan(
             findings.append(_finding(
                 target_url, "anonymous", primary, anonymous, similarity, length_ratio
             ))
-    if isinstance(secondary, requests.Response):
-        accepted, similarity, length_ratio = _matching_access(primary, secondary)
-        diagnostics["secondary"] = _summary(secondary, str(secondary_guard or ""))
-        diagnostics["secondary_comparison"] = {
-            "accepted_equivalent": accepted, "similarity": round(similarity, 4), "length_ratio": round(length_ratio, 4),
-        }
-        if accepted:
-            findings.append(_finding(
-                target_url, "secondary_authenticated", primary, secondary, similarity, length_ratio,
-            ))
+    diagnostics["identity_comparisons"] = []
+    alternate_timeout = False
+    for label, alternate, alternate_guard in alternate_responses:
+        row = {"label": label, "response": _summary(alternate, alternate_guard)}
+        if alternate_guard == "time_limit_reached":
+            alternate_timeout = True
+        if isinstance(alternate, requests.Response):
+            accepted, similarity, length_ratio = _matching_access(primary, alternate)
+            row.update({
+                "accepted_equivalent": accepted, "similarity": round(similarity, 4),
+                "length_ratio": round(length_ratio, 4),
+            })
+            if accepted:
+                findings.append(_finding(
+                    target_url, f"authenticated_identity:{label}", primary, alternate, similarity, length_ratio,
+                ))
+        diagnostics["identity_comparisons"].append(row)
 
-    if remaining_budget(deadline) <= 0 or anonymous_guard == "time_limit_reached" or secondary_guard == "time_limit_reached":
+    if remaining_budget(deadline) <= 0 or anonymous_guard == "time_limit_reached" or alternate_timeout:
         return partial(
             "Authorization Differential Verifier", target_url,
             f"Authorization differential reached its shared action time budget. Findings preserved: {len(findings)}.",

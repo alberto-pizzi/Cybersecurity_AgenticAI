@@ -9,6 +9,14 @@ from urllib.parse import parse_qsl, urljoin, urlparse
 from utils import canonical_cookie_header, cookie_names, normalized_origin, same_origin
 
 
+class BrowserLoginError(RuntimeError):
+    # Browser authentication failure carrying only entry points actually visited.
+    def __init__(self, message: str, attempted_candidates: Iterable[str] | None = None):
+        super().__init__(message)
+        self.attempted_candidates = [str(value) for value in (attempted_candidates or []) if str(value)]
+
+
+
 USERNAME_SELECTORS = (
     "#username",
     "input[name='username']",
@@ -86,22 +94,67 @@ def looks_like_oidc_login_url(url: str) -> bool:
         return False
     path = str(parsed.path or "").lower().rstrip("/")
     names = {str(name).lower() for name, _ in parse_qsl(parsed.query, keep_blank_values=True)}
-    protocol = {'client_id', 'redirect_uri', 'response_type'}
-    return bool(names & protocol) or path.endswith(('/authorize', '/oauth2/authorize', '/oidc/authorize'))
+    # client_id is the strongest generic query signal. redirect_uri/response_type are accepted
+    # together, but either one alone is too common in ordinary application routing to establish
+    # an OIDC realm safely.
+    protocol_signal = 'client_id' in names or {'redirect_uri', 'response_type'} <= names
+    return protocol_signal or path.endswith(('/authorize', '/oauth2/authorize', '/oidc/authorize'))
 
 
 def oidc_issuer_key(url: str) -> str:
-    """Return a provider-agnostic authorization-endpoint key used only for credential-reuse safety."""
+    """Return a stable OAuth/OIDC authorization-endpoint key, never an arbitrary application URL."""
+    raw = str(url or "")
+    if not looks_like_oidc_login_url(raw):
+        return ""
     try:
-        parsed = urlparse(str(url or ""))
+        parsed = urlparse(raw)
     except ValueError:
         return ""
-    origin = normalized_origin(str(url or ""))
+    origin = normalized_origin(raw)
     if not origin:
         return ""
     path = str(parsed.path or '/').rstrip('/') or '/'
-    # Keep the stable authorization endpoint path while discarding all one-shot query values.
+    # Keep the authorization endpoint path while discarding one-shot query values such as state/code.
     return origin + path
+
+
+def observed_oidc_issuer(current_url: str, observed_auth_requests: list[str] | tuple[str, ...]) -> str:
+    """Resolve a real observed OIDC authorization endpoint without inventing an issuer from an app page."""
+    direct = oidc_issuer_key(str(current_url or ""))
+    if direct:
+        return direct
+    for request_url in reversed(list(observed_auth_requests or ())):
+        issuer = oidc_issuer_key(str(request_url or ""))
+        if issuer:
+            return issuer
+    return ""
+
+
+def oidc_credential_reuse_allowed(
+    current_url: str, expected_oidc_issuer: str, observed_auth_requests: list[str] | tuple[str, ...]
+) -> tuple[bool, str]:
+    """Allow local-form reuse when no OIDC issuer exists; require the actual OIDC form to match otherwise."""
+    observed = observed_oidc_issuer(current_url, observed_auth_requests)
+    expected = str(expected_oidc_issuer or "").strip().rstrip("/")
+    if not expected:
+        # A primary local-form login has no OIDC issuer. With explicit sibling-credential reuse, the
+        # same resolved credentials may be retried only on another already-authorized LOCAL form. If
+        # the destination exposes an OIDC authorization flow, do not send local-form credentials to a
+        # newly observed provider/realm merely because the network origin is authorized for testing.
+        return (not bool(observed)), observed
+    direct = oidc_issuer_key(str(current_url or ""))
+    if direct and direct.rstrip("/") == expected:
+        return True, observed
+    # OAuth/OIDC providers commonly redirect from the authorization endpoint to a provider-local
+    # login/authenticate route. Reuse remains safe only when this same attempt actually observed the
+    # expected authorization endpoint and the credential form is still on that provider origin.
+    same_provider_login = (
+        bool(observed)
+        and observed.rstrip("/") == expected
+        and normalized_origin(str(current_url or "")) == normalized_origin(expected)
+        and _looks_like_application_login_entry(str(current_url or ""))
+    )
+    return bool(same_provider_login), observed
 
 def _looks_like_application_login_entry(url: str) -> bool:
     """Heuristic used only to prioritize browser authentication attempts, never to decide attack scope."""
@@ -206,8 +259,11 @@ def _discover_pre_auth_candidates(page: Any, target_url: str, deadline: float, *
             break
 
         try:
-            rows = page.locator("a[href], [data-href], [data-url]").evaluate_all(
-                """elements => elements.slice(0, 240).map(element => ({
+            # Use the browser DOM directly instead of Playwright's selector engine. Some legacy/XHTML
+            # applications expose custom selector behaviour that can make evaluate_all() fail with
+            # `result is not iterable`; native querySelectorAll keeps this pre-auth discovery robust.
+            rows = page.evaluate(
+                """() => Array.from(document.querySelectorAll('a[href], [data-href], [data-url]')).slice(0, 240).map(element => ({
                     url: element.href || element.getAttribute('data-href') || element.getAttribute('data-url') || '',
                     label: (element.innerText || element.textContent || '').trim().slice(0, 160)
                 }))"""
@@ -347,6 +403,7 @@ def browser_oidc_login_session(
     # the configured login timeout by the number of observed URLs.
     deadline = time.monotonic() + timeout_seconds
     failures: list[str] = []
+    attempted_candidates: list[str] = []
 
     with sync_playwright() as playwright:
         try:
@@ -374,26 +431,15 @@ def browser_oidc_login_session(
                 observed_auth_requests.append(request_url)
 
         def current_issuer(offset: int=0) -> str:
-            direct = oidc_issuer_key(str(page.url or ""))
-            if direct:
-                return direct
-            for request_url in reversed(observed_auth_requests[offset:]):
-                issuer = oidc_issuer_key(request_url)
-                if issuer:
-                    return issuer
-            return ""
+            return observed_oidc_issuer(str(page.url or ""), observed_auth_requests[offset:])
 
         def issuer_allowed(offset: int=0) -> tuple[bool, str]:
-            issuer = current_issuer(offset)
-            expected = str(expected_oidc_issuer or "").strip().rstrip("/")
-            if expected:
-                # Credentials resolved for the primary application may be reused only while the top-level
-                # browser page itself is on the same OIDC issuer/realm. Merely observing a background request
-                # to that issuer is not enough to authorize filling an unrelated application's local form.
-                direct_issuer = oidc_issuer_key(str(page.url or ""))
-                if not direct_issuer or direct_issuer.rstrip("/") != expected:
-                    return False, issuer
-            return True, issuer
+            # If the primary login used OIDC, credentials may be filled only on the same actual
+            # authorization endpoint. A background request to that issuer is not enough to authorize
+            # an unrelated local form. If the primary login was local-form, no fake issuer is created.
+            return oidc_credential_reuse_allowed(
+                str(page.url or ""), expected_oidc_issuer, observed_auth_requests[offset:]
+            )
 
         page.on("request", record_auth_request)
         try:
@@ -422,6 +468,7 @@ def browser_oidc_login_session(
             for candidate in candidates:
                 if time.monotonic() >= deadline:
                     break
+                attempted_candidates.append(candidate)
                 used_credentials = False
                 auth_request_offset = len(observed_auth_requests)
                 flow_observed = False
@@ -542,8 +589,9 @@ def browser_oidc_login_session(
                     continue
 
                 if not username or not password:
-                    raise RuntimeError(
-                        "The authentication provider requested username/password again, but the initial target credentials are not available for automatic reuse."
+                    raise BrowserLoginError(
+                        "The authentication provider requested username/password again, but the initial target credentials are not available for automatic reuse.",
+                        attempted_candidates,
                     )
 
                 if username_field is not None:
@@ -564,8 +612,9 @@ def browser_oidc_login_session(
                 if password_field is None:
                     diagnostic = _login_diagnostic(page)
                     if diagnostic == "additional_authentication_step_required":
-                        raise RuntimeError(
-                            "The authentication provider requires an additional step such as OTP; automatic username/password login cannot complete it."
+                        raise BrowserLoginError(
+                            "The authentication provider requires an additional step such as OTP; automatic username/password login cannot complete it.",
+                            attempted_candidates,
                         )
                     failures.append(f"{candidate}: password field not exposed")
                     continue
@@ -603,18 +652,23 @@ def browser_oidc_login_session(
                     diagnostic = _login_diagnostic(page)
                     if diagnostic.startswith("credentials_rejected:"):
                         message = diagnostic.split(":", 1)[1].strip()
-                        raise RuntimeError(f"The authentication provider rejected the supplied target credentials: {message}")
+                        raise BrowserLoginError(
+                            f"The authentication provider rejected the supplied target credentials: {message}",
+                            attempted_candidates,
+                        )
                     if diagnostic == "additional_authentication_step_required":
-                        raise RuntimeError(
-                            "The authentication provider requires an additional step such as OTP; automatic username/password login cannot complete it."
+                        raise BrowserLoginError(
+                            "The authentication provider requires an additional step such as OTP; automatic username/password login cannot complete it.",
+                            attempted_candidates,
                         )
                     page.wait_for_timeout(250)
 
                 failures.append(f"{candidate}: login did not return to the target origin before the shared timeout")
 
             detail = "; ".join(failures[-4:]) if failures else "no usable login entry point was found"
-            raise RuntimeError(
-                f"Automatic browser login could not establish an application session for {origin} within {timeout_seconds}s: {detail}"
+            raise BrowserLoginError(
+                f"Automatic browser login could not establish an application session for {origin} within {timeout_seconds}s: {detail}",
+                attempted_candidates,
             )
         finally:
             browser.close()
