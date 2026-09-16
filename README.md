@@ -156,9 +156,14 @@ and authenticates/verifies the remote Snap4City `llama4-agentic-inference` endpo
 not downloaded. `--prepare-ai snap4city|llama|qwen` prepares only one backend. If `--agentic-model` is specified without
 `--prepare-ai`, the initializer automatically prepares only that selected model. If both options are supplied, they must
 be coherent: `--prepare-ai all` accepts any Agentic model, while a single-backend `--prepare-ai` must match
-`--agentic-model`. The Agentic commands printed at the end use Snap4City when all backends are prepared; when one backend
-is prepared, that backend becomes the default. The initializer writes
+`--agentic-model`. Snap4City remains the global Agentic default. For configuration-driven assessments the generated
+commands intentionally omit `--model`: `execution.model` in that configuration wins, and if the field is absent the
+runner falls back to `snap4city`. An explicit operator `--model` remains the highest-priority one-run override. If
+initialization fails before the Snap4City verification step is reached, the initializer no longer interprets that as a
+provider failure and does not silently replace Snap4City with a local Ollama model. The initializer writes
 `.secops_runtime.json`, used by preflight checks and both orchestrators. `--commands-only` prints the `init.txt` command reference.
+
+Nikto capability validation accepts the upstream help convention where a trailing `+` means "this option takes a value" (for example `-timeout+` or `-Plugins+`); the `+` is not treated as part of the runtime option name. This keeps the strict contract check enabled without falsely rejecting a compatible Nikto build.
 
 - `init.txt`: Canonical operational cheat sheet stored in the repository and printed by `initScript.py --commands-only`.
   The initializer reads the existing file and does not overwrite it during normal initialization, so documentation updates remain stable.
@@ -376,7 +381,7 @@ anonymous + authenticated; add `--auth-only` only when the anonymous profile mus
 ```powershell
 python .\assessmentRunner.py --config .\configs\dvwa.generated.json --orchestrator deterministic --mode balanced
 python .\assessmentRunner.py --config .\configs\dvwa.generated.json --orchestrator deterministic --mode balanced --auth-only
-python .\assessmentRunner.py --config .\configs\dvwa.generated.json --orchestrator agentic --model snap4city --max-rounds 2 --mode balanced --require-ai
+python .\assessmentRunner.py --config .\configs\dvwa.generated.json --orchestrator agentic --max-rounds 2 --mode balanced --require-ai
 ```
 
 The runner can also be used without a JSON file. `--config` and `--target` are alternatives. Direct-target mode accepts the same
@@ -405,7 +410,7 @@ For a remote authorized application, keep host resolution, credentials and targe
 ```powershell
 python .\assessmentRunner.py --config .\configs\<assessment>.json --orchestrator deterministic --mode balanced --dry-run --authorized
 python .\assessmentRunner.py --config .\configs\<assessment>.json --orchestrator deterministic --mode balanced --authorized
-python .\assessmentRunner.py --config .\configs\<assessment>.json --orchestrator agentic --model snap4city --max-rounds 2 --mode balanced --require-ai --authorized
+python .\assessmentRunner.py --config .\configs\<assessment>.json --orchestrator agentic --max-rounds 2 --mode balanced --require-ai --authorized
 ```
 
 A service with no credential reference is anonymous-only. A service can declare **multiple** identities with `credential_refs`; each available identity becomes a separate authenticated profile and therefore receives its own discovery and scanner executions. The list is bounded to **16 identities per service** and identity labels must be unique case-insensitively; duplicate concrete sessions are rejected from cross-account comparisons so BOLA evidence cannot accidentally compare one session with itself. If `auth_only=false`, anonymous is kept as an additional profile. For every `browser_oidc` identity the runner first reads its configured cookie/username/password environment variables. If the required username/password variables are absent and the parent process is interactive, it asks for them **independently for that identity**, with prompts labelled by the credential reference; credentials are cached in memory for the assessment and are not requested again by child orchestrators. Example:

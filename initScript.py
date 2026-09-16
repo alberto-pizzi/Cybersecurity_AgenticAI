@@ -465,23 +465,20 @@ def print_important_commands(
             "--mode", "deep",
         )),
     ]
-    if agentic_model:
-        commands.extend((
+    commands.extend((
             ("4. DVWA / 127.0.0.1 - Assessment Agentic FAST", _operator_command(
                 "assessmentRunner.py", "--config", str(assessment_config), "--orchestrator", "agentic",
-                "--model", agentic_model, "--max-rounds", "2", "--mode", "fast", "--require-ai",
+                "--max-rounds", "2", "--mode", "fast", "--require-ai",
             )),
             ("5. DVWA / 127.0.0.1 - Assessment Agentic BALANCED", _operator_command(
                 "assessmentRunner.py", "--config", str(assessment_config), "--orchestrator", "agentic",
-                "--model", agentic_model, "--max-rounds", "2", "--mode", "balanced", "--require-ai",
+                "--max-rounds", "2", "--mode", "balanced", "--require-ai",
             )),
             ("6. DVWA / 127.0.0.1 - Assessment Agentic DEEP", _operator_command(
                 "assessmentRunner.py", "--config", str(assessment_config), "--orchestrator", "agentic",
-                "--model", agentic_model, "--max-rounds", "3", "--mode", "deep", "--require-ai",
+                "--max-rounds", "3", "--mode", "deep", "--require-ai",
             )),
         ))
-    else:
-        print("[!] Agentic assessment commands omitted: no verified AI backend is available from this initialization run.")
 
     for label, command in commands:
         print(f"\n{label}:\n{command}")
@@ -496,8 +493,7 @@ def print_important_commands(
     if additional_configs:
         print("\n=== Configured assessments - BALANCED ===")
         for config_path in additional_configs:
-            config_name, configured_model = _config_command_metadata(config_path)
-            selected_model = agentic_model or configured_model
+            config_name, _configured_model = _config_command_metadata(config_path)
             print(f"\n{config_name} - Deterministic BALANCED:")
             print(_operator_command(
                 "assessmentRunner.py", "--config", str(config_path),
@@ -506,7 +502,7 @@ def print_important_commands(
             print(f"\n{config_name} - Agentic BALANCED:")
             print(_operator_command(
                 "assessmentRunner.py", "--config", str(config_path),
-                "--orchestrator", "agentic", "--model", selected_model, "--max-rounds", "2",
+                "--orchestrator", "agentic", "--max-rounds", "2",
                 "--mode", "balanced", "--require-ai", "--authorized",
             ))
     print(f"\n[+] Every command and modifier: {COMMAND_REFERENCE_FILE}")
@@ -559,6 +555,7 @@ def main() -> int:
     cookie = ""
     commands_printed = False
     snap4city_ready = False
+    snap4city_attempted = False
     effective_agentic_model: str | None = agentic_model
     assessment_config = DVWA_ASSESSMENT_CONFIG
     try:
@@ -604,6 +601,7 @@ def main() -> int:
             print(f"\n[+] Bundled local-lab login created successfully.\n[+] Cookie header: {cookie}")
             if prepare_snap4city:
                 try:
+                    snap4city_attempted = True
                     _prepare_snap4city(args.snap4city_credentials)
                     snap4city_ready = True
                 except Exception as snap_exc:
@@ -654,7 +652,7 @@ def main() -> int:
                     print("[-] No verified AI backend is available for --run agentic.", file=sys.stderr)
                     return 4
                 rounds = "3" if args.mode == "deep" else "2"
-                command += ["--model", effective_agentic_model, "--max-rounds", rounds, "--require-ai"]
+                command += ["--max-rounds", rounds, "--require-ai"]
             return run(command, required=False, timeout=7200, cwd=ROOT).returncode
 
         print_important_commands(
@@ -676,18 +674,27 @@ def main() -> int:
                         file=sys.stderr,
                     )
             elif args.with_lab and agentic_model == "snap4city" and prepare_snap4city and not snap4city_ready:
-                command_agentic_model = None
-                for local_alias in ("llama", "qwen"):
-                    if LOCAL_AI_MODELS[local_alias] in local_ai_models and _local_ai_model_ready(local_alias):
-                        command_agentic_model = local_alias
+                if snap4city_attempted:
+                    command_agentic_model = None
+                    for local_alias in ("llama", "qwen"):
+                        if LOCAL_AI_MODELS[local_alias] in local_ai_models and _local_ai_model_ready(local_alias):
+                            command_agentic_model = local_alias
+                            print(
+                                f"[!] Snap4City verification failed; the direct recovery example uses verified local model {local_alias}. "
+                                "Config-driven commands keep each configuration's own execution.model.",
+                                file=sys.stderr,
+                            )
+                            break
+                    if command_agentic_model is None:
                         print(
-                            f"[!] Snap4City was not verified; recovery Agentic commands will use verified local model {local_alias}.",
+                            "[!] Snap4City verification failed and no prepared local AI model is ready. "
+                            "Config-driven commands are still printed without a model override.",
                             file=sys.stderr,
                         )
-                        break
-                if command_agentic_model is None:
+                else:
                     print(
-                        "[!] Snap4City was not verified and no prepared local AI model is ready; Agentic recovery commands are omitted.",
+                        "[!] Snap4City verification was not reached because initialization failed earlier; "
+                        "the configured model is preserved and no local provider is substituted.",
                         file=sys.stderr,
                     )
             if assessment_config.is_file():

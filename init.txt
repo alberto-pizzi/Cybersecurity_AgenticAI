@@ -189,9 +189,13 @@ python .\initScript.py --with-lab --prepare-ai qwen --run agentic --mode balance
 
 Alla fine l'initializer stampa i comandi DVWA assessmentRunner FAST/BALANCED/DEEP e il comando diretto
 orchestratorAgentic.py. Inoltre scorre automaticamente configs/*.json e, per ogni configurazione reale, stampa
-un comando Deterministic BALANCED e un comando Agentic BALANCED. Sono esclusi i file di esempio/template
-(il nome contiene example, sample o template) e dvwa.generated.json, gia' coperto dai comandi DVWA.
-La stessa lista dinamica viene stampata anche con --commands-only. I comandi manuali degli orchestrator restano validi.
+un comando Deterministic BALANCED e un comando Agentic BALANCED. I comandi basati su --config non aggiungono
+--model automaticamente: viene rispettato execution.model del file; se manca, il runner usa snap4city. Solo un
+--model scritto esplicitamente dall'operatore sovrascrive il config per quel run. Se l'init fallisce prima di aver
+raggiunto la verifica Snap4City, questo non viene interpretato come fallimento del provider e non viene sostituito
+silenziosamente con Llama/Qwen. Sono esclusi i file di esempio/template (il nome contiene example, sample o template)
+e dvwa.generated.json, gia' coperto dai comandi DVWA. La stessa lista dinamica viene stampata anche con
+--commands-only. I comandi manuali degli orchestrator restano validi.
 
 Il modello/provider AI Snap4City usa snap4city_model_credentials.json. Il file puo' contenere placeholder o riferimenti risolti da variabili d'ambiente locali; non contiene le credenziali della dashboard target.
 Se contiene ancora placeholder o manca e il terminale e' interattivo, username/password del provider AI vengono richiesti in console; la password non viene mostrata.
@@ -205,7 +209,9 @@ installato esplicitamente con una versione compatibile con il Python in uso anch
 upstream di requirements.txt lo omette; il preflight post-install importa sia matplotlib sia
 IDORChecker. Il preflight accetta entrambe le firme upstream note per il nome dell'argomento object-reference di check_idor (`param` oppure `parameter`); il wrapper passa comunque il valore in posizione, quindi una rinomina upstream non disabilita il tool. Anche il wrapper ripete un controllo bounded prima del test, ma non installa o modifica pacchetti durante l'assessment. Se la venv e' stale o manca una dipendenza, il tool fallisce rapidamente con diagnostica e la riparazione viene demandata a initScript.py senza --skip-scanners.
 Percorsi, interprete e launcher vengono salvati in .secops_runtime.json e
-verificati dal preflight.
+verificati dal preflight. Il controllo di compatibilita' Nikto riconosce anche la notazione help upstream
+con `+` finale per gli argomenti che richiedono un valore (es. `-timeout+`, `-Plugins+`): il `+` non e'
+parte del nome dell'opzione e non deve causare un falso errore di contratto.
 
 2. ASSESSMENT RUNNER E CONFIGURAZIONE
 ------------------------------------
@@ -217,7 +223,7 @@ DVWA generato dall'initializer:
 python .\assessmentRunner.py --config .\configs\dvwa.generated.json --orchestrator deterministic --mode balanced --dry-run
 python .\assessmentRunner.py --config .\configs\dvwa.generated.json --orchestrator deterministic --mode balanced
 python .\assessmentRunner.py --config .\configs\dvwa.generated.json --orchestrator deterministic --mode balanced --auth-only
-python .\assessmentRunner.py --config .\configs\dvwa.generated.json --orchestrator agentic --model snap4city --max-rounds 2 --mode balanced --require-ai
+python .\assessmentRunner.py --config .\configs\dvwa.generated.json --orchestrator agentic --max-rounds 2 --mode balanced --require-ai
 
 Il file DVWA generato contiene il cookie ma ha auth_only=false: senza --auth-only vengono eseguiti
 sia il profilo anonimo sia quello autenticato. Con --auth-only viene eseguito soltanto l'autenticato.
@@ -284,7 +290,7 @@ della sessione resta subordinato alla normale policy Cookie/Storage e alla valid
 Esempio generico:
   python .\assessmentRunner.py --config .\configs\<assessment>.json --orchestrator deterministic --mode balanced --dry-run --authorized
   python .\assessmentRunner.py --config .\configs\<assessment>.json --orchestrator deterministic --mode balanced --authorized
-  python .\assessmentRunner.py --config .\configs\<assessment>.json --orchestrator agentic --model <MODELLO_EFFETTIVO> --max-rounds 2 --mode balanced --require-ai --authorized
+  python .\assessmentRunner.py --config .\configs\<assessment>.json --orchestrator agentic --max-rounds 2 --mode balanced --require-ai --authorized
 
 Configurazioni target: URL completo oppure host/IP + porta
 --------------------------------------------------------

@@ -712,9 +712,12 @@ def _patch_arjun_status_code_bug() -> bool:
         print(f'[!] Arjun compatibility patch could not be applied: {type(exc).__name__}: {exc}', file=sys.stderr)
         return False
 
-# Match one command-line option as a standalone token in argparse-style help text.
+# Match one command-line option as a standalone token in CLI help text. Some tools (notably
+# Nikto) append '+' to options that require a value, e.g. '-timeout+' or '-Plugins+'. The
+# marker is documentation syntax, not part of the option name, so accept it before the normal
+# token delimiter while still refusing prefix matches such as '-host' inside '-hostname'.
 def _help_has_flag(help_text: str, flag: str) -> bool:
-    return re.search(rf"(?<![A-Za-z0-9_-]){re.escape(flag)}(?=$|[\s,=\]\[])", str(help_text or "")) is not None
+    return re.search(rf"(?<![A-Za-z0-9_-]){re.escape(flag)}(?:\+)?(?=$|[\s,=\]\[])", str(help_text or "")) is not None
 
 # Validate the exact Arjun CLI contract used by the runtime wrapper.
 def _validate_arjun_cli(executable: str) -> dict[str, Any]:
@@ -1056,12 +1059,22 @@ def validate_scanner_cli_contracts() -> dict[str, Any]:
     nikto_required = ('-host', '-nointeractive', '-ask', '-timeout', '-maxtime', '-Pause', '-Format', '-output', '-Tuning', '-Plugins', '-Display', '-Cgidirs', '-Option', '-nocookies')
     nikto = command_path('nikto')
     nikto_errors: list[str] = []
+
+    def _remember_nikto_contract_error(exc: RuntimeError) -> None:
+        text = str(exc)
+        lines = text.splitlines()
+        # Keep the summary containing the actual missing option names; a tail-only excerpt
+        # used to hide the cause behind Nikto's long help output.
+        summary = lines[0] if lines else text
+        tail = "\n".join(lines[-18:]) if len(lines) > 1 else ""
+        nikto_errors.append(summary + (("\n... help tail ...\n" + tail) if tail else ""))
+
     if nikto:
         try:
             results['nikto'] = _validate_cli_contract('Nikto', [nikto, '-Help'], nikto_required, accepted_codes=(0, 1, 2))
             results['nikto']['validated_by'] = 'configured_launcher'
         except RuntimeError as exc:
-            nikto_errors.append(str(exc)[-1600:])
+            _remember_nikto_contract_error(exc)
     if 'nikto' not in results:
         native_script = LOCAL_OPT / 'nikto' / 'program' / 'nikto.pl'
         perl_value = find_perl()
@@ -1073,7 +1086,7 @@ def validate_scanner_cli_contracts() -> dict[str, Any]:
                 )
                 results['nikto']['validated_by'] = 'native_perl_script'
             except RuntimeError as exc:
-                nikto_errors.append(str(exc)[-1600:])
+                _remember_nikto_contract_error(exc)
     if 'nikto' not in results and _docker_image_ready(NIKTO_DOCKER_IMAGE):
         docker = command_path('docker')
         if docker:
@@ -1084,7 +1097,7 @@ def validate_scanner_cli_contracts() -> dict[str, Any]:
                 )
                 results['nikto']['validated_by'] = 'official_docker_help'
             except RuntimeError as exc:
-                nikto_errors.append(str(exc)[-1600:])
+                _remember_nikto_contract_error(exc)
     if nikto or (LOCAL_OPT / 'nikto').exists() or _docker_image_ready(NIKTO_DOCKER_IMAGE):
         if 'nikto' not in results:
             raise RuntimeError(
