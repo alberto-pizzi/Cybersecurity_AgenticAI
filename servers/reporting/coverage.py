@@ -14,6 +14,7 @@ from .constants import TOOL_PURPOSES
 from .findings import _category, _iter_leaf_results
 from .text_utils import _esc, _redact_text
 from .toc import _heading
+from utils import request_body_fingerprint
 
 # Reclassifies a raw tool result's status, catching disguised failures/timeouts
 def _effective_status(result: dict[str, Any]) -> tuple[str, str]:
@@ -200,12 +201,13 @@ def _iter_endpoint_selection(context: dict[str, Any]):
 
 # Builds a complete endpoint/request coverage matrix from discovery plus actual scanner executions.
 def build_endpoint_coverage(results: dict[str, Any], context: dict[str, Any]) -> list[dict[str, Any]]:
-    rows: dict[tuple[str, str, str, str], dict[str, Any]] = {}
+    rows: dict[tuple[str, str, str, str, str], dict[str, Any]] = {}
 
-    def ensure_row(job_id: str, profile: str, method: str, url: str, *, entry_point: str = "", source: str = "Discovery") -> dict[str, Any]:
+    def ensure_row(job_id: str, profile: str, method: str, url: str, *, entry_point: str = "", source: str = "Discovery", body_fingerprint: str = "") -> dict[str, Any]:
         clean_url = _redact_text(url).strip()
         normalized_method = str(method or "GET").upper()
-        key = (str(job_id or ""), str(profile or ""), normalized_method, _endpoint_coverage_url_key(clean_url))
+        body_key = str(body_fingerprint or "") if normalized_method == "POST" else ""
+        key = (str(job_id or ""), str(profile or ""), normalized_method, _endpoint_coverage_url_key(clean_url), body_key)
         row = rows.get(key)
         if row is None:
             row = {
@@ -214,6 +216,7 @@ def build_endpoint_coverage(results: dict[str, Any], context: dict[str, Any]) ->
                 "profile": str(profile or ""),
                 "method": normalized_method,
                 "url": clean_url,
+                "body_fingerprint": body_key,
                 "discovery_sources": [],
                 "tests": [],
                 "status": "Discovered only",
@@ -247,8 +250,10 @@ def build_endpoint_coverage(results: dict[str, Any], context: dict[str, Any]) ->
             url = str(case.get("url") or "")
             if not url:
                 continue
-            row = ensure_row(job_id, profile, str(case.get("method") or "GET"), url, entry_point=entry_point, source=_endpoint_discovery_source(case))
+            case_method = str(case.get("method") or "GET")
             params = [str(value) for value in case.get("parameters", []) if str(value)]
+            body_fp = request_body_fingerprint(case_method, str(case.get("data") or ""), params)
+            row = ensure_row(job_id, profile, case_method, url, entry_point=entry_point, source=_endpoint_discovery_source(case), body_fingerprint=body_fp)
             if params:
                 row["parameters"] = list(dict.fromkeys([*(row.get("parameters") or []), *params]))
 
@@ -261,7 +266,7 @@ def build_endpoint_coverage(results: dict[str, Any], context: dict[str, Any]) ->
         for case in discovery.get("destructive_request_cases", []):
             if not isinstance(case, dict) or not str(case.get("url") or ""):
                 continue
-            row = ensure_row(job_id, profile, str(case.get("method") or "GET"), str(case.get("url")), entry_point=entry_point, source="Discovery")
+            row = ensure_row(job_id, profile, str(case.get("method") or "GET"), str(case.get("url")), entry_point=entry_point, source="Discovery", body_fingerprint=request_body_fingerprint(str(case.get("method") or "GET"), str(case.get("data") or ""), [str(v) for v in case.get("parameters", []) if str(v)]))
             row["status"] = "Skipped"
             row["reason_code"] = "STATE_CHANGE_BLOCKED"
             row["reason"] = "Destructive or state-changing request excluded by the discovery safety policy."
@@ -280,6 +285,7 @@ def build_endpoint_coverage(results: dict[str, Any], context: dict[str, Any]) ->
             row = ensure_row(
                 job_id, profile, str(skipped.get("method") or "GET"), str(skipped.get("url")),
                 entry_point=entry_point, source="Discovery policy",
+                body_fingerprint=str(skipped.get("body_fingerprint") or request_body_fingerprint(str(skipped.get("method") or "GET"), str(skipped.get("data") or ""), [str(v) for v in skipped.get("parameters", []) if str(v)])),
             )
             if row["status"] not in {"Tested", "Execution error", "HTTP 404", "HTTP 410"}:
                 row["status"] = "Skipped"
@@ -300,7 +306,10 @@ def build_endpoint_coverage(results: dict[str, Any], context: dict[str, Any]) ->
             row["reason_code"] = "HTTP_404" if kind == "HTTP404" else "HTTP_410"
             row["reason"] = "The server reported that the discovered resource does not exist." if kind == "HTTP404" else "The server reported that the discovered resource has been removed."
 
-    # Selector decisions explain why reachable request contracts were retained or omitted before execution.
+    # Endpoint eligibility explains which concrete request contracts can reach security planning/execution.
+    orchestration = context.get("orchestration") if isinstance(context.get("orchestration"), dict) else {}
+    orchestration_mode = str(orchestration.get("mode") or "").lower()
+    selection_source = "Agentic catalog eligibility" if orchestration_mode == "agentic" else "Deterministic selector"
     for job_id, profile, decisions in _iter_endpoint_selection(context) or []:
         entry_point = ""
         if job_id:
@@ -308,7 +317,7 @@ def build_endpoint_coverage(results: dict[str, Any], context: dict[str, Any]) ->
         for decision in decisions:
             if not isinstance(decision, dict) or not str(decision.get("url") or ""):
                 continue
-            row = ensure_row(job_id, profile, str(decision.get("method") or "GET"), str(decision.get("url")), entry_point=entry_point, source="Deterministic selector")
+            row = ensure_row(job_id, profile, str(decision.get("method") or "GET"), str(decision.get("url")), entry_point=entry_point, source=selection_source, body_fingerprint=str(decision.get("body_fingerprint") or ""))
             row["selector_selected_tools"] = sorted(set([*(row.get("selector_selected_tools") or []), *[str(v) for v in decision.get("selected_tools", []) if str(v)]]))
             row["selector_eligible_tools"] = sorted(set([*(row.get("selector_eligible_tools") or []), *[str(v) for v in decision.get("eligible_tools", []) if str(v)]]))
             code = str(decision.get("reason_code") or "").upper()
@@ -354,7 +363,7 @@ def build_endpoint_coverage(results: dict[str, Any], context: dict[str, Any]) ->
         method = str(action.get("method") or "GET").upper()
         if not target:
             continue
-        row = ensure_row(source_job, profile, method, target, entry_point=source_entry, source="Scanner target")
+        row = ensure_row(source_job, profile, method, target, entry_point=source_entry, source="Scanner target", body_fingerprint=str(action.get("body_fingerprint") or ""))
         status, _ = _effective_status(result)
         tool_label = tool or "scanner"
         test_label = f"{tool_label} ({status})"
@@ -406,9 +415,12 @@ def build_endpoint_coverage(results: dict[str, Any], context: dict[str, Any]) ->
             completed_dast = result.get("dast_completed_request_cases") if isinstance(result.get("dast_completed_request_cases"), list) else result.get("dast_request_cases")
             for case in completed_dast if isinstance(completed_dast, list) else []:
                 if isinstance(case, dict) and str(case.get("url") or ""):
-                    nuclei_targets.append((str(case.get("method") or "GET").upper(), str(case.get("url")), "nuclei completed DAST request"))
-            for nested_method, nested_url, nested_label in nuclei_targets:
-                nested = ensure_row(source_job, profile, nested_method, nested_url, entry_point=source_entry, source="Scanner evidence")
+                    nested_method = str(case.get("method") or "GET").upper()
+                    nested_params = [str(v) for v in case.get("parameters", []) if str(v)]
+                    nuclei_targets.append((nested_method, str(case.get("url")), "nuclei completed DAST request", request_body_fingerprint(nested_method, str(case.get("data") or ""), nested_params)))
+            normalized_nuclei_targets = [(*item, "") if len(item) == 3 else item for item in nuclei_targets]
+            for nested_method, nested_url, nested_label, nested_body_fp in normalized_nuclei_targets:
+                nested = ensure_row(source_job, profile, nested_method, nested_url, entry_point=source_entry, source="Scanner evidence", body_fingerprint=nested_body_fp)
                 label = f"{nested_label} ({status})"
                 if label not in nested["tests"]:
                     nested["tests"].append(label)
@@ -445,8 +457,6 @@ def build_endpoint_coverage(results: dict[str, Any], context: dict[str, Any]) ->
                     nested["reason_code"] = "TESTED"
                     nested["reason"] = "A targeted ZAP active scan was actually started for this endpoint/request context."
 
-    orchestration = context.get("orchestration") if isinstance(context.get("orchestration"), dict) else {}
-    orchestration_mode = str(orchestration.get("mode") or "").lower()
     for row in rows.values():
         if row.get("status") != "Discovered only":
             continue
@@ -454,7 +464,7 @@ def build_endpoint_coverage(results: dict[str, Any], context: dict[str, Any]) ->
             if orchestration_mode == "agentic":
                 row["status"] = "Skipped"
                 row["reason_code"] = "PLANNER_DEFERRED"
-                row["reason"] = "The deterministic selector considered this request contract eligible, but no concrete execution was recorded after Agentic tool-group planning."
+                row["reason"] = "The concrete action was eligible for Agentic planning, but no completed execution was recorded after the AI selection and resource checks."
             else:
                 row["reason_code"] = "EXECUTION_NOT_RECORDED"
                 row["reason"] = "The deterministic selector marked this request contract for security testing, but no matching concrete execution was recorded; review the execution audit."
@@ -589,6 +599,7 @@ def _render_endpoint_coverage(rows: list[dict[str, Any]], toc: list[tuple[int, s
             f"<td>{profile_text}</td>"
             f'<td class="no-wrap">{_esc(row.get("method", ""))}</td>'
             f"<td>{_esc(row.get('url', ''))}</td>"
+            f'<td class="no-wrap">{_esc(str(row.get("body_fingerprint") or "-")[:8])}</td>'
             f"<td>{_esc(source_text)}</td>"
             f"<td>{_esc(tests_text)}</td>"
             f"<td>{_esc(row.get('status', ''))}</td>"
@@ -598,7 +609,7 @@ def _render_endpoint_coverage(rows: list[dict[str, Any]], toc: list[tuple[int, s
         )
     return (
         f"{heading}"
-        '<p class="section-note">Each row represents a discovered endpoint/request context for one assessment profile. '
+        '<p class="section-note">Each row represents a discovered endpoint/request context for one assessment profile. Distinct POST bodies remain separate through a non-reversible body-context fingerprint; the fingerprint does not expose submitted values. '
         '"Tested" means that at least one concrete active execution was recorded for that endpoint; discovery alone does not count as a security test. '
         'Broad/specialist tested coverage deliberately excludes contexts reached only by the final safe-surface completion probe. '
         'The reason code states why an untested context was deferred or excluded. Anonymous and authenticated coverage are calculated independently. '
@@ -606,7 +617,7 @@ def _render_endpoint_coverage(rows: list[dict[str, Any]], toc: list[tuple[int, s
         f'<table><thead><tr><th>Metric</th>{summary_head}</tr></thead><tbody>{"".join(summary_rows)}</tbody></table>'
         '<p class="section-note">Total tested coverage counts any active check. Broad/specialist tested coverage excludes safe-surface-only contexts, preventing a shallow completion replay from being presented as specialist attack coverage. Out-of-scope references and HTTP 404/410 responses are excluded from both denominators.</p>'
         f'{detail_note}'
-        '<table><thead><tr><th>#</th><th>Profile / job</th><th>Method</th><th>Endpoint</th><th>Discovered by</th><th>Security tests</th><th>Status</th><th>Reason code</th><th>Reason</th></tr></thead>'
+        '<table><thead><tr><th>#</th><th>Profile / job</th><th>Method</th><th>Endpoint</th><th>Body ctx</th><th>Discovered by</th><th>Security tests</th><th>Status</th><th>Reason code</th><th>Reason</th></tr></thead>'
         f"<tbody>{''.join(body_rows)}</tbody></table>"
     )
 
@@ -643,11 +654,17 @@ def _coverage_constraints(
             "Repeat the assessment without --auth-only or include both anonymous and authenticated profiles.",
         )
 
-    if authenticated_profiles and not bool(context.get("secondary_identity_supplied")):
+    try:
+        authenticated_identity_count = int(context.get("authenticated_identity_count") or 0)
+    except (TypeError, ValueError):
+        authenticated_identity_count = 0
+    if authenticated_identity_count <= 0:
+        authenticated_identity_count = len(authenticated_profiles)
+    if authenticated_profiles and authenticated_identity_count < 2:
         add(
             "Authorization / BOLA",
-            "Only one authenticated identity was supplied. Horizontal and vertical authorization differences between users or roles could not be confirmed.",
-            "Provide --secondary-cookies for an account with different ownership or privileges and repeat the read-only authorization checks.",
+            "Only one authenticated identity was available. Horizontal and vertical authorization differences between users or roles could not be confirmed.",
+            "Configure at least two credential_refs with different ownership or privileges (or use --secondary-cookies for a direct CLI comparison) and repeat the read-only authorization checks.",
         )
 
     coverage_by_tool = {
@@ -697,8 +714,8 @@ def _coverage_constraints(
     if any(isinstance(item, dict) and item.get("remaining_coverage_gaps") for item in planner_audit):
         add(
             "Agentic coverage contract",
-            "At least one planner round ended with unresolved applicable tool groups.",
-            "Review the round-level coverage gaps and rerun with a stronger model, more rounds or the deterministic baseline.",
+            "At least one planner round ended with unresolved applicable concrete actions or coverage gaps.",
+            "Review the round-level coverage gaps and rerun with a stronger model or more Agentic rounds; run Deterministic separately only when a fixed reproducible comparison is desired.",
         )
 
     return constraints

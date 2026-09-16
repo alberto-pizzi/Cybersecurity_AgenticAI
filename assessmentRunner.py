@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import copy
 import getpass
+import hashlib
 import json
 import os
 import shutil
@@ -23,10 +24,11 @@ from assessmentConfig import (
     load_assessment_config,
     redacted_configuration,
     resolve_cookie_credential,
+    service_credential_refs,
     target_is_local,
     validate_authorization_scope,
 )
-from utils import atomic_write_text, canonical_cookie_header, cookie_names, normalized_origin, same_origin, scanner_request_rate_policy
+from utils import atomic_write_text, canonical_cookie_header, cookie_names, normalized_origin, normalized_hostname, same_origin, scanner_request_rate_policy
 from targetAuth import browser_oidc_login_session
 
 
@@ -152,13 +154,20 @@ def _direct_assessment(args: argparse.Namespace) -> tuple[dict[str, Any], list[d
 # Replaces credential values in a persisted command representation while keeping the executed argv unchanged.
 def _redacted_command(command: list[str]) -> list[str]:
     redacted = list(command)
-    for flag in ("--cookies", "--secondary-cookies"):
-        try:
-            index = redacted.index(flag)
-        except ValueError:
-            continue
-        if index + 1 < len(redacted):
+    index = 0
+    while index < len(redacted):
+        flag = redacted[index]
+        if flag in {"--cookies", "--secondary-cookies"} and index + 1 < len(redacted):
             redacted[index + 1] = "<redacted>"
+            index += 2
+            continue
+        if flag == "--identity-cookie" and index + 1 < len(redacted):
+            raw = str(redacted[index + 1])
+            label = raw.split("=", 1)[0].strip() if "=" in raw else "identity"
+            redacted[index + 1] = f"{label}=<redacted>"
+            index += 2
+            continue
+        index += 1
     return redacted
 
 
@@ -230,7 +239,7 @@ def _same_host_port_authorized(config: dict[str, Any], left_url: str, right_url:
         return (
             str(left.scheme or "").lower() in {"http", "https"}
             and str(left.scheme or "").lower() == str(right.scheme or "").lower()
-            and str(left.hostname or "").lower().rstrip(".") == str(right.hostname or "").lower().rstrip(".")
+            and normalized_hostname(left.hostname or "") == normalized_hostname(right.hostname or "")
             and bool(left.hostname)
             and bool(right.hostname)
         )
@@ -260,7 +269,7 @@ def _resolve_job_cookie(
     if kind == "cookie":
         value = resolve_cookie_credential(config, reference)
         if not value:
-            print(f"[AUTH] Optional credential {reference!r} is unavailable; the job will run the anonymous profile only.")
+            print(f"[AUTH] Optional credential {reference!r} is unavailable; this identity will be omitted; the job may continue with any other available configured profile.")
         else:
             value = canonical_cookie_header(value)
             # A raw Cookie header has lost Domain/Path/Secure metadata. Remember the first hostname/origin
@@ -335,9 +344,9 @@ def _resolve_job_cookie(
         if not storage_state and (not username or not password) and not bool(runtime.get("prompt_attempted")):
             runtime["prompt_attempted"] = True
             if not username and interactive:
-                username = input(f"[AUTH] Target username ({username_env or 'environment variable'} not set; optional fallback after cookie/SSO): ").strip()
+                username = input(f"[AUTH:{reference}] Target username ({username_env or 'environment variable'} not set; optional fallback after cookie/SSO): ").strip()
             if not password and interactive:
-                password = getpass.getpass(f"[AUTH] Target password ({password_env or 'environment variable'} not set; optional fallback after cookie/SSO): ")
+                password = getpass.getpass(f"[AUTH:{reference}] Target password ({password_env or 'environment variable'} not set; optional fallback after cookie/SSO): ")
             runtime["username"] = username
             runtime["password"] = password
 
@@ -354,6 +363,7 @@ def _resolve_job_cookie(
             f"cookie names: {', '.join(cookie_names(value)) or 'none'}. "
             "The child orchestrator will validate it, then try saved browser/SSO state, then the original username/password if needed."
         )
+        runtime["resolved_cookie"] = value
         cache[cache_key] = value
         return value
 
@@ -363,16 +373,16 @@ def _resolve_job_cookie(
     if not storage_state and (not username or not password) and not bool(runtime.get("prompt_attempted")):
         runtime["prompt_attempted"] = True
         if not username and interactive:
-            username = input(f"[AUTH] Target username ({username_env or 'environment variable'} not set): ").strip()
+            username = input(f"[AUTH:{reference}] Target username ({username_env or 'environment variable'} not set): ").strip()
         if not password and interactive:
-            password = getpass.getpass(f"[AUTH] Target password ({password_env or 'environment variable'} not set): ")
+            password = getpass.getpass(f"[AUTH:{reference}] Target password ({password_env or 'environment variable'} not set): ")
         runtime["username"] = username
         runtime["password"] = password
 
     if not storage_state and (not username or not password):
         if bool(credential.get("optional", False)):
             detail = "existing cookie is not applicable to this authorized origin/port and no reusable browser session or complete username/password is available"
-            print(f"[AUTH] Optional credential {reference!r}: {detail}; the job will run the anonymous profile only.")
+            print(f"[AUTH] Optional credential {reference!r}: {detail}; this identity will be omitted; the job may continue with any other available configured profile.")
             cache[cache_key] = ""
             return ""
         missing = []
@@ -399,9 +409,9 @@ def _resolve_job_cookie(
         if storage_state and (not username or not password) and not bool(runtime.get("prompt_attempted")) and interactive:
             runtime["prompt_attempted"] = True
             if not username:
-                username = input(f"[AUTH] Target username ({username_env or 'environment variable'} not set): ").strip()
+                username = input(f"[AUTH:{reference}] Target username ({username_env or 'environment variable'} not set): ").strip()
             if not password:
-                password = getpass.getpass(f"[AUTH] Target password ({password_env or 'environment variable'} not set): ")
+                password = getpass.getpass(f"[AUTH:{reference}] Target password ({password_env or 'environment variable'} not set): ")
             runtime["username"] = username
             runtime["password"] = password
             if username and password:
@@ -421,7 +431,7 @@ def _resolve_job_cookie(
                     first_exc = None
         if first_exc is not None:
             if bool(credential.get("optional", False)):
-                print(f"[AUTH] Automatic browser login failed: {first_exc}; the job will run the anonymous profile only.")
+                print(f"[AUTH] Automatic browser login failed: {first_exc}; this identity will be omitted; the job may continue with any other available configured profile.")
                 cache[cache_key] = ""
                 return ""
             raise ValueError(str(first_exc)) from first_exc
@@ -429,7 +439,7 @@ def _resolve_job_cookie(
     value = str(login_result.get("cookie_header") or "")
     if not value:
         if bool(credential.get("optional", False)):
-            print(f"[AUTH] Browser authentication for {reference!r} returned no application cookie; the job will run the anonymous profile only.")
+            print(f"[AUTH] Browser authentication for {reference!r} returned no application cookie; this identity will be omitted; the job may continue with any other available configured profile.")
             cache[cache_key] = ""
             return ""
         raise ValueError("Automatic browser login returned no application cookie.")
@@ -439,37 +449,64 @@ def _resolve_job_cookie(
     runtime["password"] = password
     reuse_note = "existing browser/SSO state" if login_result.get("sso_reused") else "the original username/password"
     print(f"[AUTH] Browser authentication succeeded using {reuse_note}; target cookie names: {', '.join(cookie_names(value)) or 'none'}.")
+    runtime["resolved_cookie"] = value
     cache[cache_key] = value
     return value
 
 
 def _runtime_auth_payload(config: dict[str, Any], job: dict[str, Any], runtime_auth_cache: dict[str, dict[str, Any]]) -> dict[str, Any]:
-    reference = str(job.get("credential_ref") or "").strip()
-    runtime = runtime_auth_cache.get(reference) if reference else None
-    if not isinstance(runtime, dict) or str(runtime.get("kind") or "") not in {"browser_oidc", "snap4city_oidc"}:
+    """Serialize identity-bound browser/OIDC runtime state for every resolved identity.
+
+    The child receives every resolved browser/OIDC identity so same-origin browser storage remains
+    identity-correct. Cross-origin/same-host reuse is still governed by each credential's
+    reuse_on_authorized_siblings flag. Cookie values are never written to this payload: a SHA-256
+    fingerprint links each already-resolved child Cookie header to its own browser storage state.
+    """
+    effective_refs = [str(value).strip() for value in (job.get("_effective_credential_refs") or []) if str(value).strip()]
+    if not effective_refs:
+        fallback = str(job.get("credential_ref") or "").strip()
+        if fallback:
+            effective_refs = [fallback]
+    identities: list[dict[str, Any]] = []
+    for reference in effective_refs:
+        runtime = runtime_auth_cache.get(reference)
+        if not isinstance(runtime, dict) or str(runtime.get("kind") or "") not in {"browser_oidc", "snap4city_oidc"}:
+            continue
+        credential_options = runtime.get("credential") if isinstance(runtime.get("credential"), dict) else {}
+        username = str(runtime.get("username") or "")
+        password = str(runtime.get("password") or "")
+        storage_state = runtime.get("storage_state") if isinstance(runtime.get("storage_state"), dict) else None
+        if (not username or not password) and not storage_state:
+            continue
+        resolved_cookie = str(runtime.get("resolved_cookie") or "")
+        if not resolved_cookie:
+            continue
+        try:
+            canonical = canonical_cookie_header(resolved_cookie)
+        except ValueError:
+            canonical = resolved_cookie
+        fingerprint = hashlib.sha256(canonical.encode("utf-8", errors="replace")).hexdigest()
+        identities.append({
+            "reference": reference,
+            "cookie_fingerprint": fingerprint,
+            "username": username,
+            "password": password,
+            "credential": copy.deepcopy(credential_options),
+            "storage_state": storage_state,
+            "oidc_issuer": str(runtime.get("oidc_issuer") or ""),
+        })
+    if not identities:
         return {}
-    credential_options = runtime.get("credential") if isinstance(runtime.get("credential"), dict) else {}
-    if not bool(credential_options.get("reuse_on_authorized_siblings", False)):
-        return {}
-    username = str(runtime.get("username") or "")
-    password = str(runtime.get("password") or "")
-    storage_state = runtime.get("storage_state") if isinstance(runtime.get("storage_state"), dict) else None
-    if not username or not password:
-        # SSO-only propagation is still useful when a browser state exists; if it later asks for credentials,
-        # the child reports that it cannot reauthenticate instead of opening a new console prompt.
-        if not storage_state:
-            return {}
     authorization = config.get("authorization") or {}
     return {
-        "schema_version": 1,
-        "kind": "browser_oidc",
-        "reference": reference,
+        "schema_version": 2,
+        "kind": "browser_oidc_multi",
+        # Preserve the actual CLI-primary identity even when it is a raw-cookie credential and
+        # therefore has no browser/OIDC state row in ``identities``. The child must never infer
+        # another browser identity as primary merely because it is the first serializable state.
+        "primary_reference": effective_refs[0],
         "primary_origin": normalized_origin(str(job.get("target") or "")),
-        "username": username,
-        "password": password,
-        "credential": copy.deepcopy(credential_options),
-        "storage_state": storage_state,
-        "oidc_issuer": str(runtime.get("oidc_issuer") or ""),
+        "identities": identities,
         "allowed_origins": list(authorization.get("allowed_origins") or []),
     }
 
@@ -508,13 +545,13 @@ def _coalesce_same_route_jobs(jobs: list[dict[str, Any]]) -> list[dict[str, Any]
         try:
             parsed = urlparse(target)
             route = parsed.path.rstrip('/') or '/'
-            origin = (parsed.scheme.lower(), (parsed.hostname or '').lower(), parsed.port or (443 if parsed.scheme.lower() == 'https' else 80))
+            origin = (parsed.scheme.lower(), normalized_hostname(parsed.hostname or ''), parsed.port or (443 if parsed.scheme.lower() == 'https' else 80))
         except ValueError:
             passthrough_positions.append((position, dict(job)))
             continue
         key = (
             str(job.get('asset_id') or ''), origin, route,
-            str(job.get('credential_ref') or ''), str(job.get('secondary_credential_ref') or ''),
+            tuple(str(value) for value in (job.get('credential_refs') or []) if str(value)),
             bool(job.get('auth_only')), job.get('allow_state_changes'), str(job.get('interactsh_injection_url') or ''),
         )
         if key not in grouped:
@@ -548,24 +585,28 @@ def _coalesce_same_route_jobs(jobs: list[dict[str, Any]]) -> list[dict[str, Any]
 
 # Uses existing credential validation/login paths as ordinary discovery seeds without changing target configuration.
 def _credential_discovery_seeds(config: dict[str, Any], job: dict[str, Any]) -> list[str]:
-    reference = str(job.get('credential_ref') or '').strip()
-    credential = (config.get('credentials') or {}).get(reference) if reference else None
-    if not isinstance(credential, dict):
-        return []
+    references = [str(value).strip() for value in (job.get('credential_refs') or []) if str(value).strip()]
+    if not references:
+        references = [value for value in (str(job.get('credential_ref') or '').strip(), str(job.get('secondary_credential_ref') or '').strip()) if value]
     target = str(job.get('target') or '').strip()
     if not target:
         return []
     selected: list[str] = []
-    for key in ('validation_path', 'login_path'):
-        raw = str(credential.get(key) or '').strip()
-        if not raw:
+    credentials = config.get('credentials') or {}
+    for reference in references:
+        credential = credentials.get(reference)
+        if not isinstance(credential, dict):
             continue
-        try:
-            candidate = urljoin(target, raw)
-        except Exception:
-            continue
-        if candidate and same_origin(target, candidate) and candidate not in selected:
-            selected.append(candidate)
+        for key in ('validation_path', 'login_path'):
+            raw = str(credential.get(key) or '').strip()
+            if not raw:
+                continue
+            try:
+                candidate = urljoin(target, raw)
+            except Exception:
+                continue
+            if candidate and same_origin(target, candidate) and candidate not in selected:
+                selected.append(candidate)
     return selected
 
 
@@ -590,22 +631,44 @@ def _build_command(
         command.extend(["--discovery-seed", discovery_seed])
 
     cache = credential_cache if credential_cache is not None else {}
-    primary_ref = str(job.get("credential_ref") or "")
-    primary_value = ""
-    if primary_ref:
-        primary_value = _resolve_job_cookie(config, primary_ref, job["target"], cache, runtime_auth_cache) if resolve_secrets else f"<credential:{primary_ref}>"
-        if primary_value:
-            command.extend(["--cookies", primary_value])
-    secondary_ref = str(job.get("secondary_credential_ref") or "")
-    if secondary_ref:
-        secondary_value = _resolve_job_cookie(config, secondary_ref, job["target"], cache, runtime_auth_cache) if resolve_secrets else f"<credential:{secondary_ref}>"
-        if secondary_value:
-            command.extend(["--secondary-cookies", secondary_value])
+    configured_refs = [str(value).strip() for value in (job.get("credential_refs") or []) if str(value).strip()]
+    if not configured_refs:
+        configured_refs = [value for value in (str(job.get("credential_ref") or "").strip(), str(job.get("secondary_credential_ref") or "").strip()) if value]
+    configured_refs = list(dict.fromkeys(configured_refs))
+    available_identities: list[tuple[str, str]] = []
+    seen_sessions: dict[str, str] = {}
+    for reference in configured_refs:
+        value = _resolve_job_cookie(config, reference, job["target"], cache, runtime_auth_cache) if resolve_secrets else f"<credential:{reference}>"
+        if not value:
+            continue
+        if resolve_secrets:
+            try:
+                canonical = canonical_cookie_header(value)
+            except ValueError:
+                canonical = value
+            fingerprint = hashlib.sha256(canonical.encode("utf-8", errors="replace")).hexdigest()
+            previous = seen_sessions.get(fingerprint)
+            if previous:
+                print(
+                    f"[AUTH WARNING] Credential {reference!r} resolved to the same concrete application session as {previous!r}; "
+                    "it is not added as a second authenticated identity because that would make cross-account/BOLA evidence misleading."
+                )
+                continue
+            seen_sessions[fingerprint] = reference
+        available_identities.append((reference, value))
+    job["_effective_credential_refs"] = [reference for reference, _ in available_identities]
+    if available_identities:
+        primary_ref, primary_value = available_identities[0]
+        command.extend(["--primary-identity-name", primary_ref, "--cookies", primary_value])
+        for reference, value in available_identities[1:]:
+            command.extend(["--identity-cookie", f"{reference}={value}"])
+    else:
+        primary_ref, primary_value = "", ""
     if force_auth_only or job.get("auth_only"):
-        if not primary_ref:
-            raise ValueError(f"Job {job['id']} requests auth_only but has no credential_ref.")
-        if resolve_secrets and not primary_value:
-            raise ValueError(f"Job {job['id']} requests auth_only but optional credential {primary_ref!r} is unavailable.")
+        if not configured_refs:
+            raise ValueError(f"Job {job['id']} requests auth_only but has no credential_refs/credential_ref.")
+        if resolve_secrets and not available_identities:
+            raise ValueError(f"Job {job['id']} requests auth_only but none of its configured identities is available.")
         command.append("--auth-only")
 
     authorization = config.get("authorization") or {}
@@ -830,6 +893,7 @@ def _aggregate_report_inputs(results_data: dict[str, Any], config: dict[str, Any
     diagnostics_by_entry: dict[str, Any] = {}
     endpoint_selection_by_entry: dict[str, Any] = {}
     secondary_identity_supplied = False
+    authenticated_identity_count = 0
 
     # Start from runner job records so an entry point remains visible even when its orchestrator
     # exits before producing a per-job report. Non-web inventory rows have no target and are not
@@ -903,6 +967,10 @@ def _aggregate_report_inputs(results_data: dict[str, Any], config: dict[str, Any
             if str(tool).strip():
                 expected_tools.add(str(tool))
         secondary_identity_supplied = secondary_identity_supplied or bool(context.get("secondary_identity_supplied"))
+        try:
+            authenticated_identity_count = max(authenticated_identity_count, int(context.get("authenticated_identity_count") or 0))
+        except (TypeError, ValueError):
+            pass
         discovery_by_entry[job_id] = row.get("discovery") if isinstance(row.get("discovery"), dict) else {}
         row_diagnostics = row.get("diagnostics") if isinstance(row.get("diagnostics"), (dict, list)) else {}
         if row_diagnostics:
@@ -964,7 +1032,14 @@ def _aggregate_report_inputs(results_data: dict[str, Any], config: dict[str, Any
         "logical_target_name": str((config.get("platform") or {}).get("name") or target_label),
         "multi_entry_target": True,
         "reporting_scope": "aggregate logical target",
-        "secondary_identity_supplied": secondary_identity_supplied,
+        "authenticated_identity_count": max(
+            authenticated_identity_count,
+            sum(1 for authenticated in profiles.values() if authenticated),
+        ),
+        "secondary_identity_supplied": secondary_identity_supplied or max(
+            authenticated_identity_count,
+            sum(1 for authenticated in profiles.values() if authenticated),
+        ) >= 2,
         "scan_mode": str((config.get("execution") or {}).get("mode") or "balanced"),
         "request_rate_policy": dict(results_data.get("traffic_policy") or {}),
         "allow_same_host_ports": bool((config.get("authorization") or {}).get("allow_same_host_ports", False)),
@@ -1265,6 +1340,7 @@ def main() -> int:
             "entry_points": list(job.get("entry_points") or []),
             "merged_service_ids": list(job.get("merged_service_ids") or []),
             "coalesced_service_count": int(job.get("coalesced_service_count") or 1),
+            "credential_refs": list(job.get("credential_refs") or []),
             "credential_ref": job.get("credential_ref") or None,
             "secondary_credential_ref": job.get("secondary_credential_ref") or None,
             "notes": job.get("notes") or "",

@@ -8,8 +8,6 @@ import time
 import traceback
 from typing import Any
 
-from langgraph.graph import END, START, StateGraph
-
 import orchestratorDeterministic as deterministic_core
 import orchestratorAgenticCore as agentic_core
 from orchestratorAgenticCore import (
@@ -25,6 +23,7 @@ from orchestratorShared import (
     select_workflow_request_cases, select_authorization_request_cases,
     select_oast_request_cases, tool_action_limit, broad_tool_order,
     add_common_cli_arguments, prepare_cli_context, prepare_cli_entry_points, prepare_cli_discovery_seeds,
+    ALL_TOOLS,
 )
 
 REGISTRY = deterministic_core.agentic_registry()
@@ -41,6 +40,7 @@ def __getattr__(name: str) -> Any:
 # Eligible but unselected actions remain visible as diagnosis="agentic_deferred_by_planner".
 
 def build_graph() -> Any:
+    from langgraph.graph import END, START, StateGraph
     graph = StateGraph(AgentState)
     graph.add_node("discovery", discovery_node)
     graph.add_node("planner", planner_node)
@@ -73,7 +73,8 @@ def main() -> int:
     parser = argparse.ArgumentParser(
         description="LangGraph FastMCP security orchestrator with selectable AI model."
     )
-    add_common_cli_arguments(parser, require_target=True)
+    add_common_cli_arguments(parser, require_target=False)
+    parser.add_argument("--list-tools", action="store_true", help="List canonical SecOps MCP tools and exit.")
     parser.add_argument(
         "--model", choices=("snap4city", "llama", "qwen"), default="snap4city",
         help=(
@@ -109,6 +110,15 @@ def main() -> int:
         help="AI planning budget per round; the analysis stage also derives its bounded per-batch budget from this value. 0 selects mode-specific defaults.",
     )
     args = parser.parse_args()
+
+    if args.list_tools:
+        print("Canonical SecOps MCP tools:")
+        for spec in ALL_TOOLS:
+            if spec.name != "report":
+                print(f"  {spec.name:11} {spec.server}:{spec.tool}")
+        return 0
+    if not args.target:
+        parser.error("--target is required unless --list-tools is used.")
 
     configure_scan_mode(args.mode)
     if args.mode == "deep":

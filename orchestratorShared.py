@@ -2,6 +2,7 @@ from __future__ import annotations
 import argparse
 import atexit
 import ast
+import contextlib
 import asyncio
 import functools
 import base64
@@ -9,11 +10,13 @@ import hashlib
 import zlib
 import html
 import importlib.util
+import ipaddress
 import json
 import math
 import os
 import re
 import shutil
+import signal
 import socket
 import ssl
 import subprocess
@@ -36,9 +39,14 @@ warnings.filterwarnings('ignore', message='.*authlib\\.jose.*deprecated.*')
 import requests
 with warnings.catch_warnings():
     warnings.simplefilter('ignore')
-    from fastmcp import Client
-from utils import apply_runtime_target_preparation, absolute_url, atomic_write_text, canonical_cookie_header, cookie_names, load_runtime_config, normalize_url, normalized_origin, parse_cookie_header, request_same_origin_redirects, ROOT_DIR, same_origin, sanitize_discovered_url, scanner_session_probe, secops_source_fingerprint, SERVERS_DIR, target_runtime_profile, url_in_authorized_scope as _url_in_explicit_scope, MCP_UNIFIED_SERVICE, mcp_http_port, mcp_http_url, scanner_request_rate, runtime_request_rate_policy
-from targetAuth import _looks_like_application_login_entry, browser_oidc_login_session
+    try:
+        from fastmcp import Client
+    except ModuleNotFoundError:
+        # Keep lightweight CLI surfaces such as --help/--list-tools available before the
+        # runtime environment is initialized. Live preflight reports the missing dependency.
+        Client = None  # type: ignore[assignment,misc]
+from utils import apply_runtime_target_preparation, absolute_url, atomic_write_text, canonical_cookie_header, cookie_names, load_runtime_config, normalize_url, normalized_origin, normalized_hostname, parse_cookie_header, request_same_origin_redirects, ROOT_DIR, same_origin, sanitize_discovered_url, scanner_session_probe, secops_source_fingerprint, request_body_fingerprint, SERVERS_DIR, target_runtime_profile, url_in_authorized_scope as _url_in_explicit_scope, MCP_UNIFIED_SERVICE, mcp_http_port, mcp_http_url, scanner_request_rate, runtime_request_rate_policy, MAX_AUTHENTICATED_IDENTITIES, valid_identity_label
+from targetAuth import BrowserLoginError, _looks_like_application_login_entry, browser_oidc_login_session
 ROOT = Path(ROOT_DIR).resolve()
 SERVERS = Path(SERVERS_DIR).resolve()
 RUNTIME_FILE = ROOT / '.secops_runtime.json'
@@ -56,6 +64,7 @@ MCP_REPORT_PDF_TIMEOUT_HINT = max(300.0, float(os.getenv('SECOPS_REPORT_PDF_TIME
 MCP_REPORT_RENDER_TIMEOUT = max(MCP_TOOL_TIMEOUT, MCP_REPORT_PDF_TIMEOUT_HINT + 300.0, float(os.getenv('SECOPS_MCP_REPORT_RENDER_TIMEOUT', '4200')))
 MCP_REPORT_RENDER_SECONDS_PER_MIB = max(0.0, float(os.getenv('SECOPS_MCP_REPORT_RENDER_SECONDS_PER_MIB', '60')))
 MCP_REPORT_RENDER_TIMEOUT_MAX = max(MCP_REPORT_RENDER_TIMEOUT, float(os.getenv('SECOPS_MCP_REPORT_RENDER_TIMEOUT_MAX', '7200')))
+MCP_ZAP_SHARED_WAIT_MULTIPLIER = max(0.0, float(os.getenv('SECOPS_ZAP_SHARED_WAIT_MULTIPLIER', '1.0')))
 MAX_PARAMETER_ENDPOINTS = max(1, int(os.getenv('SECOPS_MAX_PARAMETER_ENDPOINTS', '5')))
 TERMINAL_URL_MAX = max(120, int(os.getenv('SECOPS_TERMINAL_URL_MAX', '240')))
 
@@ -109,18 +118,18 @@ MAX_CRAWL_PAGES = max(10, int(os.getenv('SECOPS_MAX_CRAWL_PAGES', '2200')))
 MAX_SCRIPT_ASSETS = max(4, int(os.getenv('SECOPS_MAX_SCRIPT_ASSETS', '1200')))
 SCANNER_PROGRESS_INTERVAL = max(10, int(os.getenv('SECOPS_PROGRESS_INTERVAL', '30')))
 DISCOVERY_LIMITS = {
-    'fast': {'crawl_pages': 120, 'crawl_pages_max': 220, 'browser_pages': 72, 'browser_pages_max': 200, 'browser_per_origin_pages': 180, 'browser_menu_clicks_per_page': 16, 'browser_dom_passes': 3, 'scripts': 128, 'route_variants': 8, 'per_origin_pages': 190, 'same_host_service_candidates': 4096},
-    'balanced': {'crawl_pages': 600, 'crawl_pages_max': 1100, 'browser_pages': 400, 'browser_pages_max': 1200, 'browser_per_origin_pages': 1000, 'browser_menu_clicks_per_page': 64, 'browser_dom_passes': 6, 'scripts': 640, 'route_variants': 20, 'per_origin_pages': 900, 'same_host_service_candidates': 32768},
-    'deep': {'crawl_pages': 1200, 'crawl_pages_max': 2200, 'browser_pages': 800, 'browser_pages_max': 2400, 'browser_per_origin_pages': 2000, 'browser_menu_clicks_per_page': 112, 'browser_dom_passes': 9, 'scripts': 1200, 'route_variants': 32, 'per_origin_pages': 1800, 'same_host_service_candidates': 65535},
+    'fast': {'crawl_pages': 120, 'crawl_pages_max': 220, 'browser_pages': 72, 'browser_pages_max': 200, 'browser_per_origin_pages': 180, 'browser_menu_clicks_per_page': 16, 'browser_dom_passes': 3, 'scripts': 128, 'route_variants': 8, 'per_origin_pages': 190, 'same_host_service_candidates': 4096, 'same_host_service_expansion_hosts': 8, 'same_host_service_expansion_recrawl_pages': 24},
+    'balanced': {'crawl_pages': 600, 'crawl_pages_max': 1100, 'browser_pages': 400, 'browser_pages_max': 1200, 'browser_per_origin_pages': 1000, 'browser_menu_clicks_per_page': 64, 'browser_dom_passes': 6, 'scripts': 640, 'route_variants': 20, 'per_origin_pages': 900, 'same_host_service_candidates': 32768, 'same_host_service_expansion_hosts': 32, 'same_host_service_expansion_recrawl_pages': 90},
+    'deep': {'crawl_pages': 1200, 'crawl_pages_max': 2200, 'browser_pages': 800, 'browser_pages_max': 2400, 'browser_per_origin_pages': 2000, 'browser_menu_clicks_per_page': 112, 'browser_dom_passes': 9, 'scripts': 1200, 'route_variants': 32, 'per_origin_pages': 1800, 'same_host_service_candidates': 65535, 'same_host_service_expansion_hosts': 128, 'same_host_service_expansion_recrawl_pages': 180},
 }
 HTTP_ATTEMPT_BUDGET_FACTORS = {'fast': 1.75, 'balanced': 2.0, 'deep': 2.0}
 SCRIPT_ATTEMPT_BUDGET_FACTORS = {'fast': 1.5, 'balanced': 1.75, 'deep': 1.75}
 FINAL_BROWSER_VERIFICATION_LIMITS = {'fast': 12, 'balanced': 96, 'deep': 200}
 FINAL_BROWSER_VERIFICATION_MAX_LIMITS = {'fast': 20, 'balanced': 160, 'deep': 320}
 JWT_TOKEN_LIMITS = {'fast': 16, 'balanced': 64, 'deep': 192}
-# Broad sibling coverage is deliberately smaller than primary-origin coverage in fast/balanced.
-# Authorized siblings remain available to specialist selectors even when they are not selected for
-# the full ZAP/Nuclei/Nikto baseline. Deep preserves the wider broad sweep.
+# Deterministic broad scans use bounded sibling-origin reference/adaptive limits.
+# Agentic planning receives the complete authorized observed-origin ranking as concrete broad actions;
+# execution ceilings are applied only after AI selection.
 BROAD_SIBLING_ORIGIN_BASE_LIMITS = {'fast': 6, 'balanced': 32, 'deep': 64}
 BROAD_SIBLING_ORIGIN_MAX_LIMITS = {'fast': 12, 'balanced': 64, 'deep': 128}
 BROAD_SIBLING_ADAPTIVE_RATIO = 0.75
@@ -177,14 +186,22 @@ AUTHORIZED_SCOPE_ORIGINS: set[str] = set()
 ALLOW_SAME_HOST_PORTS = False
 DISCOVER_SAME_HOST_SERVICES = False
 PRIMARY_SCOPE_TARGET = ''
-SAME_HOST_SERVICE_DISCOVERY_CACHE: dict[tuple[str, str], dict[str, Any]] = {}
-AUTHENTICATED_ORIGIN_COOKIES: dict[str, str] = {}
+SAME_HOST_SERVICE_DISCOVERY_CACHE: dict[tuple[str, str, int, str], dict[str, Any]] = {}
+AUTHENTICATED_ORIGIN_COOKIES: dict[tuple[str, str], str] = {}
 # A raw Cookie header tried speculatively on another authorized port can be rejected there even
 # though it remains valid on the primary origin. Cache that conclusive rejection per cookie value
 # and destination origin so later scanners do not repeat the same invalid session attempt.
 REJECTED_SPECULATIVE_RAW_COOKIE_KEYS: set[tuple[str, str]] = set()
-RUNTIME_TARGET_AUTH: dict[str, Any] = {}
+RUNTIME_TARGET_AUTH: dict[str, Any] = {}  # primary identity compatibility view
+RUNTIME_TARGET_AUTH_STATES: dict[str, dict[str, Any]] = {}
+RUNTIME_AUTH_COOKIE_TO_REFERENCE: dict[str, str] = {}
+RUNTIME_AUTH_AMBIGUOUS_FINGERPRINTS: set[str] = set()
+RUNTIME_PRIMARY_IDENTITY_COOKIE = ''
 RUNTIME_AUTH_ORIGIN_LIMITS = {'fast': 12, 'balanced': 32, 'deep': 64}
+# One authenticated enrichment pass must be bounded globally; otherwise a 60s browser timeout can
+# multiply by every discovered same-host service/application. Deferred origins remain eligible in
+# later passes, so this limits wall-clock amplification without marking them permanently failed.
+RUNTIME_AUTH_PASS_TIMEOUTS = {'fast': 180, 'balanced': 720, 'deep': 1800}
 # Candidate application entry points are bounded per origin/root, but the login helper shares one
 # total deadline across all entries. This keeps authentication bounded while avoiding an arbitrary
 # fixed top-8 window on larger applications.
@@ -226,18 +243,69 @@ def url_in_authorized_scope(target: str, candidate: str) -> bool:
 
 # Registers one application cookie for the exact origin that created it. The authenticated profile
 # can therefore carry several independent sibling sessions without ever copying the primary raw header.
-def register_authenticated_origin_cookie(origin_or_url: str, cookies: str) -> None:
+def _cookie_fingerprint(cookies: str) -> str:
+    if not str(cookies or '').strip():
+        return ''
+    try:
+        canonical = canonical_cookie_header(cookies)
+    except ValueError:
+        canonical = str(cookies or '')
+    return hashlib.sha256(canonical.encode('utf-8', errors='replace')).hexdigest()
+
+
+def _runtime_identity_reference(cookies: str) -> str:
+    fingerprint = _cookie_fingerprint(cookies)
+    if not fingerprint or fingerprint in RUNTIME_AUTH_AMBIGUOUS_FINGERPRINTS:
+        return ''
+    return str(RUNTIME_AUTH_COOKIE_TO_REFERENCE.get(fingerprint) or '')
+
+
+def _runtime_target_auth_for_cookie(cookies: str='') -> dict[str, Any]:
+    if cookies:
+        reference = _runtime_identity_reference(cookies)
+        state = RUNTIME_TARGET_AUTH_STATES.get(reference) if reference else None
+        return state if isinstance(state, dict) else {}
+    return RUNTIME_TARGET_AUTH
+
+
+def _register_runtime_cookie_alias(cookies: str, reference: str) -> None:
+    fingerprint = _cookie_fingerprint(cookies)
+    if not fingerprint or not reference or reference not in RUNTIME_TARGET_AUTH_STATES:
+        return
+    if fingerprint in RUNTIME_AUTH_AMBIGUOUS_FINGERPRINTS:
+        return
+    existing = str(RUNTIME_AUTH_COOKIE_TO_REFERENCE.get(fingerprint) or '')
+    if existing and existing != reference:
+        # Two configured identities resolved to the same concrete Cookie header. Treat that fingerprint
+        # as ambiguous rather than silently binding it to whichever profile was loaded last. This keeps
+        # cross-account/BOLA evidence fail-closed when the target collapsed two logins into one session.
+        RUNTIME_AUTH_COOKIE_TO_REFERENCE.pop(fingerprint, None)
+        RUNTIME_AUTH_AMBIGUOUS_FINGERPRINTS.add(fingerprint)
+        return
+    RUNTIME_AUTH_COOKIE_TO_REFERENCE[fingerprint] = reference
+
+
+# Registers one application cookie for the concrete identity/origin that created it.  The registry is
+# identity-keyed so two accounts can hold different sessions for the same authorized sibling origin.
+def register_authenticated_origin_cookie(origin_or_url: str, cookies: str, identity_cookies: str='') -> None:
     origin = normalized_origin(origin_or_url)
     if not origin or not cookies:
         return
-    AUTHENTICATED_ORIGIN_COOKIES[origin] = canonical_cookie_header(cookies)
+    reference = _runtime_identity_reference(identity_cookies or cookies)
+    if not reference:
+        return
+    AUTHENTICATED_ORIGIN_COOKIES[(reference, origin)] = canonical_cookie_header(cookies)
 
 
-def authenticated_origin_cookie(origin_or_url: str) -> str:
-    return AUTHENTICATED_ORIGIN_COOKIES.get(normalized_origin(origin_or_url), '')
+def authenticated_origin_cookie(origin_or_url: str, identity_cookies: str='') -> str:
+    origin = normalized_origin(origin_or_url)
+    reference = _runtime_identity_reference(identity_cookies) if identity_cookies else str(RUNTIME_TARGET_AUTH.get('reference') or '')
+    if not origin or not reference:
+        return ''
+    return AUTHENTICATED_ORIGIN_COOKIES.get((reference, origin), '')
 
 
-def _runtime_storage_cookie_header(candidate: str) -> str:
+def _runtime_storage_cookie_header(candidate: str, identity_cookies: str='') -> str:
     """Build the Cookie header a browser would send to this exact URL from saved storage state.
 
     Unlike a raw ``Cookie:`` string, Playwright storage state retains Domain, Path, Secure and
@@ -246,12 +314,13 @@ def _runtime_storage_cookie_header(candidate: str) -> str:
     For duplicate names the longest matching cookie path wins, mirroring the application-specific
     value that a browser places first.
     """
-    storage = RUNTIME_TARGET_AUTH.get('storage_state') if isinstance(RUNTIME_TARGET_AUTH.get('storage_state'), dict) else None
+    runtime_state = _runtime_target_auth_for_cookie(identity_cookies)
+    storage = runtime_state.get('storage_state') if isinstance(runtime_state.get('storage_state'), dict) else None
     if not storage:
         return ''
     try:
         parsed = urlparse(str(candidate or ''))
-        host = str(parsed.hostname or '').lower().rstrip('.')
+        host = normalized_hostname(parsed.hostname or '')
         request_path = str(parsed.path or '/') or '/'
         secure_request = str(parsed.scheme or '').lower() == 'https'
     except ValueError:
@@ -342,15 +411,40 @@ def _speculative_same_host_port_raw_cookie(candidate: str, cookies: str) -> bool
         return False
     same_host_port_extension = (
         str(base_parts.scheme or '').lower() == str(candidate_parts.scheme or '').lower()
-        and str(base_parts.hostname or '').lower().rstrip('.') == str(candidate_parts.hostname or '').lower().rstrip('.')
+        and normalized_hostname(base_parts.hostname or '') == normalized_hostname(candidate_parts.hostname or '')
         and bool(base_parts.hostname)
         and bool(candidate_parts.hostname)
     )
     if not same_host_port_extension:
         return False
-    if _runtime_storage_cookie_header(candidate) or authenticated_origin_cookie(candidate):
+    if runtime_target_auth_available(cookies, candidate) and (_runtime_storage_cookie_header(candidate, cookies) or authenticated_origin_cookie(candidate, cookies)):
         return False
     return _raw_cookie_reuse_key(candidate, cookies) not in REJECTED_SPECULATIVE_RAW_COOKIE_KEYS
+
+
+def authenticated_application_cookie(candidate: str, identity_cookies: str='') -> str:
+    """Return a validated runtime cookie cached for the concrete application scope and identity.
+
+    This is narrower than the origin registry: a refreshed application session is reused only inside
+    the same first-path scope that produced it, so a path-specific login cannot widen a flattened
+    Cookie header across unrelated applications on the same origin.
+    """
+    reference = _runtime_identity_reference(identity_cookies)
+    if not reference:
+        return ''
+    scope_key = _runtime_application_scope_key(candidate)
+    if not scope_key:
+        return ''
+    cached = RUNTIME_AUTH_APPLICATION_ATTEMPTS.get(f'{reference}|{scope_key}')
+    if not isinstance(cached, dict) or cached.get('status') != 'authenticated':
+        return ''
+    value = str(cached.get('cookie_header') or '')
+    if not value:
+        return ''
+    try:
+        return canonical_cookie_header(value)
+    except ValueError:
+        return ''
 
 
 # A raw Cookie header does not carry browser Domain/Path metadata. It is therefore never copied to a
@@ -365,11 +459,18 @@ def scope_cookie_header(candidate: str, cookies: str, *, use_runtime_auth: bool=
     # established sibling/application sessions in this process.
     if not str(cookies or '').strip():
         return ''
-    # Secondary/BOLA identities must never inherit the primary profile's browser storage state or
-    # authenticated-origin registry. They are deliberately scoped from their own explicit Cookie
-    # header only. This prevents an A-vs-B comparison from degenerating into A-vs-A.
-    runtime_header = _runtime_storage_cookie_header(candidate) if use_runtime_auth else ''
+    # Browser/OIDC runtime state is identity-bound. Every configured browser identity may consume
+    # its own same-origin storage state. Reuse on another authorized origin/port remains separately
+    # controlled by credential.reuse_on_authorized_siblings. This prevents editor/admin comparisons
+    # from silently inheriting the primary account while still preserving same-origin localStorage/SSO.
     base = PRIMARY_SCOPE_TARGET or candidate
+    identity_state_available = bool(use_runtime_auth and _runtime_identity_reference(cookies))
+    runtime_for_identity = bool(
+        identity_state_available
+        and (same_origin(base, candidate) or runtime_target_auth_available(cookies, candidate))
+    )
+    runtime_header = _runtime_storage_cookie_header(candidate, cookies) if runtime_for_identity else ''
+    application_header = authenticated_application_cookie(candidate, cookies) if runtime_for_identity else ''
     raw_cookie_allowed = same_origin(base, candidate)
     raw_reuse_key = _raw_cookie_reuse_key(candidate, cookies) if cookies else ('', '')
     if cookies and not raw_cookie_allowed and ALLOW_SAME_HOST_PORTS and url_in_authorized_scope(base, candidate):
@@ -378,7 +479,7 @@ def scope_cookie_header(candidate: str, cookies: str, *, use_runtime_auth: bool=
             candidate_parts = urlparse(candidate)
             raw_cookie_allowed = (
                 str(base_parts.scheme or '').lower() == str(candidate_parts.scheme or '').lower()
-                and str(base_parts.hostname or '').lower().rstrip('.') == str(candidate_parts.hostname or '').lower().rstrip('.')
+                and normalized_hostname(base_parts.hostname or '') == normalized_hostname(candidate_parts.hostname or '')
                 and bool(base_parts.hostname)
                 and bool(candidate_parts.hostname)
                 and raw_reuse_key not in REJECTED_SPECULATIVE_RAW_COOKIE_KEYS
@@ -386,14 +487,16 @@ def scope_cookie_header(candidate: str, cookies: str, *, use_runtime_auth: bool=
         except ValueError:
             raw_cookie_allowed = False
     if cookies and raw_cookie_allowed:
-        if not use_runtime_auth:
+        if not runtime_for_identity:
             return canonical_cookie_header(cookies)
-        registered = authenticated_origin_cookie(candidate)
+        registered = authenticated_origin_cookie(candidate, cookies)
         # A validated session created specifically for another authorized port/origin must replace
         # the speculative raw-cookie reuse if that first attempt failed. Browser storage metadata
         # remains strongest because it can select path/domain-specific values for the concrete URL.
         if runtime_header:
             return _merge_cookie_headers(cookies, runtime_header)
+        if application_header:
+            return application_header
         if registered and not same_origin(base, candidate):
             return registered
         return canonical_cookie_header(cookies)
@@ -402,12 +505,15 @@ def scope_cookie_header(candidate: str, cookies: str, *, use_runtime_auth: bool=
     # browser storage state. Once storage-state cookie metadata exists, it is authoritative for
     # sibling requests: falling back to the flattened origin header when no cookie matches this path
     # would silently widen a path-scoped cookie.
-    if not use_runtime_auth:
+    if not runtime_for_identity:
         return ''
-    storage = RUNTIME_TARGET_AUTH.get('storage_state') if isinstance(RUNTIME_TARGET_AUTH.get('storage_state'), dict) else None
+    runtime_state = _runtime_target_auth_for_cookie(cookies)
+    storage = runtime_state.get('storage_state') if isinstance(runtime_state.get('storage_state'), dict) else None
     if storage and storage.get('cookies'):
         return runtime_header
-    return authenticated_origin_cookie(candidate)
+    if application_header:
+        return application_header
+    return authenticated_origin_cookie(candidate, cookies)
 
 
 def _load_runtime_target_auth_state() -> dict[str, Any]:
@@ -420,18 +526,24 @@ def _load_runtime_target_auth_state() -> dict[str, Any]:
     except (OSError, json.JSONDecodeError, ValueError) as exc:
         print(f'[AUTH] Runtime target-auth state could not be loaded: {type(exc).__name__}: {exc}', file=sys.stderr)
         return {}
-    if not isinstance(payload, dict) or str(payload.get('kind') or '') not in {'browser_oidc', 'snap4city_oidc'}:
-        print('[AUTH] Runtime target-auth state is missing a supported browser_oidc credential.', file=sys.stderr)
+    if not isinstance(payload, dict) or str(payload.get('kind') or '') not in {'browser_oidc', 'snap4city_oidc', 'browser_oidc_multi'}:
+        print('[AUTH] Runtime target-auth state is missing a supported browser/OIDC credential payload.', file=sys.stderr)
         return {}
     return payload
 
 
 def configure_runtime_target_auth(primary_target: str, primary_cookie: str) -> None:
+    global RUNTIME_PRIMARY_IDENTITY_COOKIE
     AUTHENTICATED_ORIGIN_COOKIES.clear()
     RUNTIME_TARGET_AUTH.clear()
+    RUNTIME_TARGET_AUTH_STATES.clear()
+    RUNTIME_AUTH_COOKIE_TO_REFERENCE.clear()
+    RUNTIME_AUTH_AMBIGUOUS_FINGERPRINTS.clear()
     RUNTIME_AUTH_APPLICATION_ATTEMPTS.clear()
-    if primary_cookie:
-        register_authenticated_origin_cookie(primary_target, primary_cookie)
+    try:
+        RUNTIME_PRIMARY_IDENTITY_COOKIE = canonical_cookie_header(primary_cookie) if primary_cookie else ''
+    except ValueError:
+        RUNTIME_PRIMARY_IDENTITY_COOKIE = str(primary_cookie or '')
     payload = _load_runtime_target_auth_state()
     if not payload:
         return
@@ -443,20 +555,80 @@ def configure_runtime_target_auth(primary_target: str, primary_cookie: str) -> N
             file=sys.stderr,
         )
         return
-    RUNTIME_TARGET_AUTH.update(payload)
-    storage = payload.get('storage_state')
-    if not isinstance(storage, dict):
-        RUNTIME_TARGET_AUTH['storage_state'] = None
-    print('[AUTH] Runtime browser/OIDC state loaded for explicitly authorized additional-origin authentication; no further console credential prompts will be used.')
+
+    if str(payload.get('kind') or '') == 'browser_oidc_multi':
+        for row in payload.get('identities') or []:
+            if not isinstance(row, dict):
+                continue
+            reference = str(row.get('reference') or '').strip()
+            fingerprint = str(row.get('cookie_fingerprint') or '').strip().lower()
+            credential = row.get('credential') if isinstance(row.get('credential'), dict) else {}
+            if not reference or not re.fullmatch(r'[0-9a-f]{64}', fingerprint):
+                continue
+            state = dict(row)
+            state['kind'] = 'browser_oidc'
+            state['reference'] = reference
+            if not isinstance(state.get('storage_state'), dict):
+                state['storage_state'] = None
+            RUNTIME_TARGET_AUTH_STATES[reference] = state
+            # Register after the state exists so duplicate-session fingerprints are detected fail-closed.
+            existing = str(RUNTIME_AUTH_COOKIE_TO_REFERENCE.get(fingerprint) or '')
+            if existing and existing != reference:
+                RUNTIME_AUTH_COOKIE_TO_REFERENCE.pop(fingerprint, None)
+                RUNTIME_AUTH_AMBIGUOUS_FINGERPRINTS.add(fingerprint)
+            elif fingerprint not in RUNTIME_AUTH_AMBIGUOUS_FINGERPRINTS:
+                RUNTIME_AUTH_COOKIE_TO_REFERENCE[fingerprint] = reference
+        primary_reference = str(payload.get('primary_reference') or '').strip()
+        # The CLI-primary identity may intentionally be a raw-cookie credential and therefore not
+        # have a browser/OIDC state row. Do not fall back to another identity: doing so would bind
+        # the primary Cookie header to somebody else's storage state during the compatibility step
+        # below. Other browser identities remain available through their own cookie fingerprints.
+        if primary_reference and primary_reference in RUNTIME_TARGET_AUTH_STATES:
+            RUNTIME_TARGET_AUTH.update(RUNTIME_TARGET_AUTH_STATES[primary_reference])
+    else:
+        reference = str(payload.get('reference') or 'primary').strip() or 'primary'
+        state = dict(payload)
+        state['reference'] = reference
+        if not isinstance(state.get('storage_state'), dict):
+            state['storage_state'] = None
+        RUNTIME_TARGET_AUTH_STATES[reference] = state
+        RUNTIME_TARGET_AUTH.update(state)
+        if primary_cookie:
+            _register_runtime_cookie_alias(primary_cookie, reference)
+
+    # The CLI primary Cookie header is authoritative for selecting the primary runtime state even
+    # when an older payload did not carry a fingerprint. Multi-identity payloads already map each
+    # resolved cookie fingerprint, including the primary.
+    if primary_cookie and RUNTIME_TARGET_AUTH:
+        primary_reference = str(RUNTIME_TARGET_AUTH.get('reference') or '')
+        if primary_reference:
+            _register_runtime_cookie_alias(primary_cookie, primary_reference)
+            register_authenticated_origin_cookie(primary_target, primary_cookie, primary_cookie)
+    if RUNTIME_TARGET_AUTH_STATES:
+        refs = ', '.join(RUNTIME_TARGET_AUTH_STATES)
+        print(f'[AUTH] Runtime browser/OIDC state loaded for identity-bound additional-origin authentication: {refs}; no child-console credential prompts will be used.')
 
 
-def runtime_target_auth_available() -> bool:
-    credential = RUNTIME_TARGET_AUTH.get('credential') if isinstance(RUNTIME_TARGET_AUTH.get('credential'), dict) else {}
-    return (
-        bool(RUNTIME_TARGET_AUTH)
-        and str(RUNTIME_TARGET_AUTH.get('kind') or '') in {'browser_oidc', 'snap4city_oidc'}
-        and bool(credential.get('reuse_on_authorized_siblings', False))
-    )
+def _runtime_auth_identity_matches(cookies: str) -> bool:
+    return bool(_runtime_identity_reference(cookies))
+
+
+def runtime_target_auth_available(cookies: str='', candidate: str='') -> bool:
+    """Return whether active browser/OIDC repair is allowed for this identity/destination.
+
+    Same-origin refresh is intrinsic to the configured identity and remains available even when
+    reuse_on_authorized_siblings=false. Crossing to another authorized origin/port requires that
+    explicit credential option in addition to the normal assessment scope policy.
+    """
+    state = _runtime_target_auth_for_cookie(cookies)
+    credential = state.get('credential') if isinstance(state.get('credential'), dict) else {}
+    if not state or str(state.get('kind') or '') not in {'browser_oidc', 'snap4city_oidc'}:
+        return False
+    destination = str(candidate or '').strip()
+    if destination and PRIMARY_SCOPE_TARGET and same_origin(PRIMARY_SCOPE_TARGET, destination):
+        return True
+    return bool(credential.get('reuse_on_authorized_siblings', False))
+
 
 # Loads the timeouts and case limits for the selected scan profile.
 def configure_scan_mode(mode: str) -> None:
@@ -498,7 +670,7 @@ WORKFLOW_TOOLS = (ToolSpec('browser', 'custom_checks/browserServer.py', 'run_bro
 OPTIONAL_TOOLS = (ToolSpec('jwt', 'custom_checks/jwtServer.py', 'run_jwt_scan', module='jwt'), ToolSpec('interactsh', 'pentest_tools/discovery/interactshServer.py', 'run_interactsh_client', 'interactsh-client', required=False), ToolSpec('report', 'reporting/reportServer.py', 'generate_report', module='weasyprint'))
 ALL_TOOLS = (*BASE_TOOLS, ARJUN_TOOL, *PARAMETER_TOOLS, AUTHORIZATION_TOOL, *WORKFLOW_TOOLS, *OPTIONAL_TOOLS)
 TOOL_SCOPES = {'ffuf': 'base', 'zap': 'base', 'nuclei': 'base', 'session': 'base', 'nikto': 'base', 'arjun': 'url', 'sqlmap': 'parameterized', 'dalfox': 'parameterized', 'commix': 'parameterized', 'traversal': 'parameterized', 'idor': 'object-reference', 'authorization': 'authorization', 'browser': 'browser', 'workflow': 'workflow', 'jwt': 'jwt', 'interactsh': 'oast'}
-TOOL_DESCRIPTIONS = {'ffuf': 'Hidden resource and endpoint discovery with credential-isolated path fuzzing.', 'zap': 'Session-aware crawling, passive analysis and prioritized active testing.', 'nuclei': 'Template-based exposure, misconfiguration, known-vulnerability and bounded DAST checks on discovered parameterized URLs.', 'session': 'Cookie flags, bounded session uniqueness and fixation indicators.', 'nikto': 'Web-server hardening and exposed-resource checks.', 'arjun': 'Hidden GET/POST parameter discovery.', 'sqlmap': 'SQL-injection confirmation on discovered request contracts.', 'dalfox': 'Reflected and stored XSS testing.', 'commix': 'Operating-system command-injection testing.', 'traversal': 'Path-traversal and local-file-inclusion verification.', 'idor': 'Single-reference object differential checks for numeric, UUID, hexadecimal and digit-bearing opaque identifiers.', 'authorization': 'Read-only anonymous and optional two-account authorization differentials on discovered high-value GET requests.', 'browser': 'Chromium verification of DOM, reflected and stored XSS using harmless markers.', 'workflow': 'Bounded CSRF, upload, authentication-throttling and CAPTCHA workflow checks.', 'jwt': 'JWT structure and claim analysis.', 'interactsh': 'Out-of-band callback confirmation.'}
+TOOL_DESCRIPTIONS = {'ffuf': 'Hidden resource and endpoint discovery with credential-isolated path fuzzing.', 'zap': 'Session-aware crawling, passive analysis and prioritized active testing.', 'nuclei': 'Template-based exposure, misconfiguration, known-vulnerability and bounded DAST checks on discovered parameterized URLs.', 'session': 'Cookie flags, bounded session uniqueness and fixation indicators.', 'nikto': 'Web-server hardening and exposed-resource checks.', 'arjun': 'Hidden GET/POST parameter discovery.', 'sqlmap': 'SQL-injection confirmation on discovered request contracts.', 'dalfox': 'Reflected and stored XSS testing.', 'commix': 'Operating-system command-injection testing.', 'traversal': 'Path-traversal and local-file-inclusion verification.', 'idor': 'Single-reference object differential checks for numeric, UUID, hexadecimal and digit-bearing opaque identifiers.', 'authorization': 'Read-only anonymous and multi-account cross-identity authorization differentials on discovered high-value GET requests.', 'browser': 'Chromium verification of DOM, reflected and stored XSS using harmless markers.', 'workflow': 'Bounded CSRF, upload, authentication-throttling and CAPTCHA workflow checks.', 'jwt': 'JWT structure and claim analysis.', 'interactsh': 'Out-of-band callback confirmation.'}
 
 # The agentic registry exposes the MCP tools available to the planner.
 def agentic_registry() -> dict[str, tuple[str, str, str, str]]:
@@ -763,6 +935,205 @@ def _server_env() -> dict[str, str]:
 _HTTP_SERVER_PROCESSES: dict[str, subprocess.Popen] = {}
 _VERIFIED_MCP_FINGERPRINTS: dict[str, str] = {}
 _HTTP_SERVER_LOGS: dict[str, Path] = {}
+_MCP_PROCESS_LEASE_REGISTERED = False
+MCP_LIFECYCLE_LOCK_TIMEOUT = max(5.0, float(os.getenv('SECOPS_MCP_LIFECYCLE_LOCK_TIMEOUT', '30')))
+
+def _mcp_lifecycle_directory() -> Path:
+    directory = ROOT / '.secops_tmp' / 'mcp-http'
+    directory.mkdir(parents=True, exist_ok=True)
+    return directory
+
+def _mcp_lease_directory() -> Path:
+    directory = _mcp_lifecycle_directory() / 'leases'
+    directory.mkdir(parents=True, exist_ok=True)
+    return directory
+
+def _mcp_lease_path(pid: int | None=None) -> Path:
+    return _mcp_lease_directory() / f'{int(pid or os.getpid())}.json'
+
+def _mcp_server_state_path() -> Path:
+    return _mcp_lifecycle_directory() / 'server.json'
+
+@contextlib.contextmanager
+def _mcp_lifecycle_guard(timeout: float=MCP_LIFECYCLE_LOCK_TIMEOUT):
+    """Cross-process guard for MCP singleton startup, leases and shutdown.
+
+    POSIX uses flock; Windows uses msvcrt byte locking. The guard is deliberately tiny and local
+    to the project runtime directory, so unrelated checkouts do not block one another.
+    """
+    path = _mcp_lifecycle_directory() / 'lifecycle.lock'
+    handle = open(path, 'a+b')
+    deadline = time.monotonic() + max(1.0, float(timeout))
+    locked = False
+    try:
+        if os.name == 'nt':
+            import msvcrt
+            handle.seek(0, os.SEEK_END)
+            if handle.tell() == 0:
+                handle.write(b'\0')
+                handle.flush()
+            while not locked:
+                handle.seek(0)
+                try:
+                    msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+                    locked = True
+                except OSError:
+                    if time.monotonic() >= deadline:
+                        raise TimeoutError('Timed out waiting for the shared MCP lifecycle lock.')
+                    time.sleep(0.05)
+        else:
+            import fcntl
+            while not locked:
+                try:
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    locked = True
+                except BlockingIOError:
+                    if time.monotonic() >= deadline:
+                        raise TimeoutError('Timed out waiting for the shared MCP lifecycle lock.')
+                    time.sleep(0.05)
+        yield
+    finally:
+        if locked:
+            try:
+                if os.name == 'nt':
+                    import msvcrt
+                    handle.seek(0)
+                    msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+                else:
+                    import fcntl
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+            except OSError:
+                pass
+        handle.close()
+
+def _pid_alive(pid: int) -> bool:
+    try:
+        pid = int(pid)
+    except (TypeError, ValueError):
+        return False
+    if pid <= 0:
+        return False
+    if pid == os.getpid():
+        return True
+    if os.name == 'nt':
+        try:
+            import ctypes
+            process_query = 0x1000
+            handle = ctypes.windll.kernel32.OpenProcess(process_query, False, pid)
+            if not handle:
+                return False
+            try:
+                code = ctypes.c_ulong()
+                if not ctypes.windll.kernel32.GetExitCodeProcess(handle, ctypes.byref(code)):
+                    return False
+                return int(code.value) == 259  # STILL_ACTIVE
+            finally:
+                ctypes.windll.kernel32.CloseHandle(handle)
+        except Exception:
+            return True  # fail safe: never kill an uncertain Windows PID
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+
+def _prune_mcp_leases_locked() -> list[int]:
+    live: list[int] = []
+    for path in _mcp_lease_directory().glob('*.json'):
+        try:
+            payload = json.loads(path.read_text(encoding='utf-8'))
+            pid = int(payload.get('pid') or path.stem)
+        except Exception:
+            path.unlink(missing_ok=True)
+            continue
+        if _pid_alive(pid):
+            live.append(pid)
+        else:
+            path.unlink(missing_ok=True)
+    return sorted(set(live))
+
+def _register_mcp_process_lease_locked() -> None:
+    global _MCP_PROCESS_LEASE_REGISTERED
+    if _MCP_PROCESS_LEASE_REGISTERED:
+        return
+    atomic_write_text(
+        _mcp_lease_path(),
+        json.dumps({
+            'pid': os.getpid(),
+            'root': str(ROOT),
+            'source_fingerprint': secops_source_fingerprint(),
+            'registered_at': datetime.now(timezone.utc).isoformat(),
+        }, ensure_ascii=False, sort_keys=True),
+    )
+    _MCP_PROCESS_LEASE_REGISTERED = True
+
+def _write_mcp_server_state_locked(process: subprocess.Popen) -> None:
+    atomic_write_text(
+        _mcp_server_state_path(),
+        json.dumps({
+            'pid': int(process.pid),
+            'root': str(ROOT),
+            'port': int(mcp_http_port(MCP_UNIFIED_SERVICE)),
+            'source_fingerprint': secops_source_fingerprint(),
+            'started_at': datetime.now(timezone.utc).isoformat(),
+        }, ensure_ascii=False, sort_keys=True),
+    )
+
+def _posix_pid_is_secops_server(pid: int) -> bool:
+    if os.name == 'nt':
+        return False
+    try:
+        command = Path(f'/proc/{int(pid)}/cmdline').read_bytes().replace(b'\0', b' ').decode('utf-8', errors='replace')
+    except OSError:
+        return False
+    return 'secopsServer.py' in command and str(ROOT) in command
+
+def _terminate_recorded_mcp_server_locked() -> None:
+    state_path = _mcp_server_state_path()
+    try:
+        payload = json.loads(state_path.read_text(encoding='utf-8'))
+        pid = int(payload.get('pid') or 0)
+        root = str(payload.get('root') or '')
+        port = int(payload.get('port') or 0)
+    except Exception:
+        state_path.unlink(missing_ok=True)
+        return
+    if root != str(ROOT) or port != int(mcp_http_port(MCP_UNIFIED_SERVICE)) or not _pid_alive(pid):
+        state_path.unlink(missing_ok=True)
+        return
+    owned = _HTTP_SERVER_PROCESSES.get(MCP_UNIFIED_SERVICE)
+    if owned is not None and int(getattr(owned, 'pid', 0) or 0) == pid:
+        _stop_owned_http_server()
+        state_path.unlink(missing_ok=True)
+        return
+    # On the Linux execution VM, verify the exact command line before terminating a server started
+    # by a different assessment process. On Windows an unowned singleton is intentionally left alive
+    # rather than risking termination of an uncertain PID; source fingerprinting still prevents stale use.
+    if _posix_pid_is_secops_server(pid):
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+        except OSError:
+            return
+        state_path.unlink(missing_ok=True)
+
+def _release_mcp_process_lease() -> None:
+    global _MCP_PROCESS_LEASE_REGISTERED
+    if not _MCP_PROCESS_LEASE_REGISTERED:
+        return
+    try:
+        with _mcp_lifecycle_guard():
+            _mcp_lease_path().unlink(missing_ok=True)
+            _MCP_PROCESS_LEASE_REGISTERED = False
+            live = _prune_mcp_leases_locked()
+            if not live:
+                _terminate_recorded_mcp_server_locked()
+    except Exception:
+        # Process shutdown must never turn a successful assessment into an atexit traceback.
+        pass
 
 # Port probing detects whether the unified MCP endpoint is already listening locally.
 def _port_open(host: str, port: int, timeout: float=0.25) -> bool:
@@ -792,10 +1163,18 @@ def _stop_owned_http_server() -> None:
             except Exception:
                 pass
 
-# Stops the unified MCP process owned by the current orchestrator.
+# Explicit administrative shutdown remains available to local callers. Normal process exit instead
+# releases a shared lease: the MCP singleton is terminated only when the last assessment using this
+# checkout exits, so one assessment cannot tear down another assessment's in-flight MCP request.
 def shutdown_mcp_http_servers() -> None:
-    _stop_owned_http_server()
-atexit.register(shutdown_mcp_http_servers)
+    try:
+        with _mcp_lifecycle_guard():
+            _stop_owned_http_server()
+            _mcp_server_state_path().unlink(missing_ok=True)
+    except Exception:
+        _stop_owned_http_server()
+
+atexit.register(_release_mcp_process_lease)
 
 # Reads the end of the unified server log to explain a startup failure.
 def _server_startup_log() -> str:
@@ -897,47 +1276,54 @@ def _ensure_http_server(*, restart: bool=False) -> str:
     url = mcp_http_url(MCP_UNIFIED_SERVICE)
     if not server.is_file():
         raise FileNotFoundError(f'Unified MCP server not found: {server}')
-    if restart:
-        _VERIFIED_MCP_FINGERPRINTS.pop(url, None)
-        _stop_owned_http_server()
-    if _port_open('127.0.0.1', port):
-        matched, detail = _verify_mcp_runtime_identity(url, force=restart)
-        if matched:
-            return url
-        existing = _HTTP_SERVER_PROCESSES.get(MCP_UNIFIED_SERVICE)
-        if existing is not None and existing.poll() is None:
+    # Serialize singleton discovery/startup across assessment processes. Register the caller lease
+    # before checking the port so an owner exiting at the same instant cannot tear the shared server
+    # down underneath a second assessment that is about to attach.
+    with _mcp_lifecycle_guard():
+        _prune_mcp_leases_locked()
+        _register_mcp_process_lease_locked()
+        if restart:
+            _VERIFIED_MCP_FINGERPRINTS.pop(url, None)
             _stop_owned_http_server()
-        else:
-            raise RuntimeError(
-                f'Port {port} is already occupied by an incompatible or stale MCP service. {detail}. '
-                'Stop the old SecOps process (or the unrelated service using this port) and rerun the command; '
-                'the current assessment will not silently use code from another checkout/version.'
-            )
-    existing = _HTTP_SERVER_PROCESSES.get(MCP_UNIFIED_SERVICE)
-    if existing is not None and existing.poll() is None:
-        process = existing
-    else:
-        log_path = _http_server_log()
-        _HTTP_SERVER_LOGS[MCP_UNIFIED_SERVICE] = log_path
-        log_handle = open(log_path, 'a', encoding='utf-8', buffering=1)
-        env = _server_env()
-        env.update({'SECOPS_MCP_HOST': '127.0.0.1', 'SECOPS_MCP_PORT': str(port)})
-        process = subprocess.Popen([_server_python(), str(server)], cwd=str(ROOT), env=env, stdout=log_handle, stderr=subprocess.STDOUT, text=True)
-        log_handle.close()
-        _HTTP_SERVER_PROCESSES[MCP_UNIFIED_SERVICE] = process
-    deadline = time.monotonic() + max(3.0, MCP_CONNECT_TIMEOUT)
-    last_identity_detail = ''
-    while time.monotonic() < deadline:
         if _port_open('127.0.0.1', port):
-            matched, last_identity_detail = _verify_mcp_runtime_identity(url, force=True)
+            matched, detail = _verify_mcp_runtime_identity(url, force=restart)
             if matched:
                 return url
-        if process.poll() is not None:
-            detail = _server_startup_log()
-            raise RuntimeError('Unified SecOps HTTP MCP server exited during startup' + (f': {detail}' if detail else '.'))
-        time.sleep(0.15)
-    detail = _server_startup_log()
-    raise TimeoutError(f'Timed out waiting for unified MCP HTTP service at {url}' + (f'. Identity: {last_identity_detail}' if last_identity_detail else '') + (f'. Server log: {detail}' if detail else ''))
+            existing = _HTTP_SERVER_PROCESSES.get(MCP_UNIFIED_SERVICE)
+            if existing is not None and existing.poll() is None:
+                _stop_owned_http_server()
+            else:
+                raise RuntimeError(
+                    f'Port {port} is already occupied by an incompatible or stale MCP service. {detail}. '
+                    'Stop the old SecOps process (or the unrelated service using this port) and rerun the command; '
+                    'the current assessment will not silently use code from another checkout/version.'
+                )
+        existing = _HTTP_SERVER_PROCESSES.get(MCP_UNIFIED_SERVICE)
+        if existing is not None and existing.poll() is None:
+            process = existing
+        else:
+            log_path = _http_server_log()
+            _HTTP_SERVER_LOGS[MCP_UNIFIED_SERVICE] = log_path
+            log_handle = open(log_path, 'a', encoding='utf-8', buffering=1)
+            env = _server_env()
+            env.update({'SECOPS_MCP_HOST': '127.0.0.1', 'SECOPS_MCP_PORT': str(port)})
+            process = subprocess.Popen([_server_python(), str(server)], cwd=str(ROOT), env=env, stdout=log_handle, stderr=subprocess.STDOUT, text=True)
+            log_handle.close()
+            _HTTP_SERVER_PROCESSES[MCP_UNIFIED_SERVICE] = process
+            _write_mcp_server_state_locked(process)
+        deadline = time.monotonic() + max(3.0, MCP_CONNECT_TIMEOUT)
+        last_identity_detail = ''
+        while time.monotonic() < deadline:
+            if _port_open('127.0.0.1', port):
+                matched, last_identity_detail = _verify_mcp_runtime_identity(url, force=True)
+                if matched:
+                    return url
+            if process.poll() is not None:
+                detail = _server_startup_log()
+                raise RuntimeError('Unified SecOps HTTP MCP server exited during startup' + (f': {detail}' if detail else '.'))
+            time.sleep(0.15)
+        detail = _server_startup_log()
+        raise TimeoutError(f'Timed out waiting for unified MCP HTTP service at {url}' + (f'. Identity: {last_identity_detail}' if last_identity_detail else '') + (f'. Server log: {detail}' if detail else ''))
 
 # Transport diagnosis recognizes failures raised by the MCP HTTP layer.
 def _http_transport_failure(exc: BaseException) -> bool:
@@ -1204,6 +1590,15 @@ async def call_mcp(server_file: str, tool_name: str, arguments: dict[str, Any], 
             float(timeout_seconds) + MCP_CONNECT_TIMEOUT,
             scanner_timeout_hint + MCP_CONNECT_TIMEOUT + 60.0 if scanner_timeout_hint else 0.0,
         )
+        if spec.name == 'zap' and scanner_timeout_hint:
+            # A shared long-lived ZAP daemon cannot safely run two session/context reconfigurations
+            # at once. Two assessments may still execute concurrently: only their ZAP phases queue.
+            # Give one queued invocation enough transport time to wait for one preceding scan and
+            # then consume its own full scanner budget.
+            operation_timeout = max(
+                operation_timeout,
+                scanner_timeout_hint * (1.0 + MCP_ZAP_SHARED_WAIT_MULTIPLIER) + MCP_CONNECT_TIMEOUT + 90.0,
+            )
         if spec.name == 'report':
             operation_timeout = MCP_REPORT_TRANSFER_TIMEOUT + MCP_REPORT_RENDER_TIMEOUT_MAX + (2 * MCP_CONNECT_TIMEOUT)
         try:
@@ -2060,7 +2455,7 @@ def refresh_authenticated_session_state(target: str, cookies: str, probe_url: st
     speculative_raw_cookie = _speculative_same_host_port_raw_cookie(target, cookies)
     effective_cookies = scope_cookie_header(target, cookies)
     runtime_reauth: dict[str, Any] | None = None
-    if not effective_cookies and runtime_target_auth_available():
+    if not effective_cookies and runtime_target_auth_available(cookies, target):
         runtime_reauth = ensure_runtime_authenticated_request(target, cookies, selected_probe)
         effective_cookies = scope_cookie_header(target, cookies) or str(runtime_reauth.get('cookie_header') or '')
     if not effective_cookies:
@@ -2097,7 +2492,7 @@ def refresh_authenticated_session_state(target: str, cookies: str, probe_url: st
     # A valid dashboard session may still be invalid for another application under the same host.
     # When the concrete probe redirects to login, establish that application's own session through
     # saved SSO state instead of treating exact-origin equality as proof that one PHP session is enough.
-    if not usable and runtime_target_auth_available() and not (runtime_reauth and runtime_reauth.get('attempted')):
+    if not usable and runtime_target_auth_available(cookies, target) and not (runtime_reauth and runtime_reauth.get('attempted')):
         runtime_reauth = ensure_runtime_authenticated_request(target, effective_cookies, selected_probe)
         repaired_cookie = str(runtime_reauth.get('cookie_header') or '') or scope_cookie_header(target, cookies)
         if runtime_reauth.get('usable') and repaired_cookie:
@@ -2311,6 +2706,37 @@ def _browser_network_case(url: str, method: str, data: str, content_type: str, s
         'source_url': source_url or url, 'network_resource_type': resource_type, 'discovery_source': 'playwright_network',
     }
 
+# Collect ordinary DOM navigation attributes without relying on Playwright's injected selector engine.
+# Legacy/XHTML pages can make eval_on_selector_all() fail with `result is not iterable` even when
+# their DOM is otherwise usable, so walk elements directly inside page context.
+def _browser_dom_navigation_values(page: Any) -> list[Any]:
+    values = page.evaluate(
+        """() => {
+            const attrs = ['href','src','action','formaction','data-href','data-url','data-link','data-src'];
+            const out = [];
+            const root = document.documentElement;
+            if (!root) return out;
+            const walker = document.createTreeWalker(root, NodeFilter.SHOW_ELEMENT);
+            let element = root;
+            while (element) {
+                for (const name of attrs) {
+                    try {
+                        const value = element.getAttribute && element.getAttribute(name);
+                        if (value) out.push(value);
+                    } catch (_) {}
+                }
+                element = walker.nextNode();
+            }
+            return out;
+        }"""
+    ) or []
+    if isinstance(values, list):
+        return values
+    if isinstance(values, tuple):
+        return list(values)
+    return []
+
+
 # Uses Chromium as a bounded dynamic discovery queue so rendered navigation and XHR/fetch contracts become scanner inputs.
 def _browser_network_discovery(target: str, cookies: str, html_urls: list[str], forced_urls: list[str] | None=None, priority_urls: list[str] | None=None) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[str], list[dict[str, Any]], dict[str, Any]]:
 
@@ -2395,7 +2821,8 @@ def _browser_network_discovery(target: str, cookies: str, html_urls: list[str], 
                 'ignore_https_errors': True,
                 'user_agent': 'SecOps-Browser-Discovery/1.0',
             }
-            runtime_storage = RUNTIME_TARGET_AUTH.get('storage_state') if cookies and isinstance(RUNTIME_TARGET_AUTH.get('storage_state'), dict) else None
+            runtime_state = _runtime_target_auth_for_cookie(cookies) if cookies else {}
+            runtime_storage = runtime_state.get('storage_state') if isinstance(runtime_state.get('storage_state'), dict) else None
             if runtime_storage and (runtime_storage.get('cookies') or runtime_storage.get('origins')):
                 # Preserve real Domain/Path/Secure cookie metadata and browser storage for authenticated
                 # discovery. This is materially more accurate than flattening an OIDC session into one
@@ -2563,10 +2990,7 @@ def _browser_network_discovery(target: str, cookies: str, html_urls: list[str], 
                         raw_values: list[Any] = []
                         for dom_attempt in range(2):
                             try:
-                                raw_values = page.eval_on_selector_all(
-                                    '[href],[src],[action],[formaction],[data-href],[data-url],[data-link],[data-src]',
-                                    """elements => elements.flatMap(element => ['href','src','action','formaction','data-href','data-url','data-link','data-src'].map(name => element.getAttribute(name)).filter(Boolean))""",
-                                )
+                                raw_values = _browser_dom_navigation_values(page)
                                 break
                             except Exception as dom_exc:
                                 if dom_attempt or not transient_browser_error(dom_exc):
@@ -2664,7 +3088,7 @@ def _browser_network_discovery(target: str, cookies: str, html_urls: list[str], 
                     # The context started from the previous state, so replacing it with the final state
                     # preserves old entries and also captures cookies/localStorage created by silent SSO
                     # while Chromium traversed newly reached application roots.
-                    RUNTIME_TARGET_AUTH['storage_state'] = context.storage_state()
+                    runtime_state['storage_state'] = context.storage_state()
                 except Exception:
                     pass
             browser.close()
@@ -2759,7 +3183,7 @@ def _stratified_tcp_port_order(limit: int) -> list[int]:
     return result
 
 
-def _resolve_service_discovery_address(hostname: str) -> tuple[str, list[str]]:
+def _resolve_service_discovery_address(hostname: str, preferred_port: int=0) -> tuple[str, list[str]]:
     infos = socket.getaddrinfo(hostname, None, type=socket.SOCK_STREAM)
     addresses: list[str] = []
     for info in infos:
@@ -2768,8 +3192,36 @@ def _resolve_service_discovery_address(hostname: str) -> tuple[str, list[str]]:
             addresses.append(address)
     if not addresses:
         raise OSError(f'No address resolved for {hostname!r}')
-    # One stable address keeps the bounded port budget meaningful; all resolved addresses remain audit metadata.
+    # Keep one address so the port budget is not multiplied by DNS cardinality, but do not blindly
+    # choose getaddrinfo()[0]: on dual-stack/multi-A hosts that address may not be the one serving the
+    # configured target. Prefer the first address reachable on the target's original port.
+    port = int(preferred_port or 0)
+    if 1 <= port <= 65535 and len(addresses) > 1:
+        for address in addresses:
+            sock: socket.socket | None = None
+            try:
+                _pace_http_request()
+                sock = socket.create_connection((address, port), timeout=0.35)
+                return address, addresses
+            except OSError:
+                continue
+            finally:
+                if sock is not None:
+                    try:
+                        sock.close()
+                    except OSError:
+                        pass
     return addresses[0], addresses
+
+
+def _http_authority_host(hostname: str) -> str:
+    """Format one host for an HTTP authority/Host header, including IPv6 brackets."""
+    host = str(hostname or '').strip()
+    try:
+        parsed_ip = ipaddress.ip_address(host)
+    except ValueError:
+        return host
+    return f'[{host}]' if parsed_ip.version == 6 else host
 
 
 def _socket_http_probe(address: str, hostname: str, port: int, *, use_tls: bool, timeout: float=0.45) -> tuple[bool, str]:
@@ -2785,13 +3237,19 @@ def _socket_http_probe(address: str, hostname: str, port: int, *, use_tls: bool,
             # accepting an untrusted/internal certificate here avoids hiding an otherwise reachable HTTPS service.
             context.check_hostname = False
             context.verify_mode = ssl.CERT_NONE
-            server_hostname = hostname if not re.fullmatch(r'[0-9a-fA-F:.]+', hostname or '') else None
+            try:
+                ipaddress.ip_address(hostname)
+            except ValueError:
+                server_hostname = hostname
+            else:
+                server_hostname = None
             sock = context.wrap_socket(base, server_hostname=server_hostname)
             sock.settimeout(timeout)
-        host_header = hostname
+        authority_host = _http_authority_host(hostname)
+        host_header = authority_host
         default_port = 443 if use_tls else 80
         if int(port) != default_port:
-            host_header = f'{hostname}:{port}'
+            host_header = f'{authority_host}:{port}'
         request = (
             f'HEAD / HTTP/1.1\r\nHost: {host_header}\r\nUser-Agent: SecOps-ServiceDiscovery/1.0\r\n'
             'Accept: */*\r\nConnection: close\r\n\r\n'
@@ -2826,11 +3284,14 @@ def _tcp_port_open(address: str, port: int, timeout: float=0.30) -> bool:
                 pass
 
 
-def discover_same_host_web_services(target: str) -> dict[str, Any]:
+def discover_same_host_web_services(target: str, candidate_cap: int | None=None) -> dict[str, Any]:
     parsed = urlparse(normalize_url(target))
-    hostname = str(parsed.hostname or '').lower().rstrip('.')
-    cap = int(DISCOVERY_LIMITS.get(CURRENT_SCAN_MODE, DISCOVERY_LIMITS['balanced']).get('same_host_service_candidates', 0) or 0)
-    cache_key = (hostname, CURRENT_SCAN_MODE)
+    hostname = normalized_hostname(parsed.hostname or '')
+    configured_cap = int(DISCOVERY_LIMITS.get(CURRENT_SCAN_MODE, DISCOVERY_LIMITS['balanced']).get('same_host_service_candidates', 0) or 0)
+    cap = configured_cap if candidate_cap is None else max(0, min(configured_cap, int(candidate_cap)))
+    original_port = parsed.port or (443 if parsed.scheme.lower() == 'https' else 80)
+    # Address preference depends on the configured service port; keep it in the cache identity.
+    cache_key = (hostname, CURRENT_SCAN_MODE, int(original_port), str(parsed.scheme or '').lower(), int(cap))
     empty = {
         'enabled': False, 'hostname': hostname, 'candidate_cap': cap, 'ports_probed': 0,
         'web_services': [], 'open_web_unconfirmed_ports': [], 'classification_deferred_ports': [],
@@ -2845,7 +3306,7 @@ def discover_same_host_web_services(target: str) -> dict[str, Any]:
         return result
     started = time.monotonic()
     try:
-        address, addresses = _resolve_service_discovery_address(hostname)
+        address, addresses = _resolve_service_discovery_address(hostname, original_port)
     except OSError as exc:
         result = {
             **empty, 'enabled': True, 'error': f'{type(exc).__name__}: {exc}',
@@ -2857,7 +3318,6 @@ def discover_same_host_web_services(target: str) -> dict[str, Any]:
     web_services: list[dict[str, Any]] = []
     open_unconfirmed: list[int] = []
     ports = _stratified_tcp_port_order(cap)
-    original_port = parsed.port or (443 if parsed.scheme.lower() == 'https' else 80)
     # Every TCP-open candidate is classified with BOTH HTTP and HTTPS. A socket being open is only
     # attack-surface inventory; it is never labelled non-web merely because bounded classification
     # did not confirm an HTTP protocol.
@@ -2867,13 +3327,15 @@ def discover_same_host_web_services(target: str) -> dict[str, Any]:
         plain_ok, plain_preview = _socket_http_probe(address, hostname, port, use_tls=False)
         tls_ok, tls_preview = _socket_http_probe(address, hostname, port, use_tls=True)
         if plain_ok:
-            root = f'http://{hostname}' + ('' if port == 80 else f':{port}') + '/'
+            authority_host = _http_authority_host(hostname)
+            root = f'http://{authority_host}' + ('' if port == 80 else f':{port}') + '/'
             web_services.append({
                 'url': root, 'port': port, 'scheme': 'http', 'probe_index': index,
                 'response_preview': plain_preview, 'http_confirmed': True, 'https_confirmed': bool(tls_ok),
             })
         if tls_ok:
-            root = f'https://{hostname}' + ('' if port == 443 else f':{port}') + '/'
+            authority_host = _http_authority_host(hostname)
+            root = f'https://{authority_host}' + ('' if port == 443 else f':{port}') + '/'
             web_services.append({
                 'url': root, 'port': port, 'scheme': 'https', 'probe_index': index,
                 'response_preview': tls_preview, 'http_confirmed': bool(plain_ok), 'https_confirmed': True,
@@ -2902,13 +3364,17 @@ def discover_same_host_web_services(target: str) -> dict[str, Any]:
     return result
 
 # Crawls the target and records pages, forms, parameters, scripts, browser requests, and auth state.
-def discover_target(target: str, cookies: str, max_pages: int=MAX_CRAWL_PAGES, seeds: list[str] | None=None, forced_seeds: list[str] | None=None) -> dict[str, Any]:
+def discover_target(
+    target: str, cookies: str, max_pages: int=MAX_CRAWL_PAGES, seeds: list[str] | None=None,
+    forced_seeds: list[str] | None=None, *, expand_authorized_service_hosts: bool=True,
+    same_host_service_candidate_cap: int | None=None,
+) -> dict[str, Any]:
 
     session = requests.Session()
     session.headers.update({'User-Agent': 'SecOps-Discovery/2.0', 'Accept': 'text/html,application/xhtml+xml,application/json;q=0.8,*/*;q=0.5'})
     target_preparation = apply_runtime_target_preparation(target, cookies) if cookies else {'performed': False, 'configured': False, 'usable': True}
     limits = DISCOVERY_LIMITS.get(CURRENT_SCAN_MODE, DISCOVERY_LIMITS['balanced'])
-    same_host_service_discovery = discover_same_host_web_services(target)
+    same_host_service_discovery = discover_same_host_web_services(target, candidate_cap=same_host_service_candidate_cap)
     discovered_service_roots = {
         _clean_url(str(row.get('url') or ''))
         for row in same_host_service_discovery.get('web_services', [])
@@ -3403,7 +3869,10 @@ def discover_target(target: str, cookies: str, max_pages: int=MAX_CRAWL_PAGES, s
             f'{browser_blocked_navigations}. Origins: {preview}{suffix}'
         )
 
-    return {'urls': sorted(visited), 'html_urls': sorted(html_urls), 'form_urls': sorted(form_urls), 'parameterized_urls': sorted(parameterized), 'request_cases': _dedupe_request_cases(request_cases), 'script_urls': sorted(script_urls), 'script_endpoint_hints': script_endpoint_hints, 'browser_network_requests': browser_network_requests, 'browser_navigation_urls': browser_navigation_urls, 'client_side_candidates': client_side_candidates, 'jwt_tokens': sorted(tokens), 'errors': errors, 'authentication_effective': auth_effective, 'authentication_note': auth_note, 'authentication_probe': auth_probe, 'target_preparation': target_preparation, 'destructive_urls_skipped': sorted(destructive_skipped), 'destructive_request_cases': _dedupe_request_cases(destructive_request_cases), 'coverage_skipped_cases': coverage_skipped_cases, 'budget_diagnostics': budget_diagnostics, 'same_host_service_discovery': same_host_service_discovery, 'explicit_entry_points': sorted(explicit_seed_urls), 'priority_discovery_seeds': sorted(ordinary_seed_urls), 'proactive_service_roots': sorted(discovered_service_roots)}
+    result = {'urls': sorted(visited), 'html_urls': sorted(html_urls), 'form_urls': sorted(form_urls), 'parameterized_urls': sorted(parameterized), 'request_cases': _dedupe_request_cases(request_cases), 'script_urls': sorted(script_urls), 'script_endpoint_hints': script_endpoint_hints, 'browser_network_requests': browser_network_requests, 'browser_navigation_urls': browser_navigation_urls, 'client_side_candidates': client_side_candidates, 'jwt_tokens': sorted(tokens), 'errors': errors, 'authentication_effective': auth_effective, 'authentication_note': auth_note, 'authentication_probe': auth_probe, 'target_preparation': target_preparation, 'destructive_urls_skipped': sorted(destructive_skipped), 'destructive_request_cases': _dedupe_request_cases(destructive_request_cases), 'coverage_skipped_cases': coverage_skipped_cases, 'budget_diagnostics': budget_diagnostics, 'same_host_service_discovery': same_host_service_discovery, 'same_host_service_discoveries': [same_host_service_discovery] if same_host_service_discovery.get('enabled') else [], 'explicit_entry_points': sorted(explicit_seed_urls), 'priority_discovery_seeds': sorted(ordinary_seed_urls), 'proactive_service_roots': sorted(discovered_service_roots)}
+    if expand_authorized_service_hosts:
+        result = expand_discovered_authorized_host_services(result, target, cookies, max_pages=max_pages)
+    return result
 
 # Orders discovery diagnostics so browser/runtime failures are visible before ordinary dead-link HTTP errors.
 def prioritized_discovery_errors(errors: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -3440,13 +3909,25 @@ def chromium_discovery_warning(discovery: dict[str, Any]) -> str:
 # Runs synchronous discovery safely even if a caller is already inside an asyncio event loop.
 # The normal CLI paths are synchronous here, but the worker fallback prevents Playwright Sync API
 # failures when this function is reused from async LangGraph/test harnesses.
-def discover_target_sync_safe(target: str, cookies: str, max_pages: int=MAX_CRAWL_PAGES, seeds: list[str] | None=None, forced_seeds: list[str] | None=None) -> dict[str, Any]:
+def discover_target_sync_safe(
+    target: str, cookies: str, max_pages: int=MAX_CRAWL_PAGES, seeds: list[str] | None=None,
+    forced_seeds: list[str] | None=None, *, expand_authorized_service_hosts: bool=True,
+    same_host_service_candidate_cap: int | None=None,
+) -> dict[str, Any]:
     try:
         asyncio.get_running_loop()
     except RuntimeError:
-        return discover_target(target, cookies, max_pages=max_pages, seeds=seeds, forced_seeds=forced_seeds)
+        return discover_target(
+            target, cookies, max_pages=max_pages, seeds=seeds, forced_seeds=forced_seeds,
+            expand_authorized_service_hosts=expand_authorized_service_hosts,
+            same_host_service_candidate_cap=same_host_service_candidate_cap,
+        )
     with ThreadPoolExecutor(max_workers=1, thread_name_prefix='secops-discovery') as executor:
-        return executor.submit(discover_target, target, cookies, max_pages, seeds, forced_seeds).result()
+        return executor.submit(
+            discover_target, target, cookies, max_pages, seeds, forced_seeds,
+            expand_authorized_service_hosts=expand_authorized_service_hosts,
+            same_host_service_candidate_cap=same_host_service_candidate_cap,
+        ).result()
 
 def _discovered_scope_origin_evidence(discovery: dict[str, Any], target: str) -> dict[str, dict[str, int]]:
     primary = normalized_origin(target)
@@ -3721,16 +4202,17 @@ def _runtime_application_scope_key(url: str) -> str:
     return origin + scope_path
 
 
-def ensure_runtime_authenticated_request(request_url: str, current_cookie: str='', probe_url: str='') -> dict[str, Any]:
-    """Establish or refresh an application session for one concrete authorized request.
+def ensure_runtime_authenticated_request(request_url: str, current_cookie: str='', probe_url: str='', timeout_seconds: int | None=None) -> dict[str, Any]:
+    """Establish or refresh one authorized application session for the owning identity.
 
-    This is the just-in-time complement to sibling discovery authentication. It also handles two
-    applications living on the same origin: if /appA is authenticated but /appB redirects to login,
-    the saved browser SSO state (and, if necessary, the credentials resolved once by the runner) is
-    used to obtain the cookie that a browser would actually send to /appB. No console prompt occurs.
+    Runtime browser/OIDC state is selected from the Cookie fingerprint resolved by the parent runner.
+    Multiple identities may therefore refresh independently without sharing storage state, credentials
+    or application-attempt caches. No child-console prompt occurs.
     """
     url = str(request_url or '').strip()
-    if not url or not runtime_target_auth_available() or not url_in_authorized_scope(PRIMARY_SCOPE_TARGET or url, url):
+    runtime_state = _runtime_target_auth_for_cookie(current_cookie)
+    identity_ref = str(runtime_state.get('reference') or '') if runtime_state else ''
+    if not url or not runtime_target_auth_available(current_cookie, url) or not url_in_authorized_scope(PRIMARY_SCOPE_TARGET or url, url):
         return {'attempted': False, 'usable': bool(scope_cookie_header(url, current_cookie)), 'cookie_header': scope_cookie_header(url, current_cookie)}
     if _destructive_crawl_url(url) or _browser_static_resource(url) or _ephemeral_identity_flow_url(url):
         return {'attempted': False, 'usable': bool(scope_cookie_header(url, current_cookie)), 'cookie_header': scope_cookie_header(url, current_cookie), 'reason': 'request_not_runtime_auth_candidate'}
@@ -3738,8 +4220,9 @@ def ensure_runtime_authenticated_request(request_url: str, current_cookie: str='
     scope_key = _runtime_application_scope_key(url)
     if not scope_key:
         return {'attempted': False, 'usable': False, 'cookie_header': '', 'reason': 'invalid_request_origin'}
+    attempt_key = f'{identity_ref}|{scope_key}'
 
-    cached = RUNTIME_AUTH_APPLICATION_ATTEMPTS.get(scope_key)
+    cached = RUNTIME_AUTH_APPLICATION_ATTEMPTS.get(attempt_key)
     cached_cookie = scope_cookie_header(url, current_cookie)
     if isinstance(cached, dict) and cached.get('status') == 'authenticated' and cached_cookie:
         return {**cached, 'attempted': False, 'reused': True, 'cookie_header': cached_cookie}
@@ -3748,10 +4231,12 @@ def ensure_runtime_authenticated_request(request_url: str, current_cookie: str='
     if isinstance(cached, dict) and cached.get('status') == 'failed' and (previous_attempts >= 3 or url in previous_urls):
         return {**cached, 'attempted': False, 'reused': True, 'cookie_header': cached_cookie}
 
-    credential = RUNTIME_TARGET_AUTH.get('credential') if isinstance(RUNTIME_TARGET_AUTH.get('credential'), dict) else {}
-    username = str(RUNTIME_TARGET_AUTH.get('username') or '')
-    password = str(RUNTIME_TARGET_AUTH.get('password') or '')
-    storage_state = RUNTIME_TARGET_AUTH.get('storage_state') if isinstance(RUNTIME_TARGET_AUTH.get('storage_state'), dict) else None
+    credential = dict(runtime_state.get('credential')) if isinstance(runtime_state.get('credential'), dict) else {}
+    if timeout_seconds is not None:
+        credential['timeout_seconds'] = max(15, int(timeout_seconds))
+    username = str(runtime_state.get('username') or '')
+    password = str(runtime_state.get('password') or '')
+    storage_state = runtime_state.get('storage_state') if isinstance(runtime_state.get('storage_state'), dict) else None
     candidate_urls = [url]
     if probe_url and same_origin(url, probe_url) and str(probe_url) != url:
         candidate_urls.append(str(probe_url))
@@ -3766,38 +4251,47 @@ def ensure_runtime_authenticated_request(request_url: str, current_cookie: str='
             candidate_urls=candidate_urls,
             initial_login=False,
             include_configured_fallbacks=False,
-            expected_oidc_issuer=str(RUNTIME_TARGET_AUTH.get('oidc_issuer') or ''),
+            expected_oidc_issuer=str(runtime_state.get('oidc_issuer') or ''),
         )
     except RuntimeError as exc:
+        attempted_urls = (
+            list(exc.attempted_candidates)
+            if isinstance(exc, BrowserLoginError) and exc.attempted_candidates
+            else [url]
+        )
         result = {
             'attempted': True,
             'usable': False,
             'status': 'failed',
+            'identity_ref': identity_ref,
             'scope_key': scope_key,
             'request_url': url,
             'reason': str(exc)[:1200],
             'cookie_header': '',
             'attempt_count': previous_attempts + 1,
-            'attempted_urls': sorted(previous_urls | {url}),
+            'attempted_urls': sorted(previous_urls | {str(value) for value in attempted_urls}),
         }
-        RUNTIME_AUTH_APPLICATION_ATTEMPTS[scope_key] = dict(result)
+        RUNTIME_AUTH_APPLICATION_ATTEMPTS[attempt_key] = dict(result)
         return result
 
     if isinstance(login.get('storage_state'), dict):
-        RUNTIME_TARGET_AUTH['storage_state'] = login['storage_state']
-    if login.get('oidc_issuer') and not RUNTIME_TARGET_AUTH.get('oidc_issuer'):
-        RUNTIME_TARGET_AUTH['oidc_issuer'] = str(login.get('oidc_issuer') or '')
+        runtime_state['storage_state'] = login['storage_state']
+    if login.get('oidc_issuer') and not runtime_state.get('oidc_issuer'):
+        runtime_state['oidc_issuer'] = str(login.get('oidc_issuer') or '')
     returned_cookie = str(login.get('cookie_header') or '')
+    if returned_cookie:
+        _register_runtime_cookie_alias(returned_cookie, identity_ref)
     origin = normalized_origin(url)
     if returned_cookie and origin and not same_origin(PRIMARY_SCOPE_TARGET or origin, origin):
-        register_authenticated_origin_cookie(origin, returned_cookie)
+        register_authenticated_origin_cookie(origin, returned_cookie, current_cookie)
 
-    effective_cookie = _runtime_storage_cookie_header(url) or returned_cookie
+    effective_cookie = _runtime_storage_cookie_header(url, current_cookie) or returned_cookie
     if not effective_cookie:
         result = {
             'attempted': True,
             'usable': False,
             'status': 'failed',
+            'identity_ref': identity_ref,
             'scope_key': scope_key,
             'request_url': url,
             'reason': 'browser authentication completed without a cookie applicable to the concrete request URL',
@@ -3805,7 +4299,7 @@ def ensure_runtime_authenticated_request(request_url: str, current_cookie: str='
             'attempt_count': previous_attempts + 1,
             'attempted_urls': sorted(previous_urls | {url}),
         }
-        RUNTIME_AUTH_APPLICATION_ATTEMPTS[scope_key] = dict(result)
+        RUNTIME_AUTH_APPLICATION_ATTEMPTS[attempt_key] = dict(result)
         return result
 
     validation_url = str(login.get('final_url') or '')
@@ -3818,6 +4312,7 @@ def ensure_runtime_authenticated_request(request_url: str, current_cookie: str='
         'attempted': True,
         'usable': bool(usable),
         'status': 'authenticated' if usable else 'failed',
+        'identity_ref': identity_ref,
         'scope_key': scope_key,
         'request_url': url,
         'entry_url': str(login.get('entry_url') or ''),
@@ -3835,15 +4330,15 @@ def ensure_runtime_authenticated_request(request_url: str, current_cookie: str='
     }
     if not usable:
         result['reason'] = 'runtime authentication did not produce a usable application session'
-    RUNTIME_AUTH_APPLICATION_ATTEMPTS[scope_key] = dict(result)
+    RUNTIME_AUTH_APPLICATION_ATTEMPTS[attempt_key] = dict(result)
     return result
 
 
-
-def _same_origin_application_auth_candidates(discovery: dict[str, Any], target: str) -> list[tuple[str, int, list[str]]]:
+def _same_origin_application_auth_candidates(discovery: dict[str, Any], target: str, identity_cookies: str='') -> list[tuple[str, int, list[str]]]:
     """Rank same-origin application roots that expose their own login/SSO entry points."""
     primary_origin = normalized_origin(target)
-    credential = RUNTIME_TARGET_AUTH.get('credential') if isinstance(RUNTIME_TARGET_AUTH.get('credential'), dict) else {}
+    runtime_state = _runtime_target_auth_for_cookie(identity_cookies)
+    credential = runtime_state.get('credential') if isinstance(runtime_state.get('credential'), dict) else {}
     configured_login = urljoin(target.rstrip('/') + '/', str(credential.get('login_path') or '/').lstrip('/'))
     configured_scope = _runtime_application_scope_key(configured_login)
     buckets: dict[str, dict[str, Any]] = {}
@@ -3910,7 +4405,7 @@ def authenticate_discovered_sibling_origins(discovery: dict[str, Any], target: s
     storage state. If the IdP asks for credentials again, it reuses only the username/password already
     resolved by assessmentRunner and never prompts from inside the orchestrator process.
     """
-    if not primary_cookies or not runtime_target_auth_available():
+    if not primary_cookies or not runtime_target_auth_available(primary_cookies):
         return discovery
 
     evidence = _discovered_scope_origin_evidence(discovery, target)
@@ -3932,7 +4427,7 @@ def authenticate_discovered_sibling_origins(discovery: dict[str, Any], target: s
         if int(bucket.get('interactive', 0) or 0) <= 0 and int(bucket.get('observations', 0) or 0) <= 1:
             continue
         login_signal = any(_looks_like_application_login_entry(url) for url in candidates)
-        storage_signal = any(bool(_runtime_storage_cookie_header(url)) for url in candidates)
+        storage_signal = any(bool(_runtime_storage_cookie_header(url, primary_cookies)) for url in candidates)
         # Do not launch a browser-login attempt for every public sibling merely because it was linked
         # by a large portal. High-ranked broad origins, explicit login/SSO entries and origins already
         # touched by browser SSO state remain eligible; lower-ranked public-only origins can still use
@@ -3958,7 +4453,7 @@ def authenticate_discovered_sibling_origins(discovery: dict[str, Any], target: s
     pending: list[tuple[str, int, list[str]]] = []
     for item in eligible:
         origin, _, candidates = item
-        if authenticated_origin_cookie(origin):
+        if authenticated_origin_cookie(origin, primary_cookies):
             continue
         attempted = failed_attempted_urls.get(origin, set())
         if attempted and all(candidate in attempted for candidate in candidates):
@@ -3974,69 +4469,90 @@ def authenticate_discovered_sibling_origins(discovery: dict[str, Any], target: s
             'message': f'Runtime sibling authentication origin limit reached in {CURRENT_SCAN_MODE}; {len(pending) - limit} lower-ranked unauthenticated origin(s) were not attempted in this pass.',
         })
 
-    credential = RUNTIME_TARGET_AUTH.get('credential') if isinstance(RUNTIME_TARGET_AUTH.get('credential'), dict) else {}
-    username = str(RUNTIME_TARGET_AUTH.get('username') or '')
-    password = str(RUNTIME_TARGET_AUTH.get('password') or '')
-    storage_state = RUNTIME_TARGET_AUTH.get('storage_state') if isinstance(RUNTIME_TARGET_AUTH.get('storage_state'), dict) else None
+    runtime_state = _runtime_target_auth_for_cookie(primary_cookies)
+    identity_ref = str(runtime_state.get('reference') or '')
+    credential = dict(runtime_state.get('credential')) if isinstance(runtime_state.get('credential'), dict) else {}
+    username = str(runtime_state.get('username') or '')
+    password = str(runtime_state.get('password') or '')
+    storage_state = runtime_state.get('storage_state') if isinstance(runtime_state.get('storage_state'), dict) else None
     merged = discovery
     primary_auth_effective = discovery.get('authentication_effective')
     primary_auth_note = discovery.get('authentication_note')
     primary_auth_probe = discovery.get('authentication_probe')
     primary_budget = dict(discovery.get('budget_diagnostics') or {})
     recrawl_pages = max(10, int(RUNTIME_AUTH_RECRAWL_PAGES.get(CURRENT_SCAN_MODE, 60)))
+    auth_pass_budget = max(30, int(RUNTIME_AUTH_PASS_TIMEOUTS.get(CURRENT_SCAN_MODE, 720)))
+    auth_pass_deadline = time.monotonic() + auth_pass_budget
 
     # Existing origin-specific cookies are retained across repeated enrichment passes without consuming
     # the current authentication-attempt budget.
     for origin, score, _ in eligible:
-        existing = authenticated_origin_cookie(origin)
+        existing = authenticated_origin_cookie(origin, primary_cookies)
         if existing and origin not in known_authenticated:
             runtime_rows.append({'origin': origin, 'status': 'reused', 'cookie_names': cookie_names(existing), 'score': score})
             known_authenticated.add(origin)
 
     attempted_count = 0
     for origin, score, candidates in selected:
+        remaining_auth = auth_pass_deadline - time.monotonic()
+        if remaining_auth < 15.0:
+            runtime_rows.append({
+                'status': 'time_budget', 'deferred_origins': max(1, len(selected) - attempted_count),
+                'attempted_origins': attempted_count, 'time_budget_seconds': auth_pass_budget,
+                'message': 'Shared runtime-authentication pass budget exhausted; remaining origins are deferred and remain eligible on a later pass.',
+            })
+            break
         print(f'    [AUTH SSO] {origin}: attempting origin-specific SSO/session establishment from {len(candidates)} observed application entry point(s).', flush=True)
         attempted_count += 1
+        attempt_credential = dict(credential)
+        configured_login_timeout = max(15, int(attempt_credential.get('timeout_seconds') or 60))
+        attempt_credential['timeout_seconds'] = max(15, min(configured_login_timeout, int(remaining_auth)))
         try:
             login = browser_oidc_login_session(
                 origin,
                 username,
                 password,
-                credential,
+                attempt_credential,
                 storage_state=storage_state,
                 candidate_urls=candidates,
                 initial_login=False,
                 include_configured_fallbacks=False,
-                expected_oidc_issuer=str(RUNTIME_TARGET_AUTH.get('oidc_issuer') or ''),
+                expected_oidc_issuer=str(runtime_state.get('oidc_issuer') or ''),
             )
         except RuntimeError as exc:
             message = str(exc)
-            # Authentication is origin/application specific. A credential rejection or extra step on one
-            # origin must not suppress independent attempts on other authorized origins, which may use a
-            # different client, realm, session bridge or already-valid SSO path.
-            runtime_rows.append({'origin': origin, 'status': 'failed', 'reason': message[:1000], 'score': score, 'candidate_count': len(candidates), 'attempted_candidates': list(candidates)})
+            # Authentication is origin/application specific. Record only entry points the browser
+            # actually reached before its shared deadline; unvisited candidates remain eligible on a
+            # later enrichment pass instead of being falsely exhausted.
+            attempted_candidates = (
+                list(exc.attempted_candidates)
+                if isinstance(exc, BrowserLoginError) and exc.attempted_candidates
+                else list(candidates[:1])
+            )
+            runtime_rows.append({'origin': origin, 'status': 'failed', 'reason': message[:1000], 'score': score, 'candidate_count': len(candidates), 'attempted_candidates': attempted_candidates})
             print(f'    [AUTH SSO] {origin}: automatic sibling authentication failed: {message}', file=sys.stderr, flush=True)
             continue
 
         sibling_cookie = str(login.get('cookie_header') or '')
         if not sibling_cookie:
-            runtime_rows.append({'origin': origin, 'status': 'failed', 'reason': 'browser login returned no origin cookie', 'score': score, 'attempted_candidates': list(candidates)})
+            runtime_rows.append({'origin': origin, 'status': 'failed', 'reason': 'browser login returned no origin cookie', 'score': score, 'attempted_candidates': [str(login.get('entry_url') or candidates[0])] if candidates else []})
             continue
-        register_authenticated_origin_cookie(origin, sibling_cookie)
+        _register_runtime_cookie_alias(sibling_cookie, identity_ref)
+        register_authenticated_origin_cookie(origin, sibling_cookie, primary_cookies)
         if isinstance(login.get('storage_state'), dict):
             storage_state = login['storage_state']
-            RUNTIME_TARGET_AUTH['storage_state'] = storage_state
-        if login.get('oidc_issuer') and not RUNTIME_TARGET_AUTH.get('oidc_issuer'):
-            RUNTIME_TARGET_AUTH['oidc_issuer'] = str(login.get('oidc_issuer') or '')
+            runtime_state['storage_state'] = storage_state
+        if login.get('oidc_issuer') and not runtime_state.get('oidc_issuer'):
+            runtime_state['oidc_issuer'] = str(login.get('oidc_issuer') or '')
 
         probe_url = str(login.get('final_url') or '')
         if not probe_url or not same_origin(origin, probe_url) or _browser_static_resource(probe_url):
-            origin_view = discovery_for_origin(merged, origin)
+            origin_view = discovery_for_origin(merged, origin, primary_cookies)
             probe_url = select_session_probe_url(origin_view, origin)
         probe = _runtime_auth_probe(origin, sibling_cookie, probe_url)
         flow_observed = bool(login.get('authentication_flow_observed'))
         if probe.get('usable') is False or (probe.get('distinguished_from_anonymous') is not True and not flow_observed):
-            AUTHENTICATED_ORIGIN_COOKIES.pop(normalized_origin(origin), None)
+            AUTHENTICATED_ORIGIN_COOKIES.pop((identity_ref, normalized_origin(origin)), None)
             runtime_rows.append({
                 'origin': origin,
                 'status': 'failed_validation',
@@ -4045,7 +4561,7 @@ def authenticate_discovered_sibling_origins(discovery: dict[str, Any], target: s
                 'authentication_flow_observed': flow_observed,
                 'probe': probe,
                 'reason': 'HTTP validation failed or no authentication-flow evidence distinguished this cookie from an incidental public cookie.',
-                'attempted_candidates': list(candidates),
+                'attempted_candidates': [str(login.get('entry_url') or candidates[0])] if candidates else [],
             })
             print(f'    [AUTH SSO] {origin}: browser state did not provide sufficient evidence for an authenticated application session.', file=sys.stderr, flush=True)
             continue
@@ -4070,8 +4586,11 @@ def authenticate_discovered_sibling_origins(discovery: dict[str, Any], target: s
         # contracts that the first anonymous sibling pass could not see. Only evidence from this
         # sibling is merged back, preventing a recursive cross-origin expansion loop.
         try:
-            recrawl = discover_target(origin, sibling_cookie, max_pages=recrawl_pages, seeds=candidates)
-            recrawl = discovery_for_origin(recrawl, origin)
+            recrawl = discover_target(
+                origin, sibling_cookie, max_pages=recrawl_pages, seeds=candidates,
+                expand_authorized_service_hosts=False,
+            )
+            recrawl = discovery_for_origin(recrawl, origin, primary_cookies)
             recrawl['authentication_effective'] = probe.get('distinguished_from_anonymous') if probe.get('distinguished_from_anonymous') is not None else True
             recrawl['authentication_note'] = 'Origin-specific runtime OIDC/SSO session established and used for authenticated sibling re-discovery.'
             recrawl['authentication_probe'] = probe
@@ -4087,14 +4606,24 @@ def authenticate_discovered_sibling_origins(discovery: dict[str, Any], target: s
     application_rows: list[dict[str, Any]] = list(discovery.get('runtime_application_authentication') or [])
     app_limit = max(1, int(RUNTIME_AUTH_APPLICATION_LIMITS.get(CURRENT_SCAN_MODE, 18)))
     app_recrawl_pages = max(10, int(RUNTIME_AUTH_APPLICATION_RECRAWL_PAGES.get(CURRENT_SCAN_MODE, 72)))
-    app_ranked = _same_origin_application_auth_candidates(merged, target)
+    app_ranked = _same_origin_application_auth_candidates(merged, target, primary_cookies)
     app_attempted = 0
     app_authenticated = 0
     for scope_key, score, candidates in app_ranked[:app_limit]:
         if not candidates:
             continue
+        remaining_auth = auth_pass_deadline - time.monotonic()
+        if remaining_auth < 15.0:
+            application_rows.append({
+                'status': 'time_budget', 'attempted_applications': app_attempted,
+                'time_budget_seconds': auth_pass_budget,
+                'message': 'Shared runtime-authentication pass budget exhausted; remaining application scopes are deferred.',
+            })
+            break
         entry_url = candidates[0]
-        result = ensure_runtime_authenticated_request(entry_url, primary_cookies, entry_url)
+        result = ensure_runtime_authenticated_request(
+            entry_url, primary_cookies, entry_url, timeout_seconds=max(15, min(60, int(remaining_auth)))
+        )
         app_attempted += 1 if result.get('attempted') else 0
         row = {
             'application_scope': scope_key,
@@ -4117,14 +4646,24 @@ def authenticate_discovered_sibling_origins(discovery: dict[str, Any], target: s
             row['reason'] = 'No application/path cookie remained applicable after runtime authentication.'
             continue
         try:
-            recrawl = discover_target(scope_key, app_cookie, max_pages=app_recrawl_pages, seeds=candidates)
-            recrawl = discovery_for_origin(recrawl, normalized_origin(target))
+            recrawl = discover_target(
+                scope_key, app_cookie, max_pages=app_recrawl_pages, seeds=candidates,
+                expand_authorized_service_hosts=False,
+            )
+            recrawl = discovery_for_origin(recrawl, normalized_origin(target), primary_cookies)
             recrawl['authentication_effective'] = True
             recrawl['authentication_note'] = 'Application-specific runtime OIDC/SSO session established and used for same-origin authenticated re-discovery.'
             recrawl['authentication_probe'] = result.get('probe') if isinstance(result.get('probe'), dict) else {}
             merged = merge_discovery(merged, recrawl)
         except Exception as exc:
             row['recrawl_error'] = f'{type(exc).__name__}: {exc}'
+
+    # Authenticated recrawls may expose additional already-authorized hostnames that were invisible
+    # to the initial profile discovery. Expand service/port discovery once from the merged surface,
+    # after all authentication recrawls, so newly observed hosts are covered without recursive fan-out.
+    merged = expand_discovered_authorized_host_services(
+        merged, target, primary_cookies, max_pages=recrawl_pages,
+    )
 
     # Sibling recrawls must not overwrite the authentication verdict or the discovery budget of the
     # primary profile. Their state is reported separately below.
@@ -4138,7 +4677,7 @@ def authenticate_discovered_sibling_origins(discovery: dict[str, Any], target: s
         if isinstance(row, dict) and row.get('status') in {'authenticated', 'reused'} and str(row.get('origin') or '')
     }
     merged['budget_diagnostics'] = {
-        **primary_budget,
+        **dict(merged.get('budget_diagnostics') or primary_budget),
         'runtime_auth_origin_limit': limit,
         'runtime_auth_origins_eligible': len(eligible),
         'runtime_auth_origins_attempted': attempted_count,
@@ -4152,7 +4691,7 @@ def authenticate_discovered_sibling_origins(discovery: dict[str, Any], target: s
 
 
 # Filters discovery evidence to one origin so broad scanners can test sibling origins independently without sharing cookies.
-def discovery_for_origin(discovery: dict[str, Any], origin: str) -> dict[str, Any]:
+def discovery_for_origin(discovery: dict[str, Any], origin: str, identity_cookies: str='') -> dict[str, Any]:
     filtered: dict[str, Any] = {}
     for key in ('urls', 'html_urls', 'form_urls', 'parameterized_urls', 'script_urls', 'browser_navigation_urls'):
         filtered[key] = [value for value in discovery.get(key, []) if isinstance(value, str) and same_origin(origin, value)]
@@ -4168,7 +4707,7 @@ def discovery_for_origin(discovery: dict[str, Any], origin: str) -> dict[str, An
     filtered['jwt_tokens'] = list(discovery.get('jwt_tokens', []))
     filtered['errors'] = []
     filtered['destructive_urls_skipped'] = [value for value in discovery.get('destructive_urls_skipped', []) if isinstance(value, str) and same_origin(origin, value)]
-    sibling_cookie = authenticated_origin_cookie(origin)
+    sibling_cookie = authenticated_origin_cookie(origin, identity_cookies)
     filtered['authentication_effective'] = True if sibling_cookie else None
     filtered['authentication_note'] = 'Sibling authorized origin uses its own runtime OIDC/SSO session.' if sibling_cookie else 'Sibling authorized origin is scanned without reusing the primary-origin cookie.'
     filtered['authentication_probe'] = {}
@@ -4230,6 +4769,173 @@ def merge_discovery(left: dict[str, Any], right: dict[str, Any]) -> dict[str, An
     left_budget = left.get('budget_diagnostics') if isinstance(left.get('budget_diagnostics'), dict) else {}
     right_budget = right.get('budget_diagnostics') if isinstance(right.get('budget_diagnostics'), dict) else {}
     merged['budget_diagnostics'] = {**left_budget, **right_budget}
+    return merged
+
+# Returns authorized origins actually evidenced by the current discovery snapshot. Port expansion is
+# host-level: multiple paths/applications on the same hostname do not trigger duplicate TCP sweeps.
+def _observed_authorized_origins(discovery: dict[str, Any], target: str) -> list[str]:
+    values: list[str] = [str(target or '')]
+    for key in ('urls', 'html_urls', 'form_urls', 'parameterized_urls', 'script_urls', 'browser_navigation_urls', 'explicit_entry_points', 'priority_discovery_seeds', 'proactive_service_roots'):
+        values.extend(str(value) for value in discovery.get(key, []) if isinstance(value, str))
+    for key in ('request_cases', 'browser_network_requests', 'script_endpoint_hints', 'client_side_candidates'):
+        for row in discovery.get(key, []) or []:
+            if isinstance(row, dict):
+                values.append(str(row.get('url') or ''))
+                values.append(str(row.get('source_url') or ''))
+    origins: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        if not value or not url_in_authorized_scope(target, value):
+            continue
+        origin = normalized_origin(value)
+        if not origin or origin in seen:
+            continue
+        seen.add(origin)
+        origins.append(origin)
+    return origins
+
+
+def _service_expansion_host_ranking(discovery: dict[str, Any], target: str) -> list[tuple[str, str, int]]:
+    primary_host = normalized_hostname(urlparse(normalize_url(target)).hostname or '')
+    evidence = _discovered_scope_origin_evidence(discovery, target)
+    hosts: dict[str, dict[str, Any]] = {}
+    for origin in _observed_authorized_origins(discovery, target):
+        parsed = urlparse(origin)
+        host = normalized_hostname(parsed.hostname or '')
+        if not host or host == primary_host:
+            continue
+        bucket = hosts.setdefault(host, {'origin': origin, 'score': -1000, 'observations': 0})
+        origin_evidence = evidence.get(origin, {})
+        score = int(origin_evidence.get('max_score', _discovery_url_score(origin)))
+        score += min(24, int(origin_evidence.get('observations', 0) or 0))
+        score += min(24, int(origin_evidence.get('interactive', 0) or 0))
+        bucket['score'] = max(int(bucket['score']), score)
+        bucket['observations'] = int(bucket['observations']) + max(1, int(origin_evidence.get('observations', 0) or 0))
+        # Prefer an observed origin with stronger application evidence as the HTTP authority used
+        # for address selection and the bounded recrawl entry point.
+        if score >= int(bucket.get('origin_score', -1000)):
+            bucket['origin'] = origin
+            bucket['origin_score'] = score
+    ranked = [(host, str(row['origin']), int(row['score']) + min(16, int(row['observations']))) for host, row in hosts.items()]
+    return sorted(ranked, key=lambda item: (-item[2], item[0], item[1]))
+
+
+def expand_discovered_authorized_host_services(
+    discovery: dict[str, Any], target: str, cookies: str, *, max_pages: int=MAX_CRAWL_PAGES,
+) -> dict[str, Any]:
+    """Expand proactive HTTP/HTTPS port discovery to newly observed, already-authorized hostnames.
+
+    The configured per-mode port candidate budget is reused as one shared expansion budget and is
+    divided across the newly observed hostnames. This broadens host coverage without multiplying the
+    port-probe budget by the number of discovered origins. No hostname is authorized by this helper.
+    """
+    if not DISCOVER_SAME_HOST_SERVICES or not ALLOW_SAME_HOST_PORTS:
+        return discovery
+    limits = DISCOVERY_LIMITS.get(CURRENT_SCAN_MODE, DISCOVERY_LIMITS['balanced'])
+    host_limit = max(0, int(limits.get('same_host_service_expansion_hosts', 0) or 0))
+    total_candidate_budget = max(0, int(limits.get('same_host_service_candidates', 0) or 0))
+    if host_limit <= 0 or total_candidate_budget <= 0:
+        return discovery
+    ranked = _service_expansion_host_ranking(discovery, target)
+    already_scanned_hosts = {
+        normalized_hostname(str(row.get('expansion_hostname') or row.get('hostname') or ''))
+        for row in discovery.get('same_host_service_discoveries', [])
+        if isinstance(row, dict) and str(row.get('expansion_hostname') or row.get('hostname') or '').strip()
+    }
+    pending_ranked = [item for item in ranked if item[0] not in already_scanned_hosts]
+    selected = pending_ranked[:host_limit]
+    if not selected:
+        base_budget = dict(discovery.get('budget_diagnostics') or {})
+        base_budget.update({
+            'same_host_service_expansion_hosts_observed': len(ranked),
+            'same_host_service_expansion_hosts_already_scanned': len(ranked) - len(pending_ranked),
+            'same_host_service_expansion_hosts_pending': len(pending_ranked),
+            'same_host_service_expansion_hosts_scanned': 0,
+            'same_host_service_expansion_candidate_budget': total_candidate_budget,
+            'same_host_service_expansion_ports_probed': 0,
+            'same_host_service_expansion_web_services_discovered': 0,
+        })
+        result = dict(discovery)
+        result['budget_diagnostics'] = base_budget
+        return result
+
+    # Fairly split one bounded expansion budget across all selected hostnames. Remainder slots go to
+    # the highest-evidence hosts, but every selected host gets a non-zero stratified sample.
+    host_count = len(selected)
+    quotient, remainder = divmod(total_candidate_budget, host_count)
+    merged = discovery
+    primary_budget = dict(discovery.get('budget_diagnostics') or {})
+    primary_auth_effective = discovery.get('authentication_effective')
+    primary_auth_note = discovery.get('authentication_note')
+    primary_auth_probe = discovery.get('authentication_probe')
+    primary_target_preparation = discovery.get('target_preparation')
+    all_discoveries = list(discovery.get('same_host_service_discoveries') or [])
+    all_roots = set(str(value) for value in discovery.get('proactive_service_roots', []) if str(value))
+    ports_probed = 0
+    web_services_discovered = 0
+    roots_recrawled = 0
+    scan_errors: list[dict[str, Any]] = []
+    recrawl_pages = max(1, min(int(max_pages), int(limits.get('same_host_service_expansion_recrawl_pages', max_pages) or max_pages)))
+
+    for index, (host, origin, score) in enumerate(selected):
+        host_cap = quotient + (1 if index < remainder else 0)
+        if host_cap <= 0:
+            continue
+        scan = discover_same_host_web_services(origin, candidate_cap=host_cap)
+        scan_row = dict(scan)
+        scan_row['expansion_origin'] = origin
+        scan_row['expansion_hostname'] = host
+        scan_row['evidence_score'] = score
+        all_discoveries.append(scan_row)
+        ports_probed += int(scan.get('ports_probed', 0) or 0)
+        roots = [
+            _clean_url(str(row.get('url') or ''))
+            for row in scan.get('web_services', [])
+            if isinstance(row, dict) and row.get('url') and url_in_authorized_scope(target, str(row.get('url')))
+        ]
+        roots = list(dict.fromkeys(root for root in roots if root))
+        web_services_discovered += len(roots)
+        all_roots.update(roots)
+        if not roots:
+            if scan.get('error'):
+                scan_errors.append({'url': origin, 'type': 'ServiceDiscoveryExpansion', 'message': str(scan.get('error'))})
+            continue
+        try:
+            # One bounded recrawl per hostname is sufficient; all newly classified service roots are
+            # priority seeds. Nested port expansion is disabled to prevent recursive host fan-out.
+            recrawl = discover_target(
+                origin, cookies, max_pages=recrawl_pages, seeds=roots,
+                expand_authorized_service_hosts=False, same_host_service_candidate_cap=host_cap,
+            )
+            roots_recrawled += len(roots)
+            merged = merge_discovery(merged, recrawl)
+        except Exception as exc:
+            scan_errors.append({'url': origin, 'type': 'ServiceDiscoveryRecrawl', 'message': f'{type(exc).__name__}: {exc}'})
+
+    merged = dict(merged)
+    # Expansion recrawls contribute surface only. They must not overwrite the authentication verdict,
+    # authentication probe or target-preparation state of the profile that initiated discovery.
+    merged['authentication_effective'] = primary_auth_effective
+    merged['authentication_note'] = primary_auth_note
+    merged['authentication_probe'] = primary_auth_probe
+    merged['target_preparation'] = primary_target_preparation
+    merged['same_host_service_discoveries'] = all_discoveries
+    merged['proactive_service_roots'] = sorted(all_roots)
+    if scan_errors:
+        merged['errors'] = [*merged.get('errors', []), *scan_errors]
+    merged['budget_diagnostics'] = {
+        **primary_budget,
+        'same_host_service_expansion_hosts_observed': len(ranked),
+        'same_host_service_expansion_hosts_already_scanned': len(ranked) - len(pending_ranked),
+        'same_host_service_expansion_hosts_pending': len(pending_ranked),
+        'same_host_service_expansion_host_limit': host_limit,
+        'same_host_service_expansion_hosts_scanned': len(selected),
+        'same_host_service_expansion_candidate_budget': total_candidate_budget,
+        'same_host_service_expansion_ports_probed': ports_probed,
+        'same_host_service_expansion_web_services_discovered': web_services_discovered,
+        'same_host_service_expansion_roots_recrawled': roots_recrawled,
+        'same_host_service_expansion_recrawl_pages_per_host': recrawl_pages,
+    }
     return merged
 
 # URL ranking relies on a small set of security-related words to prioritize discovered paths.
@@ -4320,9 +5026,9 @@ COMMAND_HINTS = {'cmd', 'command', 'exec', 'shell', 'ip', 'host', 'hostname', 'p
 # name (e.g. redirect=devices.php) is a routing-by-filename pattern and a classic local-file-
 # inclusion/path-traversal vector, not merely an XSS-reflection surface.
 TRAVERSAL_HINTS = {'file', 'filename', 'path', 'page', 'include', 'template', 'document', 'folder', 'dir', 'directory', 'view', 'resource', 'download', 'redirect', 'linkurl'}
-IDOR_HINTS = {'id', 'uid', 'user_id', 'userid', 'account_id', 'accountid', 'object_id', 'objectid', 'item_id', 'itemid', 'order_id', 'orderid', 'document_id', 'documentid', 'file_id', 'fileid', 'profile_id', 'profileid', 'dashboardid', 'widgetid', 'deviceid', 'modelid'}
+IDOR_HINTS = {'id', 'uid', 'uuid', 'guid', 'user_id', 'userid', 'account_id', 'accountid', 'object_id', 'objectid', 'item_id', 'itemid', 'order_id', 'orderid', 'document_id', 'documentid', 'file_id', 'fileid', 'profile_id', 'profileid', 'dashboardid', 'widgetid', 'deviceid', 'modelid'}
 IDOR_PROTOCOL_PARAMETER_NAMES = {'state', 'nonce', 'code', 'session_state', 'execution', 'tab_id', 'auth_session_id', 'session_code'}
-IDOR_UUID_RE = re.compile(r'^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-5][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$')
+IDOR_UUID_RE = re.compile(r'^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$')
 IDOR_HEX_RE = re.compile(r'^[0-9a-fA-F]{8,64}$')
 IDOR_DIGIT_RUN_RE = re.compile(r'\d+')
 
@@ -4602,28 +5308,47 @@ def _tool_case_priority(tool: str, case: dict[str, Any], authenticated_profile: 
         return score
     return score
 
-# Explains why a request case should not be sent to a scanner.
-def _tool_case_skip_reason(tool: str, case: dict[str, Any], authenticated_profile: bool=False) -> str:
+# Returns only hard compatibility/safety exclusions for a request-level scanner. These rules may
+# determine whether a concrete action exists at all; heuristic vulnerability-class ranking must not.
+def tool_case_hard_skip_reason(tool: str, case: dict[str, Any]) -> str:
+    name = str(tool or '').lower()
     if not _clean_case_parameter_names(case.get('parameters', [])):
         return 'The request has no testable application parameter for this parameter scanner.'
     if _is_auto_index_case(case):
         return 'Directory-index sorting parameters are navigation controls, not application inputs.'
-    if tool in {'sqlmap', 'dalfox', 'commix', 'traversal', 'idor'} and _parameter_scanner_static_asset(case):
+    if name in {'sqlmap', 'dalfox', 'commix', 'traversal', 'idor'} and _parameter_scanner_static_asset(case):
         return 'Static cache/version asset variants are retained for discovery/source analysis but are not direct request-level injection targets.'
-    if tool == 'dalfox' and _dalfox_non_html_static_asset(case):
+    if name == 'dalfox' and _dalfox_non_html_static_asset(case):
         return 'Non-HTML CSS/font/image/media assets are retained for discovery but are not direct Dalfox XSS targets.'
-    if tool in {'sqlmap', 'dalfox', 'commix', 'traversal'} and _identity_protocol_metadata_only(case):
+    if name in {'sqlmap', 'dalfox', 'commix', 'traversal'} and _identity_protocol_metadata_only(case):
         return 'Pure OAuth/OIDC protocol metadata is excluded from generic injection scanning; concrete application login/form inputs remain eligible.'
-    if tool == 'traversal' and not _traversal_case_signal(case):
+    if name == 'traversal' and not _traversal_case_signal(case):
         if _traversal_absolute_web_routing_only(case):
             return 'Absolute HTTP(S) redirect/link values are navigation/SSRF-style inputs, not local-file traversal targets.'
-        return 'Traversal/LFI requires a file/path/routing parameter or an observed local-resource value; unrelated ids, roles, sorting and other generic inputs are left to their matching specialist.'
+        return 'Traversal/LFI requires a file/path/routing parameter or an observed local-resource value.'
+    if name in {'sqlmap', 'dalfox', 'commix', 'traversal'} and _is_logout_case(case):
+        return f'{name} is not sent to logout endpoints; authenticated logout is handled only by the final session-lifecycle check.'
+    if name in {'sqlmap', 'dalfox', 'commix', 'traversal'} and _oversized_generated_request(case):
+        return f'{name} is not sent to oversized generated table/filter requests because they are unsuitable bounded specialist contracts.'
+    if name == 'idor':
+        method = str(case.get('method', 'GET')).upper()
+        url = str(case.get('url') or '')
+        path = urlparse(url).path.lower()
+        if method != 'GET' or not _object_reference_pairs(url):
+            return 'IDOR requires a read-only GET request containing a concrete object-reference value.'
+        if any(token in path for token in ('brute', 'csrf', 'password', 'sqli', 'xss', '/exec', '/csp')):
+            return 'The request belongs to a different specialized test class and is not an IDOR object-reference contract.'
+    return ''
+
+
+# Explains why deterministic specialist selection excludes a request. It includes the hard rules above
+# plus deterministic routing/ranking preferences used only by the fixed pipeline.
+def _tool_case_skip_reason(tool: str, case: dict[str, Any], authenticated_profile: bool=False) -> str:
+    hard_reason = tool_case_hard_skip_reason(tool, case)
+    if hard_reason:
+        return hard_reason
     if tool == 'dalfox' and _prefer_browser_for_xss_case(case):
         return 'Stored or DOM-oriented XSS contracts are delegated to the Chromium verifier, which can execute JavaScript and revisit state.'
-    if tool in {'sqlmap', 'dalfox', 'commix', 'traversal'} and _is_logout_case(case):
-        return f'{tool} is not sent to logout endpoints; anonymous profiles ignore logout and authenticated profiles validate logout only in the final session-lifecycle check.'
-    if tool in {'sqlmap', 'dalfox', 'commix', 'traversal'} and _oversized_generated_request(case):
-        return f'{tool} is not sent to oversized generated table/filter requests; specialist testing is reserved for concise application parameters.'
     if tool == 'sqlmap' and 'brute' in urlparse(str(case.get('url', ''))).path.lower():
         return 'The brute-force handler is an authentication workflow, not a SQL-query request class.'
     if _tool_case_priority(tool, case, authenticated_profile=authenticated_profile) <= 0:
@@ -4737,7 +5462,10 @@ def _append_generic_live_input_reserve(
         score += min(16, len(params) * 3)
         eligible.append((score, -index, case))
     added = 0
-    for score, _, case in _family_fair_ranked_cases([(a, c) for a, _, c in sorted(eligible, key=lambda row: (-row[0], -row[1]))]):
+    fair_ranked = _family_fair_ranked_cases(
+        [(score, case) for score, _, case in sorted(eligible, key=lambda row: (-row[0], -row[1]))]
+    )
+    for score, case in fair_ranked:
         if added >= reserve:
             break
         url = str(case.get('url') or '')
@@ -4748,15 +5476,18 @@ def _append_generic_live_input_reserve(
         if key in known or shape_counts[shape] >= variant_cap:
             continue
         case_authenticated = authenticated_profile and (not credential_cookies or bool(scope_cookie_header(url, credential_cookies)))
-        if _tool_case_skip_reason(tool, case, authenticated_profile=case_authenticated) and _tool_case_priority(tool, case, authenticated_profile=case_authenticated) <= 0:
-            # Generic reserve intentionally bypasses only class-name mismatch, never the hard safety exclusions above.
-            pass
+        skip_reason = _tool_case_skip_reason(tool, case, authenticated_profile=case_authenticated)
+        if skip_reason and not skip_reason.startswith('The request was not selected because'):
+            # The generic reserve may bypass only vulnerability-class ranking mismatch. All hard
+            # exclusions (logout/static/identity/oversized/auto-index/special workflow cases)
+            # remain binding exactly as they are for the ordinary specialist selector.
+            continue
         output.append({**case, 'priority_score': int(score), 'coverage_reserve': True, 'selection_reason': 'generic-live-input-reserve'})
         known.add(key); shape_counts[shape] += 1; added += 1
     return output
 
 # Chooses the best request cases for one scanner and scan profile.
-def select_tool_request_cases(discovery: dict[str, Any], tool: str, limit: int | None=None, authenticated_profile: bool=False, allow_state_changes: bool=True, credential_cookies: str='') -> list[dict[str, Any]]:
+def select_tool_request_cases(discovery: dict[str, Any], tool: str, limit: int | None=None, authenticated_profile: bool=False, allow_state_changes: bool=True, credential_cookies: str='', *, agentic_catalog: bool=False) -> list[dict[str, Any]]:
 
     effective_limit = int(limit or PARAMETER_TOOL_CASE_LIMITS.get(tool, MAX_PARAMETER_ENDPOINTS))
     cases = [case for case in discovery.get('request_cases', []) if isinstance(case, dict)]
@@ -4787,6 +5518,38 @@ def select_tool_request_cases(discovery: dict[str, Any], tool: str, limit: int |
         score = _tool_case_priority(tool, case, authenticated_profile=case_authenticated)
         if score > 0:
             ranked.append((score, -index, case))
+    # Agentic catalog mode exposes every structurally compatible concrete request to the AI.
+    # Python may attach a heuristic score as evidence, but that score never decides visibility.
+    # Exact request contracts are deduplicated; value variants are preserved because the model may
+    # legitimately choose one and reject another. Deterministic mode keeps the bounded ranked selector.
+    if agentic_catalog:
+        catalog: list[dict[str, Any]] = []
+        seen_catalog: set[tuple[str, tuple[str, str, tuple[tuple[str, str], ...]], str, tuple[str, ...]]] = set()
+        for index, raw_case in enumerate(cases):
+            if not isinstance(raw_case, dict):
+                continue
+            clean_parameters = _clean_case_parameter_names(raw_case.get('parameters', []))
+            if not clean_parameters:
+                clean_parameters = _query_parameter_names(str(raw_case.get('url') or ''))
+            case = {**raw_case, 'parameters': clean_parameters}
+            method = str(case.get('method', 'GET')).upper()
+            url = str(case.get('url') or '')
+            browser_response = case.get('browser_response') if isinstance(case.get('browser_response'), dict) else {}
+            if browser_response.get('observed') is True and int(browser_response.get('status') or 0) in {404, 410}:
+                continue
+            if method not in {'GET', 'POST'} or not url or not clean_parameters:
+                continue
+            if tool_case_hard_skip_reason(tool, case):
+                continue
+            case_authenticated = authenticated_profile and (not credential_cookies or bool(scope_cookie_header(url, credential_cookies)))
+            heuristic = _tool_case_priority(tool, case, authenticated_profile=case_authenticated)
+            key = (method, _semantic_request_url_key(url), str(case.get('data') or ''), tuple(sorted(str(v).lower() for v in clean_parameters if str(v))))
+            if key in seen_catalog:
+                continue
+            seen_catalog.add(key)
+            catalog.append({**case, 'priority_score': int(heuristic), 'selection_reason': 'agentic-structurally-compatible-candidate'})
+        return catalog
+
     unique_ranked: list[tuple[int, dict[str, Any]]] = []
     seen: set[tuple[str, str, tuple[str, ...]]] = set()
     shape_counts: dict[tuple[str, tuple[str, str, tuple[str, ...]], tuple[str, ...]], int] = {}
@@ -5126,9 +5889,9 @@ def _adaptive_specialist_evidence(tool: str, case: dict[str, Any]) -> list[str]:
         if any(token in path for token in ('include', 'download', 'file', 'template', 'document', 'view')):
             class_reasons.append('file/path-oriented route')
     elif name == 'idor':
-        numeric_pairs = [(key.lower(), value) for key, value in parse_qsl(urlparse(url).query, keep_blank_values=True) if value.isdigit()]
-        if any(key in IDOR_HINTS for key, _ in numeric_pairs):
-            class_reasons.append('numeric object-reference parameter')
+        object_pairs = _object_reference_pairs(url)
+        if object_pairs:
+            class_reasons.append('bounded object-reference parameter')
         if any(token in path for token in ('idor', 'object', 'profile', 'account', 'user', 'dashboard', 'widget', 'device')):
             class_reasons.append('object/resource-oriented route')
     elif name == 'authorization':
@@ -5208,7 +5971,7 @@ def _browser_url_key(value: str) -> tuple[str, str, int, str]:
     try:
         parsed = urlparse(str(value or ''))
         scheme = parsed.scheme.lower()
-        host = (parsed.hostname or '').lower()
+        host = normalized_hostname(parsed.hostname or '')
         if scheme not in {'http', 'https'} or not host:
             return ('', '', 0, '')
         port = parsed.port or (443 if scheme == 'https' else 80)
@@ -5249,7 +6012,7 @@ def _browser_case_priority(case: dict[str, Any], client_keys: set[tuple[str, str
     return score
 
 # Chooses pages and requests that are useful for browser checks.
-def select_browser_request_cases(discovery: dict[str, Any], limit: int | None=None) -> list[dict[str, Any]]:
+def select_browser_request_cases(discovery: dict[str, Any], limit: int | None=None, *, agentic_catalog: bool=False) -> list[dict[str, Any]]:
 
     effective_limit = int(limit or PARAMETER_TOOL_CASE_LIMITS.get('browser', 2))
     raw_client = [dict(item) for item in discovery.get('client_side_candidates', []) if isinstance(item, dict) and str(item.get('url') or '')]
@@ -5274,6 +6037,25 @@ def select_browser_request_cases(discovery: dict[str, Any], limit: int | None=No
         url = str(evidence[0].get('url') or '')
         cases.append({'url': url, 'method': 'GET', 'data': '', 'parameters': _query_parameter_names(url), 'fields': [], 'source_url': url, 'client_side_only': True, 'client_sources': sorted({str(value) for item in evidence for value in item.get('sources', []) if str(value)}), 'client_sinks': sorted({str(value) for item in evidence for value in item.get('sinks', []) if str(value)}), 'client_side_evidence': evidence})
     ranked = sorted(((_browser_case_priority(case, client_keys), -index, case) for index, case in enumerate(cases)), key=lambda item: (-item[0], -item[1]))
+    if agentic_catalog:
+        catalog: list[dict[str, Any]] = []
+        seen_catalog: set[tuple[str, tuple[str, str, tuple[tuple[str, str], ...]], str, tuple[str, ...]]] = set()
+        for score, _, case in ranked:
+            # A positive browser score is an applicability signal (XSS/client-side evidence), not an
+            # execution priority. Preserve every exact applicable contract for AI choice.
+            if score <= 0:
+                continue
+            method = str(case.get('method', 'GET')).upper()
+            url = str(case.get('url') or '')
+            if not url or method not in {'GET', 'POST'} or _destructive_crawl_url(url) or _is_auto_index_case(case) or _browser_static_resource(url):
+                continue
+            params = tuple(sorted(str(value).lower() for value in case.get('parameters', []) if str(value)))
+            key = (method, _semantic_request_url_key(url), str(case.get('data') or ''), params)
+            if key in seen_catalog:
+                continue
+            seen_catalog.add(key)
+            catalog.append({**case, 'priority_score': int(score), 'selection_reason': 'agentic-browser-applicable-candidate'})
+        return catalog
     unique_ranked: list[tuple[int, dict[str, Any]]] = []
     seen: set[tuple[str, str, tuple[str, ...]]] = set()
     shape_counts: dict[tuple[str, tuple[str, str, int, str], tuple[str, ...]], int] = {}
@@ -5362,7 +6144,7 @@ def _workflow_case_priority(case: dict[str, Any]) -> int:
     return score
 
 # Chooses request cases that are useful for workflow checks.
-def select_workflow_request_cases(discovery: dict[str, Any], limit: int | None=None) -> list[dict[str, Any]]:
+def select_workflow_request_cases(discovery: dict[str, Any], limit: int | None=None, *, agentic_catalog: bool=False) -> list[dict[str, Any]]:
 
     effective_limit = int(limit or PARAMETER_TOOL_CASE_LIMITS.get('workflow', 3))
     ranked: list[tuple[int, int, dict[str, Any]]] = []
@@ -5385,6 +6167,19 @@ def select_workflow_request_cases(discovery: dict[str, Any], limit: int | None=N
             auth_shape = any(token in path for token in ('brute', 'login', 'signin', 'auth')) or bool({'username', 'password'} <= names)
             if method == 'GET' and auth_shape and not _destructive_crawl_url(str(case.get('url') or '')):
                 ranked.append((82 + min(12, len(names) * 2), -index, {**case, 'selection_reason': 'deep-get-auth-workflow'}))
+    if agentic_catalog:
+        catalog: list[dict[str, Any]] = []
+        seen_catalog: set[tuple[str, tuple[str, str, tuple[tuple[str, str], ...]], str, tuple[str, ...]]] = set()
+        for score, _, case in sorted(ranked, key=lambda item: (-item[0], -item[1])):
+            method = str(case.get('method', 'POST')).upper()
+            url = str(case.get('url') or '')
+            fields = tuple(sorted(_case_field_names(case)))
+            key = (method, _semantic_request_url_key(url), str(case.get('data') or ''), fields)
+            if key in seen_catalog:
+                continue
+            seen_catalog.add(key)
+            catalog.append({**case, 'priority_score': int(score), 'selection_reason': 'agentic-workflow-applicable-candidate'})
+        return catalog
     unique_ranked: list[tuple[int, dict[str, Any]]] = []
     seen: set[tuple[str, str, tuple[str, ...]]] = set()
     shape_counts: dict[tuple[str, tuple[str, str, tuple[str, ...]], tuple[str, ...]], int] = {}
@@ -5486,7 +6281,7 @@ def _authorization_case_priority(case: dict[str, Any]) -> int:
     return score
 
 # Chooses requests that can be compared for authorization differences.
-def select_authorization_request_cases(discovery: dict[str, Any], limit: int | None=None) -> list[dict[str, Any]]:
+def select_authorization_request_cases(discovery: dict[str, Any], limit: int | None=None, *, agentic_catalog: bool=False) -> list[dict[str, Any]]:
 
     effective_limit = int(limit or PARAMETER_TOOL_CASE_LIMITS.get('authorization', 3))
     cases = [dict(case) for case in discovery.get('request_cases', []) if isinstance(case, dict)]
@@ -5501,6 +6296,20 @@ def select_authorization_request_cases(discovery: dict[str, Any], limit: int | N
         score = _authorization_case_priority(case)
         if score > 0:
             ranked.append((score, -index, case))
+
+    if agentic_catalog:
+        catalog: list[dict[str, Any]] = []
+        seen_catalog: set[tuple[str, str, str, tuple[str, ...]]] = set()
+        for score, _, case in sorted(ranked, key=lambda item: (-item[0], -item[1])):
+            url = str(case.get('url') or '')
+            method = str(case.get('method', 'GET')).upper()
+            fields = tuple(sorted(_case_field_names(case)))
+            key = (method, semantic_request_identity_url(url), str(case.get('data') or ''), fields)
+            if not url or key in seen_catalog:
+                continue
+            seen_catalog.add(key)
+            catalog.append({**case, 'priority_score': int(score), 'selection_reason': 'agentic-authorization-applicable-candidate'})
+        return catalog
 
     unique_ranked: list[tuple[int, dict[str, Any]]] = []
     seen: set[str] = set()
@@ -5548,9 +6357,52 @@ def select_authorization_request_cases(discovery: dict[str, Any], limit: int | N
     return _select_with_adaptive_specialist_budget('authorization', unique_ranked, effective_limit)
 
 # Chooses and limits the endpoints sent to Arjun.
-def select_arjun_request_cases(discovery: dict[str, Any], target: str, limit: int=MAX_ARJUN_ENDPOINTS) -> list[dict[str, Any]]:
+def select_arjun_request_cases(discovery: dict[str, Any], target: str, limit: int=MAX_ARJUN_ENDPOINTS, *, agentic_catalog: bool=False) -> list[dict[str, Any]]:
 
     effective_limit = int(limit)
+    if agentic_catalog:
+        catalog: list[dict[str, Any]] = []
+        seen_catalog: set[tuple[str, str, str]] = set()
+        represented_urls: set[str] = set()
+        for raw_case in discovery.get('request_cases', []):
+            if not isinstance(raw_case, dict):
+                continue
+            url = normalize_url(str(raw_case.get('url') or ''))
+            method = str(raw_case.get('method') or 'GET').upper()
+            if not url or method not in {'GET', 'POST'} or not url_in_authorized_scope(target, url):
+                continue
+            path = urlparse(url).path.lower()
+            if _destructive_crawl_url(url) or _is_auto_index_url(url) or path.endswith(('/login.php', '/login', '/setup.php', '/logout.php', '/logout')):
+                continue
+            if _browser_static_resource(url):
+                continue
+            file_parameters = [str(value) for value in raw_case.get('file_parameters', []) if str(value)]
+            enctype = str(raw_case.get('enctype') or '').lower()
+            if file_parameters or 'multipart/form-data' in enctype:
+                continue
+            data = str(raw_case.get('data') or '')
+            key = (method, semantic_request_identity_url(url), data)
+            if key in seen_catalog:
+                continue
+            seen_catalog.add(key)
+            represented_urls.add(semantic_request_identity_url(url))
+            score = _risk_terms(path) + (18 if any(token in path for token in ('/api/', 'callback', 'webhook', 'debug', 'admin')) else 0)
+            catalog.append({**raw_case, 'url': url, 'method': method, 'data': data, 'parameters': [str(value) for value in raw_case.get('parameters', []) if str(value)], 'priority_score': int(score), 'selection_reason': 'agentic-arjun-safe-endpoint-candidate'})
+        for raw_url in [*(discovery.get('html_urls', []) or []), *(discovery.get('form_urls', []) or [])]:
+            url = normalize_url(str(raw_url or ''))
+            if not url or not url_in_authorized_scope(target, url) or semantic_request_identity_url(url) in represented_urls:
+                continue
+            path = urlparse(url).path.lower()
+            if _destructive_crawl_url(url) or _is_auto_index_url(url) or _browser_static_resource(url) or path.endswith(('/login.php', '/login', '/setup.php', '/logout.php', '/logout')):
+                continue
+            key = ('GET', semantic_request_identity_url(url), '')
+            if key in seen_catalog:
+                continue
+            seen_catalog.add(key)
+            score = _risk_terms(path) + (18 if any(token in path for token in ('/api/', 'callback', 'webhook', 'debug', 'admin')) else 0)
+            catalog.append({'url': url, 'method': 'GET', 'data': '', 'parameters': _query_parameter_names(url), 'priority_score': int(score), 'selection_reason': 'agentic-arjun-safe-page-candidate'})
+        return catalog
+
     ranked: list[tuple[int, dict[str, Any]]] = []
     represented_paths: set[str] = set()
     for case in discovery.get('request_cases', []):
@@ -5625,15 +6477,26 @@ def select_arjun_request_cases(discovery: dict[str, Any], target: str, limit: in
         unique_ranked.append((int(score), case))
     return _select_with_adaptive_specialist_budget('arjun', unique_ranked, max(1, effective_limit))
 
-# Builds report-facing reasons for discovered request contracts that were not selected for
-# request-level security testing. The result is deterministic and shared by both orchestrators.
-def endpoint_selection_decisions(discovery: dict[str, Any], target: str, authenticated_profile: bool=False, allow_state_changes: bool=True, credential_cookies: str='') -> list[dict[str, Any]]:
+# Builds report-facing eligibility decisions for discovered request contracts.
+# Deterministic reports use the bounded selector; Agentic reports use the same concrete-action
+# catalog eligibility that is presented to the planner.
+def endpoint_selection_decisions(
+    discovery: dict[str, Any],
+    target: str,
+    authenticated_profile: bool=False,
+    allow_state_changes: bool=True,
+    credential_cookies: str='',
+    *,
+    agentic_catalog: bool=False,
+) -> list[dict[str, Any]]:
     cases = [dict(case) for case in discovery.get('request_cases', []) if isinstance(case, dict) and str(case.get('url') or '')]
     if not cases:
         return []
 
-    def key(case: dict[str, Any]) -> tuple[str, str]:
-        return (str(case.get('method') or 'GET').upper(), _clean_url(str(case.get('url') or '')))
+    def key(case: dict[str, Any]) -> tuple[str, str, str]:
+        method = str(case.get('method') or 'GET').upper()
+        fields = sorted(_case_field_names(case))
+        return (method, _clean_url(str(case.get('url') or '')), request_body_fingerprint(method, str(case.get('data') or ''), fields))
 
     def shape(tool: str, case: dict[str, Any]) -> tuple[str, tuple[Any, ...], tuple[str, ...]]:
         method = str(case.get('method') or 'GET').upper()
@@ -5648,23 +6511,58 @@ def endpoint_selection_decisions(discovery: dict[str, Any], target: str, authent
             route = _structural_route_signature(url)
         return (method, route, fields)
 
-    selected_by_tool: dict[str, set[tuple[str, str]]] = {}
+    selected_by_tool: dict[str, set[tuple[str, str, str]]] = {}
     selected_shapes_by_tool: dict[str, set[tuple[str, tuple[Any, ...], tuple[str, ...]]]] = {}
     selected_counts: dict[str, int] = {}
 
+    # The Agentic report must not recreate deterministic cutoffs. The pool limit is sized from the
+    # complete discovered surface so selector functions can return every concrete compatible action.
+    catalog_limit = max(
+        64,
+        len(cases)
+        + len(discovery.get('parameterized_urls', []) or [])
+        + len(discovery.get('html_urls', []) or [])
+        + len(discovery.get('form_urls', []) or [])
+        + len(discovery.get('client_side_candidates', []) or [])
+        + 64,
+    )
+
     for tool in ('sqlmap', 'dalfox', 'commix', 'traversal', 'idor'):
-        selected = select_tool_request_cases(discovery, tool, authenticated_profile=authenticated_profile, allow_state_changes=allow_state_changes, credential_cookies=credential_cookies)
+        selected = select_tool_request_cases(
+            discovery, tool,
+            limit=catalog_limit if agentic_catalog else None,
+            authenticated_profile=authenticated_profile,
+            allow_state_changes=allow_state_changes,
+            credential_cookies=credential_cookies,
+            agentic_catalog=agentic_catalog,
+        )
         selected_by_tool[tool] = {key(case) for case in selected}
         selected_shapes_by_tool[tool] = {shape(tool, case) for case in selected}
         selected_counts[tool] = len(selected)
 
-    browser_selected = select_browser_request_cases(discovery)
-    workflow_selected = select_workflow_request_cases(discovery)
+    browser_selected = select_browser_request_cases(
+        discovery,
+        limit=catalog_limit if agentic_catalog else None,
+        agentic_catalog=agentic_catalog,
+    )
+    workflow_selected = select_workflow_request_cases(
+        discovery,
+        limit=catalog_limit if agentic_catalog else None,
+        agentic_catalog=agentic_catalog,
+    )
     authorization_selected = [
-        case for case in select_authorization_request_cases(discovery)
+        case for case in select_authorization_request_cases(
+            discovery,
+            limit=catalog_limit if agentic_catalog else None,
+            agentic_catalog=agentic_catalog,
+        )
         if authenticated_profile and (not credential_cookies or scope_cookie_header(str(case.get('url') or ''), credential_cookies))
     ]
-    arjun_selected = select_arjun_request_cases(discovery, target, limit=ARJUN_ENDPOINT_LIMIT)
+    arjun_selected = select_arjun_request_cases(
+        discovery, target,
+        limit=catalog_limit if agentic_catalog else ARJUN_ENDPOINT_LIMIT,
+        agentic_catalog=agentic_catalog,
+    )
     for tool, selected in (
         ('browser', browser_selected),
         ('workflow', workflow_selected),
@@ -5682,9 +6580,9 @@ def endpoint_selection_decisions(discovery: dict[str, Any], target: str, authent
 
     decisions: list[dict[str, Any]] = []
     for case in cases:
-        method, url = key(case)
+        method, url, body_fingerprint = key(case)
         fields = _case_field_names(case)
-        selected_tools = sorted(tool for tool, values in selected_by_tool.items() if (method, url) in values)
+        selected_tools = sorted(tool for tool, values in selected_by_tool.items() if (method, url, body_fingerprint) in values)
         eligible_tools: list[str] = []
 
         state_change_reason = request_case_state_change_reason(case) if not allow_state_changes else ''
@@ -5704,7 +6602,7 @@ def endpoint_selection_decisions(discovery: dict[str, Any], target: str, authent
                     eligible_tools.append('workflow')
             if case_authenticated and _authorization_case_priority(case) > 0:
                 eligible_tools.append('authorization')
-            if (method, url) in selected_by_tool.get('arjun', set()):
+            if (method, url, body_fingerprint) in selected_by_tool.get('arjun', set()):
                 eligible_tools.append('arjun')
 
         reason_code = ''
@@ -5717,10 +6615,16 @@ def endpoint_selection_decisions(discovery: dict[str, Any], target: str, authent
             reason = 'The request maps to a destructive/state-changing route or request contract excluded by the safety policy.'
         elif selected_tools:
             reason_code = 'SELECTED_FOR_SECURITY_TEST'
-            reason = 'Deterministic ranking selected this request contract for one or more request-level security tools.'
+            if agentic_catalog:
+                reason = 'At least one concrete action for this request contract is eligible for Agentic planning.'
+            else:
+                reason = 'The deterministic selector retained this request contract for one or more request-level security tools.'
         elif not fields:
             reason_code = 'NO_COMPATIBLE_PARAMETERS'
             reason = 'No compatible application parameter, form field or client-side input was available for request-level specialist testing.'
+        elif agentic_catalog:
+            reason_code = 'NO_COMPATIBLE_PARAMETERS'
+            reason = 'No policy-eligible concrete specialist action can be constructed from this discovered request contract.'
         else:
             duplicate_tools = [
                 tool for tool in eligible_tools
@@ -5729,10 +6633,10 @@ def endpoint_selection_decisions(discovery: dict[str, Any], target: str, authent
             ]
             if duplicate_tools:
                 reason_code = 'DUPLICATE_ROUTE_VARIANT'
-                reason = 'A higher-ranked value variant with the same method, route and parameter-name shape was retained; this variant was omitted by the anti-saturation cap.'
+                reason = 'A higher-ranked value variant with the same method, route and parameter-name shape was retained by the deterministic selector.'
             elif eligible_tools and any(selected_counts.get(tool, 0) >= tool_action_limit(tool, include_adaptive=True) > 0 for tool in eligible_tools):
                 reason_code = 'BUDGET_LIMIT'
-                reason = 'The request was compatible with a specialist, but that specialist had already reached its bounded adaptive case ceiling for this profile.'
+                reason = 'The request was compatible with a specialist, but that deterministic specialist reached its bounded adaptive case ceiling for this profile.'
             else:
                 reason_code = 'DEFERRED_LOW_PRIORITY'
                 reason = 'The request remained below the deterministic specialist cutoff after vulnerability-class ranking and higher-value candidates were preferred.'
@@ -5741,6 +6645,7 @@ def endpoint_selection_decisions(discovery: dict[str, Any], target: str, authent
             'url': url,
             'method': method,
             'parameters': sorted(fields),
+            'body_fingerprint': body_fingerprint,
             'selected_tools': selected_tools,
             'eligible_tools': sorted(set(eligible_tools)),
             'reason_code': reason_code,
@@ -5793,7 +6698,7 @@ def _replace_parameter_value(pairs: list[tuple[str, str]], parameter: str, value
     return updated
 
 # Chooses request cases that can support out-of-band callback checks.
-def select_oast_request_cases(discovery: dict[str, Any], target: str, limit: int=1) -> list[dict[str, Any]]:
+def select_oast_request_cases(discovery: dict[str, Any], target: str, limit: int=1, *, agentic_catalog: bool=False) -> list[dict[str, Any]]:
 
     ranked: list[tuple[int, dict[str, Any]]] = []
     for case in discovery.get('request_cases', []):
@@ -5840,7 +6745,7 @@ def select_oast_request_cases(discovery: dict[str, Any], target: str, limit: int
             continue
         seen.add(key)
         selected.append(candidate)
-        if len(selected) >= max(1, int(limit)):
+        if (not agentic_catalog) and len(selected) >= max(1, int(limit)):
             break
     return selected
 
@@ -6057,7 +6962,7 @@ def log_result(profile: str, name: str, result: dict[str, Any], target: str='') 
             print(f"    [NIKTO DOCKER] create_rc={docker_create.get('return_code', 'n/a')}; state_available={docker_state.get('available', False)}; exit={docker_state.get('ExitCode', 'n/a')}; state_error={docker_state.get('Error') or 'none'}; report_path={structured.get('path') or 'not-created'}; copy_attempts={len(structured.get('attempts') or [])}")
         baseline = result.get('baseline_probe') if isinstance(result.get('baseline_probe'), dict) else {}
         if baseline.get('performed'):
-            print(f"    [NIKTO BASELINE] status={baseline.get('status', 'n/a')}; server={baseline.get('server') or 'not-disclosed'}; signals={baseline.get('signal_count', 0)}; missing headers={','.join(baseline.get('missing_security_headers') or []) or 'none'}")
+            print(f"    [NIKTO REFERENCE] status={baseline.get('status', 'n/a')}; server={baseline.get('server') or 'not-disclosed'}; signals={baseline.get('signal_count', 0)}; missing headers={','.join(baseline.get('missing_security_headers') or []) or 'none'}")
 
 # Combines repeated tool runs into one summary for the report.
 def aggregate_runs(tool: str, target: str, runs: list[dict[str, Any]]) -> dict[str, Any]:
@@ -6229,7 +7134,9 @@ def add_common_cli_arguments(parser: argparse.ArgumentParser, *, require_target:
     else:
         parser.add_argument('--target')
     parser.add_argument('--cookies', default='')
+    parser.add_argument('--primary-identity-name', default='primary', help='Label for the primary authenticated identity used in reports/comparisons.')
     parser.add_argument('--secondary-cookies', default='', help='Optional second authenticated identity for read-only authorization/BOLA comparison.')
+    parser.add_argument('--identity-cookie', action='append', default=[], metavar='NAME=COOKIE', help='Additional authenticated identity. Repeat as needed; each identity becomes an independent authenticated profile.')
     parser.add_argument('--auth-only', action='store_true')
     parser.add_argument('--authorized', action='store_true')
     parser.add_argument('--authorized-origin', action='append', default=[], help='Additional exact HTTP/HTTPS origin explicitly included in the authorized assessment scope. Repeat as needed.')
@@ -6290,10 +7197,11 @@ def prepare_cli_context(parser: argparse.ArgumentParser, args: argparse.Namespac
         except ValueError as exc:
             parser.error(f'Invalid --cookies value: {exc}')
         print('[*] Authenticated cookie names: ' + ', '.join(cookie_names(normalized_cookie)))
-        profiles.append({'name': 'authenticated', 'cookies': normalized_cookie})
+        profiles.append({'name': 'authenticated', 'cookies': normalized_cookie, 'identity_ref': str(getattr(args, 'primary_identity_name', '') or 'primary')})
     elif args.auth_only:
         parser.error('--auth-only requires --cookies.')
     secondary_cookie = ''
+    additional_identities: list[tuple[str, str]] = []
     if args.secondary_cookies:
         if not normalized_cookie:
             parser.error('--secondary-cookies requires a primary --cookies value.')
@@ -6303,7 +7211,51 @@ def prepare_cli_context(parser: argparse.ArgumentParser, args: argparse.Namespac
             parser.error(f'Invalid --secondary-cookies value: {exc}')
         if secondary_cookie == normalized_cookie:
             parser.error('--secondary-cookies must represent a different authenticated identity.')
-        print('[*] Secondary identity cookie names: ' + ', '.join(cookie_names(secondary_cookie)))
+        print('[*] Secondary comparison-only identity cookie names: ' + ', '.join(cookie_names(secondary_cookie)))
+    used_identity_labels: set[str] = set()
+    if normalized_cookie:
+        primary_label = str(getattr(args, 'primary_identity_name', '') or 'primary').strip()
+        if not valid_identity_label(primary_label):
+            parser.error('--primary-identity-name must use only letters, digits, dot, underscore or hyphen.')
+        used_identity_labels.add(primary_label.casefold())
+    for raw_identity in getattr(args, 'identity_cookie', []) or []:
+        raw = str(raw_identity or '')
+        if '=' not in raw:
+            parser.error('--identity-cookie must use NAME=COOKIE syntax.')
+        label, raw_cookie = raw.split('=', 1)
+        label = label.strip()
+        if not valid_identity_label(label):
+            parser.error('--identity-cookie identity names must use only letters, digits, dot, underscore or hyphen.')
+        if label.casefold() in used_identity_labels:
+            parser.error(f'Authenticated identity label {label!r} is duplicated; identity labels must be unique.')
+        used_identity_labels.add(label.casefold())
+        try:
+            value = canonical_cookie_header(raw_cookie)
+        except ValueError as exc:
+            parser.error(f'Invalid --identity-cookie value for {label!r}: {exc}')
+        if value == normalized_cookie or any(existing == value for _, existing in additional_identities):
+            parser.error(f'Identity {label!r} duplicates an already configured authenticated session.')
+        additional_identities.append((label, value))
+    if secondary_cookie and any(value == secondary_cookie for _, value in additional_identities):
+        parser.error('--secondary-cookies duplicates a --identity-cookie session; configure that account only once.')
+    configured_identity_count = (1 if normalized_cookie else 0) + len(additional_identities) + (1 if secondary_cookie else 0)
+    if configured_identity_count > MAX_AUTHENTICATED_IDENTITIES:
+        parser.error(
+            f'At most {MAX_AUTHENTICATED_IDENTITIES} authenticated identities are supported per target, including the --secondary-cookies identity.'
+        )
+    used_profile_names = {str(profile.get('name') or '') for profile in profiles}
+    for label, value in additional_identities:
+        safe_label = re.sub(r'[^a-zA-Z0-9_]+', '_', label).strip('_').lower() or 'identity'
+        profile_name = f'authenticated_{safe_label}'
+        suffix = 2
+        while profile_name in used_profile_names:
+            profile_name = f'authenticated_{safe_label}_{suffix}'
+            suffix += 1
+        used_profile_names.add(profile_name)
+        profiles.append({'name': profile_name, 'cookies': value, 'identity_ref': label})
+        if not secondary_cookie:
+            secondary_cookie = value
+        print(f"[*] Authenticated identity {label!r} cookie names: " + ', '.join(cookie_names(value)))
     configure_runtime_target_auth(target, normalized_cookie)
     return (target, profiles, normalized_cookie, secondary_cookie, injection_url)
 
@@ -6350,7 +7302,7 @@ def prepare_cli_discovery_seeds(parser: argparse.ArgumentParser, args: argparse.
     return selected
 
 # Builds the arguments sent to each MCP tool from discovery data.
-def build_tool_arguments(tool: str, target_url: str, cookies: str, discovery: dict[str, Any], *, case: dict[str, Any] | None=None, secondary_cookies: str='', allow_state_changes: bool | None=None, timeout_override: int=0, diagnostic_only: bool=False, single_tool: bool=False) -> dict[str, Any]:
+def build_tool_arguments(tool: str, target_url: str, cookies: str, discovery: dict[str, Any], *, case: dict[str, Any] | None=None, secondary_cookies: str='', comparison_identities: list[dict[str, str]] | None=None, allow_state_changes: bool | None=None, timeout_override: int=0, diagnostic_only: bool=False, single_tool: bool=False) -> dict[str, Any]:
 
     case = case or {}
     effective_cookies = scope_cookie_header(target_url, cookies)
@@ -6429,7 +7381,26 @@ def build_tool_arguments(tool: str, target_url: str, cookies: str, discovery: di
         elif tool == 'traversal':
             arguments['scan_profile'] = CURRENT_SCAN_MODE
     elif tool == 'authorization':
-        arguments.update({'secondary_cookies': scope_cookie_header(target_url, secondary_cookies, use_runtime_auth=False), 'method': 'GET', 'data': '', 'parameters': parameters, 'timeout': timeout_override or PARAMETER_TOOL_TIMEOUTS[tool]})
+        comparison_rows: list[dict[str, str]] = []
+        seen_cookies: set[str] = set()
+        for row in comparison_identities or []:
+            if not isinstance(row, dict):
+                continue
+            value = scope_cookie_header(target_url, str(row.get('cookies') or ''), use_runtime_auth=True)
+            if not value or value == effective_cookies or value in seen_cookies:
+                continue
+            seen_cookies.add(value)
+            comparison_rows.append({'label': str(row.get('label') or row.get('name') or 'alternate'), 'cookies': value})
+        legacy_secondary = scope_cookie_header(target_url, secondary_cookies, use_runtime_auth=False)
+        if legacy_secondary and legacy_secondary != effective_cookies and legacy_secondary not in seen_cookies:
+            comparison_rows.append({'label': 'secondary', 'cookies': legacy_secondary})
+        arguments.update({
+            'secondary_cookies': legacy_secondary,
+            'identity_cookies': [row['cookies'] for row in comparison_rows],
+            'identity_labels': [row['label'] for row in comparison_rows],
+            'method': 'GET', 'data': '', 'parameters': parameters,
+            'timeout': timeout_override or PARAMETER_TOOL_TIMEOUTS[tool],
+        })
     elif tool in {'browser', 'workflow'}:
         default_method = 'POST' if tool == 'workflow' else 'GET'
         arguments.update({'method': method if case.get('method') else default_method, 'data': data, 'parameters': parameters, 'source_url': str(case.get('source_url') or ''), 'allow_state_changes': state_changing_tests_allowed(target_url, allow_state_changes), 'timeout': timeout_override or PARAMETER_TOOL_TIMEOUTS[tool]})

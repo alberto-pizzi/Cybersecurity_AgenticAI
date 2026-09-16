@@ -7,6 +7,8 @@ from pathlib import Path
 from typing import Any, Iterator
 from urllib.parse import urljoin, urlparse
 
+from utils import MAX_AUTHENTICATED_IDENTITIES, valid_identity_label
+
 
 SCHEMA_VERSION = 1
 SUPPORTED_WEB_PROTOCOLS = {"http", "https"}
@@ -14,6 +16,7 @@ SUPPORTED_ORCHESTRATORS = {"deterministic", "agentic"}
 SUPPORTED_MODES = {"fast", "balanced", "deep"}
 SUPPORTED_MODELS = {"snap4city", "llama", "qwen"}
 SUPPORTED_CREDENTIAL_KINDS = {"cookie", "browser_oidc", "snap4city_oidc"}
+MAX_SERVICE_CREDENTIAL_IDENTITIES = MAX_AUTHENTICATED_IDENTITIES
 
 
 # Loads and validates the platform-level assessment configuration.
@@ -198,6 +201,43 @@ def _validate_assets(assets: list[Any]) -> None:
                     raise ValueError(f"Port out of range for {global_id}: {numeric_port}")
 
 
+def service_credential_refs(service: dict[str, Any]) -> list[str]:
+    """Return ordered credential identities for one service, preserving legacy fields."""
+    refs: list[str] = []
+    configured = service.get("credential_refs")
+    if configured is not None:
+        if not isinstance(configured, list) or not all(isinstance(item, str) and item.strip() for item in configured):
+            raise ValueError("service credential_refs must be a list of non-empty credential names.")
+        refs.extend(str(item).strip() for item in configured)
+        if len(refs) > MAX_SERVICE_CREDENTIAL_IDENTITIES:
+            raise ValueError(
+                f"service credential_refs exceeds the bounded {MAX_SERVICE_CREDENTIAL_IDENTITIES}-identity safety limit."
+            )
+    for field in ("credential_ref", "secondary_credential_ref"):
+        value = str(service.get(field) or "").strip()
+        if value and value not in refs:
+            refs.append(value)
+    refs = list(dict.fromkeys(refs))
+    folded: dict[str, str] = {}
+    for reference in refs:
+        if not valid_identity_label(reference):
+            raise ValueError(
+                f"service credential reference {reference!r} is not a stable identity label; use only letters, digits, dot, underscore or hyphen."
+            )
+        key = reference.casefold()
+        previous = folded.get(key)
+        if previous is not None and previous != reference:
+            raise ValueError(
+                f"service credential references {previous!r} and {reference!r} differ only by case; identity labels must be unique."
+            )
+        folded[key] = reference
+    if len(refs) > MAX_SERVICE_CREDENTIAL_IDENTITIES:
+        raise ValueError(
+            f"service credential references exceed the bounded {MAX_SERVICE_CREDENTIAL_IDENTITIES}-identity safety limit."
+        )
+    return refs
+
+
 # Validates that every service credential reference resolves before a dry-run can be accepted.
 def _validate_credential_references(assets: list[Any], credentials: dict[str, Any]) -> None:
     for asset in assets:
@@ -205,13 +245,12 @@ def _validate_credential_references(assets: list[Any], credentials: dict[str, An
         for service in asset.get("services") or []:
             service_id = str(service.get("id") or "").strip()
             global_id = f"{asset_id}/{service_id}"
-            primary_ref = str(service.get("credential_ref") or "").strip()
-            secondary_ref = str(service.get("secondary_credential_ref") or "").strip()
-            for field, reference in (("credential_ref", primary_ref), ("secondary_credential_ref", secondary_ref)):
-                if reference and reference not in credentials:
-                    raise ValueError(f"Unknown {field} {reference!r} for service {global_id}.")
-            if service.get("auth_only") is True and not primary_ref:
-                raise ValueError(f"Service {global_id} sets auth_only=true but has no credential_ref.")
+            refs = service_credential_refs(service)
+            for reference in refs:
+                if reference not in credentials:
+                    raise ValueError(f"Unknown credential reference {reference!r} for service {global_id}.")
+            if service.get("auth_only") is True and not refs:
+                raise ValueError(f"Service {global_id} sets auth_only=true but has no credential_refs/credential_ref.")
 
 
 # Validates secret references without resolving or persisting the secret values.
@@ -362,8 +401,9 @@ def iter_service_jobs(config: dict[str, Any]) -> Iterator[dict[str, Any]]:
                     continue
                 entry_points.append(urljoin(target, value) if value.startswith("/") and target else value)
             entry_points = list(dict.fromkeys(entry_points))
-            primary_ref = str(service.get("credential_ref") or "").strip()
-            secondary_ref = str(service.get("secondary_credential_ref") or "").strip()
+            credential_refs = service_credential_refs(service)
+            primary_ref = credential_refs[0] if credential_refs else ""
+            secondary_ref = credential_refs[1] if len(credential_refs) > 1 else ""
             yield {
                 "id": f"{asset_id}/{service_id}",
                 "asset_id": asset_id,
@@ -377,6 +417,7 @@ def iter_service_jobs(config: dict[str, Any]) -> Iterator[dict[str, Any]]:
                 "enabled": enabled,
                 "supported": protocol in SUPPORTED_WEB_PROTOCOLS,
                 "unsupported_reason": "" if protocol in SUPPORTED_WEB_PROTOCOLS else "current orchestrators assess HTTP/HTTPS application services only",
+                "credential_refs": credential_refs,
                 "credential_ref": primary_ref,
                 "credential_kind": str((credentials.get(primary_ref) or {}).get("kind") or "") if primary_ref else "",
                 "secondary_credential_ref": secondary_ref,

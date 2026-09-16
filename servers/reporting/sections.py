@@ -41,11 +41,20 @@ def _context_summary_html(context: dict[str, Any], toc: list[tuple[int, str, str
         run_rows.append(("Orchestration mode", _esc(orchestration["mode"])))
     if orchestration.get("nodes"):
         run_rows.append(("Pipeline phases", _esc(" -> ".join(str(n) for n in orchestration["nodes"]))))
-    if context.get("secondary_identity_supplied") is not None:
+    if context.get("authenticated_identity_count") is not None:
+        try:
+            identity_count = max(0, int(context.get("authenticated_identity_count") or 0))
+        except (TypeError, ValueError):
+            identity_count = 0
         run_rows.append((
-            "Secondary identity supplied",
-            "Yes" if context["secondary_identity_supplied"]
-            else "No - authorization/BOLA differentials could not be tested",
+            "Authenticated identities",
+            str(identity_count) + (" - cross-identity authorization/BOLA comparison enabled" if identity_count >= 2 else " - add another identity for cross-account authorization/BOLA differentials"),
+        ))
+    elif context.get("secondary_identity_supplied") is not None:
+        run_rows.append((
+            "Authenticated identities",
+            "2+ (secondary identity supplied)" if context["secondary_identity_supplied"]
+            else "1 or fewer - authorization/BOLA differentials could not be tested",
         ))
     if context.get("expected_tools"):
         run_rows.append(("Expected tools", _esc(", ".join(str(t) for t in context["expected_tools"]))))
@@ -61,7 +70,7 @@ def _context_summary_html(context: dict[str, Any], toc: list[tuple[int, str, str
     if context.get("allow_same_host_ports") is not None:
         run_rows.append((
             "Same-host multi-port authorization",
-            "Enabled - other ports on an already-authorized exact hostname may be discovered/tested on the same scheme"
+            "Enabled - HTTP/HTTPS services on other ports of an already-authorized exact hostname may be discovered/tested; scheme changes remain limited to that exact hostname"
             if bool(context.get("allow_same_host_ports"))
             else "Disabled - additional ports require an explicit authorized origin/service",
         ))
@@ -219,6 +228,19 @@ def _context_summary_html(context: dict[str, Any], toc: list[tuple[int, str, str
                 pieces.append(f"deduplicated route variants {route_variants_skipped}, origin-budget skips {origin_budget_skipped}")
             if families:
                 pieces.append(f"application families visited {families}")
+            service_ports = int(budget.get("same_host_service_ports_probed", 0) or 0)
+            service_roots = int(budget.get("same_host_web_services_discovered", 0) or 0)
+            expansion_hosts = int(budget.get("same_host_service_expansion_hosts_scanned", 0) or 0)
+            expansion_observed = int(budget.get("same_host_service_expansion_hosts_observed", 0) or 0)
+            expansion_ports = int(budget.get("same_host_service_expansion_ports_probed", 0) or 0)
+            expansion_roots = int(budget.get("same_host_service_expansion_web_services_discovered", 0) or 0)
+            if service_ports or service_roots:
+                pieces.append(f"primary-host service discovery ports {service_ports}, web roots {service_roots}")
+            if expansion_hosts or expansion_observed:
+                pieces.append(
+                    f"authorized discovered-host service expansion {expansion_hosts}/{expansion_observed} host(s), "
+                    f"ports {expansion_ports}, web roots {expansion_roots}"
+                )
             rows.append(("Discovery budget", _esc(" | ".join(pieces))))
             out_scope_count = int(budget.get("out_of_scope_urls_skipped", 0) or 0)
             out_scope_origins = budget.get("out_of_scope_origins_observed") if isinstance(budget.get("out_of_scope_origins_observed"), list) else []
@@ -687,41 +709,38 @@ def _render_agentic_audit(context_value: dict[str, Any], toc: list[tuple[int, st
             continue
         outcomes = item.get("execution_outcomes", []) if isinstance(item.get("execution_outcomes"), list) else []
         gaps = item.get("remaining_coverage_gaps", []) if isinstance(item.get("remaining_coverage_gaps"), list) else []
-        selected_group_count = item.get("selected_group_count", 0)
         concrete_pool_count = item.get("concrete_action_pool_count", item.get("eligible_action_count", 0))
+        ai_selected_before_cap = item.get("ai_selected_action_count_before_cap", item.get("selected_action_count", 0))
         audit_rows += (
             "<tr>"
             f"<td>{_esc(item.get('round',''))}</td>"
             f"<td>{_esc(item.get('planner_source',''))}</td>"
             f"<td>{_esc(concrete_pool_count)}</td>"
-            f"<td>{_esc(selected_group_count)}</td>"
+            f"<td>{_esc(item.get('planner_batch_count',0))}</td>"
+            f"<td>{_esc(ai_selected_before_cap)}</td>"
             f"<td>{_esc(item.get('selected_action_count',0))}</td>"
             f"<td>{_esc(len(gaps))}</td>"
             f"<td>{_esc(len(outcomes))}</td>"
             "</tr>"
         )
 
-        # Key round facts as a label/value list, matching the finding-card style,
-        # rather than a raw JSON dump.
         facts = "".join(
             _field(label, value)
             for label, value in (
                 ("Planner endpoint", item.get("planner_endpoint", "")),
-                ("Context size (bytes)", item.get("context_bytes", "")),
-                ("Tool-group candidates shown / pool", f"{item.get('planner_candidate_count', 0)} / {item.get('planner_candidate_pool_count', 0)}"),
-                ("Tool-group budget per profile", item.get("tool_group_budget_per_profile", item.get("round_action_budget", ""))),
-                ("Concrete action normal floor, total round", item.get("round_action_normal_base_total", item.get("execution_action_budget_per_profile", ""))),
-                ("Concrete action resolved base, total round", item.get("round_action_resolved_base_total", item.get("execution_action_budget_per_profile", ""))),
-                ("Concrete action adaptive max, total round", item.get("round_action_resolved_max_total", item.get("execution_action_adaptive_max_per_profile", ""))),
-                ("Concrete action hard cap, total round", item.get("round_action_hard_cap_total", "")),
-                ("Actions before final cap", item.get("round_action_count_before_final_cap", "")),
-                ("Required ordinary actions / remaining round", item.get("round_action_required_per_round", "")),
-                ("Eligible tools", ", ".join(str(value) for value in (item.get("eligible_tools") or []))),
-                ("Baseline / AI / breadth-review tool groups", f"{item.get('baseline_selected_group_count', 0)} / {item.get('ai_selected_group_count', 0)} / {item.get('review_selected_group_count', 0)}"),
-                ("Validated concrete actions", item.get('validated_concrete_action_count', item.get('selected_action_count', 0))),
-                ("Selected groups per profile", json.dumps(item.get("selected_groups_per_profile", {}), ensure_ascii=False, sort_keys=True) if item.get("selected_groups_per_profile") else ""),
-                ("Concrete actions per profile", json.dumps(item.get("expanded_actions_per_profile", {}), ensure_ascii=False, sort_keys=True) if item.get("expanded_actions_per_profile") else ""),
-                ("Review reasoning", item.get("review_reasoning", "")),
+                ("Context size (bytes) / max window", f"{item.get('context_bytes', '')} / {item.get('context_window', '')}"),
+                ("Concrete candidates presented to AI", concrete_pool_count),
+                ("Planner batch size / batches", f"{item.get('planner_batch_size', 0)} / {item.get('planner_batch_count', 0)}"),
+                ("Concrete candidates per profile", json.dumps(item.get("available_actions_per_profile", {}), ensure_ascii=False, sort_keys=True) if item.get("available_actions_per_profile") else ""),
+                ("Normal global execution ceiling", item.get("round_action_reference_cap_total", item.get("round_action_normal_target_total", ""))),
+                ("Adaptive global execution ceiling", item.get("round_action_adaptive_ceiling_total", "")),
+                ("Active global execution ceiling", item.get("round_action_active_ceiling_total", item.get("round_action_hard_cap_total", ""))),
+                ("AI requested adaptive extension", ("yes" if item.get("round_action_adaptive_extension_ai_requested") else "no") if "round_action_adaptive_extension_ai_requested" in item else ""),
+                ("Adaptive extension effective", ("yes" if item.get("round_action_adaptive_extension_ai_effective") else "no") if "round_action_adaptive_extension_ai_effective" in item else ""),
+                ("AI-selected actions before caps", ai_selected_before_cap),
+                ("Validated/admitted concrete actions", item.get("validated_concrete_action_count", item.get("selected_action_count", 0))),
+                ("Concrete actions admitted per profile", json.dumps(item.get("admitted_actions_per_profile", {}), ensure_ascii=False, sort_keys=True) if item.get("admitted_actions_per_profile") else ""),
+                ("Eligible tools represented by candidates", ", ".join(str(value) for value in (item.get("eligible_tools") or []))),
                 ("Fallback reason", item.get("fallback_reason", "")),
                 ("New request contracts discovered", item.get("new_request_contracts", "")),
                 ("Remaining eligible actions after execution", item.get("remaining_eligible_actions_after_execution", "")),
@@ -729,31 +748,12 @@ def _render_agentic_audit(context_value: dict[str, Any], toc: list[tuple[int, st
         )
         facts_html = f"<dl>{facts}</dl>" if facts else ""
 
-        selected_groups = item.get("selected_tool_groups", []) if isinstance(item.get("selected_tool_groups"), list) else []
-        groups_html = ""
-        if selected_groups:
-            group_rows = "".join(
-                "<tr>"
-                f"<td>{_esc(group.get('id',''))}</td>"
-                f"<td>{_esc(group.get('profile',''))}</td>"
-                f"<td>{_esc(group.get('tool',''))}</td>"
-                f"<td>{_esc(group.get('source',''))}</td>"
-                f"<td>{_esc(group.get('concrete_action_count',0))}</td>"
-                f"<td>{_esc(group.get('adaptive_action_count',0))}</td>"
-                "</tr>"
-                for group in selected_groups if isinstance(group, dict)
-            )
-            groups_html = (
-                '<p class="field-label">Selected tool groups</p>'
-                "<table><thead><tr><th>ID</th><th>Profile</th><th>Tool</th><th>Source</th><th>Available concrete actions</th><th>Adaptive</th></tr></thead>"
-                f"<tbody>{group_rows}</tbody></table>"
-            )
-
         selected_actions = item.get("selected_actions", []) if isinstance(item.get("selected_actions"), list) else []
         actions_html = ""
         if selected_actions:
             action_rows = "".join(
                 "<tr>"
+                f"<td>{_esc(action.get('planner_action_id',''))}</td>"
                 f"<td>{_esc(action.get('profile',''))}</td>"
                 f"<td>{_esc(action.get('tool',''))}</td>"
                 f"<td>{_esc(action.get('method','GET'))}</td>"
@@ -764,8 +764,8 @@ def _render_agentic_audit(context_value: dict[str, Any], toc: list[tuple[int, st
                 for action in selected_actions if isinstance(action, dict)
             )
             actions_html = (
-                '<p class="field-label">Selected actions</p>'
-                "<table><thead><tr><th>Profile</th><th>Tool</th><th>Method</th><th>Target URL</th><th>Parameters</th><th>Reason</th></tr></thead>"
+                '<p class="field-label">AI-selected concrete actions admitted for execution</p>'
+                "<table><thead><tr><th>Action ID</th><th>Profile</th><th>Tool</th><th>Method</th><th>Target URL</th><th>Parameters</th><th>Reason</th></tr></thead>"
                 f"<tbody>{action_rows}</tbody></table>"
             )
 
@@ -792,12 +792,11 @@ def _render_agentic_audit(context_value: dict[str, Any], toc: list[tuple[int, st
             ('<p class="field-label">Remaining coverage gaps</p>' + _render_list([str(gap) for gap in gaps]))
             if gaps else ""
         )
-
         round_items.append(
             "<li>"
             f"<b>Round {_esc(item.get('round',''))}: {_esc(item.get('planner_source',''))}</b>"
             f"<p>{_esc(item.get('reasoning_summary',''))}</p>"
-            f"{facts_html}{groups_html}{actions_html}{outcomes_html}{gaps_html}"
+            f"{facts_html}{actions_html}{outcomes_html}{gaps_html}"
             "</li>"
         )
     if not audit_rows:
@@ -805,8 +804,9 @@ def _render_agentic_audit(context_value: dict[str, Any], toc: list[tuple[int, st
     heading = _heading(2, "Agentic planning audit", toc, anchor="agentic-audit")
     return (
         f"{heading}"
-        "<p class='section-note'>This section records model-selected profile/tool capability groups, their deterministic expansion into concrete request-level executions, coverage repair, fallback use and execution outcomes. It contains concise planner summaries, not hidden chain-of-thought.</p>"
-        "<table><thead><tr><th>Round</th><th>Planner</th><th>Concrete pool</th><th>Tool groups</th><th>Concrete plan</th><th>Gaps</th><th>Outcomes</th></tr></thead>"
+        "<p class='section-note'>Agentic planning is action-level: Python discovers, normalizes, deduplicates and safety-validates concrete request/scanner candidates, then presents all eligible candidates to the model in bounded batches. The model selects exact action IDs and their priority; Python enforces validity and resource ceilings while preserving that order. If AI planning fails and --require-ai is disabled, the emergency deterministic fallback follows the same scope and safety policy. This audit contains concise planner summaries, not hidden chain-of-thought.</p>"
+        "<table><thead><tr><th>Round</th><th>Planner</th><th>Concrete candidates</th><th>AI batches</th><th>AI selected</th><th>Admitted plan</th><th>Gaps</th><th>Outcomes</th></tr></thead>"
         f"<tbody>{audit_rows}</tbody></table>"
         f"<ul class=\"audit-rounds\">{''.join(round_items)}</ul>"
     )
+

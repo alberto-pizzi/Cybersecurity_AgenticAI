@@ -45,6 +45,21 @@ def secops_source_fingerprint() -> str:
     _SOURCE_FINGERPRINT_CACHE = digest.hexdigest()
     return _SOURCE_FINGERPRINT_CACHE
 
+# Returns a non-reversible identifier for one HTTP request body contract. The report uses this
+# only to keep distinct POST bodies separate without exposing submitted values or credentials.
+def request_body_fingerprint(method: str, data: str = "", parameters: Iterable[str] | None = None) -> str:
+    if str(method or "GET").upper() != "POST":
+        return ""
+    payload = str(data or "")
+    names = sorted({str(value).strip().lower() for value in (parameters or []) if str(value).strip()})
+    if not payload and not names:
+        return ""
+    digest = hashlib.sha256()
+    digest.update(payload.encode("utf-8", errors="replace"))
+    digest.update(b"\0")
+    digest.update("\n".join(names).encode("utf-8", errors="replace"))
+    return digest.hexdigest()[:16]
+
 # Persist text artifacts atomically on Linux, macOS and Windows. A crash can therefore leave the
 # previous complete file or the new complete file, rather than a half-written Results Data/report.
 def atomic_write_text(path: str | Path, text: str, *, encoding: str = "utf-8") -> Path:
@@ -80,6 +95,13 @@ def atomic_write_text(path: str | Path, text: str, *, encoding: str = "utf-8") -
 # substantially different traffic profile than the operator intended.
 DEFAULT_REQUEST_RATE = 10.0
 REQUEST_RATE_HARD_CAP = 50.0
+# Shared upper bound for authenticated identities attached to one service/direct target.
+# This bounds profile multiplication and O(N^2) cross-account authorization comparisons.
+MAX_AUTHENTICATED_IDENTITIES = 16
+IDENTITY_LABEL_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
+
+def valid_identity_label(value: str) -> bool:
+    return bool(IDENTITY_LABEL_RE.fullmatch(str(value or "").strip()))
 _REQUEST_RATE_UNSET = object()
 
 def scanner_request_rate_policy(value: Any = _REQUEST_RATE_UNSET) -> dict[str, Any]:
@@ -274,6 +296,22 @@ def load_runtime_config() -> dict[str, Any]:
         return {}
 
 
+# Normalizes a DNS/IP hostname for exact-host policy comparisons. Unicode DNS labels are
+# converted to their IDNA ASCII representation so a user-facing international hostname and its
+# punycode form cannot create two different authorization/cookie-scope decisions. A terminal DNS
+# dot is ignored because it denotes the same absolute hostname.
+def normalized_hostname(value: str) -> str:
+    host = str(value or "").strip().lower().rstrip(".")
+    if not host:
+        return ""
+    try:
+        return host.encode("idna").decode("ascii").lower()
+    except UnicodeError:
+        # Keep malformed/non-DNS literals stable rather than inventing a different hostname;
+        # URL validation/scope checks remain fail-closed at their normal boundary.
+        return host
+
+
 # Parses an HTTP/HTTPS origin without allowing malformed authority/port text to escape as an exception.
 def _url_origin_parts(url: str) -> tuple[str, str, int] | None:
     try:
@@ -282,7 +320,7 @@ def _url_origin_parts(url: str) -> tuple[str, str, int] | None:
         # A terminal DNS dot denotes the same absolute hostname (example.com. == example.com).
         # Normalize it centrally so exact-origin and same-host-port decisions do not disagree with
         # browser/DNS semantics merely because one discovered URL used the absolute form.
-        host = str(parsed.hostname or "").lower().rstrip(".")
+        host = normalized_hostname(parsed.hostname or "")
         if scheme not in {"http", "https"} or not host:
             return None
         port = parsed.port or (443 if scheme == "https" else 80)

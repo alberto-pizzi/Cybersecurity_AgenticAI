@@ -14,8 +14,6 @@ from pathlib import Path
 from typing import Any, TypedDict
 from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 
-from langgraph.graph import END, START, StateGraph
-
 import orchestratorShared as shared
 from orchestratorShared import (
     ALL_TOOLS, ARJUN_TOOL, AUTHORIZATION_TOOL, BASE_TOOLS, BROAD_SCANNER_TIMEOUTS,
@@ -51,12 +49,13 @@ def __getattr__(name: str) -> Any:
 
 
 # Attaches request-level execution metadata used by the endpoint coverage matrix.
-def _tag_coverage_action(result: dict[str, Any], tool: str, *, target_url: str, method: str = 'GET', parameters: list[str] | None = None, source_url: str = '') -> dict[str, Any]:
+def _tag_coverage_action(result: dict[str, Any], tool: str, *, target_url: str, method: str = 'GET', parameters: list[str] | None = None, source_url: str = '', data: str = '') -> dict[str, Any]:
     result['coverage_action'] = {
         'tool': str(tool or ''),
         'target_url': str(target_url or ''),
         'method': str(method or 'GET').upper(),
         'parameters': [str(value) for value in (parameters or []) if str(value)],
+        'body_fingerprint': shared.request_body_fingerprint(method, data, parameters or []),
         'source_url': str(source_url or ''),
     }
     return result
@@ -233,7 +232,7 @@ async def deterministic_broad_scan_node(state: DeterministicState) -> dict[str, 
             sibling_runs: list[dict[str, Any]] = []
             if result.get('status') != 'skipped' and spec.name in {'zap', 'nuclei', 'nikto'}:
                 for sibling_origin in sibling_origins:
-                    sibling_discovery = shared.discovery_for_origin(discovery[name], sibling_origin)
+                    sibling_discovery = shared.discovery_for_origin(discovery[name], sibling_origin, cookies)
                     sibling_timeout = shared.sibling_broad_timeout(spec.name, scanner_timeout)
                     sibling_refresh: dict[str, Any] | None = None
                     if cookies:
@@ -316,7 +315,7 @@ async def deterministic_broad_scan_node(state: DeterministicState) -> dict[str, 
                     empty_limits = empty_limits + 1 if timed_out_empty else 0
                     if result.get('status') in {'success', 'partial'}:
                         discovery[name], _ = enrich_discovery_with_arjun(discovery[name], result, endpoint)
-                _tag_coverage_action(result, 'arjun', target_url=endpoint, method=str(case.get('method', 'GET')), parameters=list(case.get('parameters', [])), source_url=str(case.get('source_url', '')))
+                _tag_coverage_action(result, 'arjun', target_url=endpoint, method=str(case.get('method', 'GET')), parameters=list(case.get('parameters', [])), source_url=str(case.get('source_url', '')), data=str(case.get('data') or ''))
                 arjun_runs.append(result)
                 log_result(name, 'arjun', result, endpoint)
         profile_session_state[name] = session_valid
@@ -338,23 +337,23 @@ async def deterministic_parameter_scan_node(state: DeterministicState) -> dict[s
     no_cookie_executions: set[tuple[str, str, str, tuple[str, ...]]] = set()
 
     # A selected request case is executed and converted into the common tool-result format.
-    async def run_case(spec: ToolSpec, case: dict[str, Any], cookies: str, probe_url: str) -> dict[str, Any]:
+    async def run_case(spec: ToolSpec, case: dict[str, Any], cookies: str, profile_discovery: dict[str, Any]) -> dict[str, Any]:
         url = str(case.get('url', ''))
         effective_cookies = shared.scope_cookie_header(url, cookies)
         skip_reason = _tool_case_skip_reason(spec.name, case, authenticated_profile=bool(effective_cookies or cookies))
         if skip_reason:
-            return _tag_coverage_action(make_skipped_result(spec.name, url, skip_reason), spec.name, target_url=url, method=str(case.get('method', 'GET')), parameters=list(case.get('parameters', [])), source_url=str(case.get('source_url', '')))
+            return _tag_coverage_action(make_skipped_result(spec.name, url, skip_reason), spec.name, target_url=url, method=str(case.get('method', 'GET')), parameters=list(case.get('parameters', [])), source_url=str(case.get('source_url', '')), data=str(case.get('data') or ''))
         timeout = PARAMETER_TOOL_TIMEOUTS.get(spec.name, 120)
         method = str(case.get('method', 'GET')).upper()
-        case_probe = url if method in {'GET', 'HEAD'} else shared.select_application_session_probe_url(discovery.get('authenticated', {}) if cookies else {}, url, str(case.get('source_url') or ''))
+        case_probe = url if method in {'GET', 'HEAD'} else shared.select_application_session_probe_url(profile_discovery if cookies else {}, url, str(case.get('source_url') or ''))
         refresh = (await asyncio.to_thread(refresh_authenticated_session_state, url, cookies, case_probe)) if cookies else {'performed': False, 'usable': True, 'credential_applied': False}
         if refresh.get('usable') is False or (cookies and not refresh.get('credential_applied')):
             skipped = make_skipped_result(spec.name, url, 'The authenticated application session could not be restored before this scanner.') | {'session_state_refresh': refresh}
-            return _tag_coverage_action(skipped, spec.name, target_url=url, method=str(case.get('method', 'GET')), parameters=list(case.get('parameters', [])), source_url=str(case.get('source_url', '')))
+            return _tag_coverage_action(skipped, spec.name, target_url=url, method=str(case.get('method', 'GET')), parameters=list(case.get('parameters', [])), source_url=str(case.get('source_url', '')), data=str(case.get('data') or ''))
         arguments = build_tool_arguments(spec.name, url, cookies, {}, case=case, allow_state_changes=allow_state_changes, timeout_override=timeout)
         result = await call_mcp_with_progress(spec, arguments, timeout_seconds=timeout + 35)
         result['session_state_refresh'] = refresh
-        return _tag_coverage_action(result, spec.name, target_url=url, method=str(case.get('method', 'GET')), parameters=list(case.get('parameters', [])), source_url=str(case.get('source_url', '')))
+        return _tag_coverage_action(result, spec.name, target_url=url, method=str(case.get('method', 'GET')), parameters=list(case.get('parameters', [])), source_url=str(case.get('source_url', '')), data=str(case.get('data') or ''))
     for profile in profiles:
         name, cookies = (profile['name'], profile['cookies'])
         print(f'\n[*] Scanner su parametri - profilo: {name}')
@@ -379,7 +378,13 @@ async def deterministic_parameter_scan_node(state: DeterministicState) -> dict[s
             for case in cases:
                 case_url = str(case.get('url') or '')
                 no_cookie_key = (spec.name, str(case.get('method', 'GET')).upper(), case_url, tuple(sorted(str(value).lower() for value in case.get('parameters', []) if str(value))))
-                if not shared.scope_cookie_header(case_url, cookies):
+                applicable_cookie = shared.scope_cookie_header(case_url, cookies)
+                can_refresh_identity = bool(cookies and shared.runtime_target_auth_available(cookies, case_url))
+                if cookies and not applicable_cookie and not can_refresh_identity:
+                    # Do not spend a specialist slot on a request that this authenticated identity
+                    # can never credential. Anonymous, when enabled, owns the no-cookie equivalent.
+                    continue
+                if not cookies and not applicable_cookie:
                     if no_cookie_key in no_cookie_executions:
                         continue
                     no_cookie_executions.add(no_cookie_key)
@@ -393,7 +398,7 @@ async def deterministic_parameter_scan_node(state: DeterministicState) -> dict[s
                 budget_detail += f"; routing reserve={budget['coverage_reserve_used']}/{budget['coverage_reserve_max']}; effective max={budget['effective_max']}"
             print(f"    [INFO   ] {spec.name}: casi selezionati={len(cases)} (GET={get_count}, POST={len(cases) - get_count}); {budget_detail}")
             for case in cases:
-                result = await run_case(spec, case, cookies, probe_url)
+                result = await run_case(spec, case, cookies, discovery[name])
                 grouped[spec.name].append(result)
                 log_result(name, spec.name, result, f"{case.get('method', 'GET')} {case.get('url', '')}")
         for spec in PARAMETER_TOOLS:
@@ -426,12 +431,17 @@ async def deterministic_authorization_node(state: DeterministicState) -> dict[st
         state_changes_allowed = bool(state.get('workflow_state_changes', False))
         cases = [
             case for case in select_authorization_request_cases(discovery[name])
-            if shared.scope_cookie_header(str(case.get('url') or ''), cookies)
+            if (shared.scope_cookie_header(str(case.get('url') or ''), cookies) or shared.runtime_target_auth_available(cookies, str(case.get('url') or '')))
             and (state_changes_allowed or not shared.request_case_state_change_reason(case))
         ]
         authorization_selection_summary[name] = [{'method': 'GET', 'url': str(case.get('url', '')), 'parameters': list(case.get('parameters', [])), 'priority_score': case.get('priority_score'), 'adaptive_budget': bool(case.get('adaptive_budget')), 'adaptive_budget_evidence': list(case.get('adaptive_budget_evidence', []))} for case in cases]
+        comparison_identities = [
+            {'label': str(other.get('identity_ref') or other.get('name') or 'alternate'), 'cookies': str(other.get('cookies') or '')}
+            for other in profiles
+            if str(other.get('name') or '') != name and str(other.get('cookies') or '')
+        ]
         authorization_budget = shared.specialist_budget_diagnostics('authorization', cases)
-        print(f"\n[*] Authorization differential - profilo: {name}\n    [INFO   ] authorization: casi selezionati={len(cases)}; base={authorization_budget['base']}; adaptive={authorization_budget['adaptive_used']}; adaptive max={authorization_budget['adaptive_max']}; seconda identità={('sì' if secondary_cookies else 'no')}")
+        print(f"\n[*] Authorization differential - profilo: {name}\n    [INFO   ] authorization: casi selezionati={len(cases)}; base={authorization_budget['base']}; adaptive={authorization_budget['adaptive_used']}; adaptive max={authorization_budget['adaptive_max']}; identità alternative={len(comparison_identities)}")
         runs: list[dict[str, Any]] = []
         probe_url = select_session_probe_url(discovery[name], target)
         for case in cases:
@@ -441,10 +451,10 @@ async def deterministic_authorization_node(state: DeterministicState) -> dict[st
             if state_refresh.get('usable') is False or not state_refresh.get('credential_applied'):
                 result = make_skipped_result('authorization', case_url, 'The primary authenticated session could not be restored before authorization comparison.') | {'session_state_refresh': state_refresh}
             else:
-                arguments = build_tool_arguments('authorization', case_url, cookies, discovery[name], case=case, secondary_cookies=secondary_cookies, timeout_override=PARAMETER_TOOL_TIMEOUTS.get('authorization', 40))
+                arguments = build_tool_arguments('authorization', case_url, cookies, discovery[name], case=case, secondary_cookies=secondary_cookies, comparison_identities=comparison_identities, timeout_override=PARAMETER_TOOL_TIMEOUTS.get('authorization', 40))
                 result = await call_mcp_with_progress(AUTHORIZATION_TOOL, arguments, timeout_seconds=PARAMETER_TOOL_TIMEOUTS.get('authorization', 40) + 30)
                 result['session_state_refresh'] = state_refresh
-            _tag_coverage_action(result, 'authorization', target_url=str(case.get('url', target)), method='GET', parameters=list(case.get('parameters', [])), source_url=str(case.get('source_url', '')))
+            _tag_coverage_action(result, 'authorization', target_url=str(case.get('url', target)), method='GET', parameters=list(case.get('parameters', [])), source_url=str(case.get('source_url', '')), data=str(case.get('data') or ''))
             runs.append(result)
             log_result(name, 'authorization', result, str(case.get('url', target)))
         results[name]['authorization'] = aggregate_runs('authorization', target, runs) if runs else make_skipped_result('authorization', target, 'No discovered read-only request contained a plausible identity, object or privileged-resource signal.')
@@ -471,11 +481,11 @@ async def deterministic_browser_workflow_node(state: DeterministicState) -> dict
         case_probe = url if method in {'GET', 'HEAD'} else shared.select_application_session_probe_url(profile_discovery, url, str(case.get('source_url') or ''))
         refresh = (await asyncio.to_thread(refresh_authenticated_session_state, url, cookies, case_probe)) if cookies else {'performed': False, 'usable': True, 'credential_applied': False}
         if refresh.get('usable') is False or (cookies and not refresh.get('credential_applied')):
-            return _tag_coverage_action(make_skipped_result(tool, url, f'The authenticated application session could not be restored before {tool} verification.'), tool, target_url=url, method=str(case.get('method', 'GET')), parameters=list(case.get('parameters', [])), source_url=str(case.get('source_url', '')))
+            return _tag_coverage_action(make_skipped_result(tool, url, f'The authenticated application session could not be restored before {tool} verification.'), tool, target_url=url, method=str(case.get('method', 'GET')), parameters=list(case.get('parameters', [])), source_url=str(case.get('source_url', '')), data=str(case.get('data') or ''))
         arguments = build_tool_arguments(tool, url, cookies, profile_discovery, case=case, allow_state_changes=allow_state_changes)
         result = await call_mcp_with_progress(specs[tool], arguments, timeout_seconds=PARAMETER_TOOL_TIMEOUTS[tool] + 35)
         result['session_state_refresh'] = refresh
-        return _tag_coverage_action(result, tool, target_url=url, method=str(case.get('method', 'GET')), parameters=list(case.get('parameters', [])), source_url=str(case.get('source_url', '')))
+        return _tag_coverage_action(result, tool, target_url=url, method=str(case.get('method', 'GET')), parameters=list(case.get('parameters', [])), source_url=str(case.get('source_url', '')), data=str(case.get('data') or ''))
     for profile in profiles:
         name, cookies = (profile['name'], profile['cookies'])
         selection_summary[name] = {'browser': [], 'workflow': []}
@@ -502,7 +512,11 @@ async def deterministic_browser_workflow_node(state: DeterministicState) -> dict
             for case in cases:
                 case_url = str(case.get('url') or '')
                 key = (tool, str(case.get('method', 'GET')).upper(), case_url, tuple(sorted(str(value).lower() for value in case.get('parameters', []) if str(value))))
-                if not shared.scope_cookie_header(case_url, cookies):
+                applicable_cookie = shared.scope_cookie_header(case_url, cookies)
+                can_refresh_identity = bool(cookies and shared.runtime_target_auth_available(cookies, case_url))
+                if cookies and not applicable_cookie and not can_refresh_identity:
+                    continue
+                if not cookies and not applicable_cookie:
                     if key in no_cookie_workflow_executions:
                         continue
                     no_cookie_workflow_executions.add(key)
@@ -522,7 +536,7 @@ async def deterministic_browser_workflow_node(state: DeterministicState) -> dict
         for case in browser_cases:
             url = str(case.get('url', target))
             if browser_unavailable:
-                result = _tag_coverage_action(make_skipped_result('browser', url, 'Playwright was unavailable in the first browser run; remaining browser cases were not repeated.'), 'browser', target_url=url, method=str(case.get('method', 'GET')), parameters=list(case.get('parameters', [])), source_url=str(case.get('source_url', '')))
+                result = _tag_coverage_action(make_skipped_result('browser', url, 'Playwright was unavailable in the first browser run; remaining browser cases were not repeated.'), 'browser', target_url=url, method=str(case.get('method', 'GET')), parameters=list(case.get('parameters', [])), source_url=str(case.get('source_url', '')), data=str(case.get('data') or ''))
             else:
                 result = await run_case('browser', case, cookies, profile_discovery, probe_url)
                 if result.get('diagnosis') in {'missing_playwright', 'missing_playwright_browser'}:
@@ -580,7 +594,7 @@ async def deterministic_special_checks_node(state: DeterministicState) -> dict[s
             oast_class = str(oast_case.get('oast_class') or 'explicit')
             if oast_class in confirmed_oast_classes:
                 skipped_duplicate = make_skipped_result('interactsh', oast_case.get('source_url', target), f'A callback was already confirmed for the same OAST class ({oast_class}); the duplicate wait was omitted.')
-                _tag_coverage_action(skipped_duplicate, 'interactsh', target_url=str(oast_case.get('source_url') or target), method=str(oast_case.get('method', 'GET')), parameters=list(oast_case.get('parameters', [])), source_url=str(oast_case.get('source_url', '')))
+                _tag_coverage_action(skipped_duplicate, 'interactsh', target_url=str(oast_case.get('source_url') or target), method=str(oast_case.get('method', 'GET')), parameters=list(oast_case.get('parameters', [])), source_url=str(oast_case.get('source_url', '')), data=str(oast_case.get('data') or ''))
                 interactsh_runs.append(skipped_duplicate)
                 log_result(name, 'interactsh', skipped_duplicate, oast_case.get('source_url', target))
                 continue
@@ -595,7 +609,7 @@ async def deterministic_special_checks_node(state: DeterministicState) -> dict[s
             oast_cookies = shared.scope_cookie_header(oast_request_url, profile['cookies'])
             result = await call_mcp_with_progress(interactsh_spec, {'target_url': target, 'injection_url': oast_case['injection_url'], 'cookies': oast_cookies, 'method': oast_case.get('method', 'GET'), 'data': oast_case.get('data', ''), 'parameter': oast_case.get('parameter', ''), 'timeout': oast_timeout, 'request_rate': shared.MAX_REQUEST_RATE}, timeout_seconds=oast_timeout + 35)
             result['oast_class'] = oast_class
-            _tag_coverage_action(result, 'interactsh', target_url=str(oast_case.get('source_url') or target), method=str(oast_case.get('method', 'GET')), parameters=list(oast_case.get('parameters', [])), source_url=str(oast_case.get('source_url', '')))
+            _tag_coverage_action(result, 'interactsh', target_url=str(oast_case.get('source_url') or target), method=str(oast_case.get('method', 'GET')), parameters=list(oast_case.get('parameters', [])), source_url=str(oast_case.get('source_url', '')), data=str(oast_case.get('data') or ''))
             interactsh_runs.append(result)
             log_result(name, 'interactsh', result, oast_case.get('source_url', target))
             if result.get('callback_confirmed'):
@@ -798,7 +812,7 @@ async def deterministic_verification_node(state: DeterministicState) -> dict[str
                     _reconcile_deterministic_browser_result(results, profile_name, source_result, case, result)
                     if result.get('diagnosis') in {'missing_playwright', 'missing_playwright_browser'}:
                         browser_unavailable = True
-            _tag_coverage_action(result, 'browser', target_url=url, method=str(case.get('method', 'GET')), parameters=list(case.get('parameters', [])), source_url=str(case.get('source_url', '')))
+            _tag_coverage_action(result, 'browser', target_url=url, method=str(case.get('method', 'GET')), parameters=list(case.get('parameters', [])), source_url=str(case.get('source_url', '')), data=str(case.get('data') or ''))
             key = f'browser_final_verification_{index}'
             results.setdefault(profile_name, {})[key] = result
             log_result(profile_name, 'browser', result, url)
@@ -834,7 +848,7 @@ async def deterministic_verification_node(state: DeterministicState) -> dict[str
                  'method': str(logout_case.get('method') or 'GET'), 'data': str(logout_case.get('data') or ''), 'timeout': 25, 'request_rate': shared.MAX_REQUEST_RATE},
                 timeout_seconds=30,
             )
-            _tag_coverage_action(result, 'session-logout', target_url=logout_url, method=str(logout_case.get('method', 'GET')), source_url=str(logout_case.get('source_url', '')))
+            _tag_coverage_action(result, 'session-logout', target_url=logout_url, method=str(logout_case.get('method', 'GET')), source_url=str(logout_case.get('source_url', '')), data=str(logout_case.get('data') or ''))
             key = 'session_logout_final' if index == 1 else f'session_logout_final_{index}'
             results.setdefault(profile_name, {})[key] = result
             log_result(profile_name, 'session-logout', result, logout_url)
@@ -858,7 +872,7 @@ async def deterministic_report_node(state: DeterministicState) -> dict[str, Any]
     workflow_selection_summary = state.get('workflow_selection_summary', {})
     verification_selection_summary = state.get('verification_selection_summary', {})
     authorization_selection_summary = state.get('authorization_selection_summary', {})
-    context = {'profiles': [{'name': profile['name'], 'authenticated': bool(profile.get('cookies')) and discovery.get(profile['name'], {}).get('authentication_effective') is not False} for profile in profiles],
+    context = {'profiles': [{'name': profile['name'], 'identity_ref': str(profile.get('identity_ref') or ''), 'authenticated': bool(profile.get('cookies')) and discovery.get(profile['name'], {}).get('authentication_effective') is not False} for profile in profiles],
         'explicit_entry_points': list(state.get('entry_points') or []),
         'priority_discovery_seeds': list(state.get('discovery_seeds') or []),
         'expected_tools': [spec.name for spec in (*BASE_TOOLS, ARJUN_TOOL, *PARAMETER_TOOLS, AUTHORIZATION_TOOL, *WORKFLOW_TOOLS, OPTIONAL_TOOLS[0], OPTIONAL_TOOLS[1])],
@@ -881,7 +895,15 @@ async def deterministic_report_node(state: DeterministicState) -> dict[str, Any]
         'workflow_selection': workflow_selection_summary,
         'verification_selection': verification_selection_summary,
         'authorization_selection': authorization_selection_summary,
-        'secondary_identity_supplied': bool(secondary_cookies),
+        'authenticated_identity_count': sum(
+            1 for profile in profiles
+            if bool(profile.get('cookies')) and discovery.get(profile['name'], {}).get('authentication_effective') is not False
+        ),
+        # Compatibility alias for old report readers. Multi-identity reports should use authenticated_identity_count.
+        'secondary_identity_supplied': bool(secondary_cookies) or sum(
+            1 for profile in profiles
+            if bool(profile.get('cookies')) and discovery.get(profile['name'], {}).get('authentication_effective') is not False
+        ) >= 2,
         'parameter_tool_timeouts': PARAMETER_TOOL_TIMEOUTS,
         'broad_scanner_timeouts': BROAD_SCANNER_TIMEOUTS,
         'scan_mode': shared.CURRENT_SCAN_MODE,
@@ -1016,6 +1038,7 @@ async def run_single_tool_debug(*, tool: str, target: str, cookies: str, mode: s
 
 # Builds the ordered LangGraph used by the deterministic pipeline.
 def build_deterministic_graph() -> Any:
+    from langgraph.graph import END, START, StateGraph
     graph = StateGraph(DeterministicState)
     graph.add_node("discovery", deterministic_discovery_node)
     graph.add_node("broad_scan", deterministic_broad_scan_node)

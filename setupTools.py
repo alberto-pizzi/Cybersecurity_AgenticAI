@@ -1,6 +1,7 @@
 from __future__ import annotations
 import json
 import importlib.metadata
+import inspect
 import os
 import platform
 import re
@@ -350,7 +351,7 @@ def install_idor_forge() -> dict[str, Any]:
     runtime_requirements = _idor_forge_runtime_requirements(requirements)
     print('[*] IDOR-Forge runtime dependencies: ' + ', '.join(runtime_requirements))
     run([str(venv_python), '-m', 'pip', 'install', '--disable-pip-version-check', *runtime_requirements], timeout=3600, cwd=IDOR_FORGE_DIR)
-    probe = run([str(venv_python), '-c', "import matplotlib; from core.IDORChecker import IDORChecker; print('IDOR-Forge import OK')"], required=False, capture=True, show_output=False, timeout=120, cwd=IDOR_FORGE_DIR, env_overrides={'MPLBACKEND': 'Agg'})
+    probe = run([str(venv_python), '-c', "import inspect, matplotlib; from core.IDORChecker import IDORChecker; init=inspect.signature(IDORChecker.__init__).parameters; check=inspect.signature(IDORChecker.check_idor).parameters; need_init={'url','delay','headers','timeout','verbose','max_workers','max_retries','logger'}; need_check={'parameter','test_values','method','max_workers'}; assert need_init.issubset(init), f'IDORChecker.__init__ missing {sorted(need_init-set(init))}'; assert need_check.issubset(check), f'IDORChecker.check_idor missing {sorted(need_check-set(check))}'; assert callable(getattr(IDORChecker,'_generate_payloads',None)), 'IDORChecker._generate_payloads missing'; print('IDOR-Forge API contract OK')"], required=False, capture=True, show_output=False, timeout=120, cwd=IDOR_FORGE_DIR, env_overrides={'MPLBACKEND': 'Agg'})
     if probe.returncode:
         detail = '\n'.join(filter(None, ((probe.stdout or '').strip(), (probe.stderr or '').strip())))
         raise RuntimeError('IDOR-Forge dependency preflight failed.\n' + detail[-2500:])
@@ -719,7 +720,7 @@ def _help_has_flag(help_text: str, flag: str) -> bool:
 def _validate_arjun_cli(executable: str) -> dict[str, Any]:
     result = run([executable, '--help'], required=False, capture=True, show_output=False, timeout=60)
     help_text = _process_output(result, 12000)
-    required = ('-u', '-m', '-w', '-t', '-T', '-c', '--disable-redirects')
+    required = ('-u', '-m', '-w', '-t', '-T', '-c', '-q', '--include', '--headers', '--disable-redirects')
     missing = [flag for flag in required if not _help_has_flag(help_text, flag)]
     output_flag = '-oJ' if _help_has_flag(help_text, '-oJ') else '-o' if _help_has_flag(help_text, '-o') else ''
     rate_flag = '--rate-limit' if _help_has_flag(help_text, '--rate-limit') else '--ratelimit' if _help_has_flag(help_text, '--ratelimit') else ''
@@ -993,23 +994,46 @@ def _validate_cli_contract(name: str, command: list[str], required_flags: tuple[
 
 def validate_scanner_cli_contracts() -> dict[str, Any]:
     results: dict[str, Any] = {}
+    sqlmap_api = LOCAL_OPT / 'sqlmap' / 'sqlmapapi.py'
+    if sqlmap_api.is_file():
+        results['sqlmap-api'] = _validate_cli_contract(
+            'SQLMap REST API', [sys.executable, str(sqlmap_api), '-h'],
+            ('-s', '-H', '-p', '--username', '--password'), accepted_codes=(0,),
+        )
+    commix_script = LOCAL_OPT / 'commix' / 'commix.py'
+    if commix_script.is_file():
+        results['commix'] = _validate_cli_contract(
+            'Commix', [sys.executable, str(commix_script), '--help'],
+            ('--url', '--batch', '--ignore-session', '--disable-coloring', '--ignore-redirects', '--level', '--timeout', '--retries', '--drop-set-cookie', '--time-limit', '--delay', '--data', '-p', '--cookie'),
+            accepted_codes=(0,),
+        )
     ffuf = command_path('ffuf')
     if ffuf:
         results['ffuf'] = _validate_cli_contract(
-            'FFUF', [ffuf, '-h'], ('-u', '-w', '-of', '-o', '-t', '-rate', '-timeout', '-maxtime', '-noninteractive'),
+            'FFUF', [ffuf, '-h'], ('-u', '-w', '-of', '-o', '-ac', '-t', '-rate', '-timeout', '-maxtime', '-noninteractive', '-b'),
         )
     interactsh = command_path('interactsh-client')
     if interactsh:
         results['interactsh-client'] = _validate_cli_contract(
-            'Interactsh', [interactsh, '-h'], ('-n', '-pi', '-json', '-psf', '-o'),
+            'Interactsh', [interactsh, '-h'], ('-n', '-pi', '-json', '-v', '-duc', '-ps', '-psf', '-o'),
         )
     dalfox = command_path('dalfox')
     if dalfox:
         scan = run([dalfox, 'scan', '--help'], required=False, capture=True, show_output=False, timeout=90)
         legacy = run([dalfox, 'url', '--help'], required=False, capture=True, show_output=False, timeout=90)
         scan_help, legacy_help = _process_output(scan, 16000), _process_output(legacy, 16000)
-        v3_ok = all(_help_has_flag(scan_help, flag) for flag in ('--format', '--output', '--param'))
-        v2_ok = bool(legacy_help) and (scan.returncode in (0, 1, 2) or legacy.returncode in (0, 1, 2))
+        v3_required = ('--format', '--output', '--param', '--cookies', '--no-color', '--silence', '--method', '--data')
+        v3_ok = all(_help_has_flag(scan_help, flag) for flag in v3_required)
+        v2_param_ok = _help_has_flag(legacy_help, '--param') or _help_has_flag(legacy_help, '-p')
+        v2_cookie_ok = _help_has_flag(legacy_help, '--cookies') or _help_has_flag(legacy_help, '--cookie')
+        v2_required = ('--method', '--data')
+        v2_ok = (
+            bool(legacy_help)
+            and legacy.returncode in (0, 1, 2)
+            and v2_param_ok
+            and v2_cookie_ok
+            and all(_help_has_flag(legacy_help, flag) for flag in v2_required)
+        )
         if not (v3_ok or v2_ok):
             raise RuntimeError('Dalfox CLI contract validation failed: neither supported scan-mode nor legacy URL-mode help was detected.')
         results['dalfox'] = {'v3': v3_ok, 'v2': v2_ok}
@@ -1017,7 +1041,7 @@ def validate_scanner_cli_contracts() -> dict[str, Any]:
     nuclei = command_path('nuclei')
     if nuclei and nuclei_mode != 'docker_official_image':
         results['nuclei'] = _validate_cli_contract(
-            'Nuclei', [nuclei, '-h'], ('-l', '-jsonl', '-silent', '-nc', '-o', '-duc', '-no-stdin', '-c', '-bs', '-pc', '-rl', '-timeout', '-retries', '-dr', '-H', '-dast', '-im', '-fm', '-fa', '-fuzz-param-frequency', '-t', '-severity', '-ni', '-tags', '-etags'),
+            'Nuclei', [nuclei, '-h'], ('-l', '-jsonl', '-silent', '-nc', '-o', '-duc', '-no-stdin', '-c', '-bs', '-pc', '-rl', '-timeout', '-retries', '-dr', '-H', '-dast', '-im', '-fm', '-fa', '-fuzz-param-frequency', '-t', '-severity', '-ni', '-tags', '-etags', '-tl'),
         )
     elif nuclei_mode == 'docker_official_image':
         docker = command_path('docker')
@@ -1026,19 +1050,57 @@ def validate_scanner_cli_contracts() -> dict[str, Any]:
             raise RuntimeError('Nuclei Docker mode is selected but docker is not available for CLI contract validation.')
         results['nuclei'] = _validate_cli_contract(
             'Nuclei Docker', [docker, 'run', '--rm', image, '-h'],
-            ('-l', '-jsonl', '-silent', '-nc', '-o', '-duc', '-no-stdin', '-c', '-bs', '-pc', '-rl', '-timeout', '-retries', '-dr', '-H', '-dast', '-im', '-fm', '-fa', '-fuzz-param-frequency', '-t', '-severity', '-ni', '-tags', '-etags'),
+            ('-l', '-jsonl', '-silent', '-nc', '-o', '-duc', '-no-stdin', '-c', '-bs', '-pc', '-rl', '-timeout', '-retries', '-dr', '-H', '-dast', '-im', '-fm', '-fa', '-fuzz-param-frequency', '-t', '-severity', '-ni', '-tags', '-etags', '-tl'),
         )
         results['nuclei']['validated_by'] = 'official_docker_help_and_dast_runtime'
     nikto = command_path('nikto')
     if nikto:
         try:
             results['nikto'] = _validate_cli_contract(
-                'Nikto', [nikto, '-Help'], ('-h', '-maxtime', '-Pause', '-Format', '-o', '-Tuning'),
+                'Nikto', [nikto, '-Help'], ('-host', '-nointeractive', '-ask', '-timeout', '-maxtime', '-Pause', '-Format', '-output', '-Tuning', '-Display', '-Cgidirs', '-Option', '-nocookies'),
             )
         except RuntimeError as exc:
             # Some distro launchers emit reduced help; runtime still has a structured native/Docker fallback.
             results['nikto'] = {'warning': str(exc)[-1200:]}
             print('[!] Nikto CLI help could not prove every wrapper option; runtime fallback remains enabled.', file=sys.stderr)
+    return results
+
+
+# Validate Python API method names used by wrappers before an assessment can start.
+def validate_scanner_python_contracts() -> dict[str, Any]:
+    results: dict[str, Any] = {}
+    try:
+        from zapv2 import ZAPv2
+    except Exception as exc:
+        raise RuntimeError(f'ZAP Python API import failed: {type(exc).__name__}: {exc}') from exc
+    zap = ZAPv2()
+    zap_contract = {
+        'spider': ('scan', 'stop', 'exclude_from_scan', 'set_option_logout_avoidance', 'set_option_accept_cookies'),
+        'ascan': ('enable_all_scanners', 'disable_all_scanners', 'enable_scanners', 'set_scanner_attack_strength', 'set_option_thread_per_host', 'set_option_delay_in_ms', 'scan', 'scan_as_user', 'stop', 'remove_scan', 'exclude_from_scan'),
+        'core': ('urls', 'set_mode', 'send_request', 'messages', 'alerts', 'new_session'),
+        'context': ('new_context', 'include_in_context', 'set_context_in_scope', 'exclude_from_context', 'remove_context'),
+        'replacer': ('remove_rule', 'add_rule'),
+        'httpsessions': ('add_session_token', 'create_empty_session', 'set_session_token_value', 'set_active_session', 'active_session'),
+        'sessionManagement': ('set_session_management_method',),
+        'authentication': ('set_authentication_method',),
+        'users': ('new_user', 'set_cookie', 'set_user_enabled', 'get_authentication_session'),
+        'pscan': ('set_scan_only_in_scope', 'enable_all_scanners'),
+    }
+    missing: list[str] = []
+    for component_name, method_names in zap_contract.items():
+        component = getattr(zap, component_name, None)
+        if component is None:
+            missing.append(component_name + '.*')
+            continue
+        for method_name in method_names:
+            if not callable(getattr(component, method_name, None)):
+                missing.append(component_name + '.' + method_name)
+    if missing:
+        raise RuntimeError('ZAP Python API contract validation failed; missing methods: ' + ', '.join(missing))
+    results['zaproxy'] = {
+        'validated_methods': sum(len(methods) for methods in zap_contract.values()),
+        'components': sorted(zap_contract),
+    }
     return results
 
 # Installs or updates every external scanner required by the project.
@@ -1062,6 +1124,8 @@ def install_scanners() -> None:
     _NUCLEI_TEMPLATE_STATE.update(nuclei_templates)
     cli_contracts = validate_scanner_cli_contracts()
     print(f"[+] Scanner CLI contracts validated: {', '.join(sorted(cli_contracts))}")
+    python_contracts = validate_scanner_python_contracts()
+    print(f"[+] Scanner Python API contracts validated: {', '.join(sorted(python_contracts))}")
 
 # Scanner resolution locates the executable or launcher that will actually be invoked.
 def scanner_status() -> dict[str, str | None]:

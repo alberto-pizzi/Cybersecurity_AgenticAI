@@ -11,23 +11,44 @@
     "discover_same_host_services": true
   },
   "credentials": {
-    "portal_primary": {
+    "portal_user": {
       "kind": "browser_oidc",
-      "cookie_env": "SECOPS_PORTAL_PRIMARY_COOKIE",
-      "username_env": "SECOPS_PORTAL_PRIMARY_USERNAME",
-      "password_env": "SECOPS_PORTAL_PRIMARY_PASSWORD",
+      "cookie_env": "SECOPS_PORTAL_USER_COOKIE",
+      "username_env": "SECOPS_PORTAL_USER_USERNAME",
+      "password_env": "SECOPS_PORTAL_USER_PASSWORD",
       "login_path": "/app/",
       "validation_path": "/app/",
       "headless": true,
       "timeout_seconds": 60,
-      "optional": true,
+      "optional": false,
       "reuse_on_authorized_siblings": true,
-      "purpose": "Primary OIDC web identity. An existing cookie is tried first on its configured origin and on discovered same-host/same-scheme ports only when allow_same_host_ports=true; it is never copied to a different hostname. If validation fails, saved browser/OIDC state is tried and the original username/password may be reused only after the browser reaches the same issuer/realm. No second console prompt is opened."
+      "purpose": "Ordinary user identity. Cookie is tried first; if the environment does not provide a usable session or username/password, assessmentRunner asks once in the console for this identity."
     },
-    "portal_secondary": {
-      "kind": "cookie",
-      "env": "SECOPS_PORTAL_SECONDARY_COOKIE",
-      "purpose": "Second identity for authorization comparisons"
+    "portal_editor": {
+      "kind": "browser_oidc",
+      "cookie_env": "SECOPS_PORTAL_EDITOR_COOKIE",
+      "username_env": "SECOPS_PORTAL_EDITOR_USERNAME",
+      "password_env": "SECOPS_PORTAL_EDITOR_PASSWORD",
+      "login_path": "/app/",
+      "validation_path": "/app/",
+      "headless": true,
+      "timeout_seconds": 60,
+      "optional": false,
+      "reuse_on_authorized_siblings": true,
+      "purpose": "Second account/role. Missing environment credentials are prompted independently, so authorization/BOLA checks can compare this identity with the others."
+    },
+    "portal_admin": {
+      "kind": "browser_oidc",
+      "cookie_env": "SECOPS_PORTAL_ADMIN_COOKIE",
+      "username_env": "SECOPS_PORTAL_ADMIN_USERNAME",
+      "password_env": "SECOPS_PORTAL_ADMIN_PASSWORD",
+      "login_path": "/app/",
+      "validation_path": "/app/",
+      "headless": true,
+      "timeout_seconds": 60,
+      "optional": false,
+      "reuse_on_authorized_siblings": true,
+      "purpose": "Higher-privilege example identity. It becomes a separate authenticated profile; scanners run with its own session rather than merging credentials."
     }
   },
   "assets": [
@@ -39,11 +60,14 @@
         {
           "id": "https-main-by-url",
           "url": "https://portal.example.internal/app/",
-          "credential_ref": "portal_primary",
-          "secondary_credential_ref": "portal_secondary",
-          "auth_only": true,
+          "auth_only": false,
           "allow_state_changes": false,
-          "notes": "Absolute-URL form. When url is set it takes precedence over asset.host, service.port, protocol and base_path. portal_primary opts into authorized-sibling OIDC/SSO reuse: saved SSO state is tried first and the initially resolved username/password are reused automatically only after the browser reaches the same primary OIDC issuer/realm."
+          "notes": "Absolute-URL form. Three configured identities become distinct authenticated profiles, in addition to anonymous because auth_only=false. If their env vars are missing, the runner prompts once per identity. Authorization/BOLA compares the active identity with every other available identity.",
+          "credential_refs": [
+            "portal_user",
+            "portal_editor",
+            "portal_admin"
+          ]
         },
         {
           "id": "http-redirect",
@@ -66,10 +90,14 @@
           "protocol": "https",
           "port": 8443,
           "base_path": "/api/",
-          "credential_ref": "portal_primary",
-          "auth_only": true,
+          "auth_only": false,
           "allow_state_changes": false,
-          "notes": "Host/IP + port form with explicit HTTPS because 8443 is a non-standard HTTPS port. It reuses portal_primary as an identity reference, but the runner obtains/validates a separate exact-origin application session for this sibling rather than copying the primary Cookie header."
+          "notes": "Host/IP + port form with explicit HTTPS. Each configured identity is resolved independently for this service; same-host/OIDC reuse remains subject to the authorization and issuer/realm safeguards.",
+          "credential_refs": [
+            "portal_user",
+            "portal_editor",
+            "portal_admin"
+          ]
         },
         {
           "id": "ssh-inventory",

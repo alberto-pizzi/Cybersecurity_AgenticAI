@@ -22,7 +22,7 @@ warnings.filterwarnings("ignore", message=r".*authlib\.jose.*deprecated.*")
 import requests
 import orchestratorShared as shared
 from orchestratorShared import (
-    BROAD_SCANNER_TIMEOUTS, PARAMETER_TOOL_TIMEOUTS, _tool_case_skip_reason,
+    BROAD_SCANNER_TIMEOUTS, PARAMETER_TOOL_TIMEOUTS,
     build_tool_arguments, call_mcp, call_mcp_with_progress, diagnose_error,
     discover_target, discover_target_sync_safe, enrich_discovery_with_arjun, enrich_discovery_with_ffuf,
     iter_leaf_results, log_result, log_zap_session_diagnostics, make_skipped_result,
@@ -90,6 +90,16 @@ AI_PLANNER_CONTEXT_WINDOWS = {
     'balanced': 8192,
     'deep': 12288,
 }
+# Concrete-action planning is batched so large multi-identity catalogs remain tractable without
+# turning prompt size into a security-policy decision. Context limits may change batch size/context
+# representation, but every eligible concrete action must still be presented to the AI.
+AI_PLANNER_CONTEXT_WINDOWS_MAX = {
+    'fast': 12288,
+    'balanced': 16384,
+    'deep': 24576,
+}
+PLANNER_CONTEXT_BYTES_PER_TOKEN_ESTIMATE = 3
+PLANNER_CONTEXT_SAFETY_TOKENS = 512
 
 # Same CPU-only-Ollama rationale as AI_PLANNER_TIMEOUTS above: this is a hard ceiling on
 # batch_budget (analysis_node caps it with min(ai_timeout, this value)), so raising --ai-timeout
@@ -108,70 +118,81 @@ BROAD_COVERAGE_TOOLS = ('ffuf', 'zap', 'nuclei', 'session', 'nikto')
 PARAMETER_COVERAGE_TOOLS = ('sqlmap', 'dalfox', 'commix', 'traversal', 'idor')
 AUTHORIZATION_COVERAGE_TOOLS = ('authorization',)
 WORKFLOW_COVERAGE_TOOLS = ('browser', 'workflow')
-# Broad baseline coverage and cheap local JWT analysis are mandatory when discovery makes them eligible.
-# The AI still chooses complementary specialist/workflow groups; it cannot accidentally omit the baseline.
-AGENTIC_BASELINE_TOOLS = ('ffuf', 'zap', 'nuclei', 'session', 'nikto', 'jwt')
-# Planner choices are tool/capability groups. Tool-group quotas remain independent per profile,
-# while the concrete execution budget is GLOBAL for the round so anonymous+authenticated work
-# cannot silently multiply the wall-clock/traffic budget. The existing names are retained for
-# compatibility with older review snapshots, but their values now describe the normal round floor.
-PROFILE_EXECUTION_ACTION_BUDGETS = {'fast': 120, 'balanced': 420, 'deep': 760}
-# Concrete execution has a small evidence-backed overflow from round 1 and a bounded growth step
-# on later rounds. The base remains the normal capacity; overflow is never filled merely because
-# more actions exist. This preserves adaptive breadth without returning to hundreds of sequential
-# specialist invocations in one balanced round.
-PROFILE_EXECUTION_ACTION_OVERFLOW_INITIAL = {'fast': 24, 'balanced': 96, 'deep': 160}
-PROFILE_EXECUTION_ACTION_OVERFLOW_STEP = {'fast': 16, 'balanced': 64, 'deep': 96}
-PROFILE_EXECUTION_ACTION_OVERFLOW_MAX = {'fast': 64, 'balanced': 224, 'deep': 384}
-PROFILE_EXECUTION_ACTION_MAX = {
-    mode: PROFILE_EXECUTION_ACTION_BUDGETS[mode] + PROFILE_EXECUTION_ACTION_OVERFLOW_MAX[mode]
-    for mode in PROFILE_EXECUTION_ACTION_BUDGETS
-}
-# Absolute concrete-action cap for one Agentic round across ALL active profiles. BALANCED
-# deliberately allows deterministic baseline pressure to lift the normal 420/516/580/644
-# envelope, but never beyond 800 total actions in one round. Fast/deep retain their configured
-# normal maxima; changing these caps is explicit and is never inferred from the number of profiles.
-ROUND_EXECUTION_ACTION_HARD_CAPS = {
-    'fast': PROFILE_EXECUTION_ACTION_MAX['fast'],
+# In normal Agentic mode no scanner, tool, capability family or request is mandatory. Python
+# derives concrete discovery-backed action candidates and enforces only scope/safety/resource limits;
+# the AI decides which concrete actions are useful. Deterministic mode remains the fixed pipeline.
+#
+# These are GLOBAL per-round execution ceilings, not coverage baselines and not minimums. They never
+# cause an action to run by themselves. The planner may select fewer actions, including zero.
+ROUND_EXECUTION_ACTION_REFERENCE_CAPS = {
+    'fast': 300,
     'balanced': 800,
-    'deep': PROFILE_EXECUTION_ACTION_MAX['deep'],
+    'deep': 1144,
+}
+# Compatibility alias used by older report/validation code. It now means the normal global round
+# ceiling; it is not a per-profile target and must not be interpreted as deterministic coverage.
+PROFILE_EXECUTION_ACTION_BUDGETS = dict(ROUND_EXECUTION_ACTION_REFERENCE_CAPS)
+PROFILE_EXECUTION_ACTION_OVERFLOW_INITIAL = {mode: 0 for mode in ROUND_EXECUTION_ACTION_REFERENCE_CAPS}
+PROFILE_EXECUTION_ACTION_OVERFLOW_STEP = {mode: 0 for mode in ROUND_EXECUTION_ACTION_REFERENCE_CAPS}
+PROFILE_EXECUTION_ACTION_OVERFLOW_MAX = {mode: 0 for mode in ROUND_EXECUTION_ACTION_REFERENCE_CAPS}
+PROFILE_EXECUTION_ACTION_MAX = dict(ROUND_EXECUTION_ACTION_REFERENCE_CAPS)
+# The AI may explicitly ask for up to +12.5% capacity when useful selected actions would otherwise
+# exceed the normal ceiling. Python validates the request and still enforces scope and safety.
+ROUND_EXECUTION_ADAPTIVE_CEILING_NUMERATOR = 9
+ROUND_EXECUTION_ADAPTIVE_CEILING_DENOMINATOR = 8
+ROUND_EXECUTION_ACTION_ADAPTIVE_CEILINGS = {
+    mode: max(
+        int(reference),
+        (int(reference) * ROUND_EXECUTION_ADAPTIVE_CEILING_NUMERATOR + ROUND_EXECUTION_ADAPTIVE_CEILING_DENOMINATOR - 1)
+        // ROUND_EXECUTION_ADAPTIVE_CEILING_DENOMINATOR,
+    )
+    for mode, reference in ROUND_EXECUTION_ACTION_REFERENCE_CAPS.items()
 }
 
 def _execution_overflow_cap(mode: str, round_number: int) -> int:
-    name = str(mode or 'balanced')
-    initial = int(PROFILE_EXECUTION_ACTION_OVERFLOW_INITIAL.get(name, 0))
-    step = int(PROFILE_EXECUTION_ACTION_OVERFLOW_STEP.get(name, 0))
-    maximum = int(PROFILE_EXECUTION_ACTION_OVERFLOW_MAX.get(name, initial))
-    growth = max(0, int(round_number) - 1) * max(0, step)
-    return max(0, min(maximum, initial + growth))
+    # Legacy helper retained for report compatibility. Normal Agentic planning has no Python-chosen
+    # overflow lane; capacity above the normal ceiling exists only after an explicit AI request.
+    reference = int(ROUND_EXECUTION_ACTION_REFERENCE_CAPS.get(str(mode or 'balanced'), 800))
+    adaptive = int(ROUND_EXECUTION_ACTION_ADAPTIVE_CEILINGS.get(str(mode or 'balanced'), reference))
+    return max(0, adaptive - reference)
+
 
 def _execution_round_max(mode: str, round_number: int) -> int:
-    base = int(PROFILE_EXECUTION_ACTION_BUDGETS.get(str(mode or 'balanced'), 48))
-    return base + _execution_overflow_cap(mode, round_number)
+    return int(ROUND_EXECUTION_ACTION_REFERENCE_CAPS.get(str(mode or 'balanced'), 800))
 
 
-def _round_execution_budget(state: AgentState, eligible: list[dict[str, Any]], round_number: int) -> dict[str, int]:
-    """Resolve one GLOBAL round budget from remaining deterministic/base work.
+def _round_execution_budget(state: AgentState, eligible: list[dict[str, Any]], round_number: int, *, ai_extension_requested: bool=False) -> dict[str, int]:
+    """Return resource ceilings only; never select or guarantee security actions.
 
-    Adaptive-only rows do not force the base upward. With BALANCED and two rounds remaining,
-    1400 ordinary eligible actions resolve to base=700/max=796; 2000 resolve to 800/800.
+    The normal reference ceiling is a maximum number of concrete actions that may execute in this
+    round. It is not a baseline/minimum and does not add any scanner/tool/request to the plan. The AI
+    may explicitly request the bounded adaptive ceiling; Python accepts it only when enough concrete
+    eligible actions exist.
     """
     mode = str(shared.CURRENT_SCAN_MODE or 'balanced')
-    normal_base = int(PROFILE_EXECUTION_ACTION_BUDGETS.get(mode, 48))
-    overflow = int(_execution_overflow_cap(mode, round_number))
-    configured_max = int(PROFILE_EXECUTION_ACTION_MAX.get(mode, normal_base + overflow))
-    hard_cap = max(1, int(ROUND_EXECUTION_ACTION_HARD_CAPS.get(mode, configured_max)))
+    reference_cap = max(1, int(ROUND_EXECUTION_ACTION_REFERENCE_CAPS.get(mode, 800)))
+    adaptive_ceiling = max(reference_cap, int(ROUND_EXECUTION_ACTION_ADAPTIVE_CEILINGS.get(mode, reference_cap)))
+    eligible_count = len([action for action in eligible if isinstance(action, dict)])
     remaining_rounds = max(1, int(state.get('max_rounds', 1) or 1) - int(state.get('round', 0) or 0))
     ordinary_remaining = sum(1 for action in eligible if isinstance(action, dict) and not bool(action.get('adaptive_budget')))
     required_per_round = (ordinary_remaining + remaining_rounds - 1) // remaining_rounds if ordinary_remaining else 0
-    resolved_base = min(hard_cap, max(normal_base, required_per_round))
-    resolved_max = min(hard_cap, resolved_base + overflow)
+    ai_request_effective = bool(ai_extension_requested) and eligible_count > reference_cap
+    active_ceiling = adaptive_ceiling if ai_request_effective else reference_cap
+    resolved_max = min(active_ceiling, eligible_count)
+    resolved_base = min(reference_cap, eligible_count)
     return {
-        'normal_base': normal_base,
-        'normal_round_max': min(hard_cap, normal_base + overflow),
-        'configured_normal_max': min(hard_cap, configured_max),
-        'overflow_cap': overflow,
-        'hard_cap': hard_cap,
+        'normal_base': reference_cap,  # compatibility name: ceiling, never a minimum
+        'normal_round_max': reference_cap,
+        'configured_normal_max': reference_cap,
+        'overflow_cap': max(0, active_ceiling - reference_cap),
+        'reference_cap': reference_cap,
+        'adaptive_ceiling': adaptive_ceiling,
+        'active_ceiling': active_ceiling,
+        'adaptive_extension_unlocked': int(ai_request_effective),
+        'adaptive_extension_ai_requested': int(bool(ai_extension_requested)),
+        'adaptive_extension_ai_effective': int(ai_request_effective),
+        'adaptive_extension_deterministic_pressure': 0,
+        'hard_cap': active_ceiling,
         'remaining_rounds': remaining_rounds,
         'ordinary_remaining': ordinary_remaining,
         'required_per_round': required_per_round,
@@ -259,19 +280,30 @@ def _fair_global_action_cap(actions: list[dict[str, Any]], cap: int) -> list[dic
         active_profiles = next_active
     return selected
 
-PROFILE_TOOL_GROUP_BUDGETS = {'fast': 20, 'balanced': 30, 'deep': 40}
-PROFILE_BREADTH_REVIEW_GROUP_CAPS = {'fast': 5, 'balanced': 10, 'deep': 14}
-# A grouped catalog is much smaller than the concrete request-action pool. The limit is only a
-# prompt guard and is filled fairly across profiles; normally every available profile/tool group fits.
-PLANNER_GROUP_CANDIDATE_LIMITS = {'fast': 64, 'balanced': 96, 'deep': 128}
+# 64/96/128 are NOT tool/group quotas and do not limit what the AI may choose. They are only the
+# maximum number of CONCRETE action candidates put in one planner request. If more candidates exist,
+# Python creates additional fair batches until every eligible action has been presented to the AI.
+PLANNER_ACTION_BATCH_SIZES = {'fast': 64, 'balanced': 96, 'deep': 128}
 PLAN_SCHEMA = {
     'type': 'object',
     'properties': {
         'reasoning_summary': {'type': 'string'},
         'selected_action_ids': {'type': 'array', 'items': {'type': 'string'}},
+        'selected_action_priorities': {
+            'type': 'array',
+            'items': {
+                'type': 'object',
+                'properties': {
+                    'id': {'type': 'string'},
+                    'priority': {'type': 'integer', 'minimum': 0, 'maximum': 100},
+                },
+                'required': ['id', 'priority'],
+            },
+        },
+        'request_adaptive_extension': {'type': 'boolean'},
         'finish': {'type': 'boolean'},
     },
-    'required': ['reasoning_summary', 'selected_action_ids', 'finish'],
+    'required': ['reasoning_summary', 'selected_action_ids', 'selected_action_priorities', 'finish'],
 }
 
 ANALYSIS_SCHEMA = {
@@ -389,8 +421,6 @@ def ensure_ollama_model(ollama_url: str, requested_model: str, *, allow_pull: bo
         except Exception as exc:
             pull_error = f'{type(exc).__name__}: {exc}'
     diagnostics['model_pull_error'] = pull_error
-    # If the requested local model cannot be used, fall back only to the other
-    # explicitly supported local planner model rather than to an arbitrary installed tag.
     supported_fallbacks = [OLLAMA_DEFAULT_MODEL, OLLAMA_QWEN_MODEL]
     for preferred in supported_fallbacks:
         if _model_matches(requested_model, preferred):
@@ -405,7 +435,7 @@ def ensure_ollama_model(ollama_url: str, requested_model: str, *, allow_pull: bo
     diagnostics.update(model_ready=False, selected_model='')
     raise RuntimeError('Ollama is reachable but no usable local model exists. ' + (pull_error or f"Requested model '{requested_model}' is not installed."))
 
-# Parses the compact ID-selection contract shared by every supported AI provider.
+# Parses the compact concrete-action ID selection contract shared by every supported AI provider.
 def _parse_ai_plan_content(content: str) -> dict[str, Any]:
     raw = str(content or '').strip()
     if raw.startswith('```'):
@@ -417,10 +447,29 @@ def _parse_ai_plan_content(content: str) -> dict[str, Any]:
     value = json.loads(raw)
     if not isinstance(value, dict) or not isinstance(value.get('selected_action_ids', []), list):
         raise ValueError('AI provider returned an invalid compact plan object.')
+    priorities = value.get('selected_action_priorities')
+    if not isinstance(priorities, list):
+        raise ValueError('AI provider omitted selected_action_priorities.')
+    selected = [str(item) for item in value.get('selected_action_ids', [])]
+    priority_ids: set[str] = set()
+    for row in priorities:
+        if not isinstance(row, dict) or not str(row.get('id') or ''):
+            raise ValueError('AI provider returned an invalid selected_action_priorities entry.')
+        try:
+            priority = int(row.get('priority'))
+        except (TypeError, ValueError) as exc:
+            raise ValueError('AI provider returned a non-integer action priority.') from exc
+        if priority < 0 or priority > 100:
+            raise ValueError('AI action priority must be between 0 and 100.')
+        priority_ids.add(str(row.get('id')))
+    missing = [candidate_id for candidate_id in selected if candidate_id not in priority_ids]
+    if missing:
+        raise ValueError('AI provider omitted priorities for selected action IDs: ' + ', '.join(missing[:8]))
     return value
 
 
-# The model sees compact identifiers; Python retains the exact validated request contracts.
+# Compact view of ONE concrete action. Python already validated the request contract; the AI decides
+# whether this exact action is useful. Values that could contain credentials remain local/redacted.
 def _planner_candidate_view(action: dict[str, Any], candidate_id: str) -> dict[str, Any]:
     return {
         'id': candidate_id,
@@ -428,285 +477,84 @@ def _planner_candidate_view(action: dict[str, Any], candidate_id: str) -> dict[s
         'tool': str(action.get('tool') or ''),
         'method': str(action.get('method') or 'GET'),
         'url': str(action.get('target_url') or ''),
-        'parameters': [str(value) for value in action.get('parameters', [])][:10],
-        'file_parameters': [str(value) for value in action.get('file_parameters', [])][:6],
-        'token_parameters': [str(value) for value in action.get('token_parameters', [])][:6],
+        'parameters': [str(value) for value in action.get('parameters', [])][:8],
+        'file_parameters': [str(value) for value in action.get('file_parameters', [])][:4],
+        'token_parameters': [str(value) for value in action.get('token_parameters', [])][:4],
         'oast_class': str(action.get('oast_class') or ''),
-        'evidence': str(action.get('reason') or '')[:220],
+        'adaptive_candidate': bool(action.get('adaptive_budget')),
+        'coverage_reserve_hint': bool(action.get('coverage_reserve')),
+        'priority_score_hint': action.get('priority_score'),
+        'evidence': str(action.get('reason') or '')[:150],
     }
 
 
-# Groups concrete request-level actions by profile and tool before they are shown to the AI.
-# The model therefore decides which capabilities are useful; Python still decides which exact
-# ranked request contracts each selected capability receives.
-def _planner_action_groups(actions: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    groups: dict[tuple[str, str], dict[str, Any]] = {}
+def _fair_planner_action_order(actions: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Interleave profile/tool buckets without deciding which actions are useful.
+
+    This is prompt scheduling only. Every input action is returned exactly once. The purpose is to
+    prevent an early large tool/profile bucket from occupying all of the first planner batch.
+    """
+    buckets: dict[tuple[str, str], list[dict[str, Any]]] = {}
     order: list[tuple[str, str]] = []
     for action in actions:
         key = (str(action.get('profile') or ''), str(action.get('tool') or '').lower())
-        if key not in groups:
-            groups[key] = {'profile': key[0], 'tool': key[1], 'actions': []}
+        if key not in buckets:
+            buckets[key] = []
             order.append(key)
-        groups[key]['actions'].append(action)
-    return [groups[key] for key in order]
-
-
-# Compact AI view for one profile/tool capability group. Exact request bodies remain local.
-def _planner_group_candidate_view(group: dict[str, Any], candidate_id: str) -> dict[str, Any]:
-    actions = [item for item in group.get('actions', []) if isinstance(item, dict)]
-    examples = []
-    for action in actions[:4]:
-        examples.append({
-            'method': str(action.get('method') or 'GET'),
-            'url': str(action.get('target_url') or ''),
-            'parameters': [str(value) for value in action.get('parameters', [])][:6],
-            'adaptive': bool(action.get('adaptive_budget')),
-            'coverage_reserve': bool(action.get('coverage_reserve')),
-            'evidence': str(action.get('reason') or '')[:150],
-        })
-    return {
-        'id': candidate_id,
-        'profile': str(group.get('profile') or ''),
-        'tool': str(group.get('tool') or ''),
-        'concrete_action_count': len(actions),
-        'adaptive_action_count': sum(bool(action.get('adaptive_budget')) for action in actions),
-        'coverage_reserve_action_count': sum(bool(action.get('coverage_reserve')) for action in actions),
-        'examples': examples,
-    }
-
-
-# Prompt groups are bounded fairly by profile. Since there is at most one group per profile/tool,
-# this guard normally keeps every capability and only matters for future registry growth.
-def _fair_planner_group_catalog(groups: list[dict[str, Any]], limit: int) -> list[dict[str, Any]]:
-    cap = max(1, int(limit))
-    if len(groups) <= cap:
-        return list(groups)
-    by_profile: dict[str, list[dict[str, Any]]] = {}
-    profile_order: list[str] = []
-    for group in groups:
-        profile = str(group.get('profile') or '')
-        if profile not in by_profile:
-            by_profile[profile] = []
-            profile_order.append(profile)
-        by_profile[profile].append(group)
-    offsets = {profile: 0 for profile in profile_order}
-    selected: list[dict[str, Any]] = []
-    while len(selected) < cap:
+        buckets[key].append(action)
+    offsets = {key: 0 for key in order}
+    output: list[dict[str, Any]] = []
+    while len(output) < len(actions):
         added = False
-        for profile in profile_order:
-            index = offsets[profile]
-            bucket = by_profile[profile]
+        for key in order:
+            index = offsets[key]
+            bucket = buckets[key]
             if index >= len(bucket):
                 continue
-            selected.append(bucket[index])
-            offsets[profile] = index + 1
+            output.append(bucket[index])
+            offsets[key] = index + 1
             added = True
-            if len(selected) >= cap:
-                break
         if not added:
             break
-    return selected
+    return output
 
 
-# Expands AI-selected capability groups back into concrete request actions. Group expansion keeps
-# per-profile capability fairness and bounded adaptive depth, but the concrete plan is subsequently
-# constrained by one GLOBAL round budget shared across all active profiles. Prior tool findings raise
-# follow-up priority; all stages use capability-fair round-robin selection.
-def _tool_has_followup_signal(profile_results: dict[str, Any], tool: str) -> bool:
-    prefix = f"{str(tool or '').lower()}:"
-    for key, result in profile_results.items():
-        if not isinstance(result, dict):
-            continue
-        key_text = str(key).lower()
-        result_tool = str(result.get('tool') or '').lower()
-        if result_tool != str(tool or '').lower() and not key_text.startswith(prefix):
-            continue
-        vulnerabilities = result.get('vulnerabilities')
-        if isinstance(vulnerabilities, list) and vulnerabilities:
-            return True
-        if bool(result.get('callback_confirmed')):
-            return True
-        try:
-            if int(result.get('phase_parameters', 0) or 0) > 0:
-                return True
-        except (TypeError, ValueError):
-            pass
-    return False
+def _planner_action_batches(actions: list[dict[str, Any]], batch_size: int) -> list[list[dict[str, Any]]]:
+    ordered = _fair_planner_action_order(actions)
+    size = max(1, int(batch_size))
+    return [ordered[index:index + size] for index in range(0, len(ordered), size)]
 
 
-def _expand_planner_groups(
-    selected_groups: list[tuple[str, dict[str, Any], str]],
+def _fit_planner_prompt_context(
+    prompt: dict[str, Any],
+    system_message: str,
     *,
-    per_profile_budget: int,
-    per_profile_max: int,
-    round_number: int=1,
-    previous_results: dict[str, dict[str, Any]] | None=None,
-) -> tuple[list[dict[str, Any]], dict[str, dict[str, int]]]:
-    by_profile: dict[str, list[tuple[str, dict[str, Any], str]]] = {}
-    profile_order: list[str] = []
-    for candidate_id, group, selection_source in selected_groups:
-        profile = str(group.get('profile') or '')
-        if profile not in by_profile:
-            by_profile[profile] = []
-            profile_order.append(profile)
-        by_profile[profile].append((candidate_id, group, selection_source))
+    base_context_window: int,
+    max_context_window: int,
+    max_predict: int,
+) -> tuple[dict[str, Any], str, int, int]:
+    """Fit one concrete-action batch without silently hiding candidates.
 
-    previous_results = previous_results or {}
-    expanded: list[dict[str, Any]] = []
-    diagnostics: dict[str, dict[str, int]] = {}
-    for profile in profile_order:
-        groups = by_profile[profile]
-        prepared: list[tuple[str, dict[str, Any], str, list[dict[str, Any]]]] = []
-        available = 0
-        adaptive_available = 0
-        reserve_available = 0
-        for candidate_id, group, selection_source in groups:
-            actions = [item for item in group.get('actions', []) if isinstance(item, dict)]
-            # Reserve cases remain ahead of ordinary actions inside their own capability, but the
-            # capability itself receives only one action per round-robin pass. This preserves their
-            # priority without allowing Traversal (or any future reserve) to monopolize the profile.
-            actions = sorted(
-                actions,
-                key=lambda item: (
-                    0 if item.get('coverage_reserve') else 1,
-                    1 if item.get('adaptive_budget') else 0,
-                ),
-            )
-            prepared.append((candidate_id, group, selection_source, actions))
-            available += len(actions)
-            adaptive_available += sum(bool(item.get('adaptive_budget')) for item in actions)
-            reserve_available += sum(bool(item.get('coverage_reserve')) for item in actions)
-
-        base = max(1, int(per_profile_budget))
-        maximum = max(base, int(per_profile_max))
-        base_target = min(base, available)
-        offsets = [0] * len(prepared)
-        consumed: set[tuple[int, int]] = set()
-        used = 0
-        reserve_used = 0
-        adaptive_used = 0
-
-        def append_action(index: int, offset: int) -> None:
-            nonlocal used, reserve_used, adaptive_used
-            candidate_id, group, selection_source, actions = prepared[index]
-            action = dict(actions[offset])
-            action['planner_group_id'] = candidate_id
-            action['planner_group_action_index'] = offset + 1
-            action['planner_group_action_count'] = len(actions)
-            if selection_source == 'baseline':
-                prefix = 'Deterministic baseline selected'
-            elif selection_source == 'review':
-                prefix = 'AI review selected'
-            else:
-                prefix = 'AI selected'
-            action['reason'] = f"{prefix} {candidate_id} ({group.get('tool')} capability): {str(action.get('reason') or 'discovery-derived candidate')[:380]}"
-            expanded.append(action)
-            consumed.add((index, offset))
-            used += 1
-            if action.get('coverage_reserve'):
-                reserve_used += 1
-            if action.get('adaptive_budget'):
-                adaptive_used += 1
-
-        # Fixed base: one NON-adaptive action per selected capability on every pass. Candidate pools
-        # contain both the normal per-tool allocation and actions marked adaptive_budget beyond that
-        # allocation. Older code eventually consumed those adaptive rows while filling the global
-        # base, making logs report overflow=0 even when a tool had already exceeded its base selector
-        # budget. Adaptive rows now enter only through the explicit overflow stage below.
-        while used < base_target:
-            added = False
-            for index, (_, _, _, actions) in enumerate(prepared):
-                offset = offsets[index]
-                while offset < len(actions) and (
-                    (index, offset) in consumed or bool(actions[offset].get('adaptive_budget'))
-                ):
-                    offset += 1
-                offsets[index] = offset
-                if offset >= len(actions):
-                    continue
-                append_action(index, offset)
-                offsets[index] = offset + 1
-                added = True
-                if used >= base_target:
-                    break
-            if not added:
-                break
-        base_selected = used
-
-        # Overflow is available from round 1, but only to deterministic high-confidence reserve or
-        # adaptive specialist cases. Later rounds receive a larger cap; prior findings/Arjun parameter
-        # discovery raise a tool's overflow priority without making such evidence mandatory. This keeps
-        # round 1 adaptive while still preventing ordinary lower-ranked actions from filling the overflow.
-        overflow_cap = max(0, maximum - base)
-        signaled_tools = {
-            str(group.get('tool') or '').lower()
-            for _, group, _, _ in prepared
-            if _tool_has_followup_signal(previous_results.get(profile, {}), str(group.get('tool') or ''))
-        }
-
-        def overflow_priority(action: dict[str, Any], tool: str) -> int | None:
-            if action.get('coverage_reserve'):
-                return 0
-            if action.get('adaptive_budget') and tool in signaled_tools:
-                return 1
-            if action.get('adaptive_budget'):
-                return 2
-            return None
-
-        overflow_eligible = 0
-        if overflow_cap > 0:
-            for index, (_, group, _, actions) in enumerate(prepared):
-                tool = str(group.get('tool') or '').lower()
-                for offset, action in enumerate(actions):
-                    if (index, offset) in consumed:
-                        continue
-                    if overflow_priority(action, tool) is not None:
-                        overflow_eligible += 1
-
-        overflow_target = min(maximum, base_selected + min(overflow_cap, overflow_eligible), available)
-        while used < overflow_target:
-            added = False
-            # Preserve capability fairness. Within one pass, reserve and prior-signal follow-up cases
-            # outrank unsignaled adaptive overflow, but every selected capability gets a chance.
-            for priority in (0, 1, 2):
-                for index, (_, group, _, actions) in enumerate(prepared):
-                    tool = str(group.get('tool') or '').lower()
-                    chosen_offset = None
-                    for offset, action in enumerate(actions):
-                        if (index, offset) in consumed:
-                            continue
-                        if overflow_priority(action, tool) == priority:
-                            chosen_offset = offset
-                            break
-                    if chosen_offset is None:
-                        continue
-                    append_action(index, chosen_offset)
-                    added = True
-                    if used >= overflow_target:
-                        break
-                if used >= overflow_target:
-                    break
-            if not added:
-                break
-
-        diagnostics[profile] = {
-            'base': base,
-            'adaptive_max': maximum,
-            'overflow_cap': overflow_cap,
-            'configured_overflow_max': max(0, maximum - base),
-            'available': available,
-            'selected': used,
-            'base_selected': base_selected,
-            'coverage_reserve_available': reserve_available,
-            'coverage_reserve_selected': reserve_used,
-            'execution_overflow_used': max(0, used - base_selected),
-            'adaptive_cases_available': adaptive_available,
-            'adaptive_cases_selected': adaptive_used,
-            'overflow_eligible': overflow_eligible,
-            'followup_signal_tools': len(signaled_tools),
-            'deferred': max(0, available - used),
-        }
-    return expanded, diagnostics
+    Unlike the older group planner, candidate_actions is never trimmed. If a configured batch does
+    not fit even at the bounded maximum context, the caller must split it into smaller batches.
+    """
+    adjusted = dict(prompt)
+    candidates = list(adjusted.get('candidate_actions') or [])
+    minimum_window = max(2048, int(base_context_window))
+    maximum_window = max(minimum_window, int(max_context_window))
+    system_bytes = len(str(system_message or '').encode('utf-8'))
+    context = json.dumps(adjusted, ensure_ascii=False, separators=(',', ':'))
+    context_bytes = len(context.encode('utf-8'))
+    prompt_bytes = system_bytes + context_bytes
+    estimated_prompt_tokens = (prompt_bytes + PLANNER_CONTEXT_BYTES_PER_TOKEN_ESTIMATE - 1) // PLANNER_CONTEXT_BYTES_PER_TOKEN_ESTIMATE
+    needed = estimated_prompt_tokens + max(0, int(max_predict)) + PLANNER_CONTEXT_SAFETY_TOKENS
+    context_window = minimum_window if needed <= minimum_window else min(maximum_window, ((needed + 2047) // 2048) * 2048)
+    if needed > context_window:
+        raise RuntimeError(
+            f'Planner action batch requires about {needed} context tokens, exceeding bounded context window {context_window}. '
+            'Split the concrete-action batch; never drop candidates silently.'
+        )
+    return adjusted, context, context_window, len(candidates)
 
 
 def _planner_discovery_summary(discovery: dict[str, dict[str, Any]]) -> dict[str, Any]:
@@ -1062,9 +910,19 @@ def _dedupe_no_cookie_profile_actions(state: AgentState, actions: list[dict[str,
     for action in actions:
         profile = str(action.get('profile') or '')
         request_url = _action_request_url(action, str(state.get('target') or ''))
-        effective_cookie = shared.scope_cookie_header(request_url, _profile_cookie(state, profile))
+        raw_cookie = _profile_cookie(state, profile)
+        effective_cookie = shared.scope_cookie_header(request_url, raw_cookie)
         if effective_cookie:
             output.append(action)
+            continue
+        # A browser/OIDC identity may legitimately have no cookie for a newly authorized origin yet
+        # while still being able to establish an identity-bound session there. Keep that candidate so
+        # the executor can perform the bounded refresh. A raw-cookie identity with neither an
+        # applicable cookie nor an identity-aware runtime path must not consume authenticated budget.
+        if raw_cookie and shared.runtime_target_auth_available(raw_cookie, request_url):
+            output.append(action)
+            continue
+        if raw_cookie:
             continue
         identifier = action_execution_id(action)
         previous_index = anonymous_equivalent.get(identifier)
@@ -1099,76 +957,57 @@ def _profile_is_plannable(state: AgentState, profile_name: str) -> bool:
 def _humanize_planner_reasoning(value: Any) -> str:
     text = str(value or '').strip()
     replacements = (
-        ('already_selected_action_ids', 'tool groups already selected'),
-        ('selected_action_ids', 'selected tool groups'),
-        ('remaining_candidates', 'remaining tool groups'),
+        ('already_selected_action_ids', 'actions already selected'),
+        ('selected_action_ids', 'selected concrete actions'),
+        ('remaining_candidates', 'remaining concrete actions'),
         ('reasoning_summary', 'reasoning'),
-        ('tool_group_budget_per_profile', 'tool-group budget per profile'),
-        ('execution_action_budget_per_profile', 'legacy profile expansion floor'),
-        ('execution_action_adaptive_max_per_profile', 'legacy profile expansion ceiling'),
-        ('execution_action_overflow_per_profile', 'legacy profile expansion overflow'),
-        ('execution_action_configured_max_per_profile', 'legacy profile expansion configured ceiling'),
-        ('execution_action_normal_floor_total', 'normal concrete-action floor for the whole round'),
-        ('execution_action_resolved_base_total', 'resolved concrete-action base for the whole round'),
-        ('execution_action_adaptive_max_total', 'resolved concrete-action maximum for the whole round'),
+        ('execution_action_normal_target_total', 'normal concrete-action ceiling for the whole round'),
+        ('execution_action_resolved_base_total', 'normal concrete-action capacity available this round'),
+        ('execution_action_adaptive_max_total', 'active concrete-action ceiling for the whole round'),
         ('execution_action_hard_cap_total', 'absolute concrete-action cap for the whole round'),
-        ('remaining_slots_by_profile', 'remaining slots by profile'),
+        ('remaining_slots_by_profile', 'remaining execution capacity by profile'),
     )
     for internal, readable in replacements:
         text = text.replace(internal, readable)
     text = re.sub(r'\bredundant with actions already selected\b', 'overlap with actions already selected', text, flags=re.IGNORECASE)
     return re.sub(r'\s+', ' ', text).strip()
 
+
 def _planner_system_message() -> str:
-    # The provider-specific prompt uses explicit role, constraints, definitions and output sections.
-    # Reuse that structure while keeping this planner task-specific and compact for local models.
     return (
         '[ROLE]\n'
-        'You are the autonomous planner for an explicitly authorized web-security assessment. '
-        'Choose the next useful scanner capability groups from discovery-derived candidate IDs. Each candidate represents one tool for one profile and may contain several concrete request-level actions that Python will rank and bound.\n\n'
+        'You are the autonomous planner for an explicitly authorized web-security assessment. You decide which CONCRETE discovery-derived actions should execute. '
+        'Each candidate ID is one exact profile + tool + target/request contract; selecting an ID selects that action, not an entire tool family.\n\n'
         '[OBJECTIVE]\n'
-        'Maximize useful and complementary security evidence within each profile-specific tool-group budget. '
-        'Do not execute tools yourself and do not invent endpoints, parameters, identities or candidate IDs.\n\n'
+        'Choose the useful concrete actions that maximize complementary security evidence. Python does not choose attacks for you: it only discovers/normalizes candidates, removes invalid or unsafe work, batches the catalog for context size, and enforces the final traffic/time ceiling.\n\n'
         '[INPUT CONTRACT]\n'
-        'The user message is JSON containing target, round, scan mode, discovery summary, previous results, available tools and candidates. '
-        'Every candidate has already been derived from live discovery and will be validated again by Python.\n\n'
+        'The user message contains one batch of concrete candidate_actions, discovery summary, previous results and round resource ceilings. '
+        'If the full catalog is larger than this batch, other batches are evaluated separately; therefore judge every candidate in this batch on its own evidence and complementarity.\n\n'
         '[DECISION RULES]\n'
-        '- Baseline groups listed in baseline_group_ids are already selected deterministically; do not rely on the model to preserve broad coverage or JWT analysis.\n'
-        '- Evaluate every remaining profile/tool group before returning the plan.\n'
-        '- SELECT a profile/tool group when that capability can add useful, complementary or independent evidence for that profile; Python chooses the exact ranked request contracts inside the group.\n'
-        '- DEFER only for a concrete reason: real duplication, already completed equivalent work, unsupported discovery, incompatible input, unsafe action, or clearly very low expected value.\n'
-        '- Broad scanners and targeted tools are complementary; neither category replaces the other by default.\n'
-        '- A confirmed finding does not stop exploration of unrelated attack surfaces.\n'
-        '- On rounds after the first, previously deferred request contracts that have never been executed remain valid base-budget work even when no new surface appeared. Continue a specialist group when it still contains useful, in-scope, non-equivalent unexecuted contracts; previous results or newly exposed surface should raise priority but are not prerequisites for consuming normal base capacity. Do not repeat semantically equivalent completed work, and do not use adaptive overflow merely because deferred contracts remain.\n'
-        '- Use IDOR only for suitable numeric references, authorization only for read-only identity/object/resource signals, and Interactsh only for compatible OAST inputs.\n'
-        '- tool_group_budget_per_profile is an independent maximum for each active profile, not a shared quota. Never add groups merely to reach a count.\n'
-        '- Concrete request execution uses one shared round budget across all active profiles. Python distributes it fairly across profile/capability buckets; unused capacity from one profile can be used by another. A bounded overflow is available from round 1 and grows gradually on later rounds. BALANCED may raise the base when deterministic work remaining per round exceeds the normal floor, but the absolute total cap is 800 actions for the whole round.\n'
-        '- Do not omit authenticated coverage merely because anonymous groups were selected: profiles are considered separately during tool-group planning, while concrete actions share the same fair global round budget.\n'
-        '- Set finish=true only when no remaining candidate is likely to add useful evidence.\n\n'
+        '- Evaluate EVERY candidate action in candidate_actions. Do not choose a tool first and then assume all of its requests should run.\n'
+        '- SELECT an action ID when that exact request/scanner action is useful, complementary or independently evidentiary.\n'
+        '- DEFER an action only for a concrete reason such as semantic duplication, equivalent completed work, weak applicability, incompatibility, safety constraints already described, or very low expected value.\n'
+        '- Different actions from the same tool can have very different value; judge them independently. Likewise, an important action from a tool whose other actions are weak must still be selectable.\n'
+        '- Broad scanners and targeted specialists are complementary; neither category replaces the other automatically.\n'
+        '- Previous findings raise follow-up priority when relevant but do not justify repeating equivalent completed work.\n'
+        '- adaptive_candidate and coverage_reserve_hint are Python ranking hints only, not mandatory selections and not exclusions.\n'
+        '- FAST/BALANCED/DEEP normal global execution ceilings are 300/800/1144 concrete actions per round. Python may execute fewer because you selected fewer. '
+        'Set request_adaptive_extension=true only if useful selected work may need the bounded +12.5% ceiling; never request it merely to fill capacity.\n'
+        '- For every selected_action_id, include one matching selected_action_priorities entry with an integer priority from 0 to 100. Use the same scale across batches: 100 = highest-value action for this assessment, 0 = selected only as a very low-priority fallback.\n'
+        '- Order selected_action_ids from highest to lowest priority within this batch. After all batches, Python merges selections by YOUR numeric priorities before applying per-tool/global ceilings; ties preserve your returned order.\n'
+        '- finish is a batch-local signal: set it true only when none of the candidates in this batch is useful.\n\n'
         '[OUTPUT CONTRACT]\n'
         'Return exactly one JSON object with these fields and no others: '
-        '{"reasoning_summary":"brief decision summary, not chain-of-thought","selected_action_ids":["candidate IDs"],"finish":false}. '
-        'reasoning_summary must be concise and must not reveal hidden chain-of-thought.\n\n'
-        '[FINAL INSTRUCTION]\n'
-        'Return only valid JSON. Re-check that every selected_action_id exists in candidates and that finish matches the remaining useful work.'
-    )
-
-
-def _planner_review_system_message() -> str:
-    return (
-        '[ROLE]\nYou are the breadth-review pass for an explicitly authorized web-security assessment.\n\n'
-        '[OBJECTIVE]\nReview only the profile/tool groups deferred by the first AI plan and add useful complementary capabilities that were missed, especially for sparse profiles.\n\n'
-        '[RULES]\n'
-        '- Evaluate every remaining profile/tool group.\n'
-        '- ADD discovery-supported profile/tool groups that can provide useful, complementary or independent evidence.\n'
-        '- KEEP DEFERRED only for concrete duplication, completed equivalent work, unsupported discovery, incompatibility, unsafe action or clearly very low value.\n'
-        '- Broad scanners and targeted tools remain complementary; do not reject one category solely because the other was already selected.\n'
-        '- Do not repeat already_selected_action_ids and do not add actions merely to fill remaining slots.\n'
-        "- Respect review_addition_cap_per_profile and remaining_slots_by_profile strictly; one profile must never consume another profile's capacity.\n\n"
-        '[OUTPUT CONTRACT]\n'
-        'Return exactly one JSON object: {"reasoning_summary":"brief review summary","selected_action_ids":["remaining candidate IDs"],"finish":false}.\n\n'
+        '{"reasoning_summary":"brief decision summary, not chain-of-thought","selected_action_ids":["concrete candidate IDs"],"selected_action_priorities":[{"id":"A0001","priority":90}],"request_adaptive_extension":false,"finish":false}.\n'
+        'Use only IDs present in candidate_actions. Do not include chain-of-thought.\n\n'
         '[FINAL INSTRUCTION]\nReturn only valid JSON.'
     )
+
+
+# Kept as a compatibility wrapper for older callers/tests. Normal planning no longer performs a
+# tool-group breadth review because every concrete action is already evaluated by the AI.
+def _planner_review_system_message() -> str:
+    return _planner_system_message()
 
 
 def _analysis_system_message() -> str:
@@ -1204,79 +1043,125 @@ def _analysis_system_message() -> str:
     )
 
 
-# Asks the selected AI provider which profile/tool capabilities should run next. Python expands
-# each selected capability into exact ranked request actions under an independent budget per profile.
+# Asks the selected AI provider which exact concrete actions should run next. No tool/capability is
+# preselected in normal Agentic mode. Python constructs a valid deduplicated catalog, batches it for
+# context size, and applies safety/resource ceilings only after the model has prioritized actions.
 def ai_plan(state: AgentState) -> dict[str, Any]:
+    """Ask the AI to decide concrete actions, not tools/groups.
+
+    Large catalogs are split into fair concrete-action batches. Every eligible action is presented to
+    the AI exactly once in the planning pass. Python never expands a selected tool into hidden
+    requests.
+    """
     concrete_pool = _eligible_action_catalog(state)
-    group_pool = _planner_action_groups(concrete_pool)
-    eligible_groups = _fair_planner_group_catalog(
-        group_pool, PLANNER_GROUP_CANDIDATE_LIMITS.get(shared.CURRENT_SCAN_MODE, 32)
-    )
-    candidate_map = {f'G{index:03d}': group for index, group in enumerate(eligible_groups, 1)}
-    candidates = [_planner_group_candidate_view(group, candidate_id) for candidate_id, group in candidate_map.items()]
-    baseline_group_ids = [
-        candidate_id for candidate_id, group in candidate_map.items()
-        if str(group.get('tool') or '').lower() in AGENTIC_BASELINE_TOOLS
-        or any(bool(action.get('coverage_reserve')) for action in group.get('actions', []) if isinstance(action, dict))
-    ]
-    candidate_tools = sorted({str(group.get('tool') or '') for group in eligible_groups})
+    if not concrete_pool:
+        return {'reasoning_summary': 'No eligible concrete actions.', 'actions': [], 'request_adaptive_extension': False, 'finish': True}
+
+    mode = str(shared.CURRENT_SCAN_MODE or 'balanced')
+    batch_size = int(PLANNER_ACTION_BATCH_SIZES.get(mode, 96))
+    batches = _planner_action_batches(concrete_pool, batch_size)
+    # Stable IDs follow the fair prompt order so diagnostics and batch boundaries are reproducible.
+    ordered_pool = [action for batch in batches for action in batch]
+    candidate_map = {f'A{index:04d}': action for index, action in enumerate(ordered_pool, 1)}
+    id_by_identity = {id(action): candidate_id for candidate_id, action in candidate_map.items()}
+
+    candidate_tools = sorted({str(action.get('tool') or '') for action in concrete_pool})
     registry = {
         name: {'scope': REGISTRY[name][2], 'description': str(REGISTRY[name][3])[:180]}
         for name in candidate_tools if name in REGISTRY
     }
-    profile_names = list(dict.fromkeys(str(group.get('profile') or '') for group in eligible_groups if str(group.get('profile') or '')))
-    group_budget = PROFILE_TOOL_GROUP_BUDGETS.get(shared.CURRENT_SCAN_MODE, 12)
     current_round = int(state.get('round', 0) or 0) + 1
-    round_budget = _round_execution_budget(state, concrete_pool, current_round)
-    execution_budget = int(round_budget['resolved_base'])
-    execution_overflow_cap = int(round_budget['overflow_cap'])
-    execution_max = int(round_budget['resolved_max'])
-    configured_execution_max = int(round_budget['configured_normal_max'])
-    prompt = {
-        'target': state['target'],
-        'round': state['round'] + 1,
-        'maximum_rounds': state['max_rounds'],
-        'tool_group_budget_per_profile': group_budget,
-        'execution_action_normal_floor_total': int(round_budget['normal_base']),
-        'execution_action_resolved_base_total': execution_budget,
-        'execution_action_adaptive_max_total': execution_max,
-        'execution_action_overflow_total': execution_overflow_cap,
-        'execution_action_configured_normal_max_total': configured_execution_max,
-        'execution_action_hard_cap_total': int(round_budget['hard_cap']),
-        'execution_action_ordinary_remaining': int(round_budget['ordinary_remaining']),
-        'execution_action_remaining_rounds': int(round_budget['remaining_rounds']),
-        'active_profiles': profile_names,
-        'scan_mode': shared.CURRENT_SCAN_MODE,
-        'discovery_summary': _planner_discovery_summary(state['discovery']),
-        'previous_results': compact_results(state['results']),
-        'available_tools': registry,
-        'baseline_group_ids': baseline_group_ids,
-        'candidates': candidates,
-    }
+    initial_budget = _round_execution_budget(state, concrete_pool, current_round)
     system_message = _planner_system_message()
     provider = str(state.get('ai_provider') or 'ollama').lower()
     base = state['ollama_url'].rstrip('/')
     total_timeout = max(120, int(state.get('ai_timeout') or 480))
-    max_predict = AI_PLANNER_MAX_PREDICT.get(shared.CURRENT_SCAN_MODE, 320)
-    context = json.dumps(prompt, ensure_ascii=False, separators=(',', ':'))
-    context_window = AI_PLANNER_CONTEXT_WINDOWS.get(shared.CURRENT_SCAN_MODE, 6144)
-    common_options = {'temperature': 0, 'num_predict': max_predict, 'num_ctx': context_window, 'top_p': 0.9}
-    LAST_AI_PLAN_DIAGNOSTICS.clear()
-    LAST_AI_PLAN_DIAGNOSTICS.update({
-        'endpoint': 'pending',
-        'context_bytes': len(context.encode('utf-8')),
-        'candidate_count': len(candidates),
-        'candidate_pool_count': len(group_pool),
-        'concrete_action_pool_count': len(concrete_pool),
-        'selected_action_ids': [],
-        'seconds': 0.0,
-        'attempt_errors': [],
-    })
-    if provider == 'snap4city':
-        attempts = [('snap4city', '', {}, total_timeout)]
-    else:
-        attempts = [
-            ('chat', f'{base}/api/chat', {
+    max_predict = AI_PLANNER_MAX_PREDICT.get(mode, 800)
+    base_context_window = AI_PLANNER_CONTEXT_WINDOWS.get(mode, 6144)
+    max_context_window = AI_PLANNER_CONTEXT_WINDOWS_MAX.get(mode, base_context_window)
+
+    selected_ids: list[str] = []
+    selected_id_set: set[str] = set()
+    selected_priority_by_id: dict[str, int] = {}
+    selected_first_seen: dict[str, int] = {}
+    selected_actions: list[dict[str, Any]] = []
+    reasoning_parts: list[str] = []
+    adaptive_requested = False
+    endpoint_kinds: list[str] = []
+    errors: list[str] = []
+    batch_diagnostics: list[dict[str, Any]] = []
+    total_context_bytes = 0
+    max_context_used = 0
+    planning_started = time.monotonic()
+
+    def build_batch_prompt(batch_number: int, batch_count: int, batch: list[dict[str, Any]], selected_count: int) -> dict[str, Any]:
+        return {
+            'target': state['target'],
+            'round': current_round,
+            'maximum_rounds': state['max_rounds'],
+            'scan_mode': mode,
+            'batch_number': batch_number,
+            'batch_count': batch_count,
+            'batch_size_limit': batch_size,
+            'total_concrete_action_candidates': len(concrete_pool),
+            'normal_global_execution_ceiling': int(initial_budget['reference_cap']),
+            'adaptive_global_execution_ceiling': int(initial_budget['adaptive_ceiling']),
+            'selected_so_far_count': selected_count,
+            'discovery_summary': _planner_discovery_summary(state['discovery']),
+            'previous_results': compact_results(state['results']),
+            'available_tools': registry,
+            'candidate_actions': [
+                _planner_candidate_view(action, id_by_identity[id(action)])
+                for action in batch
+            ],
+        }
+
+    # 64/96/128 are maxima, not requirements. If unusually rich candidate descriptions make one
+    # configured batch exceed the bounded context window, split it until every action still fits.
+    # No candidate is dropped and no Python-side attack choice is introduced by this operation.
+    while True:
+        provisional_count = len(batches)
+        rebuilt: list[list[dict[str, Any]]] = []
+        split_happened = False
+        for provisional_number, batch in enumerate(batches, 1):
+            preflight_prompt = build_batch_prompt(provisional_number, provisional_count, batch, 0)
+            try:
+                _fit_planner_prompt_context(
+                    preflight_prompt, system_message,
+                    base_context_window=base_context_window,
+                    max_context_window=max_context_window,
+                    max_predict=max_predict,
+                )
+            except RuntimeError:
+                if len(batch) <= 1:
+                    raise
+                midpoint = (len(batch) + 1) // 2
+                rebuilt.extend((batch[:midpoint], batch[midpoint:]))
+                split_happened = True
+            else:
+                rebuilt.append(batch)
+        batches = rebuilt
+        if not split_happened:
+            break
+
+    effective_batch_size = max((len(batch) for batch in batches), default=0)
+
+    def run_one_batch(batch_number: int, batch: list[dict[str, Any]]) -> tuple[dict[str, Any], str, int, int, str]:
+        prompt = build_batch_prompt(batch_number, len(batches), batch, len(selected_ids))
+        prompt, context, context_window, candidate_count = _fit_planner_prompt_context(
+            prompt, system_message,
+            base_context_window=base_context_window,
+            max_context_window=max_context_window,
+            max_predict=max_predict,
+        )
+        common_options = {'temperature': 0, 'num_predict': max_predict, 'num_ctx': context_window, 'top_p': 0.9}
+        if provider == 'snap4city':
+            content = _snap4city_chat_content(
+                state, system_message, context, total_timeout=total_timeout, temperature=0.0,
+            )
+            kind = 'snap4city'
+        else:
+            chat_payload = {
                 'model': state['model'],
                 'format': PLAN_SCHEMA,
                 'messages': [
@@ -1285,244 +1170,155 @@ def ai_plan(state: AgentState) -> dict[str, Any]:
                 ],
                 'options': common_options,
                 'keep_alive': '30m',
-            }, total_timeout),
-            ('generate', f'{base}/api/generate', {
-                'model': state['model'],
-                'format': PLAN_SCHEMA,
-                'prompt': system_message + '\n\nAssessment context:\n' + context,
-                'options': common_options,
-                'keep_alive': '30m',
-            }, total_timeout),
-        ]
-    errors: list[str] = []
-    planning_started = time.monotonic()
-    for kind, url, payload, budget in attempts:
-        started = time.monotonic()
-        try:
-            if provider == 'snap4city':
-                content = _snap4city_chat_content(
-                    state, system_message, context,
-                    total_timeout=budget, temperature=0.0,
-                )
-            else:
-                content = _ollama_stream_content(url, payload, response_kind=kind, total_timeout=budget, early_json=True)
-            compact_plan = _parse_ai_plan_content(content)
-            requested_ids = [str(value) for value in compact_plan.get('selected_action_ids', [])]
-            selected_ids: list[str] = []
-            selected_groups: list[tuple[str, dict[str, Any], str]] = []
-            selected_per_profile: dict[str, int] = {}
-            baseline_selected_ids: list[str] = []
-            ai_selected_ids: list[str] = []
-            baseline_per_profile: dict[str, int] = {}
-            for candidate_id in baseline_group_ids:
-                group = candidate_map.get(candidate_id)
-                if group is None:
-                    continue
-                profile = str(group.get('profile') or '')
-                if selected_per_profile.get(profile, 0) >= group_budget:
-                    continue
-                selected_ids.append(candidate_id)
-                baseline_selected_ids.append(candidate_id)
-                selected_groups.append((candidate_id, group, 'baseline'))
-                selected_per_profile[profile] = selected_per_profile.get(profile, 0) + 1
-                baseline_per_profile[profile] = baseline_per_profile.get(profile, 0) + 1
-            for candidate_id in requested_ids:
-                group = candidate_map.get(candidate_id)
-                if group is None or candidate_id in selected_ids:
-                    continue
-                profile = str(group.get('profile') or '')
-                if selected_per_profile.get(profile, 0) >= group_budget:
-                    continue
-                selected_ids.append(candidate_id)
-                ai_selected_ids.append(candidate_id)
-                selected_groups.append((candidate_id, group, 'initial'))
-                selected_per_profile[profile] = selected_per_profile.get(profile, 0) + 1
-
-            # Breadth recovery is evaluated per profile. A sparse/omitted authenticated plan can
-            # therefore be reviewed without consuming the anonymous profile's independent capacity.
-            review_selected_ids: list[str] = []
-            review_seconds = 0.0
-            review_error = ''
-            review_reasoning = ''
-            eligible_per_profile: dict[str, int] = {}
-            for group in eligible_groups:
-                profile = str(group.get('profile') or '')
-                eligible_per_profile[profile] = eligible_per_profile.get(profile, 0) + 1
-            review_cap_per_profile = PROFILE_BREADTH_REVIEW_GROUP_CAPS.get(shared.CURRENT_SCAN_MODE, 4)
-            remaining_slots_by_profile = {
-                profile: max(0, group_budget - selected_per_profile.get(profile, 0))
-                for profile in eligible_per_profile
             }
-            # Mandatory baseline groups must not make a profile look well-covered by the AI.
-            # Breadth recovery judges only the discretionary (non-baseline) capability choices.
-            sparse_profiles = []
-            for profile, eligible_count in eligible_per_profile.items():
-                baseline_count = baseline_per_profile.get(profile, 0)
-                discretionary_eligible = max(0, eligible_count - baseline_count)
-                discretionary_selected = max(0, selected_per_profile.get(profile, 0) - baseline_count)
-                if (
-                    remaining_slots_by_profile.get(profile, 0) > 0
-                    and discretionary_eligible > discretionary_selected
-                    and discretionary_selected <= max(1, discretionary_eligible // 3)
-                ):
-                    sparse_profiles.append(profile)
-            review_addition_cap = sum(
-                min(review_cap_per_profile, remaining_slots_by_profile.get(profile, 0))
-                for profile in sparse_profiles
-            )
-            remaining_candidate_count = len(candidates) - len(selected_ids)
-            review_time_budget = min(total_timeout, max(120, int(total_timeout * 0.40)))
-            if sparse_profiles and remaining_candidate_count >= 1 and review_addition_cap > 0 and review_time_budget >= 30:
-                remaining_candidates = [
-                    candidate for candidate in candidates
-                    if str(candidate.get('id') or '') not in selected_ids
-                ]
-                review_prompt = {
-                    'target': state['target'],
-                    'scan_mode': shared.CURRENT_SCAN_MODE,
-                    'round': state['round'] + 1,
-                    'tool_group_budget_per_profile': group_budget,
-                    'round_execution_normal_floor_total': int(round_budget['normal_base']),
-                    'round_execution_resolved_base_total': execution_budget,
-                    'round_execution_adaptive_max_total': execution_max,
-                    'round_execution_overflow_total': execution_overflow_cap,
-                    'round_execution_configured_normal_max_total': configured_execution_max,
-                    'round_execution_hard_cap_total': int(round_budget['hard_cap']),
-                    'discovery_summary': prompt['discovery_summary'],
-                    'previous_results': prompt['previous_results'],
-                    'available_tools': registry,
-                    'already_selected_action_ids': selected_ids,
-                    'sparse_profiles': sparse_profiles,
-                    'remaining_slots_by_profile': remaining_slots_by_profile,
-                    'review_addition_cap_per_profile': review_cap_per_profile,
-                    'remaining_candidates': remaining_candidates,
-                    'previous_reasoning_summary': str(compact_plan.get('reasoning_summary') or '')[:240],
+            try:
+                content = _ollama_stream_content(
+                    f'{base}/api/chat', chat_payload, response_kind='chat', total_timeout=total_timeout, early_json=True,
+                )
+                kind = 'chat'
+            except Exception as chat_exc:
+                errors.append(f'batch {batch_number} chat: {type(chat_exc).__name__}: {chat_exc}')
+                generate_payload = {
+                    'model': state['model'],
+                    'format': PLAN_SCHEMA,
+                    'prompt': system_message + '\n\nAssessment context:\n' + context,
+                    'options': common_options,
+                    'keep_alive': '30m',
                 }
-                review_system_message = _planner_review_system_message()
-                review_context = json.dumps(review_prompt, ensure_ascii=False, separators=(',', ':'))
-                review_started = time.monotonic()
-                try:
-                    if provider == 'snap4city':
-                        review_content = _snap4city_chat_content(
-                            state, review_system_message, review_context,
-                            total_timeout=review_time_budget, temperature=0.0,
-                        )
-                    else:
-                        review_content = _ollama_stream_content(
-                            f'{base}/api/chat',
-                            {
-                                'model': state['model'],
-                                'format': PLAN_SCHEMA,
-                                'messages': [
-                                    {'role': 'system', 'content': review_system_message},
-                                    {'role': 'user', 'content': review_context},
-                                ],
-                                'options': common_options,
-                                'keep_alive': '30m',
-                            },
-                            response_kind='chat',
-                            total_timeout=review_time_budget,
-                            early_json=True,
-                        )
-                    review_plan = _parse_ai_plan_content(review_content)
-                    review_reasoning = _humanize_planner_reasoning(review_plan.get('reasoning_summary'))[:500]
-                    review_per_profile: dict[str, int] = {}
-                    for candidate_id in [str(value) for value in review_plan.get('selected_action_ids', [])]:
-                        group = candidate_map.get(candidate_id)
-                        if group is None or candidate_id in selected_ids:
-                            continue
-                        profile = str(group.get('profile') or '')
-                        if profile not in sparse_profiles:
-                            continue
-                        if selected_per_profile.get(profile, 0) >= group_budget:
-                            continue
-                        if review_per_profile.get(profile, 0) >= review_cap_per_profile:
-                            continue
-                        selected_ids.append(candidate_id)
-                        review_selected_ids.append(candidate_id)
-                        selected_groups.append((candidate_id, group, 'review'))
-                        selected_per_profile[profile] = selected_per_profile.get(profile, 0) + 1
-                        review_per_profile[profile] = review_per_profile.get(profile, 0) + 1
-                except Exception as review_exc:
-                    review_error = f'{type(review_exc).__name__}: {review_exc}'
-                finally:
-                    review_seconds = round(time.monotonic() - review_started, 2)
+                content = _ollama_stream_content(
+                    f'{base}/api/generate', generate_payload, response_kind='generate', total_timeout=total_timeout, early_json=True,
+                )
+                kind = 'generate'
+        plan = _parse_ai_plan_content(content)
+        return plan, context, context_window, candidate_count, kind
 
-            selected_actions, execution_diagnostics = _expand_planner_groups(
-                selected_groups,
-                per_profile_budget=execution_budget,
-                per_profile_max=execution_max,
-                round_number=state['round'] + 1,
-                previous_results=state.get('results', {}),
-            )
-            expanded_before_global_cap = len(selected_actions)
-            selected_actions = _fair_global_action_cap(selected_actions, execution_max)
-            concrete_selected_per_profile: dict[str, int] = {}
-            for action in selected_actions:
-                profile = str(action.get('profile') or '')
-                concrete_selected_per_profile[profile] = concrete_selected_per_profile.get(profile, 0) + 1
-            # Keep per-profile diagnostics based on the actually admitted GLOBAL plan.
-
-            selected_group_summaries = [
-                {
-                    'id': candidate_id,
-                    'profile': str(group.get('profile') or ''),
-                    'tool': str(group.get('tool') or ''),
-                    'concrete_action_count': len(group.get('actions') or []),
-                    'adaptive_action_count': sum(1 for item in (group.get('actions') or []) if isinstance(item, dict) and item.get('adaptive_budget')),
-                    'source': source,
-                }
-                for candidate_id, group, source in selected_groups
-            ]
-            LAST_AI_PLAN_DIAGNOSTICS.clear()
-            LAST_AI_PLAN_DIAGNOSTICS.update({
+    for batch_number, batch in enumerate(batches, 1):
+        batch_started = time.monotonic()
+        try:
+            compact_plan, context, context_window, candidate_count, kind = run_one_batch(batch_number, batch)
+            endpoint_kinds.append(kind)
+            total_context_bytes += len(context.encode('utf-8'))
+            max_context_used = max(max_context_used, context_window)
+            adaptive_requested = adaptive_requested or bool(compact_plan.get('request_adaptive_extension', False))
+            valid_batch_ids = {id_by_identity[id(action)] for action in batch}
+            raw_priority_rows = compact_plan.get('selected_action_priorities', [])
+            priority_map: dict[str, int] = {}
+            for row in raw_priority_rows if isinstance(raw_priority_rows, list) else []:
+                if not isinstance(row, dict):
+                    continue
+                candidate_id = str(row.get('id') or '')
+                if candidate_id not in valid_batch_ids:
+                    continue
+                priority_map[candidate_id] = max(0, min(100, int(row.get('priority'))))
+            accepted_this_batch: list[str] = []
+            for candidate_id in [str(value) for value in compact_plan.get('selected_action_ids', [])]:
+                if candidate_id not in valid_batch_ids or candidate_id in selected_id_set:
+                    continue
+                if candidate_id not in priority_map:
+                    raise ValueError(f'AI batch {batch_number} selected {candidate_id} without a priority.')
+                selected_id_set.add(candidate_id)
+                selected_first_seen[candidate_id] = len(selected_ids)
+                selected_priority_by_id[candidate_id] = int(priority_map[candidate_id])
+                selected_ids.append(candidate_id)
+                selected_actions.append(dict(candidate_map[candidate_id]))
+                accepted_this_batch.append(candidate_id)
+            reasoning = _humanize_planner_reasoning(compact_plan.get('reasoning_summary'))[:400]
+            if reasoning:
+                reasoning_parts.append(f'Batch {batch_number}/{len(batches)}: {reasoning}')
+            batch_diagnostics.append({
+                'batch': batch_number,
+                'candidate_count': candidate_count,
+                'selected_count': len(accepted_this_batch),
+                'selected_action_ids': accepted_this_batch,
                 'endpoint': kind,
                 'context_bytes': len(context.encode('utf-8')),
-                'candidate_count': len(candidates),
-                'candidate_pool_count': len(group_pool),
-                'concrete_action_pool_count': len(concrete_pool),
-                'selected_action_ids': selected_ids,
-                'selected_group_ids': selected_ids,
-                'baseline_selected_group_ids': baseline_selected_ids,
-                'baseline_groups_per_profile': dict(baseline_per_profile),
-                'ai_selected_group_ids': ai_selected_ids,
-                'review_selected_action_ids': review_selected_ids,
-                'review_selected_group_ids': review_selected_ids,
-                'selected_group_summaries': selected_group_summaries,
-                'selected_groups_per_profile': dict(selected_per_profile),
-                'expanded_actions_per_profile': concrete_selected_per_profile,
-                'expanded_action_count': len(selected_actions),
-                'tool_group_budget_per_profile': group_budget,
-                'round_execution_normal_base': int(round_budget['normal_base']),
-                'round_execution_resolved_base': execution_budget,
-                'round_execution_resolved_max': execution_max,
-                'round_execution_overflow_cap': execution_overflow_cap,
-                'round_execution_configured_normal_max': configured_execution_max,
-                'round_execution_hard_cap': int(round_budget['hard_cap']),
-                'round_execution_ordinary_remaining': int(round_budget['ordinary_remaining']),
-                'round_execution_required_per_round': int(round_budget['required_per_round']),
-                'round_execution_remaining_rounds': int(round_budget['remaining_rounds']),
-                'expanded_before_global_cap': expanded_before_global_cap,
-                'execution_budget_diagnostics_per_profile': execution_diagnostics,
-                'review_seconds': review_seconds,
-                'review_error': review_error,
-                'review_reasoning': review_reasoning,
-                'seconds': round(time.monotonic() - planning_started, 2),
-                'attempt_errors': list(errors),
+                'context_window': context_window,
+                'seconds': round(time.monotonic() - batch_started, 2),
             })
-            return {
-                'reasoning_summary': _humanize_planner_reasoning(compact_plan.get('reasoning_summary'))[:1000],
-                'actions': selected_actions,
-                'finish': bool(compact_plan.get('finish', False)),
-            }
         except Exception as exc:
-            errors.append(f'{kind}: {type(exc).__name__}: {exc}')
-            LAST_AI_PLAN_DIAGNOSTICS.update({
-                'endpoint': kind,
-                'seconds': round(time.monotonic() - planning_started, 2),
-                'attempt_errors': list(errors),
-            })
-    raise RuntimeError('; '.join(errors))
+            errors.append(f'batch {batch_number}: {type(exc).__name__}: {exc}')
+            # A failed batch means some concrete actions were never judged by the AI. In strict
+            # Agentic planning this is a planner failure, not permission for Python to choose them.
+            raise RuntimeError('; '.join(errors)) from exc
+
+    # Every batch uses the same AI priority scale. Merge the batch-local selections globally using
+    # only priorities returned by the model; technical batch order is a tie-breaker only when the AI
+    # assigned equal priority. This prevents an early prompt batch from winning a later execution cap
+    # merely because it was evaluated first.
+    selected_ids.sort(key=lambda candidate_id: (-selected_priority_by_id[candidate_id], selected_first_seen[candidate_id]))
+    selected_actions = [dict(candidate_map[candidate_id]) for candidate_id in selected_ids]
+
+    round_budget = _round_execution_budget(
+        state, concrete_pool, current_round, ai_extension_requested=adaptive_requested,
+    )
+    execution_max = int(round_budget['resolved_max'])
+    selected_before_cap = len(selected_actions)
+    # Python now applies only the global ceiling to the AI-prioritized sequence. Unadmitted selected
+    # actions remain eligible in later rounds because they are not marked completed.
+    selected_actions = selected_actions[:execution_max]
+    selected_ids_admitted = selected_ids[:execution_max]
+
+    selected_per_profile: dict[str, int] = {}
+    available_per_profile: dict[str, int] = {}
+    for action in concrete_pool:
+        profile = str(action.get('profile') or '')
+        available_per_profile[profile] = available_per_profile.get(profile, 0) + 1
+    for action in selected_actions:
+        profile = str(action.get('profile') or '')
+        selected_per_profile[profile] = selected_per_profile.get(profile, 0) + 1
+    # Attach stable planner IDs after copying.
+    for candidate_id, action in zip(selected_ids_admitted, selected_actions):
+        action['planner_action_id'] = candidate_id
+        action['reason'] = f"AI selected concrete action {candidate_id}: {str(action.get('reason') or 'discovery-derived candidate')[:420]}"
+
+    LAST_AI_PLAN_DIAGNOSTICS.clear()
+    LAST_AI_PLAN_DIAGNOSTICS.update({
+        'endpoint': '+'.join(dict.fromkeys(endpoint_kinds)) or 'unknown',
+        'context_bytes': total_context_bytes,
+        'context_window': max_context_used,
+        'candidate_count': len(concrete_pool),
+        'detailed_candidate_count': len(concrete_pool),
+        'candidate_pool_count': len(concrete_pool),
+        'concrete_action_pool_count': len(concrete_pool),
+        'planner_batch_size': effective_batch_size,
+        'planner_configured_batch_size': batch_size,
+        'planner_batch_count': len(batches),
+        'planner_batches': batch_diagnostics,
+        'selected_action_ids': selected_ids_admitted,
+        'ai_selected_action_ids_before_cap': selected_ids,
+        'ai_selected_action_priorities': {candidate_id: selected_priority_by_id[candidate_id] for candidate_id in selected_ids},
+        'admitted_actions_per_profile': selected_per_profile,
+        'admitted_action_count': len(selected_actions),
+        'available_actions_per_profile': available_per_profile,
+        'round_execution_normal_base': int(round_budget['reference_cap']),
+        'round_execution_resolved_base': int(round_budget['resolved_base']),
+        'round_execution_resolved_max': execution_max,
+        'round_execution_overflow_cap': int(round_budget['overflow_cap']),
+        'round_execution_configured_normal_max': int(round_budget['reference_cap']),
+        'round_execution_reference_ceiling': int(round_budget['reference_cap']),
+        'round_execution_adaptive_ceiling': int(round_budget['adaptive_ceiling']),
+        'round_execution_active_ceiling': int(round_budget['active_ceiling']),
+        'round_execution_adaptive_extension_ai_requested': bool(round_budget.get('adaptive_extension_ai_requested')),
+        'round_execution_adaptive_extension_ai_effective': bool(round_budget.get('adaptive_extension_ai_effective')),
+        'round_execution_ordinary_remaining': int(round_budget['ordinary_remaining']),
+        'round_execution_required_per_round': int(round_budget['required_per_round']),
+        'round_execution_remaining_rounds': int(round_budget['remaining_rounds']),
+        'expanded_before_global_cap': selected_before_cap,
+        'execution_budget_diagnostics_per_profile': {},
+        'review_seconds': 0.0,
+        'review_error': '',
+        'review_reasoning': '',
+        'seconds': round(time.monotonic() - planning_started, 2),
+        'attempt_errors': list(errors),
+    })
+    return {
+        'reasoning_summary': ' '.join(reasoning_parts)[:1400],
+        'actions': selected_actions,
+        'request_adaptive_extension': adaptive_requested,
+        'initial_request_adaptive_extension': adaptive_requested,
+        'review_request_adaptive_extension': False,
+        'finish': len(selected_actions) == 0,
+    }
 
 # Removes reusable credentials from evidence before it is sent to the selected AI provider.
 def _redact_ai_evidence(value: Any) -> str:
@@ -2065,32 +1861,22 @@ def discovery_node(state: AgentState) -> dict[str, Any]:
         sibling_ranking = sibling_selection['ranking']
         if sibling_ranking:
             print(
-                f"    [DISCOVERY] Broad sibling policy ({shared.CURRENT_SCAN_MODE}): "
-                f"selected={len(sibling_selection['selected'])}/{len(sibling_ranking)} "
-                f"(base={sibling_selection['base_limit']}, adaptive_overflow={sibling_selection['overflow']}, "
-                f"max={sibling_selection['max_limit']}); full ZAP/Nuclei/Nikto coverage is limited to the ranked adaptive set, "
-                "while request-level specialists remain eligible across the full authorized discovered scope."
+                f"    [DISCOVERY] Agentic sibling-origin catalog ({shared.CURRENT_SCAN_MODE}): "
+                f"authorized_observed_origins={len(sibling_ranking)}; each origin is exposed as a concrete "
+                "ZAP/Nuclei/Nikto action when its profile/session is valid. Execution ceilings are applied after AI prioritization."
             )
     return {'discovery': discovery, 'diagnostics': diagnostics}
 
 
-# Returns how many concrete actions of one profile/tool have already completed. Agentic selectors
-# use this only to expose the next page of deterministic candidates in later rounds; the per-round
-# execution ceiling remains unchanged.
+# Returns how many concrete actions of one profile/tool have already completed. Kept for coverage
+# accounting only; candidate visibility must not depend on the AI having selected earlier actions.
 def _completed_tool_action_count(state: AgentState, profile_name: str, tool: str) -> int:
     prefix = f"{profile_name}|{str(tool or '').lower()}|"
     return sum(1 for identifier in state.get('completed', []) if str(identifier).startswith(prefix))
 
 
-# Expands only the planner-visible candidate pool across rounds. Round 1 exposes one bounded page;
-# later rounds ask the deterministic selector for enough ranked cases to move past already-completed
-# actions, then validate_plan() still enforces the normal per-round tool ceiling.
-def _agentic_selector_pool_limit(state: AgentState, profile_name: str, tool: str) -> int:
-    per_round = max(1, shared.tool_action_limit(tool, include_adaptive=True))
-    completed = _completed_tool_action_count(state, profile_name, tool)
-    max_rounds = max(1, int(state.get('max_rounds', 1) or 1))
-    return min(per_round * max_rounds, completed + per_round)
-
+# Agentic catalog selectors enumerate the complete structurally eligible surface. Prompt
+# size is controlled by planner batching and execution ceilings apply after AI prioritization.
 
 def _completed_sibling_origins(state: AgentState, profile_name: str, tool: str) -> set[str]:
     result: set[str] = set()
@@ -2146,7 +1932,7 @@ def discovery_candidate_actions(state: AgentState) -> list[dict[str, Any]]:
         authenticated = _profile_has_effective_auth(state, name)
         broad = list(shared.broad_tool_order(authenticated))
         for tool in broad:
-            actions.append({'profile': name, 'tool': tool, 'target_url': state['target'], 'jwt_token': '', 'injection_url': '', 'reason': 'Session-aware baseline coverage.'})
+            actions.append({'profile': name, 'tool': tool, 'target_url': state['target'], 'jwt_token': '', 'injection_url': '', 'reason': 'Session-aware broad coverage candidate for AI selection.'})
         anonymous_available = any(
             str(item.get('name') or '') == 'anonymous' and _profile_is_plannable(state, 'anonymous')
             for item in state['profiles']
@@ -2157,7 +1943,7 @@ def discovery_candidate_actions(state: AgentState) -> list[dict[str, Any]]:
         raw_profile_cookie = _profile_cookie(state, name)
         for tool in ('zap', 'nuclei', 'nikto'):
             sibling_selection, authenticated_targets = _agentic_sibling_selection(state, name, tool)
-            for sibling_origin, sibling_score in sibling_selection['selected']:
+            for sibling_origin, sibling_score in sibling_selection.get('ranking', sibling_selection.get('selected', [])):
                 broad_target = authenticated_targets.get(sibling_origin, sibling_origin)
                 sibling_cookie = shared.scope_cookie_header(broad_target, raw_profile_cookie)
                 if authenticated and not sibling_cookie:
@@ -2177,29 +1963,26 @@ def discovery_candidate_actions(state: AgentState) -> list[dict[str, Any]]:
                     'sibling_origin_score': sibling_score,
                     'reason': reason,
                 })
-        arjun_pool_limit = _agentic_selector_pool_limit(state, name, 'arjun')
-        for case in select_arjun_request_cases(state['discovery'].get(name, {}), state['target'], limit=arjun_pool_limit):
+        for case in select_arjun_request_cases(state['discovery'].get(name, {}), state['target'], agentic_catalog=True):
             adaptive = bool(case.get('adaptive_budget'))
-            actions.append({'profile': name, 'tool': 'arjun', 'target_url': case['url'], 'method': case.get('method', 'GET'), 'data': case.get('data', ''), 'parameters': case.get('parameters', []), 'jwt_token': '', 'injection_url': '', 'adaptive_budget': adaptive, 'priority_score': case.get('priority_score'), 'reason': ('Adaptive high-value overflow selected by deterministic ranking: ' if adaptive else '') + 'Hidden-parameter discovery using the real request method and body.'})
+            actions.append({'profile': name, 'tool': 'arjun', 'target_url': case['url'], 'method': case.get('method', 'GET'), 'data': case.get('data', ''), 'parameters': case.get('parameters', []), 'jwt_token': '', 'injection_url': '', 'adaptive_budget': adaptive, 'priority_score': case.get('priority_score'), 'reason': ('Discovery ranking marked this as an adaptive high-value candidate; AI still decides execution. ' if adaptive else '') + 'Hidden-parameter discovery using the real request method and body.'})
         for tool in ('sqlmap', 'dalfox', 'commix', 'traversal', 'idor'):
-            pool_limit = _agentic_selector_pool_limit(state, name, tool)
-            for case in select_tool_request_cases(state['discovery'].get(name, {}), tool, limit=pool_limit, authenticated_profile=authenticated, allow_state_changes=state_changes_allowed, credential_cookies=_profile_cookie(state, name)):
+            for case in select_tool_request_cases(state['discovery'].get(name, {}), tool, authenticated_profile=authenticated, allow_state_changes=state_changes_allowed, credential_cookies=_profile_cookie(state, name), agentic_catalog=True):
                 adaptive = bool(case.get('adaptive_budget'))
                 coverage_reserve = bool(case.get('coverage_reserve'))
-                prefix = f'Adaptive high-value overflow selected by deterministic ranking for {tool}. ' if adaptive else 'Routing-value coverage reserve selected for direct traversal/LFI validation. ' if coverage_reserve else ''
-                actions.append({'profile': name, 'tool': tool, 'target_url': case['url'], 'method': case.get('method', 'GET'), 'data': case.get('data', ''), 'parameters': case.get('parameters', []), 'jwt_token': '', 'injection_url': '', 'adaptive_budget': adaptive, 'coverage_reserve': coverage_reserve, 'priority_score': case.get('priority_score'), 'reason': prefix + f'Highest-value discovered request for {tool}.'})
+                prefix = f'Discovery ranking marked this as an adaptive high-value candidate for {tool}; AI still decides execution. ' if adaptive else 'Discovery marked this as a routing-value traversal/LFI candidate; AI still decides execution. ' if coverage_reserve else ''
+                actions.append({'profile': name, 'tool': tool, 'target_url': case['url'], 'method': case.get('method', 'GET'), 'data': case.get('data', ''), 'parameters': case.get('parameters', []), 'jwt_token': '', 'injection_url': '', 'adaptive_budget': adaptive, 'coverage_reserve': coverage_reserve, 'priority_score': case.get('priority_score'), 'reason': prefix + f'Concrete discovered request candidate for {tool}.'})
         if authenticated:
             raw_cookie = _profile_cookie(state, name)
-            authorization_pool_limit = _agentic_selector_pool_limit(state, name, 'authorization')
-            for case in select_authorization_request_cases(state['discovery'].get(name, {}), limit=authorization_pool_limit):
+            for case in select_authorization_request_cases(state['discovery'].get(name, {}), agentic_catalog=True):
                 if (not state_changes_allowed) and shared.request_case_state_change_reason(case):
                     continue
-                if not shared.scope_cookie_header(str(case.get('url') or ''), raw_cookie):
+                case_url = str(case.get('url') or '')
+                if not (shared.scope_cookie_header(case_url, raw_cookie) or shared.runtime_target_auth_available(raw_cookie, case_url)):
                     continue
                 adaptive = bool(case.get('adaptive_budget'))
-                actions.append({'profile': name, 'tool': 'authorization', 'target_url': case['url'], 'method': 'GET', 'data': '', 'parameters': case.get('parameters', []), 'jwt_token': '', 'injection_url': '', 'adaptive_budget': adaptive, 'priority_score': case.get('priority_score'), 'reason': ('Adaptive high-value overflow selected by deterministic ranking for authorization. ' if adaptive else '') + 'Read-only authorization differential candidate derived from an identity, object or privileged-resource signal.'})
-        browser_pool_limit = _agentic_selector_pool_limit(state, name, 'browser')
-        for case in select_browser_request_cases(state['discovery'].get(name, {}), limit=browser_pool_limit):
+                actions.append({'profile': name, 'tool': 'authorization', 'target_url': case['url'], 'method': 'GET', 'data': '', 'parameters': case.get('parameters', []), 'jwt_token': '', 'injection_url': '', 'adaptive_budget': adaptive, 'priority_score': case.get('priority_score'), 'reason': ('Discovery ranking marked this as an adaptive high-value authorization candidate; AI still decides execution. ' if adaptive else '') + 'Read-only authorization differential candidate derived from an identity, object or privileged-resource signal.'})
+        for case in select_browser_request_cases(state['discovery'].get(name, {}), agentic_catalog=True):
             if (not state_changes_allowed) and shared.request_case_state_change_reason(case):
                 continue
             actions.append({'profile': name,
@@ -2216,9 +1999,8 @@ def discovery_candidate_actions(state: AgentState) -> list[dict[str, Any]]:
                 'client_sinks': case.get('client_sinks', []),
                 'adaptive_budget': bool(case.get('adaptive_budget')),
                 'priority_score': case.get('priority_score'),
-                'reason': ('Adaptive high-value overflow selected by deterministic ranking. ' if case.get('adaptive_budget') else '') + 'Browser verification candidate derived from XSS-like parameters or client-side source/sink evidence.'})
-        workflow_pool_limit = _agentic_selector_pool_limit(state, name, 'workflow')
-        for case in select_workflow_request_cases(state['discovery'].get(name, {}), limit=workflow_pool_limit):
+                'reason': ('Discovery ranking marked this as an adaptive high-value candidate; AI still decides execution. ' if case.get('adaptive_budget') else '') + 'Browser verification candidate derived from XSS-like parameters or client-side source/sink evidence.'})
+        for case in select_workflow_request_cases(state['discovery'].get(name, {}), agentic_catalog=True):
             if (not state_changes_allowed) and shared.request_case_state_change_reason(case):
                 continue
             actions.append({'profile': name,
@@ -2236,28 +2018,29 @@ def discovery_candidate_actions(state: AgentState) -> list[dict[str, Any]]:
                 'enctype': case.get('enctype', ''),
                 'adaptive_budget': bool(case.get('adaptive_budget')),
                 'priority_score': case.get('priority_score'),
-                'reason': ('Adaptive high-value overflow selected by deterministic ranking. ' if case.get('adaptive_budget') else '') + 'Multi-step workflow candidate derived from discovered form metadata.'})
-        jwt_pool_limit = _agentic_selector_pool_limit(state, name, 'jwt')
-        tokens = [str(value) for value in state['discovery'].get(name, {}).get('jwt_tokens', []) if str(value)][:jwt_pool_limit]
+                'reason': ('Discovery ranking marked this as an adaptive high-value candidate; AI still decides execution. ' if case.get('adaptive_budget') else '') + 'Multi-step workflow candidate derived from discovered form metadata.'})
+        tokens = list(dict.fromkeys(str(value) for value in state['discovery'].get(name, {}).get('jwt_tokens', []) if str(value)))
         for token in tokens:
-            actions.append({'profile': name, 'tool': 'jwt', 'target_url': state['target'], 'jwt_token': token, 'injection_url': '', 'reason': 'Discovered JWT selected within the bounded per-profile token budget.'})
+            actions.append({'profile': name, 'tool': 'jwt', 'target_url': state['target'], 'jwt_token': token, 'injection_url': '', 'reason': 'Discovered JWT candidate exposed as a concrete AI action.'})
         if state['injection_url']:
             actions.append({'profile': name, 'tool': 'interactsh', 'target_url': state['target'], 'method': 'GET', 'data': '', 'parameters': ['explicit'], 'jwt_token': '', 'injection_url': state['injection_url'], 'oast_class': 'explicit', 'reason': 'Configured OAST URL.'})
         else:
-            oast_pool_limit = _agentic_selector_pool_limit(state, name, 'interactsh')
-            for case in select_oast_request_cases(state['discovery'].get(name, {}), state['target'], limit=oast_pool_limit):
-                actions.append({'profile': name, 'tool': 'interactsh', 'target_url': state['target'], 'method': case.get('method', 'GET'), 'data': case.get('data', ''), 'parameters': case.get('parameters', []), 'jwt_token': '', 'injection_url': case.get('injection_url', ''), 'oast_class': case.get('oast_class', 'remote-fetch'), 'reason': f"Automatically selected OAST-capable parameter: {case.get('parameter', 'unknown')}."})
+            for case in select_oast_request_cases(state['discovery'].get(name, {}), state['target'], agentic_catalog=True):
+                actions.append({'profile': name, 'tool': 'interactsh', 'target_url': state['target'], 'method': case.get('method', 'GET'), 'data': case.get('data', ''), 'parameters': case.get('parameters', []), 'jwt_token': '', 'injection_url': case.get('injection_url', ''), 'oast_class': case.get('oast_class', 'remote-fetch'), 'reason': f"Discovered OAST-capable candidate parameter: {case.get('parameter', 'unknown')}."})
     return _dedupe_no_cookie_profile_actions(state, actions)
 
 # Planner validation compares proposed actions with target scope, discovery evidence, and safety rules.
-def validate_plan(state: AgentState, proposed: Any) -> list[dict[str, Any]]:
+def validate_plan(state: AgentState, proposed: Any, *, enforce_execution_limits: bool = True) -> list[dict[str, Any]]:
     if not isinstance(proposed, list):
         return []
     profiles = {profile['name'] for profile in state['profiles']}
     completed, valid = (set(state['completed']), [])
     per_tool: dict[tuple[str, str], int] = {}
     proposal_limit = max(512, PROFILE_EXECUTION_ACTION_BUDGETS.get(shared.CURRENT_SCAN_MODE, 20) * max(1, len(state.get('profiles', []))) * 8)
-    for raw in proposed[:proposal_limit]:
+    # Candidate-catalog validation must not silently hide otherwise valid actions before the AI sees them.
+    # Execution limits are applied only to the AI-selected list, in the priority order returned by the model.
+    proposal_rows = proposed[:proposal_limit] if enforce_execution_limits else proposed
+    for raw in proposal_rows:
         if not isinstance(raw, dict):
             continue
         profile, tool = (str(raw.get('profile', '')), str(raw.get('tool', '')).lower())
@@ -2290,7 +2073,7 @@ def validate_plan(state: AgentState, proposed: Any) -> list[dict[str, Any]]:
                 else:
                     normalized_target = shared.normalized_origin(target_url)
                     sibling_selection, authenticated_targets = _agentic_sibling_selection(state, profile, tool)
-                    sibling_origins = {origin for origin, _ in sibling_selection['selected']}
+                    sibling_origins = {origin for origin, _ in sibling_selection.get('ranking', sibling_selection.get('selected', []))}
                     if normalized_target not in sibling_origins:
                         continue
                     # Preserve the concrete path where a path-scoped browser cookie is applicable.
@@ -2298,7 +2081,7 @@ def validate_plan(state: AgentState, proposed: Any) -> list[dict[str, Any]]:
                     # session into a false authentication_precheck_failed result.
                     target_url = authenticated_targets.get(normalized_target, normalized_target)
         elif scope == 'url':
-            cases = select_arjun_request_cases(found, state['target'], limit=_agentic_selector_pool_limit(state, profile, 'arjun'))
+            cases = select_arjun_request_cases(found, state['target'], agentic_catalog=True)
             matching = [case for case in cases if str(case.get('url', '')) == target_url]
             if method:
                 matching = [case for case in matching if str(case.get('method', 'GET')).upper() == method]
@@ -2309,15 +2092,18 @@ def validate_plan(state: AgentState, proposed: Any) -> list[dict[str, Any]]:
             data = str(selected.get('data', ''))
             parameters = [str(value) for value in selected.get('parameters', [])]
         elif scope in {'parameterized', 'numeric'}:
-            cases = select_tool_request_cases(found, tool, limit=_agentic_selector_pool_limit(state, profile, tool), authenticated_profile=profile_has_cookie, allow_state_changes=shared.state_changing_tests_allowed(state['target'], state.get('allow_state_changes')), credential_cookies=_profile_cookie(state, profile))
+            cases = select_tool_request_cases(found, tool, authenticated_profile=profile_has_cookie, allow_state_changes=shared.state_changing_tests_allowed(state['target'], state.get('allow_state_changes')), credential_cookies=_profile_cookie(state, profile), agentic_catalog=True)
             matching = [case for case in cases if str(case.get('url', '')) == target_url]
             if method:
                 matching = [case for case in matching if str(case.get('method', 'GET')).upper() == method]
             if not matching:
                 continue
             selected = matching[0]
-            selected_cookie = shared.scope_cookie_header(str(selected.get('url') or ''), _profile_cookie(state, profile))
-            if _tool_case_skip_reason(tool, selected, authenticated_profile=bool(selected_cookie)):
+            raw_profile_cookie = _profile_cookie(state, profile)
+            selected_url = str(selected.get('url') or '')
+            selected_cookie = shared.scope_cookie_header(selected_url, raw_profile_cookie)
+            can_refresh_identity = bool(raw_profile_cookie and shared.runtime_target_auth_available(raw_profile_cookie, selected_url))
+            if shared.tool_case_hard_skip_reason(tool, selected):
                 continue
             if (not shared.state_changing_tests_allowed(state['target'], state.get('allow_state_changes'))) and shared.request_case_state_change_reason(selected):
                 continue
@@ -2327,9 +2113,10 @@ def validate_plan(state: AgentState, proposed: Any) -> list[dict[str, Any]]:
             if scope == 'numeric' and (method != 'GET' or not any((value.isdigit() for _, value in parse_qsl(urlparse(target_url).query, keep_blank_values=True)))):
                 continue
         elif scope == 'authorization':
-            if not profile_has_cookie or not shared.scope_cookie_header(target_url, _profile_cookie(state, profile)):
+            raw_profile_cookie = _profile_cookie(state, profile)
+            if not profile_has_cookie or not (shared.scope_cookie_header(target_url, raw_profile_cookie) or shared.runtime_target_auth_available(raw_profile_cookie, target_url)):
                 continue
-            cases = select_authorization_request_cases(found, limit=_agentic_selector_pool_limit(state, profile, 'authorization'))
+            cases = select_authorization_request_cases(found, agentic_catalog=True)
             matching = [case for case in cases if str(case.get('url', '')) == target_url]
             if not matching:
                 continue
@@ -2340,7 +2127,7 @@ def validate_plan(state: AgentState, proposed: Any) -> list[dict[str, Any]]:
             data = ''
             parameters = [str(value) for value in selected.get('parameters', [])]
         elif scope == 'browser':
-            cases = select_browser_request_cases(found, limit=_agentic_selector_pool_limit(state, profile, 'browser'))
+            cases = select_browser_request_cases(found, agentic_catalog=True)
             matching = [case for case in cases if str(case.get('url', '')) == target_url]
             if method:
                 matching = [case for case in matching if str(case.get('method', 'GET')).upper() == method]
@@ -2357,7 +2144,7 @@ def validate_plan(state: AgentState, proposed: Any) -> list[dict[str, Any]]:
             client_sources = [str(value) for value in selected.get('client_sources', []) if str(value)]
             client_sinks = [str(value) for value in selected.get('client_sinks', []) if str(value)]
         elif scope == 'workflow':
-            cases = select_workflow_request_cases(found, limit=_agentic_selector_pool_limit(state, profile, 'workflow'))
+            cases = select_workflow_request_cases(found, agentic_catalog=True)
             matching = [case for case in cases if str(case.get('url', '')) == target_url]
             if method:
                 matching = [case for case in matching if str(case.get('method', 'POST')).upper() == method]
@@ -2387,7 +2174,7 @@ def validate_plan(state: AgentState, proposed: Any) -> list[dict[str, Any]]:
                 parameters = ['explicit']
                 oast_class = 'explicit'
             else:
-                candidates = select_oast_request_cases(found, state['target'], limit=_agentic_selector_pool_limit(state, profile, 'interactsh'))
+                candidates = select_oast_request_cases(found, state['target'], agentic_catalog=True)
                 matching = [item for item in candidates if not injection or item.get('injection_url') == injection]
                 if not matching:
                     continue
@@ -2400,88 +2187,33 @@ def validate_plan(state: AgentState, proposed: Any) -> list[dict[str, Any]]:
         action = {'profile': profile, 'tool': tool, 'target_url': target_url, 'method': method or 'GET', 'data': data, 'parameters': parameters, 'source_url': source_url, 'fields': fields, 'client_sources': client_sources, 'client_sinks': client_sinks, 'file_parameters': file_parameters, 'token_parameters': token_parameters, 'enctype': enctype, 'jwt_token': token, 'injection_url': injection, 'oast_class': oast_class, 'adaptive_budget': bool(selected.get('adaptive_budget')), 'coverage_reserve': bool(selected.get('coverage_reserve') or raw.get('coverage_reserve')), 'priority_score': selected.get('priority_score'), 'sibling_broad': bool(raw.get('sibling_broad')), 'sibling_origin_score': raw.get('sibling_origin_score'), 'reason': str(raw.get('reason', ''))[:500] or 'No planner reason supplied.'}
         identifier = action_id(action)
         key = (profile, tool)
-        limit = shared.tool_action_limit(tool, include_adaptive=True)
-        if per_tool.get(key, 0) >= limit:
-            continue
+        if enforce_execution_limits:
+            limit = shared.tool_action_limit(tool, include_adaptive=True)
+            if per_tool.get(key, 0) >= limit:
+                continue
         if identifier not in completed and all((action_id(item) != identifier for item in valid)):
             valid.append(action)
-            per_tool[key] = per_tool.get(key, 0) + 1
+            if enforce_execution_limits:
+                per_tool[key] = per_tool.get(key, 0) + 1
     return valid
 
 # Lists the actions that are currently valid for the planner.
 # --only-tool is a debug filter only: when unset, the autonomous candidate set is unchanged.
 def _eligible_action_catalog(state: AgentState) -> list[dict[str, Any]]:
-    actions = validate_plan(state, discovery_candidate_actions(state))
+    actions = validate_plan(state, discovery_candidate_actions(state), enforce_execution_limits=False)
     only_tool = str(state.get('only_tool') or '').strip().lower()
     if only_tool:
         actions = [action for action in actions if str(action.get('tool') or '').lower() == only_tool]
     return actions
 
-# Builds the bounded prompt catalog fairly across profile/tool buckets. Within each bucket the
-# existing deterministic ranking is preserved, while round-robin admission prevents the anonymous
-# profile or an early broad-scanner family from starving authenticated/specialist candidates.
-def _fair_planner_candidate_catalog(actions: list[dict[str, Any]], limit: int) -> list[dict[str, Any]]:
-    cap = max(1, int(limit))
-    if len(actions) <= cap:
-        return list(actions)
-    buckets: dict[tuple[str, str], list[dict[str, Any]]] = {}
-    bucket_order: list[tuple[str, str]] = []
-    for action in actions:
-        key = (str(action.get('profile') or ''), str(action.get('tool') or '').lower())
-        if key not in buckets:
-            buckets[key] = []
-            bucket_order.append(key)
-        buckets[key].append(action)
-    selected: list[dict[str, Any]] = []
-    offsets = {key: 0 for key in bucket_order}
-    while len(selected) < cap:
-        added = False
-        for key in bucket_order:
-            index = offsets[key]
-            bucket = buckets[key]
-            if index >= len(bucket):
-                continue
-            selected.append(bucket[index])
-            offsets[key] = index + 1
-            added = True
-            if len(selected) >= cap:
-                break
-        if not added:
-            break
-    return selected
-
-# Combines new AI actions with valid actions already selected.
-def _merge_ai_actions(base: list[dict[str, Any]], additions: list[dict[str, Any]], *, budget: int) -> list[dict[str, Any]]:
-    merged = list(base)
-    known = {action_id(action) for action in merged}
-    for action in additions:
-        identifier = action_id(action)
-        if identifier in known or len(merged) >= budget:
-            continue
-        merged.append(action)
-        known.add(identifier)
-    return merged
-
-# Concrete execution capacity is enforced independently for each active profile.
-def _merge_ai_actions_per_profile(base: list[dict[str, Any]], additions: list[dict[str, Any]], *, budget_per_profile: int) -> list[dict[str, Any]]:
-    merged = list(base)
-    known = {action_id(action) for action in merged}
-    counts: dict[str, int] = {}
-    for action in merged:
-        profile = str(action.get('profile') or '')
-        counts[profile] = counts.get(profile, 0) + 1
-    for action in additions:
-        identifier = action_id(action)
-        profile = str(action.get('profile') or '')
-        if identifier in known or counts.get(profile, 0) >= budget_per_profile:
-            continue
-        merged.append(action)
-        known.add(identifier)
-        counts[profile] = counts.get(profile, 0) + 1
-    return merged
-
-# Fallback planning remains capability-fair and obeys the same GLOBAL round cap as AI planning.
+# Emergency fallback is used only when AI planning fails and --require-ai is not active. It is not
+# part of normal Agentic decision-making: no tool is mandatory here either. The fallback simply uses
+# the same discovery-derived eligible pool, tool execution ranking and fair global concrete-action
+# ceiling so a non-strict run can still finish without fabricating scope or bypassing safety rules.
 def _fallback_plan(state: AgentState, eligible: list[dict[str, Any]], budget_total: int) -> list[dict[str, Any]]:
+    maximum = max(0, int(budget_total))
+    if maximum <= 0:
+        return []
     authenticated = {str(profile.get('name') or ''): _profile_has_effective_auth(state, str(profile.get('name') or '')) for profile in state['profiles']}
     ordered = sorted(
         eligible,
@@ -2492,11 +2224,12 @@ def _fallback_plan(state: AgentState, eligible: list[dict[str, Any]], budget_tot
             str(action.get('target_url') or ''),
         ),
     )
-    return _fair_global_action_cap(ordered, budget_total)
+    return _fair_global_action_cap(ordered, maximum)
+
 
 # Pending-action filtering keeps only valid actions that have not run yet.
 def _remaining_eligible_actions(state: AgentState) -> list[dict[str, Any]]:
-    actions = validate_plan(state, discovery_candidate_actions(state))
+    actions = validate_plan(state, discovery_candidate_actions(state), enforce_execution_limits=False)
     only_tool = str(state.get('only_tool') or '').strip().lower()
     if only_tool:
         actions = [action for action in actions if str(action.get('tool') or '').lower() == only_tool]
@@ -2515,23 +2248,27 @@ def _missing_tool_reason(state: AgentState, profile_name: str, tool: str) -> str
     if tool in BROAD_COVERAGE_TOOLS:
         return ''
     if tool == 'arjun':
-        return '' if select_arjun_request_cases(found, state['target'], limit=1) else 'No suitable discovered GET/POST request was available for hidden-parameter discovery.'
+        return '' if select_arjun_request_cases(found, state['target'], limit=1, agentic_catalog=True) else 'No suitable discovered GET/POST request was available for hidden-parameter discovery.'
     if tool in PARAMETER_COVERAGE_TOOLS:
-        return '' if select_tool_request_cases(found, tool, limit=1, authenticated_profile=profile_has_cookie, allow_state_changes=shared.state_changing_tests_allowed(state['target'], state.get('allow_state_changes')), credential_cookies=_profile_cookie(state, profile_name)) else f"No discovered policy-eligible request matched {tool}'s vulnerability class."
+        return '' if select_tool_request_cases(found, tool, limit=1, authenticated_profile=profile_has_cookie, allow_state_changes=shared.state_changing_tests_allowed(state['target'], state.get('allow_state_changes')), credential_cookies=_profile_cookie(state, profile_name), agentic_catalog=True) else f"No discovered policy-eligible request matched {tool}'s vulnerability class."
     if tool == 'authorization':
         if not profile_has_cookie:
             return 'Authorization comparison requires a primary authenticated profile.'
         raw_cookie = _profile_cookie(state, profile_name)
-        credentialed_cases = [case for case in select_authorization_request_cases(found, limit=shared.tool_action_limit('authorization')) if shared.scope_cookie_header(str(case.get('url') or ''), raw_cookie)]
-        return '' if credentialed_cases else 'No credentialed exact-origin read-only request contained a plausible identity, object or privileged-resource signal.'
+        credentialed_cases = [
+            case for case in select_authorization_request_cases(found, agentic_catalog=True)
+            if shared.scope_cookie_header(str(case.get('url') or ''), raw_cookie)
+            or (raw_cookie and shared.runtime_target_auth_available(raw_cookie, str(case.get('url') or '')))
+        ]
+        return '' if credentialed_cases else 'No identity-applicable exact-origin read-only request contained a plausible identity, object or privileged-resource signal.'
     if tool == 'browser':
-        return '' if select_browser_request_cases(found, limit=1) else 'No discovered request or client-side page matched browser XSS verification.'
+        return '' if select_browser_request_cases(found, limit=1, agentic_catalog=True) else 'No discovered request or client-side page matched browser XSS verification.'
     if tool == 'workflow':
-        return '' if select_workflow_request_cases(found, limit=1) else 'No discovered POST form matched CSRF, upload, authentication or CAPTCHA workflow classes.'
+        return '' if select_workflow_request_cases(found, limit=1, agentic_catalog=True) else 'No discovered POST form matched CSRF, upload, authentication or CAPTCHA workflow classes.'
     if tool == 'jwt':
         return '' if found.get('jwt_tokens') else 'No JWT was discovered in crawled responses.'
     if tool == 'interactsh':
-        if state.get('injection_url') or select_oast_request_cases(found, state['target'], limit=1):
+        if state.get('injection_url') or select_oast_request_cases(found, state['target'], limit=1, agentic_catalog=True):
             return ''
         return 'No discovered OAST-capable input was available.'
     return ''
@@ -2555,7 +2292,7 @@ def _materialize_unselected_actions(state: AgentState) -> dict[str, dict[str, An
 # Planner auditing records a concise summary of each proposed action.
 def _audit_action_summary(action: dict[str, Any]) -> dict[str, Any]:
 
-    return {'profile': str(action.get('profile') or ''), 'tool': str(action.get('tool') or ''), 'target_url': str(action.get('target_url') or ''), 'method': str(action.get('method') or 'GET'), 'parameters': [str(value) for value in action.get('parameters', [])][:12], 'reason': str(action.get('reason') or '')[:500]}
+    return {'planner_action_id': str(action.get('planner_action_id') or ''), 'profile': str(action.get('profile') or ''), 'tool': str(action.get('tool') or ''), 'target_url': str(action.get('target_url') or ''), 'method': str(action.get('method') or 'GET'), 'parameters': [str(value) for value in action.get('parameters', [])][:12], 'reason': str(action.get('reason') or '')[:500]}
 
 # At each planning round, the model proposes useful actions and validation filters unsafe or unsupported choices.
 def planner_node(state: AgentState) -> dict[str, Any]:
@@ -2563,13 +2300,38 @@ def planner_node(state: AgentState) -> dict[str, Any]:
     notes = list(state['notes'])
     audit = list(state.get('planner_audit', []))
     eligible = _eligible_action_catalog(state)
+    if not eligible:
+        notes.append(f'Round {round_number}: no eligible discovery-derived actions remain; no AI concrete-action selection call was required.')
+        audit.append({
+            'round': round_number,
+            'planner_source': 'no_eligible_actions',
+            'planner_endpoint': 'not_required',
+            'context_bytes': 0,
+            'context_window': 0,
+            'eligible_action_count': 0,
+            'planner_candidate_pool_count': 0,
+            'planner_candidate_count': 0,
+            'planner_detailed_candidate_count': 0,
+            'concrete_action_pool_count': 0,
+                        'eligible_tools': [],
+            'selected_action_count': 0,
+            'validated_concrete_action_count': 0,
+            'selected_actions': [],
+            'reasoning_summary': 'No eligible discovery-derived actions remain.',
+        })
+        return {
+            'plan': [], 'round': round_number, 'notes': notes, 'finished': True,
+            'planner_source': 'no_eligible_actions', 'planner_audit': audit,
+        }
     round_budget = _round_execution_budget(state, eligible, round_number)
     normal_round_base = int(round_budget['normal_base'])
     resolved_round_base = int(round_budget['resolved_base'])
     round_overflow_cap = int(round_budget['overflow_cap'])
     resolved_round_max = int(round_budget['resolved_max'])
     configured_normal_round_max = int(round_budget['configured_normal_max'])
-    hard_round_cap = int(round_budget['hard_cap'])
+    reference_round_cap = int(round_budget['reference_cap'])
+    adaptive_round_ceiling = int(round_budget['adaptive_ceiling'])
+    active_round_ceiling = int(round_budget['active_ceiling'])
     planner_source = 'ai'
     summary = ''
     endpoint = 'unavailable'
@@ -2580,61 +2342,72 @@ def planner_node(state: AgentState) -> dict[str, Any]:
     fallback_reason = ''
     try:
         decision = ai_plan(state)
+        round_budget = _round_execution_budget(
+            state, eligible, round_number,
+            ai_extension_requested=bool(decision.get('request_adaptive_extension', False)),
+        )
+        normal_round_base = int(round_budget['normal_base'])
+        resolved_round_base = int(round_budget['resolved_base'])
+        round_overflow_cap = int(round_budget['overflow_cap'])
+        resolved_round_max = int(round_budget['resolved_max'])
+        configured_normal_round_max = int(round_budget['configured_normal_max'])
+        reference_round_cap = int(round_budget['reference_cap'])
+        adaptive_round_ceiling = int(round_budget['adaptive_ceiling'])
+        active_round_ceiling = int(round_budget['active_ceiling'])
         validated_plan = validate_plan(state, decision.get('actions', []))
         validated_concrete_action_count = len(validated_plan)
-        plan = _fair_global_action_cap(validated_plan, resolved_round_max)
+        # ai_plan already returns actions in explicit AI priority order. Validation may remove invalid
+        # rows, but Python must not reshuffle the surviving actions by tool/profile.
+        plan = validated_plan[:resolved_round_max]
         summary = str(decision.get('reasoning_summary', ''))[:1000]
         finished = bool(decision.get('finish', False)) and (not plan)
         endpoint = str(LAST_AI_PLAN_DIAGNOSTICS.get('endpoint', 'unknown'))
         context_bytes = int(LAST_AI_PLAN_DIAGNOSTICS.get('context_bytes', 0) or 0)
         planner_seconds = float(LAST_AI_PLAN_DIAGNOSTICS.get('seconds', 0) or 0)
         candidate_count = int(LAST_AI_PLAN_DIAGNOSTICS.get('candidate_count', 0) or 0)
+        detailed_candidate_count = int(LAST_AI_PLAN_DIAGNOSTICS.get('detailed_candidate_count', candidate_count) or 0)
         candidate_pool_count = int(LAST_AI_PLAN_DIAGNOSTICS.get('candidate_pool_count', candidate_count) or candidate_count)
         selected_ids = [str(value) for value in LAST_AI_PLAN_DIAGNOSTICS.get('selected_action_ids', [])]
-        baseline_selected_ids = [str(value) for value in LAST_AI_PLAN_DIAGNOSTICS.get('baseline_selected_group_ids', [])]
-        discretionary_ai_ids = [str(value) for value in LAST_AI_PLAN_DIAGNOSTICS.get('ai_selected_group_ids', [])]
-        review_selected_ids = [str(value) for value in LAST_AI_PLAN_DIAGNOSTICS.get('review_selected_action_ids', [])]
-        review_seconds = float(LAST_AI_PLAN_DIAGNOSTICS.get('review_seconds', 0) or 0)
-        review_error = str(LAST_AI_PLAN_DIAGNOSTICS.get('review_error', '') or '')
-        review_reasoning = str(LAST_AI_PLAN_DIAGNOSTICS.get('review_reasoning', '') or '')[:500]
+        ai_selected_ids = [str(value) for value in LAST_AI_PLAN_DIAGNOSTICS.get('ai_selected_action_ids_before_cap', selected_ids)]
+        review_selected_ids = []
+        review_seconds = 0.0
+        review_error = ''
+        review_reasoning = ''
         if not plan and (not finished) and eligible:
             finished = True
             summary = (summary + ' No action was selected; the planner ended the round without forcing a checklist.').strip()
-        if review_selected_ids:
-            summary = (summary + f' Breadth review added {len(review_selected_ids)} complementary tool group(s).').strip()
-            if review_reasoning:
-                summary = (summary + f' Review: {review_reasoning}').strip()
-        elif review_seconds and review_reasoning:
-            summary = (summary + f' Breadth review added no actions. Review: {review_reasoning}').strip()
-        elif review_error:
-            summary = (summary + ' Optional breadth review failed; the initial AI plan was kept.').strip()
         notes.append(f'Round {round_number} [{planner_source}/{endpoint}; context={context_bytes}B]: {summary}')
-        review_note = f'; review_groups=+{len(review_selected_ids)} in {review_seconds:.1f}s' if review_seconds else ''
         provider_name = str(state.get('ai_provider') or 'ollama')
         concrete_pool_count = int(LAST_AI_PLAN_DIAGNOSTICS.get('concrete_action_pool_count', len(eligible)) or len(eligible))
-        expanded_count = int(LAST_AI_PLAN_DIAGNOSTICS.get('expanded_action_count', len(plan)) or len(plan))
-        group_note = f'group_pool={candidate_pool_count}; ' if candidate_pool_count != candidate_count else ''
-        print(f'\n[*] AI plan round {round_number} [{provider_name}] via {endpoint} (context={context_bytes} bytes; concrete_pool={concrete_pool_count}; {group_note}tool_groups={candidate_count}; baseline_groups={len(baseline_selected_ids)}; ai_groups={len(discretionary_ai_ids)}{review_note}; concrete_actions={expanded_count}; {planner_seconds:.1f}s): {summary}', flush=True)
-        selected_groups_by_profile = LAST_AI_PLAN_DIAGNOSTICS.get('selected_groups_per_profile', {})
-        execution_budget_diagnostics = LAST_AI_PLAN_DIAGNOSTICS.get('execution_budget_diagnostics_per_profile', {})
-        if isinstance(selected_groups_by_profile, dict):
-            for profile_name in sorted(selected_groups_by_profile):
-                details = execution_budget_diagnostics.get(profile_name, {}) if isinstance(execution_budget_diagnostics, dict) else {}
-                selected_actions = int(details.get('selected', 0) or 0) if isinstance(details, dict) else 0
-                available_actions = int(details.get('available', selected_actions) or selected_actions) if isinstance(details, dict) else selected_actions
-                deferred_actions = int(details.get('deferred', 0) or 0) if isinstance(details, dict) else 0
+        selected_count = int(LAST_AI_PLAN_DIAGNOSTICS.get('admitted_action_count', len(plan)) or len(plan))
+        planner_batch_count = int(LAST_AI_PLAN_DIAGNOSTICS.get('planner_batch_count', 1) or 1)
+        planner_batch_size = int(LAST_AI_PLAN_DIAGNOSTICS.get('planner_batch_size', candidate_count) or candidate_count)
+        print(
+            f'\n[*] AI plan round {round_number} [{provider_name}] via {endpoint} '
+            f'(context_total={context_bytes} bytes; concrete_candidates={concrete_pool_count}; '
+            f'batches={planner_batch_count}x<= {planner_batch_size}; AI_selected={len(ai_selected_ids)}; '
+            f'admitted={selected_count}; {planner_seconds:.1f}s): {summary}',
+            flush=True,
+        )
+        selected_actions_by_profile = LAST_AI_PLAN_DIAGNOSTICS.get('admitted_actions_per_profile', {})
+        available_actions_by_profile = LAST_AI_PLAN_DIAGNOSTICS.get('available_actions_per_profile', {})
+        if isinstance(available_actions_by_profile, dict):
+            for profile_name in sorted(available_actions_by_profile):
+                selected_for_profile = int(selected_actions_by_profile.get(profile_name, 0) or 0) if isinstance(selected_actions_by_profile, dict) else 0
+                available_for_profile = int(available_actions_by_profile.get(profile_name, 0) or 0)
                 print(
-                    f"    [PLANNER BUDGET] {profile_name}: tool groups={selected_groups_by_profile.get(profile_name, 0)}/{PROFILE_TOOL_GROUP_BUDGETS.get(shared.CURRENT_SCAN_MODE, 12)}; "
-                    f"actions admitted after shared cap={selected_actions}; selected-group pool={available_actions}; deferred={deferred_actions}",
+                    f"    [PLANNER] {profile_name}: concrete candidates={available_for_profile}; AI-selected/admitted={selected_for_profile}; "
+                    f"deferred={max(0, available_for_profile - selected_for_profile)}",
                     flush=True,
                 )
-            before_global_cap = int(LAST_AI_PLAN_DIAGNOSTICS.get('expanded_before_global_cap', len(plan)) or len(plan))
-            print(
-                f"    [ROUND BUDGET] total actions={len(plan)}; normal floor={normal_round_base}; resolved base={resolved_round_base}; "
-                f"resolved max={resolved_round_max}; normal configured max={configured_normal_round_max}; hard cap={hard_round_cap}; "
-                f"ordinary remaining={int(round_budget['ordinary_remaining'])}; rounds remaining={int(round_budget['remaining_rounds'])}; before cap={before_global_cap}",
-                flush=True,
-            )
+        before_global_cap = int(LAST_AI_PLAN_DIAGNOSTICS.get('expanded_before_global_cap', len(plan)) or len(plan))
+        print(
+            f"    [ROUND BUDGET] actions={len(plan)}; normal ceiling={reference_round_cap}; "
+            f"adaptive ceiling={adaptive_round_ceiling}; active ceiling={active_round_ceiling}; "
+            f"AI extension request={'yes' if round_budget.get('adaptive_extension_ai_requested') else 'no'}; "
+            f"before cap={before_global_cap}",
+            flush=True,
+        )
     except Exception as exc:
         endpoint = str(LAST_AI_PLAN_DIAGNOSTICS.get('endpoint', 'unavailable'))
         context_bytes = int(LAST_AI_PLAN_DIAGNOSTICS.get('context_bytes', 0) or 0)
@@ -2643,43 +2416,55 @@ def planner_node(state: AgentState) -> dict[str, Any]:
         plan = _fallback_plan(state, eligible, resolved_round_max)
         finished = not plan
         fallback_reason = f'{type(exc).__name__}: {exc}'
-        message = 'AI planning failed after streamed retries; a capability-fair discovery-derived fallback was used under the same global round cap: ' + fallback_reason
+        message = 'AI concrete-action planning failed; because --require-ai is disabled, the emergency deterministic fallback was used under the same global round cap: ' + fallback_reason
         notes.append(message)
         planner_source = 'fallback'
         summary = message[:1000]
         print(f'\n[!] {message}', file=sys.stderr, flush=True)
     plan_before_final_cap = len(plan)
-    plan = _fair_global_action_cap(plan, min(resolved_round_max, hard_round_cap))
+    final_cap = min(resolved_round_max, active_round_ceiling)
+    if planner_source == 'ai':
+        plan = plan[:final_cap]
+    else:
+        plan = _fair_global_action_cap(plan, final_cap)
     if plan_before_final_cap != len(plan):
         notes.append(f'Round {round_number}: final shared action cap reduced {plan_before_final_cap} validated actions to {len(plan)}.')
     audit.append({'round': round_number,
         'planner_source': planner_source,
         'planner_endpoint': endpoint,
         'context_bytes': context_bytes,
+        'context_window': int(LAST_AI_PLAN_DIAGNOSTICS.get('context_window', 0) or 0) if planner_source == 'ai' else 0,
         'eligible_action_count': len(eligible),
         'planner_candidate_pool_count': int(LAST_AI_PLAN_DIAGNOSTICS.get('candidate_pool_count', len(eligible)) or len(eligible)) if planner_source == 'ai' else len(eligible),
         'planner_candidate_count': int(LAST_AI_PLAN_DIAGNOSTICS.get('candidate_count', len(eligible)) or len(eligible)) if planner_source == 'ai' else len(eligible),
+        'planner_detailed_candidate_count': int(LAST_AI_PLAN_DIAGNOSTICS.get('detailed_candidate_count', 0) or 0) if planner_source == 'ai' else 0,
         'concrete_action_pool_count': int(LAST_AI_PLAN_DIAGNOSTICS.get('concrete_action_pool_count', len(eligible)) or len(eligible)) if planner_source == 'ai' else len(eligible),
-        'selected_groups_per_profile': dict(LAST_AI_PLAN_DIAGNOSTICS.get('selected_groups_per_profile', {})) if planner_source == 'ai' and isinstance(LAST_AI_PLAN_DIAGNOSTICS.get('selected_groups_per_profile', {}), dict) else {},
-        'expanded_actions_per_profile': dict(LAST_AI_PLAN_DIAGNOSTICS.get('expanded_actions_per_profile', {})) if planner_source == 'ai' and isinstance(LAST_AI_PLAN_DIAGNOSTICS.get('expanded_actions_per_profile', {}), dict) else {},
+        'planner_batch_size': int(LAST_AI_PLAN_DIAGNOSTICS.get('planner_batch_size', 0) or 0) if planner_source == 'ai' else 0,
+        'planner_batch_count': int(LAST_AI_PLAN_DIAGNOSTICS.get('planner_batch_count', 0) or 0) if planner_source == 'ai' else 0,
+        'available_actions_per_profile': dict(LAST_AI_PLAN_DIAGNOSTICS.get('available_actions_per_profile', {})) if planner_source == 'ai' and isinstance(LAST_AI_PLAN_DIAGNOSTICS.get('available_actions_per_profile', {}), dict) else {},
+        'admitted_actions_per_profile': dict(LAST_AI_PLAN_DIAGNOSTICS.get('admitted_actions_per_profile', {})) if planner_source == 'ai' and isinstance(LAST_AI_PLAN_DIAGNOSTICS.get('admitted_actions_per_profile', {}), dict) else {},
         'eligible_tools': sorted({str(action.get('tool') or '') for action in eligible}),
-        'round_action_normal_base_total': normal_round_base,
+        'round_action_normal_target_total': normal_round_base,
+        'round_action_normal_base_total': normal_round_base,  # legacy compatibility
         'round_action_resolved_base_total': resolved_round_base,
         'round_action_resolved_max_total': resolved_round_max,
         'round_action_overflow_total': round_overflow_cap,
         'round_action_configured_normal_max_total': configured_normal_round_max,
-        'round_action_hard_cap_total': hard_round_cap,
+        'round_action_reference_cap_total': reference_round_cap,
+        'round_action_adaptive_ceiling_total': adaptive_round_ceiling,
+        'round_action_active_ceiling_total': active_round_ceiling,
+        'round_action_adaptive_extension_unlocked': bool(round_budget.get('adaptive_extension_unlocked')),
+        'round_action_adaptive_extension_ai_requested': bool(round_budget.get('adaptive_extension_ai_requested')),
+        'round_action_adaptive_extension_ai_effective': bool(round_budget.get('adaptive_extension_ai_effective')),
+        'round_action_adaptive_extension_deterministic_pressure': bool(round_budget.get('adaptive_extension_deterministic_pressure')),
+        # Compatibility field for older report consumers.
+        'round_action_hard_cap_total': active_round_ceiling,
         'round_action_ordinary_remaining': int(round_budget['ordinary_remaining']),
         'round_action_required_per_round': int(round_budget['required_per_round']),
         'round_action_remaining_rounds': int(round_budget['remaining_rounds']),
         'round_action_count_before_final_cap': plan_before_final_cap,
         'execution_budget_diagnostics_per_profile': dict(LAST_AI_PLAN_DIAGNOSTICS.get('execution_budget_diagnostics_per_profile', {})) if planner_source == 'ai' and isinstance(LAST_AI_PLAN_DIAGNOSTICS.get('execution_budget_diagnostics_per_profile', {}), dict) else {},
-        'tool_group_budget_per_profile': PROFILE_TOOL_GROUP_BUDGETS.get(shared.CURRENT_SCAN_MODE, 12),
-        'baseline_selected_group_count': len(baseline_selected_ids) if planner_source == 'ai' else 0,
-        'ai_selected_group_count': len(discretionary_ai_ids) if planner_source == 'ai' else 0,
-        'review_selected_group_count': len(review_selected_ids) if planner_source == 'ai' else 0,
-        'selected_group_count': len(selected_ids) if planner_source == 'ai' else 0,
-        'selected_tool_groups': list(LAST_AI_PLAN_DIAGNOSTICS.get('selected_group_summaries', [])) if planner_source == 'ai' and isinstance(LAST_AI_PLAN_DIAGNOSTICS.get('selected_group_summaries', []), list) else [],
+        'ai_selected_action_count_before_cap': len(ai_selected_ids) if planner_source == 'ai' else 0,
         'validated_concrete_action_count': validated_concrete_action_count,
         'review_reasoning': review_reasoning if planner_source == 'ai' else '',
         'fallback_reason': fallback_reason,
@@ -2692,7 +2477,7 @@ def planner_node(state: AgentState) -> dict[str, Any]:
     return {'plan': plan, 'round': round_number, 'notes': notes, 'finished': finished, 'planner_source': planner_source, 'planner_audit': audit}
 
 # Action execution invokes one validated tool and stores the normalized result in planner state.
-async def execute_action(action: dict[str, Any], cookies: dict[str, str], discovery: dict[str, dict[str, Any]], allow_state_changes: bool | None=None, secondary_cookies: str='') -> tuple[dict[str, Any], dict[str, Any]]:
+async def execute_action(action: dict[str, Any], cookies: dict[str, str], discovery: dict[str, dict[str, Any]], allow_state_changes: bool | None=None, secondary_cookies: str='', identity_labels: dict[str, str] | None=None) -> tuple[dict[str, Any], dict[str, Any]]:
     tool = action['tool']
     profile = action['profile']
     server, function = REGISTRY[tool][:2]
@@ -2707,7 +2492,17 @@ async def execute_action(action: dict[str, Any], cookies: dict[str, str], discov
         arguments = {'target_url': action['target_url'], 'injection_url': action['injection_url'], 'cookies': shared.scope_cookie_header(request_url, cookies.get(profile, '')), 'method': action.get('method', 'GET'), 'data': action.get('data', ''), 'parameter': (action.get('parameters') or [''])[0], 'timeout': oast_timeout, 'request_rate': shared.MAX_REQUEST_RATE}
     else:
         profile_discovery = discovery.get(profile, {})
-        arguments = shared.build_tool_arguments(tool, action['target_url'], cookies.get(profile, ''), profile_discovery, case=action, secondary_cookies=secondary_cookies, allow_state_changes=allow_state_changes)
+        labels = identity_labels or {}
+        comparison_identities = [
+            {'label': str(labels.get(str(name)) or name), 'cookies': str(value)}
+            for name, value in cookies.items()
+            if str(name) != str(profile) and str(value)
+        ]
+        arguments = shared.build_tool_arguments(
+            tool, action['target_url'], cookies.get(profile, ''), profile_discovery, case=action,
+            secondary_cookies=secondary_cookies, comparison_identities=comparison_identities,
+            allow_state_changes=allow_state_changes,
+        )
         if action.get('sibling_broad') and tool in {'zap', 'nuclei', 'nikto'}:
             arguments['timeout'] = shared.sibling_broad_timeout(tool, arguments.get('timeout'))
         if tool == 'ffuf':
@@ -2717,7 +2512,7 @@ async def execute_action(action: dict[str, Any], cookies: dict[str, str], discov
     raw_profile_cookie = cookies.get(profile, '')
     request_url = _action_request_url(action, action['target_url'])
     effective_action_cookie = shared.scope_cookie_header(request_url, raw_profile_cookie)
-    if profile == 'authenticated' and (tool in authenticated_specialists or bool(action.get('sibling_broad'))):
+    if raw_profile_cookie and (tool in authenticated_specialists or bool(action.get('sibling_broad'))):
         profile_discovery = discovery.get(profile, {})
         source_url = str(action.get('source_url') or '')
         method = str(action.get('method') or 'GET').upper()
@@ -2794,7 +2589,7 @@ def _fair_sequential_action_order(plan: list[dict[str, Any]], cookies: dict[str,
 
 
 # Within each planner round, validated actions run before the model is asked to plan again.
-async def execute_plan(plan: list[dict[str, Any]], cookies: dict[str, str], discovery: dict[str, dict[str, Any]], allow_state_changes: bool | None=None, secondary_cookies: str='') -> list[tuple[dict[str, Any], dict[str, Any]]]:
+async def execute_plan(plan: list[dict[str, Any]], cookies: dict[str, str], discovery: dict[str, dict[str, Any]], allow_state_changes: bool | None=None, secondary_cookies: str='', identity_labels: dict[str, str] | None=None) -> list[tuple[dict[str, Any], dict[str, Any]]]:
 
     ordered = _fair_sequential_action_order(plan, cookies)
     total = len(ordered)
@@ -2819,7 +2614,7 @@ async def execute_plan(plan: list[dict[str, Any]], cookies: dict[str, str], disc
             elif action['tool'] == 'arjun' and arjun_empty_limits.get(action['profile'], 0) >= arjun_threshold:
                 item = (action, {'tool': 'arjun', 'status': 'skipped', 'target': action['target_url'], 'output': 'Adaptive budget reallocation: earlier high-priority Arjun actions reached their full budget without discovering a parameter; this lower-priority repeat was skipped.', 'diagnosis': 'adaptive_budget_reallocated', 'vulnerabilities': []})
             else:
-                item = await execute_action(action, cookies, discovery, allow_state_changes=allow_state_changes, secondary_cookies=secondary_cookies)
+                item = await execute_action(action, cookies, discovery, allow_state_changes=allow_state_changes, secondary_cookies=secondary_cookies, identity_labels=identity_labels)
         except Exception as exc:
             message = f'Agent executor isolated failure: {type(exc).__name__}: {exc}'
             item = (action, {'tool': action['tool'], 'status': 'error', 'target': action['target_url'], 'output': message, 'vulnerabilities': [], 'diagnosis': diagnose_error(message), 'traceback': traceback.format_exc()})
@@ -2861,6 +2656,10 @@ def _record_execution_batch(executed: list[tuple[dict[str, Any], dict[str, Any]]
             'target_url': coverage_action_target,
             'method': str(action.get('method') or 'GET').upper(),
             'parameters': [str(value) for value in action.get('parameters', []) if str(value)],
+            'body_fingerprint': shared.request_body_fingerprint(
+                str(action.get('method') or 'GET'), str(action.get('data') or ''),
+                [str(value) for value in action.get('parameters', []) if str(value)],
+            ),
             'source_url': str(action.get('source_url') or ''),
         }
         profile_results[f'{tool}:{number}'] = {**result, **metadata, 'coverage_action': coverage_action, 'planner_reason': action['reason'], 'planner_round': state['round']}
@@ -2931,13 +2730,21 @@ def executor_node(state: AgentState) -> dict[str, Any]:
         return {}
     audit = state.get('planner_audit', [])
     last_audit = audit[-1] if isinstance(audit, list) and audit and isinstance(audit[-1], dict) else {}
-    hard_cap = int(ROUND_EXECUTION_ACTION_HARD_CAPS.get(str(shared.CURRENT_SCAN_MODE or 'balanced'), len(state['plan'])) or len(state['plan']))
-    resolved_max = int(last_audit.get('round_action_resolved_max_total', hard_cap) or hard_cap)
-    execution_cap = max(1, min(hard_cap, resolved_max))
+    mode = str(shared.CURRENT_SCAN_MODE or 'balanced')
+    reference_cap = int(ROUND_EXECUTION_ACTION_REFERENCE_CAPS.get(mode, len(state['plan'])) or len(state['plan']))
+    adaptive_ceiling = int(ROUND_EXECUTION_ACTION_ADAPTIVE_CEILINGS.get(mode, reference_cap) or reference_cap)
+    # The executor never unlocks the emergency extension by itself: it only honors the active
+    # ceiling already resolved/audited by the planner. Without audit metadata it falls back to the
+    # safer normal reference ceiling.
+    active_ceiling = int(last_audit.get('round_action_active_ceiling_total', reference_cap) or reference_cap)
+    active_ceiling = max(1, min(active_ceiling, max(reference_cap, adaptive_ceiling)))
+    resolved_max = int(last_audit.get('round_action_resolved_max_total', active_ceiling) or active_ceiling)
+    execution_cap = max(1, min(active_ceiling, resolved_max))
     guarded_plan = _fair_global_action_cap(list(state['plan']), execution_cap)
     if len(guarded_plan) != len(state['plan']):
         print(f"[!] Final round guard reduced plan from {len(state['plan'])} to {len(guarded_plan)} total action(s) (cap={execution_cap}).", flush=True)
     cookies = {profile['name']: profile['cookies'] for profile in state['profiles']}
+    identity_labels = {str(profile.get('name') or ''): str(profile.get('identity_ref') or profile.get('name') or '') for profile in state['profiles']}
     results = {profile: dict(values) for profile, values in state['results'].items()}
     discovery = {profile: dict(values) for profile, values in state['discovery'].items()}
     completed = list(state['completed'])
@@ -2947,11 +2754,11 @@ def executor_node(state: AgentState) -> dict[str, Any]:
     remaining_stage = [action for action in guarded_plan if action['tool'] != 'ffuf']
     if discovery_stage:
         print('\n[*] Discovery enrichment stage: FFUF runs before ZAP/Nuclei.', flush=True)
-        ffuf_executed = asyncio.run(execute_plan(discovery_stage, cookies, discovery, allow_state_changes=state.get('allow_state_changes'), secondary_cookies=state.get('secondary_cookies', '')))
+        ffuf_executed = asyncio.run(execute_plan(discovery_stage, cookies, discovery, allow_state_changes=state.get('allow_state_changes'), secondary_cookies=state.get('secondary_cookies', ''), identity_labels=identity_labels))
         new_attack_surface += _record_execution_batch(ffuf_executed, state=state, results=results, discovery=discovery, completed=completed, profile_cookies=profile_cookies)
         print('[*] FFUF enrichment is available to planned ZAP/Nuclei actions; any new parameter candidates will be available to a later planner round.', flush=True)
     if remaining_stage:
-        executed = asyncio.run(execute_plan(remaining_stage, cookies, discovery, allow_state_changes=state.get('allow_state_changes'), secondary_cookies=state.get('secondary_cookies', '')))
+        executed = asyncio.run(execute_plan(remaining_stage, cookies, discovery, allow_state_changes=state.get('allow_state_changes'), secondary_cookies=state.get('secondary_cookies', ''), identity_labels=identity_labels))
         new_attack_surface += _record_execution_batch(executed, state=state, results=results, discovery=discovery, completed=completed, profile_cookies=profile_cookies)
     next_state = dict(state)
     next_state.update(results=results, discovery=discovery, completed=completed)
@@ -3037,7 +2844,7 @@ def _final_browser_verification_actions(state: AgentState) -> list[dict[str, Any
         for chosen in shared.select_adaptive_final_xss_candidates(ranked):
             action = dict(chosen)
             if chosen.get('adaptive_final_xss_budget'):
-                action['reason'] = 'Adaptive final-XSS overflow selected by deterministic ranking. ' + str(action.get('reason') or '')
+                action['reason'] = 'Discovery ranking marked this as an adaptive final-XSS candidate; AI still decides execution. ' + str(action.get('reason') or '')
             actions.append(action)
     return actions
 
@@ -3121,6 +2928,10 @@ async def _final_logout_checks(state: AgentState, results: dict[str, dict[str, A
                 'target_url': logout_url,
                 'method': str(logout_case.get('method') or 'GET').upper(),
                 'parameters': [str(value) for value in logout_case.get('parameters', []) if str(value)],
+                'body_fingerprint': shared.request_body_fingerprint(
+                    str(logout_case.get('method') or 'GET'), str(logout_case.get('data') or ''),
+                    [str(value) for value in logout_case.get('parameters', []) if str(value)],
+                ),
                 'source_url': str(logout_case.get('source_url') or ''),
             }
             key = 'session_logout_final' if index == 1 else f'session_logout_final_{index}'
@@ -3178,7 +2989,7 @@ def verification_node(state: AgentState) -> dict[str, Any]:
         )
         print(f'\n[*] Final verification: validating {len(actions)} XSS candidate(s) with Chromium; per-profile={counts_text}.', flush=True)
         before_keys = {profile: set(values) for profile, values in results.items()}
-        executed = asyncio.run(execute_plan(actions, cookies, discovery, allow_state_changes=state.get('allow_state_changes'), secondary_cookies=state.get('secondary_cookies', '')))
+        executed = asyncio.run(execute_plan(actions, cookies, discovery, allow_state_changes=state.get('allow_state_changes'), secondary_cookies=state.get('secondary_cookies', ''), identity_labels={str(profile.get('name') or ''): str(profile.get('identity_ref') or profile.get('name') or '') for profile in state['profiles']}))
         for action, browser_result in executed:
             _reconcile_final_browser_result(results, action, browser_result)
         _record_execution_batch(executed, state=state, results=results, discovery=discovery, completed=completed, profile_cookies=profile_cookies)
@@ -3203,7 +3014,7 @@ def report_node(state: AgentState) -> dict[str, Any]:
     output_name = str(os.environ.get('SECOPS_REPORT_RUN_ID') or f'SecOps_Agentic_Assessment_{datetime.now():%Y%m%d_%H%M%S_%f}_{os.getpid()}_{uuid.uuid4().hex[:8]}')
     report_results = _materialize_unselected_actions(state)
     remaining = _remaining_eligible_actions({**state, 'results': report_results})
-    context = {'profiles': [{'name': profile['name'], 'authenticated': _profile_has_effective_auth(state, str(profile.get('name') or ''))} for profile in state['profiles']],
+    context = {'profiles': [{'name': profile['name'], 'identity_ref': str(profile.get('identity_ref') or ''), 'authenticated': _profile_has_effective_auth(state, str(profile.get('name') or ''))} for profile in state['profiles']],
         'explicit_entry_points': list(state.get('entry_points') or []),
         'priority_discovery_seeds': list(state.get('discovery_seeds') or []),
         'expected_tools': list(REGISTRY),
@@ -3214,6 +3025,7 @@ def report_node(state: AgentState) -> dict[str, Any]:
                 authenticated_profile=_profile_has_effective_auth(state, str(profile.get('name') or '')),
                 allow_state_changes=shared.state_changing_tests_allowed(state['target'], state.get('allow_state_changes')),
                 credential_cookies=str(profile.get('cookies') or ''),
+                agentic_catalog=True,
             )
             for profile in state['profiles']
         },
@@ -3241,7 +3053,15 @@ def report_node(state: AgentState) -> dict[str, Any]:
         'remaining_eligible_actions_at_report': len(remaining),
         'execution_policy': 'AI selects discovery-derived scan actions under deterministic safety validation. After the planning rounds, the deterministic verification stage rechecks unresolved XSS candidates with Chromium and then validates any safely discovered authenticated logout endpoint as the final session-mutating action; anonymous profiles never execute logout. A separate AI analysis node then independently enriches severity, description, impact, potential consequences, recovery guidance and remediation using scanner evidence. Category, verification status, request evidence and confirmation rules remain deterministic and immutable. Bounded state-changing workflow probes use a tri-state policy: an explicit allow/deny is authoritative; when unspecified, only loopback local labs enable them automatically and remote authorized targets keep them disabled.',
         'allow_state_changes': state.get('allow_state_changes'),
-        'secondary_identity_supplied': bool(state.get('secondary_cookies', '')),
+        'authenticated_identity_count': sum(
+            1 for profile in state['profiles']
+            if bool(profile.get('cookies')) and _profile_has_effective_auth(state, str(profile.get('name') or ''))
+        ),
+        # Compatibility alias for old report readers. Multi-identity reports should use authenticated_identity_count.
+        'secondary_identity_supplied': bool(state.get('secondary_cookies', '')) or sum(
+            1 for profile in state['profiles']
+            if bool(profile.get('cookies')) and _profile_has_effective_auth(state, str(profile.get('name') or ''))
+        ) >= 2,
         'orchestration': {'engine': 'langgraph', 'mode': 'agentic', 'nodes': ['discovery', 'planner', 'executor', 'verification', 'analysis', 'report']}}
     report = asyncio.run(call_mcp('reporting/reportServer.py', 'generate_report', {'findings_summary': report_results, 'target_url': state['target'], 'output_name': output_name, 'assessment_context': context}))
     if report.get('status') != 'success':
