@@ -229,17 +229,59 @@ def _context_summary_html(context: dict[str, Any], toc: list[tuple[int, str, str
             if families:
                 pieces.append(f"application families visited {families}")
             service_ports = int(budget.get("same_host_service_ports_probed", 0) or 0)
+            service_reused_ports = int(budget.get("same_host_service_reused_ports_probed", 0) or 0)
+            service_cache_hit = bool(budget.get("same_host_service_cache_hit", False))
             service_roots = int(budget.get("same_host_web_services_discovered", 0) or 0)
+            service_seconds = float(budget.get("same_host_service_discovery_seconds", 0.0) or 0.0)
+            service_local_budget = float(budget.get("same_host_service_time_budget_seconds", 0.0) or 0.0)
+            service_global_budget = float(budget.get("same_host_service_global_time_budget_seconds", 0.0) or 0.0)
+            service_global_remaining = float(budget.get("same_host_service_global_time_remaining_seconds", 0.0) or 0.0)
+            service_time_exhausted = bool(budget.get("same_host_service_time_budget_exhausted", False))
             expansion_hosts = int(budget.get("same_host_service_expansion_hosts_scanned", 0) or 0)
+            expansion_reused = int(budget.get("same_host_service_expansion_hosts_reused_cached", 0) or 0)
+            expansion_deferred = int(budget.get("same_host_service_expansion_hosts_deferred_time_budget", 0) or 0)
+            expansion_failed_preprobe = int(budget.get("same_host_service_expansion_hosts_failed_before_probe", 0) or 0)
+            expansion_considered = int(budget.get("same_host_service_expansion_hosts_considered", 0) or 0)
             expansion_observed = int(budget.get("same_host_service_expansion_hosts_observed", 0) or 0)
             expansion_ports = int(budget.get("same_host_service_expansion_ports_probed", 0) or 0)
+            expansion_reused_ports = int(budget.get("same_host_service_expansion_reused_ports_probed", 0) or 0)
             expansion_roots = int(budget.get("same_host_service_expansion_web_services_discovered", 0) or 0)
-            if service_ports or service_roots:
-                pieces.append(f"primary-host service discovery ports {service_ports}, web roots {service_roots}")
-            if expansion_hosts or expansion_observed:
+            expansion_candidate_budget = int(budget.get("same_host_service_expansion_candidate_budget", 0) or 0)
+            expansion_candidate_consumed = int(budget.get("same_host_service_expansion_candidate_budget_consumed", expansion_ports) or 0)
+            expansion_candidate_remaining = int(budget.get("same_host_service_expansion_candidate_budget_remaining", max(0, expansion_candidate_budget - expansion_candidate_consumed)) or 0)
+            expansion_time_policy = str(budget.get("same_host_service_expansion_time_allocation_policy") or "").strip()
+            if service_ports or service_roots or budget.get("discover_same_host_services"):
+                timing = ""
+                if service_local_budget:
+                    timing = f", initial scan time {service_seconds:.1f}/{service_local_budget:.0f}s"
+                    if service_time_exhausted:
+                        timing += " (time limit reached)"
+                reuse = f", reused cached host scan ({service_reused_ports} prior port probes)" if service_cache_hit else ""
+                pieces.append(f"primary-host service discovery ports {service_ports}, web roots {service_roots}{timing}{reuse}")
+            if expansion_hosts or expansion_reused or expansion_deferred or expansion_failed_preprobe or expansion_observed:
+                considered = expansion_considered or (expansion_hosts + expansion_reused + expansion_deferred + expansion_failed_preprobe)
+                allocation = ""
+                if expansion_time_policy == "equal-share-of-remaining-time-and-candidates-with-unused-capacity-recycled":
+                    allocation = ", remaining time/candidates shared equally across pending new hosts; unused capacity recycled"
+                elif expansion_time_policy:
+                    allocation = f", allocation policy {expansion_time_policy}"
+                candidate_text = ""
+                if expansion_candidate_budget:
+                    candidate_text = (
+                        f", candidate pool {expansion_candidate_consumed}/{expansion_candidate_budget} consumed, "
+                        f"{expansion_candidate_remaining} remaining"
+                    )
                 pieces.append(
-                    f"authorized discovered-host service expansion {expansion_hosts}/{expansion_observed} host(s), "
-                    f"ports {expansion_ports}, web roots {expansion_roots}"
+                    f"authorized discovered-host service expansion: considered {considered}/{expansion_observed}, "
+                    f"new TCP sweeps {expansion_hosts}, cached host scans reused {expansion_reused}, "
+                    f"time-budget deferred {expansion_deferred}, pre-probe failures {expansion_failed_preprobe}, new port probes {expansion_ports}, "
+                    f"reused prior probes {expansion_reused_ports}, web roots {expansion_roots}{candidate_text}{allocation}"
+                )
+            if service_global_budget:
+                service_global_used = max(0.0, service_global_budget - service_global_remaining)
+                pieces.append(
+                    f"service-discovery global time {service_global_used:.1f}/{service_global_budget:.0f}s, "
+                    f"remaining {max(0.0, service_global_remaining):.1f}s"
                 )
             rows.append(("Discovery budget", _esc(" | ".join(pieces))))
             out_scope_count = int(budget.get("out_of_scope_urls_skipped", 0) or 0)

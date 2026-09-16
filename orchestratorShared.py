@@ -118,9 +118,9 @@ MAX_CRAWL_PAGES = max(10, int(os.getenv('SECOPS_MAX_CRAWL_PAGES', '2200')))
 MAX_SCRIPT_ASSETS = max(4, int(os.getenv('SECOPS_MAX_SCRIPT_ASSETS', '1200')))
 SCANNER_PROGRESS_INTERVAL = max(10, int(os.getenv('SECOPS_PROGRESS_INTERVAL', '30')))
 DISCOVERY_LIMITS = {
-    'fast': {'crawl_pages': 120, 'crawl_pages_max': 220, 'browser_pages': 72, 'browser_pages_max': 200, 'browser_per_origin_pages': 180, 'browser_menu_clicks_per_page': 16, 'browser_dom_passes': 3, 'scripts': 128, 'route_variants': 8, 'per_origin_pages': 190, 'same_host_service_candidates': 4096, 'same_host_service_expansion_hosts': 8, 'same_host_service_expansion_recrawl_pages': 24},
-    'balanced': {'crawl_pages': 600, 'crawl_pages_max': 1100, 'browser_pages': 400, 'browser_pages_max': 1200, 'browser_per_origin_pages': 1000, 'browser_menu_clicks_per_page': 64, 'browser_dom_passes': 6, 'scripts': 640, 'route_variants': 20, 'per_origin_pages': 900, 'same_host_service_candidates': 32768, 'same_host_service_expansion_hosts': 32, 'same_host_service_expansion_recrawl_pages': 90},
-    'deep': {'crawl_pages': 1200, 'crawl_pages_max': 2200, 'browser_pages': 800, 'browser_pages_max': 2400, 'browser_per_origin_pages': 2000, 'browser_menu_clicks_per_page': 112, 'browser_dom_passes': 9, 'scripts': 1200, 'route_variants': 32, 'per_origin_pages': 1800, 'same_host_service_candidates': 65535, 'same_host_service_expansion_hosts': 128, 'same_host_service_expansion_recrawl_pages': 180},
+    'fast': {'crawl_pages': 120, 'crawl_pages_max': 220, 'browser_pages': 72, 'browser_pages_max': 200, 'browser_per_origin_pages': 180, 'browser_menu_clicks_per_page': 16, 'browser_dom_passes': 3, 'scripts': 128, 'route_variants': 8, 'per_origin_pages': 190, 'same_host_service_candidates': 4096, 'same_host_service_time_budget_seconds': 240, 'same_host_service_initial_time_budget_seconds': 120, 'same_host_service_expansion_hosts': 8, 'same_host_service_expansion_recrawl_pages': 24},
+    'balanced': {'crawl_pages': 600, 'crawl_pages_max': 1100, 'browser_pages': 400, 'browser_pages_max': 1200, 'browser_per_origin_pages': 1000, 'browser_menu_clicks_per_page': 64, 'browser_dom_passes': 6, 'scripts': 640, 'route_variants': 20, 'per_origin_pages': 900, 'same_host_service_candidates': 32768, 'same_host_service_time_budget_seconds': 720, 'same_host_service_initial_time_budget_seconds': 360, 'same_host_service_expansion_hosts': 32, 'same_host_service_expansion_recrawl_pages': 90},
+    'deep': {'crawl_pages': 1200, 'crawl_pages_max': 2200, 'browser_pages': 800, 'browser_pages_max': 2400, 'browser_per_origin_pages': 2000, 'browser_menu_clicks_per_page': 112, 'browser_dom_passes': 9, 'scripts': 1200, 'route_variants': 32, 'per_origin_pages': 1800, 'same_host_service_candidates': 65535, 'same_host_service_time_budget_seconds': 1200, 'same_host_service_initial_time_budget_seconds': 600, 'same_host_service_expansion_hosts': 128, 'same_host_service_expansion_recrawl_pages': 180},
 }
 HTTP_ATTEMPT_BUDGET_FACTORS = {'fast': 1.75, 'balanced': 2.0, 'deep': 2.0}
 SCRIPT_ATTEMPT_BUDGET_FACTORS = {'fast': 1.5, 'balanced': 1.75, 'deep': 1.75}
@@ -186,7 +186,9 @@ AUTHORIZED_SCOPE_ORIGINS: set[str] = set()
 ALLOW_SAME_HOST_PORTS = False
 DISCOVER_SAME_HOST_SERVICES = False
 PRIMARY_SCOPE_TARGET = ''
-SAME_HOST_SERVICE_DISCOVERY_CACHE: dict[tuple[str, str, int, str], dict[str, Any]] = {}
+SAME_HOST_SERVICE_DISCOVERY_CACHE: dict[tuple[str, str, int, str, int], dict[str, Any]] = {}
+SAME_HOST_SERVICE_DISCOVERY_TIME_SPENT_SECONDS = 0.0
+SAME_HOST_SERVICE_DISCOVERY_TIME_LOCK = threading.Lock()
 AUTHENTICATED_ORIGIN_COOKIES: dict[tuple[str, str], str] = {}
 # A raw Cookie header tried speculatively on another authorized port can be rejected there even
 # though it remains valid on the primary origin. Cache that conclusive rejection per cookie value
@@ -222,13 +224,15 @@ def configure_authorized_scope(
     target: str, origins: list[str] | None=None, *, allow_same_host_ports: bool=False,
     discover_same_host_services: bool=False,
 ) -> None:
-    global PRIMARY_SCOPE_TARGET, ALLOW_SAME_HOST_PORTS, DISCOVER_SAME_HOST_SERVICES
+    global PRIMARY_SCOPE_TARGET, ALLOW_SAME_HOST_PORTS, DISCOVER_SAME_HOST_SERVICES, SAME_HOST_SERVICE_DISCOVERY_TIME_SPENT_SECONDS
     PRIMARY_SCOPE_TARGET = normalize_url(target)
     ALLOW_SAME_HOST_PORTS = bool(allow_same_host_ports)
     DISCOVER_SAME_HOST_SERVICES = bool(discover_same_host_services and ALLOW_SAME_HOST_PORTS)
     AUTHORIZED_SCOPE_ORIGINS.clear()
     REJECTED_SPECULATIVE_RAW_COOKIE_KEYS.clear()
     SAME_HOST_SERVICE_DISCOVERY_CACHE.clear()
+    with SAME_HOST_SERVICE_DISCOVERY_TIME_LOCK:
+        SAME_HOST_SERVICE_DISCOVERY_TIME_SPENT_SECONDS = 0.0
     for value in origins or []:
         origin = normalized_origin(str(value or '').strip())
         if origin:
@@ -632,7 +636,7 @@ def runtime_target_auth_available(cookies: str='', candidate: str='') -> bool:
 
 # Loads the timeouts and case limits for the selected scan profile.
 def configure_scan_mode(mode: str) -> None:
-    global CURRENT_SCAN_MODE, ARJUN_TIMEOUT, ARJUN_ENDPOINT_LIMIT
+    global CURRENT_SCAN_MODE, ARJUN_TIMEOUT, ARJUN_ENDPOINT_LIMIT, SAME_HOST_SERVICE_DISCOVERY_TIME_SPENT_SECONDS
     selected = str(mode or 'balanced').lower()
     if selected not in SCAN_MODES:
         raise ValueError(f'Unknown scan mode: {mode}')
@@ -646,6 +650,14 @@ def configure_scan_mode(mode: str) -> None:
     PARAMETER_TOOL_CASE_LIMITS.update(profile['limits'])
     ARJUN_TIMEOUT = int(profile['arjun'])
     ARJUN_ENDPOINT_LIMIT = int(profile.get('arjun_limit', 1))
+    # A scan-mode configuration starts a fresh assessment budget. Reset the host-level service
+    # cache together with the wall-clock counter so a second programmatic run in the same Python
+    # process cannot combine a fresh time allowance with stale TCP/HTTP classifications. Within
+    # one assessment configure_scan_mode() is not called again, so anonymous/authenticated profiles
+    # still reuse the same exact-host cache as intended.
+    SAME_HOST_SERVICE_DISCOVERY_CACHE.clear()
+    with SAME_HOST_SERVICE_DISCOVERY_TIME_LOCK:
+        SAME_HOST_SERVICE_DISCOVERY_TIME_SPENT_SECONDS = 0.0
 TIME_LIMIT_DIAGNOSES = {'timeout', 'time_limit_reached', 'timeout_with_partial_results', 'timeout_with_confirmed_finding', 'bounded_partial_scan'}
 AUTO_INDEX_PARAMETERS = {'c', 'n', 'm', 's', 'd', 'o'}
 OAST_PARAMETER_SCORES = {'url': 120, 'uri': 115, 'host': 115, 'hostname': 115, 'domain': 110, 'callback': 130, 'callback_url': 135, 'webhook': 135, 'webhook_url': 140, 'endpoint': 100, 'target': 95, 'dest': 100, 'destination': 105, 'redirect': 80, 'redirect_url': 90, 'next': 55, 'return': 55, 'fetch': 120, 'resource': 90, 'remote': 100, 'proxy': 105, 'image': 65, 'src': 70, 'file': 75, 'filename': 75, 'path': 60, 'page': 85, 'include': 105, 'template': 80, 'feed': 90, 'avatar': 65, 'document': 65, 'ip': 125, 'cmd': 145, 'command': 145, 'exec': 140, 'shell': 145, 'ping': 130}
@@ -3112,8 +3124,17 @@ def _browser_network_discovery(target: str, cookies: str, html_urls: list[str], 
     return (_dedupe_request_cases(cases), unique_observed, list(dict.fromkeys(navigated)), errors, budget_info)
 
 
-# Builds a deterministic, target-agnostic port order. Runtime service databases are considered first,
-# then a midpoint walk covers the whole TCP space without biasing discovery toward only low ports.
+# Builds a deterministic, target-agnostic port order. A compact generic web/application set is
+# always attempted first, then runtime service databases, then a midpoint walk covers the remaining
+# TCP space. This makes bounded scans useful early without encoding any target-specific port list.
+COMMON_WEB_SERVICE_PORTS = (
+    80, 443, 81, 3000, 3001, 3002, 4000, 4200, 5000, 5001, 5601, 6443, 7000, 7001,
+    8000, 8001, 8008, 8080, 8081, 8082, 8088, 8090, 8181, 8200, 8280, 8333,
+    8443, 8444, 8500, 8880, 8888, 8983, 9000, 9001, 9043, 9080, 9090, 9091,
+    9093, 9100, 9200, 9443, 10000, 10250, 10443, 15672, 18080,
+)
+
+
 def _runtime_service_database_ports() -> list[int]:
     candidates = [
         Path('/etc/services'),
@@ -3145,15 +3166,27 @@ def _stratified_tcp_port_order(limit: int) -> list[int]:
     cap = max(0, min(65535, int(limit)))
     if cap <= 0:
         return []
-    preferred = _runtime_service_database_ports()
     result: list[int] = []
     seen: set[int] = set()
-    for port in preferred:
+
+    # Common web/application ports come first so a short time-bounded pass still covers the most
+    # likely HTTP/HTTPS administration, API and developer surfaces. The list is generic and is not
+    # derived from a target inventory, compose file or benchmark dataset.
+    for port in COMMON_WEB_SERVICE_PORTS:
         if port not in seen:
             seen.add(port)
             result.append(port)
             if len(result) >= cap:
                 return result
+
+    # Runtime service databases broaden the generic priority set according to the host environment.
+    for port in _runtime_service_database_ports():
+        if port not in seen:
+            seen.add(port)
+            result.append(port)
+            if len(result) >= cap:
+                return result
+
     # Breadth-first interval bisection makes low/mid/high ranges appear early and is deterministic.
     intervals: list[tuple[int, int]] = [(1, 65535)]
     cursor = 0
@@ -3183,8 +3216,94 @@ def _stratified_tcp_port_order(limit: int) -> list[int]:
     return result
 
 
-def _resolve_service_discovery_address(hostname: str, preferred_port: int=0) -> tuple[str, list[str]]:
-    infos = socket.getaddrinfo(hostname, None, type=socket.SOCK_STREAM)
+def _same_host_service_time_limits() -> tuple[float, float]:
+    limits = DISCOVERY_LIMITS.get(CURRENT_SCAN_MODE, DISCOVERY_LIMITS['balanced'])
+    total = max(0.0, float(limits.get('same_host_service_time_budget_seconds', 0) or 0))
+    initial = max(0.0, float(limits.get('same_host_service_initial_time_budget_seconds', total) or total))
+    return total, min(total, initial)
+
+
+def _same_host_service_time_remaining_seconds() -> float:
+    total, _ = _same_host_service_time_limits()
+    with SAME_HOST_SERVICE_DISCOVERY_TIME_LOCK:
+        spent = float(SAME_HOST_SERVICE_DISCOVERY_TIME_SPENT_SECONDS)
+    return max(0.0, total - spent)
+
+
+def _consume_same_host_service_time(seconds: float) -> None:
+    global SAME_HOST_SERVICE_DISCOVERY_TIME_SPENT_SECONDS
+    value = max(0.0, float(seconds or 0.0))
+    if value <= 0:
+        return
+    with SAME_HOST_SERVICE_DISCOVERY_TIME_LOCK:
+        SAME_HOST_SERVICE_DISCOVERY_TIME_SPENT_SECONDS += value
+
+
+def _cached_same_host_service_discovery(hostname: str) -> dict[str, Any] | None:
+    """Return the best service scan already completed for one exact hostname in this process.
+
+    Port discovery is host-level, so anonymous/authenticated profiles and later application recrawls
+    reuse the same TCP/HTTP classification instead of paying for another sweep with a different cap.
+    """
+    host = normalized_hostname(hostname)
+    matches: list[dict[str, Any]] = []
+    for key, value in SAME_HOST_SERVICE_DISCOVERY_CACHE.items():
+        if not isinstance(key, tuple) or len(key) < 2 or key[0] != host or key[1] != CURRENT_SCAN_MODE:
+            continue
+        if isinstance(value, dict):
+            matches.append(value)
+    if not matches:
+        return None
+    return dict(max(
+        matches,
+        key=lambda row: (
+            int(row.get('ports_probed', 0) or 0),
+            int(row.get('candidate_cap', 0) or 0),
+            float(row.get('duration_seconds', 0.0) or 0.0),
+        ),
+    ))
+
+
+def _bounded_service_getaddrinfo(hostname: str, timeout: float) -> list[tuple[Any, ...]]:
+    """Resolve one service-discovery hostname without escaping the profile wall-clock budget.
+
+    ``socket.getaddrinfo`` has no portable timeout argument and may block for resolver retries.  Run it
+    in a daemon helper thread and wait only for the bounded allowance.  A timed-out resolver thread is
+    never used for later decisions; daemonization prevents it from holding process shutdown open.
+    """
+    allowance = max(0.0, float(timeout or 0.0))
+    if allowance <= 0:
+        raise TimeoutError(f'DNS resolution budget exhausted for {hostname!r}')
+    done = threading.Event()
+    state: dict[str, Any] = {}
+
+    def _resolve() -> None:
+        try:
+            state['infos'] = socket.getaddrinfo(hostname, None, type=socket.SOCK_STREAM)
+        except BaseException as exc:  # preserve the resolver exception for the calling thread
+            state['error'] = exc
+        finally:
+            done.set()
+
+    worker = threading.Thread(target=_resolve, name='secops-service-dns', daemon=True)
+    worker.start()
+    if not done.wait(allowance):
+        raise TimeoutError(f'DNS resolution timed out for {hostname!r} after {allowance:.2f}s')
+    error = state.get('error')
+    if isinstance(error, BaseException):
+        raise error
+    infos = state.get('infos')
+    return list(infos) if isinstance(infos, list) else list(infos or [])
+
+
+def _resolve_service_discovery_address(
+    hostname: str, preferred_port: int=0, *, deadline: float | None=None,
+) -> tuple[str, list[str]]:
+    remaining = 3.0 if deadline is None else max(0.0, float(deadline) - time.monotonic())
+    # DNS is part of the same service-discovery wall-clock budget.  Three seconds is enough for the
+    # normal local/university resolver path while preventing resolver retries from violating the
+    # advertised 4/12/20 minute global ceilings.
+    infos = _bounded_service_getaddrinfo(hostname, min(3.0, remaining))
     addresses: list[str] = []
     for info in infos:
         address = str((info[4] or ('',))[0] or '').strip()
@@ -3194,14 +3313,21 @@ def _resolve_service_discovery_address(hostname: str, preferred_port: int=0) -> 
         raise OSError(f'No address resolved for {hostname!r}')
     # Keep one address so the port budget is not multiplied by DNS cardinality, but do not blindly
     # choose getaddrinfo()[0]: on dual-stack/multi-A hosts that address may not be the one serving the
-    # configured target. Prefer the first address reachable on the target's original port.
+    # configured target. Prefer the first address reachable on the target's original port while the
+    # same local deadline still has capacity.
     port = int(preferred_port or 0)
     if 1 <= port <= 65535 and len(addresses) > 1:
         for address in addresses:
+            remaining = 0.35 if deadline is None else max(0.0, float(deadline) - time.monotonic())
+            if remaining <= 0:
+                break
             sock: socket.socket | None = None
             try:
                 _pace_http_request()
-                sock = socket.create_connection((address, port), timeout=0.35)
+                remaining = 0.35 if deadline is None else max(0.0, float(deadline) - time.monotonic())
+                if remaining <= 0:
+                    break
+                sock = socket.create_connection((address, port), timeout=min(0.35, remaining))
                 return address, addresses
             except OSError:
                 continue
@@ -3284,46 +3410,109 @@ def _tcp_port_open(address: str, port: int, timeout: float=0.30) -> bool:
                 pass
 
 
-def discover_same_host_web_services(target: str, candidate_cap: int | None=None) -> dict[str, Any]:
+def discover_same_host_web_services(
+    target: str, candidate_cap: int | None=None, *, time_budget_seconds: float | None=None,
+) -> dict[str, Any]:
     parsed = urlparse(normalize_url(target))
     hostname = normalized_hostname(parsed.hostname or '')
-    configured_cap = int(DISCOVERY_LIMITS.get(CURRENT_SCAN_MODE, DISCOVERY_LIMITS['balanced']).get('same_host_service_candidates', 0) or 0)
+    limits = DISCOVERY_LIMITS.get(CURRENT_SCAN_MODE, DISCOVERY_LIMITS['balanced'])
+    configured_cap = int(limits.get('same_host_service_candidates', 0) or 0)
     cap = configured_cap if candidate_cap is None else max(0, min(configured_cap, int(candidate_cap)))
     original_port = parsed.port or (443 if parsed.scheme.lower() == 'https' else 80)
     # Address preference depends on the configured service port; keep it in the cache identity.
     cache_key = (hostname, CURRENT_SCAN_MODE, int(original_port), str(parsed.scheme or '').lower(), int(cap))
+    total_time_budget, initial_time_budget = _same_host_service_time_limits()
+    remaining_global = _same_host_service_time_remaining_seconds()
+    requested_time_budget = initial_time_budget if time_budget_seconds is None else max(0.0, float(time_budget_seconds))
+    local_time_budget = min(remaining_global, requested_time_budget)
     empty = {
-        'enabled': False, 'hostname': hostname, 'candidate_cap': cap, 'ports_probed': 0,
-        'web_services': [], 'open_web_unconfirmed_ports': [], 'classification_deferred_ports': [],
-        'resolved_addresses': [],
+        'enabled': False, 'hostname': hostname, 'candidate_cap': cap, 'candidate_ports_planned': 0,
+        'ports_probed': 0, 'web_services': [], 'open_web_unconfirmed_ports': [],
+        'classification_deferred_ports': [], 'resolved_addresses': [],
+        'time_budget_seconds': round(local_time_budget, 3),
+        'global_time_budget_seconds': round(total_time_budget, 3),
+        'global_time_remaining_before_seconds': round(remaining_global, 3),
+        'common_web_ports_priority_count': min(cap, len(COMMON_WEB_SERVICE_PORTS)),
     }
     if not DISCOVER_SAME_HOST_SERVICES or not ALLOW_SAME_HOST_PORTS or not hostname or cap <= 0:
         return empty
     cached = SAME_HOST_SERVICE_DISCOVERY_CACHE.get(cache_key)
+    if not isinstance(cached, dict):
+        # The TCP/service sweep is host-level: if another profile or application view already scanned
+        # this exact hostname with a different candidate share, reuse that result rather than scanning
+        # the host again. Application recrawls still run with the current profile/session later.
+        cached = _cached_same_host_service_discovery(hostname)
     if isinstance(cached, dict):
         result = dict(cached)
+        previous_ports = int(result.get('ports_probed', 0) or 0)
+        previous_duration = float(result.get('duration_seconds', 0.0) or 0.0)
+        services: list[dict[str, Any]] = []
+        for row in result.get('web_services', []) or []:
+            if not isinstance(row, dict):
+                continue
+            copy = dict(row)
+            copy['configured_port'] = (
+                int(copy.get('port') or 0) == int(original_port)
+                and str(copy.get('scheme') or '') == str(parsed.scheme or '').lower()
+            )
+            services.append(copy)
+        result['web_services'] = services
         result['cache_hit'] = True
+        result['host_level_cache_reuse'] = True
+        result['requested_candidate_cap'] = cap
+        result['reused_ports_probed'] = previous_ports
+        result['original_scan_duration_seconds'] = round(previous_duration, 3)
+        # These fields describe work performed by this call; the reused scan remains visible above.
+        result['ports_probed'] = 0
+        result['duration_seconds'] = 0.0
+        result['time_budget_seconds'] = 0.0
+        result['time_budget_exhausted'] = False
+        result['global_time_remaining_before_seconds'] = round(remaining_global, 3)
+        result['global_time_remaining_after_seconds'] = round(_same_host_service_time_remaining_seconds(), 3)
         return result
+    if local_time_budget <= 0:
+        return {
+            **empty, 'enabled': True, 'time_budget_exhausted': True, 'cache_hit': False,
+            'global_time_remaining_after_seconds': round(remaining_global, 3),
+        }
+
     started = time.monotonic()
+    deadline = started + local_time_budget
     try:
-        address, addresses = _resolve_service_discovery_address(hostname, original_port)
-    except OSError as exc:
+        address, addresses = _resolve_service_discovery_address(hostname, original_port, deadline=deadline)
+    except (OSError, TimeoutError) as exc:
+        elapsed = time.monotonic() - started
+        _consume_same_host_service_time(elapsed)
+        exhausted = bool(time.monotonic() >= deadline or _same_host_service_time_remaining_seconds() <= 0)
         result = {
             **empty, 'enabled': True, 'error': f'{type(exc).__name__}: {exc}',
-            'duration_seconds': round(time.monotonic() - started, 3), 'cache_hit': False,
+            'duration_seconds': round(elapsed, 3), 'cache_hit': False,
+            'time_budget_exhausted': exhausted,
+            'global_time_remaining_after_seconds': round(_same_host_service_time_remaining_seconds(), 3),
         }
-        SAME_HOST_SERVICE_DISCOVERY_CACHE[cache_key] = dict(result)
+        # No TCP candidate was probed.  Do not freeze a transient DNS/pre-probe failure into the
+        # host-level service cache; a later authorized profile may retry if global budget remains.
         return result
 
     web_services: list[dict[str, Any]] = []
     open_unconfirmed: list[int] = []
+    classification_deferred: list[int] = []
     ports = _stratified_tcp_port_order(cap)
+    ports_probed = 0
+    time_budget_exhausted = False
     # Every TCP-open candidate is classified with BOTH HTTP and HTTPS. A socket being open is only
     # attack-surface inventory; it is never labelled non-web merely because bounded classification
     # did not confirm an HTTP protocol.
     for index, port in enumerate(ports, start=1):
+        if time.monotonic() >= deadline:
+            time_budget_exhausted = True
+            break
+        ports_probed += 1
         if not _tcp_port_open(address, port):
             continue
+        # Once a TCP port is found open, finish its protocol classification even if the local deadline
+        # is reached during the probes; this avoids throwing away the most valuable result. The bounded
+        # socket timeouts limit the possible overrun to the current candidate only.
         plain_ok, plain_preview = _socket_http_probe(address, hostname, port, use_tls=False)
         tls_ok, tls_preview = _socket_http_probe(address, hostname, port, use_tls=True)
         if plain_ok:
@@ -3343,6 +3532,11 @@ def discover_same_host_web_services(target: str, candidate_cap: int | None=None)
         if not plain_ok and not tls_ok:
             open_unconfirmed.append(port)
 
+    elapsed = time.monotonic() - started
+    _consume_same_host_service_time(elapsed)
+    if ports_probed < len(ports) and time.monotonic() >= deadline:
+        time_budget_exhausted = True
+
     unique_services: list[dict[str, Any]] = []
     seen_roots: set[str] = set()
     for row in web_services:
@@ -3356,9 +3550,16 @@ def discover_same_host_web_services(target: str, candidate_cap: int | None=None)
         unique_services.append(copy)
     result = {
         'enabled': True, 'hostname': hostname, 'resolved_address': address, 'resolved_addresses': addresses,
-        'candidate_cap': cap, 'ports_probed': len(ports), 'web_services': unique_services,
-        'open_web_unconfirmed_ports': sorted(set(open_unconfirmed)), 'classification_deferred_ports': [],
-        'duration_seconds': round(time.monotonic() - started, 3), 'cache_hit': False,
+        'candidate_cap': cap, 'candidate_ports_planned': len(ports), 'ports_probed': ports_probed,
+        'web_services': unique_services, 'open_web_unconfirmed_ports': sorted(set(open_unconfirmed)),
+        'classification_deferred_ports': sorted(set(classification_deferred)),
+        'duration_seconds': round(elapsed, 3), 'cache_hit': False,
+        'time_budget_seconds': round(local_time_budget, 3), 'time_budget_exhausted': bool(time_budget_exhausted),
+        'global_time_budget_seconds': round(total_time_budget, 3),
+        'global_time_remaining_before_seconds': round(remaining_global, 3),
+        'global_time_remaining_after_seconds': round(_same_host_service_time_remaining_seconds(), 3),
+        'common_web_ports_priority_count': min(cap, len(COMMON_WEB_SERVICE_PORTS)),
+        'candidate_order_policy': 'generic-common-web-ports -> runtime-service-databases -> stratified-full-range',
     }
     SAME_HOST_SERVICE_DISCOVERY_CACHE[cache_key] = dict(result)
     return result
@@ -3837,7 +4038,15 @@ def discover_target(
         'allow_same_host_ports': ALLOW_SAME_HOST_PORTS,
         'discover_same_host_services': DISCOVER_SAME_HOST_SERVICES,
         'same_host_service_candidate_cap': int(same_host_service_discovery.get('candidate_cap', 0) or 0),
+        'same_host_service_candidate_ports_planned': int(same_host_service_discovery.get('candidate_ports_planned', 0) or 0),
         'same_host_service_ports_probed': int(same_host_service_discovery.get('ports_probed', 0) or 0),
+        'same_host_service_reused_ports_probed': int(same_host_service_discovery.get('reused_ports_probed', 0) or 0),
+        'same_host_service_cache_hit': bool(same_host_service_discovery.get('cache_hit', False)),
+        'same_host_service_time_budget_seconds': float(same_host_service_discovery.get('time_budget_seconds', 0.0) or 0.0),
+        'same_host_service_time_budget_exhausted': bool(same_host_service_discovery.get('time_budget_exhausted', False)),
+        'same_host_service_global_time_budget_seconds': float(same_host_service_discovery.get('global_time_budget_seconds', 0.0) or 0.0),
+        'same_host_service_global_time_remaining_seconds': float(same_host_service_discovery.get('global_time_remaining_after_seconds', 0.0) or 0.0),
+        'same_host_service_candidate_order_policy': str(same_host_service_discovery.get('candidate_order_policy') or ''),
         'same_host_web_services_discovered': len(same_host_service_discovery.get('web_services') or []),
         'same_host_open_web_unconfirmed_ports': len(same_host_service_discovery.get('open_web_unconfirmed_ports') or []),
         'same_host_classification_deferred_ports': len(same_host_service_discovery.get('classification_deferred_ports') or []),
@@ -4588,7 +4797,7 @@ def authenticate_discovered_sibling_origins(discovery: dict[str, Any], target: s
         try:
             recrawl = discover_target(
                 origin, sibling_cookie, max_pages=recrawl_pages, seeds=candidates,
-                expand_authorized_service_hosts=False,
+                expand_authorized_service_hosts=False, same_host_service_candidate_cap=0,
             )
             recrawl = discovery_for_origin(recrawl, origin, primary_cookies)
             recrawl['authentication_effective'] = probe.get('distinguished_from_anonymous') if probe.get('distinguished_from_anonymous') is not None else True
@@ -4648,7 +4857,7 @@ def authenticate_discovered_sibling_origins(discovery: dict[str, Any], target: s
         try:
             recrawl = discover_target(
                 scope_key, app_cookie, max_pages=app_recrawl_pages, seeds=candidates,
-                expand_authorized_service_hosts=False,
+                expand_authorized_service_hosts=False, same_host_service_candidate_cap=0,
             )
             recrawl = discovery_for_origin(recrawl, normalized_origin(target), primary_cookies)
             recrawl['authentication_effective'] = True
@@ -4852,6 +5061,8 @@ def expand_discovered_authorized_host_services(
             'same_host_service_expansion_hosts_pending': len(pending_ranked),
             'same_host_service_expansion_hosts_scanned': 0,
             'same_host_service_expansion_candidate_budget': total_candidate_budget,
+            'same_host_service_expansion_candidate_budget_consumed': 0,
+            'same_host_service_expansion_candidate_budget_remaining': total_candidate_budget,
             'same_host_service_expansion_ports_probed': 0,
             'same_host_service_expansion_web_services_discovered': 0,
         })
@@ -4859,10 +5070,17 @@ def expand_discovered_authorized_host_services(
         result['budget_diagnostics'] = base_budget
         return result
 
-    # Fairly split one bounded expansion budget across all selected hostnames. Remainder slots go to
-    # the highest-evidence hosts, but every selected host gets a non-zero stratified sample.
-    host_count = len(selected)
-    quotient, remainder = divmod(total_candidate_budget, host_count)
+    # Cached hosts consume no new TCP candidate/time budget. Split the shared candidate budget only
+    # across exact hostnames that have not already been scanned during this assessment process.
+    uncached_hosts = [host for host, _, _ in selected if _cached_same_host_service_discovery(host) is None]
+    uncached_count = len(uncached_hosts)
+    # Candidate capacity is a shared expansion pool just like wall-clock time. Allocate an equal
+    # share of what remains to each still-pending uncached host, then subtract only the ports that
+    # were actually probed. If DNS fails or a host reaches its time share early, the unused
+    # candidate capacity is therefore recycled fairly among the remaining hosts instead of being
+    # stranded in an allocation that was never exercised.
+    remaining_candidate_budget = total_candidate_budget
+    remaining_uncached_hosts = uncached_count
     merged = discovery
     primary_budget = dict(discovery.get('budget_diagnostics') or {})
     primary_auth_effective = discovery.get('authentication_effective')
@@ -4872,22 +5090,62 @@ def expand_discovered_authorized_host_services(
     all_discoveries = list(discovery.get('same_host_service_discoveries') or [])
     all_roots = set(str(value) for value in discovery.get('proactive_service_roots', []) if str(value))
     ports_probed = 0
+    reused_ports = 0
     web_services_discovered = 0
     roots_recrawled = 0
+    hosts_newly_scanned = 0
+    hosts_reused_cached = 0
+    hosts_deferred_time_budget = 0
+    hosts_failed_before_probe = 0
     scan_errors: list[dict[str, Any]] = []
     recrawl_pages = max(1, min(int(max_pages), int(limits.get('same_host_service_expansion_recrawl_pages', max_pages) or max_pages)))
 
     for index, (host, origin, score) in enumerate(selected):
-        host_cap = quotient + (1 if index < remainder else 0)
-        if host_cap <= 0:
-            continue
-        scan = discover_same_host_web_services(origin, candidate_cap=host_cap)
+        cached_before = _cached_same_host_service_discovery(host) is not None
+        if cached_before:
+            # Any positive cap reaches the host-level cache; no TCP work is performed.
+            host_cap = 1
+            host_time_budget = 0.0
+        else:
+            if remaining_uncached_hosts <= 0 or remaining_candidate_budget <= 0:
+                continue
+            quotient, remainder = divmod(remaining_candidate_budget, remaining_uncached_hosts)
+            host_cap = quotient + (1 if remainder else 0)
+            if host_cap <= 0:
+                continue
+            remaining_time = _same_host_service_time_remaining_seconds()
+            # Fairly share BOTH remaining candidate capacity and remaining wall-clock time over
+            # the exact hostnames still waiting to be scanned. Unused capacity from this host is
+            # recycled after the call based on actual ports_probed.
+            host_time_budget = remaining_time / remaining_uncached_hosts if remaining_time > 0 else 0.0
+        scan = discover_same_host_web_services(
+            origin, candidate_cap=host_cap, time_budget_seconds=host_time_budget,
+        )
         scan_row = dict(scan)
         scan_row['expansion_origin'] = origin
         scan_row['expansion_hostname'] = host
         scan_row['evidence_score'] = score
+        scan_row['expansion_candidate_cap'] = host_cap
+        scan_row['expansion_time_budget_seconds'] = round(host_time_budget, 3)
+        scan_row['expansion_allocation_policy'] = 'equal-share-of-remaining-time-and-candidates-with-unused-capacity-recycled'
         all_discoveries.append(scan_row)
-        ports_probed += int(scan.get('ports_probed', 0) or 0)
+        current_ports = int(scan.get('ports_probed', 0) or 0)
+        ports_probed += current_ports
+        reused_ports += int(scan.get('reused_ports_probed', 0) or 0)
+        if not cached_before:
+            remaining_candidate_budget = max(0, remaining_candidate_budget - current_ports)
+            remaining_uncached_hosts = max(0, remaining_uncached_hosts - 1)
+        if scan.get('cache_hit'):
+            hosts_reused_cached += 1
+        elif current_ports > 0:
+            # Count a new TCP sweep only when at least one candidate port was actually probed.
+            # DNS/address-resolution failures can consume wall-clock time without performing any
+            # TCP probe and must not inflate the coverage counter.
+            hosts_newly_scanned += 1
+        elif scan.get('time_budget_exhausted'):
+            hosts_deferred_time_budget += 1
+        elif scan.get('error'):
+            hosts_failed_before_probe += 1
         roots = [
             _clean_url(str(row.get('url') or ''))
             for row in scan.get('web_services', [])
@@ -4905,7 +5163,7 @@ def expand_discovered_authorized_host_services(
             # priority seeds. Nested port expansion is disabled to prevent recursive host fan-out.
             recrawl = discover_target(
                 origin, cookies, max_pages=recrawl_pages, seeds=roots,
-                expand_authorized_service_hosts=False, same_host_service_candidate_cap=host_cap,
+                expand_authorized_service_hosts=False, same_host_service_candidate_cap=0,
             )
             roots_recrawled += len(roots)
             merged = merge_discovery(merged, recrawl)
@@ -4929,12 +5187,22 @@ def expand_discovered_authorized_host_services(
         'same_host_service_expansion_hosts_already_scanned': len(ranked) - len(pending_ranked),
         'same_host_service_expansion_hosts_pending': len(pending_ranked),
         'same_host_service_expansion_host_limit': host_limit,
-        'same_host_service_expansion_hosts_scanned': len(selected),
+        'same_host_service_expansion_hosts_scanned': hosts_newly_scanned,
+        'same_host_service_expansion_hosts_reused_cached': hosts_reused_cached,
+        'same_host_service_expansion_hosts_deferred_time_budget': hosts_deferred_time_budget,
+        'same_host_service_expansion_hosts_failed_before_probe': hosts_failed_before_probe,
+        'same_host_service_expansion_hosts_considered': len(selected),
         'same_host_service_expansion_candidate_budget': total_candidate_budget,
+        'same_host_service_expansion_candidate_budget_consumed': ports_probed,
+        'same_host_service_expansion_candidate_budget_remaining': max(0, remaining_candidate_budget),
         'same_host_service_expansion_ports_probed': ports_probed,
+        'same_host_service_expansion_reused_ports_probed': reused_ports,
         'same_host_service_expansion_web_services_discovered': web_services_discovered,
         'same_host_service_expansion_roots_recrawled': roots_recrawled,
+        'same_host_service_expansion_time_allocation_policy': 'equal-share-of-remaining-time-and-candidates-with-unused-capacity-recycled',
         'same_host_service_expansion_recrawl_pages_per_host': recrawl_pages,
+        'same_host_service_global_time_budget_seconds': _same_host_service_time_limits()[0],
+        'same_host_service_global_time_remaining_seconds': round(_same_host_service_time_remaining_seconds(), 3),
     }
     return merged
 
