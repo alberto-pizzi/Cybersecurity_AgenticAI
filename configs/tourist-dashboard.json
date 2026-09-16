@@ -2,7 +2,7 @@
   "schema_version": 1,
   "platform": {
     "name": "Snap4City tourist dashboard",
-    "description": "Assessment definition for the eight authorized tourist-dashboard views."
+    "description": "Assessment definition for the eight authorized tourist-dashboard views. This target is currently configured for anonymous-only assessment because no target accounts are available; authentication may be added later through the generic credential configuration."
   },
   "authorization": {
     "confirmed": true,
@@ -20,7 +20,7 @@
           "enabled": true,
           "auth_only": false,
           "allow_state_changes": false,
-          "notes": "Explicit authorized dashboard-view entry point. Kept as a separate service job to guarantee coverage of this supplied URL."
+          "notes": "Explicit authorized public dashboard-view entry point. Current configuration is anonymous-only: no target credential is requested. Kept as a separate service job to guarantee coverage of this supplied URL."
         },
         {
           "id": "dashboard-4332",
@@ -28,7 +28,7 @@
           "enabled": true,
           "auth_only": false,
           "allow_state_changes": false,
-          "notes": "Explicit authorized dashboard-view entry point. Kept as a separate service job to guarantee coverage of this supplied URL."
+          "notes": "Explicit authorized public dashboard-view entry point. Current configuration is anonymous-only: no target credential is requested. Kept as a separate service job to guarantee coverage of this supplied URL."
         },
         {
           "id": "dashboard-4901",
@@ -36,7 +36,7 @@
           "enabled": true,
           "auth_only": false,
           "allow_state_changes": false,
-          "notes": "Explicit authorized dashboard-view entry point. Kept as a separate service job to guarantee coverage of this supplied URL."
+          "notes": "Explicit authorized public dashboard-view entry point. Current configuration is anonymous-only: no target credential is requested. Kept as a separate service job to guarantee coverage of this supplied URL."
         },
         {
           "id": "dashboard-4621",
@@ -44,7 +44,7 @@
           "enabled": true,
           "auth_only": false,
           "allow_state_changes": false,
-          "notes": "Explicit authorized dashboard-view entry point. Kept as a separate service job to guarantee coverage of this supplied URL."
+          "notes": "Explicit authorized public dashboard-view entry point. Current configuration is anonymous-only: no target credential is requested. Kept as a separate service job to guarantee coverage of this supplied URL."
         },
         {
           "id": "dashboard-4722",
@@ -52,7 +52,7 @@
           "enabled": true,
           "auth_only": false,
           "allow_state_changes": false,
-          "notes": "Explicit authorized dashboard-view entry point. Kept as a separate service job to guarantee coverage of this supplied URL."
+          "notes": "Explicit authorized public dashboard-view entry point. Current configuration is anonymous-only: no target credential is requested. Kept as a separate service job to guarantee coverage of this supplied URL."
         },
         {
           "id": "dashboard-4257",
@@ -60,7 +60,7 @@
           "enabled": true,
           "auth_only": false,
           "allow_state_changes": false,
-          "notes": "Explicit authorized dashboard-view entry point. Kept as a separate service job to guarantee coverage of this supplied URL."
+          "notes": "Explicit authorized public dashboard-view entry point. Current configuration is anonymous-only: no target credential is requested. Kept as a separate service job to guarantee coverage of this supplied URL."
         },
         {
           "id": "dashboard-4883",
@@ -68,7 +68,7 @@
           "enabled": true,
           "auth_only": false,
           "allow_state_changes": false,
-          "notes": "Explicit authorized dashboard-view entry point. Kept as a separate service job to guarantee coverage of this supplied URL."
+          "notes": "Explicit authorized public dashboard-view entry point. Current configuration is anonymous-only: no target credential is requested. Kept as a separate service job to guarantee coverage of this supplied URL."
         },
         {
           "id": "dashboard-4923",
@@ -76,7 +76,7 @@
           "enabled": true,
           "auth_only": false,
           "allow_state_changes": false,
-          "notes": "Explicit authorized dashboard-view entry point. Kept as a separate service job to guarantee coverage of this supplied URL."
+          "notes": "Explicit authorized public dashboard-view entry point. Current configuration is anonymous-only: no target credential is requested. Kept as a separate service job to guarantee coverage of this supplied URL."
         }
       ]
     }

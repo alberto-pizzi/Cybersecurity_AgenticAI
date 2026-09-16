@@ -28,7 +28,7 @@ from assessmentConfig import (
     target_is_local,
     validate_authorization_scope,
 )
-from utils import atomic_write_text, canonical_cookie_header, cookie_names, normalized_origin, normalized_hostname, same_origin, scanner_request_rate_policy
+from utils import atomic_write_text, canonical_cookie_header, cookie_header_fingerprint, cookie_names, normalized_origin, normalized_hostname, same_origin, scanner_request_rate_policy
 from targetAuth import browser_oidc_login_session
 
 
@@ -222,11 +222,29 @@ def _verify_selected_agentic_model(config: dict[str, Any]) -> None:
         )
 
 
-# Credential cache entries are origin-specific. Browser/OIDC credentials may still reuse one raw
-# cookie across another port of the exact same hostname when the config explicitly enables
-# allow_same_host_ports, because HTTP cookies themselves are not port-scoped.
+# Credential cache entries are origin + application-path specific for browser/OIDC identities.
+# The underlying browser storage remains identity-scoped and reusable, while each flattened Cookie
+# header is re-resolved for the concrete path. Raw cookies may still be retried on another port of
+# the exact same hostname/scheme only when allow_same_host_ports explicitly permits it.
 def _credential_cache_key(reference: str, target_url: str) -> tuple[str, str]:
-    return str(reference or ''), normalized_origin(target_url)
+    """Cache one resolved identity for the concrete application path, not only its origin.
+
+    Browser/OIDC storage can legitimately contain path-scoped cookies for multiple applications on
+    the same origin. Reusing the flattened Cookie header obtained for /app-a on /app-b would either
+    send an inapplicable cookie or omit the cookie that /app-b needs. The browser storage itself is
+    still reused per identity; only the flattened child Cookie header is resolved per target path.
+    """
+    try:
+        parsed = urlparse(str(target_url or ''))
+        path = str(parsed.path or '/') or '/'
+    except ValueError:
+        path = '/'
+    if not path.startswith('/'):
+        path = '/' + path
+    # Query/fragment do not define cookie path scope. Preserve the path itself, including a trailing
+    # slash: HTTP cookie Path matching can distinguish /app from /app/, so collapsing them may reuse
+    # a flattened Cookie header that is not applicable to the concrete request URL.
+    return str(reference or ''), f"{normalized_origin(target_url)}{path}"
 
 
 def _same_host_port_authorized(config: dict[str, Any], left_url: str, right_url: str) -> bool:
@@ -259,7 +277,17 @@ def _resolve_job_cookie(
 ) -> str:
     cache_key = _credential_cache_key(reference, target_url)
     if cache_key in cache:
-        return cache[cache_key]
+        cached_value = cache[cache_key]
+        # The flattened Cookie header is path-specific for browser/OIDC identities. A later job on
+        # another application path may have updated runtime["resolved_cookie"], so a cache hit must
+        # restore the cookie that belongs to *this* target before _runtime_auth_payload() fingerprints
+        # it for the child. Otherwise CLI cookie and browser storage identity can become temporarily
+        # mismatched when the same credential revisits an earlier application path.
+        runtime_cache = runtime_auth_cache if runtime_auth_cache is not None else {}
+        runtime = runtime_cache.get(reference)
+        if isinstance(runtime, dict) and str(runtime.get("kind") or "") in {"browser_oidc", "snap4city_oidc"}:
+            runtime["resolved_cookie"] = cached_value
+        return cached_value
 
     credentials = config.get("credentials") or {}
     credential = credentials.get(reference)
@@ -307,6 +335,7 @@ def _resolve_job_cookie(
         "password": "",
         "storage_state": None,
         "oidc_issuer": "",
+        "browser_login_completed": False,
         "manual_cookie_origin": "",
         "prompt_attempted": False,
     })
@@ -320,6 +349,29 @@ def _resolve_job_cookie(
 
     cookie_env = str(credential.get("cookie_env") or "").strip()
     manual_cookie = os.environ.get(cookie_env, "").strip() if cookie_env else ""
+    if manual_cookie:
+        try:
+            manual_cookie = canonical_cookie_header(manual_cookie)
+        except ValueError as exc:
+            if bool(credential.get("optional", False)):
+                print(f"[AUTH] Optional credential {reference!r} supplied an invalid cookie in {cookie_env}: {exc}; browser/username-password fallback will be tried.")
+                manual_cookie = ""
+            else:
+                raise ValueError(f"Cookie environment variable {cookie_env!r} for credential {reference!r} is invalid: {exc}") from exc
+        if manual_cookie:
+            required_cookie_names = {
+                str(name).strip().casefold()
+                for name in credential.get("required_cookie_names") or []
+                if str(name).strip()
+            }
+            present_cookie_names = {name.casefold() for name in cookie_names(manual_cookie)}
+            missing_required = sorted(required_cookie_names - present_cookie_names)
+            if missing_required:
+                print(
+                    f"[AUTH] Existing cookie for credential {reference!r} is missing required cookie(s) "
+                    f"{', '.join(missing_required)}; saved browser/SSO state or username/password fallback will be tried instead."
+                )
+                manual_cookie = ""
     target_origin = normalized_origin(target_url)
     manual_origin = str(runtime.get("manual_cookie_origin") or "")
     manual_cookie_allowed = bool(
@@ -350,7 +402,7 @@ def _resolve_job_cookie(
             runtime["username"] = username
             runtime["password"] = password
 
-        value = canonical_cookie_header(manual_cookie)
+        value = manual_cookie
         if not manual_origin:
             runtime["manual_cookie_origin"] = target_origin
             reuse_note = ""
@@ -400,7 +452,7 @@ def _resolve_job_cookie(
             password,
             credential,
             storage_state=storage_state,
-            initial_login=True,
+            initial_login=not bool(runtime.get("browser_login_completed")),
             expected_oidc_issuer=str(runtime.get("oidc_issuer") or ""),
         )
     except RuntimeError as first_exc:
@@ -422,7 +474,7 @@ def _resolve_job_cookie(
                         password,
                         credential,
                         storage_state=storage_state,
-                        initial_login=True,
+                        initial_login=not bool(runtime.get("browser_login_completed")),
                         expected_oidc_issuer=str(runtime.get("oidc_issuer") or ""),
                     )
                 except RuntimeError as exc:
@@ -445,6 +497,7 @@ def _resolve_job_cookie(
         raise ValueError("Automatic browser login returned no application cookie.")
     runtime["storage_state"] = login_result.get("storage_state") if isinstance(login_result.get("storage_state"), dict) else runtime.get("storage_state")
     runtime["oidc_issuer"] = str(login_result.get("oidc_issuer") or runtime.get("oidc_issuer") or "")
+    runtime["browser_login_completed"] = True
     runtime["username"] = username
     runtime["password"] = password
     reuse_note = "existing browser/SSO state" if login_result.get("sso_reused") else "the original username/password"
@@ -485,7 +538,7 @@ def _runtime_auth_payload(config: dict[str, Any], job: dict[str, Any], runtime_a
             canonical = canonical_cookie_header(resolved_cookie)
         except ValueError:
             canonical = resolved_cookie
-        fingerprint = hashlib.sha256(canonical.encode("utf-8", errors="replace")).hexdigest()
+        fingerprint = cookie_header_fingerprint(canonical)
         identities.append({
             "reference": reference,
             "cookie_fingerprint": fingerprint,
@@ -544,7 +597,12 @@ def _coalesce_same_route_jobs(jobs: list[dict[str, Any]]) -> list[dict[str, Any]
             continue
         try:
             parsed = urlparse(target)
-            route = parsed.path.rstrip('/') or '/'
+            # Preserve the concrete URL path, including a trailing slash. /app and /app/ may be
+            # distinct application routes and, critically, HTTP Cookie Path matching distinguishes
+            # them. Query/fragment remain outside the coalescing key so same-route configured entry
+            # URLs (for example dashboard IDs) still share one bounded full-pipeline scan while all
+            # concrete URLs are retained as forced discovery seeds below.
+            route = str(parsed.path or '/') or '/'
             origin = (parsed.scheme.lower(), normalized_hostname(parsed.hostname or ''), parsed.port or (443 if parsed.scheme.lower() == 'https' else 80))
         except ValueError:
             passthrough_positions.append((position, dict(job)))
@@ -646,7 +704,7 @@ def _build_command(
                 canonical = canonical_cookie_header(value)
             except ValueError:
                 canonical = value
-            fingerprint = hashlib.sha256(canonical.encode("utf-8", errors="replace")).hexdigest()
+            fingerprint = cookie_header_fingerprint(canonical)
             previous = seen_sessions.get(fingerprint)
             if previous:
                 print(
@@ -1056,7 +1114,16 @@ def _aggregate_report_inputs(results_data: dict[str, Any], config: dict[str, Any
             + ("enabled (exact hostname, HTTP/HTTPS services on authorized ports)" if bool((config.get("authorization") or {}).get("allow_same_host_ports", False)) else "disabled")
             + "; project discovery follows bounded redirects only while each hop remains authorized; external scanner processes do not autonomously follow redirects, so scanner-internal redirect-dependent behavior is conservatively suppressed unless the destination was independently discovered; unauthorized destinations are observed but not queued"
         ),
-        "allow_state_changes": (config.get("execution") or {}).get("allow_state_changes"),
+        "allow_state_changes": (
+            next(iter({bool(row.get("allow_state_changes")) for row in results_data.get("jobs", []) if isinstance(row, dict)}))
+            if len({bool(row.get("allow_state_changes")) for row in results_data.get("jobs", []) if isinstance(row, dict)}) == 1
+            else None
+        ),
+        "allow_state_changes_mixed": len({bool(row.get("allow_state_changes")) for row in results_data.get("jobs", []) if isinstance(row, dict)}) > 1,
+        "allow_state_changes_by_entry": {
+            str(row.get("id") or index): bool(row.get("allow_state_changes"))
+            for index, row in enumerate(results_data.get("jobs", []), start=1) if isinstance(row, dict)
+        },
         "orchestration": {
             "engine": "assessmentRunner aggregate",
             "mode": str((config.get("execution") or {}).get("orchestrator") or ""),
@@ -1343,6 +1410,9 @@ def main() -> int:
             "credential_refs": list(job.get("credential_refs") or []),
             "credential_ref": job.get("credential_ref") or None,
             "secondary_credential_ref": job.get("secondary_credential_ref") or None,
+            # Persist the effective job policy rather than only the execution-level default.
+            # A service override may differ from another service in the same aggregate assessment.
+            "allow_state_changes": bool(job.get("allow_state_changes")),
             "notes": job.get("notes") or "",
         }
         if not job.get("enabled"):
@@ -1399,6 +1469,8 @@ def main() -> int:
                     continue
                 suffix = path.suffix.lower()
                 report_id = path.name[:-len(".review.json")] if path.name.endswith(".review.json") else path.stem
+                if not (report_id == expected_report_id or report_id.startswith(expected_report_id + "_Emergency_")):
+                    continue
                 if suffix == ".pdf":
                     report_bases.setdefault(report_id, {"pdf": None, "html": None})["pdf"] = path.resolve()
                 elif suffix == ".html":

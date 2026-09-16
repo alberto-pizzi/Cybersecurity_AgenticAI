@@ -5,7 +5,7 @@ from typing import Any
 
 import requests
 
-from utils import RequestRatePacer, request_same_origin_redirects, partial, scanner_session_probe, success
+from utils import RequestRatePacer, request_contract_state_change_reason, request_same_origin_redirects, partial, scanner_session_probe, skipped, success
 
 from core.scannerCommon import mutate_parameter, proportional_budget, remaining_budget, service, wall_clock_deadline
 
@@ -26,13 +26,13 @@ PROBES = (
 )
 
 # Send one bounded traversal request while preserving the discovered request contract.
-def _request(url: str, cookies: str, method: str, data: str, pacer: RequestRatePacer, read_timeout: float, deadline: float) -> requests.Response:
+def _request(url: str, cookies: str, method: str, data: str, pacer: RequestRatePacer, read_timeout: float, deadline: float, allow_state_changes: bool = False) -> requests.Response:
     headers = {"Cache-Control": "no-cache", "User-Agent": "SecOps-Path-Traversal-Verifier/1.0"}
     if cookies:
         headers["Cookie"] = cookies
     return request_same_origin_redirects(
         method, url, data=data if method != "GET" else None, headers=headers,
-        timeout=(max(1.0, read_timeout * 0.25), max(1.0, read_timeout)), pacer=pacer, deadline=deadline,
+        timeout=(max(1.0, read_timeout * 0.25), max(1.0, read_timeout)), pacer=pacer, deadline=deadline, allow_state_changes=bool(allow_state_changes),
     )
 
 # Extract a compact response excerpt around the marker used for LFI verification.
@@ -47,7 +47,7 @@ def _excerpt(text: str, match: re.Match[str] | None, limit: int = 1000) -> str:
 @mcp.tool()
 def run_traversal_scan(
     target_url: str, cookies: str = "", method: str = "GET", data: str = "", parameters: list[str] | None = None, timeout: int = 30,
-    scan_profile: str = "balanced", request_rate: float | None = None,
+    scan_profile: str = "balanced", request_rate: float | None = None, allow_state_changes: bool = False, session_probe_url: str = "",
 ) -> dict:
 
     method = str(method or "GET").upper()
@@ -64,6 +64,9 @@ def run_traversal_scan(
             "Path Traversal/LFI", target_url, f"Unsupported HTTP method for bounded traversal verification: {method}.",
             diagnosis="unsupported_method", timed_out=False, vulnerabilities=[],
         )
+    state_reason = request_contract_state_change_reason({"url": target_url, "method": method, "data": data, "parameters": parameters or []}) if not allow_state_changes else ""
+    if state_reason:
+        return skipped("Path Traversal/LFI", target_url, f"Traversal request blocked by allow_state_changes=false: {state_reason}.", diagnosis="state_change_policy_blocked", allow_state_changes=False)
     candidates = [
         value for value in dict.fromkeys(str(item) for item in (parameters or []) if str(item))
         if value.lower() in PATH_PARAMETERS and value.lower() not in CONTROL_PARAMETERS
@@ -74,7 +77,9 @@ def run_traversal_scan(
             vulnerabilities=[], applicable=False,
         )
 
-    session_probe = scanner_session_probe(target_url, cookies, method, data, timeout=min(proportional_budget(timeout, TRAVERSAL_SESSION_RATIO), max(1, int(remaining_budget(deadline)))), attempts=1, pacer=pacer, deadline=deadline)
+    probe_target = str(session_probe_url or target_url)
+    probe_method, probe_data = ("GET", "") if session_probe_url else (method, data)
+    session_probe = scanner_session_probe(probe_target, cookies, probe_method, probe_data, timeout=min(proportional_budget(timeout, TRAVERSAL_SESSION_RATIO), max(1, int(remaining_budget(deadline)))), attempts=1, pacer=pacer, deadline=deadline)
     if cookies and session_probe.get("performed") and session_probe.get("conclusive") and session_probe.get("authenticated") is False:
         return partial(
             "Path Traversal/LFI", target_url,
@@ -86,7 +91,7 @@ def run_traversal_scan(
     baseline: requests.Response | None = None
     baseline_error = ""
     try:
-        baseline = _request(target_url, cookies, method, data, pacer, min(request_budget, max(1.0, remaining_budget(deadline))), deadline)
+        baseline = _request(target_url, cookies, method, data, pacer, min(request_budget, max(1.0, remaining_budget(deadline))), deadline, bool(allow_state_changes))
     except requests.RequestException as exc:
         baseline_error = f"{type(exc).__name__}: {exc}"
 
@@ -101,7 +106,7 @@ def run_traversal_scan(
                 break
             probe_url, probe_data = mutate_parameter(target_url, method, data, parameter, payload, case_insensitive=True)
             try:
-                response = _request(probe_url, cookies, method, probe_data, pacer, min(request_budget, max(1.0, remaining_budget(deadline))), deadline)
+                response = _request(probe_url, cookies, method, probe_data, pacer, min(request_budget, max(1.0, remaining_budget(deadline))), deadline, bool(allow_state_changes))
             except requests.RequestException as exc:
                 attempts.append({
                     "parameter": parameter, "payload": payload, "source": label, "error": f"{type(exc).__name__}: {exc}",

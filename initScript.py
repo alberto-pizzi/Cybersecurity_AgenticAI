@@ -15,7 +15,7 @@ from setupTools import (
     _ensure_report_docker_image, configure_path, configure_perl_environment, create_wordlist, install_playwright_browser,
     install_python_packages, install_scanners, run, verify_scanners, write_runtime_config,
 )
-from utils import setup_path
+from utils import atomic_write_text, setup_path
 
 UNIFIED_MCP_SERVER = ROOT / "servers" / "secopsServer.py"
 LINUX_BASE_PACKAGES = ("perl", "cpanminus", "build-essential")
@@ -252,7 +252,7 @@ def command_reference_text() -> str:
 # Ensures the operator command guide exists before it is displayed or reused.
 def write_command_reference() -> Path:
     if not COMMAND_REFERENCE_FILE.is_file():
-        COMMAND_REFERENCE_FILE.write_text(command_reference_text(), encoding="utf-8")
+        atomic_write_text(COMMAND_REFERENCE_FILE, command_reference_text())
     return COMMAND_REFERENCE_FILE
 
 # Prints the complete operator guide in a readable terminal format.
@@ -372,9 +372,7 @@ def _write_dvwa_assessment_config(cookie_header: str, agentic_model: str, mode: 
             "ollama_url": "http://127.0.0.1:11434",
         },
     }
-    DVWA_ASSESSMENT_CONFIG.write_text(
-        json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8",
-    )
+    atomic_write_text(DVWA_ASSESSMENT_CONFIG, json.dumps(payload, indent=2, ensure_ascii=False))
     return DVWA_ASSESSMENT_CONFIG
 
 

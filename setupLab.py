@@ -12,7 +12,7 @@ from urllib.parse import urlparse
 
 import requests
 
-from utils import canonical_cookie_header
+from utils import atomic_write_text, canonical_cookie_header
 from setupTools import (
     LOCAL_LAB_CONTAINER, LOCAL_LAB_IMAGE, LOCAL_LAB_NETWORK, NIKTO_DOCKER_IMAGE, RUNTIME_FILE, TARGET, _docker_image_ready, run,
 )
@@ -458,6 +458,7 @@ def update_runtime_auth(cookie: str) -> None:
         "pre_scan_requests": [
             {
                 "method": "GET", "path": "/security.php?phpids=off", "accepted_statuses": [200, 302],
+                "state_changing": True, "required": False,
             }
         ],
 
@@ -469,7 +470,7 @@ def update_runtime_auth(cookie: str) -> None:
         "last_auth_target": TARGET, "last_auth_cookie": cookie,
         "last_auth_generated_at": datetime.now(timezone.utc).isoformat(), "target_profiles": target_profiles,
     })
-    RUNTIME_FILE.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
+    atomic_write_text(RUNTIME_FILE, json.dumps(payload, indent=2, ensure_ascii=False))
 
 # Pulls a required local-lab Docker image when it is missing.
 def _ensure_local_docker_image(image: str, platform_name: str = "") -> None:

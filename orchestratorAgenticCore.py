@@ -1797,13 +1797,15 @@ def discovery_node(state: AgentState) -> dict[str, Any]:
     print(f'\n[*] Discovery of active profiles: {active_profiles}')
     discovery, diagnostics = ({}, list(state['diagnostics']))
     for profile in state['profiles']:
+        state_changes_allowed = shared.state_changing_tests_allowed(state['target'], state.get('allow_state_changes'))
         found = discover_target_sync_safe(
             state['target'], profile['cookies'],
             seeds=list(state.get('discovery_seeds') or []),
             forced_seeds=list(state.get('entry_points') or []),
+            allow_state_changes=state_changes_allowed,
         )
         if profile.get('cookies') and found.get('authentication_effective') is not False:
-            found = shared.authenticate_discovered_sibling_origins(found, state['target'], profile['cookies'])
+            found = shared.authenticate_discovered_sibling_origins(found, state['target'], profile['cookies'], allow_state_changes=state_changes_allowed)
         discovery[profile['name']] = found
         diagnostics.extend(({'phase': 'discovery', 'profile': profile['name'], **item} for item in found['errors']))
         print(f"    {profile['name']}: {len(found.get('html_urls', []))} HTML pages, {len(found.get('request_cases', []))} request contracts, {len(found.get('browser_network_requests', []))} browser network requests, {len(found.get('browser_navigation_urls', []))} Chromium navigations, {len(found['jwt_tokens'])} JWTs")
@@ -1963,7 +1965,7 @@ def discovery_candidate_actions(state: AgentState) -> list[dict[str, Any]]:
                     'sibling_origin_score': sibling_score,
                     'reason': reason,
                 })
-        for case in select_arjun_request_cases(state['discovery'].get(name, {}), state['target'], agentic_catalog=True):
+        for case in select_arjun_request_cases(state['discovery'].get(name, {}), state['target'], allow_state_changes=state_changes_allowed, agentic_catalog=True):
             adaptive = bool(case.get('adaptive_budget'))
             actions.append({'profile': name, 'tool': 'arjun', 'target_url': case['url'], 'method': case.get('method', 'GET'), 'data': case.get('data', ''), 'parameters': case.get('parameters', []), 'jwt_token': '', 'injection_url': '', 'adaptive_budget': adaptive, 'priority_score': case.get('priority_score'), 'reason': ('Discovery ranking marked this as an adaptive high-value candidate; AI still decides execution. ' if adaptive else '') + 'Hidden-parameter discovery using the real request method and body.'})
         for tool in ('sqlmap', 'dalfox', 'commix', 'traversal', 'idor'):
@@ -2025,7 +2027,7 @@ def discovery_candidate_actions(state: AgentState) -> list[dict[str, Any]]:
         if state['injection_url']:
             actions.append({'profile': name, 'tool': 'interactsh', 'target_url': state['target'], 'method': 'GET', 'data': '', 'parameters': ['explicit'], 'jwt_token': '', 'injection_url': state['injection_url'], 'oast_class': 'explicit', 'reason': 'Configured OAST URL.'})
         else:
-            for case in select_oast_request_cases(state['discovery'].get(name, {}), state['target'], agentic_catalog=True):
+            for case in select_oast_request_cases(state['discovery'].get(name, {}), state['target'], allow_state_changes=state_changes_allowed, agentic_catalog=True):
                 actions.append({'profile': name, 'tool': 'interactsh', 'target_url': state['target'], 'method': case.get('method', 'GET'), 'data': case.get('data', ''), 'parameters': case.get('parameters', []), 'jwt_token': '', 'injection_url': case.get('injection_url', ''), 'oast_class': case.get('oast_class', 'remote-fetch'), 'reason': f"Discovered OAST-capable candidate parameter: {case.get('parameter', 'unknown')}."})
     return _dedupe_no_cookie_profile_actions(state, actions)
 
@@ -2081,7 +2083,7 @@ def validate_plan(state: AgentState, proposed: Any, *, enforce_execution_limits:
                     # session into a false authentication_precheck_failed result.
                     target_url = authenticated_targets.get(normalized_target, normalized_target)
         elif scope == 'url':
-            cases = select_arjun_request_cases(found, state['target'], agentic_catalog=True)
+            cases = select_arjun_request_cases(found, state['target'], allow_state_changes=shared.state_changing_tests_allowed(state['target'], state.get('allow_state_changes')), agentic_catalog=True)
             matching = [case for case in cases if str(case.get('url', '')) == target_url]
             if method:
                 matching = [case for case in matching if str(case.get('method', 'GET')).upper() == method]
@@ -2151,8 +2153,6 @@ def validate_plan(state: AgentState, proposed: Any, *, enforce_execution_limits:
             if not matching:
                 continue
             selected = matching[0]
-            if (not shared.state_changing_tests_allowed(state['target'], state.get('allow_state_changes'))) and shared.request_case_state_change_reason(selected):
-                continue
             method = str(selected.get('method', 'POST')).upper()
             data = str(selected.get('data', ''))
             parameters = [str(value) for value in selected.get('parameters', [])]
@@ -2174,7 +2174,7 @@ def validate_plan(state: AgentState, proposed: Any, *, enforce_execution_limits:
                 parameters = ['explicit']
                 oast_class = 'explicit'
             else:
-                candidates = select_oast_request_cases(found, state['target'], agentic_catalog=True)
+                candidates = select_oast_request_cases(found, state['target'], allow_state_changes=shared.state_changing_tests_allowed(state['target'], state.get('allow_state_changes')), agentic_catalog=True)
                 matching = [item for item in candidates if not injection or item.get('injection_url') == injection]
                 if not matching:
                     continue
@@ -2248,7 +2248,7 @@ def _missing_tool_reason(state: AgentState, profile_name: str, tool: str) -> str
     if tool in BROAD_COVERAGE_TOOLS:
         return ''
     if tool == 'arjun':
-        return '' if select_arjun_request_cases(found, state['target'], limit=1, agentic_catalog=True) else 'No suitable discovered GET/POST request was available for hidden-parameter discovery.'
+        return '' if select_arjun_request_cases(found, state['target'], limit=1, allow_state_changes=shared.state_changing_tests_allowed(state['target'], state.get('allow_state_changes')), agentic_catalog=True) else 'No suitable discovered GET/POST request was available for hidden-parameter discovery.'
     if tool in PARAMETER_COVERAGE_TOOLS:
         return '' if select_tool_request_cases(found, tool, limit=1, authenticated_profile=profile_has_cookie, allow_state_changes=shared.state_changing_tests_allowed(state['target'], state.get('allow_state_changes')), credential_cookies=_profile_cookie(state, profile_name), agentic_catalog=True) else f"No discovered policy-eligible request matched {tool}'s vulnerability class."
     if tool == 'authorization':
@@ -2268,7 +2268,7 @@ def _missing_tool_reason(state: AgentState, profile_name: str, tool: str) -> str
     if tool == 'jwt':
         return '' if found.get('jwt_tokens') else 'No JWT was discovered in crawled responses.'
     if tool == 'interactsh':
-        if state.get('injection_url') or select_oast_request_cases(found, state['target'], limit=1, agentic_catalog=True):
+        if state.get('injection_url') or select_oast_request_cases(found, state['target'], limit=1, allow_state_changes=shared.state_changing_tests_allowed(state['target'], state.get('allow_state_changes')), agentic_catalog=True):
             return ''
         return 'No discovered OAST-capable input was available.'
     return ''
@@ -2489,7 +2489,7 @@ async def execute_action(action: dict[str, Any], cookies: dict[str, str], discov
         deep_timeout, normal_timeout = timeout_by_class.get(oast_class, timeout_by_class['remote-fetch'])
         oast_timeout = deep_timeout if shared.CURRENT_SCAN_MODE == 'deep' else normal_timeout
         request_url = _action_request_url(action, action['target_url'])
-        arguments = {'target_url': action['target_url'], 'injection_url': action['injection_url'], 'cookies': shared.scope_cookie_header(request_url, cookies.get(profile, '')), 'method': action.get('method', 'GET'), 'data': action.get('data', ''), 'parameter': (action.get('parameters') or [''])[0], 'timeout': oast_timeout, 'request_rate': shared.MAX_REQUEST_RATE}
+        arguments = {'target_url': action['target_url'], 'injection_url': action['injection_url'], 'cookies': shared.scope_cookie_header(request_url, cookies.get(profile, '')), 'method': action.get('method', 'GET'), 'data': action.get('data', ''), 'parameter': (action.get('parameters') or [''])[0], 'timeout': oast_timeout, 'request_rate': shared.MAX_REQUEST_RATE, 'allow_state_changes': shared.state_changing_tests_allowed(action['target_url'], allow_state_changes)}
     else:
         profile_discovery = discovery.get(profile, {})
         labels = identity_labels or {}
@@ -2526,6 +2526,7 @@ async def execute_action(action: dict[str, Any], cookies: dict[str, str], discov
         state_refresh = await asyncio.to_thread(
             shared.refresh_authenticated_session_state,
             request_url, raw_profile_cookie, probe_url,
+            allow_state_changes=shared.state_changing_tests_allowed(state['target'], state.get('allow_state_changes')),
         )
         if state_refresh.get('usable') is False or not state_refresh.get('credential_applied'):
             print(f'    [PARTIAL ] {tool}: authenticated session precheck failed', flush=True)
@@ -2702,11 +2703,11 @@ def _record_execution_batch(executed: list[tuple[dict[str, Any], dict[str, Any]]
             before = len(discovery.get(profile, {}).get('request_cases', []))
             enriched, urls = enrich_discovery_with_ffuf(discovery.get(profile, {}), result, state['target'])
             if urls:
-                recrawl = discover_target_sync_safe(state['target'], profile_cookies.get(profile, ''), seeds=urls)
+                recrawl = discover_target_sync_safe(state['target'], profile_cookies.get(profile, ''), seeds=urls, allow_state_changes=shared.state_changing_tests_allowed(state['target'], state.get('allow_state_changes')))
                 enriched = merge_discovery(enriched, recrawl)
                 print(f"    [DISCOVERY] {profile}: FFUF re-crawl expanded the surface to {len(enriched.get('html_urls', []))} HTML pages and {len(enriched.get('request_cases', []))} request cases.", flush=True)
             if profile_cookies.get(profile, '') and enriched.get('authentication_effective') is not False:
-                enriched = shared.authenticate_discovered_sibling_origins(enriched, state['target'], profile_cookies[profile])
+                enriched = shared.authenticate_discovered_sibling_origins(enriched, state['target'], profile_cookies[profile], allow_state_changes=shared.state_changing_tests_allowed(state['target'], state.get('allow_state_changes')))
             discovery[profile] = enriched
             new_attack_surface += max(0, len(enriched.get('request_cases', [])) - before)
         if tool == 'arjun' and result.get('status') in {'success', 'partial'}:
@@ -2890,6 +2891,15 @@ def _reconcile_final_browser_result(results: dict[str, dict[str, Any]], action: 
 # Runs the final authenticated logout lifecycle check after every other authenticated test.
 async def _final_logout_checks(state: AgentState, results: dict[str, dict[str, Any]]) -> int:
     executed = 0
+    if not shared.state_changing_tests_allowed(state['target'], state.get('allow_state_changes')):
+        for profile in state.get('profiles', []):
+            name = str(profile.get('name') or '')
+            if str(profile.get('cookies') or ''):
+                results.setdefault(name, {})['session_logout_final'] = make_skipped_result(
+                    'session-logout', state['target'],
+                    'Logout lifecycle verification is state-changing and allow_state_changes is false.',
+                )
+        return executed
     for profile in state.get('profiles', []):
         name = str(profile.get('name') or '')
         cookies = str(profile.get('cookies') or '')
@@ -2920,6 +2930,7 @@ async def _final_logout_checks(state: AgentState, results: dict[str, dict[str, A
                     'target_url': state['target'], 'logout_url': logout_url, 'cookies': logout_cookies,
                     'probe_url': logout_probe, 'method': str(logout_case.get('method') or 'GET'),
                     'data': str(logout_case.get('data') or ''), 'timeout': 25, 'request_rate': shared.MAX_REQUEST_RATE,
+                    'allow_state_changes': True,
                 },
                 timeout_seconds=30,
             )

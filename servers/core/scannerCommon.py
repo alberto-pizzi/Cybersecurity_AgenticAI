@@ -11,7 +11,7 @@ import requests
 
 from fastmcp import FastMCP
 
-from utils import ROOT_DIR, RequestRatePacer, request_same_origin_redirects, runtime_container_route
+from utils import ROOT_DIR, RequestRatePacer, request_invocation_state_change_reason, request_same_origin_redirects, runtime_container_route
 
 # Creates a composable child FastMCP registry; only secopsServer.py owns the HTTP listener.
 def service(label: str, key: str) -> tuple[FastMCP, Callable[[], None]]:
@@ -144,7 +144,8 @@ def mutate_parameter(
 # Retry transient transport failures and re-raise the last Requests error.
 def request_retry(
     method: str, url: str, *, attempts: int = 3, backoff: float = 0.7,
-    pacer: RequestRatePacer | None = None, request_rate: Any = None, deadline: float | None = None, **kwargs: Any,
+    pacer: RequestRatePacer | None = None, request_rate: Any = None, deadline: float | None = None,
+    allow_state_changes: bool = False, **kwargs: Any,
 ) -> requests.Response:
 
     last: requests.RequestException | None = None
@@ -163,10 +164,20 @@ def request_retry(
                 else:
                     kwargs["timeout"] = left
             if kwargs.get("allow_redirects"):
-                return request_same_origin_redirects(method, url, pacer=active_pacer, deadline=deadline, **kwargs)
+                return request_same_origin_redirects(
+                    method, url, pacer=active_pacer, deadline=deadline,
+                    allow_state_changes=allow_state_changes, **kwargs,
+                )
             # Keep retry behavior deterministic: no implicit Requests redirect follow. Callers that
             # opt in to redirects are handled above by the project same-origin guard.
             kwargs["allow_redirects"] = False
+            if not allow_state_changes:
+                state_reason = request_invocation_state_change_reason(
+                    method, url, data=kwargs.get("data"), json_body=kwargs.get("json"),
+                    params=kwargs.get("params"), files=kwargs.get("files"), headers=kwargs.get("headers"),
+                )
+                if state_reason:
+                    raise requests.RequestException(f"state-change policy blocked request before send: {state_reason}")
             active_pacer.wait()
             return requests.request(method, url, **kwargs)
         except (requests.Timeout, requests.ConnectionError) as exc:

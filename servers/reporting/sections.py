@@ -205,6 +205,9 @@ def _context_summary_html(context: dict[str, Any], toc: list[tuple[int, str, str
             browser_nav_retries = int(budget.get("browser_navigation_retries", 0) or 0)
             browser_dom_retries = int(budget.get("browser_dom_retries", 0) or 0)
             dead_browser = int(budget.get("browser_dead_404_410", 0) or 0)
+            browser_wall_budget = float(budget.get("browser_wall_clock_budget_seconds", 0.0) or 0.0)
+            browser_wall_elapsed = float(budget.get("browser_wall_clock_elapsed_seconds", 0.0) or 0.0)
+            browser_wall_exhausted = bool(budget.get("browser_wall_clock_exhausted", False))
             script_done = int(budget.get("scripts_processed", 0) or 0)
             script_budget = int(budget.get("script_budget", 0) or 0)
             script_attempts = int(budget.get("script_requests_attempted", 0) or 0)
@@ -222,6 +225,9 @@ def _context_summary_html(context: dict[str, Any], toc: list[tuple[int, str, str
                 pieces.append(f"HTTP attempts {http_attempts}/{http_attempt_budget}, dead 404/410 {dead_http}")
             if browser_nav_retries or browser_dom_retries or dead_browser:
                 pieces.append(f"Chromium retries navigation/DOM {browser_nav_retries}/{browser_dom_retries}, dead 404/410 {dead_browser}")
+            if browser_wall_budget:
+                wall_note = " (wall-clock limit reached)" if browser_wall_exhausted else ""
+                pieces.append(f"Chromium wall-clock {browser_wall_elapsed:.1f}/{browser_wall_budget:.0f}s{wall_note}")
             if script_attempt_budget:
                 pieces.append(f"script attempts {script_attempts}/{script_attempt_budget}, deferred {script_deferred}")
             if route_variants_skipped or origin_budget_skipped:
@@ -230,6 +236,10 @@ def _context_summary_html(context: dict[str, Any], toc: list[tuple[int, str, str
                 pieces.append(f"application families visited {families}")
             service_ports = int(budget.get("same_host_service_ports_probed", 0) or 0)
             service_reused_ports = int(budget.get("same_host_service_reused_ports_probed", 0) or 0)
+            service_deferred_candidates = int(budget.get("same_host_service_candidate_ports_deferred", 0) or 0)
+            service_tcp_attempts = int(budget.get("same_host_service_tcp_connection_attempts", 0) or 0)
+            service_resolved_addresses = int(budget.get("same_host_service_resolved_address_count", 0) or 0)
+            service_classification_deferred = int(budget.get("same_host_classification_deferred_ports", 0) or 0)
             service_cache_hit = bool(budget.get("same_host_service_cache_hit", False))
             service_roots = int(budget.get("same_host_web_services_discovered", 0) or 0)
             service_seconds = float(budget.get("same_host_service_discovery_seconds", 0.0) or 0.0)
@@ -245,6 +255,10 @@ def _context_summary_html(context: dict[str, Any], toc: list[tuple[int, str, str
             expansion_observed = int(budget.get("same_host_service_expansion_hosts_observed", 0) or 0)
             expansion_ports = int(budget.get("same_host_service_expansion_ports_probed", 0) or 0)
             expansion_reused_ports = int(budget.get("same_host_service_expansion_reused_ports_probed", 0) or 0)
+            expansion_deferred_candidates = int(budget.get("same_host_service_expansion_candidate_ports_deferred", 0) or 0)
+            expansion_tcp_attempts = int(budget.get("same_host_service_expansion_tcp_connection_attempts", 0) or 0)
+            expansion_resolved_addresses = int(budget.get("same_host_service_expansion_resolved_address_count", 0) or 0)
+            expansion_classification_deferred = int(budget.get("same_host_service_expansion_classification_deferred_ports", 0) or 0)
             expansion_roots = int(budget.get("same_host_service_expansion_web_services_discovered", 0) or 0)
             expansion_candidate_budget = int(budget.get("same_host_service_expansion_candidate_budget", 0) or 0)
             expansion_candidate_consumed = int(budget.get("same_host_service_expansion_candidate_budget_consumed", expansion_ports) or 0)
@@ -257,7 +271,11 @@ def _context_summary_html(context: dict[str, Any], toc: list[tuple[int, str, str
                     if service_time_exhausted:
                         timing += " (time limit reached)"
                 reuse = f", reused cached host scan ({service_reused_ports} prior port probes)" if service_cache_hit else ""
-                pieces.append(f"primary-host service discovery ports {service_ports}, web roots {service_roots}{timing}{reuse}")
+                probe_detail = (
+                    f", TCP attempts {service_tcp_attempts}, resolved addresses {service_resolved_addresses}, "
+                    f"deferred candidates {service_deferred_candidates}, classification-deferred ports {service_classification_deferred}"
+                )
+                pieces.append(f"primary-host service discovery ports {service_ports}, web roots {service_roots}{timing}{reuse}{probe_detail}")
             if expansion_hosts or expansion_reused or expansion_deferred or expansion_failed_preprobe or expansion_observed:
                 considered = expansion_considered or (expansion_hosts + expansion_reused + expansion_deferred + expansion_failed_preprobe)
                 allocation = ""
@@ -275,7 +293,9 @@ def _context_summary_html(context: dict[str, Any], toc: list[tuple[int, str, str
                     f"authorized discovered-host service expansion: considered {considered}/{expansion_observed}, "
                     f"new TCP sweeps {expansion_hosts}, cached host scans reused {expansion_reused}, "
                     f"time-budget deferred {expansion_deferred}, pre-probe failures {expansion_failed_preprobe}, new port probes {expansion_ports}, "
-                    f"reused prior probes {expansion_reused_ports}, web roots {expansion_roots}{candidate_text}{allocation}"
+                    f"reused prior probes {expansion_reused_ports}, TCP attempts {expansion_tcp_attempts}, "
+                    f"resolved-address observations {expansion_resolved_addresses}, deferred candidates {expansion_deferred_candidates}, "
+                    f"classification-deferred ports {expansion_classification_deferred}, web roots {expansion_roots}{candidate_text}{allocation}"
                 )
             if service_global_budget:
                 service_global_used = max(0.0, service_global_budget - service_global_remaining)

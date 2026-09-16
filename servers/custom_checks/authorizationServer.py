@@ -7,7 +7,7 @@ from urllib.parse import parse_qsl, urljoin, urlparse
 
 import requests
 
-from utils import RequestRatePacer, partial, skipped, success
+from utils import MAX_AUTHENTICATED_IDENTITIES, RequestRatePacer, canonical_cookie_header, cookie_header_fingerprint, partial, request_contract_state_change_reason, skipped, success
 
 from utils import same_origin
 
@@ -16,10 +16,6 @@ from core.scannerCommon import bounded_text_similarity, looks_like_login, propor
 mcp, _serve = service("Authorization Differential Verifier", "authorization")
 
 AUTHORIZATION_IDENTITY_RATIO = 0.30
-
-DESTRUCTIVE_RE = re.compile(
-    r"(?:logout|signout|logoff|setup|install|delete|remove|drop|truncate|purge|wipe|reset)", re.I,
-)
 
 PUBLIC_CONTENT_RE = re.compile(
     r"(?:^|/)(?:docs?|documentation|instructions?|help|about|changelog|license|copying|readme|static|assets?)(?:/|$)", re.I,
@@ -71,6 +67,9 @@ def _safe_get(url: str, cookies: str, request_budget: float, pacer: RequestRateP
             return None, "time_limit_reached"
         if not same_origin(url, current):
             return None, "cross_origin_blocked"
+        state_reason = request_contract_state_change_reason({"url": current, "method": "GET", "data": "", "parameters": []})
+        if state_reason:
+            return None, "state_change_target_blocked:" + state_reason
         try:
             pacer.wait()
             left = max(1.0, min(float(request_budget), remaining_budget(deadline)))
@@ -88,9 +87,10 @@ def _safe_get(url: str, cookies: str, request_budget: float, pacer: RequestRateP
         if not same_origin(url, candidate):
             response.url = current
             return response, "cross_origin_redirect_blocked"
-        if DESTRUCTIVE_RE.search(urlparse(candidate).path):
+        state_reason = request_contract_state_change_reason({"url": candidate, "method": "GET", "data": "", "parameters": []})
+        if state_reason:
             response.url = current
-            return response, "destructive_redirect_blocked"
+            return response, "state_change_redirect_blocked:" + state_reason
         if candidate in seen:
             response.url = current
             return response, "redirect_loop"
@@ -190,25 +190,69 @@ def run_authorization_scan(
             "Authorization Differential Verifier", target_url,
             "Authorization differential checks are intentionally limited to read-only GET requests.",
         )
+    state_reason = request_contract_state_change_reason({"url": target_url, "method": "GET", "data": "", "parameters": parameters or []})
+    if state_reason:
+        return skipped(
+            "Authorization Differential Verifier", target_url,
+            f"Authorization request blocked by read-only state policy: {state_reason}.", diagnosis="state_change_policy_blocked",
+        )
     if not cookies:
         return skipped(
             "Authorization Differential Verifier", target_url,
             "A primary authenticated Cookie header is required for authorization comparison.",
         )
-    if DESTRUCTIVE_RE.search(urlparse(target_url).path):
-        return skipped(
-            "Authorization Differential Verifier", target_url, "Destructive logout, setup, reset or deletion routes are excluded.",
-        )
     timeout = max(5, min(int(timeout), 180))
     deadline = wall_clock_deadline(timeout)
     pacer = RequestRatePacer(request_rate)
     relevance_score, relevance_reasons = _authorization_relevance(target_url, parameters)
-    supplied_alternates = [str(value or "") for value in (identity_cookies or []) if str(value or "")]
-    if secondary_cookies and secondary_cookies not in supplied_alternates:
-        supplied_alternates.append(secondary_cookies)
-    labels = [str(value or "alternate") for value in (identity_labels or [])]
-    while len(labels) < len(supplied_alternates):
-        labels.append(f"identity_{len(labels) + 2}")
+    raw_identity_cookies = list(identity_cookies or [])
+    raw_identity_labels = list(identity_labels or [])
+    alternate_pairs: list[tuple[str, str]] = []
+    seen_alternate_sessions: set[str] = set()
+    try:
+        primary_canonical = canonical_cookie_header(cookies)
+        primary_fingerprint = cookie_header_fingerprint(primary_canonical)
+    except ValueError as exc:
+        return skipped(
+            "Authorization Differential Verifier", target_url,
+            f"Primary Cookie header is invalid: {exc}", diagnosis="invalid_cookie_header",
+        )
+    invalid_alternate_labels: list[str] = []
+    for index, raw_cookie in enumerate(raw_identity_cookies):
+        value = str(raw_cookie or "").strip()
+        if not value:
+            continue
+        label = str(raw_identity_labels[index] if index < len(raw_identity_labels) else "").strip() or f"identity_{index + 2}"
+        try:
+            canonical = canonical_cookie_header(value)
+            fingerprint = cookie_header_fingerprint(canonical)
+        except ValueError:
+            invalid_alternate_labels.append(label)
+            continue
+        if not canonical or fingerprint == primary_fingerprint or fingerprint in seen_alternate_sessions:
+            continue
+        alternate_pairs.append((label, canonical))
+        seen_alternate_sessions.add(fingerprint)
+    if secondary_cookies:
+        try:
+            secondary_canonical = canonical_cookie_header(secondary_cookies)
+            secondary_fingerprint = cookie_header_fingerprint(secondary_canonical)
+        except ValueError:
+            secondary_canonical = ""
+            secondary_fingerprint = ""
+            invalid_alternate_labels.append("secondary")
+        if secondary_canonical and secondary_fingerprint != primary_fingerprint and secondary_fingerprint not in seen_alternate_sessions:
+            alternate_pairs.append(("secondary", secondary_canonical))
+            seen_alternate_sessions.add(secondary_fingerprint)
+    max_alternates = max(0, MAX_AUTHENTICATED_IDENTITIES - 1)
+    if len(alternate_pairs) > max_alternates:
+        return skipped(
+            "Authorization Differential Verifier", target_url,
+            f"Too many alternate authenticated identities ({len(alternate_pairs)}); at most {max_alternates} alternates plus the primary identity are supported.",
+            diagnosis="authenticated_identity_limit_exceeded",
+        )
+    labels = [label for label, _ in alternate_pairs]
+    supplied_alternates = [value for _, value in alternate_pairs]
     if relevance_score <= 0 and not supplied_alternates:
         return skipped(
             "Authorization Differential Verifier", target_url,
@@ -250,6 +294,7 @@ def run_authorization_scan(
         "anonymous": _summary(anonymous, anonymous_guard), "secondary_supplied": bool(supplied_alternates),
         "identity_comparison_count": len(supplied_alternates),
         "identity_labels": labels[:len(supplied_alternates)],
+        "invalid_identity_labels": invalid_alternate_labels,
         "relevance_score": relevance_score, "relevance_reasons": relevance_reasons,
         "tool_timeout_seconds": timeout,
         "identity_request_budget_seconds": round(fair_request_budget, 3),

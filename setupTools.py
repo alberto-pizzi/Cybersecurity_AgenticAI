@@ -18,7 +18,7 @@ from pathlib import Path
 from typing import Any
 import requests
 from packaging.requirements import Requirement
-from utils import ROOT_DIR, WORDLISTS_DIR, MCP_SERVER_PORTS, mcp_http_url
+from utils import ROOT_DIR, WORDLISTS_DIR, MCP_SERVER_PORTS, atomic_write_text, mcp_http_url
 ROOT = Path(ROOT_DIR).resolve()
 LOCAL_ROOT = Path.home() / '.local'
 LOCAL_BIN = LOCAL_ROOT / 'bin'
@@ -1004,7 +1004,7 @@ def validate_scanner_cli_contracts() -> dict[str, Any]:
     if commix_script.is_file():
         results['commix'] = _validate_cli_contract(
             'Commix', [sys.executable, str(commix_script), '--help'],
-            ('--url', '--batch', '--ignore-session', '--disable-coloring', '--ignore-redirects', '--level', '--timeout', '--retries', '--drop-set-cookie', '--time-limit', '--delay', '--data', '-p', '--cookie'),
+            ('--url', '--batch', '--ignore-session', '--disable-coloring', '--ignore-redirects', '--level', '--timeout', '--retries', '--drop-set-cookie', '--time-limit', '--delay', '--technique', '--data', '-p', '--cookie'),
             accepted_codes=(0,),
         )
     ffuf = command_path('ffuf')
@@ -1053,16 +1053,45 @@ def validate_scanner_cli_contracts() -> dict[str, Any]:
             ('-l', '-jsonl', '-silent', '-nc', '-o', '-duc', '-no-stdin', '-c', '-bs', '-pc', '-rl', '-timeout', '-retries', '-dr', '-H', '-dast', '-im', '-fm', '-fa', '-fuzz-param-frequency', '-t', '-severity', '-ni', '-tags', '-etags', '-tl'),
         )
         results['nuclei']['validated_by'] = 'official_docker_help_and_dast_runtime'
+    nikto_required = ('-host', '-nointeractive', '-ask', '-timeout', '-maxtime', '-Pause', '-Format', '-output', '-Tuning', '-Plugins', '-Display', '-Cgidirs', '-Option', '-nocookies')
     nikto = command_path('nikto')
+    nikto_errors: list[str] = []
     if nikto:
         try:
-            results['nikto'] = _validate_cli_contract(
-                'Nikto', [nikto, '-Help'], ('-host', '-nointeractive', '-ask', '-timeout', '-maxtime', '-Pause', '-Format', '-output', '-Tuning', '-Display', '-Cgidirs', '-Option', '-nocookies'),
-            )
+            results['nikto'] = _validate_cli_contract('Nikto', [nikto, '-Help'], nikto_required, accepted_codes=(0, 1, 2))
+            results['nikto']['validated_by'] = 'configured_launcher'
         except RuntimeError as exc:
-            # Some distro launchers emit reduced help; runtime still has a structured native/Docker fallback.
-            results['nikto'] = {'warning': str(exc)[-1200:]}
-            print('[!] Nikto CLI help could not prove every wrapper option; runtime fallback remains enabled.', file=sys.stderr)
+            nikto_errors.append(str(exc)[-1600:])
+    if 'nikto' not in results:
+        native_script = LOCAL_OPT / 'nikto' / 'program' / 'nikto.pl'
+        perl_value = find_perl()
+        if native_script.is_file() and perl_value:
+            try:
+                results['nikto'] = _validate_cli_contract(
+                    'Nikto native Perl', [str(Path(perl_value).resolve()), str(native_script.resolve()), '-Help'],
+                    nikto_required, accepted_codes=(0, 1, 2),
+                )
+                results['nikto']['validated_by'] = 'native_perl_script'
+            except RuntimeError as exc:
+                nikto_errors.append(str(exc)[-1600:])
+    if 'nikto' not in results and _docker_image_ready(NIKTO_DOCKER_IMAGE):
+        docker = command_path('docker')
+        if docker:
+            try:
+                results['nikto'] = _validate_cli_contract(
+                    'Nikto official Docker', [docker, 'run', '--rm', NIKTO_DOCKER_IMAGE, '-Help'],
+                    nikto_required, accepted_codes=(0, 1, 2),
+                )
+                results['nikto']['validated_by'] = 'official_docker_help'
+            except RuntimeError as exc:
+                nikto_errors.append(str(exc)[-1600:])
+    if nikto or (LOCAL_OPT / 'nikto').exists() or _docker_image_ready(NIKTO_DOCKER_IMAGE):
+        if 'nikto' not in results:
+            raise RuntimeError(
+                'Nikto runtime contract could not be proven for any configured native/Docker runtime. '
+                'Rerun initScript.py to repair the scanner before starting an assessment.\n' +
+                '\n--- validation attempt ---\n'.join(nikto_errors[-3:])
+            )
     return results
 
 
@@ -1075,7 +1104,7 @@ def validate_scanner_python_contracts() -> dict[str, Any]:
         raise RuntimeError(f'ZAP Python API import failed: {type(exc).__name__}: {exc}') from exc
     zap = ZAPv2()
     zap_contract = {
-        'spider': ('scan', 'stop', 'exclude_from_scan', 'set_option_logout_avoidance', 'set_option_accept_cookies'),
+        'spider': ('scan', 'stop', 'exclude_from_scan', 'set_option_logout_avoidance', 'set_option_accept_cookies', 'set_option_process_form', 'set_option_post_form'),
         'ascan': ('enable_all_scanners', 'disable_all_scanners', 'enable_scanners', 'set_scanner_attack_strength', 'set_option_thread_per_host', 'set_option_delay_in_ms', 'scan', 'scan_as_user', 'stop', 'remove_scan', 'exclude_from_scan'),
         'core': ('urls', 'set_mode', 'send_request', 'messages', 'alerts', 'new_session'),
         'context': ('new_context', 'include_in_context', 'set_context_in_scope', 'exclude_from_context', 'remove_context'),
@@ -1176,7 +1205,7 @@ def write_runtime_config(status: dict[str, str | None]) -> None:
             status_directories.append(str(path.parent))
     directories = configure_path() + status_directories
     payload = {'schema_version': 4, 'generated_at': datetime.now(timezone.utc).isoformat(), 'project_root': str(ROOT), 'python_executable': sys.executable, 'platform': platform.platform(), 'machine': platform.machine(), 'tool_directories': list(dict.fromkeys(directories)), 'executables': status, 'idor_forge': dict(_IDOR_FORGE_STATE) if _IDOR_FORGE_STATE else {'repository': IDOR_FORGE_REPOSITORY, 'directory': str(IDOR_FORGE_DIR), 'python': str(IDOR_FORGE_DIR / '.venv' / ('Scripts/python.exe' if os.name == 'nt' else 'bin/python'))}, 'mcp_transport': 'streamable_http', 'mcp_http': {'host': '127.0.0.1', 'path': '/mcp', 'services': {name: mcp_http_url(name) for name in MCP_SERVER_PORTS}}, 'playwright_chromium': {'ready': _playwright_chromium_ready()[0], 'interpreter': sys.executable}, 'nikto_perl': str(Path(find_perl()).resolve()) if find_perl() else '', 'nikto_script': str((LOCAL_OPT / 'nikto' / 'program' / 'nikto.pl').resolve()), 'nikto_image': NIKTO_DOCKER_IMAGE, 'nikto_execution_mode': 'docker_official_image' if _docker_image_ready(NIKTO_DOCKER_IMAGE) else 'native_perl', 'nuclei_image': NUCLEI_DOCKER_IMAGE if _NUCLEI_ENGINE_STATE.get('execution_mode') == 'docker_official_image' else '', 'nuclei_execution_mode': str(_NUCLEI_ENGINE_STATE.get('execution_mode') or 'native'), 'nuclei_engine': dict(_NUCLEI_ENGINE_STATE), 'report_docker_image': REPORT_DOCKER_IMAGE if _docker_image_ready(REPORT_DOCKER_IMAGE) else '', 'report_docker_source_image': REPORT_DOCKER_SOURCE_IMAGE, 'report_execution_mode': 'docker_registry_alias' if _docker_image_ready(REPORT_DOCKER_IMAGE) else 'native_weasyprint', 'nuclei_templates': dict(_NUCLEI_TEMPLATE_STATE) if _NUCLEI_TEMPLATE_STATE else {'count': _filesystem_nuclei_template_count()[0], 'directory': _best_nuclei_template_directory(), 'directories': _filesystem_nuclei_template_count()[1], 'filesystem_candidates': _filesystem_nuclei_template_inventory(), 'minimum_expected': NUCLEI_TEMPLATE_MINIMUM}}
-    RUNTIME_FILE.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding='utf-8')
+    atomic_write_text(RUNTIME_FILE, json.dumps(payload, indent=2, ensure_ascii=False))
     print(f'[+] Runtime scanner configuration written: {RUNTIME_FILE}')
 
 # FFUF setup writes the bundled fallback wordlist only when no project copy exists.

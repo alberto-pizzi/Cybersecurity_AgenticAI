@@ -6,7 +6,7 @@ import time
 from typing import Any, Iterable
 from urllib.parse import parse_qsl, urljoin, urlparse
 
-from utils import canonical_cookie_header, cookie_names, normalized_origin, same_origin
+from utils import canonical_cookie_header, cookie_names, normalized_origin, request_contract_state_change_reason, same_origin
 
 
 class BrowserLoginError(RuntimeError):
@@ -131,17 +131,41 @@ def observed_oidc_issuer(current_url: str, observed_auth_requests: list[str] | t
 
 
 def oidc_credential_reuse_allowed(
-    current_url: str, expected_oidc_issuer: str, observed_auth_requests: list[str] | tuple[str, ...]
+    current_url: str, expected_oidc_issuer: str, observed_auth_requests: list[str] | tuple[str, ...],
+    *, allow_initial_oidc_bootstrap: bool = False,
 ) -> tuple[bool, str]:
-    """Allow local-form reuse when no OIDC issuer exists; require the actual OIDC form to match otherwise."""
+    """Decide whether already-resolved target credentials may be filled on the visible login form.
+
+    ``expected_oidc_issuer`` is normally learned from the primary login and then pins every later
+    sibling/session refresh to that same authorization endpoint.  During the *first* primary login
+    there is deliberately no stored issuer yet; in that one case an OIDC provider may be bootstrapped
+    only from an authorization request observed in the same browser attempt, and only while the
+    credential form remains on that provider origin.  A local-form primary identity therefore cannot
+    later leak credentials into a newly observed OIDC realm.
+    """
     observed = observed_oidc_issuer(current_url, observed_auth_requests)
     expected = str(expected_oidc_issuer or "").strip().rstrip("/")
     if not expected:
-        # A primary local-form login has no OIDC issuer. With explicit sibling-credential reuse, the
-        # same resolved credentials may be retried only on another already-authorized LOCAL form. If
-        # the destination exposes an OIDC authorization flow, do not send local-form credentials to a
-        # newly observed provider/realm merely because the network origin is authorized for testing.
-        return (not bool(observed)), observed
+        if not observed:
+            return True, observed
+        if allow_initial_oidc_bootstrap:
+            current_origin = normalized_origin(str(current_url or ""))
+            provider_origin = normalized_origin(observed)
+            direct = oidc_issuer_key(str(current_url or ""))
+            provider_local_form = (
+                bool(current_origin)
+                and current_origin == provider_origin
+                and (
+                    bool(direct and direct.rstrip("/") == observed.rstrip("/"))
+                    or _looks_like_application_login_entry(str(current_url or ""))
+                )
+            )
+            if provider_local_form:
+                return True, observed
+        # A previously established local-form primary identity has no OIDC issuer. On later sibling
+        # reuse, credentials remain restricted to another local form; observing an OIDC request does
+        # not authorize a new provider/realm.
+        return False, observed
     direct = oidc_issuer_key(str(current_url or ""))
     if direct and direct.rstrip("/") == expected:
         return True, observed
@@ -165,22 +189,19 @@ def _looks_like_application_login_entry(url: str) -> bool:
     return any(token in path for token in ('login', 'signin', 'sign-in', 'session', 'authenticate'))
 
 def _preauth_safe_candidate(target_url: str, candidate: str) -> bool:
-    """Keep generic pre-auth browsing same-origin, HTTP(S), GET-like and non-destructive."""
+    """Keep pre-auth browsing same-origin and non-mutating without a second URL blacklist.
+
+    Login discovery performs ordinary GET navigation only. Reuse the same state-change classifier used
+    by crawler/scanners so read-only pages such as /setup, /install or /reset-password remain visible,
+    while logout/delete/reset actions that actually change application/session state stay blocked.
+    """
     try:
         parsed = urlparse(str(candidate or ""))
     except ValueError:
         return False
     if parsed.scheme.lower() not in {"http", "https"} or not same_origin(target_url, candidate):
         return False
-    path_words = {part for part in re.split(r"[^a-z0-9]+", str(parsed.path or "").lower()) if part}
-    blocked_actions = {"logout", "signout", "delete", "remove", "destroy", "install", "uninstall", "purge", "wipe", "drop", "truncate"}
-    if path_words & blocked_actions:
-        return False
-    action_keys = {"action", "operation", "op", "task", "command"}
-    for name, value in parse_qsl(parsed.query, keep_blank_values=True):
-        if str(name).lower() in action_keys and str(value).lower() in blocked_actions:
-            return False
-    return True
+    return not bool(request_contract_state_change_reason({"method": "GET", "url": str(candidate or "")}))
 
 
 def _preauth_link_score(url: str, label: str = "") -> int:
@@ -346,6 +367,19 @@ def _target_cookie_header(context: Any, url: str, credential: dict[str, Any], *,
     return header
 
 
+def _capture_storage_state(context: Any) -> dict[str, Any]:
+    """Capture reusable browser authentication state, including IndexedDB when supported.
+
+    Playwright 1.51+ can persist IndexedDB-backed authentication tokens. Keep a compatibility
+    fallback so a slightly older VM runtime still works instead of failing the login path.
+    """
+    try:
+        state = context.storage_state(indexed_db=True)
+    except TypeError:
+        state = context.storage_state()
+    return state if isinstance(state, dict) else {}
+
+
 def _remaining_ms(deadline: float, *, cap_ms: int = 20_000, floor_ms: int = 1_000) -> int:
     remaining = max(0.0, deadline - time.monotonic())
     return max(floor_ms, min(cap_ms, int(remaining * 1000)))
@@ -438,7 +472,8 @@ def browser_oidc_login_session(
             # authorization endpoint. A background request to that issuer is not enough to authorize
             # an unrelated local form. If the primary login was local-form, no fake issuer is created.
             return oidc_credential_reuse_allowed(
-                str(page.url or ""), expected_oidc_issuer, observed_auth_requests[offset:]
+                str(page.url or ""), expected_oidc_issuer, observed_auth_requests[offset:],
+                allow_initial_oidc_bootstrap=bool(initial_login),
             )
 
         page.on("request", record_auth_request)
@@ -501,7 +536,7 @@ def browser_oidc_login_session(
                         issuer = current_issuer(auth_request_offset)
                         return {
                             "cookie_header": existing_header,
-                            "storage_state": context.storage_state(),
+                            "storage_state": _capture_storage_state(context),
                             "final_url": current_url,
                             "entry_url": candidate,
                             "used_credentials": False,
@@ -535,7 +570,7 @@ def browser_oidc_login_session(
                                 issuer = current_issuer(auth_request_offset)
                                 return {
                                     "cookie_header": header,
-                                    "storage_state": context.storage_state(),
+                                    "storage_state": _capture_storage_state(context),
                                     "final_url": current_url,
                                     "entry_url": candidate,
                                     "used_credentials": False,
@@ -566,7 +601,7 @@ def browser_oidc_login_session(
                             issuer = current_issuer(auth_request_offset)
                             return {
                                 "cookie_header": header,
-                                "storage_state": context.storage_state(),
+                                "storage_state": _capture_storage_state(context),
                                 "final_url": current_url,
                                 "entry_url": candidate,
                                 "used_credentials": False,
@@ -641,7 +676,7 @@ def browser_oidc_login_session(
                             issuer = current_issuer(auth_request_offset)
                             return {
                                 "cookie_header": header,
-                                "storage_state": context.storage_state(),
+                                "storage_state": _capture_storage_state(context),
                                 "final_url": current_url,
                                 "entry_url": candidate,
                                 "used_credentials": used_credentials,

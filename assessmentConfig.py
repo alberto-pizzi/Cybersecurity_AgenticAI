@@ -19,11 +19,20 @@ SUPPORTED_CREDENTIAL_KINDS = {"cookie", "browser_oidc", "snap4city_oidc"}
 MAX_SERVICE_CREDENTIAL_IDENTITIES = MAX_AUTHENTICATED_IDENTITIES
 
 
+def _strict_json_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError(f"Assessment configuration contains duplicate JSON key {key!r}.")
+        result[key] = value
+    return result
+
+
 # Loads and validates the platform-level assessment configuration.
 def load_assessment_config(path: str | Path) -> dict[str, Any]:
     config_path = Path(path).expanduser().resolve()
     try:
-        payload = json.loads(config_path.read_text(encoding="utf-8"))
+        payload = json.loads(config_path.read_text(encoding="utf-8"), object_pairs_hook=_strict_json_object)
     except OSError as exc:
         raise ValueError(f"Cannot read assessment configuration {config_path}: {exc}") from exc
     except json.JSONDecodeError as exc:
@@ -61,9 +70,11 @@ def load_assessment_config(path: str | Path) -> dict[str, Any]:
         value = execution.get("max_rounds")
         if isinstance(value, bool) or not isinstance(value, int) or value not in {1, 2, 3}:
             raise ValueError("execution.max_rounds must be one of 1, 2 or 3 when supplied.")
-    _validate_authorization(payload.get("authorization") or {})
+    authorization_value = payload.get("authorization")
+    _validate_authorization({} if authorization_value is None else authorization_value)
     _validate_assets(assets)
-    credentials = payload.get("credentials") or {}
+    credentials_value = payload.get("credentials")
+    credentials = {} if credentials_value is None else credentials_value
     _validate_credentials(credentials)
     _validate_credential_references(assets, credentials)
     _validate_reporting(payload.get("reporting"))
@@ -257,7 +268,19 @@ def _validate_credential_references(assets: list[Any], credentials: dict[str, An
 def _validate_credentials(credentials: Any) -> None:
     if not isinstance(credentials, dict):
         raise ValueError("credentials must be a JSON object when supplied.")
+    folded_names: dict[str, str] = {}
     for name, credential in credentials.items():
+        if not isinstance(name, str) or not valid_identity_label(name):
+            raise ValueError(
+                f"Credential name {name!r} is not a stable identity label; use only letters, digits, dot, underscore or hyphen."
+            )
+        folded = name.casefold()
+        previous = folded_names.get(folded)
+        if previous is not None and previous != name:
+            raise ValueError(
+                f"Credential names {previous!r} and {name!r} differ only by case; credential identity labels must be globally unique."
+            )
+        folded_names[folded] = name
         if not isinstance(credential, dict):
             raise ValueError(f"Credential {name!r} must be a JSON object.")
         kind = str(credential.get("kind") or "").strip().lower()
@@ -296,6 +319,15 @@ def _validate_credentials(credentials: Any) -> None:
                 or not all(isinstance(item, str) and item.strip() for item in required_names)
             ):
                 raise ValueError(f"Credential {name!r} required_cookie_names must be a list of non-empty strings.")
+            if required_names is not None:
+                folded_required: set[str] = set()
+                for cookie_name in required_names:
+                    folded_cookie = str(cookie_name).strip().casefold()
+                    if folded_cookie in folded_required:
+                        raise ValueError(
+                            f"Credential {name!r} required_cookie_names contains duplicate cookie name {cookie_name!r} (case-insensitive)."
+                        )
+                    folded_required.add(folded_cookie)
 
 
 # Resolves one target credential at execution time; environment references are preferred.
@@ -423,7 +455,9 @@ def iter_service_jobs(config: dict[str, Any]) -> Iterator[dict[str, Any]]:
                 "secondary_credential_ref": secondary_ref,
                 "secondary_credential_kind": str((credentials.get(secondary_ref) or {}).get("kind") or "") if secondary_ref else "",
                 "auth_only": bool(service.get("auth_only", False)),
-                "allow_state_changes": service.get("allow_state_changes") if "allow_state_changes" in service else execution.get("allow_state_changes"),
+                # Omission is the binding safe default, not a third runtime state. Normalizing here
+                # keeps command generation, same-route coalescing and reporting consistent.
+                "allow_state_changes": bool(service.get("allow_state_changes") if "allow_state_changes" in service else execution.get("allow_state_changes", False)),
                 "interactsh_injection_url": str(service.get("interactsh_injection_url") or "").strip(),
                 "notes": str(service.get("notes") or "").strip(),
             }

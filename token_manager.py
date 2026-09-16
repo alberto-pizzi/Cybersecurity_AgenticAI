@@ -9,6 +9,7 @@ import requests
 import time
 import json
 import os
+from utils import atomic_write_text
 
 
 TOKEN_HTTP_TIMEOUT = (5, 30)
@@ -105,8 +106,12 @@ class TokenManager:
             "token_expiry": self.token_expiry
         }
         try:
-            with open(self.store_path, "w") as f:
-                json.dump(data, f)
+            atomic_write_text(self.store_path, json.dumps(data, ensure_ascii=False))
+            if os.name != "nt":
+                try:
+                    os.chmod(self.store_path, 0o600)
+                except OSError:
+                    pass
             print("[SAVE_TOKEN] - Access Token successfully saved.")
         except Exception as e:
             print(f"[SAVE_TOKEN] - ERROR in saving Access Token: {e}")

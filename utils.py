@@ -12,7 +12,7 @@ import threading
 import time
 from pathlib import Path
 from typing import Any, Callable, Iterable
-from urllib.parse import urljoin, urlparse, urlunparse
+from urllib.parse import parse_qsl, urljoin, urlparse, urlunparse
 
 import requests
 
@@ -44,6 +44,287 @@ def secops_source_fingerprint() -> str:
         digest.update(b"\0")
     _SOURCE_FINGERPRINT_CACHE = digest.hexdigest()
     return _SOURCE_FINGERPRINT_CACHE
+
+# Central fail-closed request-state policy shared by orchestrators and direct MCP wrappers.
+# GET/HEAD/OPTIONS remain eligible unless the route explicitly represents a mutation; PUT/PATCH/
+# DELETE are always blocked when state changes are disabled. POST is accepted only with strong
+# read-only evidence, so direct tool calls cannot bypass the orchestrator's safety gate.
+def request_contract_state_change_reason(case: dict[str, Any]) -> str:
+    if not isinstance(case, dict):
+        return ""
+    url = str(case.get("url") or "")
+    method = str(case.get("method") or "GET").upper()
+    try:
+        parsed = urlparse(url)
+    except ValueError:
+        parsed = urlparse("")
+    raw_path = str(parsed.path or "")
+    path = raw_path.lower()
+
+    # Method-override mechanisms can turn an apparently read-only outer request into PUT/PATCH/
+    # DELETE on common frameworks. Treat both headers and conventional query/body fields as the
+    # effective method for the state-change gate instead of trusting the transport verb alone.
+    headers = case.get("headers")
+    header_pairs: list[tuple[str, str]] = []
+    if isinstance(headers, dict):
+        header_pairs = [(str(name).lower(), str(value).strip().upper()) for name, value in headers.items()]
+    elif isinstance(headers, (list, tuple)):
+        for row in headers:
+            if isinstance(row, (list, tuple)) and len(row) >= 2:
+                header_pairs.append((str(row[0]).lower(), str(row[1]).strip().upper()))
+    override_header_names = {"x-http-method-override", "x-http-method", "x-method-override", "x-original-method"}
+    for name, value in header_pairs:
+        if name in override_header_names and value and value not in {"GET", "HEAD", "OPTIONS"}:
+            return f"state-changing HTTP method override: {value}"
+    path_tokens = {token for token in re.split(r"[^a-z0-9]+", path) if token}
+    mutating_tokens = {
+        "delete", "remove", "destroy", "reset", "install", "reinstall", "uninstall", "setup",
+        "upload", "register", "signup", "create", "update", "save", "modify", "change",
+        "truncate", "purge", "wipe", "logout", "signout", "logoff", "commit", "approve",
+        "reject", "enable", "disable", "activate", "deactivate", "publish", "unpublish",
+    }
+    destructive_get_tokens = {
+        "delete", "remove", "destroy", "reinstall", "uninstall", "truncate", "purge",
+        "wipe", "logout", "signout", "logoff",
+    }
+    # A mutating parent route can expose a read-only child endpoint (for example
+    # /setup/status or /upload/validate). These tokens are also used to distinguish a descriptive
+    # GET route such as /delete/preview from an imperative /delete/123 action.
+    read_only_route_tokens = {
+        "search", "query", "lookup", "find", "filter", "list", "read", "get", "fetch",
+        "preview", "validate", "check", "status", "report", "export", "autocomplete",
+        "suggest", "resolve", "inspect", "view", "select", "load", "retrieve", "describe",
+        "count", "info", "details",
+    }
+    basename = raw_path.rstrip("/").rsplit("/", 1)[-1].rsplit(".", 1)[0]
+    separated = re.sub(r"([a-z0-9])([A-Z])", r"\1 \2", basename)
+    basename_tokens = [token.lower() for token in re.split(r"[^A-Za-z0-9]+", separated) if token]
+    final_path_tokens = set(basename_tokens)
+    read_only_post_route = bool(final_path_tokens & read_only_route_tokens)
+
+    def route_segment_tokens(segment: str) -> set[str]:
+        stem = str(segment or "").rsplit(".", 1)[0]
+        split_camel = re.sub(r"([a-z0-9])([A-Z])", r"\1 \2", stem)
+        return {token.lower() for token in re.split(r"[^A-Za-z0-9]+", split_camel) if token}
+
+    route_segments = [segment for segment in raw_path.split("/") if segment]
+    navigational_reset_suffixes = {"password", "form", "page", "view", "preview", "request", "token"}
+    destructive_route = False
+    for index, segment in enumerate(route_segments):
+        tokens = route_segment_tokens(segment)
+        hits = tokens & destructive_get_tokens
+        if not hits:
+            continue
+        # /reset-password and delete-preview style resources describe a page/preview rather than an
+        # action. A destructive parent followed by an explicit read-only child is treated likewise.
+        if "reset" in hits and len(basename_tokens) > 1 and basename_tokens[0] == "reset" and basename_tokens[1] in navigational_reset_suffixes:
+            continue
+        if tokens & read_only_route_tokens:
+            continue
+        if index + 1 < len(route_segments):
+            next_tokens = route_segment_tokens(route_segments[index + 1])
+            if next_tokens & read_only_route_tokens:
+                continue
+        destructive_route = True
+        break
+    if destructive_route:
+        return "destructive or state-changing route"
+    if method in {"POST", "JSON", "XML"} and path_tokens & mutating_tokens and not read_only_post_route:
+        return "state-changing POST route"
+
+    query_pairs = [(str(name).lower(), str(value).lower()) for name, value in parse_qsl(parsed.query, keep_blank_values=True)]
+    # Only controller/action selectors make their *value* part of the current operation. Navigation
+    # parameters (next/redirect/url/path/target/...) are deliberately not included: they do not by
+    # themselves mutate the current request, and any resulting redirect is checked before following.
+    action_names = {"action", "operation", "op", "task", "mode", "command", "do", "event",
+                    "method", "_method", "http_method", "httpmethod"}
+    benign_action_values = {"view", "show", "list", "read", "get", "search", "query", "find", "lookup", "status", "preview", "check", "validate", "report", "export", "count", "info", "details"}
+    falsey_values = {"", "0", "false", "no", "off", "none", "null"}
+    explicit_mutating_field_names = {
+        "delete", "remove", "destroy", "reset", "upload", "register", "signup", "create",
+        "update", "save", "modify", "change", "truncate", "purge", "wipe", "logout",
+        "signout", "logoff", "commit", "approve", "reject", "enable", "disable", "activate",
+        "deactivate", "publish", "unpublish",
+    }
+    for name, value in query_pairs:
+        leaf_name = re.split(r"[.\[]", name)[-1].rstrip("]")
+        # Match an explicit controller field, not a descriptive name such as last_update or
+        # created_at. This keeps filters/metadata discoverable while still blocking delete=1 etc.
+        if leaf_name in explicit_mutating_field_names and value not in falsey_values:
+            return "state-changing URL parameter"
+        if name in {"method", "_method", "http_method", "httpmethod"}:
+            override = value.strip().upper()
+            if override and override not in {"GET", "HEAD", "OPTIONS"}:
+                return f"state-changing URL method override: {override}"
+        if name in action_names:
+            tokens = {token for token in re.split(r"[^a-z0-9]+", value) if token}
+            if tokens & mutating_tokens and not tokens <= benign_action_values:
+                return "state-changing URL action"
+
+    if method in {"PUT", "PATCH", "DELETE"}:
+        return f"state-changing {method} request method"
+    if method in {"GET", "HEAD", "OPTIONS"}:
+        # Bodies/files on normally read-only methods are non-standard and cannot be assumed harmless.
+        # Ordinary discovery does not use them, so failing closed here removes an edge-case bypass
+        # without reducing normal GET/HEAD/OPTIONS coverage.
+        if str(case.get("data") or "").strip() or case.get("file_parameters"):
+            return f"{method} request with body/files not proven read-only"
+        return ""
+    if method not in {"POST", "JSON", "XML"}:
+        return f"HTTP method {method or 'UNKNOWN'} not proven read-only"
+
+    file_parameters = {str(value).strip().lower() for value in case.get("file_parameters", []) if str(value).strip()}
+    content_type = str(case.get("content_type") or case.get("enctype") or "").lower()
+    if file_parameters or "multipart/form-data" in content_type:
+        return "file-upload POST contract"
+
+    pairs = list(query_pairs)
+    raw_data = str(case.get("data") or "")
+    payload: Any = None
+    if raw_data:
+        if "json" in content_type or method == "JSON" or raw_data.lstrip().startswith(("{", "[")):
+            try:
+                payload = json.loads(raw_data)
+            except Exception:
+                payload = None
+            def add_json(value: Any, prefix: str = "", depth: int = 0) -> None:
+                if depth > 5:
+                    return
+                if isinstance(value, dict):
+                    for name, nested in value.items():
+                        key = f"{prefix}.{name}" if prefix else str(name)
+                        if isinstance(nested, (dict, list)):
+                            add_json(nested, key, depth + 1)
+                        else:
+                            pairs.append((key.lower(), str(nested or "").lower()))
+                elif isinstance(value, list):
+                    for index, nested in enumerate(value[:40]):
+                        add_json(nested, f"{prefix}[{index}]" if prefix else f"[{index}]", depth + 1)
+            if isinstance(payload, (dict, list)):
+                add_json(payload)
+        else:
+            pairs.extend((str(name).lower(), str(value).lower()) for name, value in parse_qsl(raw_data, keep_blank_values=True))
+    for field in case.get("fields", []) if isinstance(case.get("fields"), list) else []:
+        if isinstance(field, dict) and field.get("name"):
+            pairs.append((str(field.get("name")).lower(), str(field.get("value") or "").lower()))
+
+    names = {name for name, _ in pairs}
+    leaf_names = {re.split(r"[.\[]", name)[-1].rstrip("]") for name in names}
+
+    # Method overrides are authoritative even on otherwise read-only endpoints or GraphQL queries.
+    for name, value in pairs:
+        leaf = re.split(r"[.\[]", name)[-1].rstrip("]")
+        if name in {"method", "_method", "http_method", "httpmethod"} or leaf in {"method", "_method", "http_method", "httpmethod"}:
+            override = value.strip().upper()
+            if override and override not in {"GET", "HEAD", "OPTIONS"}:
+                return f"state-changing POST method override: {override}"
+
+    # GraphQL operation type is stronger evidence than variable names. A query may legitimately
+    # validate a proposed password/update object without persisting it; mutation/subscription remains
+    # blocked. This check therefore precedes generic mutating-field heuristics.
+    if "graphql" in path or any(name in {"query", "operationname", "variables"} for name in names):
+        if isinstance(payload, dict):
+            graphql = str(payload.get("query") or "").strip()
+        else:
+            graphql_values = [value for name, value in pairs if name == "query"]
+            graphql = str(graphql_values[-1] if graphql_values else raw_data).strip()
+        lowered = re.sub(r"^\s*(?:#[^\n]*\s*)*", "", graphql, flags=re.M).lower()
+        if lowered.startswith("query") or lowered.startswith("{"):
+            return ""
+        if lowered.startswith("mutation") or lowered.startswith("subscription") or re.search(r"\b(?:mutation|subscription)\b", lowered):
+            return "state-changing GraphQL operation"
+        return "POST contract not proven read-only while state changes are disabled"
+
+    mutating_names = {
+        "password_new", "password_conf", "new_password", "confirm_password", "newpassword",
+        "role_update", "permission_update",
+    }
+    if (names & mutating_names or leaf_names & mutating_names) and not read_only_post_route:
+        return "state-changing POST field"
+    if {"username", "password"} <= names or {"user", "password"} <= names:
+        return "authentication POST contract"
+    for name, value in pairs:
+        leaf = re.split(r"[.\[]", name)[-1].rstrip("]")
+        if leaf in explicit_mutating_field_names and value not in falsey_values and not read_only_post_route:
+            return "state-changing POST field"
+        if name in action_names or leaf in action_names:
+            tokens = {token for token in re.split(r"[^a-z0-9]+", value) if token}
+            if tokens & mutating_tokens:
+                return "state-changing POST action"
+
+    read_only_tokens = read_only_route_tokens | {"calculate", "compute"}
+    if path_tokens & read_only_tokens:
+        return ""
+    for name, value in pairs:
+        leaf = re.split(r"[.\[]", name)[-1].rstrip("]")
+        if name in action_names or leaf in action_names:
+            values = {token for token in re.split(r"[^a-z0-9]+", value) if token}
+            if values & (read_only_tokens | benign_action_values):
+                return ""
+    return "POST contract not proven read-only while state changes are disabled"
+
+
+def request_contract_allowed(case: dict[str, Any], allow_state_changes: bool) -> tuple[bool, str]:
+    if allow_state_changes:
+        return True, ""
+    reason = request_contract_state_change_reason(case)
+    return not bool(reason), reason
+
+
+def request_invocation_state_change_reason(
+    method: str, url: str, *, data: Any = None, json_body: Any = None, params: Any = None,
+    files: Any = None, headers: Any = None,
+) -> str:
+    """Classify the concrete HTTP invocation before any network request is sent.
+
+    This is defense-in-depth for shared HTTP helpers: wrappers should still reject unsafe contracts
+    before constructing a scan, but a forgotten wrapper gate must not make the first request
+    fail-open. Query params/body/file metadata are normalized to the same central policy shape.
+    """
+    effective_url = str(url or "")
+    if params not in (None, "", {}, []):
+        try:
+            effective_url = str(requests.Request("GET", effective_url, params=params).prepare().url or effective_url)
+        except Exception:
+            # If parameters cannot be serialized, the concrete URL cannot be classified before
+            # transmission. Fail closed for every method instead of treating an unrenderable GET as
+            # implicitly safe.
+            return "request parameters could not be normalized for state-change policy"
+    content_type = ""
+    if isinstance(headers, dict):
+        content_type = next((str(value) for name, value in headers.items() if str(name).lower() == "content-type"), "")
+    body = ""
+    if json_body is not None:
+        try:
+            body = json.dumps(json_body, ensure_ascii=False, separators=(",", ":"))
+        except Exception:
+            return "JSON request body could not be normalized for state-change policy"
+        content_type = content_type or "application/json"
+    elif data not in (None, ""):
+        if isinstance(data, (dict, list, tuple)):
+            try:
+                prepared = requests.Request("POST", "http://secops.invalid/", data=data).prepare()
+                raw_body = prepared.body
+                body = raw_body.decode("utf-8", errors="replace") if isinstance(raw_body, bytes) else str(raw_body or "")
+                content_type = content_type or str(prepared.headers.get("Content-Type") or "")
+            except Exception:
+                return "request body could not be normalized for state-change policy"
+        else:
+            body = data.decode("utf-8", errors="replace") if isinstance(data, bytes) else str(data)
+    file_parameters: list[str] = []
+    if files:
+        if isinstance(files, dict):
+            file_parameters = [str(name) for name in files]
+        elif isinstance(files, (list, tuple)):
+            for row in files:
+                if isinstance(row, (list, tuple)) and row:
+                    file_parameters.append(str(row[0]))
+        if not file_parameters:
+            file_parameters = ["file"]
+    return request_contract_state_change_reason({
+        "url": effective_url, "method": str(method or "GET").upper(), "data": body,
+        "content_type": content_type, "file_parameters": file_parameters, "headers": headers or {},
+    })
 
 # Returns a non-reversible identifier for one HTTP request body contract. The report uses this
 # only to keep distinct POST bodies separate without exposing submitted values or credentials.
@@ -263,6 +544,18 @@ def canonical_cookie_header(value: str) -> str:
     return "; ".join(f"{name}={cookie_value}" for name, cookie_value in parse_cookie_header(value))
 
 
+# Stable session identity is independent from pair ordering in a Cookie header. Duplicate cookie
+# names are already rejected by parse_cookie_header(), so sorting cannot collapse two distinct
+# same-name path cookies that the flattened project header format cannot represent in the first place.
+def cookie_header_fingerprint(value: str) -> str:
+    pairs = parse_cookie_header(value)
+    if not pairs:
+        return ""
+    normalized = sorted(((name.casefold(), cookie_value) for name, cookie_value in pairs), key=lambda row: row[0])
+    payload = json.dumps(normalized, ensure_ascii=False, separators=(",", ":"))
+    return hashlib.sha256(payload.encode("utf-8", errors="replace")).hexdigest()
+
+
 # Cookie-name extraction exposes only the names present in the supplied header.
 def cookie_names(value: str) -> list[str]:
     return [name for name, _ in parse_cookie_header(value)]
@@ -372,7 +665,7 @@ def runtime_container_route(target: str, scanner_container: str = "") -> dict[st
 
 
 # Applies target-specific preparation requests before a scanner starts.
-def apply_runtime_target_preparation(target: str, cookies: str) -> dict[str, Any]:
+def apply_runtime_target_preparation(target: str, cookies: str, *, allow_state_changes: bool = False) -> dict[str, Any]:
 
 
     profile = target_runtime_profile(target)
@@ -401,10 +694,27 @@ def apply_runtime_target_preparation(target: str, cookies: str) -> dict[str, Any
             usable = False
             outcomes.append({"url": url, "error": "cross-origin preparation request rejected"})
             continue
+        request_data = str(item.get("data") or "") if method == "POST" else ""
+        declared_state_change = bool(item.get("state_changing"))
+        state_reason = request_contract_state_change_reason({
+            "url": url, "method": method, "data": request_data,
+            "parameters": list(item.get("parameters") or []),
+            "content_type": str(item.get("content_type") or ""),
+        })
+        if not allow_state_changes and (declared_state_change or state_reason):
+            required = bool(item.get("required"))
+            usable = usable and (not required)
+            outcomes.append({
+                "method": method, "url": url, "skipped": True,
+                "diagnosis": "state_change_policy_blocked",
+                "reason": ("declared state-changing preparation" if declared_state_change else state_reason),
+                "required": required,
+            })
+            continue
         try:
             response = request_same_origin_redirects(
-                method, url, session=session, data=str(item.get("data") or "") if method == "POST" else None,
-                timeout=(4, 15),
+                method, url, session=session, data=request_data if method == "POST" else None,
+                timeout=(4, 15), allow_state_changes=bool(allow_state_changes),
             )
             accepted = item.get("accepted_statuses", [200, 204, 302])
             accepted_set = {int(value) for value in accepted if str(value).isdigit()}
@@ -440,6 +750,7 @@ def request_with_retries(
     pacer: RequestRatePacer | None = None,
     request_rate: Any = _REQUEST_RATE_UNSET,
     deadline: float | None = None,
+    allow_state_changes: bool = False,
     **kwargs: Any,
 ) -> tuple[requests.Response | None, list[str]]:
 
@@ -461,10 +772,17 @@ def request_with_retries(
                 else:
                     kwargs["timeout"] = left
             if kwargs.get("allow_redirects"):
-                return request_same_origin_redirects(method, url, pacer=active_pacer, deadline=deadline, **kwargs), errors
+                return request_same_origin_redirects(method, url, pacer=active_pacer, deadline=deadline, allow_state_changes=allow_state_changes, **kwargs), errors
             # Scanner helpers never inherit Requests' method-dependent redirect defaults. A caller
             # must opt in explicitly; opt-in follow is always routed through the same-origin guard.
             kwargs["allow_redirects"] = False
+            if not allow_state_changes:
+                state_reason = request_invocation_state_change_reason(
+                    method, url, data=kwargs.get("data"), json_body=kwargs.get("json"),
+                    params=kwargs.get("params"), files=kwargs.get("files"), headers=kwargs.get("headers"),
+                )
+                if state_reason:
+                    raise requests.RequestException(f"state-change policy blocked request before send: {state_reason}")
             active_pacer.wait()
             return requests.request(method=method, url=url, **kwargs), errors
         except (requests.Timeout, requests.ConnectionError) as exc:
@@ -498,6 +816,13 @@ def scanner_session_probe(
 
     if not cookies:
         return {"performed": False, "authenticated": None, "conclusive": True}
+    method_upper = str(method or "GET").upper()
+    state_reason = request_contract_state_change_reason({"url": str(url or ""), "method": method_upper, "data": str(data or "")})
+    if state_reason:
+        return {
+            "performed": False, "authenticated": None, "conclusive": False,
+            "state_change_blocked": True, "diagnosis": "state_change_policy_blocked", "reason": state_reason,
+        }
     response, errors = request_with_retries(
         str(method or "GET").upper(),
         url,
@@ -509,6 +834,7 @@ def scanner_session_probe(
         pacer=pacer,
         request_rate=request_rate,
         deadline=deadline,
+        allow_state_changes=False,
     )
     if response is None:
         return {
@@ -622,7 +948,7 @@ def exact_origin_url_regex(url: str) -> str:
 def request_same_origin_redirects(
     method: str, url: str, *, max_redirects: int = 5, session: requests.Session | None = None,
     pacer: RequestRatePacer | None = None, request_rate: Any = _REQUEST_RATE_UNSET,
-    deadline: float | None = None, **kwargs: Any,
+    deadline: float | None = None, allow_state_changes: bool = False, **kwargs: Any,
 ) -> requests.Response:
     """Send one HTTP request and follow redirects only while they remain on the starting origin.
 
@@ -641,6 +967,13 @@ def request_same_origin_redirects(
         requester = session.request if session is not None else requests.request
         if deadline is not None and float(deadline) - time.monotonic() <= 0:
             raise requests.Timeout("shared scanner deadline reached")
+        if not allow_state_changes:
+            state_reason = request_invocation_state_change_reason(
+                method, current, data=kwargs.get("data"), json_body=kwargs.get("json"),
+                params=kwargs.get("params"), files=kwargs.get("files"), headers=kwargs.get("headers"),
+            )
+            if state_reason:
+                raise requests.RequestException(f"state-change policy blocked request before send: {state_reason}")
         active_pacer.wait()
         if deadline is not None:
             left = float(deadline) - time.monotonic()
@@ -682,6 +1015,16 @@ def request_same_origin_redirects(
                     if str(header_name).lower() in {'content-length', 'content-type', 'transfer-encoding'}:
                         headers.pop(header_name, None)
                 kwargs['headers'] = headers
+        if not allow_state_changes:
+            candidate_method = str(method).upper()
+            candidate_data = str(kwargs.get('data') or '') if candidate_method != 'GET' else ''
+            state_reason = request_contract_state_change_reason({
+                'url': candidate, 'method': candidate_method, 'data': candidate_data,
+            })
+            if state_reason:
+                response.headers['X-SecOps-State-Change-Guard'] = 'state-change-blocked'
+                response.headers['X-SecOps-State-Change-Reason'] = state_reason[:240]
+                return response
         current = candidate
     assert response is not None
     response.headers['X-SecOps-Redirect-Guard'] = 'redirect-limit-reached'

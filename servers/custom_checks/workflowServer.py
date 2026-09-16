@@ -26,7 +26,6 @@ WORKFLOW_PHASE_RATIOS = {
 WORKFLOW_CONNECT_RATIO = 0.25
 
 TOKEN_RE = re.compile(r"(?:csrf|xsrf|token|nonce|authenticity|request[_-]?verification)", re.I)
-DESTRUCTIVE_RE = re.compile(r"(?:logout|signout|logoff|setup|install|delete|remove|drop|truncate|purge|wipe|reset)", re.I)
 STATE_CHANGE_RE = re.compile(
     r"(?:change|update|save|create|submit|send|comment|message|feedback|upload|password|email|profile|settings|transfer|captcha|admin)",
     re.I,
@@ -87,7 +86,7 @@ def _csrf_check(
     parsed = urlparse(target_url)
     names = [field["name"] for field in fields]
     text = " ".join([parsed.path, parsed.query, *names])
-    if not STATE_CHANGE_RE.search(text) or AUTH_RE.search(text) or DESTRUCTIVE_RE.search(text):
+    if not STATE_CHANGE_RE.search(text) or AUTH_RE.search(text):
         return findings, diagnostic
     diagnostic["applicable"] = True
     tokens = list(dict.fromkeys([*token_parameters, *[name for name in names if TOKEN_RE.search(name)]]))
@@ -117,10 +116,10 @@ def _csrf_check(
 
     session = _session(cookies)
     try:
-        baseline = request_same_origin_redirects("POST", target_url, session=session, data=original, timeout=(max(1.0, timeout * WORKFLOW_CONNECT_RATIO), timeout), pacer=pacer, deadline=deadline,
+        baseline = request_same_origin_redirects("POST", target_url, session=session, data=original, allow_state_changes=True, timeout=(max(1.0, timeout * WORKFLOW_CONNECT_RATIO), timeout), pacer=pacer, deadline=deadline,
             headers={"Referer": source_url or target_url, "Origin": f"{parsed.scheme}://{parsed.netloc}"},
         )
-        without_token = request_same_origin_redirects("POST", target_url, session=session, data=stripped, timeout=(max(1.0, timeout * WORKFLOW_CONNECT_RATIO), timeout), pacer=pacer, deadline=deadline, headers={"Sec-Fetch-Site": "cross-site"})
+        without_token = request_same_origin_redirects("POST", target_url, session=session, data=stripped, allow_state_changes=True, timeout=(max(1.0, timeout * WORKFLOW_CONNECT_RATIO), timeout), pacer=pacer, deadline=deadline, headers={"Sec-Fetch-Site": "cross-site"})
     except requests.RequestException as exc:
         diagnostic["error"] = f"{type(exc).__name__}: {exc}"
         return findings, diagnostic
@@ -161,7 +160,7 @@ def _upload_check(
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     findings: list[dict[str, Any]] = []
     diagnostic: dict[str, Any] = {"applicable": bool(file_parameters)}
-    if not file_parameters or not allow_state_changes or DESTRUCTIVE_RE.search(urlparse(target_url).path):
+    if not file_parameters or not allow_state_changes:
         return findings, diagnostic
 
     # Upload a uniquely named harmless marker so later same-origin retrieval is unambiguous.
@@ -179,7 +178,7 @@ def _upload_check(
     files = {file_parameters[0]: (filename, content, "text/html")}
     session = _session(cookies)
     try:
-        response = request_same_origin_redirects("POST", target_url, session=session, data=form_data, files=files, timeout=(max(1.0, timeout * WORKFLOW_CONNECT_RATIO), timeout), pacer=pacer, deadline=deadline, headers={"Referer": source_url or target_url})
+        response = request_same_origin_redirects("POST", target_url, session=session, data=form_data, files=files, allow_state_changes=True, timeout=(max(1.0, timeout * WORKFLOW_CONNECT_RATIO), timeout), pacer=pacer, deadline=deadline, headers={"Referer": source_url or target_url})
     except requests.RequestException as exc:
         diagnostic["error"] = f"{type(exc).__name__}: {exc}"
         return findings, diagnostic
@@ -221,7 +220,7 @@ def _upload_check(
         if remaining_budget(deadline) <= 0:
             break
         try:
-            listing = request_same_origin_redirects("GET", directory, session=session, timeout=(max(1.0, timeout * WORKFLOW_CONNECT_RATIO), timeout), pacer=pacer, deadline=deadline)
+            listing = request_same_origin_redirects("GET", directory, session=session, allow_state_changes=False, timeout=(max(1.0, timeout * WORKFLOW_CONNECT_RATIO), timeout), pacer=pacer, deadline=deadline)
         except requests.RequestException as exc:
             directory_searches.append({"url": directory, "error": f"{type(exc).__name__}: {exc}"})
             continue
@@ -243,7 +242,7 @@ def _upload_check(
         if remaining_budget(deadline) <= 0:
             break
         try:
-            probe = request_same_origin_redirects("GET", candidate, session=session, timeout=(max(1.0, timeout * WORKFLOW_CONNECT_RATIO), timeout), pacer=pacer, deadline=deadline)
+            probe = request_same_origin_redirects("GET", candidate, session=session, allow_state_changes=False, timeout=(max(1.0, timeout * WORKFLOW_CONNECT_RATIO), timeout), pacer=pacer, deadline=deadline)
         except requests.RequestException:
             continue
         present = marker in probe.text
@@ -323,9 +322,9 @@ def _authentication_check(
             payload[password_name] = secrets.token_urlsafe(12)
         try:
             if str(method or "POST").upper() == "GET":
-                response = request_same_origin_redirects("GET", target_url, session=session, params=payload, timeout=(max(1.0, timeout * WORKFLOW_CONNECT_RATIO), timeout), pacer=pacer, deadline=deadline)
+                response = request_same_origin_redirects("GET", target_url, session=session, params=payload, allow_state_changes=True, timeout=(max(1.0, timeout * WORKFLOW_CONNECT_RATIO), timeout), pacer=pacer, deadline=deadline)
             else:
-                response = request_same_origin_redirects("POST", target_url, session=session, data=payload, timeout=(max(1.0, timeout * WORKFLOW_CONNECT_RATIO), timeout), pacer=pacer, deadline=deadline)
+                response = request_same_origin_redirects("POST", target_url, session=session, data=payload, allow_state_changes=True, timeout=(max(1.0, timeout * WORKFLOW_CONNECT_RATIO), timeout), pacer=pacer, deadline=deadline)
         except requests.RequestException as exc:
             attempts.append({"error": f"{type(exc).__name__}: {exc}"})
             break
@@ -382,7 +381,7 @@ def _captcha_check(
     stripped = [(name, value) for name, value in pairs if name not in set(captcha_names)]
     session = _session(cookies)
     try:
-        response = request_same_origin_redirects("POST", target_url, session=session, data=stripped, timeout=(max(1.0, timeout * WORKFLOW_CONNECT_RATIO), timeout), pacer=pacer, deadline=deadline)
+        response = request_same_origin_redirects("POST", target_url, session=session, data=stripped, allow_state_changes=True, timeout=(max(1.0, timeout * WORKFLOW_CONNECT_RATIO), timeout), pacer=pacer, deadline=deadline)
     except requests.RequestException as exc:
         diagnostic["error"] = f"{type(exc).__name__}: {exc}"
         return findings, diagnostic
@@ -431,9 +430,11 @@ def run_workflow_scan(
     pacer = RequestRatePacer(request_rate)
     if method not in {"GET", "POST"}:
         return skipped("Web Workflow Verifier", target_url, "The current workflow checks require a discovered GET/POST form contract.")
-    if DESTRUCTIVE_RE.search(urlparse(target_url).path):
-        return skipped("Web Workflow Verifier", target_url, "Destructive setup, deletion, reset or logout workflows are deliberately excluded.")
 
+    # Do not discard a discovered workflow merely because its path contains reset/setup/delete-like
+    # language. With state changes disabled the checks below remain structural-only; with explicit
+    # authorization the active workflow checks may run. The previous top-level regex hid useful CSRF,
+    # CAPTCHA and authentication evidence even when no request would have been sent.
     findings: list[dict[str, Any]] = []
     diagnostics: dict[str, Any] = {
         "method": method, "source_url": source_url, "enctype": enctype, "allow_state_changes": bool(allow_state_changes),

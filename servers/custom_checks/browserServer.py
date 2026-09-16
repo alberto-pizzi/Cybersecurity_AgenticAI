@@ -7,15 +7,12 @@ import shutil
 from typing import Any
 from urllib.parse import quote, urlparse
 
-from utils import RequestRatePacer, failure, parse_cookie_header, partial, scanner_request_rate, skipped, success, same_origin, url_in_authorized_scope
+from utils import RequestRatePacer, failure, parse_cookie_header, partial, request_contract_state_change_reason, scanner_request_rate, skipped, success, same_origin, url_in_authorized_scope
 
 from core.scannerCommon import proportional_budget, service
 
 mcp, _serve = service("Browser XSS and Workflow Verifier", "browser")
 
-DESTRUCTIVE_RE = re.compile(
-    r"(?:logout|signout|logoff|setup|install|delete|remove|drop|truncate|purge|wipe|reset|clear)", re.I,
-)
 TOKEN_RE = re.compile(r"(?:csrf|xsrf|token|nonce|authenticity|request[_-]?verification)", re.I)
 XSS_NAME_RE = re.compile(
     r"(?:name|message|comment|search|query|q|text|title|input|html|body|content|url|redirect|default|description|bio|note)", re.I,
@@ -268,8 +265,8 @@ async def _stored_check(
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     diagnostic: dict[str, Any] = {"attempted": False, "attempts": []}
     findings: list[dict[str, Any]] = []
-    if not allow_state_changes or DESTRUCTIVE_RE.search(urlparse(target_url).path):
-        diagnostic["reason"] = "state changes not authorized or route excluded"
+    if not allow_state_changes:
+        diagnostic["reason"] = "state changes not authorized"
         return findings, diagnostic
     start_url = source_url if source_url and same_origin(target_url, source_url) else target_url
 
@@ -403,6 +400,29 @@ async def _stored_check(
         diagnostic["reason"] = "no compatible field could carry a harmless executable marker"
     return findings, diagnostic
 
+# Choose a browser navigation point without dropping safe structural coverage for a blocked contract.
+def _browser_analysis_start_url(
+    target_url: str, source_url: str, method: str, data: str,
+    parameters: list[str], fields: list[dict[str, Any]], allow_state_changes: bool,
+) -> tuple[str, str]:
+    if allow_state_changes:
+        return target_url, ""
+    initial_reason = request_contract_state_change_reason({
+        "url": target_url, "method": str(method or "GET").upper(), "data": str(data or ""),
+        "parameters": parameters, "fields": fields,
+    })
+    if not initial_reason:
+        return target_url, ""
+    candidate = str(source_url or "").strip()
+    if candidate and same_origin(target_url, candidate):
+        source_reason = request_contract_state_change_reason({
+            "url": candidate, "method": "GET", "data": "", "parameters": [],
+        })
+        if not source_reason:
+            return candidate, initial_reason
+    return "", initial_reason
+
+
 # Coordinate Chromium checks for DOM, reflected and stored XSS on one request case.
 async def _run_browser_scan_core(
     target_url: str, cookies: str = "", method: str = "GET", data: str = "",
@@ -427,6 +447,15 @@ async def _run_browser_scan_core(
         source_url = ""
     parameters = [str(value) for value in (parameters or []) if str(value)]
     fields = [dict(value) for value in (fields or []) if isinstance(value, dict)]
+    analysis_start_url, initial_reason = _browser_analysis_start_url(
+        target_url, source_url, method, data, parameters, fields, bool(allow_state_changes),
+    )
+    if initial_reason and not analysis_start_url:
+        return skipped(
+            "Browser XSS and Workflow Verifier", target_url,
+            f"Active browser verification is blocked by allow_state_changes=false ({initial_reason}) and no safe same-origin source page is available for structural/DOM analysis.",
+            diagnosis="state_change_policy_blocked_no_safe_source", allow_state_changes=False,
+        )
     client_sources = [str(value) for value in (client_sources or []) if str(value)]
     client_sinks = [str(value) for value in (client_sinks or []) if str(value)]
     authorized_origins = [str(value) for value in (authorized_origins or []) if str(value)]
@@ -439,6 +468,7 @@ async def _run_browser_scan_core(
     blocked_top_level_urls: list[str] = []
     diagnostics: dict[str, Any] = {
         "method": str(method or "GET").upper(), "parameters": parameters, "fields": fields, "source_url": source_url,
+        "analysis_start_url": analysis_start_url, "initial_contract_blocked_reason": initial_reason,
         "client_sources": client_sources, "client_sinks": client_sinks,
         "allow_state_changes": bool(allow_state_changes), "playwright_api": "async",
         "request_rate": effective_request_rate, "authorized_navigation_origins": authorized_origins, "allow_same_host_ports": bool(allow_same_host_ports),
@@ -476,15 +506,46 @@ async def _run_browser_scan_core(
                             is_navigation = bool(request.is_navigation_request())
                         except Exception:
                             is_navigation = str(getattr(request, "resource_type", "") or "") == "document"
-                        if is_navigation:
-                            request_url = str(getattr(request, "url", "") or "")
-                            if request_url and not url_in_authorized_scope(
-                                target_url, request_url, authorized_origins, allow_same_host_ports=bool(allow_same_host_ports),
-                            ):
-                                if request_url not in blocked_top_level_urls:
-                                    blocked_top_level_urls.append(request_url)
+                        request_url = str(getattr(request, "url", "") or "")
+                        request_method = str(getattr(request, "method", "GET") or "GET").upper()
+                        in_scope = bool(request_url) and url_in_authorized_scope(
+                            target_url, request_url, authorized_origins, allow_same_host_ports=bool(allow_same_host_ports),
+                        )
+                        if is_navigation and request_url and not in_scope:
+                            if request_url not in blocked_top_level_urls:
+                                blocked_top_level_urls.append(request_url)
+                            await route.abort("blockedbyclient")
+                            return
+                        # External dependencies are rendering-only regardless of allow_state_changes:
+                        # authorization never extends to third-party POST/PUT/PATCH/DELETE requests merely
+                        # because the assessed application emitted them from JavaScript.
+                        if not in_scope and request_method not in {"GET", "HEAD", "OPTIONS"}:
+                            diagnostics.setdefault("scope_blocked_requests", []).append({
+                                "url": request_url, "method": request_method, "reason": "external non-read-only dependency",
+                            })
+                            await route.abort("blockedbyclient")
+                            return
+
+                        # For authorized traffic, apply the same fail-closed request-contract policy used
+                        # by the orchestrators so page JavaScript cannot bypass allow_state_changes. Include
+                        # Content-Type because multipart/file submissions must never be mistaken for an opaque
+                        # harmless POST.
+                        if not allow_state_changes:
+                            post_data = str(getattr(request, "post_data", "") or "")
+                            raw_headers = getattr(request, "headers", {})
+                            request_headers = dict(raw_headers) if isinstance(raw_headers, dict) else {}
+                            content_type = str(request_headers.get("content-type") or request_headers.get("Content-Type") or "")
+                            state_reason = request_contract_state_change_reason({
+                                "url": request_url, "method": request_method, "data": post_data, "parameters": [],
+                                "headers": request_headers, "content_type": content_type,
+                            })
+                            if state_reason:
+                                diagnostics.setdefault("state_policy_blocked_requests", []).append({
+                                    "url": request_url, "method": request_method, "reason": state_reason,
+                                })
                                 await route.abort("blockedbyclient")
                                 return
+                        if is_navigation:
                             await asyncio.to_thread(navigation_pacer.wait)
                         await route.continue_()
 
@@ -494,10 +555,16 @@ async def _run_browser_scan_core(
                     page = await context.new_page()
                     page.set_default_timeout(timeout_ms)
 
-                    query_findings, query_attempts = await _query_checks(page, target_url, parameters, timeout_ms)
+                    if initial_reason:
+                        # The original contract may be a state-changing POST/GET. Do not mutate or navigate it;
+                        # retain only safe DOM/client-source analysis on the page that exposed the contract.
+                        query_findings, query_attempts = [], []
+                        diagnostics["query_checks_skipped_reason"] = "initial request contract is state-changing; safe source-page analysis only"
+                    else:
+                        query_findings, query_attempts = await _query_checks(page, target_url, parameters, timeout_ms)
                     findings.extend(query_findings)
                     source_findings, source_attempts = await _client_source_checks(
-                        page, target_url, timeout_ms, client_sources, client_sinks
+                        page, analysis_start_url, timeout_ms, client_sources, client_sinks
                     )
                     findings.extend(source_findings)
                     diagnostics["dom_attempts"] = [*query_attempts, *source_attempts]
