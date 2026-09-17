@@ -10,10 +10,23 @@ from utils import canonical_cookie_header, cookie_names, normalized_origin, requ
 
 
 class BrowserLoginError(RuntimeError):
-    # Browser authentication failure carrying only entry points actually visited.
-    def __init__(self, message: str, attempted_candidates: Iterable[str] | None = None):
+    # Browser authentication failure carrying entry points actually visited plus a stable reason code.
+    # The reason lets the parent runner distinguish a real credential rejection from navigation/SSO
+    # failures without parsing provider-specific human-readable error text.
+    def __init__(
+        self,
+        message: str,
+        attempted_candidates: Iterable[str] | None = None,
+        *,
+        reason: str = "browser_login_failed",
+        auth_destination: str = "",
+        credential_scope: str = "",
+    ):
         super().__init__(message)
         self.attempted_candidates = [str(value) for value in (attempted_candidates or []) if str(value)]
+        self.reason = str(reason or "browser_login_failed")
+        self.auth_destination = str(auth_destination or "")
+        self.credential_scope = str(credential_scope or "")
 
 
 
@@ -72,18 +85,68 @@ def _first_visible_locator(page: Any, selectors: Iterable[str]) -> Any | None:
 
 
 def _login_diagnostic(page: Any) -> str:
+    # Do not treat every provider alert as a bad password. Account lockout, temporary provider
+    # failures, policy denial or CAPTCHA messages must not trigger an automatic credential retry.
+    # Only generic, explicit credential-rejection wording is eligible for the one parent-side
+    # correction attempt.
+    rejection_patterns = (
+        r"\binvalid (?:user(?:name)? )?(?:credentials|password)\b",
+        r"\binvalid username or password\b",
+        r"\bincorrect username or password\b",
+        r"\bwrong password\b",
+        r"\bbad credentials\b",
+        r"\bcredentials (?:are )?(?:invalid|incorrect)\b",
+    )
     for selector in ERROR_SELECTORS:
         try:
             locator = page.locator(selector).first
             if locator.count() and locator.is_visible():
                 text = " ".join(str(locator.inner_text() or "").split())
                 if text:
-                    return "credentials_rejected: " + text[:240]
+                    normalized = text.casefold()
+                    if any(re.search(pattern, normalized) for pattern in rejection_patterns):
+                        return "credentials_rejected: " + text[:240]
+                    return "authentication_error: " + text[:240]
         except Exception:
             continue
     if _first_visible_locator(page, ADDITIONAL_STEP_SELECTORS) is not None:
         return "additional_authentication_step_required"
     return ""
+
+
+def _safe_auth_destination(url: str) -> str:
+    """Return a non-secret auth destination for diagnostics (origin + path, no query/fragment)."""
+    try:
+        parsed = urlparse(str(url or ""))
+    except ValueError:
+        return ""
+    if parsed.scheme.lower() not in {"http", "https"} or not parsed.hostname:
+        return ""
+    port = parsed.port
+    default_port = 443 if parsed.scheme.lower() == "https" else 80
+    authority = parsed.hostname if not port or port == default_port else f"{parsed.hostname}:{port}"
+    return f"{parsed.scheme.lower()}://{authority}{parsed.path or '/'}"
+
+
+def _credential_submission_scope(target_url: str, current_url: str, observed_issuer: str = "") -> str:
+    """Classify where credentials are being submitted without treating scope and identity as equivalent."""
+    if same_origin(target_url, current_url):
+        return "target_origin"
+    current_origin = normalized_origin(str(current_url or ""))
+    issuer_origin = normalized_origin(str(observed_issuer or ""))
+    if (issuer_origin and current_origin == issuer_origin) or looks_like_oidc_login_url(current_url):
+        return "external_oidc"
+    return "external_origin"
+
+
+def _filled_value_matches(locator: Any, expected: str) -> bool:
+    """Best-effort check that a browser-controlled credential field actually retained the supplied value."""
+    try:
+        return str(locator.input_value()) == str(expected)
+    except Exception:
+        # Some custom controls do not expose input_value reliably. Playwright fill() already waits for
+        # editability, so inability to introspect is not by itself a login failure.
+        return True
 
 
 def looks_like_oidc_login_url(url: str) -> bool:
@@ -418,6 +481,8 @@ def browser_oidc_login_session(
     headless = bool(credential.get("headless", True))
     configured_login_path = str(credential.get("login_path") or "").strip()
     configured_validation_path = str(credential.get("validation_path") or "").strip()
+    configured_oidc_issuer = str(credential.get("oidc_issuer") or "").strip().rstrip("/")
+    effective_expected_oidc_issuer = str(expected_oidc_issuer or configured_oidc_issuer or "").strip().rstrip("/")
     explicit_candidates = _same_origin_candidates(target_url, candidate_urls or [])
     configured_values = [*[str(value) for value in credential.get("sibling_login_paths") or []]]
     if configured_login_path:
@@ -438,6 +503,7 @@ def browser_oidc_login_session(
     deadline = time.monotonic() + timeout_seconds
     failures: list[str] = []
     attempted_candidates: list[str] = []
+    external_credential_rejections: list[tuple[str, str]] = []
 
     with sync_playwright() as playwright:
         try:
@@ -472,7 +538,7 @@ def browser_oidc_login_session(
             # authorization endpoint. A background request to that issuer is not enough to authorize
             # an unrelated local form. If the primary login was local-form, no fake issuer is created.
             return oidc_credential_reuse_allowed(
-                str(page.url or ""), expected_oidc_issuer, observed_auth_requests[offset:],
+                str(page.url or ""), effective_expected_oidc_issuer, observed_auth_requests[offset:],
                 allow_initial_oidc_bootstrap=bool(initial_login),
             )
 
@@ -619,7 +685,7 @@ def browser_oidc_login_session(
                 if not allowed_issuer:
                     failures.append(
                         f"{candidate}: credential reuse blocked because OIDC issuer {observed_issuer!r} "
-                        f"differs from the primary issuer {str(expected_oidc_issuer)!r}"
+                        f"differs from the primary/configured issuer {str(effective_expected_oidc_issuer)!r}"
                     )
                     continue
 
@@ -627,11 +693,21 @@ def browser_oidc_login_session(
                     raise BrowserLoginError(
                         "The authentication provider requested username/password again, but the initial target credentials are not available for automatic reuse.",
                         attempted_candidates,
+                        reason="credentials_unavailable",
                     )
 
                 if username_field is not None:
                     username_field.fill(username)
                     used_credentials = True
+                    if not _filled_value_matches(username_field, username):
+                        destination = _safe_auth_destination(str(page.url or ""))
+                        raise BrowserLoginError(
+                            f"The username field did not retain the supplied value at {destination or 'the authentication form'}; credentials were not classified as rejected.",
+                            attempted_candidates,
+                            reason="credential_form_fill_failed",
+                            auth_destination=destination,
+                            credential_scope=_credential_submission_scope(target_url, str(page.url or ""), current_issuer(auth_request_offset)),
+                        )
 
                 if password_field is None:
                     submit = _first_visible_locator(page, SUBMIT_SELECTORS)
@@ -650,12 +726,22 @@ def browser_oidc_login_session(
                         raise BrowserLoginError(
                             "The authentication provider requires an additional step such as OTP; automatic username/password login cannot complete it.",
                             attempted_candidates,
+                            reason="additional_authentication_step_required",
                         )
                     failures.append(f"{candidate}: password field not exposed")
                     continue
 
                 password_field.fill(password)
                 used_credentials = True
+                if not _filled_value_matches(password_field, password):
+                    destination = _safe_auth_destination(str(page.url or ""))
+                    raise BrowserLoginError(
+                        f"The password field did not retain the supplied value at {destination or 'the authentication form'}; credentials were not classified as rejected.",
+                        attempted_candidates,
+                        reason="credential_form_fill_failed",
+                        auth_destination=destination,
+                        credential_scope=_credential_submission_scope(target_url, str(page.url or ""), current_issuer(auth_request_offset)),
+                    )
                 submit = _first_visible_locator(page, SUBMIT_SELECTORS)
                 if submit is not None:
                     submit.click()
@@ -687,20 +773,62 @@ def browser_oidc_login_session(
                     diagnostic = _login_diagnostic(page)
                     if diagnostic.startswith("credentials_rejected:"):
                         message = diagnostic.split(":", 1)[1].strip()
+                        issuer = current_issuer(auth_request_offset)
+                        destination = _safe_auth_destination(current_url)
+                        submission_scope = _credential_submission_scope(target_url, current_url, issuer)
+                        # Historical and multi-application deployments may use local target credentials
+                        # for the primary dashboard while an authorized sibling/redirect reaches a
+                        # different Keycloak/OIDC realm where those credentials are intentionally invalid.
+                        # On the first primary login, an unpinned external realm rejection is therefore
+                        # not proof that the dashboard credentials themselves are wrong. Try the remaining
+                        # same-origin/application entry points instead of aborting or asking the operator to
+                        # retype the same secret. A configured/persisted issuer remains authoritative.
+                        if initial_login and not effective_expected_oidc_issuer and submission_scope == "external_oidc":
+                            external_credential_rejections.append((destination, issuer))
+                            failures.append(
+                                f"{candidate}: external OIDC destination {destination or current_url!r} rejected credentials; "
+                                "trying remaining primary-target login entry points before classifying the target credentials"
+                            )
+                            break
                         raise BrowserLoginError(
-                            f"The authentication provider rejected the supplied target credentials: {message}",
+                            f"The authentication provider rejected the supplied target credentials at {destination or 'the authentication form'}: {message}",
                             attempted_candidates,
+                            reason="credentials_rejected",
+                            auth_destination=destination,
+                            credential_scope=submission_scope,
+                        )
+                    if diagnostic.startswith("authentication_error:"):
+                        message = diagnostic.split(":", 1)[1].strip()
+                        raise BrowserLoginError(
+                            f"The authentication provider returned an authentication error: {message}",
+                            attempted_candidates,
+                            reason="provider_authentication_error",
                         )
                     if diagnostic == "additional_authentication_step_required":
                         raise BrowserLoginError(
                             "The authentication provider requires an additional step such as OTP; automatic username/password login cannot complete it.",
                             attempted_candidates,
+                            reason="additional_authentication_step_required",
                         )
                     page.wait_for_timeout(250)
 
+                # A break caused by an unpinned external OIDC rejection already recorded a precise
+                # diagnostic above. Continue with the next target/application candidate rather than
+                # misreporting the same candidate as a generic timeout.
+                if external_credential_rejections and failures and failures[-1].startswith(f"{candidate}: external OIDC destination"):
+                    continue
                 failures.append(f"{candidate}: login did not return to the target origin before the shared timeout")
 
             detail = "; ".join(failures[-4:]) if failures else "no usable login entry point was found"
+            if external_credential_rejections and not effective_expected_oidc_issuer:
+                destination, issuer = external_credential_rejections[-1]
+                raise BrowserLoginError(
+                    f"Automatic browser login did not establish a primary application session. An external OIDC realm rejected the supplied credentials at {destination or issuer or 'an external provider'}, while no remaining primary-target login entry point succeeded. This does not prove that the dashboard-local credentials are invalid; pin credential.oidc_issuer only when that provider/realm is the intended login authority. Details: {detail}",
+                    attempted_candidates,
+                    reason="external_oidc_credentials_rejected",
+                    auth_destination=destination,
+                    credential_scope="external_oidc",
+                )
             raise BrowserLoginError(
                 f"Automatic browser login could not establish an application session for {origin} within {timeout_seconds}s: {detail}",
                 attempted_candidates,

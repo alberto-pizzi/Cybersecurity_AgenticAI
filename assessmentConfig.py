@@ -302,7 +302,7 @@ def _validate_credentials(credentials: Any) -> None:
         if kind == "cookie" and not (credential.get("env") or credential.get("value")):
             raise ValueError(f"Cookie credential {name!r} requires env or value.")
         if kind in {"browser_oidc", "snap4city_oidc"}:
-            for field in ("username_env", "password_env", "cookie_env", "login_path", "validation_path"):
+            for field in ("username_env", "password_env", "cookie_env", "login_path", "validation_path", "oidc_issuer"):
                 if field in credential and not isinstance(credential.get(field), str):
                     raise ValueError(f"Credential {name!r} field {field} must be a string when supplied.")
             if "headless" in credential and not isinstance(credential.get("headless"), bool):
