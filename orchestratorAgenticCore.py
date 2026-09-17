@@ -2687,7 +2687,7 @@ async def execute_action(action: dict[str, Any], cookies: dict[str, str], discov
         state_refresh = await asyncio.to_thread(
             shared.refresh_authenticated_session_state,
             request_url, raw_profile_cookie, probe_url,
-            allow_state_changes=shared.state_changing_tests_allowed(state['target'], state.get('allow_state_changes')),
+            allow_state_changes=shared.state_changing_tests_allowed(action['target_url'], allow_state_changes),
         )
         if state_refresh.get('usable') is False or not state_refresh.get('credential_applied'):
             print(f'    [PARTIAL ] {tool}: authenticated session precheck failed', flush=True)

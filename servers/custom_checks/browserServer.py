@@ -9,7 +9,7 @@ from urllib.parse import quote, urlparse
 
 from utils import RequestRatePacer, failure, parse_cookie_header, partial, request_contract_state_change_reason, scanner_request_rate, skipped, success, same_origin, url_in_authorized_scope
 
-from core.scannerCommon import proportional_budget, service
+from core.scannerCommon import mutate_parameter, proportional_budget, service
 
 mcp, _serve = service("Browser XSS and Workflow Verifier", "browser")
 
