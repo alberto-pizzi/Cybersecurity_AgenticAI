@@ -10,6 +10,7 @@ import sys
 from pathlib import Path
 
 from setupLab import setup_local_lab, update_runtime_auth
+from assessmentConfig import default_max_rounds
 from setupTools import (
     COMMAND_REFERENCE_FILE, ROOT, RUNTIME_FILE, TARGET,
     _ensure_report_docker_image, configure_path, configure_perl_environment, create_wordlist, install_playwright_browser,
@@ -365,7 +366,7 @@ def _write_dvwa_assessment_config(cookie_header: str, agentic_model: str, mode: 
             "mode": mode,
             "request_rate": 10,
             "model": agentic_model,
-            "max_rounds": 3 if mode == "deep" else 2,
+            "max_rounds": default_max_rounds(mode),
             "require_ai": True,
             "allow_state_changes": True,
             "snap4city_credentials": "snap4city_model_credentials.json",
@@ -452,38 +453,44 @@ def print_important_commands(
     print("\n=== Commands ready to run ===")
     print("Run them from: " + str(ROOT))
     commands: list[tuple[str, str]] = [
-        ("1. DVWA / 127.0.0.1 - Assessment Deterministic FAST", _operator_command(
+        ("1. DVWA / 127.0.0.1 - Assessment Deterministic TEST", _operator_command(
+            "assessmentRunner.py", "--config", str(assessment_config), "--orchestrator", "deterministic",
+            "--mode", "test",
+        )),
+        ("2. DVWA / 127.0.0.1 - Assessment Deterministic FAST", _operator_command(
             "assessmentRunner.py", "--config", str(assessment_config), "--orchestrator", "deterministic",
             "--mode", "fast",
         )),
-        ("2. DVWA / 127.0.0.1 - Assessment Deterministic BALANCED", _operator_command(
+        ("3. DVWA / 127.0.0.1 - Assessment Deterministic BALANCED", _operator_command(
             "assessmentRunner.py", "--config", str(assessment_config), "--orchestrator", "deterministic",
             "--mode", "balanced",
         )),
-        ("3. DVWA / 127.0.0.1 - Assessment Deterministic DEEP", _operator_command(
+        ("4. DVWA / 127.0.0.1 - Assessment Deterministic DEEP", _operator_command(
             "assessmentRunner.py", "--config", str(assessment_config), "--orchestrator", "deterministic",
             "--mode", "deep",
         )),
+        ("5. DVWA / 127.0.0.1 - Assessment Agentic TEST", _operator_command(
+            "assessmentRunner.py", "--config", str(assessment_config), "--orchestrator", "agentic",
+            "--max-rounds", "1", "--mode", "test", "--require-ai",
+        )),
+        ("6. DVWA / 127.0.0.1 - Assessment Agentic FAST", _operator_command(
+            "assessmentRunner.py", "--config", str(assessment_config), "--orchestrator", "agentic",
+            "--max-rounds", "2", "--mode", "fast", "--require-ai",
+        )),
+        ("7. DVWA / 127.0.0.1 - Assessment Agentic BALANCED", _operator_command(
+            "assessmentRunner.py", "--config", str(assessment_config), "--orchestrator", "agentic",
+            "--max-rounds", "2", "--mode", "balanced", "--require-ai",
+        )),
+        ("8. DVWA / 127.0.0.1 - Assessment Agentic DEEP", _operator_command(
+            "assessmentRunner.py", "--config", str(assessment_config), "--orchestrator", "agentic",
+            "--max-rounds", "3", "--mode", "deep", "--require-ai",
+        )),
     ]
-    commands.extend((
-            ("4. DVWA / 127.0.0.1 - Assessment Agentic FAST", _operator_command(
-                "assessmentRunner.py", "--config", str(assessment_config), "--orchestrator", "agentic",
-                "--max-rounds", "2", "--mode", "fast", "--require-ai",
-            )),
-            ("5. DVWA / 127.0.0.1 - Assessment Agentic BALANCED", _operator_command(
-                "assessmentRunner.py", "--config", str(assessment_config), "--orchestrator", "agentic",
-                "--max-rounds", "2", "--mode", "balanced", "--require-ai",
-            )),
-            ("6. DVWA / 127.0.0.1 - Assessment Agentic DEEP", _operator_command(
-                "assessmentRunner.py", "--config", str(assessment_config), "--orchestrator", "agentic",
-                "--max-rounds", "3", "--mode", "deep", "--require-ai",
-            )),
-        ))
 
     for label, command in commands:
         print(f"\n{label}:\n{command}")
     if agentic_model:
-        rounds = "3" if mode == "deep" else "2"
+        rounds = str(default_max_rounds(mode))
         print("\nDVWA / 127.0.0.1 - Manual Agentic orchestrator command:")
         print(_operator_command(
             "orchestratorAgentic.py", "--target", TARGET, "--cookies", cookie, "--auth-only",
@@ -491,9 +498,20 @@ def print_important_commands(
         ))
     additional_configs = _additional_assessment_configs(assessment_config)
     if additional_configs:
-        print("\n=== Configured assessments - BALANCED ===")
+        print("\n=== Configured assessments - TEST and BALANCED ===")
         for config_path in additional_configs:
             config_name, _configured_model = _config_command_metadata(config_path)
+            print(f"\n{config_name} - Deterministic TEST:")
+            print(_operator_command(
+                "assessmentRunner.py", "--config", str(config_path),
+                "--orchestrator", "deterministic", "--mode", "test", "--authorized",
+            ))
+            print(f"\n{config_name} - Agentic TEST:")
+            print(_operator_command(
+                "assessmentRunner.py", "--config", str(config_path),
+                "--orchestrator", "agentic", "--max-rounds", "1",
+                "--mode", "test", "--require-ai", "--authorized",
+            ))
             print(f"\n{config_name} - Deterministic BALANCED:")
             print(_operator_command(
                 "assessmentRunner.py", "--config", str(config_path),
@@ -535,7 +553,7 @@ def main() -> int:
         "--snap4city-credentials", default="snap4city_model_credentials.json",
         help="Credentials JSON for the Snap4City AI model/provider (not the assessed dashboard account). Cached access/refresh tokens are reused first; missing/placeholder credentials are requested interactively only when no usable token remains.",
     )
-    parser.add_argument("--mode", choices=("fast", "balanced", "deep"), default="balanced", help="Scanner coverage/runtime profile (default: balanced).")
+    parser.add_argument("--mode", choices=("test", "fast", "balanced", "deep"), default="balanced", help="Scanner coverage/runtime profile (default: balanced; test = short diagnostic budgets).")
     parser.add_argument("--skip-preflight", action="store_true", help="Skip the live deterministic MCP/dependency preflight.")
     parser.add_argument("--skip-scanners", action="store_true", help="Skip scanner installation and do not require all scanner executables.")
     parser.add_argument("--skip-browser", action="store_true", help="Do not install/verify Playwright Chromium; browser-only checks will be skipped.")
@@ -651,7 +669,7 @@ def main() -> int:
                 if not effective_agentic_model:
                     print("[-] No verified AI backend is available for --run agentic.", file=sys.stderr)
                     return 4
-                rounds = "3" if args.mode == "deep" else "2"
+                rounds = str(default_max_rounds(args.mode))
                 command += ["--max-rounds", rounds, "--require-ai"]
             return run(command, required=False, timeout=7200, cwd=ROOT).returncode
 

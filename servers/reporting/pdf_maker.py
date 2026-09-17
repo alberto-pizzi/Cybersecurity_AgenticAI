@@ -12,17 +12,18 @@ import sys
 import uuid
 from pathlib import Path
 
-from utils import ROOT_DIR
+from utils import ROOT_DIR, safe_int_value, safe_float_value
 
-REPORT_PDF_TIMEOUT_SECONDS = max(300, int(os.getenv("SECOPS_REPORT_PDF_TIMEOUT", "3600")))
+REPORT_PDF_TIMEOUT_SECONDS = max(300, safe_int_value(os.getenv("SECOPS_REPORT_PDF_TIMEOUT", "3600"), 3600))
 
 
 # Converts an HTML report to PDF via native WeasyPrint, falling back to the report Docker image
-def html2pdf(html_path, pdf_path):
+def html2pdf(html_path, pdf_path, *, timeout_seconds: int | float | None = None):
     html_path = Path(html_path).resolve()
     pdf_path = Path(pdf_path).resolve()
     pdf_path.parent.mkdir(parents=True, exist_ok=True)
     temporary_pdf = pdf_path.with_name(f".{pdf_path.name}.{os.getpid()}.{uuid.uuid4().hex[:8]}.tmp.pdf")
+    effective_timeout = REPORT_PDF_TIMEOUT_SECONDS if timeout_seconds is None else max(30, safe_int_value(safe_float_value(timeout_seconds, REPORT_PDF_TIMEOUT_SECONDS), REPORT_PDF_TIMEOUT_SECONDS))
 
     # Keep conversion diagnostics on stderr so the MCP response channel stays clean.
     print("HTML path received:", html_path, file=sys.stderr)
@@ -49,13 +50,13 @@ def html2pdf(html_path, pdf_path):
                 text=True,
                 encoding="utf-8",
                 errors="replace",
-                timeout=REPORT_PDF_TIMEOUT_SECONDS,
+                timeout=effective_timeout,
                 check=False,
             )
         except subprocess.TimeoutExpired as exc:
             temporary_pdf.unlink(missing_ok=True)
             raise TimeoutError(
-                f"Native WeasyPrint exceeded the configured {REPORT_PDF_TIMEOUT_SECONDS}-second PDF rendering budget."
+                f"Native WeasyPrint exceeded the configured {effective_timeout}-second PDF rendering budget."
             ) from exc
         if converted.returncode != 0 or not temporary_pdf.is_file():
             temporary_pdf.unlink(missing_ok=True)
@@ -77,6 +78,10 @@ def html2pdf(html_path, pdf_path):
             "WeasyPrint is unavailable natively and Docker is not available for the report fallback."
         ) from native_error
 
+    # Keep Docker readiness probing proportional to the active render budget. In TEST the
+    # conversion itself is bounded, so a fixed 60s image inspection would consume a disproportionate
+    # fraction of the smoke-test report allowance before rendering even starts.
+    inspect_timeout = min(60, max(10, int(effective_timeout * 0.20)))
     inspect = subprocess.run(
         [docker, "image", "inspect", image],
         cwd=str(ROOT_DIR),
@@ -84,7 +89,7 @@ def html2pdf(html_path, pdf_path):
         text=True,
         encoding="utf-8",
         errors="replace",
-        timeout=60,
+        timeout=inspect_timeout,
         check=False,
     )
     if inspect.returncode != 0:
@@ -125,13 +130,13 @@ def html2pdf(html_path, pdf_path):
             text=True,
             encoding="utf-8",
             errors="replace",
-            timeout=REPORT_PDF_TIMEOUT_SECONDS,
+            timeout=effective_timeout,
             check=False,
         )
     except subprocess.TimeoutExpired as exc:
         temporary_pdf.unlink(missing_ok=True)
         raise TimeoutError(
-            f"Report Docker conversion exceeded the configured {REPORT_PDF_TIMEOUT_SECONDS}-second PDF rendering budget."
+            f"Report Docker conversion exceeded the configured {effective_timeout}-second PDF rendering budget."
         ) from exc
     if converted.returncode != 0 or not temporary_pdf.is_file():
         temporary_pdf.unlink(missing_ok=True)

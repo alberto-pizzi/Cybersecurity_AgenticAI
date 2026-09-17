@@ -314,7 +314,7 @@ async def deterministic_broad_scan_node(state: DeterministicState) -> dict[str, 
                         arguments = build_tool_arguments('arjun', endpoint, cookies, discovery[name], case=case, allow_state_changes=state.get('allow_state_changes'))
                         result = await call_mcp_with_progress(ARJUN_TOOL, arguments)
                         result['session_state_refresh'] = refresh
-                    found = int(result.get('phase_parameters', 0) or 0)
+                    found = shared.safe_int_metadata(result.get('phase_parameters', 0), 0)
                     timed_out_empty = result.get('diagnosis') in TIME_LIMIT_DIAGNOSES and (not result.get('vulnerabilities')) and (found == 0)
                     empty_limits = empty_limits + 1 if timed_out_empty else 0
                     if result.get('status') in {'success', 'partial'}:
@@ -600,12 +600,7 @@ async def deterministic_special_checks_node(state: DeterministicState) -> dict[s
                 log_result(name, 'interactsh', skipped_duplicate, oast_case.get('source_url', target))
                 continue
             interactsh_spec = next((item for item in OPTIONAL_TOOLS if item.name == 'interactsh'))
-            if injection_url:
-                oast_timeout = 120 if shared.CURRENT_SCAN_MODE == 'deep' else 75
-            elif oast_class == 'command':
-                oast_timeout = 75 if shared.CURRENT_SCAN_MODE == 'deep' else 55
-            else:
-                oast_timeout = 60 if shared.CURRENT_SCAN_MODE == 'deep' else 45
+            oast_timeout = shared.oast_timeout_seconds('explicit' if injection_url else oast_class)
             oast_request_url = str(oast_case.get('injection_url') or '').replace('FUZZ', 'secops-oast-placeholder')
             oast_cookies = shared.scope_cookie_header(oast_request_url, profile['cookies'])
             result = await call_mcp_with_progress(interactsh_spec, {'target_url': target, 'injection_url': oast_case['injection_url'], 'cookies': oast_cookies, 'method': oast_case.get('method', 'GET'), 'data': oast_case.get('data', ''), 'parameter': oast_case.get('parameter', ''), 'timeout': oast_timeout, 'request_rate': shared.MAX_REQUEST_RATE, 'allow_state_changes': shared.state_changing_tests_allowed(target, state.get('allow_state_changes'))}, timeout_seconds=oast_timeout + 35)
@@ -1040,7 +1035,7 @@ async def run_single_tool_debug(*, tool: str, target: str, cookies: str, mode: s
                 return make_skipped_result('interactsh', target, 'No OAST-capable input was discovered.')
             selected = cases[0]
         oast_request_url = str(selected.get('injection_url') or '').replace('FUZZ', 'secops-oast-placeholder')
-        arguments = {'target_url': target, 'injection_url': selected['injection_url'], 'cookies': shared.scope_cookie_header(oast_request_url, cookies), 'method': selected.get('method', 'GET'), 'data': selected.get('data', ''), 'parameter': selected.get('parameter', ''), 'timeout': timeout_override or (120 if mode == 'deep' else 75), 'request_rate': shared.MAX_REQUEST_RATE, 'allow_state_changes': state_changes}
+        arguments = {'target_url': target, 'injection_url': selected['injection_url'], 'cookies': shared.scope_cookie_header(oast_request_url, cookies), 'method': selected.get('method', 'GET'), 'data': selected.get('data', ''), 'parameter': selected.get('parameter', ''), 'timeout': timeout_override or shared.oast_timeout_seconds('explicit' if injection_url else str(selected.get('oast_class') or 'remote-fetch')), 'request_rate': shared.MAX_REQUEST_RATE, 'allow_state_changes': state_changes}
     else:
         raise ValueError(f'Unsupported single tool: {tool}')
     scanner_limit = float(arguments.get('timeout', 180))

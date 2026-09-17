@@ -13,8 +13,14 @@ from utils import MAX_AUTHENTICATED_IDENTITIES, valid_identity_label
 SCHEMA_VERSION = 1
 SUPPORTED_WEB_PROTOCOLS = {"http", "https"}
 SUPPORTED_ORCHESTRATORS = {"deterministic", "agentic"}
-SUPPORTED_MODES = {"fast", "balanced", "deep"}
+SUPPORTED_MODES = {"test", "fast", "balanced", "deep"}
+DEFAULT_MAX_ROUNDS_BY_MODE = {"test": 1, "fast": 2, "balanced": 2, "deep": 3}
 SUPPORTED_MODELS = {"snap4city", "llama", "qwen"}
+
+
+def default_max_rounds(mode: str) -> int:
+    """Return the normal Agentic round count for a validated scan profile."""
+    return int(DEFAULT_MAX_ROUNDS_BY_MODE.get(str(mode or "balanced").strip().lower(), 2))
 SUPPORTED_CREDENTIAL_KINDS = {"cookie", "browser_oidc", "snap4city_oidc"}
 MAX_SERVICE_CREDENTIAL_IDENTITIES = MAX_AUTHENTICATED_IDENTITIES
 
@@ -39,8 +45,9 @@ def load_assessment_config(path: str | Path) -> dict[str, Any]:
         raise ValueError(f"Assessment configuration is not valid JSON: {config_path}: {exc}") from exc
     if not isinstance(payload, dict):
         raise ValueError("Assessment configuration must be a JSON object.")
-    if int(payload.get("schema_version") or 0) != SCHEMA_VERSION:
-        raise ValueError(f"Unsupported assessment schema_version; expected {SCHEMA_VERSION}.")
+    schema_version = payload.get("schema_version")
+    if isinstance(schema_version, bool) or not isinstance(schema_version, int) or schema_version != SCHEMA_VERSION:
+        raise ValueError(f"Unsupported assessment schema_version; expected integer {SCHEMA_VERSION}.")
     platform = payload.get("platform")
     if not isinstance(platform, dict) or not str(platform.get("name") or "").strip():
         raise ValueError("platform.name is required.")
@@ -204,6 +211,8 @@ def _validate_assets(assets: list[Any]) -> None:
 
             port = service.get("port")
             if port not in (None, ""):
+                if isinstance(port, bool):
+                    raise ValueError(f"Invalid port for {global_id}: boolean values are not ports.")
                 try:
                     numeric_port = int(port)
                 except (TypeError, ValueError) as exc:
@@ -307,6 +316,8 @@ def _validate_credentials(credentials: Any) -> None:
             ):
                 raise ValueError(f"Credential {name!r} sibling_login_paths must be a list of non-empty strings.")
             if "timeout_seconds" in credential:
+                if isinstance(credential.get("timeout_seconds"), bool):
+                    raise ValueError(f"Credential {name!r} timeout_seconds must be an integer, not a boolean.")
                 try:
                     timeout_seconds = int(credential.get("timeout_seconds"))
                 except (TypeError, ValueError) as exc:

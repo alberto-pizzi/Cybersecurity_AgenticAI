@@ -8,6 +8,7 @@ from __future__ import annotations
 from typing import Any
 
 from .text_utils import _esc
+from utils import safe_int_value
 
 # Renders the executed orchestration phases as an arrow-connected step flow
 def _render_pipeline_diagram(nodes: list[Any]) -> str:
@@ -29,7 +30,7 @@ def _svg_severity_chart(risks: dict[str, int]) -> str:
         ("Low", "low", "#b49b00"),
         ("Info", "info", "#4b86b4"),
     )
-    values = [(label, color, int(risks.get(key, 0) or 0)) for label, key, color in levels]
+    values = [(label, color, max(0, safe_int_value(risks.get(key, 0), 0))) for label, key, color in levels]
     max_value = max((v for _, _, v in values), default=0) or 1
     width, row_h, gap, label_w, pad, track_w = 640, 26, 10, 70, 10, 460
     height = pad * 2 + len(values) * (row_h + gap) - gap

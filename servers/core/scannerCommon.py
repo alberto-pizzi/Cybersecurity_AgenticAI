@@ -11,7 +11,7 @@ import requests
 
 from fastmcp import FastMCP
 
-from utils import ROOT_DIR, RequestRatePacer, request_invocation_state_change_reason, request_same_origin_redirects, runtime_container_route
+from utils import ROOT_DIR, RequestRatePacer, request_invocation_state_change_reason, request_same_origin_redirects, runtime_container_route, safe_port_value
 
 # Creates a composable child FastMCP registry; only secopsServer.py owns the HTTP listener.
 def service(label: str, key: str) -> tuple[FastMCP, Callable[[], None]]:
@@ -205,7 +205,8 @@ def docker_target(url: str) -> tuple[str, list[str], str]:
         route = runtime_container_route(origin)
     alias, network = str(route.get("alias") or ""), str(route.get("network") or "")
     if alias and network:
-        internal = int(route.get("internal_port") or (443 if parsed.scheme == "https" else 80))
+        default_port = 443 if parsed.scheme == "https" else 80
+        internal = safe_port_value(route.get("internal_port"), default_port)
         netloc = alias if internal in {80, 443} else f"{alias}:{internal}"
         return urlunparse(parsed._replace(netloc=netloc)), ["--network", network], "runtime_network_alias"
     netloc = "host.docker.internal" + (f":{parsed.port}" if parsed.port else "")

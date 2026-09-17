@@ -13,7 +13,7 @@ from pathlib import Path
 import requests
 from fastmcp import FastMCP
 
-from utils import REPORTS_DIR, atomic_write_text, failure, run_mcp_http, success
+from utils import REPORTS_DIR, atomic_write_text, failure, partial, run_mcp_http, success, safe_bool_value, safe_int_value, safe_float_value
 
 from reporting.coverage import _executive_text, build_coverage, build_endpoint_coverage, summarize, summarize_endpoint_coverage
 from reporting.findings import _finding_groups, _human_readable_findings, flatten_findings
@@ -26,16 +26,16 @@ from reporting.text_utils import _as_dict, _redact_value, _safe_name
 mcp = FastMCP("SecOps Report Server")
 
 
-REPORT_UPLOAD_TTL_SECONDS = max(60, int(os.getenv("SECOPS_REPORT_UPLOAD_TTL_SECONDS", "900")))
-REPORT_UPLOAD_MAX_BYTES = max(1024 * 1024, int(os.getenv("SECOPS_REPORT_UPLOAD_MAX_BYTES", str(64 * 1024 * 1024))))
+REPORT_UPLOAD_TTL_SECONDS = max(60, safe_int_value(os.getenv("SECOPS_REPORT_UPLOAD_TTL_SECONDS", "900"), 900))
+REPORT_UPLOAD_MAX_BYTES = max(1024 * 1024, safe_int_value(os.getenv("SECOPS_REPORT_UPLOAD_MAX_BYTES", str(64 * 1024 * 1024)), 64 * 1024 * 1024))
 REPORT_UPLOAD_MAX_COMPRESSED_BYTES = REPORT_UPLOAD_MAX_BYTES + 1024 * 1024
-REPORT_UPLOAD_MAX_CHUNKS = max(8, int(os.getenv("SECOPS_REPORT_UPLOAD_MAX_CHUNKS", "2048")))
+REPORT_UPLOAD_MAX_CHUNKS = max(8, safe_int_value(os.getenv("SECOPS_REPORT_UPLOAD_MAX_CHUNKS", "2048"), 2048))
 _REPORT_UPLOADS: dict[str, dict] = {}
 _REPORT_UPLOAD_LOCK = threading.Lock()
 
 
 def _cleanup_report_uploads_locked(now: float) -> None:
-    expired = [upload_id for upload_id, row in _REPORT_UPLOADS.items() if now - float(row.get("updated", now)) > REPORT_UPLOAD_TTL_SECONDS]
+    expired = [upload_id for upload_id, row in _REPORT_UPLOADS.items() if now - safe_float_value(row.get("updated", now), now) > REPORT_UPLOAD_TTL_SECONDS]
     for upload_id in expired:
         _REPORT_UPLOADS.pop(upload_id, None)
 
@@ -82,9 +82,9 @@ def upload_report_chunk(
             "updated": now,
         })
         if (
-            int(row.get("total_chunks", -1)) != total_chunks
+            safe_int_value(row.get("total_chunks", -1), -1) != total_chunks
             or str(row.get("compressed_sha256", "")) != digest
-            or int(row.get("uncompressed_bytes", -1)) != uncompressed_bytes
+            or safe_int_value(row.get("uncompressed_bytes", -1), -1) != uncompressed_bytes
         ):
             _REPORT_UPLOADS.pop(upload_id, None)
             return {"status": "error", "error": "inconsistent metadata for report upload"}
@@ -116,15 +116,15 @@ def _consume_report_upload(upload_id: str) -> dict:
         row = _REPORT_UPLOADS.pop(upload_id, None)
     if not isinstance(row, dict):
         raise ValueError("report upload is missing or expired")
-    total_chunks = int(row.get("total_chunks", 0))
+    total_chunks = safe_int_value(row.get("total_chunks", 0), 0)
     chunks = row.get("chunks") if isinstance(row.get("chunks"), dict) else {}
     if len(chunks) != total_chunks or any(index not in chunks for index in range(total_chunks)):
         raise ValueError(f"report upload is incomplete: received {len(chunks)}/{total_chunks} chunks")
     compressed = b"".join(chunks[index] for index in range(total_chunks))
     if hashlib.sha256(compressed).hexdigest() != str(row.get("compressed_sha256", "")):
         raise ValueError("report upload digest mismatch")
-    expected_bytes = int(row.get("uncompressed_bytes", 0))
-    if expected_bytes > REPORT_UPLOAD_MAX_BYTES:
+    expected_bytes = safe_int_value(row.get("uncompressed_bytes", 0), -1)
+    if expected_bytes < 0 or expected_bytes > REPORT_UPLOAD_MAX_BYTES:
         raise ValueError("report payload exceeds the configured in-memory safety ceiling")
     print(f"[REPORT SERVER] upload {upload_id}: reconstructing {total_chunks} chunk(s), compressed_bytes={len(compressed)}.", flush=True)
     decompressor = zlib.decompressobj()
@@ -243,8 +243,26 @@ def _generate_report(
         print(f"[REPORT SERVER] report {base}: JSON/review/HTML ready; preparing PDF-only HTML.", flush=True)
         atomic_write_text(pdf_source_path, _render_html(payload, for_pdf=True))
         print(f"[REPORT SERVER] report {base}: starting PDF rendering.", flush=True)
-        html2pdf(pdf_source_path, pdf_path)
+        scan_mode = str(context.get("scan_mode") or "balanced").strip().lower()
+        pdf_timeout = 180 if scan_mode == "test" else None
+        html2pdf(pdf_source_path, pdf_path, timeout_seconds=pdf_timeout)
         print(f"[REPORT SERVER] report {base}: PDF rendering completed; file={pdf_path}.", flush=True)
+    except TimeoutError as exc:
+        # A bounded TEST render timeout is an expected resource limit, not a broken report stack.
+        # JSON/HTML/review artifacts were already written and remain valid for inspection.
+        result = partial(
+            "Report Generator", target_url,
+            f"PDF rendering reached the configured time budget; JSON/HTML/review artifacts were preserved. {exc}",
+            diagnosis="time_limit_reached", timed_out=True, time_limit_reached=True, vulnerabilities=[],
+        )
+        result.update(
+            json_filename=str(json_path.resolve()),
+            review_snapshot_filename=str(review_snapshot_path.resolve()) if review_snapshot_path.is_file() else None,
+            html_filename=str(html_path.resolve()), pdf_filename=None, findings_count=len(findings),
+            local_json_generated=json_path.is_file(), local_html_generated=html_path.is_file(),
+            local_review_snapshot_generated=review_snapshot_path.is_file(), local_pdf_generated=False,
+        )
+        return result
     except Exception as exc:
         result = failure("Report Generator", target_url, f"PDF report creation failed: {type(exc).__name__}: {exc}", diagnosis="pdf_generation_failed")
         result.update(
@@ -287,8 +305,8 @@ def _generate_report(
         observations_count=payload["observations_count"],
         execution_limitations_count=len(summary.get("limitations") or []),
         coverage_constraints_count=len(summary.get("coverage_constraints") or []),
-        execution_complete=bool(summary.get("execution_complete")),
-        coverage_complete=bool(summary.get("coverage_complete")),
+        execution_complete=safe_bool_value(summary.get("execution_complete"), False),
+        coverage_complete=safe_bool_value(summary.get("coverage_complete"), False),
         pwndoc_status=pwndoc_status,
     )
 

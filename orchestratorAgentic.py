@@ -10,6 +10,7 @@ from typing import Any
 
 import orchestratorDeterministic as deterministic_core
 import orchestratorAgenticCore as agentic_core
+from assessmentConfig import default_max_rounds
 from orchestratorAgenticCore import (
     AgentState, AI_PLANNER_TIMEOUTS, SNAP4CITY_DEFAULT_API_URL, resolve_ai_model,
     ensure_ollama_model, warm_ollama_model, ensure_snap4city_model,
@@ -96,7 +97,7 @@ def main() -> int:
         action="store_true",
         help="Fail if a required AI planning or analysis stage cannot complete.",
     )
-    parser.add_argument("--max-rounds", type=int, default=1, choices=(1, 2, 3))
+    parser.add_argument("--max-rounds", type=int, default=0, choices=(0, 1, 2, 3), help="Maximum planning rounds; 0 selects the scan-profile default (TEST=1, FAST=2, BALANCED=2, DEEP=3).")
     parser.add_argument(
         "--only-tool",
         default="",
@@ -110,6 +111,9 @@ def main() -> int:
         help="AI planning budget per round; the analysis stage also derives its bounded per-batch budget from this value. 0 selects mode-specific defaults.",
     )
     args = parser.parse_args()
+
+    if not args.max_rounds:
+        args.max_rounds = default_max_rounds(args.mode)
 
     if args.list_tools:
         print("Canonical SecOps MCP tools:")

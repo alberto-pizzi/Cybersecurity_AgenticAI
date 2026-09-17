@@ -59,8 +59,9 @@ If this is the first time you open the repository, use this sequence.
 
    `--dry-run` validates and expands the configuration without starting scanners. The example above adds `--authorized` only because `platform.example.json` deliberately ships with `authorization.confirmed=false`; before a real assessment, replace the placeholder authorization/reference and confirm the real scope instead of relying on the example override. Dry-run does not require the MCP/scanner runtime or a locally installed Agentic model, and it does not resolve reusable secrets; those checks are deferred to a real execution.
 
-6. **Use `balanced` unless you need a different trade-off.** `fast` is intended for smoke tests and short diagnostics.
-   `deep` increases discovery and scanner budgets, so use it after the target, authentication and scope have been checked.
+6. **Use `balanced` unless you need a different trade-off.** `test` is the diagnostic profile: every scanner/action gets a 10-second execution budget, while local discovery/crawl expansion is kept below 10 seconds wherever that stage owns its own wall-clock budget. MCP transport keeps a separate safety margin so a scanner that uses its full 10 seconds can still return a structured partial result instead of being cut off by the transport. `fast` remains the shortest normal-coverage profile; `deep` increases discovery and scanner budgets.
+
+   TEST is intentionally a smoke/regression profile rather than a coverage profile. Agentic TEST uses one round, at most 32 fairly interleaved planner candidates in one planner batch, a 24-action reference ceiling (27 only after an explicit bounded adaptive request), and AI analysis of at most one finding. The planner has a 90-second control-plane budget and analysis has 60 seconds; these do **not** enlarge the 10-second scanner deadlines. The generic 1200-second MCP timeout is explicitly clamped in TEST: a normal 10-second scanner has an outer MCP watchdog of about 90 seconds, ZAP about 130 seconds because of its shared-daemon cleanup allowance, and auxiliary calls without a scanner deadline remain below 120 seconds. Report transport/rendering is separate: TEST uses a 60-second transfer budget and a 180-second PDF-render budget, with an outer report watchdog below six minutes. A PDF render timeout is reported as `partial/time_limit_reached` while preserving JSON/HTML/review artifacts; a real renderer/dependency failure remains an error.
 
 7. **Watch the terminal during the assessment.** Deterministic reports the fixed pipeline stages. Agentic also reports
    planner rounds and selected actions. Execution status and coverage remain separate from security findings.
@@ -213,51 +214,52 @@ The report therefore exposes **two coverage numbers**: (1) contexts tested by an
 
 The profiles increase discovery breadth **and** deep scanner execution. All ceilings are generic and applied only after scope/safety filtering, application-family fairness and semantic/structural deduplication; none contains application names, target endpoint lists or externally supplied port data. ZAP/Nuclei work is batched inside one scanner process where possible, while request-level specialists remain sequential to preserve target safety and session integrity.
 
-| Coverage bound | fast | balanced | deep |
-| --- | ---: | ---: | ---: |
-| HTTP crawler pages per profile (base / adaptive max) | 120 / 220 | 600 / 1100 | 1200 / 2200 |
-| Chromium navigations per profile (base / adaptive max) | 72 / 200 | 400 / 1200 | 800 / 2400 |
-| Safe menu controls per rendered page / DOM passes | 16 / 3 | 64 / 6 | 112 / 9 |
-| JavaScript assets successfully inspected | 128 | 640 | 1200 |
-| Discovery route-value variants per shape | 8 | 20 | 32 |
-| Initial authorized-host TCP candidate cap | 4096 | 32768 | 65535 |
-| Total proactive service-discovery wall-clock budget | 240 s | 720 s | 1200 s |
-| Maximum initial-host share of that time budget | 120 s | 360 s | 600 s |
-| Additional observed-authorized hostnames per expansion pass | 8 | 32 | 128 |
-| Shared TCP candidate budget across those additional hostnames | 4096 | 32768 | 65535 |
-| Additional-host time policy | fair share of remaining global budget | fair share of remaining global budget | fair share of remaining global budget |
-| Service-root recrawl pages per additional hostname | 24 | 90 | 180 |
-| ZAP ranked/proxy-verified request contracts | 80 | 320 | 640 |
-| ZAP native active request contexts | 32 | 96 | 192 |
-| ZAP passive observations retained | 180 | 800 | 1400 |
-| ZAP generic GET fallback pages | 1 | 2 | 3 |
-| Nuclei focused/static targets | 128 | 1024 | 2048 |
-| Nuclei DAST request contracts | 96 | 1200 | 3000 |
-| Nuclei DAST batch size | 48 | 160 | 240 |
-| Deterministic SQLMap cases (base / adaptive / generic-live reserve) | 6 / +2 / +4 | 72 / +48 / +96 | 128 / +96 / +160 |
-| Deterministic Dalfox cases (base / adaptive / generic-live reserve) | 8 / +3 / +6 | 96 / +64 / +128 | 160 / +112 / +192 |
-| Deterministic Commix cases (base / adaptive / generic-live reserve) | 6 / +2 / +2 | 64 / +48 / +64 | 112 / +96 / +96 |
-| Deterministic Traversal base / adaptive; routing-resource reserve | 8 / +4; 32 | 96 / +64; 192 | 160 / +112; 320 |
-| Deterministic IDOR base / adaptive | 6 / +2 | 64 / +48 | 112 / +96 |
-| Deterministic Authorization base / adaptive | 10 / +4 | 128 / +72 | 192 / +128 |
-| Deterministic Browser verification base / adaptive | 10 / +4 | 128 / +72 | 192 / +128 |
-| Deterministic Workflow base / adaptive | 8 / +3 | 96 / +56 | 160 / +112 |
-| Deterministic Arjun endpoints base / adaptive | 12 / +4 | 96 / +64 | 160 / +112 |
-| Interactsh OAST candidates | 2 | 6 | 10 |
-| Final Chromium XSS base / adaptive max | 12 / 20 | 96 / 160 | 200 / 320 |
-| Safe-surface sweep contexts per profile | 800 | 6000 | 15000 |
-| ZAP primary tool deadline (s) | 120 | 2400 | 4800 |
-| Nuclei primary tool deadline (s) | 240 | 3600 | 7200 |
-| Agentic concrete actions per AI planner call | 64 | 96 | 128 |
-| Agentic reference execution ceiling, TOTAL actions/round | **300** | **800** | **1144** |
-| Agentic adaptive execution ceiling (+12.5% max), TOTAL actions/round | **338** | **900** | **1287** |
+| Coverage bound | test | fast | balanced | deep |
+| --- | ---: | ---: | ---: | ---: |
+| HTTP crawler pages per profile (base / adaptive max) | 8 / 12 | 120 / 220 | 600 / 1100 | 1200 / 2200 |
+| Chromium navigations per profile (base / adaptive max) | 4 / 6 | 72 / 200 | 400 / 1200 | 800 / 2400 |
+| Safe menu controls per rendered page / DOM passes | 2 / 1 | 16 / 3 | 64 / 6 | 112 / 9 |
+| JavaScript assets successfully inspected | 8 | 128 | 640 | 1200 |
+| Discovery route-value variants per shape | 2 | 8 | 20 | 32 |
+| Initial authorized-host TCP candidate cap | 32 | 4096 | 32768 | 65535 |
+| Total proactive service-discovery wall-clock budget | 8 s | 240 s | 720 s | 1200 s |
+| Maximum initial-host share of that time budget | 4 s | 120 s | 360 s | 600 s |
+| Additional observed-authorized hostnames per expansion pass | 2 | 8 | 32 | 128 |
+| Shared TCP candidate budget across those additional hostnames | 32 | 4096 | 32768 | 65535 |
+| Additional-host time policy | fair share of remaining global budget | fair share of remaining global budget | fair share of remaining global budget | fair share of remaining global budget |
+| Service-root recrawl pages per additional hostname | 4 | 24 | 90 | 180 |
+| ZAP ranked/proxy-verified request contracts | 20 | 80 | 320 | 640 |
+| ZAP native active request contexts | 4 | 32 | 96 | 192 |
+| ZAP passive observations retained | 40 | 180 | 800 | 1400 |
+| Nuclei focused/static targets | 32 | 128 | 1024 | 2048 |
+| Deterministic SQLMap cases (base / adaptive / generic-live reserve) | 1 / +0 / +1 | 6 / +2 / +4 | 72 / +48 / +96 | 128 / +96 / +160 |
+| Deterministic Dalfox cases (base / adaptive / generic-live reserve) | 1 / +0 / +1 | 8 / +3 / +6 | 96 / +64 / +128 | 160 / +112 / +192 |
+| Deterministic Commix cases (base / adaptive / generic-live reserve) | 1 / +0 / +1 | 6 / +2 / +2 | 64 / +48 / +64 | 112 / +96 / +96 |
+| Deterministic Traversal base / adaptive; routing-resource reserve | 2 / +0; 2 | 8 / +4; 32 | 96 / +64; 192 | 160 / +112; 320 |
+| Deterministic IDOR base / adaptive | 1 / +0 | 6 / +2 | 64 / +48 | 112 / +96 |
+| Deterministic Authorization base / adaptive | 2 / +0 | 10 / +4 | 128 / +72 | 192 / +128 |
+| Deterministic Browser verification base / adaptive | 2 / +0 | 10 / +4 | 128 / +72 | 192 / +128 |
+| Deterministic Workflow base / adaptive | 1 / +0 | 8 / +3 | 96 / +56 | 160 / +112 |
+| Deterministic Arjun endpoints base / adaptive | 2 / +0 | 12 / +4 | 96 / +64 | 160 / +112 |
+| Final Chromium XSS base / adaptive max | 2 / 3 | 12 / 20 | 96 / 160 | 200 / 320 |
+| Safe-surface sweep contexts per profile | 32 | 800 | 6000 | 15000 |
+| Broad/parameter scanner action deadline (s) | **10** | profile-specific | profile-specific | profile-specific |
+| ZAP primary tool deadline (s) | 10 | 120 | 2400 | 4800 |
+| Nuclei primary tool deadline (s) | 10 | 240 | 3600 | 7200 |
+| Agentic concrete actions per AI planner call | 32 | 64 | 96 | 128 |
+| Agentic reference execution ceiling, TOTAL actions/round | **24** | **300** | **800** | **1144** |
+| Agentic adaptive execution ceiling (+12.5% max), TOTAL actions/round | **27** | **338** | **900** | **1287** |
 
 Concrete Agentic actions use **one shared round execution ceiling across all active profiles**, rather than one execution budget per profile. The unit of decision is one exact action: `profile + tool + target/request contract`. For example, `editor + sqlmap + POST /api/orders + parameter orderId` and `editor + sqlmap + GET /search + parameter q` are two independent candidates; the AI may select one, both or neither.
 The decision granularity is the **orchestrator action**, not each raw HTTP packet generated internally by a scanner. For a targeted specialist, one action normally identifies the exact request contract/parameters. For a broad scanner such as ZAP, Nuclei or Nikto, one action is a bounded invocation against one authorized target/origin; once that action is selected, the scanner itself decides its internal probes according to its configured policy. Python does not silently select another scanner action on the model's behalf.
 
-The values **64/96/128** are only the maximum number of **concrete action descriptions in one model call** for FAST/BALANCED/DEEP. They bound only the number of concrete action descriptions carried by one planner request. If Balanced has 230 eligible actions, the planner normally receives three batches (96 + 96 + 38); every one of the 230 actions is presented to the AI exactly once in that planning pass. If an unusually rich batch would exceed the bounded model context, it is split again into smaller batches rather than dropping candidates. Batching/interleaving only controls prompt scheduling so one large profile/tool family does not monopolize the first call. It never authorizes an action and never removes an eligible candidate.
+The values **32/64/96/128** are only the maximum number of **concrete action descriptions in one model call** for TEST/FAST/BALANCED/DEEP. They bound only the number of concrete action descriptions carried by one planner request. If Balanced has 230 eligible actions, the planner normally receives three batches (96 + 96 + 38); every one of the 230 actions is presented to the AI exactly once in that planning pass. If an unusually rich batch would exceed the bounded model context, it is split again into smaller batches rather than dropping candidates. Batching/interleaving only controls prompt scheduling so one large profile/tool family does not monopolize the first call. It never authorizes an action and never removes an eligible candidate.
 
-Python and AI therefore have deliberately different responsibilities. **Python decides what is allowed and representable**: scope, credential isolation, state-change policy, compatibility, duplicate suppression, request normalization and hard resource ceilings. It may attach discovery evidence or ranking hints, but these do not execute anything. **The AI decides what should run** by returning exact `Axxxx` action IDs and a 0-100 priority for every selected action. Priorities use one scale across all prompt batches; Python merges all selected actions by that AI priority (ties retain the model order) before enforcing per-tool and global ceilings; Python does not replace rejected/overflow actions with different attacks of its own choosing. The normal reference ceilings are **300/800/1144** actions per round and the bounded adaptive ceilings are **338/900/1287**. Going above the reference ceiling requires `request_adaptive_extension=true` from the AI and enough eligible work. If AI planning fails, a deterministic emergency fallback exists only when `--require-ai` is disabled; with `--require-ai`, the run fails rather than silently switching decision policy. Deterministic remains a separate fixed-pipeline orchestrator. Fixed post-planning verification/completion stages (for example exact-parameter Chromium confirmation, the safe-surface completion sweep and session-lifecycle validation) provide deterministic evidence and safety checks after planning; planner-selected attack actions remain controlled by the AI decision.
+The planner contract is also normalized at the representation boundary. A numeric AI priority outside the documented 0-100 range is clamped to that range and recorded in `contract_normalizations` in the planner diagnostics instead of aborting an otherwise valid strict Agentic run. Missing, non-numeric or non-finite priorities still fail closed because Python would otherwise have to invent an AI decision. Boolean planner fields are parsed explicitly (`true/false`, `1/0`, `yes/no`) instead of through Python truthiness, duplicate selected IDs are deduplicated, identical duplicate priority rows are collapsed, and conflicting priorities for the same ID remain a contract error. Risk/confidence enum drift such as `Informational risk` or `High confidence` is normalized only when the intended enum is unambiguous.
+
+The same defensive boundary is applied to MCP/scanner results and persisted report metadata. Strings such as `"false"` no longer become true merely because they are non-empty; malformed numeric metadata falls back to bounded defaults; non-object vulnerability entries are ignored with a contract warning rather than crashing the assessment; FFUF status values and IDOR-Forge booleans are parsed defensively. SQLMap and IDOR-Forge also reserve a small TEST startup/preflight slice (3 s and 4 s respectively): exhausting that short diagnostic budget is a `partial/time_limit_reached` result, while an actual missing dependency or runtime failure remains an error.
+
+Python and AI therefore have deliberately different responsibilities. **Python decides what is allowed and representable**: scope, credential isolation, state-change policy, compatibility, duplicate suppression, request normalization and hard resource ceilings. It may attach discovery evidence or ranking hints, but these do not execute anything. **The AI decides what should run** by returning exact `Axxxx` action IDs and a 0-100 priority for every selected action. Priorities use one scale across all prompt batches; Python merges all selected actions by that AI priority (ties retain the model order) before enforcing per-tool and global ceilings; Python does not replace rejected/overflow actions with different attacks of its own choosing. The reference ceilings are **24/300/800/1144** actions per round in TEST/FAST/BALANCED/DEEP and the bounded adaptive ceilings are **27/338/900/1287**. Going above the reference ceiling requires `request_adaptive_extension=true` from the AI and enough eligible work. If AI planning fails, a deterministic emergency fallback exists only when `--require-ai` is disabled; with `--require-ai`, the run fails rather than silently switching decision policy. Deterministic remains a separate fixed-pipeline orchestrator. Fixed post-planning verification/completion stages (for example exact-parameter Chromium confirmation, the safe-surface completion sweep and session-lifecycle validation) provide deterministic evidence and safety checks after planning; planner-selected attack actions remain controlled by the AI decision.
 
 Traversal keeps distinct routing/file values only when they plausibly select different local resources. Deterministic specialist selection uses structural route identities and bounded base/adaptive/live-reserve limits to prevent harmless value variants from multiplying execution. Agentic catalog construction retains every structurally compatible exact request contract after hard safety/scope/compatibility and exact semantic deduplication; Python scores remain evidence hints rather than visibility cutoffs. IDOR accepts numeric, UUID, hexadecimal and digit-bearing opaque query references. Arjun, FFUF, Traversal and Nuclei accept the full timeout supplied by the active profile, while their internal subphases share the action deadline.
 
@@ -444,6 +446,17 @@ python .\selftests\auth_config_regression.py
 ```
 
 This regression covers multiple cookie identities, multiple browser/OIDC username-password identities, mixed profiles, path-aware session reuse, concrete-session deduplication, required-cookie fallback and browser-cookie scope projection.
+
+Scanner/runtime contracts can be rechecked without a live target as well:
+
+```powershell
+python .\selftests\cli_contract_regression.py
+python .\selftests\tool_contract_regression.py
+python .\selftests\metadata_contract_regression.py
+python .\selftests\environment_contract_regression.py
+```
+
+`cli_contract_regression.py` statically compares the literal flags emitted by Nikto, Arjun, FFUF, Nuclei, Dalfox, Commix, SQLMap and Interactsh with the CLI contract validated by `setupTools.py`; the obsolete/unsupported Nikto `-nocheck` flag is explicitly forbidden. The regression also scans the whole wrapper files, not only the main command builders, so an option introduced later in a helper must either belong to the initializer contract or be explicitly whitelisted as Docker/help/capability-guarded. `tool_contract_regression.py` evaluates TEST/FAST/BALANCED/DEEP, checks generated MCP arguments against the actual tool signatures, enforces each server-side timeout ceiling, verifies `scan_profile` propagation where applicable and requires the normal timeout ordering `fast <= balanced <= deep`. Profile-aware Nuclei, Nikto and Traversal paths reject an unknown `scan_profile` instead of silently falling back to BALANCED, so a typo cannot launch a different budget than the requested one. `metadata_contract_regression.py` exercises defensive parsing for persisted/report/scanner/runtime metadata so string booleans such as `"false"` cannot become true, malformed numeric diagnostics cannot crash reporting, invalid Docker/ZAP internal ports fall back to the HTTP/HTTPS default, and malformed severity counters cannot break report rendering. The JSON assessment parser also rejects quoted booleans for fields such as `enabled`, `auth_only` and `allow_state_changes` instead of relying on Python truthiness. `environment_contract_regression.py` injects malformed numeric `SECOPS_*` overrides and verifies that startup falls back to documented defaults; direct `int(os.getenv(...))`/`float(os.getenv(...))` conversions are forbidden by the regression. These checks are designed specifically to catch late, low-level integration failures before a multi-hour assessment.
 
 `discover_same_host_services=true` is valid only together with `allow_same_host_ports=true`. It probes the initial authorized hostname and expands to exact hostnames observed later only when those hostnames are already authorized. The candidate ceilings remain 4096/32768/65535, but service discovery is also bounded by one process-wide wall-clock budget of 240/720/1200 seconds in fast/balanced/deep. The initial hostname can consume at most 120/360/600 seconds; additional hostnames share both the separate expansion candidate pool and the remaining time fairly: while more than one unscanned hostname remains, no single hostname can consume the entire residual pool, and unused time or unprobed candidate capacity is recycled before the next allocation, so 20 discovered hosts do not create 20 independent long scans. Every hostname starts from the same generic common-web/application port prefix, then runtime service databases, then stratified full-range sampling. Authenticated recrawls never launch a separate port sweep; one final expansion pass handles new authorized hostnames, and exact-host scan results are cached across anonymous/authenticated profiles so a host is TCP-swept at most once per assessment process. Confirmed HTTP/HTTPS roots receive bounded recrawl. The feature never authorizes a hostname from a discovered link, DNS suffix or naming similarity and does not use target-specific reference data.
 

@@ -49,6 +49,19 @@ IDOR_FORGE_REPOSITORY = 'https://github.com/errorfiathck/IDOR-Forge.git'
 IDOR_FORGE_DIR = LOCAL_OPT / 'idor-forge'
 RELEASE_TOOLS = {'nuclei': ('projectdiscovery/nuclei', 'nuclei'), 'ffuf': ('ffuf/ffuf', 'ffuf'), 'dalfox': ('hahwul/dalfox', 'dalfox'), 'interactsh-client': ('projectdiscovery/interactsh', 'interactsh-client')}
 
+# Central CLI contracts used by both initializer validation and regression tests. Keeping these
+# option names in one place prevents wrapper changes from silently reintroducing runtime-only
+# failures such as the historical Nikto '-nocheck' incompatibility.
+ARJUN_REQUIRED_FLAGS = ('-u', '-m', '-w', '-t', '-T', '-c', '-q', '--include', '--headers', '--disable-redirects')
+SQLMAP_API_REQUIRED_FLAGS = ('-s', '-H', '-p', '--username', '--password')
+COMMIX_REQUIRED_FLAGS = ('--url', '--batch', '--ignore-session', '--disable-coloring', '--ignore-redirects', '--level', '--timeout', '--retries', '--drop-set-cookie', '--time-limit', '--delay', '--technique', '--data', '-p', '--cookie')
+FFUF_REQUIRED_FLAGS = ('-u', '-w', '-of', '-o', '-ac', '-t', '-rate', '-timeout', '-maxtime', '-noninteractive', '-b')
+INTERACTSH_REQUIRED_FLAGS = ('-n', '-pi', '-json', '-v', '-duc', '-ps', '-psf', '-o')
+DALFOX_V3_REQUIRED_FLAGS = ('--format', '--output', '--param', '--cookies', '--no-color', '--silence', '--method', '--data')
+DALFOX_V2_REQUIRED_FLAGS = ('--method', '--data')
+NUCLEI_REQUIRED_FLAGS = ('-l', '-jsonl', '-silent', '-nc', '-o', '-duc', '-no-stdin', '-c', '-bs', '-pc', '-rl', '-timeout', '-retries', '-dr', '-H', '-dast', '-im', '-fm', '-fa', '-fuzz-param-frequency', '-t', '-severity', '-ni', '-tags', '-etags', '-tl')
+NIKTO_REQUIRED_FLAGS = ('-host', '-nointeractive', '-ask', '-timeout', '-maxtime', '-Pause', '-Format', '-output', '-Tuning', '-Plugins', '-Display', '-Cgidirs', '-Option', '-nocookies')
+
 # Setup commands use one wrapper so timeouts and process failures produce consistent errors.
 def run(command: list[str], *, required: bool=True, capture: bool=False, show_output: bool=True, timeout: int=3600, cwd: Path | None=None, env_overrides: dict[str, str] | None=None) -> subprocess.CompletedProcess[str]:
     print('[+] ' + subprocess.list2cmdline(command))
@@ -723,7 +736,7 @@ def _help_has_flag(help_text: str, flag: str) -> bool:
 def _validate_arjun_cli(executable: str) -> dict[str, Any]:
     result = run([executable, '--help'], required=False, capture=True, show_output=False, timeout=60)
     help_text = _process_output(result, 12000)
-    required = ('-u', '-m', '-w', '-t', '-T', '-c', '-q', '--include', '--headers', '--disable-redirects')
+    required = ARJUN_REQUIRED_FLAGS
     missing = [flag for flag in required if not _help_has_flag(help_text, flag)]
     output_flag = '-oJ' if _help_has_flag(help_text, '-oJ') else '-o' if _help_has_flag(help_text, '-o') else ''
     rate_flag = '--rate-limit' if _help_has_flag(help_text, '--rate-limit') else '--ratelimit' if _help_has_flag(help_text, '--ratelimit') else ''
@@ -1001,35 +1014,35 @@ def validate_scanner_cli_contracts() -> dict[str, Any]:
     if sqlmap_api.is_file():
         results['sqlmap-api'] = _validate_cli_contract(
             'SQLMap REST API', [sys.executable, str(sqlmap_api), '-h'],
-            ('-s', '-H', '-p', '--username', '--password'), accepted_codes=(0,),
+            SQLMAP_API_REQUIRED_FLAGS, accepted_codes=(0,),
         )
     commix_script = LOCAL_OPT / 'commix' / 'commix.py'
     if commix_script.is_file():
         results['commix'] = _validate_cli_contract(
             'Commix', [sys.executable, str(commix_script), '--help'],
-            ('--url', '--batch', '--ignore-session', '--disable-coloring', '--ignore-redirects', '--level', '--timeout', '--retries', '--drop-set-cookie', '--time-limit', '--delay', '--technique', '--data', '-p', '--cookie'),
+            COMMIX_REQUIRED_FLAGS,
             accepted_codes=(0,),
         )
     ffuf = command_path('ffuf')
     if ffuf:
         results['ffuf'] = _validate_cli_contract(
-            'FFUF', [ffuf, '-h'], ('-u', '-w', '-of', '-o', '-ac', '-t', '-rate', '-timeout', '-maxtime', '-noninteractive', '-b'),
+            'FFUF', [ffuf, '-h'], FFUF_REQUIRED_FLAGS,
         )
     interactsh = command_path('interactsh-client')
     if interactsh:
         results['interactsh-client'] = _validate_cli_contract(
-            'Interactsh', [interactsh, '-h'], ('-n', '-pi', '-json', '-v', '-duc', '-ps', '-psf', '-o'),
+            'Interactsh', [interactsh, '-h'], INTERACTSH_REQUIRED_FLAGS,
         )
     dalfox = command_path('dalfox')
     if dalfox:
         scan = run([dalfox, 'scan', '--help'], required=False, capture=True, show_output=False, timeout=90)
         legacy = run([dalfox, 'url', '--help'], required=False, capture=True, show_output=False, timeout=90)
         scan_help, legacy_help = _process_output(scan, 16000), _process_output(legacy, 16000)
-        v3_required = ('--format', '--output', '--param', '--cookies', '--no-color', '--silence', '--method', '--data')
+        v3_required = DALFOX_V3_REQUIRED_FLAGS
         v3_ok = all(_help_has_flag(scan_help, flag) for flag in v3_required)
         v2_param_ok = _help_has_flag(legacy_help, '--param') or _help_has_flag(legacy_help, '-p')
         v2_cookie_ok = _help_has_flag(legacy_help, '--cookies') or _help_has_flag(legacy_help, '--cookie')
-        v2_required = ('--method', '--data')
+        v2_required = DALFOX_V2_REQUIRED_FLAGS
         v2_ok = (
             bool(legacy_help)
             and legacy.returncode in (0, 1, 2)
@@ -1044,7 +1057,7 @@ def validate_scanner_cli_contracts() -> dict[str, Any]:
     nuclei = command_path('nuclei')
     if nuclei and nuclei_mode != 'docker_official_image':
         results['nuclei'] = _validate_cli_contract(
-            'Nuclei', [nuclei, '-h'], ('-l', '-jsonl', '-silent', '-nc', '-o', '-duc', '-no-stdin', '-c', '-bs', '-pc', '-rl', '-timeout', '-retries', '-dr', '-H', '-dast', '-im', '-fm', '-fa', '-fuzz-param-frequency', '-t', '-severity', '-ni', '-tags', '-etags', '-tl'),
+            'Nuclei', [nuclei, '-h'], NUCLEI_REQUIRED_FLAGS,
         )
     elif nuclei_mode == 'docker_official_image':
         docker = command_path('docker')
@@ -1053,10 +1066,10 @@ def validate_scanner_cli_contracts() -> dict[str, Any]:
             raise RuntimeError('Nuclei Docker mode is selected but docker is not available for CLI contract validation.')
         results['nuclei'] = _validate_cli_contract(
             'Nuclei Docker', [docker, 'run', '--rm', image, '-h'],
-            ('-l', '-jsonl', '-silent', '-nc', '-o', '-duc', '-no-stdin', '-c', '-bs', '-pc', '-rl', '-timeout', '-retries', '-dr', '-H', '-dast', '-im', '-fm', '-fa', '-fuzz-param-frequency', '-t', '-severity', '-ni', '-tags', '-etags', '-tl'),
+            NUCLEI_REQUIRED_FLAGS,
         )
         results['nuclei']['validated_by'] = 'official_docker_help_and_dast_runtime'
-    nikto_required = ('-host', '-nointeractive', '-ask', '-timeout', '-maxtime', '-Pause', '-Format', '-output', '-Tuning', '-Plugins', '-Display', '-Cgidirs', '-Option', '-nocookies')
+    nikto_required = NIKTO_REQUIRED_FLAGS
     nikto = command_path('nikto')
     nikto_errors: list[str] = []
 

@@ -4,6 +4,7 @@ import asyncio
 import copy
 import getpass
 import json
+import math
 import os
 import re
 import platform
@@ -74,18 +75,21 @@ class AgentState(TypedDict):
 # CPU-only Ollama hosts can take far longer than 720s to prefill+decode a JSON-schema-constrained
 # plan (no tokens at all until prefill finishes), so these budgets stay generous by default.
 AI_PLANNER_TIMEOUTS = {
+    'test': 90,
     'fast': 900,
     'balanced': 1800,
     'deep': 3000,
 }
 
 AI_PLANNER_MAX_PREDICT = {
+    'test': 500,
     'fast': 800,
     'balanced': 1300,
     'deep': 1800,
 }
 
 AI_PLANNER_CONTEXT_WINDOWS = {
+    'test': 4096,
     'fast': 6144,
     'balanced': 8192,
     'deep': 12288,
@@ -94,6 +98,7 @@ AI_PLANNER_CONTEXT_WINDOWS = {
 # turning prompt size into a security-policy decision. Context limits may change batch size/context
 # representation, but every eligible concrete action must still be presented to the AI.
 AI_PLANNER_CONTEXT_WINDOWS_MAX = {
+    'test': 6144,
     'fast': 12288,
     'balanced': 16384,
     'deep': 24576,
@@ -105,14 +110,17 @@ PLANNER_CONTEXT_SAFETY_TOKENS = 512
 # batch_budget (analysis_node caps it with min(ai_timeout, this value)), so raising --ai-timeout
 # alone does not help this stage unless this dict is also raised.
 AI_ANALYSIS_BATCH_TIMEOUTS = {
+    'test': 60,
     'fast': 480,
     'balanced': 900,
     'deep': 1500,
 }
-AI_ANALYSIS_BATCH_SIZES = {'fast': 2, 'balanced': 4, 'deep': 6}
-AI_ANALYSIS_MAX_PREDICT = {'fast': 520, 'balanced': 850, 'deep': 1200}
-AI_ANALYSIS_RESCUE_MAX_PREDICT = {'fast': 340, 'balanced': 460, 'deep': 600}
-AI_ANALYSIS_CONTEXT_WINDOWS = {'fast': 6144, 'balanced': 8192, 'deep': 12288}
+AI_ANALYSIS_BATCH_SIZES = {'test': 1, 'fast': 2, 'balanced': 4, 'deep': 6}
+TEST_PLANNER_CANDIDATE_LIMIT = 32
+TEST_ANALYSIS_FINDING_LIMIT = 1
+AI_ANALYSIS_MAX_PREDICT = {'test': 400, 'fast': 520, 'balanced': 850, 'deep': 1200}
+AI_ANALYSIS_RESCUE_MAX_PREDICT = {'test': 260, 'fast': 340, 'balanced': 460, 'deep': 600}
+AI_ANALYSIS_CONTEXT_WINDOWS = {'test': 4096, 'fast': 6144, 'balanced': 8192, 'deep': 12288}
 LAST_AI_PLAN_DIAGNOSTICS: dict[str, Any] = {}
 BROAD_COVERAGE_TOOLS = ('ffuf', 'zap', 'nuclei', 'session', 'nikto')
 PARAMETER_COVERAGE_TOOLS = ('sqlmap', 'dalfox', 'commix', 'traversal', 'idor')
@@ -125,6 +133,7 @@ WORKFLOW_COVERAGE_TOOLS = ('browser', 'workflow')
 # These are GLOBAL per-round execution ceilings, not coverage baselines and not minimums. They never
 # cause an action to run by themselves. The planner may select fewer actions, including zero.
 ROUND_EXECUTION_ACTION_REFERENCE_CAPS = {
+    'test': 24,
     'fast': 300,
     'balanced': 800,
     'deep': 1144,
@@ -280,10 +289,10 @@ def _fair_global_action_cap(actions: list[dict[str, Any]], cap: int) -> list[dic
         active_profiles = next_active
     return selected
 
-# 64/96/128 are NOT tool/group quotas and do not limit what the AI may choose. They are only the
+# 32/64/96/128 are NOT tool/group quotas and do not limit what the AI may choose. They are only the
 # maximum number of CONCRETE action candidates put in one planner request. If more candidates exist,
 # Python creates additional fair batches until every eligible action has been presented to the AI.
-PLANNER_ACTION_BATCH_SIZES = {'fast': 64, 'balanced': 96, 'deep': 128}
+PLANNER_ACTION_BATCH_SIZES = {'test': 32, 'fast': 64, 'balanced': 96, 'deep': 128}
 PLAN_SCHEMA = {
     'type': 'object',
     'properties': {
@@ -435,6 +444,31 @@ def ensure_ollama_model(ollama_url: str, requested_model: str, *, allow_pull: bo
     diagnostics.update(model_ready=False, selected_model='')
     raise RuntimeError('Ollama is reachable but no usable local model exists. ' + (pull_error or f"Requested model '{requested_model}' is not installed."))
 
+def _normalize_ai_boolean_field(value: dict[str, Any], field: str, *, default: bool=False) -> bool:
+    """Normalize harmless schema-type drift without relying on Python truthiness."""
+    if field not in value:
+        value[field] = bool(default)
+        return bool(default)
+    raw = value.get(field)
+    normalized: bool
+    if isinstance(raw, bool):
+        normalized = raw
+    elif isinstance(raw, (int, float)) and not isinstance(raw, bool) and math.isfinite(float(raw)) and float(raw) in {0.0, 1.0}:
+        normalized = bool(int(raw))
+    elif isinstance(raw, str) and raw.strip().lower() in {'true', 'false', '1', '0', 'yes', 'no'}:
+        normalized = raw.strip().lower() in {'true', '1', 'yes'}
+    else:
+        raise ValueError(f'AI provider returned an invalid boolean for {field}.')
+    if raw is not normalized or type(raw) is not bool:
+        value.setdefault('_contract_normalizations', []).append({
+            'field': field,
+            'received': raw,
+            'normalized': normalized,
+        })
+    value[field] = normalized
+    return normalized
+
+
 # Parses the compact concrete-action ID selection contract shared by every supported AI provider.
 def _parse_ai_plan_content(content: str) -> dict[str, Any]:
     raw = str(content or '').strip()
@@ -450,18 +484,75 @@ def _parse_ai_plan_content(content: str) -> dict[str, Any]:
     priorities = value.get('selected_action_priorities')
     if not isinstance(priorities, list):
         raise ValueError('AI provider omitted selected_action_priorities.')
-    selected = [str(item) for item in value.get('selected_action_ids', [])]
+    selected: list[str] = []
+    seen_selected: set[str] = set()
+    duplicate_selected: list[str] = []
+    for item in value.get('selected_action_ids', []):
+        candidate_id = str(item).strip()
+        if not candidate_id:
+            continue
+        if candidate_id in seen_selected:
+            if candidate_id not in duplicate_selected:
+                duplicate_selected.append(candidate_id)
+            continue
+        seen_selected.add(candidate_id)
+        selected.append(candidate_id)
+    if duplicate_selected:
+        value.setdefault('_contract_normalizations', []).append({
+            'field': 'selected_action_ids',
+            'deduplicated_ids': duplicate_selected,
+        })
+    value['selected_action_ids'] = selected
+    _normalize_ai_boolean_field(value, 'request_adaptive_extension', default=False)
+    _normalize_ai_boolean_field(value, 'finish', default=False)
     priority_ids: set[str] = set()
-    for row in priorities:
-        if not isinstance(row, dict) or not str(row.get('id') or ''):
+    priority_values: dict[str, int] = {}
+    normalized_priorities: list[dict[str, Any]] = []
+    for raw_row in priorities:
+        if not isinstance(raw_row, dict) or not str(raw_row.get('id') or '').strip():
             raise ValueError('AI provider returned an invalid selected_action_priorities entry.')
+        row = dict(raw_row)
+        row['id'] = str(row.get('id')).strip()
+        raw_priority = row.get('priority')
+        if isinstance(raw_priority, bool):
+            raise ValueError('AI provider returned a boolean action priority; an integer 0..100 is required.')
         try:
-            priority = int(row.get('priority'))
+            numeric_priority = float(raw_priority)
         except (TypeError, ValueError) as exc:
-            raise ValueError('AI provider returned a non-integer action priority.') from exc
-        if priority < 0 or priority > 100:
-            raise ValueError('AI action priority must be between 0 and 100.')
-        priority_ids.add(str(row.get('id')))
+            raise ValueError('AI provider returned a non-numeric action priority.') from exc
+        if not math.isfinite(numeric_priority):
+            raise ValueError('AI provider returned a non-finite action priority.')
+        # Structured-output providers occasionally violate the JSON-schema numeric bounds even
+        # when the rest of the plan is valid (for example 120 on a documented 0..100 scale).
+        # Treat this as a recoverable representation defect rather than discarding a complete AI
+        # decision. Clamping preserves the model's monotonic intent while Python still does not
+        # invent an action or a priority for an omitted action.
+        priority = max(0, min(100, int(round(numeric_priority))))
+        if numeric_priority != priority:
+            value.setdefault('_contract_normalizations', []).append({
+                'field': 'selected_action_priorities.priority',
+                'id': row['id'],
+                'received': raw_priority,
+                'normalized': priority,
+            })
+        row['priority'] = priority
+        candidate_id = row['id']
+        if candidate_id in priority_values:
+            if priority_values[candidate_id] != priority:
+                raise ValueError(
+                    f'AI provider returned conflicting priorities for {candidate_id}: '
+                    f'{priority_values[candidate_id]} and {priority}.'
+                )
+            value.setdefault('_contract_normalizations', []).append({
+                'field': 'selected_action_priorities',
+                'deduplicated_id': candidate_id,
+                'priority': priority,
+            })
+            continue
+        priority_values[candidate_id] = priority
+        priority_ids.add(candidate_id)
+        normalized_priorities.append(row)
+    value['selected_action_priorities'] = normalized_priorities
     missing = [candidate_id for candidate_id in selected if candidate_id not in priority_ids]
     if missing:
         raise ValueError('AI provider omitted priorities for selected action IDs: ' + ', '.join(missing[:8]))
@@ -1053,11 +1144,19 @@ def ai_plan(state: AgentState) -> dict[str, Any]:
     the AI exactly once in the planning pass. Python never expands a selected tool into hidden
     requests.
     """
-    concrete_pool = _eligible_action_catalog(state)
-    if not concrete_pool:
+    full_concrete_pool = _eligible_action_catalog(state)
+    if not full_concrete_pool:
         return {'reasoning_summary': 'No eligible concrete actions.', 'actions': [], 'request_adaptive_extension': False, 'finish': True}
 
     mode = str(shared.CURRENT_SCAN_MODE or 'balanced')
+    eligible_candidate_count = len(full_concrete_pool)
+    if mode == 'test' and eligible_candidate_count > TEST_PLANNER_CANDIDATE_LIMIT:
+        # TEST is a plumbing/smoke profile, not a coverage profile. Keep one fair interleaved
+        # sample across profile/tool buckets so large applications cannot multiply the AI timeout
+        # into dozens of planner batches. FAST/BALANCED/DEEP still present every eligible action.
+        concrete_pool = _fair_planner_action_order(full_concrete_pool)[:TEST_PLANNER_CANDIDATE_LIMIT]
+    else:
+        concrete_pool = full_concrete_pool
     batch_size = int(PLANNER_ACTION_BATCH_SIZES.get(mode, 96))
     batches = _planner_action_batches(concrete_pool, batch_size)
     # Stable IDs follow the fair prompt order so diagnostics and batch boundaries are reproducible.
@@ -1075,7 +1174,8 @@ def ai_plan(state: AgentState) -> dict[str, Any]:
     system_message = _planner_system_message()
     provider = str(state.get('ai_provider') or 'ollama').lower()
     base = state['ollama_url'].rstrip('/')
-    total_timeout = max(120, int(state.get('ai_timeout') or 480))
+    planner_timeout_floor = 20 if mode == 'test' else 120
+    total_timeout = max(planner_timeout_floor, int(state.get('ai_timeout') or 480))
     max_predict = AI_PLANNER_MAX_PREDICT.get(mode, 800)
     base_context_window = AI_PLANNER_CONTEXT_WINDOWS.get(mode, 6144)
     max_context_window = AI_PLANNER_CONTEXT_WINDOWS_MAX.get(mode, base_context_window)
@@ -1104,6 +1204,7 @@ def ai_plan(state: AgentState) -> dict[str, Any]:
             'batch_count': batch_count,
             'batch_size_limit': batch_size,
             'total_concrete_action_candidates': len(concrete_pool),
+            'total_eligible_action_candidates': eligible_candidate_count,
             'normal_global_execution_ceiling': int(initial_budget['reference_cap']),
             'adaptive_global_execution_ceiling': int(initial_budget['adaptive_ceiling']),
             'selected_so_far_count': selected_count,
@@ -1234,6 +1335,7 @@ def ai_plan(state: AgentState) -> dict[str, Any]:
                 'context_bytes': len(context.encode('utf-8')),
                 'context_window': context_window,
                 'seconds': round(time.monotonic() - batch_started, 2),
+                'contract_normalizations': list(compact_plan.get('_contract_normalizations') or []),
             })
         except Exception as exc:
             errors.append(f'batch {batch_number}: {type(exc).__name__}: {exc}')
@@ -1277,6 +1379,9 @@ def ai_plan(state: AgentState) -> dict[str, Any]:
         'context_bytes': total_context_bytes,
         'context_window': max_context_used,
         'candidate_count': len(concrete_pool),
+        'eligible_candidate_count': eligible_candidate_count,
+        'test_candidate_limit': TEST_PLANNER_CANDIDATE_LIMIT if mode == 'test' else 0,
+        'test_candidates_deferred': max(0, eligible_candidate_count - len(concrete_pool)) if mode == 'test' else 0,
         'detailed_candidate_count': len(concrete_pool),
         'candidate_pool_count': len(concrete_pool),
         'concrete_action_pool_count': len(concrete_pool),
@@ -1459,6 +1564,30 @@ def _analysis_related_findings(batch: list[dict[str, Any]], all_candidates: list
 AI_ANALYSIS_MIN_WORDS = {'description': 20, 'impact': 12, 'consequences': 12, 'recovery': 12, 'solution': 15, 'rationale': 8}
 
 
+def _normalize_analysis_enum(raw: Any, field: str) -> tuple[str, bool]:
+    """Normalize obvious formatting/synonym drift in bounded AI enum fields."""
+    text = re.sub(r'[\s_-]+', ' ', str(raw or '').strip().lower())
+    original = text
+    if field == 'risk':
+        for suffix in (' risk', ' severity'):
+            if text.endswith(suffix):
+                text = text[:-len(suffix)].strip()
+        aliases = {'informational': 'info', 'information': 'info', 'moderate': 'medium', 'med': 'medium'}
+        text = aliases.get(text, text)
+        valid = {'critical', 'high', 'medium', 'low', 'info'}
+    elif field == 'confidence':
+        if text.endswith(' confidence'):
+            text = text[:-len(' confidence')].strip()
+        aliases = {'moderate': 'medium', 'med': 'medium', 'very high': 'high', 'very low': 'low'}
+        text = aliases.get(text, text)
+        valid = {'high', 'medium', 'low'}
+    else:
+        raise ValueError(f'Unsupported AI analysis enum field: {field}')
+    if text not in valid:
+        raise ValueError(f'Analysis returned invalid {field}: {raw!r}.')
+    return text, text != original or str(raw or '').strip() != text
+
+
 def _analysis_quality_check(rows: list[dict[str, Any]], expected: set[str]) -> list[dict[str, Any]]:
     # Validate the AI contract without failing strict mode for weak prose alone.
     # Strict agentic mode still requires a real, parseable AI assessment for every finding.
@@ -1466,18 +1595,34 @@ def _analysis_quality_check(rows: list[dict[str, Any]], expected: set[str]) -> l
     # underdeveloped narrative field and the scanner has a stronger
     # original value, that one field falls back to the scanner text instead of aborting
     # the entire assessment.
-    returned_ids = [str(item.get('id') or '') for item in rows]
-    returned = set(returned_ids)
-    if returned != expected or len(returned_ids) != len(expected):
-        missing = sorted(expected - returned)
-        extra = sorted(returned - expected)
-        duplicates = sorted({value for value in returned_ids if returned_ids.count(value) > 1 and value})
-        raise ValueError(f'Analysis IDs mismatch; missing={missing}, extra={extra}, duplicates={duplicates}')
+    normalized_expected = {str(value).strip() for value in expected if str(value).strip()}
     for row in rows:
-        risk = str(row.get('risk') or '').lower()
-        confidence = str(row.get('confidence') or '').lower()
-        if risk not in {'critical', 'high', 'medium', 'low', 'info'} or confidence not in {'high', 'medium', 'low'}:
-            raise ValueError(f"Analysis returned invalid risk/confidence for {row.get('id')!r}.")
+        row['id'] = str(row.get('id') or '').strip()
+    # Extra/hallucinated rows can be discarded safely when every requested finding is present;
+    # Python is not inventing an analysis, only refusing an unsolicited ID. Missing or duplicate
+    # requested IDs remain fatal in strict mode because choosing/reconstructing one would invent data.
+    extra_ids = sorted({str(row.get('id') or '') for row in rows if str(row.get('id') or '') not in normalized_expected})
+    filtered = [row for row in rows if str(row.get('id') or '') in normalized_expected]
+    returned_ids = [str(item.get('id') or '') for item in filtered]
+    returned = set(returned_ids)
+    missing = sorted(normalized_expected - returned)
+    duplicates = sorted({value for value in returned_ids if returned_ids.count(value) > 1 and value})
+    if missing or duplicates:
+        raise ValueError(f'Analysis IDs mismatch; missing={missing}, extra={extra_ids}, duplicates={duplicates}')
+    if extra_ids and filtered:
+        filtered[0].setdefault('_contract_normalizations', []).append({
+            'field': 'analyses.id', 'dropped_extra_ids': extra_ids,
+        })
+    rows = filtered
+    for row in rows:
+        risk, risk_changed = _normalize_analysis_enum(row.get('risk'), 'risk')
+        confidence, confidence_changed = _normalize_analysis_enum(row.get('confidence'), 'confidence')
+        if risk_changed:
+            row.setdefault('_contract_normalizations', []).append({'field': 'risk', 'received': row.get('risk'), 'normalized': risk})
+        if confidence_changed:
+            row.setdefault('_contract_normalizations', []).append({'field': 'confidence', 'received': row.get('confidence'), 'normalized': confidence})
+        row['risk'] = risk
+        row['confidence'] = confidence
         short_fields: list[str] = []
         for key, minimum in AI_ANALYSIS_MIN_WORDS.items():
             value = str(row.get(key) or '').strip()
@@ -1494,7 +1639,7 @@ def _analysis_quality_check(rows: list[dict[str, Any]], expected: set[str]) -> l
 def _ai_analysis_batch(state: AgentState, batch: list[dict[str, Any]], all_candidates: list[dict[str, Any]], timeout: int) -> list[dict[str, Any]]:
     system_message = _analysis_system_message()
     mode = shared.CURRENT_SCAN_MODE
-    related_findings = [] if mode == 'fast' else _analysis_related_findings(batch, all_candidates)
+    related_findings = [] if mode in {'test', 'fast'} else _analysis_related_findings(batch, all_candidates)
     context = json.dumps({
         'target': state['target'],
         'scan_mode': mode,
@@ -1514,9 +1659,15 @@ def _ai_analysis_batch(state: AgentState, batch: list[dict[str, Any]], all_candi
     started = time.monotonic()
     errors: list[str] = []
 
-    # For a one-finding request, reserve time for a compact rescue. For a larger
-    # batch, use a shorter first attempt so adaptive splitting happens early.
-    if len(batch) == 1:
+    # For a one-finding request, reserve time for a compact rescue. TEST uses much smaller
+    # control-plane minima so a diagnostic run cannot inherit the normal 45--60 second retry floors.
+    if mode == 'test':
+        rescue_reserve = 10
+        if len(batch) == 1:
+            chat_budget = max(15, min(int(timeout * 0.70), max(15, timeout - rescue_reserve)))
+        else:
+            chat_budget = max(15, min(int(timeout * 0.70), 30))
+    elif len(batch) == 1:
         chat_budget = max(60, min(int(timeout * 0.62), timeout - 45))
     else:
         chat_budget = max(55, min(int(timeout * 0.70), 105))
@@ -1544,7 +1695,8 @@ def _ai_analysis_batch(state: AgentState, batch: list[dict[str, Any]], all_candi
             raise RuntimeError('; '.join(errors)) from exc
 
     remaining = max(0, int(timeout - (time.monotonic() - started)))
-    if remaining < 40:
+    rescue_minimum = 8 if mode == 'test' else 40
+    if remaining < rescue_minimum:
         raise RuntimeError('; '.join(errors + ['single-finding rescue skipped: analysis budget exhausted']))
 
     rescue_system = (
@@ -1597,7 +1749,8 @@ def _ai_analysis_batch_adaptive(
     if deadline is None:
         deadline = time.monotonic() + max(1, int(timeout))
     remaining = max(0, int(deadline - time.monotonic()))
-    if remaining < 45:
+    attempt_floor = 12 if shared.CURRENT_SCAN_MODE == 'test' else 45
+    if remaining < attempt_floor:
         raise TimeoutError(f'{label} exhausted its shared analysis batch budget before another AI attempt could start.')
     try:
         return _ai_analysis_batch(state, batch, all_candidates, remaining)
@@ -1608,7 +1761,8 @@ def _ai_analysis_batch_adaptive(
         left = batch[:midpoint]
         right = batch[midpoint:]
         remaining = max(0, int(deadline - time.monotonic()))
-        if remaining < 90:
+        split_floor = 24 if shared.CURRENT_SCAN_MODE == 'test' else 90
+        if remaining < split_floor:
             raise
         print(
             f'    AI analysis: {label} did not complete cleanly; retrying as smaller AI batches '
@@ -1618,7 +1772,8 @@ def _ai_analysis_batch_adaptive(
         rows: list[dict[str, Any]] = []
         # Allocate the first child only its proportional share of the remaining wall-clock time;
         # the second child receives whatever remains under the same parent deadline.
-        left_share = max(45, int(remaining * (len(left) / max(1, len(batch)))))
+        left_floor = 12 if shared.CURRENT_SCAN_MODE == 'test' else 45
+        left_share = max(left_floor, int(remaining * (len(left) / max(1, len(batch)))))
         left_deadline = min(deadline, time.monotonic() + left_share)
         rows.extend(_ai_analysis_batch_adaptive(
             state, left, all_candidates, timeout, label=f'{label}.1', deadline=left_deadline,
@@ -1740,6 +1895,11 @@ def analysis_node(state: AgentState) -> dict[str, Any]:
 
     started = time.monotonic()
     mode = shared.CURRENT_SCAN_MODE
+    total_candidate_findings = len(candidates)
+    if mode == 'test' and total_candidate_findings > TEST_ANALYSIS_FINDING_LIMIT:
+        # One bounded batch is enough to prove the analysis path and structured-output contract.
+        # TEST deliberately leaves the remaining scanner findings untouched for the real profiles.
+        candidates = candidates[:TEST_ANALYSIS_FINDING_LIMIT]
     default_batch_budget = AI_ANALYSIS_BATCH_TIMEOUTS.get(mode, 240)
     configured_budget = int(state.get('ai_timeout') or default_batch_budget)
     batch_budget = min(configured_budget, default_batch_budget)
@@ -1777,6 +1937,9 @@ def analysis_node(state: AgentState) -> dict[str, Any]:
         'provider': str(state.get('ai_provider') or 'ollama'),
         'model': state['model'],
         'candidate_findings': len(candidates),
+        'candidate_findings_total': total_candidate_findings,
+        'test_finding_limit': TEST_ANALYSIS_FINDING_LIMIT if mode == 'test' else 0,
+        'test_findings_deferred': max(0, total_candidate_findings - len(candidates)) if mode == 'test' else 0,
         'analyzed_findings': analyzed,
         'severity_changes': changed,
         'errors': errors,
@@ -2485,9 +2648,7 @@ async def execute_action(action: dict[str, Any], cookies: dict[str, str], discov
         arguments = {'jwt_token': action['jwt_token'], 'target_url': action['target_url']}
     elif tool == 'interactsh':
         oast_class = str(action.get('oast_class') or 'remote-fetch')
-        timeout_by_class = {'explicit': (120, 75), 'command': (75, 55), 'remote-fetch': (60, 45)}
-        deep_timeout, normal_timeout = timeout_by_class.get(oast_class, timeout_by_class['remote-fetch'])
-        oast_timeout = deep_timeout if shared.CURRENT_SCAN_MODE == 'deep' else normal_timeout
+        oast_timeout = shared.oast_timeout_seconds(oast_class)
         request_url = _action_request_url(action, action['target_url'])
         arguments = {'target_url': action['target_url'], 'injection_url': action['injection_url'], 'cookies': shared.scope_cookie_header(request_url, cookies.get(profile, '')), 'method': action.get('method', 'GET'), 'data': action.get('data', ''), 'parameter': (action.get('parameters') or [''])[0], 'timeout': oast_timeout, 'request_rate': shared.MAX_REQUEST_RATE, 'allow_state_changes': shared.state_changing_tests_allowed(action['target_url'], allow_state_changes)}
     else:
@@ -2626,7 +2787,7 @@ async def execute_plan(plan: list[dict[str, Any]], cookies: dict[str, str], disc
         if action['tool'] == 'interactsh' and result.get('callback_confirmed'):
             confirmed_oast_classes.add((action['profile'], str(action.get('oast_class') or 'remote-fetch')))
         if action['tool'] == 'arjun':
-            found_parameters = int(result.get('phase_parameters', 0) or 0)
+            found_parameters = shared.safe_int_metadata(result.get('phase_parameters', 0), 0)
             if str(result.get('diagnosis', '')) in shared.TIME_LIMIT_DIAGNOSES and (not result.get('vulnerabilities')) and (found_parameters == 0):
                 arjun_empty_limits[action['profile']] = arjun_empty_limits.get(action['profile'], 0) + 1
             elif result.get('diagnosis') != 'adaptive_budget_reallocated':

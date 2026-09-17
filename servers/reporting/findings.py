@@ -10,6 +10,7 @@ from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 
 from .constants import AUTO_INDEX_QUERY_KEYS, RISK_ORDER
 from .text_utils import _redact_text, _redact_value
+from utils import safe_int_value
 
 # Walks the nested results tree, yielding each leaf (or run) result with its path
 def _iter_leaf_results(value: Any, path: tuple[str, ...] = ()) -> Iterator[tuple[tuple[str, ...], dict[str, Any]]]:
@@ -364,7 +365,7 @@ def _merge_finding_rows(existing: dict[str, Any], row: dict[str, Any], profile: 
                 existing[key] = row[key]
     existing["tool"] = ", ".join(sorted(set(str(value) for value in tools if value)))
     existing["profile"] = ", ".join(sorted(set(profiles)))
-    existing["occurrence_count"] = int(existing.get("occurrence_count", 1)) + 1
+    existing["occurrence_count"] = max(1, safe_int_value(existing.get("occurrence_count", 1), 1)) + 1
 
 
 def flatten_findings(results: dict[str, Any]) -> list[dict[str, Any]]:

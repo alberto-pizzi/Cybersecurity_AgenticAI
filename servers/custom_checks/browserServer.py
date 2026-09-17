@@ -459,7 +459,7 @@ async def _run_browser_scan_core(
     client_sources = [str(value) for value in (client_sources or []) if str(value)]
     client_sinks = [str(value) for value in (client_sinks or []) if str(value)]
     authorized_origins = [str(value) for value in (authorized_origins or []) if str(value)]
-    timeout = max(15, min(int(timeout), 300))
+    timeout = max(10, min(int(timeout), 300))
     navigation_timeout = proportional_budget(timeout, BROWSER_NAVIGATION_RATIO)
     timeout_ms = navigation_timeout * 1000
     findings: list[dict[str, Any]] = []

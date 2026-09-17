@@ -13,6 +13,7 @@ if str(SERVERS) not in sys.path:
 
 from reporting.reportServer import generate_report  # noqa: E402
 from reporting.revision_snapshot import REVIEW_SNAPSHOT_SCHEMA_VERSION  # noqa: E402
+from utils import safe_int_value  # noqa: E402
 
 
 # Loads one persisted review snapshot and validates the fields required to regenerate a report.
@@ -26,7 +27,7 @@ def _load_snapshot(path: str) -> dict:
         raise ValueError(f"Review snapshot is not valid JSON: {snapshot_path}: {exc}") from exc
     if not isinstance(payload, dict) or payload.get("snapshot_type") != "secops-review-snapshot":
         raise ValueError("Input is not a SecOps review snapshot.")
-    if int(payload.get("schema_version") or 0) != REVIEW_SNAPSHOT_SCHEMA_VERSION:
+    if safe_int_value(payload.get("schema_version"), 0) != REVIEW_SNAPSHOT_SCHEMA_VERSION:
         raise ValueError(f"Unsupported review snapshot schema; expected {REVIEW_SNAPSHOT_SCHEMA_VERSION}.")
     if not isinstance(payload.get("results"), dict) or not str(payload.get("target") or ""):
         raise ValueError("Review snapshot does not contain target/results required for report regeneration.")

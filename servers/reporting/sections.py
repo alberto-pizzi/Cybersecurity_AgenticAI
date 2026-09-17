@@ -18,6 +18,7 @@ from .fields import _field, _render_list
 from .findings import _finding_family
 from .text_utils import _esc
 from .toc import _heading
+from utils import safe_int_value, safe_float_value, safe_bool_value
 
 # Renders a schematic summary of the assessment context (run config, limits, discovery)
 def _context_summary_html(context: dict[str, Any], toc: list[tuple[int, str, str]]) -> str:
@@ -42,10 +43,7 @@ def _context_summary_html(context: dict[str, Any], toc: list[tuple[int, str, str
     if orchestration.get("nodes"):
         run_rows.append(("Pipeline phases", _esc(" -> ".join(str(n) for n in orchestration["nodes"]))))
     if context.get("authenticated_identity_count") is not None:
-        try:
-            identity_count = max(0, int(context.get("authenticated_identity_count") or 0))
-        except (TypeError, ValueError):
-            identity_count = 0
+        identity_count = max(0, safe_int_value(context.get("authenticated_identity_count"), 0))
         run_rows.append((
             "Authenticated identities",
             str(identity_count) + (" - cross-identity authorization/BOLA comparison enabled" if identity_count >= 2 else " - add another identity for cross-account authorization/BOLA differentials"),
@@ -53,7 +51,7 @@ def _context_summary_html(context: dict[str, Any], toc: list[tuple[int, str, str
     elif context.get("secondary_identity_supplied") is not None:
         run_rows.append((
             "Authenticated identities",
-            "2+ (secondary identity supplied)" if context["secondary_identity_supplied"]
+            "2+ (secondary identity supplied)" if safe_bool_value(context.get("secondary_identity_supplied"), False)
             else "1 or fewer - authorization/BOLA differentials could not be tested",
         ))
     if context.get("expected_tools"):
@@ -71,7 +69,7 @@ def _context_summary_html(context: dict[str, Any], toc: list[tuple[int, str, str
         run_rows.append((
             "Same-host multi-port authorization",
             "Enabled - HTTP/HTTPS services on other ports of an already-authorized exact hostname may be discovered/tested; scheme changes remain limited to that exact hostname"
-            if bool(context.get("allow_same_host_ports"))
+            if safe_bool_value(context.get("allow_same_host_ports"), False)
             else "Disabled - additional ports require an explicit authorized origin/service",
         ))
     auth_scope_policy = str(context.get("authentication_scope_policy") or "").strip()
@@ -189,33 +187,33 @@ def _context_summary_html(context: dict[str, Any], toc: list[tuple[int, str, str
 
         budget = data.get("budget_diagnostics") if isinstance(data.get("budget_diagnostics"), dict) else {}
         if budget:
-            http_base = int(budget.get("http_page_budget", 0) or 0)
-            http_max = int(budget.get("http_page_max_budget", http_base) or http_base)
-            http_done = int(budget.get("http_pages_processed", 0) or 0)
-            http_overflow = int(budget.get("http_adaptive_overflow_used", 0) or 0)
-            http_left = int(budget.get("http_remaining_candidates", 0) or 0)
-            http_attempts = int(budget.get("http_requests_attempted", 0) or 0)
-            http_attempt_budget = int(budget.get("http_attempt_budget", 0) or 0)
-            dead_http = int(budget.get("dead_http_404_410", 0) or 0)
-            browser_base = int(budget.get("browser_page_budget", 0) or 0)
-            browser_max = int(budget.get("browser_page_max_budget", browser_base) or browser_base)
-            browser_done = int(budget.get("browser_pages_attempted", 0) or 0)
-            browser_overflow = int(budget.get("browser_adaptive_overflow_used", 0) or 0)
-            browser_left = int(budget.get("browser_remaining_candidates", 0) or 0)
-            browser_nav_retries = int(budget.get("browser_navigation_retries", 0) or 0)
-            browser_dom_retries = int(budget.get("browser_dom_retries", 0) or 0)
-            dead_browser = int(budget.get("browser_dead_404_410", 0) or 0)
-            browser_wall_budget = float(budget.get("browser_wall_clock_budget_seconds", 0.0) or 0.0)
-            browser_wall_elapsed = float(budget.get("browser_wall_clock_elapsed_seconds", 0.0) or 0.0)
-            browser_wall_exhausted = bool(budget.get("browser_wall_clock_exhausted", False))
-            script_done = int(budget.get("scripts_processed", 0) or 0)
-            script_budget = int(budget.get("script_budget", 0) or 0)
-            script_attempts = int(budget.get("script_requests_attempted", 0) or 0)
-            script_attempt_budget = int(budget.get("script_attempt_budget", 0) or 0)
-            script_deferred = int(budget.get("script_candidates_deferred", 0) or 0)
-            route_variants_skipped = int(budget.get("route_variants_skipped", 0) or 0)
-            origin_budget_skipped = int(budget.get("origin_budget_skipped", 0) or 0)
-            families = int(budget.get("application_families_visited", 0) or 0)
+            http_base = safe_int_value(budget.get("http_page_budget"), 0)
+            http_max = safe_int_value(budget.get("http_page_max_budget"), http_base)
+            http_done = safe_int_value(budget.get("http_pages_processed"), 0)
+            http_overflow = safe_int_value(budget.get("http_adaptive_overflow_used"), 0)
+            http_left = safe_int_value(budget.get("http_remaining_candidates"), 0)
+            http_attempts = safe_int_value(budget.get("http_requests_attempted"), 0)
+            http_attempt_budget = safe_int_value(budget.get("http_attempt_budget"), 0)
+            dead_http = safe_int_value(budget.get("dead_http_404_410"), 0)
+            browser_base = safe_int_value(budget.get("browser_page_budget"), 0)
+            browser_max = safe_int_value(budget.get("browser_page_max_budget"), browser_base)
+            browser_done = safe_int_value(budget.get("browser_pages_attempted"), 0)
+            browser_overflow = safe_int_value(budget.get("browser_adaptive_overflow_used"), 0)
+            browser_left = safe_int_value(budget.get("browser_remaining_candidates"), 0)
+            browser_nav_retries = safe_int_value(budget.get("browser_navigation_retries"), 0)
+            browser_dom_retries = safe_int_value(budget.get("browser_dom_retries"), 0)
+            dead_browser = safe_int_value(budget.get("browser_dead_404_410"), 0)
+            browser_wall_budget = safe_float_value(budget.get("browser_wall_clock_budget_seconds"), 0.0)
+            browser_wall_elapsed = safe_float_value(budget.get("browser_wall_clock_elapsed_seconds"), 0.0)
+            browser_wall_exhausted = safe_bool_value(budget.get("browser_wall_clock_exhausted"), False)
+            script_done = safe_int_value(budget.get("scripts_processed"), 0)
+            script_budget = safe_int_value(budget.get("script_budget"), 0)
+            script_attempts = safe_int_value(budget.get("script_requests_attempted"), 0)
+            script_attempt_budget = safe_int_value(budget.get("script_attempt_budget"), 0)
+            script_deferred = safe_int_value(budget.get("script_candidates_deferred"), 0)
+            route_variants_skipped = safe_int_value(budget.get("route_variants_skipped"), 0)
+            origin_budget_skipped = safe_int_value(budget.get("origin_budget_skipped"), 0)
+            families = safe_int_value(budget.get("application_families_visited"), 0)
             pieces = [
                 f"HTTP useful pages {http_done}/{http_base} base, max {http_max}, overflow {http_overflow}, queued {http_left}",
                 f"Chromium {browser_done}/{browser_base} base, max {browser_max}, overflow {browser_overflow}, queued {browser_left}",
@@ -234,35 +232,35 @@ def _context_summary_html(context: dict[str, Any], toc: list[tuple[int, str, str
                 pieces.append(f"deduplicated route variants {route_variants_skipped}, origin-budget skips {origin_budget_skipped}")
             if families:
                 pieces.append(f"application families visited {families}")
-            service_ports = int(budget.get("same_host_service_ports_probed", 0) or 0)
-            service_reused_ports = int(budget.get("same_host_service_reused_ports_probed", 0) or 0)
-            service_deferred_candidates = int(budget.get("same_host_service_candidate_ports_deferred", 0) or 0)
-            service_tcp_attempts = int(budget.get("same_host_service_tcp_connection_attempts", 0) or 0)
-            service_resolved_addresses = int(budget.get("same_host_service_resolved_address_count", 0) or 0)
-            service_classification_deferred = int(budget.get("same_host_classification_deferred_ports", 0) or 0)
-            service_cache_hit = bool(budget.get("same_host_service_cache_hit", False))
-            service_roots = int(budget.get("same_host_web_services_discovered", 0) or 0)
-            service_seconds = float(budget.get("same_host_service_discovery_seconds", 0.0) or 0.0)
-            service_local_budget = float(budget.get("same_host_service_time_budget_seconds", 0.0) or 0.0)
-            service_global_budget = float(budget.get("same_host_service_global_time_budget_seconds", 0.0) or 0.0)
-            service_global_remaining = float(budget.get("same_host_service_global_time_remaining_seconds", 0.0) or 0.0)
-            service_time_exhausted = bool(budget.get("same_host_service_time_budget_exhausted", False))
-            expansion_hosts = int(budget.get("same_host_service_expansion_hosts_scanned", 0) or 0)
-            expansion_reused = int(budget.get("same_host_service_expansion_hosts_reused_cached", 0) or 0)
-            expansion_deferred = int(budget.get("same_host_service_expansion_hosts_deferred_time_budget", 0) or 0)
-            expansion_failed_preprobe = int(budget.get("same_host_service_expansion_hosts_failed_before_probe", 0) or 0)
-            expansion_considered = int(budget.get("same_host_service_expansion_hosts_considered", 0) or 0)
-            expansion_observed = int(budget.get("same_host_service_expansion_hosts_observed", 0) or 0)
-            expansion_ports = int(budget.get("same_host_service_expansion_ports_probed", 0) or 0)
-            expansion_reused_ports = int(budget.get("same_host_service_expansion_reused_ports_probed", 0) or 0)
-            expansion_deferred_candidates = int(budget.get("same_host_service_expansion_candidate_ports_deferred", 0) or 0)
-            expansion_tcp_attempts = int(budget.get("same_host_service_expansion_tcp_connection_attempts", 0) or 0)
-            expansion_resolved_addresses = int(budget.get("same_host_service_expansion_resolved_address_count", 0) or 0)
-            expansion_classification_deferred = int(budget.get("same_host_service_expansion_classification_deferred_ports", 0) or 0)
-            expansion_roots = int(budget.get("same_host_service_expansion_web_services_discovered", 0) or 0)
-            expansion_candidate_budget = int(budget.get("same_host_service_expansion_candidate_budget", 0) or 0)
-            expansion_candidate_consumed = int(budget.get("same_host_service_expansion_candidate_budget_consumed", expansion_ports) or 0)
-            expansion_candidate_remaining = int(budget.get("same_host_service_expansion_candidate_budget_remaining", max(0, expansion_candidate_budget - expansion_candidate_consumed)) or 0)
+            service_ports = safe_int_value(budget.get("same_host_service_ports_probed"), 0)
+            service_reused_ports = safe_int_value(budget.get("same_host_service_reused_ports_probed"), 0)
+            service_deferred_candidates = safe_int_value(budget.get("same_host_service_candidate_ports_deferred"), 0)
+            service_tcp_attempts = safe_int_value(budget.get("same_host_service_tcp_connection_attempts"), 0)
+            service_resolved_addresses = safe_int_value(budget.get("same_host_service_resolved_address_count"), 0)
+            service_classification_deferred = safe_int_value(budget.get("same_host_classification_deferred_ports"), 0)
+            service_cache_hit = safe_bool_value(budget.get("same_host_service_cache_hit"), False)
+            service_roots = safe_int_value(budget.get("same_host_web_services_discovered"), 0)
+            service_seconds = safe_float_value(budget.get("same_host_service_discovery_seconds"), 0.0)
+            service_local_budget = safe_float_value(budget.get("same_host_service_time_budget_seconds"), 0.0)
+            service_global_budget = safe_float_value(budget.get("same_host_service_global_time_budget_seconds"), 0.0)
+            service_global_remaining = safe_float_value(budget.get("same_host_service_global_time_remaining_seconds"), 0.0)
+            service_time_exhausted = safe_bool_value(budget.get("same_host_service_time_budget_exhausted"), False)
+            expansion_hosts = safe_int_value(budget.get("same_host_service_expansion_hosts_scanned"), 0)
+            expansion_reused = safe_int_value(budget.get("same_host_service_expansion_hosts_reused_cached"), 0)
+            expansion_deferred = safe_int_value(budget.get("same_host_service_expansion_hosts_deferred_time_budget"), 0)
+            expansion_failed_preprobe = safe_int_value(budget.get("same_host_service_expansion_hosts_failed_before_probe"), 0)
+            expansion_considered = safe_int_value(budget.get("same_host_service_expansion_hosts_considered"), 0)
+            expansion_observed = safe_int_value(budget.get("same_host_service_expansion_hosts_observed"), 0)
+            expansion_ports = safe_int_value(budget.get("same_host_service_expansion_ports_probed"), 0)
+            expansion_reused_ports = safe_int_value(budget.get("same_host_service_expansion_reused_ports_probed"), 0)
+            expansion_deferred_candidates = safe_int_value(budget.get("same_host_service_expansion_candidate_ports_deferred"), 0)
+            expansion_tcp_attempts = safe_int_value(budget.get("same_host_service_expansion_tcp_connection_attempts"), 0)
+            expansion_resolved_addresses = safe_int_value(budget.get("same_host_service_expansion_resolved_address_count"), 0)
+            expansion_classification_deferred = safe_int_value(budget.get("same_host_service_expansion_classification_deferred_ports"), 0)
+            expansion_roots = safe_int_value(budget.get("same_host_service_expansion_web_services_discovered"), 0)
+            expansion_candidate_budget = safe_int_value(budget.get("same_host_service_expansion_candidate_budget"), 0)
+            expansion_candidate_consumed = safe_int_value(budget.get("same_host_service_expansion_candidate_budget_consumed"), expansion_ports)
+            expansion_candidate_remaining = safe_int_value(budget.get("same_host_service_expansion_candidate_budget_remaining"), max(0, expansion_candidate_budget - expansion_candidate_consumed))
             expansion_time_policy = str(budget.get("same_host_service_expansion_time_allocation_policy") or "").strip()
             if service_ports or service_roots or budget.get("discover_same_host_services"):
                 timing = ""
@@ -304,7 +302,7 @@ def _context_summary_html(context: dict[str, Any], toc: list[tuple[int, str, str
                     f"remaining {max(0.0, service_global_remaining):.1f}s"
                 )
             rows.append(("Discovery budget", _esc(" | ".join(pieces))))
-            out_scope_count = int(budget.get("out_of_scope_urls_skipped", 0) or 0)
+            out_scope_count = safe_int_value(budget.get("out_of_scope_urls_skipped"), 0)
             out_scope_origins = budget.get("out_of_scope_origins_observed") if isinstance(budget.get("out_of_scope_origins_observed"), list) else []
             if out_scope_count or out_scope_origins:
                 preview = ", ".join(str(value) for value in out_scope_origins[:6])
@@ -314,8 +312,8 @@ def _context_summary_html(context: dict[str, Any], toc: list[tuple[int, str, str
                     text += f": {preview}{suffix}"
                 rows.append(("Out-of-scope observations", _esc(text)))
             browser_external_origins = budget.get("browser_external_origins_observed") if isinstance(budget.get("browser_external_origins_observed"), list) else []
-            browser_external_requests = int(budget.get("browser_external_subresource_requests", 0) or 0)
-            browser_blocked_navigations = int(budget.get("browser_external_navigation_requests_blocked", 0) or 0)
+            browser_external_requests = safe_int_value(budget.get("browser_external_subresource_requests"), 0)
+            browser_blocked_navigations = safe_int_value(budget.get("browser_external_navigation_requests_blocked"), 0)
             if browser_external_origins or browser_external_requests or browser_blocked_navigations:
                 preview = ", ".join(str(value) for value in browser_external_origins[:6])
                 suffix = f", +{len(browser_external_origins) - 6} more" if len(browser_external_origins) > 6 else ""
@@ -433,7 +431,7 @@ def _render_severity_legend(toc: list[tuple[int, str, str]], context_value: dict
         for name, color, desc in SEVERITY_DEFINITIONS
     )
     ai_assessment = context_value.get("ai_analysis", {}) if isinstance(context_value, dict) else {}
-    assessed = int(ai_assessment.get("analyzed_findings", 0) or 0) if isinstance(ai_assessment, dict) else 0
+    assessed = safe_int_value(ai_assessment.get("analyzed_findings", 0), 0) if isinstance(ai_assessment, dict) else 0
     if assessed:
         methodology = (
             '<p class="section-note">For this agentic run, severity, description, security impact and recommended '

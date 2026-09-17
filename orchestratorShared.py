@@ -45,28 +45,39 @@ with warnings.catch_warnings():
         # Keep lightweight CLI surfaces such as --help/--list-tools available before the
         # runtime environment is initialized. Live preflight reports the missing dependency.
         Client = None  # type: ignore[assignment,misc]
-from utils import apply_runtime_target_preparation, absolute_url, atomic_write_text, canonical_cookie_header, cookie_header_fingerprint, cookie_names, load_runtime_config, normalize_url, normalized_origin, normalized_hostname, parse_cookie_header, request_same_origin_redirects, request_contract_state_change_reason, ROOT_DIR, same_origin, sanitize_discovered_url, scanner_session_probe, secops_source_fingerprint, request_body_fingerprint, SERVERS_DIR, target_runtime_profile, url_in_authorized_scope as _url_in_explicit_scope, MCP_UNIFIED_SERVICE, mcp_http_port, mcp_http_url, scanner_request_rate, runtime_request_rate_policy, MAX_AUTHENTICATED_IDENTITIES, valid_identity_label
+from utils import apply_runtime_target_preparation, absolute_url, atomic_write_text, canonical_cookie_header, cookie_header_fingerprint, cookie_names, load_runtime_config, normalize_url, normalized_origin, normalized_hostname, parse_cookie_header, request_same_origin_redirects, request_contract_state_change_reason, ROOT_DIR, same_origin, sanitize_discovered_url, scanner_session_probe, secops_source_fingerprint, request_body_fingerprint, SERVERS_DIR, target_runtime_profile, url_in_authorized_scope as _url_in_explicit_scope, MCP_UNIFIED_SERVICE, mcp_http_port, mcp_http_url, scanner_request_rate, runtime_request_rate_policy, MAX_AUTHENTICATED_IDENTITIES, valid_identity_label, safe_int_value, safe_bool_value, safe_float_value
 from targetAuth import BrowserLoginError, _capture_storage_state, _looks_like_application_login_entry, browser_oidc_login_session
 ROOT = Path(ROOT_DIR).resolve()
 SERVERS = Path(SERVERS_DIR).resolve()
 RUNTIME_FILE = ROOT / '.secops_runtime.json'
 UNIFIED_MCP_SERVER = 'secopsServer.py'
 LOCAL_BIN = Path.home() / '.local' / 'bin'
-MCP_CONNECT_TIMEOUT = float(os.getenv('SECOPS_MCP_CONNECT_TIMEOUT', '20'))
-MCP_TOOL_TIMEOUT = float(os.getenv('SECOPS_MCP_TIMEOUT', '1200'))
-MCP_REPORT_MAX_BYTES = max(1024 * 1024, int(os.getenv('SECOPS_MCP_REPORT_MAX_BYTES', str(64 * 1024 * 1024))))
-MCP_REPORT_INLINE_MAX_BYTES = min(MCP_REPORT_MAX_BYTES, max(65536, int(os.getenv('SECOPS_MCP_REPORT_INLINE_MAX_BYTES', str(128 * 1024)))))
-MCP_REPORT_CHUNK_BYTES = min(512 * 1024, max(16384, int(os.getenv('SECOPS_MCP_REPORT_CHUNK_BYTES', str(64 * 1024)))))
-MCP_REPORT_MAX_CHUNKS = max(8, int(os.getenv('SECOPS_REPORT_UPLOAD_MAX_CHUNKS', '2048')))
-MCP_REPORT_CHUNK_TIMEOUT = max(30.0, float(os.getenv('SECOPS_MCP_REPORT_CHUNK_TIMEOUT', '120')))
-MCP_REPORT_TRANSFER_TIMEOUT = max(MCP_REPORT_CHUNK_TIMEOUT, float(os.getenv('SECOPS_MCP_REPORT_TRANSFER_TIMEOUT', '900')))
-MCP_REPORT_PDF_TIMEOUT_HINT = max(300.0, float(os.getenv('SECOPS_REPORT_PDF_TIMEOUT', '3600')))
-MCP_REPORT_RENDER_TIMEOUT = max(MCP_TOOL_TIMEOUT, MCP_REPORT_PDF_TIMEOUT_HINT + 300.0, float(os.getenv('SECOPS_MCP_REPORT_RENDER_TIMEOUT', '4200')))
-MCP_REPORT_RENDER_SECONDS_PER_MIB = max(0.0, float(os.getenv('SECOPS_MCP_REPORT_RENDER_SECONDS_PER_MIB', '60')))
-MCP_REPORT_RENDER_TIMEOUT_MAX = max(MCP_REPORT_RENDER_TIMEOUT, float(os.getenv('SECOPS_MCP_REPORT_RENDER_TIMEOUT_MAX', '7200')))
-MCP_ZAP_SHARED_WAIT_MULTIPLIER = max(0.0, float(os.getenv('SECOPS_ZAP_SHARED_WAIT_MULTIPLIER', '1.0')))
-MAX_PARAMETER_ENDPOINTS = max(1, int(os.getenv('SECOPS_MAX_PARAMETER_ENDPOINTS', '5')))
-TERMINAL_URL_MAX = max(120, int(os.getenv('SECOPS_TERMINAL_URL_MAX', '240')))
+MCP_CONNECT_TIMEOUT = safe_float_value(os.getenv('SECOPS_MCP_CONNECT_TIMEOUT', '20'), 20.0)
+MCP_TOOL_TIMEOUT = safe_float_value(os.getenv('SECOPS_MCP_TIMEOUT', '1200'), 1200.0)
+MCP_SCANNER_RETURN_GRACE_SECONDS = max(15.0, safe_float_value(os.getenv('SECOPS_MCP_SCANNER_RETURN_GRACE_SECONDS', '60'), 60.0))
+MCP_ZAP_RETURN_GRACE_SECONDS = max(30.0, safe_float_value(os.getenv('SECOPS_MCP_ZAP_RETURN_GRACE_SECONDS', '90'), 90.0))
+MCP_REPORT_MAX_BYTES = max(1024 * 1024, safe_int_value(os.getenv('SECOPS_MCP_REPORT_MAX_BYTES', str(64 * 1024 * 1024)), 64 * 1024 * 1024))
+MCP_REPORT_INLINE_MAX_BYTES = min(MCP_REPORT_MAX_BYTES, max(65536, safe_int_value(os.getenv('SECOPS_MCP_REPORT_INLINE_MAX_BYTES', str(128 * 1024)), 128 * 1024)))
+MCP_REPORT_CHUNK_BYTES = min(512 * 1024, max(16384, safe_int_value(os.getenv('SECOPS_MCP_REPORT_CHUNK_BYTES', str(64 * 1024)), 64 * 1024)))
+MCP_REPORT_MAX_CHUNKS = max(8, safe_int_value(os.getenv('SECOPS_REPORT_UPLOAD_MAX_CHUNKS', '2048'), 2048))
+MCP_REPORT_CHUNK_TIMEOUT = max(30.0, safe_float_value(os.getenv('SECOPS_MCP_REPORT_CHUNK_TIMEOUT', '120'), 120.0))
+MCP_REPORT_TRANSFER_TIMEOUT = max(MCP_REPORT_CHUNK_TIMEOUT, safe_float_value(os.getenv('SECOPS_MCP_REPORT_TRANSFER_TIMEOUT', '900'), 900.0))
+MCP_REPORT_PDF_TIMEOUT_HINT = max(300.0, safe_float_value(os.getenv('SECOPS_REPORT_PDF_TIMEOUT', '3600'), 3600.0))
+MCP_REPORT_RENDER_TIMEOUT = max(MCP_TOOL_TIMEOUT, MCP_REPORT_PDF_TIMEOUT_HINT + 300.0, safe_float_value(os.getenv('SECOPS_MCP_REPORT_RENDER_TIMEOUT', '4200'), 4200.0))
+MCP_REPORT_RENDER_SECONDS_PER_MIB = max(0.0, safe_float_value(os.getenv('SECOPS_MCP_REPORT_RENDER_SECONDS_PER_MIB', '60'), 60.0))
+MCP_REPORT_RENDER_TIMEOUT_MAX = max(MCP_REPORT_RENDER_TIMEOUT, safe_float_value(os.getenv('SECOPS_MCP_REPORT_RENDER_TIMEOUT_MAX', '7200'), 7200.0))
+# TEST verifies that report transport/rendering works, but must never inherit the multi-hour normal
+# report watchdog. The report server receives the same scan_mode and applies the render ceiling to
+# the actual WeasyPrint subprocess as well, so a cancelled HTTP request cannot leave it running for hours.
+TEST_REPORT_TRANSFER_TIMEOUT_SECONDS = max(30.0, safe_float_value(os.getenv('SECOPS_TEST_REPORT_TRANSFER_TIMEOUT', '60'), 60.0))
+TEST_REPORT_RENDER_TIMEOUT_SECONDS = max(60.0, safe_float_value(os.getenv('SECOPS_TEST_REPORT_RENDER_TIMEOUT', '180'), 180.0))
+# The generic MCP timeout is intentionally generous for normal assessments, but TEST is a smoke
+# profile and must not inherit a 20-minute control-plane watchdog. This ceiling applies only to
+# the requested MCP wait; scanner cleanup/serialization grace is added separately below.
+TEST_MCP_AUX_REQUEST_TIMEOUT_SECONDS = max(30.0, safe_float_value(os.getenv('SECOPS_TEST_MCP_AUX_REQUEST_TIMEOUT', '60'), 60.0))
+MCP_ZAP_SHARED_WAIT_MULTIPLIER = max(0.0, safe_float_value(os.getenv('SECOPS_ZAP_SHARED_WAIT_MULTIPLIER', '1.0'), 1.0))
+MAX_PARAMETER_ENDPOINTS = max(1, safe_int_value(os.getenv('SECOPS_MAX_PARAMETER_ENDPOINTS', '5'), 5))
+TERMINAL_URL_MAX = max(120, safe_int_value(os.getenv('SECOPS_TERMINAL_URL_MAX', '240'), 240))
 
 MAX_REQUEST_RATE = scanner_request_rate()
 REQUEST_INTERVAL_SECONDS = 1.0 / MAX_REQUEST_RATE
@@ -89,6 +100,17 @@ def _pace_http_request(deadline: float | None = None) -> bool:
             return False
         _LAST_HTTP_REQUEST_AT = time.monotonic()
         return True
+
+
+# Converts untrusted numeric metadata without letting a malformed scanner/MCP field abort an
+# orchestrator node after the scanner itself has already returned. Booleans are deliberately
+# rejected because Python otherwise treats True/False as integers 1/0.
+def safe_int_metadata(value: Any, default: int=0) -> int:
+    return safe_int_value(value, default)
+
+
+def safe_bool_metadata(value: Any, default: bool=False) -> bool:
+    return safe_bool_value(value, default)
 
 
 # Keeps terminal output readable without altering the full URL stored in results, JSON or reports.
@@ -119,34 +141,45 @@ def compact_log_url(value: Any, max_length: int | None=None) -> str:
     except Exception:
         pass
     return text[:limit - 3] + '...'
-MAX_ARJUN_ENDPOINTS = max(1, int(os.getenv('SECOPS_MAX_ARJUN_ENDPOINTS', '12')))
-MAX_CRAWL_PAGES = max(10, int(os.getenv('SECOPS_MAX_CRAWL_PAGES', '2200')))
-MAX_SCRIPT_ASSETS = max(4, int(os.getenv('SECOPS_MAX_SCRIPT_ASSETS', '1200')))
-SCANNER_PROGRESS_INTERVAL = max(10, int(os.getenv('SECOPS_PROGRESS_INTERVAL', '30')))
+MAX_ARJUN_ENDPOINTS = max(1, safe_int_value(os.getenv('SECOPS_MAX_ARJUN_ENDPOINTS', '12'), 12))
+MAX_CRAWL_PAGES = max(10, safe_int_value(os.getenv('SECOPS_MAX_CRAWL_PAGES', '2200'), 2200))
+MAX_SCRIPT_ASSETS = max(4, safe_int_value(os.getenv('SECOPS_MAX_SCRIPT_ASSETS', '1200'), 1200))
+SCANNER_PROGRESS_INTERVAL = max(10, safe_int_value(os.getenv('SECOPS_PROGRESS_INTERVAL', '30'), 30))
+TEST_SCANNER_TIMEOUT_SECONDS = 10
+TEST_DISCOVERY_TIME_BUDGET_SECONDS = 8
+
 DISCOVERY_LIMITS = {
+    'test': {'crawl_pages': 8, 'crawl_pages_max': 12, 'browser_pages': 4, 'browser_pages_max': 6, 'browser_per_origin_pages': 6, 'browser_menu_clicks_per_page': 2, 'browser_dom_passes': 1, 'scripts': 8, 'route_variants': 2, 'per_origin_pages': 8, 'same_host_service_candidates': 32, 'same_host_service_time_budget_seconds': TEST_DISCOVERY_TIME_BUDGET_SECONDS, 'same_host_service_initial_time_budget_seconds': 4, 'same_host_service_expansion_hosts': 2, 'same_host_service_expansion_recrawl_pages': 4},
     'fast': {'crawl_pages': 120, 'crawl_pages_max': 220, 'browser_pages': 72, 'browser_pages_max': 200, 'browser_per_origin_pages': 180, 'browser_menu_clicks_per_page': 16, 'browser_dom_passes': 3, 'scripts': 128, 'route_variants': 8, 'per_origin_pages': 190, 'same_host_service_candidates': 4096, 'same_host_service_time_budget_seconds': 240, 'same_host_service_initial_time_budget_seconds': 120, 'same_host_service_expansion_hosts': 8, 'same_host_service_expansion_recrawl_pages': 24},
     'balanced': {'crawl_pages': 600, 'crawl_pages_max': 1100, 'browser_pages': 400, 'browser_pages_max': 1200, 'browser_per_origin_pages': 1000, 'browser_menu_clicks_per_page': 64, 'browser_dom_passes': 6, 'scripts': 640, 'route_variants': 20, 'per_origin_pages': 900, 'same_host_service_candidates': 32768, 'same_host_service_time_budget_seconds': 720, 'same_host_service_initial_time_budget_seconds': 360, 'same_host_service_expansion_hosts': 32, 'same_host_service_expansion_recrawl_pages': 90},
     'deep': {'crawl_pages': 1200, 'crawl_pages_max': 2200, 'browser_pages': 800, 'browser_pages_max': 2400, 'browser_per_origin_pages': 2000, 'browser_menu_clicks_per_page': 112, 'browser_dom_passes': 9, 'scripts': 1200, 'route_variants': 32, 'per_origin_pages': 1800, 'same_host_service_candidates': 65535, 'same_host_service_time_budget_seconds': 1200, 'same_host_service_initial_time_budget_seconds': 600, 'same_host_service_expansion_hosts': 128, 'same_host_service_expansion_recrawl_pages': 180},
 }
-HTTP_ATTEMPT_BUDGET_FACTORS = {'fast': 1.75, 'balanced': 2.0, 'deep': 2.0}
-SCRIPT_ATTEMPT_BUDGET_FACTORS = {'fast': 1.5, 'balanced': 1.75, 'deep': 1.75}
+HTTP_ATTEMPT_BUDGET_FACTORS = {'test': 1.0, 'fast': 1.75, 'balanced': 2.0, 'deep': 2.0}
+SCRIPT_ATTEMPT_BUDGET_FACTORS = {'test': 1.0, 'fast': 1.5, 'balanced': 1.75, 'deep': 1.75}
 # Chromium discovery has both a page ceiling and a wall-clock ceiling. The time budget scales with
 # the configured base navigation budget instead of being a second unrelated magic-number table.
 # Four seconds/base page is intentionally generous for normal local/intranet pages while preventing
 # pathological navigation retries or slow SPAs from turning a bounded crawl into an unbounded run.
 BROWSER_DISCOVERY_SECONDS_PER_BASE_PAGE = 4.0
 BROWSER_DISCOVERY_MIN_SECONDS = 120.0
-FINAL_BROWSER_VERIFICATION_LIMITS = {'fast': 12, 'balanced': 96, 'deep': 200}
-FINAL_BROWSER_VERIFICATION_MAX_LIMITS = {'fast': 20, 'balanced': 160, 'deep': 320}
-JWT_TOKEN_LIMITS = {'fast': 16, 'balanced': 64, 'deep': 192}
+BROWSER_DISCOVERY_MIN_SECONDS_BY_MODE = {'test': float(TEST_DISCOVERY_TIME_BUDGET_SECONDS)}
+FINAL_BROWSER_VERIFICATION_LIMITS = {'test': 2, 'fast': 12, 'balanced': 96, 'deep': 200}
+FINAL_BROWSER_VERIFICATION_MAX_LIMITS = {'test': 3, 'fast': 20, 'balanced': 160, 'deep': 320}
+JWT_TOKEN_LIMITS = {'test': 4, 'fast': 16, 'balanced': 64, 'deep': 192}
 # Deterministic broad scans use bounded sibling-origin reference/adaptive limits.
 # Agentic planning receives the complete authorized observed-origin ranking as concrete broad actions;
 # execution ceilings are applied only after AI selection.
-BROAD_SIBLING_ORIGIN_BASE_LIMITS = {'fast': 6, 'balanced': 32, 'deep': 64}
-BROAD_SIBLING_ORIGIN_MAX_LIMITS = {'fast': 12, 'balanced': 64, 'deep': 128}
+BROAD_SIBLING_ORIGIN_BASE_LIMITS = {'test': 1, 'fast': 6, 'balanced': 32, 'deep': 64}
+BROAD_SIBLING_ORIGIN_MAX_LIMITS = {'test': 2, 'fast': 12, 'balanced': 64, 'deep': 128}
 BROAD_SIBLING_ADAPTIVE_RATIO = 0.75
-BROAD_SIBLING_TIMEOUT_FACTORS = {'fast': 0.55, 'balanced': 0.75, 'deep': 0.85}
+BROAD_SIBLING_TIMEOUT_FACTORS = {'test': 1.0, 'fast': 0.55, 'balanced': 0.75, 'deep': 0.85}
 SCAN_MODES = {
+    'test': {
+        'broad': {'zap': TEST_SCANNER_TIMEOUT_SECONDS, 'nuclei': TEST_SCANNER_TIMEOUT_SECONDS, 'nikto': TEST_SCANNER_TIMEOUT_SECONDS, 'ffuf': TEST_SCANNER_TIMEOUT_SECONDS, 'session': TEST_SCANNER_TIMEOUT_SECONDS},
+        'parameter': {'sqlmap': TEST_SCANNER_TIMEOUT_SECONDS, 'dalfox': TEST_SCANNER_TIMEOUT_SECONDS, 'commix': TEST_SCANNER_TIMEOUT_SECONDS, 'traversal': TEST_SCANNER_TIMEOUT_SECONDS, 'idor': TEST_SCANNER_TIMEOUT_SECONDS, 'authorization': TEST_SCANNER_TIMEOUT_SECONDS, 'browser': TEST_SCANNER_TIMEOUT_SECONDS, 'workflow': TEST_SCANNER_TIMEOUT_SECONDS},
+        'limits': {'sqlmap': 1, 'dalfox': 1, 'commix': 1, 'traversal': 2, 'idor': 1, 'authorization': 2, 'browser': 2, 'workflow': 1},
+        'arjun': TEST_SCANNER_TIMEOUT_SECONDS, 'arjun_limit': 2,
+    },
     'fast': {
         'broad': {'zap': 120, 'nuclei': 240, 'nikto': 60, 'ffuf': 50, 'session': 25},
         'parameter': {'sqlmap': 75, 'dalfox': 45, 'commix': 90, 'traversal': 35, 'idor': 18, 'authorization': 30, 'browser': 45, 'workflow': 40},
@@ -174,6 +207,7 @@ SCAN_MODES = {
 # Specialist budgets have a fixed base and a bounded adaptive overflow. The overflow is
 # available only to high-value deferred request contracts selected by deterministic ranking.
 ADAPTIVE_SPECIALIST_OVERFLOW = {
+    'test': {'arjun': 0, 'sqlmap': 0, 'dalfox': 0, 'commix': 0, 'traversal': 0, 'idor': 0, 'authorization': 0, 'browser': 0, 'workflow': 0},
     'fast': {'arjun': 4, 'sqlmap': 2, 'dalfox': 3, 'commix': 2, 'traversal': 4, 'idor': 2, 'authorization': 4, 'browser': 4, 'workflow': 3},
     'balanced': {'arjun': 64, 'sqlmap': 48, 'dalfox': 64, 'commix': 48, 'traversal': 64, 'idor': 48, 'authorization': 72, 'browser': 72, 'workflow': 56},
     'deep': {'arjun': 112, 'sqlmap': 96, 'dalfox': 112, 'commix': 96, 'traversal': 112, 'idor': 96, 'authorization': 128, 'browser': 128, 'workflow': 112},
@@ -181,17 +215,18 @@ ADAPTIVE_SPECIALIST_OVERFLOW = {
 # Routing parameters that select internal files/modules are a high-confidence traversal/LFI class.
 # A separate bounded reserve prevents large menus from starving these contracts behind unrelated
 # request variants while retaining the normal specialist ranking for every other case.
-ROUTING_TRAVERSAL_RESERVE = {'fast': 32, 'balanced': 192, 'deep': 320}
+ROUTING_TRAVERSAL_RESERVE = {'test': 2, 'fast': 32, 'balanced': 192, 'deep': 320}
 # Discovery may retain more value variants so later reasoning can see them, while request-level
 # scanners use a smaller cap for equivalent method/path/parameter shapes. Traversal is the explicit
 # exception because routing values that select different local resources receive distinct signatures.
-SPECIALIST_ROUTE_VARIANT_LIMITS = {'fast': 2, 'balanced': 4, 'deep': 6}
+SPECIALIST_ROUTE_VARIANT_LIMITS = {'test': 1, 'fast': 2, 'balanced': 4, 'deep': 6}
 GENERIC_LIVE_INPUT_RESERVE = {
+    'test': {'sqlmap': 1, 'dalfox': 1, 'commix': 1},
     'fast': {'sqlmap': 4, 'dalfox': 6, 'commix': 2},
     'balanced': {'sqlmap': 96, 'dalfox': 128, 'commix': 64},
     'deep': {'sqlmap': 160, 'dalfox': 192, 'commix': 96},
 }
-SAFE_SURFACE_SWEEP_LIMITS = {'fast': 800, 'balanced': 6000, 'deep': 15000}
+SAFE_SURFACE_SWEEP_LIMITS = {'test': 32, 'fast': 800, 'balanced': 6000, 'deep': 15000}
 SAFE_SURFACE_SWEEP_TIMEOUT_FACTOR = 0.25
 ADAPTIVE_HIGH_VALUE_PATH_HINTS = ('/api/', '/admin/', 'management', 'search', 'query', 'upload', 'download', 'callback', 'webhook', 'config', 'settings', 'profile', 'account')
 AUTHORIZED_SCOPE_ORIGINS: set[str] = set()
@@ -211,18 +246,18 @@ RUNTIME_TARGET_AUTH_STATES: dict[str, dict[str, Any]] = {}
 RUNTIME_AUTH_COOKIE_TO_REFERENCE: dict[str, str] = {}
 RUNTIME_AUTH_AMBIGUOUS_FINGERPRINTS: set[str] = set()
 RUNTIME_PRIMARY_IDENTITY_COOKIE = ''
-RUNTIME_AUTH_ORIGIN_LIMITS = {'fast': 12, 'balanced': 32, 'deep': 64}
+RUNTIME_AUTH_ORIGIN_LIMITS = {'test': 2, 'fast': 12, 'balanced': 32, 'deep': 64}
 # One authenticated enrichment pass must be bounded globally; otherwise a 60s browser timeout can
 # multiply by every discovered same-host service/application. Deferred origins remain eligible in
 # later passes, so this limits wall-clock amplification without marking them permanently failed.
-RUNTIME_AUTH_PASS_TIMEOUTS = {'fast': 180, 'balanced': 720, 'deep': 1800}
+RUNTIME_AUTH_PASS_TIMEOUTS = {'test': TEST_DISCOVERY_TIME_BUDGET_SECONDS, 'fast': 180, 'balanced': 720, 'deep': 1800}
 # Candidate application entry points are bounded per origin/root, but the login helper shares one
 # total deadline across all entries. This keeps authentication bounded while avoiding an arbitrary
 # fixed top-8 window on larger applications.
-RUNTIME_AUTH_ENTRY_CANDIDATE_LIMITS = {'fast': 6, 'balanced': 12, 'deep': 16}
-RUNTIME_AUTH_RECRAWL_PAGES = {'fast': 36, 'balanced': 90, 'deep': 180}
-RUNTIME_AUTH_APPLICATION_LIMITS = {'fast': 6, 'balanced': 18, 'deep': 36}
-RUNTIME_AUTH_APPLICATION_RECRAWL_PAGES = {'fast': 24, 'balanced': 72, 'deep': 150}
+RUNTIME_AUTH_ENTRY_CANDIDATE_LIMITS = {'test': 2, 'fast': 6, 'balanced': 12, 'deep': 16}
+RUNTIME_AUTH_RECRAWL_PAGES = {'test': 4, 'fast': 36, 'balanced': 90, 'deep': 180}
+RUNTIME_AUTH_APPLICATION_LIMITS = {'test': 2, 'fast': 6, 'balanced': 18, 'deep': 36}
+RUNTIME_AUTH_APPLICATION_RECRAWL_PAGES = {'test': 4, 'fast': 24, 'balanced': 72, 'deep': 150}
 RUNTIME_AUTH_APPLICATION_ATTEMPTS: dict[str, dict[str, Any]] = {}
 CURRENT_SCAN_MODE = 'balanced'
 BROAD_SCANNER_TIMEOUTS = dict(SCAN_MODES[CURRENT_SCAN_MODE]['broad'])
@@ -230,6 +265,23 @@ PARAMETER_TOOL_TIMEOUTS = dict(SCAN_MODES[CURRENT_SCAN_MODE]['parameter'])
 PARAMETER_TOOL_CASE_LIMITS = dict(SCAN_MODES[CURRENT_SCAN_MODE]['limits'])
 ARJUN_TIMEOUT = int(SCAN_MODES[CURRENT_SCAN_MODE]['arjun'])
 ARJUN_ENDPOINT_LIMIT = int(SCAN_MODES[CURRENT_SCAN_MODE].get('arjun_limit', 1))
+
+
+def oast_timeout_seconds(oast_class: str='remote-fetch') -> int:
+    """Return the bounded Interactsh action timeout for the active scan profile.
+
+    TEST is deliberately capped at the same 10-second action budget as every other scanner.
+    Keeping this policy in one place prevents debug/single-tool paths from silently inheriting
+    the normal 45--75 second waits.
+    """
+    if CURRENT_SCAN_MODE == 'test':
+        return TEST_SCANNER_TIMEOUT_SECONDS
+    normalized = str(oast_class or 'remote-fetch').strip().lower()
+    if normalized == 'explicit':
+        return 120 if CURRENT_SCAN_MODE == 'deep' else 75
+    if normalized == 'command':
+        return 75 if CURRENT_SCAN_MODE == 'deep' else 55
+    return 60 if CURRENT_SCAN_MODE == 'deep' else 45
 
 # Configures the explicit HTTP scope extension for this process; same-origin remains allowed by default.
 def configure_authorized_scope(
@@ -370,7 +422,7 @@ def _runtime_storage_cookie_header(candidate: str, identity_cookies: str='') -> 
                 continue
         elif host != domain:
             continue
-        if bool(row.get('secure')) and not secure_request:
+        if safe_bool_metadata(row.get('secure'), False) and not secure_request:
             continue
         raw_expires = row.get('expires', -1)
         try:
@@ -783,7 +835,7 @@ def final_xss_verification_priority(finding: dict[str, Any], case: dict[str, Any
     response = case.get('browser_response') if isinstance(case.get('browser_response'), dict) else {}
     if response.get('observed') is True:
         try:
-            status = int(response.get('status') or 0)
+            status = safe_int_metadata(response.get('status'), 0)
         except (TypeError, ValueError):
             status = 0
         if 200 <= status < 400:
@@ -853,12 +905,12 @@ def tool_action_limit(tool: str, include_adaptive: bool=False) -> int:
     if name == 'arjun':
         return adaptive_tool_max_limit(name) if include_adaptive else ARJUN_ENDPOINT_LIMIT
     if name == 'interactsh':
-        return 4 if CURRENT_SCAN_MODE == 'deep' else 3 if CURRENT_SCAN_MODE == 'balanced' else 1
+        return 1 if CURRENT_SCAN_MODE == 'test' else 4 if CURRENT_SCAN_MODE == 'deep' else 3 if CURRENT_SCAN_MODE == 'balanced' else 1
     if name == 'jwt':
         return jwt_token_limit()
     if name in {'zap', 'nuclei', 'nikto'}:
         # One primary-origin run plus the maximum bounded sibling page for this round.
-        return 17 if CURRENT_SCAN_MODE == 'deep' else 9 if CURRENT_SCAN_MODE == 'balanced' else 4
+        return 2 if CURRENT_SCAN_MODE == 'test' else 17 if CURRENT_SCAN_MODE == 'deep' else 9 if CURRENT_SCAN_MODE == 'balanced' else 4
     if name in PARAMETER_TOOL_CASE_LIMITS:
         limit = adaptive_tool_max_limit(name) if include_adaptive else PARAMETER_TOOL_CASE_LIMITS[name]
         if name == 'traversal' and include_adaptive:
@@ -994,7 +1046,7 @@ _HTTP_SERVER_PROCESSES: dict[str, subprocess.Popen] = {}
 _VERIFIED_MCP_FINGERPRINTS: dict[str, str] = {}
 _HTTP_SERVER_LOGS: dict[str, Path] = {}
 _MCP_PROCESS_LEASE_REGISTERED = False
-MCP_LIFECYCLE_LOCK_TIMEOUT = max(5.0, float(os.getenv('SECOPS_MCP_LIFECYCLE_LOCK_TIMEOUT', '30')))
+MCP_LIFECYCLE_LOCK_TIMEOUT = max(5.0, safe_float_value(os.getenv('SECOPS_MCP_LIFECYCLE_LOCK_TIMEOUT', '30'), 30.0))
 
 def _mcp_lifecycle_directory() -> Path:
     directory = ROOT / '.secops_tmp' / 'mcp-http'
@@ -1257,9 +1309,15 @@ def _server_report_progress_log() -> str:
 
 # Gives report rendering a dedicated budget independent from ordinary scanner calls.
 def _report_render_timeout(payload_bytes: int) -> float:
+    if CURRENT_SCAN_MODE == 'test':
+        return float(TEST_REPORT_RENDER_TIMEOUT_SECONDS)
     mib = max(1, math.ceil(max(0, int(payload_bytes)) / float(1024 * 1024)))
     adaptive = MCP_REPORT_RENDER_TIMEOUT + (mib * MCP_REPORT_RENDER_SECONDS_PER_MIB)
     return min(MCP_REPORT_RENDER_TIMEOUT_MAX, max(MCP_REPORT_RENDER_TIMEOUT, adaptive))
+
+
+def _report_transfer_timeout() -> float:
+    return float(TEST_REPORT_TRANSFER_TIMEOUT_SECONDS if CURRENT_SCAN_MODE == 'test' else MCP_REPORT_TRANSFER_TIMEOUT)
 
 # Waits for a long report tool call while emitting terminal heartbeats and the latest server stage.
 async def _await_report_tool(client: Client, tool_name: str, arguments: dict[str, Any], *, timeout: float, label: str) -> Any:
@@ -1390,7 +1448,10 @@ def _http_transport_failure(exc: BaseException) -> bool:
 
 # Extracts the structured tool payload from an MCP response.
 def _extract_response(response: Any) -> tuple[Any, bool, str]:
-    is_error = bool(getattr(response, 'is_error', False) or getattr(response, 'isError', False))
+    raw_is_error = getattr(response, 'is_error', None)
+    if raw_is_error is None:
+        raw_is_error = getattr(response, 'isError', False)
+    is_error = safe_bool_metadata(raw_is_error, False)
     for name in ('data', 'structured_content', 'structuredContent'):
         value = getattr(response, name, None)
         if value is not None:
@@ -1435,7 +1496,7 @@ def _finding_counts(result: dict[str, Any]) -> tuple[int, int, int]:
 def _is_time_limited(result: dict[str, Any]) -> bool:
     diagnosis = str(result.get('diagnosis', '')).lower()
     text = ' '.join((str(result.get(key, '')) for key in ('output', 'stderr', 'stdout'))).lower()
-    return bool(result.get('timed_out') or diagnosis in TIME_LIMIT_DIAGNOSES or 'timeout' in diagnosis or ('timed out' in text) or ('time limit' in text) or ('time budget' in text))
+    return bool(safe_bool_metadata(result.get('timed_out'), False) or diagnosis in TIME_LIMIT_DIAGNOSES or 'timeout' in diagnosis or ('timed out' in text) or ('time limit' in text) or ('time budget' in text))
 
 # Keeps useful partial results while marking a run that reached its limit.
 def _normalize_time_limit(result: dict[str, Any], tool: str, target: str) -> dict[str, Any]:
@@ -1444,7 +1505,7 @@ def _normalize_time_limit(result: dict[str, Any], tool: str, target: str) -> dic
     # renderer/serialization error instead of rewriting it as a scan coverage timeout.
     if str(tool or '').lower() == 'report':
         return result
-    if result.get('hard_failure') or not _is_time_limited(result):
+    if safe_bool_metadata(result.get('hard_failure'), False) or not _is_time_limited(result):
         return result
     total, security, observations = _finding_counts(result)
     previous = str(result.get('diagnosis', ''))
@@ -1469,10 +1530,35 @@ def _normalize_result(data: Any, spec: ToolSpec, target: str, elapsed: float, is
     result.setdefault('tool', spec.name)
     result.setdefault('target', target)
     result.setdefault('output', '')
-    result.setdefault('vulnerabilities', [])
-    status = 'error' if is_error else str(result.get('status', 'success')).lower()
-    result['status'] = status if status in {'success', 'error', 'skipped', 'partial'} else 'error'
-    result['_meta'] = {'server': spec.server, 'resolved_server': str(resolve_server_path(spec.server, spec.tool)), 'mcp_server': str(resolve_server_path(UNIFIED_MCP_SERVER)), 'duration_seconds': round(elapsed, 3), 'response_shape': shape}
+    contract_warnings: list[str] = []
+    raw_vulnerabilities = result.get('vulnerabilities', [])
+    if not isinstance(raw_vulnerabilities, list):
+        contract_warnings.append(f'vulnerabilities had invalid type {type(raw_vulnerabilities).__name__}; replaced with an empty list')
+        raw_vulnerabilities = []
+    elif any(not isinstance(item, dict) for item in raw_vulnerabilities):
+        invalid_count = sum(1 for item in raw_vulnerabilities if not isinstance(item, dict))
+        contract_warnings.append(f'vulnerabilities contained {invalid_count} non-object item(s); invalid items were ignored')
+        raw_vulnerabilities = [item for item in raw_vulnerabilities if isinstance(item, dict)]
+    result['vulnerabilities'] = raw_vulnerabilities
+    for boolean_field in ('timed_out', 'time_limit_reached', 'hard_failure'):
+        if boolean_field in result:
+            original = result.get(boolean_field)
+            normalized = safe_bool_metadata(original, False)
+            if not isinstance(original, bool):
+                contract_warnings.append(f'{boolean_field} normalized from {original!r} to {normalized!r}')
+            result[boolean_field] = normalized
+    status = 'error' if is_error else str(result.get('status', 'success')).strip().lower()
+    if status not in {'success', 'error', 'skipped', 'partial'}:
+        contract_warnings.append(f'unknown status {status!r}; normalized to error')
+        status = 'error'
+    if contract_warnings and status == 'success':
+        status = 'partial'
+        result.setdefault('diagnosis', 'tool_result_contract_normalized')
+    result['status'] = status
+    existing_meta = result.get('_meta') if isinstance(result.get('_meta'), dict) else {}
+    result['_meta'] = {**existing_meta, 'server': spec.server, 'resolved_server': str(resolve_server_path(spec.server, spec.tool)), 'mcp_server': str(resolve_server_path(UNIFIED_MCP_SERVER)), 'duration_seconds': round(elapsed, 3), 'response_shape': shape}
+    if contract_warnings:
+        result['_meta']['contract_warnings'] = contract_warnings
     if result['status'] == 'error':
         result.setdefault('diagnosis', diagnose_error(str(result.get('output', ''))))
     return _normalize_time_limit(result, spec.name, target)
@@ -1513,6 +1599,36 @@ def _recover_nuclei_checkpoint(output_path: Path | None, target: str) -> dict[st
     return recovered
 
 
+def mcp_operation_timeout_seconds(spec_name: str, timeout_seconds: float, scanner_timeout_hint: float=0.0) -> float:
+    """Return the outer MCP watchdog for one tool invocation.
+
+    The watchdog is intentionally longer than the scanner's own deadline. A TEST scanner may use
+    its complete 10-second action budget and still needs time for MCP connection, process cleanup,
+    JSON serialization and the structured partial result to travel back to the orchestrator.
+    """
+    requested = max(0.0, float(timeout_seconds))
+    scanner = max(0.0, float(scanner_timeout_hint))
+    normalized_name = str(spec_name or '').lower()
+    # call_mcp()/call_mcp_with_progress() default to the generous global 1200s timeout. Without
+    # this TEST-specific clamp, a 10s scanner could still leave the smoke test waiting ~20 minutes
+    # if the MCP transport or child process stopped returning data. Keep enough time for connection
+    # and structured partial-result delivery, while preventing the generic default from leaking in.
+    if CURRENT_SCAN_MODE == 'test' and normalized_name != 'report':
+        requested = min(requested, TEST_MCP_AUX_REQUEST_TIMEOUT_SECONDS)
+    operation_timeout = max(
+        requested + MCP_CONNECT_TIMEOUT,
+        scanner + MCP_CONNECT_TIMEOUT + MCP_SCANNER_RETURN_GRACE_SECONDS if scanner else 0.0,
+    )
+    if normalized_name == 'zap' and scanner:
+        operation_timeout = max(
+            operation_timeout,
+            scanner * (1.0 + MCP_ZAP_SHARED_WAIT_MULTIPLIER) + MCP_CONNECT_TIMEOUT + MCP_ZAP_RETURN_GRACE_SECONDS,
+        )
+    if normalized_name == 'report':
+        operation_timeout = _report_transfer_timeout() + _report_render_timeout(0) + (2 * MCP_CONNECT_TIMEOUT)
+    return float(operation_timeout)
+
+
 # Calls one MCP tool and returns a normalized result.
 async def call_mcp(server_file: str, tool_name: str, arguments: dict[str, Any], timeout_seconds: float=MCP_TOOL_TIMEOUT) -> dict[str, Any]:
     spec = next((item for item in ALL_TOOLS if item.server == server_file and item.tool == tool_name), ToolSpec(tool_name, server_file, tool_name))
@@ -1549,16 +1665,17 @@ async def call_mcp(server_file: str, tool_name: str, arguments: dict[str, Any], 
         if len(chunks) > MCP_REPORT_MAX_CHUNKS:
             raise ValueError(f'Report MCP payload requires {len(chunks)} chunks, above the configured {MCP_REPORT_MAX_CHUNKS}-chunk safety ceiling.')
         transfer_started = time.monotonic()
+        transfer_timeout = _report_transfer_timeout()
         render_timeout = _report_render_timeout(len(encoded))
         print(
-            f'[REPORT HTTP] payload={len(encoded)} bytes; compressed={len(compressed)} bytes; chunks={len(chunks)}; chunk_size<={chunk_bytes} bytes; transfer budget={MCP_REPORT_TRANSFER_TIMEOUT:.0f}s; render budget={render_timeout:.0f}s.',
+            f'[REPORT HTTP] payload={len(encoded)} bytes; compressed={len(compressed)} bytes; chunks={len(chunks)}; chunk_size<={chunk_bytes} bytes; transfer budget={transfer_timeout:.0f}s; render budget={render_timeout:.0f}s.',
             flush=True,
         )
         try:
             for index, chunk in enumerate(chunks):
-                remaining = MCP_REPORT_TRANSFER_TIMEOUT - (time.monotonic() - transfer_started)
+                remaining = transfer_timeout - (time.monotonic() - transfer_started)
                 if remaining <= 0:
-                    raise TimeoutError(f'Report HTTP chunk transfer exceeded its {MCP_REPORT_TRANSFER_TIMEOUT:.0f}-second budget after {index}/{len(chunks)} chunks.')
+                    raise TimeoutError(f'Report HTTP chunk transfer exceeded its {transfer_timeout:.0f}-second budget after {index}/{len(chunks)} chunks.')
                 response = await asyncio.wait_for(
                     client.call_tool('upload_report_chunk', {
                         'upload_id': upload_id,
@@ -1574,7 +1691,7 @@ async def call_mcp(server_file: str, tool_name: str, arguments: dict[str, Any], 
                 if is_error or not isinstance(data, dict) or str(data.get('status', '')).lower() != 'success':
                     raise RuntimeError(f'Report chunk {index + 1}/{len(chunks)} was rejected: {data}')
                 print(
-                    f'[REPORT HTTP] chunk {index + 1}/{len(chunks)} accepted; compressed bytes received={int(data.get("received_compressed_bytes", 0) or 0)}.',
+                    f'[REPORT HTTP] chunk {index + 1}/{len(chunks)} accepted; compressed bytes received={safe_int_metadata(data.get("received_compressed_bytes"), 0)}.',
                     flush=True,
                 )
             transfer_elapsed = time.monotonic() - transfer_started
@@ -1644,21 +1761,7 @@ async def call_mcp(server_file: str, tool_name: str, arguments: dict[str, Any], 
         # The transport watchdog must never be shorter than the bounded scanner budget that was
         # deliberately selected for this invocation. Otherwise long DEEP/BALANCED scans can be
         # aborted by MCP even though the scanner itself still has valid time remaining.
-        operation_timeout = max(
-            float(timeout_seconds) + MCP_CONNECT_TIMEOUT,
-            scanner_timeout_hint + MCP_CONNECT_TIMEOUT + 60.0 if scanner_timeout_hint else 0.0,
-        )
-        if spec.name == 'zap' and scanner_timeout_hint:
-            # A shared long-lived ZAP daemon cannot safely run two session/context reconfigurations
-            # at once. Two assessments may still execute concurrently: only their ZAP phases queue.
-            # Give one queued invocation enough transport time to wait for one preceding scan and
-            # then consume its own full scanner budget.
-            operation_timeout = max(
-                operation_timeout,
-                scanner_timeout_hint * (1.0 + MCP_ZAP_SHARED_WAIT_MULTIPLIER) + MCP_CONNECT_TIMEOUT + 90.0,
-            )
-        if spec.name == 'report':
-            operation_timeout = MCP_REPORT_TRANSFER_TIMEOUT + MCP_REPORT_RENDER_TIMEOUT_MAX + (2 * MCP_CONNECT_TIMEOUT)
+        operation_timeout = mcp_operation_timeout_seconds(spec.name, timeout_seconds, scanner_timeout_hint)
         try:
             data, is_error, shape = await asyncio.wait_for(invoke(url), timeout=operation_timeout)
         except Exception as first_exc:
@@ -2711,8 +2814,11 @@ def _browser_network_discovery(target: str, cookies: str, html_urls: list[str], 
     per_origin_limit = max(int(limits.get('browser_per_origin_pages', limits['per_origin_pages'])), len(forced_set))
     browser_started = time.monotonic()
     browser_wall_clock_budget = max(
-        BROWSER_DISCOVERY_MIN_SECONDS,
-        float(navigation_budget) * BROWSER_DISCOVERY_SECONDS_PER_BASE_PAGE,
+        BROWSER_DISCOVERY_MIN_SECONDS_BY_MODE.get(CURRENT_SCAN_MODE, BROWSER_DISCOVERY_MIN_SECONDS),
+        min(
+            float(TEST_DISCOVERY_TIME_BUDGET_SECONDS) if CURRENT_SCAN_MODE == 'test' else float('inf'),
+            float(navigation_budget) * BROWSER_DISCOVERY_SECONDS_PER_BASE_PAGE,
+        ),
     )
     browser_deadline = browser_started + browser_wall_clock_budget
     budget_info: dict[str, Any] = {
@@ -3666,6 +3772,24 @@ def discover_target(
     session.headers.update({'User-Agent': 'SecOps-Discovery/2.0', 'Accept': 'text/html,application/xhtml+xml,application/json;q=0.8,*/*;q=0.5'})
     target_preparation = apply_runtime_target_preparation(target, cookies, allow_state_changes=allow_state_changes) if cookies else {'performed': False, 'configured': False, 'usable': True}
     limits = DISCOVERY_LIMITS.get(CURRENT_SCAN_MODE, DISCOVERY_LIMITS['balanced'])
+    # TEST is a diagnostic profile: the HTTP crawler owns an explicit short wall-clock budget,
+    # independent from the equally bounded service-discovery and Chromium stages. Normal profiles
+    # retain their existing page/attempt limits and request timeouts.
+    http_discovery_started = time.monotonic()
+    http_discovery_deadline = (
+        http_discovery_started + float(TEST_DISCOVERY_TIME_BUDGET_SECONDS)
+        if CURRENT_SCAN_MODE == 'test' else None
+    )
+
+    def discovery_request_timeout(connect_seconds: float, read_seconds: float) -> tuple[float, float]:
+        if http_discovery_deadline is None:
+            return (connect_seconds, read_seconds)
+        remaining = max(0.5, http_discovery_deadline - time.monotonic())
+        return (max(0.5, min(connect_seconds, remaining * 0.25)), max(0.5, min(read_seconds, remaining)))
+
+    def http_discovery_time_left() -> bool:
+        return http_discovery_deadline is None or time.monotonic() < http_discovery_deadline
+
     same_host_service_discovery = discover_same_host_web_services(target, candidate_cap=same_host_service_candidate_cap)
     discovered_service_roots = {
         _clean_url(str(row.get('url') or ''))
@@ -3789,7 +3913,7 @@ def discover_target(
     http_base_scores: list[int] = []
     http_adaptive_threshold: int | None = None
 
-    while queue and pages_processed < page_max_budget and http_attempts < attempt_budget:
+    while queue and pages_processed < page_max_budget and http_attempts < attempt_budget and http_discovery_time_left():
         queue.sort(key=lambda candidate: (0 if candidate in priority_seed_urls else 1, -_discovery_diversity_score(target, candidate, family_useful_visits), candidate))
         requested = queue[0]
         requested_score = _discovery_diversity_score(target, requested, family_useful_visits)
@@ -3826,7 +3950,7 @@ def discover_target(
             if url_in_authorized_scope(target, nested) and _crawlable_url(nested) and not _destructive_crawl_url(nested):
                 enqueue(nested, force=forced_requested, source_url=requested)
         try:
-            response, final, redirect_issue = _safe_crawl_get(session, requested, target, timeout=(5, 15), max_redirects=5, cookies=cookies)
+            response, final, redirect_issue = _safe_crawl_get(session, requested, target, timeout=discovery_request_timeout(5, 15), max_redirects=5, cookies=cookies)
             if response is not None and bool(getattr(response, '_secops_tls_trust_retry', False)):
                 tls_trust_fallback_urls.add(str(final or requested))
         except requests.RequestException as exc:
@@ -3940,12 +4064,15 @@ def discover_target(
             ranked_scripts.append(script_url)
         ranked_scripts = sorted(set(ranked_scripts), key=lambda value: (-_script_value_score(value), value))
         for script_index, script_url in enumerate(ranked_scripts):
+            if not http_discovery_time_left():
+                deferred_script_urls.update(ranked_scripts[script_index:])
+                break
             if len(scanned_script_urls) >= script_budget or len(attempted_script_urls) >= script_attempt_budget:
                 deferred_script_urls.update(ranked_scripts[script_index:])
                 break
             attempted_script_urls.add(script_url)
             try:
-                script_response, script_final, script_issue = _safe_crawl_get(session, script_url, target, timeout=(4, 12), max_redirects=4, cookies=cookies)
+                script_response, script_final, script_issue = _safe_crawl_get(session, script_url, target, timeout=discovery_request_timeout(4, 12), max_redirects=4, cookies=cookies)
                 if script_response is not None and bool(getattr(script_response, '_secops_tls_trust_retry', False)):
                     tls_trust_fallback_urls.add(str(script_final or script_url))
             except requests.RequestException as exc:
@@ -4053,7 +4180,7 @@ def discover_target(
         try:
             original_headers = dict(session.headers)
             session.headers['Cache-Control'] = 'no-cache'
-            probe_response, probe_final, probe_redirect_issue = _safe_crawl_get(session, probe_url, target, timeout=(5, 15), max_redirects=5, cookies=cookies)
+            probe_response, probe_final, probe_redirect_issue = _safe_crawl_get(session, probe_url, target, timeout=discovery_request_timeout(5, 15), max_redirects=5, cookies=cookies)
             session.headers.clear()
             session.headers.update(original_headers)
             if probe_response is None:
@@ -4062,7 +4189,7 @@ def discover_target(
             final_login_detected = _looks_like_login(probe_response)
             anonymous_session = requests.Session()
             anonymous_session.headers.update({'User-Agent': 'SecOps-Discovery-Anonymous-Comparison/1.0', 'Cache-Control': 'no-cache'})
-            anonymous_response, anonymous_final, anonymous_redirect_issue = _safe_crawl_get(anonymous_session, probe_url, target, timeout=(5, 15), max_redirects=5, cookies='')
+            anonymous_response, anonymous_final, anonymous_redirect_issue = _safe_crawl_get(anonymous_session, probe_url, target, timeout=discovery_request_timeout(5, 15), max_redirects=5, cookies='')
             if anonymous_response is None:
                 raise requests.RequestException(anonymous_redirect_issue or f'Anonymous probe was blocked: {anonymous_final}')
             anonymous_response.url = anonymous_final
@@ -4095,6 +4222,9 @@ def discover_target(
         'http_page_budget_saturated': bool(queue and pages_processed >= page_budget),
         'http_page_max_budget_saturated': bool(queue and pages_processed >= page_max_budget),
         'http_attempt_budget_saturated': bool(queue and http_attempts >= attempt_budget),
+        'http_wall_clock_budget_seconds': float(TEST_DISCOVERY_TIME_BUDGET_SECONDS) if CURRENT_SCAN_MODE == 'test' else 0.0,
+        'http_wall_clock_elapsed_seconds': round(time.monotonic() - http_discovery_started, 3),
+        'http_wall_clock_exhausted': bool(http_discovery_deadline is not None and time.monotonic() >= http_discovery_deadline),
         'dead_http_404_410': dead_http_responses,
         'browser_page_budget': int(browser_budget_info.get('base_budget', limits['browser_pages'])),
         'browser_page_max_budget': int(browser_budget_info.get('max_budget', limits.get('browser_pages_max', limits['browser_pages']))),
@@ -4131,23 +4261,23 @@ def discover_target(
         'authorized_origins': sorted(AUTHORIZED_SCOPE_ORIGINS),
         'allow_same_host_ports': ALLOW_SAME_HOST_PORTS,
         'discover_same_host_services': DISCOVER_SAME_HOST_SERVICES,
-        'same_host_service_candidate_cap': int(same_host_service_discovery.get('candidate_cap', 0) or 0),
-        'same_host_service_candidate_ports_planned': int(same_host_service_discovery.get('candidate_ports_planned', 0) or 0),
-        'same_host_service_ports_probed': int(same_host_service_discovery.get('ports_probed', 0) or 0),
-        'same_host_service_candidate_ports_deferred': int(same_host_service_discovery.get('candidate_ports_deferred', 0) or 0),
-        'same_host_service_tcp_connection_attempts': int(same_host_service_discovery.get('tcp_connection_attempts', 0) or 0),
-        'same_host_service_resolved_address_count': int(same_host_service_discovery.get('resolved_address_count', 0) or 0),
-        'same_host_service_reused_ports_probed': int(same_host_service_discovery.get('reused_ports_probed', 0) or 0),
-        'same_host_service_cache_hit': bool(same_host_service_discovery.get('cache_hit', False)),
-        'same_host_service_time_budget_seconds': float(same_host_service_discovery.get('time_budget_seconds', 0.0) or 0.0),
-        'same_host_service_time_budget_exhausted': bool(same_host_service_discovery.get('time_budget_exhausted', False)),
-        'same_host_service_global_time_budget_seconds': float(same_host_service_discovery.get('global_time_budget_seconds', 0.0) or 0.0),
-        'same_host_service_global_time_remaining_seconds': float(same_host_service_discovery.get('global_time_remaining_after_seconds', 0.0) or 0.0),
+        'same_host_service_candidate_cap': safe_int_value(same_host_service_discovery.get('candidate_cap'), 0),
+        'same_host_service_candidate_ports_planned': safe_int_value(same_host_service_discovery.get('candidate_ports_planned'), 0),
+        'same_host_service_ports_probed': safe_int_value(same_host_service_discovery.get('ports_probed'), 0),
+        'same_host_service_candidate_ports_deferred': safe_int_value(same_host_service_discovery.get('candidate_ports_deferred'), 0),
+        'same_host_service_tcp_connection_attempts': safe_int_value(same_host_service_discovery.get('tcp_connection_attempts'), 0),
+        'same_host_service_resolved_address_count': safe_int_value(same_host_service_discovery.get('resolved_address_count'), 0),
+        'same_host_service_reused_ports_probed': safe_int_value(same_host_service_discovery.get('reused_ports_probed'), 0),
+        'same_host_service_cache_hit': safe_bool_metadata(same_host_service_discovery.get('cache_hit'), False),
+        'same_host_service_time_budget_seconds': safe_float_value(same_host_service_discovery.get('time_budget_seconds'), 0.0),
+        'same_host_service_time_budget_exhausted': safe_bool_metadata(same_host_service_discovery.get('time_budget_exhausted'), False),
+        'same_host_service_global_time_budget_seconds': safe_float_value(same_host_service_discovery.get('global_time_budget_seconds'), 0.0),
+        'same_host_service_global_time_remaining_seconds': safe_float_value(same_host_service_discovery.get('global_time_remaining_after_seconds'), 0.0),
         'same_host_service_candidate_order_policy': str(same_host_service_discovery.get('candidate_order_policy') or ''),
         'same_host_web_services_discovered': len(same_host_service_discovery.get('web_services') or []),
         'same_host_open_web_unconfirmed_ports': len(same_host_service_discovery.get('open_web_unconfirmed_ports') or []),
         'same_host_classification_deferred_ports': len(same_host_service_discovery.get('classification_deferred_ports') or []),
-        'same_host_service_discovery_seconds': float(same_host_service_discovery.get('duration_seconds', 0.0) or 0.0),
+        'same_host_service_discovery_seconds': safe_float_value(same_host_service_discovery.get('duration_seconds'), 0.0),
         'tls_trust_fallback_count': len(tls_trust_fallback_urls),
         'tls_trust_fallback_urls': sorted(tls_trust_fallback_urls),
         'explicit_entry_points': len(explicit_seed_urls),
@@ -4387,7 +4517,8 @@ def sibling_broad_timeout(tool: str, base_timeout: float | int | None=None) -> i
     if base_timeout is None:
         base_timeout = BROAD_SCANNER_TIMEOUTS.get(scanner, 180)
     factor = float(BROAD_SIBLING_TIMEOUT_FACTORS.get(CURRENT_SCAN_MODE, 0.60))
-    return max(45, int(float(base_timeout) * factor))
+    minimum = TEST_SCANNER_TIMEOUT_SECONDS if CURRENT_SCAN_MODE == 'test' else 45
+    return max(minimum, int(float(base_timeout) * factor))
 
 
 def discovered_scope_origins(discovery: dict[str, Any], target: str, limit: int | None=None) -> list[str]:
@@ -4614,7 +4745,7 @@ def ensure_runtime_authenticated_request(request_url: str, current_cookie: str='
     if not validation_url or not same_origin(origin, validation_url) or _browser_static_resource(validation_url):
         validation_url = url
     probe = _runtime_auth_probe(origin, effective_cookie, validation_url)
-    flow_observed = bool(login.get('authentication_flow_observed'))
+    flow_observed = safe_bool_metadata(login.get('authentication_flow_observed'), False)
     usable = probe.get('usable') is not False and (probe.get('distinguished_from_anonymous') is True or flow_observed)
     result = {
         'attempted': True,
@@ -4628,8 +4759,8 @@ def ensure_runtime_authenticated_request(request_url: str, current_cookie: str='
         'probe_url': validation_url,
         'cookie_header': effective_cookie if usable else '',
         'cookie_names': cookie_names(effective_cookie) if usable else [],
-        'sso_reused': bool(login.get('sso_reused')),
-        'credentials_reused': bool(login.get('used_credentials')),
+        'sso_reused': safe_bool_metadata(login.get('sso_reused'), False),
+        'credentials_reused': safe_bool_metadata(login.get('used_credentials'), False),
         'authentication_flow_observed': flow_observed,
         'distinguished_from_anonymous': probe.get('distinguished_from_anonymous'),
         'probe': probe,
@@ -4788,8 +4919,10 @@ def authenticate_discovered_sibling_origins(discovery: dict[str, Any], target: s
     primary_auth_note = discovery.get('authentication_note')
     primary_auth_probe = discovery.get('authentication_probe')
     primary_budget = dict(discovery.get('budget_diagnostics') or {})
-    recrawl_pages = max(10, int(RUNTIME_AUTH_RECRAWL_PAGES.get(CURRENT_SCAN_MODE, 60)))
-    auth_pass_budget = max(30, int(RUNTIME_AUTH_PASS_TIMEOUTS.get(CURRENT_SCAN_MODE, 720)))
+    recrawl_minimum = 1 if CURRENT_SCAN_MODE == 'test' else 10
+    auth_timeout_minimum = 1 if CURRENT_SCAN_MODE == 'test' else 30
+    recrawl_pages = max(recrawl_minimum, int(RUNTIME_AUTH_RECRAWL_PAGES.get(CURRENT_SCAN_MODE, 60)))
+    auth_pass_budget = max(auth_timeout_minimum, int(RUNTIME_AUTH_PASS_TIMEOUTS.get(CURRENT_SCAN_MODE, 720)))
     auth_pass_deadline = time.monotonic() + auth_pass_budget
 
     # Existing origin-specific cookies are retained across repeated enrichment passes without consuming
@@ -4803,7 +4936,7 @@ def authenticate_discovered_sibling_origins(discovery: dict[str, Any], target: s
     attempted_count = 0
     for origin, score, candidates in selected:
         remaining_auth = auth_pass_deadline - time.monotonic()
-        if remaining_auth < 15.0:
+        if remaining_auth < (2.0 if CURRENT_SCAN_MODE == 'test' else 15.0):
             runtime_rows.append({
                 'status': 'time_budget', 'deferred_origins': max(1, len(selected) - attempted_count),
                 'attempted_origins': attempted_count, 'time_budget_seconds': auth_pass_budget,
@@ -4813,8 +4946,9 @@ def authenticate_discovered_sibling_origins(discovery: dict[str, Any], target: s
         print(f'    [AUTH SSO] {origin}: attempting origin-specific SSO/session establishment from {len(candidates)} observed application entry point(s).', flush=True)
         attempted_count += 1
         attempt_credential = dict(credential)
-        configured_login_timeout = max(15, int(attempt_credential.get('timeout_seconds') or 60))
-        attempt_credential['timeout_seconds'] = max(15, min(configured_login_timeout, int(remaining_auth)))
+        login_minimum = 2 if CURRENT_SCAN_MODE == 'test' else 15
+        configured_login_timeout = max(login_minimum, int(attempt_credential.get('timeout_seconds') or 60))
+        attempt_credential['timeout_seconds'] = max(login_minimum, min(configured_login_timeout, int(remaining_auth)))
         try:
             login = browser_oidc_login_session(
                 origin,
@@ -4858,7 +4992,7 @@ def authenticate_discovered_sibling_origins(discovery: dict[str, Any], target: s
             origin_view = discovery_for_origin(merged, origin, primary_cookies)
             probe_url = select_session_probe_url(origin_view, origin)
         probe = _runtime_auth_probe(origin, sibling_cookie, probe_url)
-        flow_observed = bool(login.get('authentication_flow_observed'))
+        flow_observed = safe_bool_metadata(login.get('authentication_flow_observed'), False)
         if probe.get('usable') is False or (probe.get('distinguished_from_anonymous') is not True and not flow_observed):
             AUTHENTICATED_ORIGIN_COOKIES.pop((identity_ref, normalized_origin(origin)), None)
             runtime_rows.append({
@@ -4881,8 +5015,8 @@ def authenticate_discovered_sibling_origins(discovery: dict[str, Any], target: s
             'entry_url': str(login.get('entry_url') or ''),
             'probe_url': probe_url,
             'cookie_names': cookie_names(sibling_cookie),
-            'sso_reused': bool(login.get('sso_reused')),
-            'credentials_reused': bool(login.get('used_credentials')),
+            'sso_reused': safe_bool_metadata(login.get('sso_reused'), False),
+            'credentials_reused': safe_bool_metadata(login.get('used_credentials'), False),
             'authentication_flow_observed': flow_observed,
             'distinguished_from_anonymous': probe.get('distinguished_from_anonymous'),
             'probe': probe,
@@ -4914,7 +5048,8 @@ def authenticate_discovered_sibling_origins(discovery: dict[str, Any], target: s
     # the just-in-time fallback in refresh_authenticated_session_state().
     application_rows: list[dict[str, Any]] = list(discovery.get('runtime_application_authentication') or [])
     app_limit = max(1, int(RUNTIME_AUTH_APPLICATION_LIMITS.get(CURRENT_SCAN_MODE, 18)))
-    app_recrawl_pages = max(10, int(RUNTIME_AUTH_APPLICATION_RECRAWL_PAGES.get(CURRENT_SCAN_MODE, 72)))
+    app_recrawl_minimum = 1 if CURRENT_SCAN_MODE == 'test' else 10
+    app_recrawl_pages = max(app_recrawl_minimum, int(RUNTIME_AUTH_APPLICATION_RECRAWL_PAGES.get(CURRENT_SCAN_MODE, 72)))
     app_ranked = _same_origin_application_auth_candidates(merged, target, primary_cookies)
     app_attempted = 0
     app_authenticated = 0
@@ -4922,7 +5057,7 @@ def authenticate_discovered_sibling_origins(discovery: dict[str, Any], target: s
         if not candidates:
             continue
         remaining_auth = auth_pass_deadline - time.monotonic()
-        if remaining_auth < 15.0:
+        if remaining_auth < (2.0 if CURRENT_SCAN_MODE == 'test' else 15.0):
             application_rows.append({
                 'status': 'time_budget', 'attempted_applications': app_attempted,
                 'time_budget_seconds': auth_pass_budget,
@@ -4931,7 +5066,7 @@ def authenticate_discovered_sibling_origins(discovery: dict[str, Any], target: s
             break
         entry_url = candidates[0]
         result = ensure_runtime_authenticated_request(
-            entry_url, primary_cookies, entry_url, timeout_seconds=max(15, min(60, int(remaining_auth)))
+            entry_url, primary_cookies, entry_url, timeout_seconds=max(2 if CURRENT_SCAN_MODE == 'test' else 15, min(60, int(remaining_auth)))
         )
         app_attempted += 1 if result.get('attempted') else 0
         row = {
@@ -4941,8 +5076,8 @@ def authenticate_discovered_sibling_origins(discovery: dict[str, Any], target: s
             'entry_url': entry_url,
             'candidate_count': len(candidates),
             'cookie_names': list(result.get('cookie_names') or []),
-            'sso_reused': bool(result.get('sso_reused')),
-            'credentials_reused': bool(result.get('credentials_reused')),
+            'sso_reused': safe_bool_metadata(result.get('sso_reused'), False),
+            'credentials_reused': safe_bool_metadata(result.get('credentials_reused'), False),
             'reason': str(result.get('reason') or '')[:1000],
         }
         application_rows.append(row)
@@ -5140,7 +5275,7 @@ def _service_discovery_row_has_probe_coverage(row: dict[str, Any]) -> bool:
     """
     if not isinstance(row, dict):
         return False
-    if bool(row.get('cache_hit')):
+    if safe_bool_metadata(row.get('cache_hit'), False):
         return True
     try:
         ports_probed = int(row.get('ports_probed', 0) or 0)
@@ -5657,7 +5792,7 @@ def _tool_case_priority(tool: str, case: dict[str, Any], authenticated_profile: 
         return -1000
     browser_response = case.get('browser_response') if isinstance(case.get('browser_response'), dict) else {}
     if browser_response.get('observed') is True:
-        status = int(browser_response.get('status') or 0)
+        status = safe_int_metadata(browser_response.get('status'), 0)
         if 200 <= status < 400:
             score += 10
         elif status in {404, 410}:
@@ -5822,7 +5957,7 @@ def _generic_live_input_case(tool: str, case: dict[str, Any]) -> bool:
     if name == 'dalfox' and (_dalfox_non_html_static_asset(case) or _prefer_browser_for_xss_case(case)):
         return False
     response = case.get('browser_response') if isinstance(case.get('browser_response'), dict) else {}
-    status = int(response.get('status') or 0)
+    status = safe_int_metadata(response.get('status'), 0)
     observed_live = response.get('observed') is True and 200 <= status < 400
     source = str(case.get('discovery_source') or case.get('source') or '').lower()
     network_live = source in {'playwright_network', 'browser_network', 'xhr', 'fetch'} or any(token in source for token in ('playwright', 'xhr', 'fetch'))
@@ -5866,7 +6001,7 @@ def _append_generic_live_input_reserve(
             continue
         response = case.get('browser_response') if isinstance(case.get('browser_response'), dict) else {}
         score = 40
-        score += 20 if response.get('observed') is True and 200 <= int(response.get('status') or 0) < 400 else 0
+        score += 20 if response.get('observed') is True and 200 <= safe_int_metadata(response.get('status'), 0) < 400 else 0
         score += 18 if method == 'POST' else 0
         score += 14 if str(case.get('discovery_source') or '').lower() == 'playwright_network' else 0
         score += min(16, len(params) * 3)
@@ -5917,7 +6052,7 @@ def select_tool_request_cases(discovery: dict[str, Any], tool: str, limit: int |
             clean_parameters = _query_parameter_names(str(case.get('url') or ''))
         case = {**case, 'parameters': clean_parameters}
         browser_response = case.get('browser_response') if isinstance(case.get('browser_response'), dict) else {}
-        if browser_response.get('observed') is True and int(browser_response.get('status') or 0) in {404, 410}:
+        if browser_response.get('observed') is True and safe_int_metadata(browser_response.get('status'), 0) in {404, 410}:
             continue
         if str(case.get('method', 'GET')).upper() not in {'GET', 'POST'}:
             continue
@@ -5945,7 +6080,7 @@ def select_tool_request_cases(discovery: dict[str, Any], tool: str, limit: int |
             method = str(case.get('method', 'GET')).upper()
             url = str(case.get('url') or '')
             browser_response = case.get('browser_response') if isinstance(case.get('browser_response'), dict) else {}
-            if browser_response.get('observed') is True and int(browser_response.get('status') or 0) in {404, 410}:
+            if browser_response.get('observed') is True and safe_int_metadata(browser_response.get('status'), 0) in {404, 410}:
                 continue
             if method not in {'GET', 'POST'} or not url or not clean_parameters:
                 continue
@@ -6097,7 +6232,7 @@ def _tested_surface_contexts(profile_results: dict[str, Any]) -> set[tuple[str, 
                 if str(value):
                     tested.add(_safe_surface_context_key({'url': str(value), 'method': 'GET', 'parameters': _query_parameter_names(str(value))}))
         for row in result.get('targeted_active_scans', []) if isinstance(result.get('targeted_active_scans'), list) else []:
-            if isinstance(row, dict) and bool(row.get('completed')) and row.get('url'):
+            if isinstance(row, dict) and safe_bool_metadata(row.get('completed'), False) and row.get('url'):
                 tested.add(_safe_surface_context_key({
                     'url': str(row.get('url')), 'method': str(row.get('method') or 'GET'),
                     'parameters': list(row.get('parameters') or []),
@@ -6118,7 +6253,7 @@ def _safe_surface_candidate(case: dict[str, Any]) -> bool:
     if _identity_protocol_metadata_only(case) or _parameter_scanner_static_asset(case):
         return False
     response = case.get('browser_response') if isinstance(case.get('browser_response'), dict) else {}
-    if response.get('observed') is True and int(response.get('status') or 0) in {404, 410}:
+    if response.get('observed') is True and safe_int_metadata(response.get('status'), 0) in {404, 410}:
         return False
     return True
 
@@ -6133,7 +6268,8 @@ def run_safe_surface_sweep(
     specialist coverage so this phase cannot inflate the latter metric.
     """
     cap = max(0, int(limit if limit is not None else SAFE_SURFACE_SWEEP_LIMITS.get(CURRENT_SCAN_MODE, 0)))
-    total_timeout = max(30.0, float(BROAD_SCANNER_TIMEOUTS.get('nuclei', 240)) * SAFE_SURFACE_SWEEP_TIMEOUT_FACTOR)
+    sweep_minimum = 5.0 if CURRENT_SCAN_MODE == 'test' else 30.0
+    total_timeout = max(sweep_minimum, float(BROAD_SCANNER_TIMEOUTS.get('nuclei', 240)) * SAFE_SURFACE_SWEEP_TIMEOUT_FACTOR)
     started = time.monotonic()
     deadline = started + total_timeout
     previously_tested = _tested_surface_contexts(profile_results)
@@ -6269,7 +6405,7 @@ def _adaptive_specialist_evidence(tool: str, case: dict[str, Any]) -> list[str]:
     response = case.get('browser_response') if isinstance(case.get('browser_response'), dict) else {}
     if response.get('observed') is True:
         try:
-            status = int(response.get('status') or 0)
+            status = safe_int_metadata(response.get('status'), 0)
         except (TypeError, ValueError):
             status = 0
         if 200 <= status < 400:
@@ -7253,7 +7389,7 @@ def log_zap_session_diagnostics(result: dict[str, Any]) -> None:
         for item in result.get('targeted_active_scans', []):
             if not isinstance(item, dict):
                 continue
-            state = 'complete' if item.get('completed') else 'incomplete'
+            state = 'complete' if safe_bool_metadata(item.get('completed'), False) else 'incomplete'
             print(f"    [ZAP ACTIVE CASE] {item.get('method', 'GET')} {compact_log_url(item.get('url', ''))} — {state}; progress={item.get('progress', 0)}%; budget={item.get('budget_seconds', 0)}s")
         preparation = result.get('post_spider_target_preparation')
         if isinstance(preparation, dict) and preparation.get('configured'):
@@ -7311,8 +7447,8 @@ def log_result(profile: str, name: str, result: dict[str, Any], target: str='') 
     elif raw_status == 'partial':
         print(f'              {detail}')
     if name == 'ffuf':
-        isolated = bool(result.get('cookie_isolated_discovery'))
-        credentialed = bool(result.get('credentialed_fuzz_requests_sent'))
+        isolated = safe_bool_metadata(result.get('cookie_isolated_discovery'), False)
+        credentialed = safe_bool_metadata(result.get('credentialed_fuzz_requests_sent'), False)
         blocked = len(result.get('blocked_destructive_rows') or [])
         if isolated:
             print(f'    [FFUF SESSION] path fuzzing cookie-isolated=True; credentialed fuzz requests={credentialed}; destructive rows blocked={blocked}')
@@ -7480,9 +7616,9 @@ def recover_normal_report_artifacts(output_name: str, report: dict[str, Any]) ->
         recovered['coverage_constraints_count'] = len(summary.get('coverage_constraints') or [])
         recovered['execution_limitations_count'] = len(summary.get('limitations') or [])
         if 'execution_complete' in summary:
-            recovered['execution_complete'] = bool(summary.get('execution_complete'))
+            recovered['execution_complete'] = safe_bool_metadata(summary.get('execution_complete'), False)
         if 'coverage_complete' in summary:
-            recovered['coverage_complete'] = bool(summary.get('coverage_complete'))
+            recovered['coverage_complete'] = safe_bool_metadata(summary.get('coverage_complete'), False)
 
     if available['pdf_filename'] is not None:
         recovered['status'] = 'success'
@@ -7578,7 +7714,7 @@ def add_common_cli_arguments(parser: argparse.ArgumentParser, *, require_target:
     parser.add_argument('--preflight-only', action='store_true')
     parser.add_argument('--ignore-preflight-errors', action='store_true')
     parser.add_argument('--interactsh-injection-url', default='')
-    parser.add_argument('--mode', choices=('fast', 'balanced', 'deep'), default='balanced', help='Trade coverage for runtime; balanced is the default.')
+    parser.add_argument('--mode', choices=('test', 'fast', 'balanced', 'deep'), default='balanced', help='Trade coverage for runtime; test is a short diagnostic profile and balanced is the normal default.')
 
 # Validates the command line and builds target, profile, and cookie settings.
 def prepare_cli_context(parser: argparse.ArgumentParser, args: argparse.Namespace) -> tuple[str, list[dict[str, str]], str, str, str]:
@@ -7745,7 +7881,7 @@ def build_tool_arguments(tool: str, target_url: str, cookies: str, discovery: di
             arguments['allow_same_host_ports'] = ALLOW_SAME_HOST_PORTS
             arguments['allow_state_changes'] = state_changing_tests_allowed(target_url, allow_state_changes)
         elif tool == 'session':
-            sample_count = 7 if CURRENT_SCAN_MODE == 'deep' else 5 if CURRENT_SCAN_MODE == 'balanced' else 3
+            sample_count = 1 if CURRENT_SCAN_MODE == 'test' else 7 if CURRENT_SCAN_MODE == 'deep' else 5 if CURRENT_SCAN_MODE == 'balanced' else 3
             arguments.update({'probe_url': select_session_probe_url(discovery, target_url), 'sample_count': sample_count, 'allow_state_changes': state_changing_tests_allowed(target_url, allow_state_changes)})
         elif tool == 'zap':
             safe_request_cases = _request_cases_for_state_policy(
@@ -7765,9 +7901,9 @@ def build_tool_arguments(tool: str, target_url: str, cookies: str, discovery: di
                 'request_cases': safe_request_cases,
                 'scan_mode': scan_mode,
                 'session_probe_url': select_session_probe_url(discovery, target_url),
-                'max_observations': 1400 if CURRENT_SCAN_MODE == 'deep' else 800 if CURRENT_SCAN_MODE == 'balanced' else 180,
-                'max_ranked_cases': 640 if CURRENT_SCAN_MODE == 'deep' else 320 if CURRENT_SCAN_MODE == 'balanced' else 80,
-                'max_active_cases': 192 if CURRENT_SCAN_MODE == 'deep' else 96 if CURRENT_SCAN_MODE == 'balanced' else 32,
+                'max_observations': 40 if CURRENT_SCAN_MODE == 'test' else 1400 if CURRENT_SCAN_MODE == 'deep' else 800 if CURRENT_SCAN_MODE == 'balanced' else 180,
+                'max_ranked_cases': 20 if CURRENT_SCAN_MODE == 'test' else 640 if CURRENT_SCAN_MODE == 'deep' else 320 if CURRENT_SCAN_MODE == 'balanced' else 80,
+                'max_active_cases': 4 if CURRENT_SCAN_MODE == 'test' else 192 if CURRENT_SCAN_MODE == 'deep' else 96 if CURRENT_SCAN_MODE == 'balanced' else 32,
                 'allow_state_changes': state_changing_tests_allowed(target_url, allow_state_changes),
             })
             if single_tool:
@@ -7783,7 +7919,7 @@ def build_tool_arguments(tool: str, target_url: str, cookies: str, discovery: di
                 'request_cases': safe_request_cases,
                 'allow_state_changes': state_changes_allowed,
                 'scan_profile': CURRENT_SCAN_MODE,
-                'max_targets': 2048 if CURRENT_SCAN_MODE == 'deep' else 1024 if CURRENT_SCAN_MODE == 'balanced' else 128,
+                'max_targets': 32 if CURRENT_SCAN_MODE == 'test' else 2048 if CURRENT_SCAN_MODE == 'deep' else 1024 if CURRENT_SCAN_MODE == 'balanced' else 128,
             })
         elif tool == 'nikto':
             arguments['scan_profile'] = CURRENT_SCAN_MODE

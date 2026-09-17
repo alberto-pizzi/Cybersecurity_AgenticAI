@@ -52,10 +52,10 @@ def run_traversal_scan(
 
     method = str(method or "GET").upper()
     timeout = max(10, min(int(timeout), 120))
-    profile = str(scan_profile or "balanced").lower()
-    if profile not in {"fast", "balanced", "deep"}:
-        profile = "balanced"
-    parameter_limit = 2 if profile == "fast" else 3 if profile == "balanced" else 5
+    profile = str(scan_profile or "balanced").strip().lower()
+    if profile not in {"test", "fast", "balanced", "deep"}:
+        raise ValueError("scan_profile must be test, fast, balanced, or deep")
+    parameter_limit = 1 if profile == "test" else 2 if profile == "fast" else 3 if profile == "balanced" else 5
     deadline = wall_clock_deadline(timeout)
     request_budget = proportional_budget(timeout, TRAVERSAL_REQUEST_RATIO)
     pacer = RequestRatePacer(request_rate)

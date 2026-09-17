@@ -20,6 +20,7 @@ from assessmentConfig import (
     SUPPORTED_MODELS,
     SUPPORTED_MODES,
     SUPPORTED_ORCHESTRATORS,
+    default_max_rounds,
     iter_service_jobs,
     load_assessment_config,
     redacted_configuration,
@@ -28,7 +29,7 @@ from assessmentConfig import (
     target_is_local,
     validate_authorization_scope,
 )
-from utils import atomic_write_text, canonical_cookie_header, cookie_header_fingerprint, cookie_names, normalized_origin, normalized_hostname, same_origin, scanner_request_rate_policy
+from utils import atomic_write_text, canonical_cookie_header, cookie_header_fingerprint, cookie_names, normalized_origin, normalized_hostname, same_origin, scanner_request_rate_policy, safe_bool_value, safe_int_value
 from targetAuth import browser_oidc_login_session
 
 
@@ -106,7 +107,7 @@ def _direct_assessment(args: argparse.Namespace) -> tuple[dict[str, Any], list[d
         "orchestrator": args.orchestrator or "deterministic",
         "mode": args.mode or "balanced",
         "model": args.model or "snap4city",
-        "max_rounds": args.max_rounds or 2,
+        "max_rounds": args.max_rounds or default_max_rounds(args.mode or "balanced"),
         "require_ai": True if args.require_ai is None else bool(args.require_ai),
         "allow_state_changes": args.allow_state_changes,
     }
@@ -177,7 +178,10 @@ def _apply_execution_overrides(config: dict[str, Any], args: argparse.Namespace)
     if args.orchestrator:
         execution["orchestrator"] = args.orchestrator
     if args.mode:
+        previous_mode = str(execution.get("mode") or "balanced").strip().lower()
         execution["mode"] = args.mode
+        if not args.max_rounds and str(args.mode).strip().lower() != previous_mode:
+            execution["max_rounds"] = default_max_rounds(args.mode)
     if args.model:
         execution["model"] = args.model
     if args.max_rounds:
@@ -755,7 +759,7 @@ def _build_command(
         model = str(execution.get("model") or "snap4city")
         command.extend([
             "--model", model,
-            "--max-rounds", str(int(execution.get("max_rounds") or 2)),
+            "--max-rounds", str(int(execution.get("max_rounds") or default_max_rounds(str(execution.get("mode") or "balanced")))),
         ])
         if bool(execution.get("require_ai", True)):
             command.append("--require-ai")
@@ -990,8 +994,9 @@ def _aggregate_report_inputs(results_data: dict[str, Any], config: dict[str, Any
         target = str(row.get("target") or "")
         report_id = str(row.get("report_id") or "")
         source_status = row.get("source_artifact_status") if isinstance(row.get("source_artifact_status"), dict) else None
-        report_usable = True if source_status is None else bool(
-            source_status.get("technical_json_loaded") or source_status.get("review_snapshot_loaded")
+        report_usable = True if source_status is None else (
+            safe_bool_value(source_status.get("technical_json_loaded"), False)
+            or safe_bool_value(source_status.get("review_snapshot_loaded"), False)
         )
         if report_usable:
             reported_jobs.add(job_id)
@@ -1018,17 +1023,17 @@ def _aggregate_report_inputs(results_data: dict[str, Any], config: dict[str, Any
             if isinstance(profile, dict):
                 name = str(profile.get("name") or "").strip()
                 if name:
-                    profiles[name] = profiles.get(name, False) or bool(profile.get("authenticated"))
+                    profiles[name] = profiles.get(name, False) or safe_bool_value(profile.get("authenticated"), False)
             elif str(profile).strip():
                 profiles[str(profile)] = profiles.get(str(profile), False)
         for tool in context.get("expected_tools", []) if isinstance(context.get("expected_tools"), list) else []:
             if str(tool).strip():
                 expected_tools.add(str(tool))
-        secondary_identity_supplied = secondary_identity_supplied or bool(context.get("secondary_identity_supplied"))
-        try:
-            authenticated_identity_count = max(authenticated_identity_count, int(context.get("authenticated_identity_count") or 0))
-        except (TypeError, ValueError):
-            pass
+        secondary_identity_supplied = secondary_identity_supplied or safe_bool_value(context.get("secondary_identity_supplied"), False)
+        authenticated_identity_count = max(
+            authenticated_identity_count,
+            max(0, safe_int_value(context.get("authenticated_identity_count"), 0)),
+        )
         discovery_by_entry[job_id] = row.get("discovery") if isinstance(row.get("discovery"), dict) else {}
         row_diagnostics = row.get("diagnostics") if isinstance(row.get("diagnostics"), (dict, list)) else {}
         if row_diagnostics:
@@ -1115,13 +1120,13 @@ def _aggregate_report_inputs(results_data: dict[str, Any], config: dict[str, Any
             + "; project discovery follows bounded redirects only while each hop remains authorized; external scanner processes do not autonomously follow redirects, so scanner-internal redirect-dependent behavior is conservatively suppressed unless the destination was independently discovered; unauthorized destinations are observed but not queued"
         ),
         "allow_state_changes": (
-            next(iter({bool(row.get("allow_state_changes")) for row in results_data.get("jobs", []) if isinstance(row, dict)}))
-            if len({bool(row.get("allow_state_changes")) for row in results_data.get("jobs", []) if isinstance(row, dict)}) == 1
+            next(iter({safe_bool_value(row.get("allow_state_changes"), False) for row in results_data.get("jobs", []) if isinstance(row, dict)}))
+            if len({safe_bool_value(row.get("allow_state_changes"), False) for row in results_data.get("jobs", []) if isinstance(row, dict)}) == 1
             else None
         ),
-        "allow_state_changes_mixed": len({bool(row.get("allow_state_changes")) for row in results_data.get("jobs", []) if isinstance(row, dict)}) > 1,
+        "allow_state_changes_mixed": len({safe_bool_value(row.get("allow_state_changes"), False) for row in results_data.get("jobs", []) if isinstance(row, dict)}) > 1,
         "allow_state_changes_by_entry": {
-            str(row.get("id") or index): bool(row.get("allow_state_changes"))
+            str(row.get("id") or index): safe_bool_value(row.get("allow_state_changes"), False)
             for index, row in enumerate(results_data.get("jobs", []), start=1) if isinstance(row, dict)
         },
         "orchestration": {

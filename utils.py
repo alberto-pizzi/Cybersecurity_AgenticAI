@@ -24,6 +24,65 @@ LOCAL_BIN = Path.home() / ".local" / "bin"
 
 _SOURCE_FINGERPRINT_CACHE: str | None = None
 
+
+def safe_int_value(value: Any, default: int = 0) -> int:
+    """Return an integral finite metadata value or a safe default.
+
+    This is intended for scanner/MCP/report metadata, not user-facing numeric parsing. Booleans are
+    rejected explicitly because Python treats them as integers. Fractional/non-finite values are
+    rejected rather than silently truncated.
+    """
+    if isinstance(value, bool):
+        return int(default)
+    try:
+        number = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return int(default)
+    if not math.isfinite(number) or not number.is_integer():
+        return int(default)
+    try:
+        return int(number)
+    except (TypeError, ValueError, OverflowError):
+        return int(default)
+
+
+def safe_port_value(value: Any, default: int) -> int:
+    """Return a valid TCP/UDP port or a validated default without raising."""
+    fallback = safe_int_value(default, 80)
+    if not 1 <= fallback <= 65535:
+        fallback = 80
+    port = safe_int_value(value, fallback)
+    return port if 1 <= port <= 65535 else fallback
+
+
+def safe_float_value(value: Any, default: float = 0.0) -> float:
+    """Return finite floating metadata or a safe default without raising."""
+    if isinstance(value, bool):
+        return float(default)
+    try:
+        number = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return float(default)
+    return number if math.isfinite(number) else float(default)
+
+
+def safe_bool_value(value: Any, default: bool = False) -> bool:
+    """Normalize bool-like scanner metadata without truthiness surprises."""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        number = safe_float_value(value, float('nan'))
+        if math.isfinite(number) and number in {0.0, 1.0}:
+            return bool(int(number))
+        return bool(default)
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {'true', 'yes', 'on', '1'}:
+            return True
+        if normalized in {'false', 'no', 'off', '0', ''}:
+            return False
+    return bool(default)
+
 # Fingerprint the active SecOps Python source tree so an orchestrator never silently reuses an
 # MCP server that was started from stale code. The value is cached per process: the server keeps
 # the fingerprint of the files it actually loaded at startup, while a newly started orchestrator
@@ -490,7 +549,7 @@ def run_mcp_http(mcp: Any, service_name: str = MCP_UNIFIED_SERVICE) -> None:
             f"Standalone MCP service '{service_name}' is disabled; run servers/secopsServer.py instead."
         )
     host = os.getenv("SECOPS_MCP_HOST", MCP_HTTP_HOST).strip() or MCP_HTTP_HOST
-    port = int(os.getenv("SECOPS_MCP_PORT", str(mcp_http_port(MCP_UNIFIED_SERVICE))))
+    port = safe_int_value(os.getenv("SECOPS_MCP_PORT", str(mcp_http_port(MCP_UNIFIED_SERVICE))), mcp_http_port(MCP_UNIFIED_SERVICE))
     mcp.run(transport="http", host=host, port=port)
 
 _FATAL_STARTUP_PATTERNS = (
@@ -695,14 +754,14 @@ def apply_runtime_target_preparation(target: str, cookies: str, *, allow_state_c
             outcomes.append({"url": url, "error": "cross-origin preparation request rejected"})
             continue
         request_data = str(item.get("data") or "") if method == "POST" else ""
-        declared_state_change = bool(item.get("state_changing"))
+        declared_state_change = safe_bool_value(item.get("state_changing"), False)
         state_reason = request_contract_state_change_reason({
             "url": url, "method": method, "data": request_data,
             "parameters": list(item.get("parameters") or []),
             "content_type": str(item.get("content_type") or ""),
         })
         if not allow_state_changes and (declared_state_change or state_reason):
-            required = bool(item.get("required"))
+            required = safe_bool_value(item.get("required"), False)
             usable = usable and (not required)
             outcomes.append({
                 "method": method, "url": url, "skipped": True,

@@ -14,19 +14,19 @@ from .constants import TOOL_PURPOSES
 from .findings import _category, _iter_leaf_results
 from .text_utils import _esc, _redact_text
 from .toc import _heading
-from utils import request_body_fingerprint
+from utils import request_body_fingerprint, safe_bool_value, safe_int_value
 
 # Reclassifies a raw tool result's status, catching disguised failures/timeouts
 def _effective_status(result: dict[str, Any]) -> tuple[str, str]:
     status = str(result.get("status") or "unknown").lower()
     diagnosis = str(result.get("diagnosis") or "").lower()
     combined = "\n".join(str(result.get(key) or "") for key in ("output", "stdout", "stderr"))
-    if result.get("hard_failure"):
+    if safe_bool_value(result.get("hard_failure"), False):
         return (
             "error" if status == "error" else "partial",
             "At least one sub-scan ended with a real execution failure; any time-limited sub-scans and preserved findings are reported separately.",
         )
-    if result.get("timed_out") or result.get("time_limit_reached") or "timeout" in diagnosis or "time limit" in combined.lower():
+    if safe_bool_value(result.get("timed_out"), False) or safe_bool_value(result.get("time_limit_reached"), False) or "timeout" in diagnosis or "time limit" in combined.lower():
         return "time_limit", "Configured scan budget reached; retained findings are valid but coverage is incomplete."
     if status == "success" and re.search(
         r"(?:not recognized as an internal or external command|non .? riconosciuto come comando interno o esterno|can't open perl script|modulenotfounderror|traceback \(most recent call last\))",
@@ -438,7 +438,7 @@ def build_endpoint_coverage(results: dict[str, Any], context: dict[str, Any]) ->
         if tool == "zap" and status != "skipped":
             active_scans = result.get("targeted_active_scans") if isinstance(result.get("targeted_active_scans"), list) else []
             for scan in active_scans:
-                if not isinstance(scan, dict) or not scan.get("completed") or not str(scan.get("url") or ""):
+                if not isinstance(scan, dict) or not safe_bool_value(scan.get("completed"), False) or not str(scan.get("url") or ""):
                     continue
                 nested_method = str(scan.get("method") or "GET").upper()
                 nested_url = str(scan.get("url"))
@@ -492,10 +492,10 @@ def summarize_endpoint_coverage(rows: list[dict[str, Any]]) -> dict[str, Any]:
         reachable = max(0, total - dead - out_scope)
         tested = sum(str(row.get("status") or "") == "Tested" for row in items)
         broad_specialist_tested = sum(
-            str(row.get("status") or "") == "Tested" and bool(row.get("tested_by_broad_or_specialist")) for row in items
+            str(row.get("status") or "") == "Tested" and safe_bool_value(row.get("tested_by_broad_or_specialist"), False) for row in items
         )
         safe_surface_only = sum(
-            str(row.get("status") or "") == "Tested" and bool(row.get("tested_by_safe_surface")) and not bool(row.get("tested_by_broad_or_specialist"))
+            str(row.get("status") or "") == "Tested" and safe_bool_value(row.get("tested_by_safe_surface"), False) and not safe_bool_value(row.get("tested_by_broad_or_specialist"), False)
             for row in items
         )
         discovered_only = sum(str(row.get("status") or "") == "Discovered only" for row in items)
@@ -503,7 +503,7 @@ def summarize_endpoint_coverage(rows: list[dict[str, Any]]) -> dict[str, Any]:
         errors = sum(str(row.get("status") or "") == "Execution error" for row in items)
         coverage = (100.0 * tested / reachable) if reachable else 0.0
         broad_specialist_coverage = (100.0 * broad_specialist_tested / reachable) if reachable else 0.0
-        explicit = [row for row in items if bool(row.get("configured_entry_point"))]
+        explicit = [row for row in items if safe_bool_value(row.get("configured_entry_point"), False)]
         explicit_tested = sum(str(row.get("status") or "") == "Tested" for row in explicit)
         explicit_coverage = (100.0 * explicit_tested / len(explicit)) if explicit else 0.0
         return {
@@ -572,7 +572,7 @@ def _render_endpoint_coverage(rows: list[dict[str, Any]], toc: list[tuple[int, s
     display_rows = list(rows)
     detail_note = ""
     if for_pdf:
-        pdf_limit = max(80, int(os.getenv("SECOPS_REPORT_PDF_ENDPOINT_ROWS", "260")))
+        pdf_limit = max(80, safe_int_value(os.getenv("SECOPS_REPORT_PDF_ENDPOINT_ROWS", "260"), 260))
         if len(display_rows) > pdf_limit:
             status_priority = {
                 "Execution error": 0, "Discovered only": 1, "Skipped": 2,
@@ -641,11 +641,11 @@ def _coverage_constraints(
     profiles = context.get("profiles") if isinstance(context.get("profiles"), list) else []
     authenticated_profiles = [
         row for row in profiles
-        if isinstance(row, dict) and bool(row.get("authenticated"))
+        if isinstance(row, dict) and safe_bool_value(row.get("authenticated"), False)
     ]
     anonymous_profiles = [
         row for row in profiles
-        if isinstance(row, dict) and not bool(row.get("authenticated"))
+        if isinstance(row, dict) and not safe_bool_value(row.get("authenticated"), False)
     ]
     if authenticated_profiles and not anonymous_profiles:
         add(
@@ -654,10 +654,7 @@ def _coverage_constraints(
             "Repeat the assessment without --auth-only or include both anonymous and authenticated profiles.",
         )
 
-    try:
-        authenticated_identity_count = int(context.get("authenticated_identity_count") or 0)
-    except (TypeError, ValueError):
-        authenticated_identity_count = 0
+    authenticated_identity_count = max(0, safe_int_value(context.get("authenticated_identity_count"), 0))
     if authenticated_identity_count <= 0:
         authenticated_identity_count = len(authenticated_profiles)
     if authenticated_profiles and authenticated_identity_count < 2:
@@ -703,7 +700,7 @@ def _coverage_constraints(
             )
             break
 
-    remaining = int(context.get("remaining_eligible_actions_at_report", 0) or 0)
+    remaining = max(0, safe_int_value(context.get("remaining_eligible_actions_at_report"), 0))
     if remaining:
         add(
             "Agentic execution plan",
@@ -736,7 +733,7 @@ def summarize(results: dict[str, Any], findings: list[dict[str, Any]], coverage:
         if not isinstance(entry, dict):
             continue
         status = str(entry.get("status") or "").lower()
-        report_available = bool(entry.get("report_available", True))
+        report_available = safe_bool_value(entry.get("report_available"), True)
         if status not in {"error", "blocked"} and not (status in {"success", "reported", "unknown"} and not report_available):
             continue
         job_id = str(entry.get("job_id") or "entry-point")
@@ -777,7 +774,7 @@ def _executive_text(summary: dict[str, Any], findings: list[dict[str, Any]], con
     limits = len(summary["limitations"])
     constraints = len(summary.get("coverage_constraints") or [])
     ai_assessment = (context or {}).get("ai_analysis", {}) if isinstance(context, dict) else {}
-    assessed = int(ai_assessment.get("analyzed_findings", 0) or 0) if isinstance(ai_assessment, dict) else 0
+    assessed = safe_int_value(ai_assessment.get("analyzed_findings", 0), 0) if isinstance(ai_assessment, dict) else 0
     if assessed:
         assessment_note = (
             f" The configured AI provider/model post-assessed {assessed} confirmed/candidate finding(s), independently enriching severity, description, "
