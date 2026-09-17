@@ -30,7 +30,7 @@ from assessmentConfig import (
     validate_authorization_scope,
 )
 from utils import atomic_write_text, canonical_cookie_header, cookie_header_fingerprint, cookie_names, normalized_origin, normalized_hostname, same_origin, scanner_request_rate_policy, safe_bool_value, safe_int_value
-from targetAuth import browser_oidc_login_session
+from targetAuth import BrowserLoginError, browser_oidc_login_session
 
 
 ROOT = Path(__file__).resolve().parent
@@ -342,6 +342,7 @@ def _resolve_job_cookie(
         "browser_login_completed": False,
         "manual_cookie_origin": "",
         "prompt_attempted": False,
+        "credential_correction_attempted": False,
     })
 
     username_env = str(credential.get("username_env") or "").strip()
@@ -485,9 +486,65 @@ def _resolve_job_cookie(
                     first_exc = exc
                 else:
                     first_exc = None
+        # A provider-level "invalid username/password" response is different from a navigation or
+        # SSO failure. In an interactive parent process allow exactly one correction attempt. This
+        # catches ordinary typing mistakes without creating prompt loops, without persisting secrets,
+        # and without allowing child orchestrators to ask for credentials again.
+        if (
+            first_exc is not None
+            and isinstance(first_exc, BrowserLoginError)
+            and str(getattr(first_exc, "reason", "")) == "credentials_rejected"
+            and interactive
+            and not bool(runtime.get("credential_correction_attempted"))
+        ):
+            runtime["credential_correction_attempted"] = True
+            print(
+                f"[AUTH:{reference}] The authentication provider rejected the supplied username/password. "
+                "One correction attempt is available before this identity is omitted."
+            )
+            current_username = str(username or "")
+            prompt_suffix = f" [{current_username}]" if current_username else ""
+            corrected_username = input(
+                f"[AUTH:{reference}] Correct target username{prompt_suffix} (Enter to keep current): "
+            ).strip()
+            if corrected_username:
+                username = corrected_username
+            # Always re-enter the password after an explicit rejection. Reusing the rejected secret
+            # would only repeat the same failed request and can also trigger account lockout policy.
+            password = getpass.getpass(
+                f"[AUTH:{reference}] Re-enter target password after credential rejection: "
+            )
+            runtime["username"] = username
+            runtime["password"] = password
+            if username and password:
+                try:
+                    login_result = browser_oidc_login_session(
+                        target_url,
+                        username,
+                        password,
+                        credential,
+                        storage_state=storage_state,
+                        initial_login=not bool(runtime.get("browser_login_completed")),
+                        expected_oidc_issuer=str(runtime.get("oidc_issuer") or ""),
+                    )
+                except RuntimeError as exc:
+                    first_exc = exc
+                else:
+                    first_exc = None
+            else:
+                first_exc = BrowserLoginError(
+                    "Credential correction was incomplete; both username and password are required.",
+                    getattr(first_exc, "attempted_candidates", []),
+                    reason="credentials_unavailable",
+                )
+
         if first_exc is not None:
             if bool(credential.get("optional", False)):
-                print(f"[AUTH] Automatic browser login failed: {first_exc}; this identity will be omitted; the job may continue with any other available configured profile.")
+                reason = str(getattr(first_exc, "reason", "browser_login_failed"))
+                print(
+                    f"[AUTH] Automatic browser login failed ({reason}): {first_exc}; "
+                    "this identity will be omitted; the job may continue with any other available configured profile."
+                )
                 cache[cache_key] = ""
                 return ""
             raise ValueError(str(first_exc)) from first_exc
@@ -504,7 +561,12 @@ def _resolve_job_cookie(
     runtime["browser_login_completed"] = True
     runtime["username"] = username
     runtime["password"] = password
-    reuse_note = "existing browser/SSO state" if login_result.get("sso_reused") else "the original username/password"
+    if login_result.get("sso_reused"):
+        reuse_note = "existing browser/SSO state"
+    elif bool(runtime.get("credential_correction_attempted")):
+        reuse_note = "the corrected username/password"
+    else:
+        reuse_note = "the original username/password"
     print(f"[AUTH] Browser authentication succeeded using {reuse_note}; target cookie names: {', '.join(cookie_names(value)) or 'none'}.")
     runtime["resolved_cookie"] = value
     cache[cache_key] = value
