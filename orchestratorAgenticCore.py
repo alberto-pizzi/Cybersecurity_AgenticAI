@@ -1293,55 +1293,69 @@ def ai_plan(state: AgentState) -> dict[str, Any]:
         plan = _parse_ai_plan_content(content)
         return plan, context, context_window, candidate_count, kind
 
+    # Unlike Ollama (schema-constrained via `format=PLAN_SCHEMA`), Snap4City's chat endpoint has no
+    # structured-output enforcement, so it occasionally emits one non-conformant field (e.g. a null
+    # priority) in an otherwise-valid batch response. A single such slip must not discard every other
+    # batch's AI-derived plan, so each batch gets one same-content retry before the run is failed.
+    batch_max_attempts = 2
     for batch_number, batch in enumerate(batches, 1):
         batch_started = time.monotonic()
-        try:
-            compact_plan, context, context_window, candidate_count, kind = run_one_batch(batch_number, batch)
-            endpoint_kinds.append(kind)
-            total_context_bytes += len(context.encode('utf-8'))
-            max_context_used = max(max_context_used, context_window)
-            adaptive_requested = adaptive_requested or bool(compact_plan.get('request_adaptive_extension', False))
-            valid_batch_ids = {id_by_identity[id(action)] for action in batch}
-            raw_priority_rows = compact_plan.get('selected_action_priorities', [])
-            priority_map: dict[str, int] = {}
-            for row in raw_priority_rows if isinstance(raw_priority_rows, list) else []:
-                if not isinstance(row, dict):
+        for attempt in range(1, batch_max_attempts + 1):
+            try:
+                compact_plan, context, context_window, candidate_count, kind = run_one_batch(batch_number, batch)
+                endpoint_kinds.append(kind)
+                total_context_bytes += len(context.encode('utf-8'))
+                max_context_used = max(max_context_used, context_window)
+                adaptive_requested = adaptive_requested or bool(compact_plan.get('request_adaptive_extension', False))
+                valid_batch_ids = {id_by_identity[id(action)] for action in batch}
+                raw_priority_rows = compact_plan.get('selected_action_priorities', [])
+                priority_map: dict[str, int] = {}
+                for row in raw_priority_rows if isinstance(raw_priority_rows, list) else []:
+                    if not isinstance(row, dict):
+                        continue
+                    candidate_id = str(row.get('id') or '')
+                    if candidate_id not in valid_batch_ids:
+                        continue
+                    priority_map[candidate_id] = max(0, min(100, int(row.get('priority'))))
+                accepted_this_batch: list[str] = []
+                for candidate_id in [str(value) for value in compact_plan.get('selected_action_ids', [])]:
+                    if candidate_id not in valid_batch_ids or candidate_id in selected_id_set:
+                        continue
+                    if candidate_id not in priority_map:
+                        raise ValueError(f'AI batch {batch_number} selected {candidate_id} without a priority.')
+                    selected_id_set.add(candidate_id)
+                    selected_first_seen[candidate_id] = len(selected_ids)
+                    selected_priority_by_id[candidate_id] = int(priority_map[candidate_id])
+                    selected_ids.append(candidate_id)
+                    selected_actions.append(dict(candidate_map[candidate_id]))
+                    accepted_this_batch.append(candidate_id)
+                reasoning = _humanize_planner_reasoning(compact_plan.get('reasoning_summary'))[:400]
+                if reasoning:
+                    reasoning_parts.append(f'Batch {batch_number}/{len(batches)}: {reasoning}')
+                batch_diagnostics.append({
+                    'batch': batch_number,
+                    'candidate_count': candidate_count,
+                    'selected_count': len(accepted_this_batch),
+                    'selected_action_ids': accepted_this_batch,
+                    'endpoint': kind,
+                    'context_bytes': len(context.encode('utf-8')),
+                    'context_window': context_window,
+                    'seconds': round(time.monotonic() - batch_started, 2),
+                    'contract_normalizations': list(compact_plan.get('_contract_normalizations') or []),
+                })
+                break
+            except Exception as exc:
+                errors.append(f'batch {batch_number} attempt {attempt}/{batch_max_attempts}: {type(exc).__name__}: {exc}')
+                if attempt < batch_max_attempts:
+                    print(
+                        f'    AI planning: batch {batch_number}/{len(batches)} returned a malformed plan '
+                        f'({type(exc).__name__}: {exc}); asking the AI again for the same batch.',
+                        flush=True,
+                    )
                     continue
-                candidate_id = str(row.get('id') or '')
-                if candidate_id not in valid_batch_ids:
-                    continue
-                priority_map[candidate_id] = max(0, min(100, int(row.get('priority'))))
-            accepted_this_batch: list[str] = []
-            for candidate_id in [str(value) for value in compact_plan.get('selected_action_ids', [])]:
-                if candidate_id not in valid_batch_ids or candidate_id in selected_id_set:
-                    continue
-                if candidate_id not in priority_map:
-                    raise ValueError(f'AI batch {batch_number} selected {candidate_id} without a priority.')
-                selected_id_set.add(candidate_id)
-                selected_first_seen[candidate_id] = len(selected_ids)
-                selected_priority_by_id[candidate_id] = int(priority_map[candidate_id])
-                selected_ids.append(candidate_id)
-                selected_actions.append(dict(candidate_map[candidate_id]))
-                accepted_this_batch.append(candidate_id)
-            reasoning = _humanize_planner_reasoning(compact_plan.get('reasoning_summary'))[:400]
-            if reasoning:
-                reasoning_parts.append(f'Batch {batch_number}/{len(batches)}: {reasoning}')
-            batch_diagnostics.append({
-                'batch': batch_number,
-                'candidate_count': candidate_count,
-                'selected_count': len(accepted_this_batch),
-                'selected_action_ids': accepted_this_batch,
-                'endpoint': kind,
-                'context_bytes': len(context.encode('utf-8')),
-                'context_window': context_window,
-                'seconds': round(time.monotonic() - batch_started, 2),
-                'contract_normalizations': list(compact_plan.get('_contract_normalizations') or []),
-            })
-        except Exception as exc:
-            errors.append(f'batch {batch_number}: {type(exc).__name__}: {exc}')
-            # A failed batch means some concrete actions were never judged by the AI. In strict
-            # Agentic planning this is a planner failure, not permission for Python to choose them.
-            raise RuntimeError('; '.join(errors)) from exc
+                # Every attempt for this batch failed. In strict Agentic planning this is a planner
+                # failure, not permission for Python to choose the undecided actions itself.
+                raise RuntimeError('; '.join(errors)) from exc
 
     # Every batch uses the same AI priority scale. Merge the batch-local selections globally using
     # only priorities returned by the model; technical batch order is a tie-breaker only when the AI
