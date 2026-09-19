@@ -7620,14 +7620,44 @@ def recover_normal_report_artifacts(output_name: str, report: dict[str, Any]) ->
         if 'coverage_complete' in summary:
             recovered['coverage_complete'] = safe_bool_metadata(summary.get('coverage_complete'), False)
 
+    # The MCP round-trip (HTTP transport/timeout layering) can fail even though the report server
+    # already wrote the JSON payload to disk before it ever attempted PDF rendering. Rather than
+    # give up on the PDF entirely, render it once more directly in this process from that same
+    # payload — bypassing the async MCP transport/watchdog stack that just failed.
+    pdf_regeneration_error = ''
+    if available['pdf_filename'] is None and isinstance(payload, dict):
+        try:
+            module = _load_report_server_module()
+            render_html = getattr(module, '_render_html', None)
+            render_pdf = getattr(module, 'html2pdf', None)
+            if not callable(render_html) or not callable(render_pdf):
+                raise AttributeError('reportServer.py does not expose _render_html()/html2pdf()')
+            pdf_source_path = html_path.with_name(f'{html_path.stem}.pdf-source.html')
+            atomic_write_text(pdf_source_path, render_html(payload, for_pdf=True))
+            try:
+                render_pdf(pdf_source_path, pdf_path)
+            finally:
+                pdf_source_path.unlink(missing_ok=True)
+            if pdf_path.is_file():
+                available['pdf_filename'] = pdf_path
+                recovered['pdf_filename'] = str(pdf_path.resolve())
+                recovered['local_pdf_generated'] = True
+                recovered['pdf_regenerated_locally'] = True
+        except Exception as exc:
+            pdf_regeneration_error = f'{type(exc).__name__}: {exc}'
+
     if available['pdf_filename'] is not None:
         recovered['status'] = 'success'
         recovered['diagnosis'] = 'report_response_recovered'
         recovered['output'] = 'Normal report artifacts, including the PDF, were recovered after the MCP/HTTP response did not complete normally.'
+        if recovered.get('pdf_regenerated_locally'):
+            recovered['output'] = 'Normal JSON/HTML artifacts were recovered after the MCP/HTTP reporting failure, and the PDF was regenerated locally from the same report payload.'
     else:
         recovered['status'] = 'partial'
         recovered['diagnosis'] = 'normal_report_recovered_without_pdf'
         suffix = f' Original reporting detail: {original_output}' if original_output else ''
+        if pdf_regeneration_error:
+            suffix += f' Local PDF regeneration also failed: {pdf_regeneration_error}'
         recovered['output'] = 'Normal JSON/HTML report artifacts were recovered after the MCP/HTTP reporting failure; the PDF was not generated.' + suffix
     return recovered
 
@@ -7996,38 +8026,42 @@ def summarize_results(results: dict[str, Any]) -> tuple[int, int, int]:
             print(f'[-] {path}: {cause} — {detail[:500]}', file=sys.stderr)
     return (errors, skips, partial)
 
-# Reuses the report deduplicator for the terminal finding summary.
-def _report_flatten_findings_for_summary(results: dict[str, Any]) -> list[dict[str, Any]]:
-
+# Dynamically loads reportServer.py in-process so its rendering/dedup helpers can be reused
+# without importing the MCP server module (and its FastMCP app registration) at orchestrator startup.
+def _load_report_server_module() -> Any:
     report_path = SERVERS / 'reporting' / 'reportServer.py'
     if not report_path.is_file():
         raise FileNotFoundError(report_path)
     module_name = '_secops_report_summary_runtime'
     module = sys.modules.get(module_name)
-    if module is None:
-        spec = importlib.util.spec_from_file_location(module_name, report_path)
-        if spec is None or spec.loader is None:
-            raise ImportError(f'Cannot load report normalizer from {report_path}')
-        module = importlib.util.module_from_spec(spec)
-        sys.modules[module_name] = module
+    if module is not None:
+        return module
+    spec = importlib.util.spec_from_file_location(module_name, report_path)
+    if spec is None or spec.loader is None:
+        raise ImportError(f'Cannot load report normalizer from {report_path}')
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[module_name] = module
+    added_paths = []
+    for candidate in (str(SERVERS), str(ROOT)):
+        if candidate not in sys.path:
+            sys.path.insert(0, candidate)
+            added_paths.append(candidate)
+    try:
+        spec.loader.exec_module(module)
+    except Exception:
+        sys.modules.pop(module_name, None)
+        raise
+    finally:
+        for candidate in added_paths:
+            try:
+                sys.path.remove(candidate)
+            except ValueError:
+                pass
+    return module
 
-
-        added_paths = []
-        for candidate in (str(SERVERS), str(ROOT)):
-            if candidate not in sys.path:
-                sys.path.insert(0, candidate)
-                added_paths.append(candidate)
-        try:
-            spec.loader.exec_module(module)
-        except Exception:
-            sys.modules.pop(module_name, None)
-            raise
-        finally:
-            for candidate in added_paths:
-                try:
-                    sys.path.remove(candidate)
-                except ValueError:
-                    pass
+# Reuses the report deduplicator for the terminal finding summary.
+def _report_flatten_findings_for_summary(results: dict[str, Any]) -> list[dict[str, Any]]:
+    module = _load_report_server_module()
     flatten = getattr(module, 'flatten_findings', None)
     if not callable(flatten):
         raise AttributeError('reportServer.py does not expose flatten_findings()')
