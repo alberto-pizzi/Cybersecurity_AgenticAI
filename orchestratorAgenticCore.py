@@ -505,23 +505,46 @@ def _parse_ai_plan_content(content: str) -> dict[str, Any]:
     value['selected_action_ids'] = selected
     _normalize_ai_boolean_field(value, 'request_adaptive_extension', default=False)
     _normalize_ai_boolean_field(value, 'finish', default=False)
+    # A single malformed row (missing/non-numeric priority, duplicate id with conflicting values)
+    # is a per-row representation defect, not evidence that the rest of the batch's AI judgement is
+    # untrustworthy. At scale (a balanced/deep run can produce 100+ batches) discarding the whole
+    # batch over one bad row turns an isolated glitch into a full assessment failure. Python still
+    # never invents a priority or upgrades a candidate: a row that cannot be salvaged is dropped
+    # (and, if it was selected, simply excluded from the plan) rather than guessed at.
     priority_ids: set[str] = set()
     priority_values: dict[str, int] = {}
     normalized_priorities: list[dict[str, Any]] = []
     for raw_row in priorities:
         if not isinstance(raw_row, dict) or not str(raw_row.get('id') or '').strip():
-            raise ValueError('AI provider returned an invalid selected_action_priorities entry.')
+            value.setdefault('_contract_normalizations', []).append({
+                'field': 'selected_action_priorities',
+                'dropped_invalid_entry': True,
+            })
+            continue
         row = dict(raw_row)
         row['id'] = str(row.get('id')).strip()
+        candidate_id = row['id']
         raw_priority = row.get('priority')
         if isinstance(raw_priority, bool):
-            raise ValueError('AI provider returned a boolean action priority; an integer 0..100 is required.')
+            value.setdefault('_contract_normalizations', []).append({
+                'field': 'selected_action_priorities.priority', 'id': candidate_id,
+                'dropped_invalid_priority': raw_priority,
+            })
+            continue
         try:
             numeric_priority = float(raw_priority)
-        except (TypeError, ValueError) as exc:
-            raise ValueError('AI provider returned a non-numeric action priority.') from exc
+        except (TypeError, ValueError):
+            value.setdefault('_contract_normalizations', []).append({
+                'field': 'selected_action_priorities.priority', 'id': candidate_id,
+                'dropped_invalid_priority': raw_priority,
+            })
+            continue
         if not math.isfinite(numeric_priority):
-            raise ValueError('AI provider returned a non-finite action priority.')
+            value.setdefault('_contract_normalizations', []).append({
+                'field': 'selected_action_priorities.priority', 'id': candidate_id,
+                'dropped_invalid_priority': raw_priority,
+            })
+            continue
         # Structured-output providers occasionally violate the JSON-schema numeric bounds even
         # when the rest of the plan is valid (for example 120 on a documented 0..100 scale).
         # Treat this as a recoverable representation defect rather than discarding a complete AI
@@ -531,23 +554,31 @@ def _parse_ai_plan_content(content: str) -> dict[str, Any]:
         if numeric_priority != priority:
             value.setdefault('_contract_normalizations', []).append({
                 'field': 'selected_action_priorities.priority',
-                'id': row['id'],
+                'id': candidate_id,
                 'received': raw_priority,
                 'normalized': priority,
             })
         row['priority'] = priority
-        candidate_id = row['id']
         if candidate_id in priority_values:
             if priority_values[candidate_id] != priority:
-                raise ValueError(
-                    f'AI provider returned conflicting priorities for {candidate_id}: '
-                    f'{priority_values[candidate_id]} and {priority}.'
-                )
-            value.setdefault('_contract_normalizations', []).append({
-                'field': 'selected_action_priorities',
-                'deduplicated_id': candidate_id,
-                'priority': priority,
-            })
+                # Two entries for the same id with different priorities: keep the higher one. Both
+                # numbers came from the AI itself, so picking the max is a tie-break, not a guess.
+                resolved = max(priority_values[candidate_id], priority)
+                value.setdefault('_contract_normalizations', []).append({
+                    'field': 'selected_action_priorities.priority', 'id': candidate_id,
+                    'conflicting_values': [priority_values[candidate_id], priority], 'resolved': resolved,
+                })
+                priority_values[candidate_id] = resolved
+                for existing_row in normalized_priorities:
+                    if existing_row['id'] == candidate_id:
+                        existing_row['priority'] = resolved
+                        break
+            else:
+                value.setdefault('_contract_normalizations', []).append({
+                    'field': 'selected_action_priorities',
+                    'deduplicated_id': candidate_id,
+                    'priority': priority,
+                })
             continue
         priority_values[candidate_id] = priority
         priority_ids.add(candidate_id)
@@ -555,7 +586,12 @@ def _parse_ai_plan_content(content: str) -> dict[str, Any]:
     value['selected_action_priorities'] = normalized_priorities
     missing = [candidate_id for candidate_id in selected if candidate_id not in priority_ids]
     if missing:
-        raise ValueError('AI provider omitted priorities for selected action IDs: ' + ', '.join(missing[:8]))
+        value.setdefault('_contract_normalizations', []).append({
+            'field': 'selected_action_ids',
+            'dropped_missing_priority_ids': missing,
+        })
+        selected = [candidate_id for candidate_id in selected if candidate_id in priority_ids]
+        value['selected_action_ids'] = selected
     return value
 
 
@@ -1189,6 +1225,7 @@ def ai_plan(state: AgentState) -> dict[str, Any]:
     adaptive_requested = False
     endpoint_kinds: list[str] = []
     errors: list[str] = []
+    failed_batches: list[int] = []
     batch_diagnostics: list[dict[str, Any]] = []
     total_context_bytes = 0
     max_context_used = 0
@@ -1296,8 +1333,8 @@ def ai_plan(state: AgentState) -> dict[str, Any]:
     # Unlike Ollama (schema-constrained via `format=PLAN_SCHEMA`), Snap4City's chat endpoint has no
     # structured-output enforcement, so it occasionally emits one non-conformant field (e.g. a null
     # priority) in an otherwise-valid batch response. A single such slip must not discard every other
-    # batch's AI-derived plan, so each batch gets one same-content retry before the run is failed.
-    batch_max_attempts = 2
+    # batch's AI-derived plan, so each batch gets same-content retries before it is treated as failed.
+    batch_max_attempts = 3
     for batch_number, batch in enumerate(batches, 1):
         batch_started = time.monotonic()
         for attempt in range(1, batch_max_attempts + 1):
@@ -1353,9 +1390,34 @@ def ai_plan(state: AgentState) -> dict[str, Any]:
                         flush=True,
                     )
                     continue
-                # Every attempt for this batch failed. In strict Agentic planning this is a planner
-                # failure, not permission for Python to choose the undecided actions itself.
-                raise RuntimeError('; '.join(errors)) from exc
+                # Every attempt for this one batch failed. Python still never invents which of its
+                # candidates to select — but on a large run (100+ batches) an isolated, unsalvageable
+                # batch is not evidence that the AI itself is unusable. Skip only this batch (0 actions
+                # from it this round; its candidates remain eligible in later rounds) and keep planning
+                # the rest, instead of discarding every other batch's already-obtained AI judgement.
+                failed_batches.append(batch_number)
+                batch_diagnostics.append({
+                    'batch': batch_number,
+                    'candidate_count': len(batch),
+                    'selected_count': 0,
+                    'selected_action_ids': [],
+                    'endpoint': 'failed',
+                    'seconds': round(time.monotonic() - batch_started, 2),
+                    'error': f'{type(exc).__name__}: {exc}',
+                    'skipped_after_exhausted_retries': True,
+                })
+                print(
+                    f'[!] AI planning: batch {batch_number}/{len(batches)} could not produce a valid plan '
+                    f'after {batch_max_attempts} attempts ({type(exc).__name__}: {exc}); skipping this '
+                    f'batch (0 actions selected from it) so the rest of the assessment can continue.',
+                    file=sys.stderr, flush=True,
+                )
+
+    if failed_batches and len(failed_batches) == len(batches):
+        # Every single batch was unsalvageable: this is not an isolated formatting slip, it means the
+        # AI provider itself is not usable right now. Strict Agentic mode still fails loudly here
+        # rather than silently proceeding with zero AI-vetted actions for the whole round.
+        raise RuntimeError('; '.join(errors))
 
     # Every batch uses the same AI priority scale. Merge the batch-local selections globally using
     # only priorities returned by the model; technical batch order is a tie-breaker only when the AI
@@ -1403,6 +1465,7 @@ def ai_plan(state: AgentState) -> dict[str, Any]:
         'planner_configured_batch_size': batch_size,
         'planner_batch_count': len(batches),
         'planner_batches': batch_diagnostics,
+        'planner_batch_failures': list(failed_batches),
         'selected_action_ids': selected_ids_admitted,
         'ai_selected_action_ids_before_cap': selected_ids,
         'ai_selected_action_priorities': {candidate_id: selected_priority_by_id[candidate_id] for candidate_id in selected_ids},
