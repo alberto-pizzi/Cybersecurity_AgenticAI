@@ -2278,6 +2278,18 @@ def validate_plan(state: AgentState, proposed: Any, *, enforce_execution_limits:
     profiles = {profile['name'] for profile in state['profiles']}
     completed, valid = (set(state['completed']), [])
     per_tool: dict[tuple[str, str], int] = {}
+    # Each select_*_request_cases() call below re-ranks/re-scores every discovered request case for
+    # one profile; its result depends only on the profile (and, for select_tool_request_cases, the
+    # tool), never on the individual proposed row being validated. Recomputing it per row turns a
+    # large proposal list into a quadratic-or-worse scan (thousands of rows x re-ranking thousands of
+    # cases each), which is what actually explodes into hours/days of CPU time on a large discovery
+    # graph. Caching it once per (profile[, tool]) keeps the exact same selection logic and results.
+    arjun_cases_cache: dict[str, list[dict[str, Any]]] = {}
+    tool_cases_cache: dict[tuple[str, str], list[dict[str, Any]]] = {}
+    authorization_cases_cache: dict[str, list[dict[str, Any]]] = {}
+    browser_cases_cache: dict[str, list[dict[str, Any]]] = {}
+    workflow_cases_cache: dict[str, list[dict[str, Any]]] = {}
+    oast_cases_cache: dict[str, list[dict[str, Any]]] = {}
     proposal_limit = max(512, PROFILE_EXECUTION_ACTION_BUDGETS.get(shared.CURRENT_SCAN_MODE, 20) * max(1, len(state.get('profiles', []))) * 8)
     # Candidate-catalog validation must not silently hide otherwise valid actions before the AI sees them.
     # Execution limits are applied only to the AI-selected list, in the priority order returned by the model.
@@ -2323,7 +2335,9 @@ def validate_plan(state: AgentState, proposed: Any, *, enforce_execution_limits:
                     # session into a false authentication_precheck_failed result.
                     target_url = authenticated_targets.get(normalized_target, normalized_target)
         elif scope == 'url':
-            cases = select_arjun_request_cases(found, state['target'], allow_state_changes=shared.state_changing_tests_allowed(state['target'], state.get('allow_state_changes')), agentic_catalog=True)
+            if profile not in arjun_cases_cache:
+                arjun_cases_cache[profile] = select_arjun_request_cases(found, state['target'], allow_state_changes=shared.state_changing_tests_allowed(state['target'], state.get('allow_state_changes')), agentic_catalog=True)
+            cases = arjun_cases_cache[profile]
             matching = [case for case in cases if str(case.get('url', '')) == target_url]
             if method:
                 matching = [case for case in matching if str(case.get('method', 'GET')).upper() == method]
@@ -2334,7 +2348,10 @@ def validate_plan(state: AgentState, proposed: Any, *, enforce_execution_limits:
             data = str(selected.get('data', ''))
             parameters = [str(value) for value in selected.get('parameters', [])]
         elif scope in {'parameterized', 'numeric'}:
-            cases = select_tool_request_cases(found, tool, authenticated_profile=profile_has_cookie, allow_state_changes=shared.state_changing_tests_allowed(state['target'], state.get('allow_state_changes')), credential_cookies=_profile_cookie(state, profile), agentic_catalog=True)
+            tool_cases_key = (profile, tool)
+            if tool_cases_key not in tool_cases_cache:
+                tool_cases_cache[tool_cases_key] = select_tool_request_cases(found, tool, authenticated_profile=profile_has_cookie, allow_state_changes=shared.state_changing_tests_allowed(state['target'], state.get('allow_state_changes')), credential_cookies=_profile_cookie(state, profile), agentic_catalog=True)
+            cases = tool_cases_cache[tool_cases_key]
             matching = [case for case in cases if str(case.get('url', '')) == target_url]
             if method:
                 matching = [case for case in matching if str(case.get('method', 'GET')).upper() == method]
@@ -2358,7 +2375,9 @@ def validate_plan(state: AgentState, proposed: Any, *, enforce_execution_limits:
             raw_profile_cookie = _profile_cookie(state, profile)
             if not profile_has_cookie or not (shared.scope_cookie_header(target_url, raw_profile_cookie) or shared.runtime_target_auth_available(raw_profile_cookie, target_url)):
                 continue
-            cases = select_authorization_request_cases(found, agentic_catalog=True)
+            if profile not in authorization_cases_cache:
+                authorization_cases_cache[profile] = select_authorization_request_cases(found, agentic_catalog=True)
+            cases = authorization_cases_cache[profile]
             matching = [case for case in cases if str(case.get('url', '')) == target_url]
             if not matching:
                 continue
@@ -2369,7 +2388,9 @@ def validate_plan(state: AgentState, proposed: Any, *, enforce_execution_limits:
             data = ''
             parameters = [str(value) for value in selected.get('parameters', [])]
         elif scope == 'browser':
-            cases = select_browser_request_cases(found, agentic_catalog=True)
+            if profile not in browser_cases_cache:
+                browser_cases_cache[profile] = select_browser_request_cases(found, agentic_catalog=True)
+            cases = browser_cases_cache[profile]
             matching = [case for case in cases if str(case.get('url', '')) == target_url]
             if method:
                 matching = [case for case in matching if str(case.get('method', 'GET')).upper() == method]
@@ -2386,7 +2407,9 @@ def validate_plan(state: AgentState, proposed: Any, *, enforce_execution_limits:
             client_sources = [str(value) for value in selected.get('client_sources', []) if str(value)]
             client_sinks = [str(value) for value in selected.get('client_sinks', []) if str(value)]
         elif scope == 'workflow':
-            cases = select_workflow_request_cases(found, agentic_catalog=True)
+            if profile not in workflow_cases_cache:
+                workflow_cases_cache[profile] = select_workflow_request_cases(found, agentic_catalog=True)
+            cases = workflow_cases_cache[profile]
             matching = [case for case in cases if str(case.get('url', '')) == target_url]
             if method:
                 matching = [case for case in matching if str(case.get('method', 'POST')).upper() == method]
@@ -2414,7 +2437,9 @@ def validate_plan(state: AgentState, proposed: Any, *, enforce_execution_limits:
                 parameters = ['explicit']
                 oast_class = 'explicit'
             else:
-                candidates = select_oast_request_cases(found, state['target'], allow_state_changes=shared.state_changing_tests_allowed(state['target'], state.get('allow_state_changes')), agentic_catalog=True)
+                if profile not in oast_cases_cache:
+                    oast_cases_cache[profile] = select_oast_request_cases(found, state['target'], allow_state_changes=shared.state_changing_tests_allowed(state['target'], state.get('allow_state_changes')), agentic_catalog=True)
+                candidates = oast_cases_cache[profile]
                 matching = [item for item in candidates if not injection or item.get('injection_url') == injection]
                 if not matching:
                     continue
