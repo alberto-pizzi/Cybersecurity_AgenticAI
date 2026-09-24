@@ -39,6 +39,10 @@ OLLAMA_QWEN_MODEL = 'qwen2.5:7b'
 SNAP4CITY_DEFAULT_API_URL = 'https://www.snap4city.org/apis/llama4-agentic-inference'
 SNAP4CITY_DEFAULT_MODEL = 'llama4-agentic-inference'
 _SNAP4CITY_TOKEN_MANAGERS: dict[str, Any] = {}
+# Cache only within an unchanged graph-state object identity. Discovery enrichment and executor state
+# updates create new discovery/completed objects, which automatically invalidate this cache.
+_ELIGIBLE_ACTION_CATALOG_CACHE: dict[tuple[Any, ...], list[dict[str, Any]]] = {}
+_ELIGIBLE_ACTION_CATALOG_CACHE_MAX = 8
 
 
 # Stores the state exchanged between the agentic workflow steps.
@@ -214,13 +218,17 @@ ROUND_EXECUTION_ACTION_ADAPTIVE_CEILINGS = {
 }
 
 # Hard wall-clock ceilings for the complete Agentic child workflow, including preflight and model
-# preparation. They cap aggregate sequential scanner time, which individual per-tool timeouts cannot
-# do. The parent runner keeps a final 15-minute watchdog margin below the user's 10/12-hour maximum.
+# preparation. They are deliberately wide last-resort safety guards, not normal scheduling targets;
+# ordinary runtime reduction comes from deduplication/reuse/concurrency controls. The parent runner
+# remains wider than the child so finalization normally completes inside the workflow itself.
 AGENTIC_WALL_CLOCK_BUDGETS = {
-    'test': 45 * 60,
-    'fast': 4 * 60 * 60,
-    'balanced': (9 * 60 + 45) * 60,
-    'deep': (11 * 60 + 45) * 60,
+    # These are safety-watchdog floors at the default 10 req/s, not scheduling targets. Normal
+    # assessments should finish earlier through deduplication and lower local overhead. At slower
+    # configured rates assessment_wall_clock_budget_seconds() scales the watchdog conservatively.
+    'test': 60 * 60,
+    'fast': 10 * 60 * 60,
+    'balanced': 20 * 60 * 60,
+    'deep': 40 * 60 * 60,
 }
 # Reserve enough time for bounded verification/analysis/report generation. New specialist actions
 # are not started once only this reserve remains.
@@ -248,7 +256,10 @@ SAFE_SURFACE_FINALIZATION_SHARE = 0.35
 
 
 def assessment_wall_clock_budget_seconds(mode: str) -> int:
-    return int(AGENTIC_WALL_CLOCK_BUDGETS.get(str(mode or 'balanced').lower(), AGENTIC_WALL_CLOCK_BUDGETS['balanced']))
+    base = int(AGENTIC_WALL_CLOCK_BUDGETS.get(str(mode or 'balanced').lower(), AGENTIC_WALL_CLOCK_BUDGETS['balanced']))
+    # The global watchdog must never become the hidden coverage limiter when an operator chooses a
+    # lower request_rate. Keep the rate-10 floor and expand it proportionally below the default.
+    return int(math.ceil(base * shared.request_rate_budget_scale(shared.MAX_REQUEST_RATE)))
 
 
 def _assessment_deadline(state: AgentState) -> float:
@@ -2694,12 +2705,13 @@ def discovery_candidate_actions(state: AgentState) -> list[dict[str, Any]]:
     return _dedupe_no_cookie_profile_actions(state, actions)
 
 # Planner validation compares proposed actions with target scope, discovery evidence, and safety rules.
+# Per-tool quotas are deliberately not applied here; the global dynamic round capacity is enforced
+# after validation so the AI retains control of the selected tool mix.
 def validate_plan(state: AgentState, proposed: Any, *, enforce_execution_limits: bool = True) -> list[dict[str, Any]]:
     if not isinstance(proposed, list):
         return []
     profiles = {profile['name'] for profile in state['profiles']}
     completed, valid = (set(state['completed']), [])
-    per_tool: dict[tuple[str, str], int] = {}
     # Each select_*_request_cases() call below re-ranks/re-scores every discovered request case for
     # one profile; its result depends only on the profile (and, for select_tool_request_cases, the
     # tool), never on the individual proposed row being validated. Recomputing it per row turns a
@@ -2873,24 +2885,32 @@ def validate_plan(state: AgentState, proposed: Any, *, enforce_execution_limits:
                 oast_class = str(selected.get('oast_class') or 'remote-fetch')
         action = {'profile': profile, 'tool': tool, 'target_url': target_url, 'method': method or 'GET', 'data': data, 'parameters': parameters, 'source_url': source_url, 'fields': fields, 'client_sources': client_sources, 'client_sinks': client_sinks, 'file_parameters': file_parameters, 'token_parameters': token_parameters, 'enctype': enctype, 'jwt_token': token, 'injection_url': injection, 'oast_class': oast_class, 'adaptive_budget': bool(selected.get('adaptive_budget')), 'coverage_reserve': bool(selected.get('coverage_reserve') or raw.get('coverage_reserve')), 'priority_score': selected.get('priority_score'), 'sibling_broad': bool(raw.get('sibling_broad')), 'sibling_origin_score': raw.get('sibling_origin_score'), 'reason': str(raw.get('reason', ''))[:500] or 'No planner reason supplied.'}
         identifier = action_id(action)
-        key = (profile, tool)
-        if enforce_execution_limits:
-            limit = shared.tool_action_limit(tool, include_adaptive=True)
-            if per_tool.get(key, 0) >= limit:
-                continue
+        # Normal Agentic execution has no Python-imposed per-tool action quota. The AI decides the
+        # mix of tools and exact concrete actions; Python removes only invalid/duplicate/safety-blocked
+        # rows. The resolved global round capacity is applied *after* validation in AI priority order,
+        # so expanded discovery can be used without silently starving one vulnerability class.
         if identifier not in completed and all((action_id(item) != identifier for item in valid)):
             valid.append(action)
-            if enforce_execution_limits:
-                per_tool[key] = per_tool.get(key, 0) + 1
     return valid
 
 # Lists the actions that are currently valid for the planner.
 # --only-tool is a debug filter only: when unset, the autonomous candidate set is unchanged.
 def _eligible_action_catalog(state: AgentState) -> list[dict[str, Any]]:
-    actions = validate_plan(state, discovery_candidate_actions(state), enforce_execution_limits=False)
     only_tool = str(state.get('only_tool') or '').strip().lower()
+    key = (
+        id(state.get('discovery')), id(state.get('completed')), id(state.get('results')),
+        str(state.get('target') or ''), str(shared.CURRENT_SCAN_MODE or ''), only_tool,
+        bool(state.get('allow_state_changes')),
+    )
+    cached = _ELIGIBLE_ACTION_CATALOG_CACHE.get(key)
+    if cached is not None:
+        return [dict(action) for action in cached]
+    actions = validate_plan(state, discovery_candidate_actions(state), enforce_execution_limits=False)
     if only_tool:
         actions = [action for action in actions if str(action.get('tool') or '').lower() == only_tool]
+    if len(_ELIGIBLE_ACTION_CATALOG_CACHE) >= _ELIGIBLE_ACTION_CATALOG_CACHE_MAX:
+        _ELIGIBLE_ACTION_CATALOG_CACHE.pop(next(iter(_ELIGIBLE_ACTION_CATALOG_CACHE)), None)
+    _ELIGIBLE_ACTION_CATALOG_CACHE[key] = [dict(action) for action in actions]
     return actions
 
 # Emergency fallback is used only when AI planning fails and --require-ai is not active. It is not
@@ -2916,7 +2936,7 @@ def _fallback_plan(state: AgentState, eligible: list[dict[str, Any]], budget_tot
 
 # Pending-action filtering keeps only valid actions that have not run yet.
 def _remaining_eligible_actions(state: AgentState) -> list[dict[str, Any]]:
-    actions = validate_plan(state, discovery_candidate_actions(state), enforce_execution_limits=False)
+    actions = _eligible_action_catalog(state)
     only_tool = str(state.get('only_tool') or '').strip().lower()
     if only_tool:
         actions = [action for action in actions if str(action.get('tool') or '').lower() == only_tool]
@@ -3163,6 +3183,10 @@ def planner_node(state: AgentState) -> dict[str, Any]:
         'available_actions_per_profile': dict(LAST_AI_PLAN_DIAGNOSTICS.get('available_actions_per_profile', {})) if planner_source == 'ai' and isinstance(LAST_AI_PLAN_DIAGNOSTICS.get('available_actions_per_profile', {}), dict) else {},
         'admitted_actions_per_profile': dict(LAST_AI_PLAN_DIAGNOSTICS.get('admitted_actions_per_profile', {})) if planner_source == 'ai' and isinstance(LAST_AI_PLAN_DIAGNOSTICS.get('admitted_actions_per_profile', {}), dict) else {},
         'eligible_tools': sorted({str(action.get('tool') or '') for action in eligible}),
+        'request_case_duplicates_consolidated': sum(
+            int(((profile_data.get('budget_diagnostics') or {}).get('request_case_duplicates_consolidated_online', 0)) or 0)
+            for profile_data in state.get('discovery', {}).values() if isinstance(profile_data, dict)
+        ),
         'round_action_normal_target_total': normal_round_base,
         'round_action_normal_base_total': normal_round_base,  # legacy compatibility
         'round_action_resolved_base_total': resolved_round_base,
@@ -3275,6 +3299,10 @@ async def execute_action(action: dict[str, Any], cookies: dict[str, str], discov
         # arguments so a newly established application/path session is actually used by the tool.
         if isinstance(arguments, dict) and 'cookies' in arguments:
             arguments['cookies'] = effective_action_cookie
+        if isinstance(arguments, dict) and tool in {'sqlmap', 'dalfox', 'commix', 'traversal'}:
+            # The outer JIT precheck just completed against this exact application scope. Tell the
+            # wrapper not to issue an identical second probe immediately before starting the tool.
+            arguments['session_prevalidated'] = True
         print(f'    [SESSION ] {tool}: authenticated application session usable', flush=True)
     try:
         scanner_limit = float(arguments.get('timeout', 180))

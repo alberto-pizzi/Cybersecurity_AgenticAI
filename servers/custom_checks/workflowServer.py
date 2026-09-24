@@ -424,7 +424,7 @@ def run_workflow_scan(
         ]
     file_parameters = [str(value) for value in (file_parameters or []) if str(value)]
     token_parameters = [str(value) for value in (token_parameters or []) if str(value)]
-    timeout = max(5, min(int(timeout), 240))
+    timeout = max(5, min(int(timeout), 604800))
     action_deadline = wall_clock_deadline(timeout)
     phase_budgets = {name: proportional_budget(timeout, ratio) for name, ratio in WORKFLOW_PHASE_RATIOS.items()}
     pacer = RequestRatePacer(request_rate)

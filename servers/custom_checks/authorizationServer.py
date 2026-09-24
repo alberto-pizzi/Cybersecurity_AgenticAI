@@ -205,7 +205,7 @@ def run_authorization_scan(
             "Authorization Differential Verifier", target_url,
             "A primary authenticated Cookie header is required for authorization comparison.",
         )
-    timeout = max(5, min(int(timeout), 180))
+    timeout = max(5, min(int(timeout), 604800))
     deadline = wall_clock_deadline(timeout)
     pacer = RequestRatePacer(request_rate)
     relevance_score, relevance_reasons = _authorization_relevance(target_url, parameters)

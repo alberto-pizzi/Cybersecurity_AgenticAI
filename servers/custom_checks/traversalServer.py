@@ -47,11 +47,11 @@ def _excerpt(text: str, match: re.Match[str] | None, limit: int = 1000) -> str:
 @mcp.tool()
 def run_traversal_scan(
     target_url: str, cookies: str = "", method: str = "GET", data: str = "", parameters: list[str] | None = None, timeout: int = 30,
-    scan_profile: str = "balanced", request_rate: float | None = None, allow_state_changes: bool = False, session_probe_url: str = "",
+    scan_profile: str = "balanced", request_rate: float | None = None, allow_state_changes: bool = False, session_probe_url: str = "", session_prevalidated: bool = False,
 ) -> dict:
 
     method = str(method or "GET").upper()
-    timeout = max(10, min(int(timeout), 120))
+    timeout = max(10, min(int(timeout), 604800))
     profile = str(scan_profile or "balanced").strip().lower()
     if profile not in {"test", "fast", "balanced", "deep"}:
         raise ValueError("scan_profile must be test, fast, balanced, or deep")
@@ -79,7 +79,7 @@ def run_traversal_scan(
 
     probe_target = str(session_probe_url or target_url)
     probe_method, probe_data = ("GET", "") if session_probe_url else (method, data)
-    session_probe = scanner_session_probe(probe_target, cookies, probe_method, probe_data, timeout=min(proportional_budget(timeout, TRAVERSAL_SESSION_RATIO), max(1, int(remaining_budget(deadline)))), attempts=1, pacer=pacer, deadline=deadline)
+    session_probe = ({'performed': False, 'authenticated': True, 'conclusive': True, 'prevalidated_by_orchestrator': True} if session_prevalidated else scanner_session_probe(probe_target, cookies, probe_method, probe_data, timeout=min(proportional_budget(timeout, TRAVERSAL_SESSION_RATIO), max(1, int(remaining_budget(deadline)))), attempts=1, pacer=pacer, deadline=deadline))
     if cookies and session_probe.get("performed") and session_probe.get("conclusive") and session_probe.get("authenticated") is False:
         return partial(
             "Path Traversal/LFI", target_url,

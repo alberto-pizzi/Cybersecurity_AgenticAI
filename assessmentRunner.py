@@ -39,11 +39,19 @@ REPORTS_DIR = ROOT / "reports"
 # Last-resort parent watchdog. The Agentic child has a slightly shorter internal deadline so it
 # normally finalizes reports itself; this guard exists only for hangs outside the workflow guards.
 AGENTIC_JOB_WATCHDOG_SECONDS = {
-    'test': 60 * 60,
-    'fast': 4 * 60 * 60 + 15 * 60,
-    'balanced': 10 * 60 * 60,
-    'deep': 12 * 60 * 60,
+    # Parent last-resort guard at the default 10 req/s. The child owns normal finalization; this is
+    # deliberately wider than the child wall-clock floor and scales at lower configured rates.
+    'test': 75 * 60,
+    'fast': 11 * 60 * 60,
+    'balanced': 21 * 60 * 60,
+    'deep': 42 * 60 * 60,
 }
+
+
+def _agentic_parent_watchdog_seconds(mode: str, request_rate: float) -> float:
+    base = float(AGENTIC_JOB_WATCHDOG_SECONDS.get(str(mode or 'balanced').lower(), AGENTIC_JOB_WATCHDOG_SECONDS['balanced']))
+    scale = max(1.0, 10.0 / max(1.0, float(request_rate or 10.0)))
+    return base * scale
 
 
 
@@ -1494,7 +1502,7 @@ def main() -> int:
             child_watchdog_seconds: float | None = None
             if str((config.get('execution') or {}).get('orchestrator') or '').lower() == 'agentic':
                 mode = str((config.get('execution') or {}).get('mode') or 'balanced').lower()
-                child_watchdog_seconds = float(AGENTIC_JOB_WATCHDOG_SECONDS.get(mode, AGENTIC_JOB_WATCHDOG_SECONDS['balanced']))
+                child_watchdog_seconds = _agentic_parent_watchdog_seconds(mode, effective_rate)
             try:
                 try:
                     completed = subprocess.run(

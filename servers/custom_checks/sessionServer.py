@@ -133,7 +133,7 @@ def run_session_scan(
         state_reason = request_contract_state_change_reason({"url": selected_probe, "method": "GET", "data": "", "parameters": []})
         if state_reason:
             return skipped("Session Security Analyzer", selected_probe, f"Session probe blocked by allow_state_changes=false: {state_reason}.", diagnosis="state_change_policy_blocked", allow_state_changes=False)
-    timeout = max(5, min(int(timeout), 180))
+    timeout = max(5, min(int(timeout), 604800))
     sample_count = max(3, min(int(sample_count), 10))
     pacer = RequestRatePacer(request_rate)
 

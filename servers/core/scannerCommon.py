@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 from difflib import SequenceMatcher
 import time
+import threading
 from pathlib import Path
 from typing import Any, Callable, Iterable
 from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
@@ -12,6 +13,24 @@ import requests
 from fastmcp import FastMCP
 
 from utils import ROOT_DIR, RequestRatePacer, deadline_bounded_request_timeout, request_invocation_state_change_reason, request_same_origin_redirects, runtime_container_route, safe_port_value
+
+_CONNECTION_POOL_LOCAL = threading.local()
+
+class _StatelessCookieSession(requests.Session):
+    """Reuse TCP/TLS pools without silently carrying response cookies between scanner actions."""
+    def request(self, method: str | bytes, url: str | bytes, **kwargs: Any) -> requests.Response:
+        self.cookies.clear()
+        try:
+            return super().request(method, url, **kwargs)
+        finally:
+            self.cookies.clear()
+
+def connection_pool_session() -> requests.Session:
+    session = getattr(_CONNECTION_POOL_LOCAL, 'session', None)
+    if session is None:
+        session = _StatelessCookieSession()
+        _CONNECTION_POOL_LOCAL.session = session
+    return session
 
 # Creates a composable child FastMCP registry; only secopsServer.py owns the HTTP listener.
 def service(label: str, key: str) -> tuple[FastMCP, Callable[[], None]]:
@@ -150,6 +169,7 @@ def request_retry(
 
     last: requests.RequestException | None = None
     active_pacer = pacer or RequestRatePacer(request_rate)
+    session = connection_pool_session()
     for attempt in range(max(1, int(attempts))):
         try:
             if deadline is not None:
@@ -159,7 +179,7 @@ def request_retry(
                 kwargs["timeout"] = deadline_bounded_request_timeout(kwargs.get("timeout"), float(deadline))
             if kwargs.get("allow_redirects"):
                 return request_same_origin_redirects(
-                    method, url, pacer=active_pacer, deadline=deadline,
+                    method, url, session=session, pacer=active_pacer, deadline=deadline,
                     allow_state_changes=allow_state_changes, **kwargs,
                 )
             # Keep retry behavior deterministic: no implicit Requests redirect follow. Callers that
@@ -173,7 +193,7 @@ def request_retry(
                 if state_reason:
                     raise requests.RequestException(f"state-change policy blocked request before send: {state_reason}")
             active_pacer.wait()
-            return requests.request(method, url, **kwargs)
+            return session.request(method, url, **kwargs)
         except (requests.Timeout, requests.ConnectionError) as exc:
             last = exc
             if attempt + 1 < attempts:

@@ -10,6 +10,7 @@ import subprocess
 import tempfile
 import threading
 import time
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Callable, Iterable
 from urllib.parse import parse_qsl, urljoin, urlparse, urlunparse
@@ -674,12 +675,103 @@ def scanner_request_rate(value: Any = _REQUEST_RATE_UNSET) -> float:
     return float(scanner_request_rate_policy(value)["effective"])
 
 
-class RequestRatePacer:
-    """Per-tool-call HTTP pacer shared by project-controlled request helpers.
+def request_rate_budget_scale(value: Any = _REQUEST_RATE_UNSET, *, reference_rate: float = DEFAULT_REQUEST_RATE) -> float:
+    """Return the conservative wall-clock expansion required by a lower configured request rate.
 
-    The orchestrators execute specialist tools sequentially, but one custom checker can issue
-    several requests of its own. Reusing one pacer for the whole checker keeps those requests
-    under the configured assessment rate, including each redirect hop and retry.
+    Network-bound work configured for the project default of 10 req/s must not be truncated merely
+    because an operator intentionally selected 1/2/3 req/s. Faster-than-default rates do not shrink
+    budgets automatically: local CPU, server latency and scanner startup costs do not scale inversely
+    with the configured request rate.
+    """
+    rate = max(1.0, scanner_request_rate(value))
+    reference = max(1.0, float(reference_rate or DEFAULT_REQUEST_RATE))
+    return max(1.0, reference / rate)
+
+
+def rate_aware_network_budget(base_seconds: Any, value: Any = _REQUEST_RATE_UNSET, *,
+                              network_fraction: float = 1.0, safety_multiplier: float = 1.0,
+                              minimum_seconds: float = 0.0) -> float:
+    """Scale only the network-bound share of a timeout, never below its rate-10 baseline.
+
+    ``network_fraction=1`` is appropriate for request-count dominated scanners/discovery. Browser
+    workflows can use a smaller fraction because rendering/JavaScript time is mostly local.
+    """
+    base = max(0.0, safe_float_value(base_seconds, 0.0))
+    fraction = min(1.0, max(0.0, safe_float_value(network_fraction, 1.0)))
+    scale = request_rate_budget_scale(value)
+    adjusted = base * ((1.0 - fraction) + fraction * scale) * max(1.0, safe_float_value(safety_multiplier, 1.0))
+    return max(float(minimum_seconds or 0.0), adjusted)
+
+
+_GLOBAL_RATE_CLIENT_TTL_SECONDS = 120.0
+_GLOBAL_RATE_LOCAL_FALLBACK_LOCK = threading.Lock()
+
+def _global_request_rate_state_path() -> Path:
+    configured = str(os.getenv("SECOPS_GLOBAL_RATE_STATE") or "").strip()
+    if configured:
+        return Path(configured).expanduser()
+    try:
+        owner = str(os.getuid())
+    except (AttributeError, OSError):
+        owner = str(os.getenv("USERNAME") or os.getenv("USER") or "default")
+    safe_owner = re.sub(r"[^A-Za-z0-9_.-]+", "_", owner) or "default"
+    return Path(tempfile.gettempdir()) / f"secops-global-request-rate-{safe_owner}.json"
+
+@contextmanager
+def _cross_process_rate_lock(path: Path):
+    """Serialize request starts across SecOps Python processes on the same host.
+
+    Linux/Debian is the assessment runtime, while the Windows fallback keeps local development
+    functional. If an OS-level lock is unavailable the existing in-process lock still fails safe
+    for one process rather than preventing the assessment from running.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    handle = open(path, "a+b")
+    locked = False
+    try:
+        try:
+            if os.name == "nt":
+                import msvcrt
+                handle.seek(0, os.SEEK_END)
+                if handle.tell() == 0:
+                    handle.write(b"0")
+                    handle.flush()
+                handle.seek(0)
+                msvcrt.locking(handle.fileno(), msvcrt.LK_LOCK, 1)
+            else:
+                import fcntl
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+            locked = True
+        except (ImportError, OSError):
+            _GLOBAL_RATE_LOCAL_FALLBACK_LOCK.acquire()
+        yield
+    finally:
+        try:
+            if locked:
+                if os.name == "nt":
+                    import msvcrt
+                    handle.seek(0)
+                    msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+                else:
+                    import fcntl
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+            elif _GLOBAL_RATE_LOCAL_FALLBACK_LOCK.locked():
+                _GLOBAL_RATE_LOCAL_FALLBACK_LOCK.release()
+        finally:
+            handle.close()
+
+
+class RequestRatePacer:
+    """Assessment-host request-start pacer for project-controlled network helpers.
+
+    All SecOps Python processes owned by the same OS user coordinate through a tiny locked state
+    file. Multiple workers may therefore keep requests in flight to hide response latency, while
+    request *starts* remain globally spaced by the configured rate. Active lower-rate clients are
+    retained briefly, so concurrent project-controlled assessments fail conservatively toward the
+    lowest recently active configured rate rather than summing independent per-process pacers.
+
+    External scanners still receive their own native rate/delay flag and are executed sequentially
+    by the orchestrator; this shared pacer governs every project-controlled HTTP/TCP helper.
     """
 
     def __init__(self, request_rate: Any = _REQUEST_RATE_UNSET) -> None:
@@ -687,14 +779,84 @@ class RequestRatePacer:
         self.interval_seconds = 1.0 / self.rate
         self._last_request_at = 0.0
         self._lock = threading.Lock()
+        self._state_path = _global_request_rate_state_path()
+        self._lock_path = self._state_path.with_suffix(self._state_path.suffix + ".lock")
+        self._client_key = f"{os.getpid()}:{self.rate:g}"
+        self._wait_count = 0
+        self._throttle_seconds = 0.0
+        self._last_effective_rate = self.rate
 
-    def wait(self) -> None:
-        with self._lock:
-            now = time.monotonic()
-            delay = self.interval_seconds - (now - self._last_request_at)
-            if delay > 0:
+    def _wait_shared(self, deadline: float | None = None) -> bool:
+        with _cross_process_rate_lock(self._lock_path):
+            now = time.time()
+            state: dict[str, Any] = {}
+            try:
+                if self._state_path.is_file():
+                    loaded = json.loads(self._state_path.read_text(encoding="utf-8"))
+                    if isinstance(loaded, dict):
+                        state = loaded
+            except (OSError, ValueError, TypeError, json.JSONDecodeError):
+                state = {}
+            clients = state.get("clients") if isinstance(state.get("clients"), dict) else {}
+            fresh_clients: dict[str, dict[str, float]] = {}
+            for key, row in clients.items():
+                if not isinstance(row, dict):
+                    continue
+                seen = safe_float_value(row.get("seen"), 0.0)
+                rate = safe_float_value(row.get("rate"), 0.0)
+                if rate >= 1.0 and seen > 0.0 and now - seen <= _GLOBAL_RATE_CLIENT_TTL_SECONDS:
+                    fresh_clients[str(key)] = {"rate": rate, "seen": seen}
+            fresh_clients[self._client_key] = {"rate": self.rate, "seen": now}
+            effective_rate = min(row["rate"] for row in fresh_clients.values()) if fresh_clients else self.rate
+            interval = 1.0 / max(1.0, effective_rate)
+            last_start = safe_float_value(state.get("last_start"), 0.0)
+            # Wall-clock jumps or stale files must not create an unbounded sleep after reboot/NTP.
+            if last_start <= 0.0 or last_start > now + 5.0 or now - last_start > 3600.0:
+                last_start = 0.0
+            delay = max(0.0, interval - (now - last_start))
+            if deadline is not None:
+                remaining = float(deadline) - time.monotonic()
+                if remaining <= delay:
+                    return False
+            self._wait_count += 1
+            self._last_effective_rate = effective_rate
+            self._throttle_seconds += delay
+            if delay > 0.0:
                 time.sleep(delay)
-            self._last_request_at = time.monotonic()
+            if deadline is not None and time.monotonic() >= float(deadline):
+                return False
+            started = time.time()
+            payload = {
+                "last_start": started,
+                "effective_rate": effective_rate,
+                "clients": fresh_clients,
+                "updated": started,
+            }
+            try:
+                atomic_write_text(self._state_path, json.dumps(payload, sort_keys=True))
+            except OSError:
+                # The OS lock still serialized this call; retain an in-process timestamp if the
+                # state file itself became temporarily unwritable.
+                pass
+            return True
+
+    def wait(self, deadline: float | None = None) -> bool:
+        with self._lock:
+            # The shared file pacer is authoritative. The local timestamp is retained for telemetry
+            # and for environments where persistence becomes temporarily unavailable.
+            ok = self._wait_shared(deadline)
+            if ok:
+                self._last_request_at = time.monotonic()
+            return ok
+
+    def stats(self) -> dict[str, Any]:
+        with self._lock:
+            return {
+                'configured_rate': self.rate,
+                'last_effective_shared_rate': self._last_effective_rate,
+                'request_starts': self._wait_count,
+                'throttle_sleep_seconds': round(self._throttle_seconds, 3),
+            }
 
 
 def runtime_request_rate_policy() -> dict[str, Any]:
