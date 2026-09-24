@@ -7,7 +7,7 @@ from urllib.parse import parse_qsl, urljoin, urlparse
 
 import requests
 
-from utils import MAX_AUTHENTICATED_IDENTITIES, RequestRatePacer, canonical_cookie_header, cookie_header_fingerprint, partial, request_contract_state_change_reason, skipped, success
+from utils import MAX_AUTHENTICATED_IDENTITIES, RequestRatePacer, canonical_cookie_header, cookie_header_fingerprint, deadline_bounded_request_timeout, partial, request_contract_state_change_reason, skipped, success
 
 from utils import same_origin
 
@@ -72,8 +72,12 @@ def _safe_get(url: str, cookies: str, request_budget: float, pacer: RequestRateP
             return None, "state_change_target_blocked:" + state_reason
         try:
             pacer.wait()
-            left = max(1.0, min(float(request_budget), remaining_budget(deadline)))
-            response = session.get(current, timeout=(max(1.0, left * 0.25), left), allow_redirects=False)
+            request_timeout = deadline_bounded_request_timeout(
+                (max(0.01, float(request_budget) * 0.25), max(0.01, float(request_budget))), deadline,
+            )
+            response = session.get(current, timeout=request_timeout, allow_redirects=False)
+        except requests.Timeout:
+            return None, "time_limit_reached"
         except requests.RequestException as exc:
             return None, f"transport_unavailable:{type(exc).__name__}"
         if response.status_code not in {301, 302, 303, 307, 308}:

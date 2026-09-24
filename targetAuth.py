@@ -21,12 +21,14 @@ class BrowserLoginError(RuntimeError):
         reason: str = "browser_login_failed",
         auth_destination: str = "",
         credential_scope: str = "",
+        credential_submit_attempted: bool = False,
     ):
         super().__init__(message)
         self.attempted_candidates = [str(value) for value in (attempted_candidates or []) if str(value)]
         self.reason = str(reason or "browser_login_failed")
         self.auth_destination = str(auth_destination or "")
         self.credential_scope = str(credential_scope or "")
+        self.credential_submit_attempted = bool(credential_submit_attempted)
 
 
 
@@ -459,6 +461,7 @@ def browser_oidc_login_session(
     initial_login: bool = False,
     include_configured_fallbacks: bool = True,
     expected_oidc_issuer: str = "",
+    allow_credential_submit: bool = True,
 ) -> dict[str, Any]:
     """Obtain one origin-scoped application session without ever prompting for credentials.
 
@@ -477,7 +480,10 @@ def browser_oidc_login_session(
     if not origin:
         raise RuntimeError(f"Invalid target origin for automatic login: {target_url!r}")
 
-    timeout_seconds = max(15, int(credential.get("timeout_seconds") or 60))
+    # Credential-bearing logins keep the historical 15s minimum. SSO/session-only sibling probes
+    # may use a much shorter bounded window because they are not allowed to submit credentials.
+    timeout_floor = 15 if allow_credential_submit else 3
+    timeout_seconds = max(timeout_floor, int(credential.get("timeout_seconds") or 60))
     headless = bool(credential.get("headless", True))
     configured_login_path = str(credential.get("login_path") or "").strip()
     configured_validation_path = str(credential.get("validation_path") or "").strip()
@@ -504,17 +510,36 @@ def browser_oidc_login_session(
     failures: list[str] = []
     attempted_candidates: list[str] = []
     external_credential_rejections: list[tuple[str, str]] = []
+    # One function call may inspect several candidate login entry points, but it may perform at
+    # most one real username/password attempt. This prevents a stale/misrouted login flow from
+    # multiplying password submissions across candidates.
+    credential_submit_attempted = False
 
     with sync_playwright() as playwright:
         try:
-            browser = playwright.chromium.launch(headless=headless)
+            if time.monotonic() >= deadline:
+                raise BrowserLoginError(
+                    f'Automatic browser login deadline expired before Chromium launch for {origin}.',
+                    attempted_candidates=attempted_candidates,
+                    reason='browser_login_timeout',
+                )
+            browser = playwright.chromium.launch(headless=headless, timeout=_remaining_ms(deadline, cap_ms=30_000, floor_ms=1))
         except Exception as exc:
             # initScript normally installs the Playwright-managed browser. A system Chromium is a
             # safe compatibility fallback when the Python package is present but that cache was removed.
             system_chromium = next((path for name in ('chromium', 'chromium-browser', 'google-chrome', 'google-chrome-stable', 'msedge') if (path := shutil.which(name))), '')
             if not system_chromium:
                 raise RuntimeError(f'Chromium could not be launched for automatic target authentication: {type(exc).__name__}: {exc}') from exc
-            browser = playwright.chromium.launch(headless=headless, executable_path=system_chromium)
+            if time.monotonic() >= deadline:
+                raise BrowserLoginError(
+                    f'Automatic browser login deadline expired before system Chromium fallback for {origin}.',
+                    attempted_candidates=attempted_candidates,
+                    reason='browser_login_timeout',
+                ) from exc
+            browser = playwright.chromium.launch(
+                headless=headless, executable_path=system_chromium,
+                timeout=_remaining_ms(deadline, cap_ms=30_000, floor_ms=1),
+            )
         context_kwargs: dict[str, Any] = {
             "ignore_https_errors": True,
             "user_agent": "SecOps-Browser-Login/3.0",
@@ -695,6 +720,19 @@ def browser_oidc_login_session(
                         attempted_candidates,
                         reason="credentials_unavailable",
                     )
+                if not allow_credential_submit or credential_submit_attempted:
+                    raise BrowserLoginError(
+                        "The authentication provider requested username/password, but the per-identity credential-submit budget is already exhausted. Existing cookie/SSO state may still be reused without another password submission.",
+                        attempted_candidates,
+                        reason="credential_submit_budget_exhausted",
+                        auth_destination=_safe_auth_destination(str(page.url or "")),
+                        credential_scope=_credential_submission_scope(target_url, str(page.url or ""), current_issuer(auth_request_offset)),
+                        credential_submit_attempted=credential_submit_attempted,
+                    )
+                # Reserve the single credential attempt before filling the first field. A two-step
+                # username->password form is still one authentication attempt, but no later candidate
+                # in this call may start a second one.
+                credential_submit_attempted = True
 
                 if username_field is not None:
                     username_field.fill(username)
@@ -707,6 +745,7 @@ def browser_oidc_login_session(
                             reason="credential_form_fill_failed",
                             auth_destination=destination,
                             credential_scope=_credential_submission_scope(target_url, str(page.url or ""), current_issuer(auth_request_offset)),
+                            credential_submit_attempted=True,
                         )
 
                 if password_field is None:
@@ -727,6 +766,7 @@ def browser_oidc_login_session(
                             "The authentication provider requires an additional step such as OTP; automatic username/password login cannot complete it.",
                             attempted_candidates,
                             reason="additional_authentication_step_required",
+                            credential_submit_attempted=True,
                         )
                     failures.append(f"{candidate}: password field not exposed")
                     continue
@@ -741,6 +781,7 @@ def browser_oidc_login_session(
                         reason="credential_form_fill_failed",
                         auth_destination=destination,
                         credential_scope=_credential_submission_scope(target_url, str(page.url or ""), current_issuer(auth_request_offset)),
+                        credential_submit_attempted=True,
                     )
                 submit = _first_visible_locator(page, SUBMIT_SELECTORS)
                 if submit is not None:
@@ -766,6 +807,7 @@ def browser_oidc_login_session(
                                 "final_url": current_url,
                                 "entry_url": candidate,
                                 "used_credentials": used_credentials,
+                                "credential_submit_attempted": credential_submit_attempted,
                                 "sso_reused": False,
                                 "authentication_flow_observed": flow_observed,
                                 "oidc_issuer": issuer,
@@ -784,18 +826,21 @@ def browser_oidc_login_session(
                         # same-origin/application entry points instead of aborting or asking the operator to
                         # retype the same secret. A configured/persisted issuer remains authoritative.
                         if initial_login and not effective_expected_oidc_issuer and submission_scope == "external_oidc":
-                            external_credential_rejections.append((destination, issuer))
-                            failures.append(
-                                f"{candidate}: external OIDC destination {destination or current_url!r} rejected credentials; "
-                                "trying remaining primary-target login entry points before classifying the target credentials"
+                            raise BrowserLoginError(
+                                f"An unpinned external OIDC destination rejected the supplied credentials at {destination or current_url!r}. No second automatic credential submission is attempted on another login candidate.",
+                                attempted_candidates,
+                                reason="external_oidc_credentials_rejected",
+                                auth_destination=destination,
+                                credential_scope="external_oidc",
+                                credential_submit_attempted=True,
                             )
-                            break
                         raise BrowserLoginError(
                             f"The authentication provider rejected the supplied target credentials at {destination or 'the authentication form'}: {message}",
                             attempted_candidates,
                             reason="credentials_rejected",
                             auth_destination=destination,
                             credential_scope=submission_scope,
+                            credential_submit_attempted=True,
                         )
                     if diagnostic.startswith("authentication_error:"):
                         message = diagnostic.split(":", 1)[1].strip()
@@ -803,20 +848,17 @@ def browser_oidc_login_session(
                             f"The authentication provider returned an authentication error: {message}",
                             attempted_candidates,
                             reason="provider_authentication_error",
+                            credential_submit_attempted=True,
                         )
                     if diagnostic == "additional_authentication_step_required":
                         raise BrowserLoginError(
                             "The authentication provider requires an additional step such as OTP; automatic username/password login cannot complete it.",
                             attempted_candidates,
                             reason="additional_authentication_step_required",
+                            credential_submit_attempted=True,
                         )
                     page.wait_for_timeout(250)
 
-                # A break caused by an unpinned external OIDC rejection already recorded a precise
-                # diagnostic above. Continue with the next target/application candidate rather than
-                # misreporting the same candidate as a generic timeout.
-                if external_credential_rejections and failures and failures[-1].startswith(f"{candidate}: external OIDC destination"):
-                    continue
                 failures.append(f"{candidate}: login did not return to the target origin before the shared timeout")
 
             detail = "; ".join(failures[-4:]) if failures else "no usable login entry point was found"
@@ -828,10 +870,12 @@ def browser_oidc_login_session(
                     reason="external_oidc_credentials_rejected",
                     auth_destination=destination,
                     credential_scope="external_oidc",
+                    credential_submit_attempted=credential_submit_attempted,
                 )
             raise BrowserLoginError(
                 f"Automatic browser login could not establish an application session for {origin} within {timeout_seconds}s: {detail}",
                 attempted_candidates,
+                credential_submit_attempted=credential_submit_attempted,
             )
         finally:
             browser.close()

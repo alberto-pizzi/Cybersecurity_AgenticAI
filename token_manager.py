@@ -15,6 +15,18 @@ from utils import atomic_write_text
 TOKEN_HTTP_TIMEOUT = (5, 30)
 
 
+def _token_http_timeout(timeout_seconds=None):
+    """Return a bounded connect/read tuple whose total fits the supplied provider slice."""
+    if timeout_seconds is None:
+        return TOKEN_HTTP_TIMEOUT
+    total = max(1.0, float(timeout_seconds))
+    connect = min(5.0, max(0.5, total * 0.20))
+    read = max(0.5, total - connect)
+    if connect + read > total and total >= 1.0:
+        read = max(0.5, total - connect)
+    return (connect, read)
+
+
 class TokenManager:
     def __init__(self, username, password, client_id="clearml-apis", store_path="token_stored.json"):
         self.username = username
@@ -27,7 +39,7 @@ class TokenManager:
         print(f"[INIT] - Initializing TokenManager for user: '{self.username}'")
         self.load_token_data()
 
-    def get_token(self):
+    def get_token(self, timeout_seconds=None):
         print("[GET_TOKEN] - Checking Access Token...")
         # Se il token esiste ed è valido, lo riuso
         if self.token and time.time() < self.token_expiry:
@@ -35,9 +47,19 @@ class TokenManager:
             return self.token
 
         print("[GET_TOKEN] - Access Token not found or expired.")
+        deadline = None if timeout_seconds is None else time.monotonic() + max(1.0, float(timeout_seconds))
+
+        def remaining_timeout():
+            if deadline is None:
+                return None
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError("Snap4City token acquisition budget exhausted")
+            return remaining
+
         if self.refresh_token:
             print("[GET_TOKEN] - Trying with Refresh Token...")
-            token_data = self.get_token_via_refresh_token(self.refresh_token)
+            token_data = self.get_token_via_refresh_token(self.refresh_token, timeout_seconds=remaining_timeout())
             if token_data and 'access_token' in token_data:
                 print("[GET_TOKEN] - Access Token successfully retrieved with Refresh Token.")
                 self.save_token_data(token_data)
@@ -46,7 +68,7 @@ class TokenManager:
                 print("[GET_TOKEN] - Request with Refresh token failed. Trying request with username and password.")
 
         print("[GET_TOKEN] - Requesting Access Token with username and password...")
-        token_data = self.get_token_via_user_credentials(self.username, self.password)
+        token_data = self.get_token_via_user_credentials(self.username, self.password, timeout_seconds=remaining_timeout())
         if token_data and 'access_token' in token_data:
             print("[GET_TOKEN] - Access token successfully retrieved with username and password.")
             self.save_token_data(token_data)
@@ -55,7 +77,7 @@ class TokenManager:
         print("[GET_TOKEN] - ERROR: Can't get a valid Access Token.")
         raise Exception("Unable to get a valid token")
 
-    def get_token_via_user_credentials(self, username, password):
+    def get_token_via_user_credentials(self, username, password, timeout_seconds=None):
         print("[GET_TOKEN_VIA_USER_CREDENTIALS] - Requesting Access Token with username and password...")
         payload = {
             'f': 'json',
@@ -67,14 +89,14 @@ class TokenManager:
         header = {'Content-Type': 'application/x-www-form-urlencoded'}
         url_token = "https://www.snap4city.org/auth/realms/master/protocol/openid-connect/token"
         try:
-            response = requests.post(url_token, data=payload, headers=header, timeout=TOKEN_HTTP_TIMEOUT, allow_redirects=False)
+            response = requests.post(url_token, data=payload, headers=header, timeout=_token_http_timeout(timeout_seconds), allow_redirects=False)
             print(f"[GET_TOKEN_VIA_USER_CREDENTIALS] - Response status code: {response.status_code}")
             return response.json()
         except (requests.RequestException, ValueError) as exc:
             print(f"[GET_TOKEN_VIA_USER_CREDENTIALS] - Request failed: {type(exc).__name__}: {exc}")
             return {}
 
-    def get_token_via_refresh_token(self, refresh_token):
+    def get_token_via_refresh_token(self, refresh_token, timeout_seconds=None):
         print("[GET_TOKEN_VIA_REFRESH_TOKEN] - Sending request with Refresh Token...")
         payload = {
             'f': 'json',
@@ -86,7 +108,7 @@ class TokenManager:
         url_token = ("https://www.snap4city.org/auth/realms/master/protocol/openid-connect/token"
                      "")
         try:
-            response = requests.post(url_token, data=payload, headers=header, timeout=TOKEN_HTTP_TIMEOUT, allow_redirects=False)
+            response = requests.post(url_token, data=payload, headers=header, timeout=_token_http_timeout(timeout_seconds), allow_redirects=False)
             print(f"[GET_TOKEN_VIA_REFRESH_TOKEN] - Status code response: {response.status_code}")
             return response.json()
         except (requests.RequestException, ValueError) as exc:

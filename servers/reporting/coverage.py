@@ -491,13 +491,8 @@ def summarize_endpoint_coverage(rows: list[dict[str, Any]]) -> dict[str, Any]:
         out_scope = sum(str(row.get("reason_code") or "") == "OUT_OF_SCOPE" for row in items)
         reachable = max(0, total - dead - out_scope)
         tested = sum(str(row.get("status") or "") == "Tested" for row in items)
-        broad_specialist_tested = sum(
-            str(row.get("status") or "") == "Tested" and safe_bool_value(row.get("tested_by_broad_or_specialist"), False) for row in items
-        )
-        safe_surface_only = sum(
-            str(row.get("status") or "") == "Tested" and safe_bool_value(row.get("tested_by_safe_surface"), False) and not safe_bool_value(row.get("tested_by_broad_or_specialist"), False)
-            for row in items
-        )
+        broad_specialist_tested = sum(str(row.get("status") or "") == "Tested" and safe_bool_value(row.get("tested_by_broad_or_specialist"), False) for row in items)
+        safe_surface_only = sum(str(row.get("status") or "") == "Tested" and safe_bool_value(row.get("tested_by_safe_surface"), False) and not safe_bool_value(row.get("tested_by_broad_or_specialist"), False) for row in items)
         discovered_only = sum(str(row.get("status") or "") == "Discovered only" for row in items)
         skipped = sum(str(row.get("status") or "") == "Skipped" for row in items)
         errors = sum(str(row.get("status") or "") == "Execution error" for row in items)
@@ -506,32 +501,49 @@ def summarize_endpoint_coverage(rows: list[dict[str, Any]]) -> dict[str, Any]:
         explicit = [row for row in items if safe_bool_value(row.get("configured_entry_point"), False)]
         explicit_tested = sum(str(row.get("status") or "") == "Tested" for row in explicit)
         explicit_coverage = (100.0 * explicit_tested / len(explicit)) if explicit else 0.0
-        return {
-            "discovered_contexts": total,
-            "reachable_in_scope": reachable,
-            "tested": tested,
-            "broad_specialist_tested": broad_specialist_tested,
-            "safe_surface_only_tested": safe_surface_only,
-            "broad_specialist_tested_coverage_percent": round(broad_specialist_coverage, 1),
-            "configured_entry_points": len(explicit),
-            "tested_entry_points": explicit_tested,
-            "entry_point_tested_coverage_percent": round(explicit_coverage, 1),
-            "discovered_only": discovered_only,
-            "intentionally_skipped": skipped,
-            "execution_errors": errors,
-            "http_404_410": dead,
-            "out_of_scope": out_scope,
-            "tested_coverage_percent": round(coverage, 1),
-        }
+        return {"discovered_contexts": total, "reachable_in_scope": reachable, "tested": tested, "broad_specialist_tested": broad_specialist_tested, "safe_surface_only_tested": safe_surface_only, "broad_specialist_tested_coverage_percent": round(broad_specialist_coverage, 1), "configured_entry_points": len(explicit), "tested_entry_points": explicit_tested, "entry_point_tested_coverage_percent": round(explicit_coverage, 1), "discovered_only": discovered_only, "intentionally_skipped": skipped, "execution_errors": errors, "http_404_410": dead, "out_of_scope": out_scope, "tested_coverage_percent": round(coverage, 1)}
+
+    def origin_key(url: str) -> str:
+        try:
+            parsed=urlparse(str(url or '')); port=parsed.port or (443 if parsed.scheme.lower()=='https' else 80)
+            return f'{parsed.scheme.lower()}://{parsed.hostname or ""}:{port}' if parsed.scheme and parsed.hostname else 'unknown'
+        except ValueError:
+            return 'unknown'
+
+    def family_key(url: str) -> str:
+        try:
+            parsed=urlparse(str(url or '')); segments=[v for v in parsed.path.split('/') if v]
+            return f'{origin_key(url)}|/{segments[0].lower() if segments else ""}'
+        except ValueError:
+            return 'unknown|/'
+
+    def tested_tools(row: dict[str, Any]) -> set[str]:
+        return {str(label).split(' ',1)[0].lower() for label in row.get('tests',[]) if str(label)}
 
     profiles = sorted({str(row.get("profile") or "unknown") for row in rows})
+    class_tools={'sqli':{'sqlmap'},'xss':{'dalfox','browser'},'command_injection':{'commix'},'traversal':{'traversal'},'authorization':{'authorization'},'idor':{'idor'},'jwt':{'jwt'},'hidden_parameters':{'arjun'}}
+    by_class: dict[str,dict[str,int|float]]={}
+    for name, tools in class_tools.items():
+        eligible=[r for r in rows if tools & {str(v).lower() for v in r.get('selector_eligible_tools',[])}]
+        tested_count=sum(bool(tools & tested_tools(r)) for r in eligible)
+        by_class[name]={'eligible':len(eligible),'tested':tested_count}
+    for bucket in by_class.values():
+        eligible=int(bucket['eligible']); tested_count=int(bucket['tested']); bucket['coverage_percent']=round(100.0*tested_count/eligible,1) if eligible else 0.0
+    high_value=[r for r in rows if r.get('selector_eligible_tools')]
+    high_value_tested=sum(bool(tested_tools(r) & {str(v).lower() for v in r.get('selector_eligible_tools',[])}) for r in high_value)
+    families=sorted({family_key(str(r.get('url') or '')) for r in rows})
+    origins=sorted({origin_key(str(r.get('url') or '')) for r in rows})
+    by_family={key:summarize_rows([r for r in rows if family_key(str(r.get('url') or ''))==key]) for key in families}
+    by_origin={key:summarize_rows([r for r in rows if origin_key(str(r.get('url') or ''))==key]) for key in origins}
     return {
         "overall": summarize_rows(rows),
         "profiles": {profile: summarize_rows([row for row in rows if str(row.get("profile") or "unknown") == profile]) for profile in profiles},
+        "high_value_specialist": {"eligible":len(high_value),"tested":high_value_tested,"coverage_percent":round(100.0*high_value_tested/len(high_value),1) if high_value else 0.0},
+        "vulnerability_classes": by_class,
+        "application_families": by_family,
+        "origins": by_origin,
     }
 
-
-# Renders the endpoint coverage matrix using the same table language as the rest of the report.
 def _render_endpoint_coverage(rows: list[dict[str, Any]], toc: list[tuple[int, str, str]], *, for_pdf: bool=False) -> str:
     heading = _heading(2, "Endpoint coverage matrix", toc, anchor="endpoint-coverage")
     if not rows:
@@ -567,6 +579,28 @@ def _render_endpoint_coverage(rows: list[dict[str, Any]], toc: list[tuple[int, s
             cells.append(f"<td>{float(value):.1f}%</td>" if percent else f"<td>{int(value or 0)}</td>")
         summary_rows.append(f"<tr><td>{_esc(label)}</td>{''.join(cells)}</tr>")
     summary_head = "".join(f"<th>{_esc(column)}</th>" for column in summary_columns)
+
+    high_value = summary.get("high_value_specialist", {})
+    high_value_html = (
+        '<table><thead><tr><th>High-value specialist metric</th><th>Eligible</th><th>Tested</th><th>Coverage</th></tr></thead><tbody>'
+        f'<tr><td>Runtime-classified security-relevant contexts</td><td>{int(high_value.get("eligible", 0) or 0)}</td><td>{int(high_value.get("tested", 0) or 0)}</td><td>{float(high_value.get("coverage_percent", 0.0) or 0.0):.1f}%</td></tr>'
+        '</tbody></table>'
+    )
+    class_rows = ''.join(
+        f'<tr><td>{_esc(name)}</td><td>{int(values.get("eligible", 0) or 0)}</td><td>{int(values.get("tested", 0) or 0)}</td><td>{float(values.get("coverage_percent", 0.0) or 0.0):.1f}%</td></tr>'
+        for name, values in sorted((summary.get("vulnerability_classes") or {}).items())
+    )
+    class_html = '<table><thead><tr><th>Vulnerability class</th><th>Eligible</th><th>Tested</th><th>Coverage</th></tr></thead><tbody>' + class_rows + '</tbody></table>'
+    family_rows = ''.join(
+        f'<tr><td>{_esc(name)}</td><td>{int(values.get("discovered_contexts", 0) or 0)}</td><td>{int(values.get("broad_specialist_tested", 0) or 0)}</td><td>{int(values.get("intentionally_skipped", 0) or 0)}</td><td>{int(values.get("execution_errors", 0) or 0)}</td></tr>'
+        for name, values in sorted((summary.get("application_families") or {}).items())[:40]
+    )
+    family_html = '<table><thead><tr><th>Runtime application family</th><th>Discovered</th><th>Specialist-tested</th><th>Skipped</th><th>Errors</th></tr></thead><tbody>' + family_rows + '</tbody></table>'
+    origin_rows = ''.join(
+        f'<tr><td>{_esc(name)}</td><td>{int(values.get("discovered_contexts", 0) or 0)}</td><td>{int(values.get("broad_specialist_tested", 0) or 0)}</td><td>{int(values.get("safe_surface_only_tested", 0) or 0)}</td><td>{int(values.get("intentionally_skipped", 0) or 0)}</td><td>{int(values.get("execution_errors", 0) or 0)}</td></tr>'
+        for name, values in sorted((summary.get("origins") or {}).items())[:80]
+    )
+    origin_html = '<table><thead><tr><th>Runtime origin / web root</th><th>Discovered</th><th>Specialist-tested</th><th>Safe-only</th><th>Skipped</th><th>Errors</th></tr></thead><tbody>' + origin_rows + '</tbody></table>'
 
     aggregate = any(str(row.get("job_id") or "") for row in rows)
     display_rows = list(rows)
@@ -615,6 +649,7 @@ def _render_endpoint_coverage(rows: list[dict[str, Any]], toc: list[tuple[int, s
         'The reason code states why an untested context was deferred or excluded. Anonymous and authenticated coverage are calculated independently. '
         'Configured entry-point coverage counts the supplied URLs themselves: a value such as 0/N means none of those N exact request contexts received a concrete security-tool execution, not that the complete assessment executed zero attacks.</p>'
         f'<table><thead><tr><th>Metric</th>{summary_head}</tr></thead><tbody>{"".join(summary_rows)}</tbody></table>'
+        f'{high_value_html}{class_html}{family_html}{origin_html}'
         '<p class="section-note">Total tested coverage counts any active check. Broad/specialist tested coverage excludes safe-surface-only contexts, preventing a shallow completion replay from being presented as specialist attack coverage. Out-of-scope references and HTTP 404/410 responses are excluded from both denominators.</p>'
         f'{detail_note}'
         '<table><thead><tr><th>#</th><th>Profile / job</th><th>Method</th><th>Endpoint</th><th>Body ctx</th><th>Discovered by</th><th>Security tests</th><th>Status</th><th>Reason code</th><th>Reason</th></tr></thead>'
@@ -679,7 +714,7 @@ def _coverage_constraints(
     if idor and idor.get("status") == "skipped":
         add(
             "Object-level authorization",
-            "No compatible query-string object reference was discovered. The bounded verifier supports numeric, UUID, hexadecimal and digit-bearing opaque query identifiers; path-segment, JSON-body and multi-step ownership checks remain outside this verifier.",
+            "No compatible query-string object reference was discovered. The bounded verifier supports runtime-discovered numeric, UUID, hexadecimal and digit-bearing opaque references in query strings, path segments and policy-approved JSON/form bodies; no compatible object reference was available in this run.",
             "Supply representative object endpoints and two identities, then perform manual ownership validation.",
         )
     jwt = coverage_by_tool.get("jwt")
@@ -717,6 +752,28 @@ def _coverage_constraints(
 
     return constraints
 
+def _normalized_limitation_cause(result: dict[str, Any]) -> str:
+    diagnosis = str(result.get("diagnosis") or "unspecified").lower()
+    refresh = result.get("state_refresh") if isinstance(result.get("state_refresh"), dict) else result.get("session_state_refresh") if isinstance(result.get("session_state_refresh"), dict) else {}
+    reason = str(refresh.get("reason_code") or refresh.get("reason") or diagnosis).lower()
+    if "provider_authentication_error" in reason:
+        return "PROVIDER_ERROR"
+    if "credentials_rejected" in reason:
+        return "AUTH_REJECTED"
+    if "expired" in reason:
+        return "AUTH_EXPIRED"
+    if "no_auth_entry" in reason or "not_applicable" in reason or "session_only_credentials_required" in reason:
+        return "AUTH_NOT_APPLICABLE"
+    if "authentication" in diagnosis or "credential" in reason:
+        return "AUTH_FAILED"
+    if "tls" in diagnosis or "certificate" in reason:
+        return "TLS_POLICY"
+    if "budget" in diagnosis or "time_limit" in diagnosis or "timeout" in diagnosis:
+        return "BUDGET_EXHAUSTED"
+    if "dependency" in diagnosis or "not_installed" in diagnosis:
+        return "DEPENDENCY_MISSING"
+    return str(result.get("diagnosis") or "unspecified")
+
 # Aggregates risk counts, execution limitations and coverage constraints into the report summary
 def summarize(results: dict[str, Any], findings: list[dict[str, Any]], coverage: list[dict[str, Any]], context: dict[str, Any]) -> dict[str, Any]:
     limitations: list[dict[str, Any]] = []
@@ -726,7 +783,7 @@ def summarize(results: dict[str, Any], findings: list[dict[str, Any]], coverage:
             limitations.append({
                 "path": "/".join(path),
                 "status": status,
-                "cause": str(result.get("diagnosis") or "unspecified"),
+                "cause": _normalized_limitation_cause(result),
                 "explanation": _redact_text(result.get("output") or note),
             })
     for entry in context.get("entry_points", []) if isinstance(context.get("entry_points"), list) else []:

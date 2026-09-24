@@ -36,6 +36,16 @@ from targetAuth import BrowserLoginError, browser_oidc_login_session
 ROOT = Path(__file__).resolve().parent
 REPORTS_DIR = ROOT / "reports"
 
+# Last-resort parent watchdog. The Agentic child has a slightly shorter internal deadline so it
+# normally finalizes reports itself; this guard exists only for hangs outside the workflow guards.
+AGENTIC_JOB_WATCHDOG_SECONDS = {
+    'test': 60 * 60,
+    'fast': 4 * 60 * 60 + 15 * 60,
+    'balanced': 10 * 60 * 60,
+    'deep': 12 * 60 * 60,
+}
+
+
 
 # Resolves execution.request_rate without widening the accepted traffic envelope silently.
 def _resolve_request_rate(config: dict[str, Any]) -> dict[str, Any]:
@@ -342,6 +352,7 @@ def _resolve_job_cookie(
         "browser_login_completed": False,
         "manual_cookie_origin": "",
         "prompt_attempted": False,
+        "credential_submit_used": False,
     })
 
     username_env = str(credential.get("username_env") or "").strip()
@@ -458,8 +469,11 @@ def _resolve_job_cookie(
             storage_state=storage_state,
             initial_login=not bool(runtime.get("browser_login_completed")),
             expected_oidc_issuer=str(runtime.get("oidc_issuer") or ""),
+            allow_credential_submit=not bool(runtime.get("credential_submit_used")),
         )
     except RuntimeError as first_exc:
+        if bool(getattr(first_exc, "credential_submit_attempted", False)):
+            runtime["credential_submit_used"] = True
         # A saved SSO state may expire after the initial job. If no credentials were available yet,
         # allow one prompt now, then retry once; never prompt again later in the assessment.
         if storage_state and (not username or not password) and not bool(runtime.get("prompt_attempted")) and interactive:
@@ -480,8 +494,11 @@ def _resolve_job_cookie(
                         storage_state=storage_state,
                         initial_login=not bool(runtime.get("browser_login_completed")),
                         expected_oidc_issuer=str(runtime.get("oidc_issuer") or ""),
+                        allow_credential_submit=not bool(runtime.get("credential_submit_used")),
                     )
                 except RuntimeError as exc:
+                    if bool(getattr(exc, "credential_submit_attempted", False)):
+                        runtime["credential_submit_used"] = True
                     first_exc = exc
                 else:
                     first_exc = None
@@ -506,6 +523,8 @@ def _resolve_job_cookie(
                 return ""
             raise ValueError(str(first_exc)) from first_exc
 
+    if bool(login_result.get("credential_submit_attempted", False)):
+        runtime["credential_submit_used"] = True
     value = str(login_result.get("cookie_header") or "")
     if not value:
         if bool(credential.get("optional", False)):
@@ -568,6 +587,7 @@ def _runtime_auth_payload(config: dict[str, Any], job: dict[str, Any], runtime_a
             "credential": copy.deepcopy(credential_options),
             "storage_state": storage_state,
             "oidc_issuer": str(runtime.get("oidc_issuer") or ""),
+            "credential_submit_used": bool(runtime.get("credential_submit_used", False)),
         })
     if not identities:
         return {}
@@ -681,7 +701,7 @@ def _credential_discovery_seeds(config: dict[str, Any], job: dict[str, Any]) -> 
             if not raw:
                 continue
             try:
-                candidate = urljoin(target, raw)
+                candidate = urljoin(target.rstrip("/") + "/", raw)
             except Exception:
                 continue
             if candidate and same_origin(target, candidate) and candidate not in selected:
@@ -1470,18 +1490,36 @@ def main() -> int:
             rate_env = _request_rate_environment(os.environ, request_rate_policy)
             rate_env["SECOPS_REPORT_RUN_ID"] = expected_report_id
             child_env, runtime_state_path = _runtime_auth_environment(rate_env, runtime_payload)
+            completed_returncode = 1
+            child_watchdog_seconds: float | None = None
+            if str((config.get('execution') or {}).get('orchestrator') or '').lower() == 'agentic':
+                mode = str((config.get('execution') or {}).get('mode') or 'balanced').lower()
+                child_watchdog_seconds = float(AGENTIC_JOB_WATCHDOG_SECONDS.get(mode, AGENTIC_JOB_WATCHDOG_SECONDS['balanced']))
             try:
-                completed = subprocess.run(command, cwd=ROOT, check=False, env=child_env)
+                try:
+                    completed = subprocess.run(
+                        command, cwd=ROOT, check=False, env=child_env,
+                        timeout=child_watchdog_seconds,
+                    )
+                    completed_returncode = int(completed.returncode)
+                except subprocess.TimeoutExpired:
+                    completed_returncode = 124
+                    record['watchdog_timeout_seconds'] = child_watchdog_seconds
+                    record['reason'] = (
+                        f"agentic orchestrator exceeded the parent watchdog ({child_watchdog_seconds:.0f}s) and was terminated; "
+                        "the child should normally finalize before this guard"
+                    )
+                    print(f"[TIMEOUT] {job['id']}: {record['reason']}", file=sys.stderr, flush=True)
             finally:
                 if runtime_state_path:
                     try:
                         Path(runtime_state_path).unlink(missing_ok=True)
                     except OSError:
                         pass
-            record["returncode"] = completed.returncode
-            record["status"] = "success" if completed.returncode == 0 else "error"
-            if completed.returncode != 0:
-                record["reason"] = f"orchestrator exited with return code {completed.returncode}"
+            record["returncode"] = completed_returncode
+            record["status"] = "success" if completed_returncode == 0 else "error"
+            if completed_returncode != 0 and not record.get('reason'):
+                record["reason"] = f"orchestrator exited with return code {completed_returncode}"
             # Correlate artifacts by the unique per-job report id supplied to the child. Do not scan
             # every file modified since job start: another assessment process may be writing to the
             # same reports directory at the same time. Emergency fallbacks are tied to the same prefix.

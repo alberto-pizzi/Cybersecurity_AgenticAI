@@ -11,7 +11,7 @@ import requests
 
 from fastmcp import FastMCP
 
-from utils import ROOT_DIR, RequestRatePacer, request_invocation_state_change_reason, request_same_origin_redirects, runtime_container_route, safe_port_value
+from utils import ROOT_DIR, RequestRatePacer, deadline_bounded_request_timeout, request_invocation_state_change_reason, request_same_origin_redirects, runtime_container_route, safe_port_value
 
 # Creates a composable child FastMCP registry; only secopsServer.py owns the HTTP listener.
 def service(label: str, key: str) -> tuple[FastMCP, Callable[[], None]]:
@@ -156,13 +156,7 @@ def request_retry(
                 left = remaining_budget(deadline)
                 if left <= 0:
                     raise requests.Timeout("shared scanner deadline reached")
-                configured = kwargs.get("timeout")
-                if isinstance(configured, tuple) and len(configured) == 2:
-                    kwargs["timeout"] = (min(float(configured[0]), left), min(float(configured[1]), left))
-                elif configured is not None:
-                    kwargs["timeout"] = min(float(configured), left)
-                else:
-                    kwargs["timeout"] = left
+                kwargs["timeout"] = deadline_bounded_request_timeout(kwargs.get("timeout"), float(deadline))
             if kwargs.get("allow_redirects"):
                 return request_same_origin_redirects(
                     method, url, pacer=active_pacer, deadline=deadline,
@@ -183,7 +177,11 @@ def request_retry(
         except (requests.Timeout, requests.ConnectionError) as exc:
             last = exc
             if attempt + 1 < attempts:
-                time.sleep(backoff * (attempt + 1))
+                delay = backoff * (attempt + 1)
+                if deadline is not None:
+                    delay = min(delay, remaining_budget(deadline))
+                if delay > 0:
+                    time.sleep(delay)
         except requests.RequestException:
             raise
     assert last is not None

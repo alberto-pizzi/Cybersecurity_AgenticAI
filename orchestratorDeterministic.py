@@ -268,7 +268,7 @@ async def deterministic_broad_scan_node(state: DeterministicState) -> dict[str, 
             if spec.name == 'zap':
                 log_zap_session_diagnostics(result)
                 if cookies:
-                    recovery = scanner_session_probe(probe_url, cookies, timeout=10, attempts=4)
+                    recovery = scanner_session_probe(probe_url, cookies, timeout=10, attempts=4, allow_tls_trust_retry=shared.url_in_authorized_scope(target, probe_url))
                     refresh = await asyncio.to_thread(refresh_authenticated_session_state, target, cookies, probe_url, allow_state_changes=shared.state_changing_tests_allowed(target, state.get('allow_state_changes')))
                     result['downstream_session_recovery'] = recovery
                     result['downstream_session_state_refresh'] = refresh
@@ -299,26 +299,18 @@ async def deterministic_broad_scan_node(state: DeterministicState) -> dict[str, 
         if arjun_cases:
             arjun_budget = shared.specialist_budget_diagnostics('arjun', arjun_cases)
             print(f"    [INFO   ] Arjun request cases selected: {len(arjun_cases)}; base={arjun_budget['base']}; adaptive={arjun_budget['adaptive_used']}; adaptive max={arjun_budget['adaptive_max']}")
-            empty_limits = 0
-            limit_threshold = 2 if shared.CURRENT_SCAN_MODE == 'deep' else 1
             for case in arjun_cases:
                 endpoint = str(case.get('url') or target)
-                if empty_limits >= limit_threshold:
-                    result = make_skipped_result('arjun', endpoint, 'Adaptive budget reallocation: earlier high-priority Arjun runs reached their full budget without discovering a parameter, so lower-priority repeats were skipped.') | {'diagnosis': 'adaptive_budget_reallocated'}
+                endpoint_probe = shared.select_application_session_probe_url(discovery[name], endpoint, str(case.get('source_url') or ''))
+                refresh = (await asyncio.to_thread(refresh_authenticated_session_state, endpoint, cookies, endpoint_probe, allow_state_changes=shared.state_changing_tests_allowed(target, state.get('allow_state_changes')))) if cookies else {'performed': False, 'usable': True, 'credential_applied': False}
+                if refresh.get('usable') is False or (cookies and not refresh.get('credential_applied')):
+                    result = make_skipped_result('arjun', endpoint, 'The authenticated application session could not be restored before hidden-parameter discovery.') | {'session_state_refresh': refresh}
                 else:
-                    endpoint_probe = shared.select_application_session_probe_url(discovery[name], endpoint, str(case.get('source_url') or ''))
-                    refresh = (await asyncio.to_thread(refresh_authenticated_session_state, endpoint, cookies, endpoint_probe, allow_state_changes=shared.state_changing_tests_allowed(target, state.get('allow_state_changes')))) if cookies else {'performed': False, 'usable': True, 'credential_applied': False}
-                    if refresh.get('usable') is False or (cookies and not refresh.get('credential_applied')):
-                        result = make_skipped_result('arjun', endpoint, 'The authenticated application session could not be restored before hidden-parameter discovery.') | {'session_state_refresh': refresh}
-                    else:
-                        arguments = build_tool_arguments('arjun', endpoint, cookies, discovery[name], case=case, allow_state_changes=state.get('allow_state_changes'))
-                        result = await call_mcp_with_progress(ARJUN_TOOL, arguments)
-                        result['session_state_refresh'] = refresh
-                    found = shared.safe_int_metadata(result.get('phase_parameters', 0), 0)
-                    timed_out_empty = result.get('diagnosis') in TIME_LIMIT_DIAGNOSES and (not result.get('vulnerabilities')) and (found == 0)
-                    empty_limits = empty_limits + 1 if timed_out_empty else 0
-                    if result.get('status') in {'success', 'partial'}:
-                        discovery[name], _ = enrich_discovery_with_arjun(discovery[name], result, endpoint)
+                    arguments = build_tool_arguments('arjun', endpoint, cookies, discovery[name], case=case, allow_state_changes=state.get('allow_state_changes'))
+                    result = await call_mcp_with_progress(ARJUN_TOOL, arguments)
+                    result['session_state_refresh'] = refresh
+                if result.get('status') in {'success', 'partial'}:
+                    discovery[name], _ = enrich_discovery_with_arjun(discovery[name], result, endpoint)
                 _tag_coverage_action(result, 'arjun', target_url=endpoint, method=str(case.get('method', 'GET')), parameters=list(case.get('parameters', [])), source_url=str(case.get('source_url', '')), data=str(case.get('data') or ''))
                 arjun_runs.append(result)
                 log_result(name, 'arjun', result, endpoint)
@@ -349,7 +341,9 @@ async def deterministic_parameter_scan_node(state: DeterministicState) -> dict[s
             return _tag_coverage_action(make_skipped_result(spec.name, url, skip_reason), spec.name, target_url=url, method=str(case.get('method', 'GET')), parameters=list(case.get('parameters', [])), source_url=str(case.get('source_url', '')), data=str(case.get('data') or ''))
         timeout = PARAMETER_TOOL_TIMEOUTS.get(spec.name, 120)
         method = str(case.get('method', 'GET')).upper()
-        case_probe = url if method in {'GET', 'HEAD'} else shared.select_application_session_probe_url(profile_discovery if cookies else {}, url, str(case.get('source_url') or ''))
+        case_probe = shared.select_authenticated_precheck_probe_url(
+            profile_discovery if cookies else {}, url, str(case.get('source_url') or ''), method,
+        )
         refresh = (await asyncio.to_thread(refresh_authenticated_session_state, url, cookies, case_probe, allow_state_changes=shared.state_changing_tests_allowed(target, state.get('allow_state_changes')))) if cookies else {'performed': False, 'usable': True, 'credential_applied': False}
         if refresh.get('usable') is False or (cookies and not refresh.get('credential_applied')):
             skipped = make_skipped_result(spec.name, url, 'The authenticated application session could not be restored before this scanner.') | {'session_state_refresh': refresh}
@@ -482,7 +476,9 @@ async def deterministic_browser_workflow_node(state: DeterministicState) -> dict
     async def run_case(tool: str, case: dict[str, Any], cookies: str, profile_discovery: dict[str, Any], probe_url: str) -> dict[str, Any]:
         url = str(case.get('url', target))
         method = str(case.get('method', 'GET')).upper()
-        case_probe = url if method in {'GET', 'HEAD'} else shared.select_application_session_probe_url(profile_discovery, url, str(case.get('source_url') or ''))
+        case_probe = shared.select_authenticated_precheck_probe_url(
+            profile_discovery, url, str(case.get('source_url') or ''), method,
+        )
         refresh = (await asyncio.to_thread(refresh_authenticated_session_state, url, cookies, case_probe, allow_state_changes=shared.state_changing_tests_allowed(target, state.get('allow_state_changes')))) if cookies else {'performed': False, 'usable': True, 'credential_applied': False}
         if refresh.get('usable') is False or (cookies and not refresh.get('credential_applied')):
             return _tag_coverage_action(make_skipped_result(tool, url, f'The authenticated application session could not be restored before {tool} verification.'), tool, target_url=url, method=str(case.get('method', 'GET')), parameters=list(case.get('parameters', [])), source_url=str(case.get('source_url', '')), data=str(case.get('data') or ''))
@@ -603,7 +599,7 @@ async def deterministic_special_checks_node(state: DeterministicState) -> dict[s
             oast_timeout = shared.oast_timeout_seconds('explicit' if injection_url else oast_class)
             oast_request_url = str(oast_case.get('injection_url') or '').replace('FUZZ', 'secops-oast-placeholder')
             oast_cookies = shared.scope_cookie_header(oast_request_url, profile['cookies'])
-            result = await call_mcp_with_progress(interactsh_spec, {'target_url': target, 'injection_url': oast_case['injection_url'], 'cookies': oast_cookies, 'method': oast_case.get('method', 'GET'), 'data': oast_case.get('data', ''), 'parameter': oast_case.get('parameter', ''), 'timeout': oast_timeout, 'request_rate': shared.MAX_REQUEST_RATE, 'allow_state_changes': shared.state_changing_tests_allowed(target, state.get('allow_state_changes'))}, timeout_seconds=oast_timeout + 35)
+            result = await call_mcp_with_progress(interactsh_spec, {'target_url': target, 'injection_url': oast_case['injection_url'], 'cookies': oast_cookies, 'method': oast_case.get('method', 'GET'), 'data': oast_case.get('data', ''), 'parameter': oast_case.get('parameter', ''), 'timeout': oast_timeout, 'request_rate': shared.MAX_REQUEST_RATE, 'allow_state_changes': shared.state_changing_tests_allowed(target, state.get('allow_state_changes')), 'allow_tls_trust_retry': shared.url_in_authorized_scope(target, oast_request_url), 'authorized_origins': sorted(shared.AUTHORIZED_SCOPE_ORIGINS), 'allow_same_host_ports': bool(shared.ALLOW_SAME_HOST_PORTS)}, timeout_seconds=oast_timeout + 35)
             result['oast_class'] = oast_class
             _tag_coverage_action(result, 'interactsh', target_url=str(oast_case.get('source_url') or target), method=str(oast_case.get('method', 'GET')), parameters=list(oast_case.get('parameters', [])), source_url=str(oast_case.get('source_url', '')), data=str(oast_case.get('data') or ''))
             interactsh_runs.append(result)
@@ -701,6 +697,9 @@ def _final_browser_verification_cases(state: DeterministicState) -> list[tuple[s
                 ranked.append((shared.final_xss_verification_priority(finding, selected, context_score), payload))
         for chosen in shared.select_adaptive_final_xss_candidates(ranked):
             case = dict(chosen.get('case') or {})
+            for accounting_key in ('final_xss_eligible_total', 'final_xss_selected_total', 'final_xss_deferred_total', 'final_xss_base', 'final_xss_max'):
+                if accounting_key in chosen:
+                    case[accounting_key] = chosen[accounting_key]
             if chosen.get('adaptive_final_xss_budget'):
                 case['adaptive_final_xss_budget'] = True
                 case['adaptive_final_xss_base'] = chosen.get('adaptive_final_xss_base')
@@ -784,17 +783,27 @@ async def deterministic_verification_node(state: DeterministicState) -> dict[str
             cookies = str(profile.get('cookies') or '')
             profile_discovery = state['discovery'].get(profile_name, {})
             url = str(case.get('url') or target)
-            selection_summary.setdefault(profile_name, []).append({
+            selection_row = {
                 'source_result': source_result,
                 'method': str(case.get('method', 'GET')).upper(),
                 'url': url,
                 'parameters': list(case.get('parameters', [])),
-            })
+            }
+            for accounting_key in (
+                'final_xss_eligible_total', 'final_xss_selected_total', 'final_xss_deferred_total',
+                'final_xss_base', 'final_xss_max', 'adaptive_final_xss_budget', 'adaptive_final_xss_base',
+                'adaptive_final_xss_max', 'adaptive_final_xss_threshold', 'final_xss_priority_score',
+            ):
+                if accounting_key in case:
+                    selection_row[accounting_key] = case[accounting_key]
+            selection_summary.setdefault(profile_name, []).append(selection_row)
             if browser_unavailable:
                 result = make_skipped_result('browser', url, 'Playwright was unavailable in the first final-verification run; remaining Chromium cases were not repeated.')
             else:
                 method = str(case.get('method', 'GET')).upper()
-                case_probe = url if method in {'GET', 'HEAD'} else shared.select_application_session_probe_url(profile_discovery, url, str(case.get('source_url') or ''))
+                case_probe = shared.select_authenticated_precheck_probe_url(
+            profile_discovery, url, str(case.get('source_url') or ''), method,
+        )
                 refresh = (await asyncio.to_thread(refresh_authenticated_session_state, url, cookies, case_probe, allow_state_changes=shared.state_changing_tests_allowed(target, state.get('allow_state_changes')))) if cookies else {'performed': False, 'usable': True, 'credential_applied': False}
                 if refresh.get('usable') is False or (cookies and not refresh.get('credential_applied')):
                     result = make_skipped_result('browser', url, 'The authenticated application session could not be restored before final Chromium verification.')
@@ -802,12 +811,21 @@ async def deterministic_verification_node(state: DeterministicState) -> dict[str
                     arguments = build_tool_arguments('browser', url, cookies, profile_discovery, case=case, allow_state_changes=state.get('allow_state_changes'))
                     result = await call_mcp_with_progress(browser_spec, arguments, timeout_seconds=PARAMETER_TOOL_TIMEOUTS['browser'] + 35)
                     result['session_state_refresh'] = refresh
-                    result['final_verification_stage'] = True
-                    result['verification_source_result'] = source_result
-                    result['verification_source_parameter'] = str(case.get('verification_source_parameter') or (case.get('parameters') or [''])[0])
                     _reconcile_deterministic_browser_result(results, profile_name, source_result, case, result)
                     if result.get('diagnosis') in {'missing_playwright', 'missing_playwright_browser'}:
                         browser_unavailable = True
+            # Provenance belongs to every selected final-verification result, including bounded skips.
+            # Candidate reconciliation remains restricted to the actual Chromium execution branch above.
+            result['final_verification_stage'] = True
+            result['verification_source_result'] = source_result
+            result['verification_source_parameter'] = str(case.get('verification_source_parameter') or (case.get('parameters') or [''])[0])
+            for accounting_key in (
+                'final_xss_eligible_total', 'final_xss_selected_total', 'final_xss_deferred_total',
+                'final_xss_base', 'final_xss_max', 'adaptive_final_xss_budget', 'adaptive_final_xss_base',
+                'adaptive_final_xss_max', 'adaptive_final_xss_threshold', 'final_xss_priority_score',
+            ):
+                if accounting_key in case:
+                    result[accounting_key] = case[accounting_key]
             _tag_coverage_action(result, 'browser', target_url=url, method=str(case.get('method', 'GET')), parameters=list(case.get('parameters', [])), source_url=str(case.get('source_url', '')), data=str(case.get('data') or ''))
             key = f'browser_final_verification_{index}'
             results.setdefault(profile_name, {})[key] = result
@@ -1035,7 +1053,7 @@ async def run_single_tool_debug(*, tool: str, target: str, cookies: str, mode: s
                 return make_skipped_result('interactsh', target, 'No OAST-capable input was discovered.')
             selected = cases[0]
         oast_request_url = str(selected.get('injection_url') or '').replace('FUZZ', 'secops-oast-placeholder')
-        arguments = {'target_url': target, 'injection_url': selected['injection_url'], 'cookies': shared.scope_cookie_header(oast_request_url, cookies), 'method': selected.get('method', 'GET'), 'data': selected.get('data', ''), 'parameter': selected.get('parameter', ''), 'timeout': timeout_override or shared.oast_timeout_seconds('explicit' if injection_url else str(selected.get('oast_class') or 'remote-fetch')), 'request_rate': shared.MAX_REQUEST_RATE, 'allow_state_changes': state_changes}
+        arguments = {'target_url': target, 'injection_url': selected['injection_url'], 'cookies': shared.scope_cookie_header(oast_request_url, cookies), 'method': selected.get('method', 'GET'), 'data': selected.get('data', ''), 'parameter': selected.get('parameter', ''), 'timeout': timeout_override or shared.oast_timeout_seconds('explicit' if injection_url else str(selected.get('oast_class') or 'remote-fetch')), 'request_rate': shared.MAX_REQUEST_RATE, 'allow_state_changes': state_changes, 'allow_tls_trust_retry': shared.url_in_authorized_scope(target, oast_request_url), 'authorized_origins': sorted(shared.AUTHORIZED_SCOPE_ORIGINS), 'allow_same_host_ports': bool(shared.ALLOW_SAME_HOST_PORTS)}
     else:
         raise ValueError(f'Unsupported single tool: {tool}')
     scanner_limit = float(arguments.get('timeout', 180))

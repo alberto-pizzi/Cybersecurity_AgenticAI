@@ -71,7 +71,10 @@ class AgentState(TypedDict):
     planner_audit: list[dict[str, Any]]
     analysis: dict[str, Any]
     verification_done: bool
+    verification_selection_summary: dict[str, list[dict[str, Any]]]
     only_tool: str
+    started_monotonic: float
+    wall_clock_budget_seconds: int
 # CPU-only Ollama hosts can take far longer than 720s to prefill+decode a JSON-schema-constrained
 # plan (no tokens at all until prefill finishes), so these budgets stay generous by default.
 AI_PLANNER_TIMEOUTS = {
@@ -79,6 +82,33 @@ AI_PLANNER_TIMEOUTS = {
     'fast': 900,
     'balanced': 1800,
     'deep': 3000,
+}
+# Whole-assessment control-plane guard. Per-round budgets above remain generous ceilings, but a
+# pathologically slow provider must not consume hours simply because FAST/BALANCED/DEEP allow
+# multiple planning rounds. Unused time from an early round remains available to later rounds.
+AI_PLANNER_WORKFLOW_TIMEOUTS = {
+    'test': 90,
+    'fast': 1500,       # 25 minutes across at most two rounds
+    'balanced': 2700,   # 45 minutes across at most two rounds
+    'deep': 3600,       # 60 minutes across at most three rounds
+}
+# Reserve a useful slice for each later round before allowing the current round to consume the
+# workflow-wide planner budget. If the remaining total is already below the reserve schedule, the
+# remainder is shared evenly instead of starving the current round to ~0 seconds.
+AI_PLANNER_FUTURE_ROUND_RESERVE_SECONDS = {
+    'test': 0,
+    'fast': 600,
+    'balanced': 900,
+    'deep': 900,
+}
+# Inside one planning round, protect a useful minimum for later context batches without forcing a
+# strict equal split. This lets an unusually slow early batch borrow otherwise-idle round budget
+# while still preventing it from consuming every later batch's opportunity to be evaluated.
+AI_PLANNER_FUTURE_BATCH_RESERVE_SECONDS = {
+    'test': 15,
+    'fast': 90,
+    'balanced': 180,
+    'deep': 240,
 }
 
 AI_PLANNER_MAX_PREDICT = {
@@ -105,6 +135,10 @@ AI_PLANNER_CONTEXT_WINDOWS_MAX = {
 }
 PLANNER_CONTEXT_BYTES_PER_TOKEN_ESTIMATE = 3
 PLANNER_CONTEXT_SAFETY_TOKENS = 512
+# Keep planner feedback bounded independently from the number of scanner actions already executed.
+# The planner needs representative outcomes and aggregate counts, not hundreds of full result rows.
+PLANNER_PREVIOUS_RESULT_ROWS_PER_PROFILE = {'test': 6, 'fast': 12, 'balanced': 20, 'deep': 28}
+PLANNER_PREVIOUS_RESULT_OUTPUT_CHARS = {'test': 120, 'fast': 160, 'balanced': 180, 'deep': 220}
 
 # Same CPU-only-Ollama rationale as AI_PLANNER_TIMEOUTS above: this is a hard ceiling on
 # batch_budget (analysis_node caps it with min(ai_timeout, this value)), so raising --ai-timeout
@@ -115,6 +149,21 @@ AI_ANALYSIS_BATCH_TIMEOUTS = {
     'balanced': 900,
     'deep': 1500,
 }
+# Aggregate ceiling for the complete post-scan AI analysis stage. The per-batch ceilings above
+# remain useful rescue bounds, but repeated finding batches must not multiply into hours after the
+# scanners have already finished. The assessment/report deadlines still provide the outer guard.
+AI_ANALYSIS_STAGE_TIMEOUTS = {
+    'test': 60,
+    'fast': 900,
+    'balanced': 1800,
+    'deep': 2700,
+}
+AI_ANALYSIS_FUTURE_BATCH_RESERVE_SECONDS = {
+    'test': 12,
+    'fast': 90,
+    'balanced': 120,
+    'deep': 180,
+}
 AI_ANALYSIS_BATCH_SIZES = {'test': 1, 'fast': 2, 'balanced': 4, 'deep': 6}
 TEST_PLANNER_CANDIDATE_LIMIT = 32
 TEST_ANALYSIS_FINDING_LIMIT = 1
@@ -123,6 +172,10 @@ AI_ANALYSIS_RESCUE_MAX_PREDICT = {'test': 260, 'fast': 340, 'balanced': 460, 'de
 AI_ANALYSIS_CONTEXT_WINDOWS = {'test': 4096, 'fast': 6144, 'balanced': 8192, 'deep': 12288}
 LAST_AI_PLAN_DIAGNOSTICS: dict[str, Any] = {}
 BROAD_COVERAGE_TOOLS = ('ffuf', 'zap', 'nuclei', 'session', 'nikto')
+# These tools are discovery producers: when the AI selects them, their output must be merged before
+# selected consumer actions run so the same round can use the expanded request graph. This is a
+# data-dependency ordering rule, not a Python decision to select either tool.
+DISCOVERY_ENRICHMENT_TOOLS = ('ffuf', 'arjun')
 PARAMETER_COVERAGE_TOOLS = ('sqlmap', 'dalfox', 'commix', 'traversal', 'idor')
 AUTHORIZATION_COVERAGE_TOOLS = ('authorization',)
 WORKFLOW_COVERAGE_TOOLS = ('browser', 'workflow')
@@ -130,13 +183,15 @@ WORKFLOW_COVERAGE_TOOLS = ('browser', 'workflow')
 # derives concrete discovery-backed action candidates and enforces only scope/safety/resource limits;
 # the AI decides which concrete actions are useful. Deterministic mode remains the fixed pipeline.
 #
-# These are GLOBAL per-round execution ceilings, not coverage baselines and not minimums. They never
-# cause an action to run by themselves. The planner may select fewer actions, including zero.
+# These are configured per-round REFERENCE capacities, not coverage baselines, minimums or hard
+# coverage caps. FAST/BALANCED/DEEP may resolve a larger normal admission capacity when needed to
+# distribute the complete remaining eligible catalogue across the remaining planner rounds. They
+# never cause an action to run by themselves: the AI still decides which concrete actions are useful.
 ROUND_EXECUTION_ACTION_REFERENCE_CAPS = {
     'test': 24,
-    'fast': 300,
-    'balanced': 800,
-    'deep': 1144,
+    'fast': 120,
+    'balanced': 320,
+    'deep': 480,
 }
 # Compatibility alias used by older report/validation code. It now means the normal global round
 # ceiling; it is not a per-profile target and must not be interpreted as deterministic coverage.
@@ -146,7 +201,7 @@ PROFILE_EXECUTION_ACTION_OVERFLOW_STEP = {mode: 0 for mode in ROUND_EXECUTION_AC
 PROFILE_EXECUTION_ACTION_OVERFLOW_MAX = {mode: 0 for mode in ROUND_EXECUTION_ACTION_REFERENCE_CAPS}
 PROFILE_EXECUTION_ACTION_MAX = dict(ROUND_EXECUTION_ACTION_REFERENCE_CAPS)
 # The AI may explicitly ask for up to +12.5% capacity when useful selected actions would otherwise
-# exceed the normal ceiling. Python validates the request and still enforces scope and safety.
+# exceed the resolved normal capacity. Python validates the request and still enforces scope and safety.
 ROUND_EXECUTION_ADAPTIVE_CEILING_NUMERATOR = 9
 ROUND_EXECUTION_ADAPTIVE_CEILING_DENOMINATOR = 8
 ROUND_EXECUTION_ACTION_ADAPTIVE_CEILINGS = {
@@ -158,42 +213,128 @@ ROUND_EXECUTION_ACTION_ADAPTIVE_CEILINGS = {
     for mode, reference in ROUND_EXECUTION_ACTION_REFERENCE_CAPS.items()
 }
 
+# Hard wall-clock ceilings for the complete Agentic child workflow, including preflight and model
+# preparation. They cap aggregate sequential scanner time, which individual per-tool timeouts cannot
+# do. The parent runner keeps a final 15-minute watchdog margin below the user's 10/12-hour maximum.
+AGENTIC_WALL_CLOCK_BUDGETS = {
+    'test': 45 * 60,
+    'fast': 4 * 60 * 60,
+    'balanced': (9 * 60 + 45) * 60,
+    'deep': (11 * 60 + 45) * 60,
+}
+# Reserve enough time for bounded verification/analysis/report generation. New specialist actions
+# are not started once only this reserve remains.
+AGENTIC_FINALIZATION_RESERVE_SECONDS = {
+    'test': 4 * 60,
+    'fast': 12 * 60,
+    'balanced': 25 * 60,
+    'deep': 35 * 60,
+}
+
+
+# Finalization sub-reserves stay inside the hard wall-clock ceiling. They prevent
+# completion sweeps or AI narrative work from starving report generation.
+AGENTIC_REPORT_RESERVE_SECONDS = {
+    'test': 2 * 60, 'fast': 5 * 60, 'balanced': 10 * 60, 'deep': 15 * 60,
+}
+AGENTIC_ANALYSIS_RESERVE_SECONDS = {
+    'test': 1 * 60, 'fast': 3 * 60, 'balanced': 5 * 60, 'deep': 7 * 60,
+}
+SAFE_SURFACE_FINALIZATION_SHARE = 0.35
+
+
+def assessment_wall_clock_budget_seconds(mode: str) -> int:
+    return int(AGENTIC_WALL_CLOCK_BUDGETS.get(str(mode or 'balanced').lower(), AGENTIC_WALL_CLOCK_BUDGETS['balanced']))
+
+
+def _assessment_deadline(state: AgentState) -> float:
+    started = float(state.get('started_monotonic') or time.monotonic())
+    budget = int(state.get('wall_clock_budget_seconds') or assessment_wall_clock_budget_seconds(shared.CURRENT_SCAN_MODE))
+    return started + max(60, budget)
+
+
+def _assessment_remaining_seconds(state: AgentState) -> float:
+    return max(0.0, _assessment_deadline(state) - time.monotonic())
+
+
+def _assessment_finalization_reserve_seconds(state: AgentState) -> int:
+    mode = str(shared.CURRENT_SCAN_MODE or 'balanced')
+    configured = int(AGENTIC_FINALIZATION_RESERVE_SECONDS.get(mode, 25 * 60))
+    return min(configured, max(60, int(state.get('wall_clock_budget_seconds') or configured) // 4))
+
+
+def _assessment_execution_deadline(state: AgentState) -> float:
+    return _assessment_deadline(state) - _assessment_finalization_reserve_seconds(state)
+
+
+def _assessment_report_reserve_seconds(state: AgentState) -> float:
+    mode = str(shared.CURRENT_SCAN_MODE or 'balanced')
+    return float(AGENTIC_REPORT_RESERVE_SECONDS.get(mode, AGENTIC_REPORT_RESERVE_SECONDS['balanced']))
+
+
+def _assessment_analysis_reserve_seconds(state: AgentState) -> float:
+    mode = str(shared.CURRENT_SCAN_MODE or 'balanced')
+    return float(AGENTIC_ANALYSIS_RESERVE_SECONDS.get(mode, AGENTIC_ANALYSIS_RESERVE_SECONDS['balanced']))
+
+
+def _assessment_analysis_deadline(state: AgentState) -> float:
+    return _assessment_deadline(state) - _assessment_report_reserve_seconds(state)
+
+
+def _assessment_verification_deadline(state: AgentState) -> float:
+    return _assessment_analysis_deadline(state) - _assessment_analysis_reserve_seconds(state)
+
+
+def _assessment_execution_budget_exhausted(state: AgentState) -> bool:
+    return time.monotonic() >= _assessment_execution_deadline(state)
+
 def _execution_overflow_cap(mode: str, round_number: int) -> int:
     # Legacy helper retained for report compatibility. Normal Agentic planning has no Python-chosen
-    # overflow lane; capacity above the normal ceiling exists only after an explicit AI request.
+    # overflow lane; capacity above the resolved normal capacity exists only after an explicit AI request.
     reference = int(ROUND_EXECUTION_ACTION_REFERENCE_CAPS.get(str(mode or 'balanced'), 800))
     adaptive = int(ROUND_EXECUTION_ACTION_ADAPTIVE_CEILINGS.get(str(mode or 'balanced'), reference))
     return max(0, adaptive - reference)
 
 
-def _execution_round_max(mode: str, round_number: int) -> int:
-    return int(ROUND_EXECUTION_ACTION_REFERENCE_CAPS.get(str(mode or 'balanced'), 800))
-
-
 def _round_execution_budget(state: AgentState, eligible: list[dict[str, Any]], round_number: int, *, ai_extension_requested: bool=False) -> dict[str, int]:
-    """Return resource ceilings only; never select or guarantee security actions.
+    """Return admission/resource capacity only; never select or guarantee security actions.
 
-    The normal reference ceiling is a maximum number of concrete actions that may execute in this
-    round. It is not a baseline/minimum and does not add any scanner/tool/request to the plan. The AI
-    may explicitly request the bounded adaptive ceiling; Python accepts it only when enough concrete
-    eligible actions exist.
+    TEST intentionally remains a small smoke profile. For FAST/BALANCED/DEEP the configured
+    reference cap is a planning reference, not a hard coverage cap: normal admission capacity grows
+    when necessary to distribute the complete remaining eligible catalogue across the remaining
+    planner rounds. The AI still decides which concrete actions are useful and their priority. The
+    wall-clock/finalization deadline remains the hard runtime guard.
     """
     mode = str(shared.CURRENT_SCAN_MODE or 'balanced')
     reference_cap = max(1, int(ROUND_EXECUTION_ACTION_REFERENCE_CAPS.get(mode, 800)))
-    adaptive_ceiling = max(reference_cap, int(ROUND_EXECUTION_ACTION_ADAPTIVE_CEILINGS.get(mode, reference_cap)))
     eligible_count = len([action for action in eligible if isinstance(action, dict)])
     remaining_rounds = max(1, int(state.get('max_rounds', 1) or 1) - int(state.get('round', 0) or 0))
     ordinary_remaining = sum(1 for action in eligible if isinstance(action, dict) and not bool(action.get('adaptive_budget')))
-    required_per_round = (ordinary_remaining + remaining_rounds - 1) // remaining_rounds if ordinary_remaining else 0
-    ai_request_effective = bool(ai_extension_requested) and eligible_count > reference_cap
-    active_ceiling = adaptive_ceiling if ai_request_effective else reference_cap
+    required_per_round = (eligible_count + remaining_rounds - 1) // remaining_rounds if eligible_count else 0
+
+    if mode == 'test':
+        normal_capacity = min(reference_cap, eligible_count)
+    else:
+        # Capacity, not selection: if the AI considers the full eligible catalogue useful, enough
+        # slots exist to distribute it across the configured remaining rounds instead of silently
+        # losing coverage to a Python-chosen static action count.
+        normal_capacity = min(eligible_count, max(reference_cap, required_per_round))
+
+    adaptive_ceiling_unbounded = max(
+        normal_capacity,
+        (normal_capacity * ROUND_EXECUTION_ADAPTIVE_CEILING_NUMERATOR + ROUND_EXECUTION_ADAPTIVE_CEILING_DENOMINATOR - 1)
+        // ROUND_EXECUTION_ADAPTIVE_CEILING_DENOMINATOR,
+    )
+    adaptive_ceiling = min(eligible_count, adaptive_ceiling_unbounded)
+    ai_request_effective = bool(ai_extension_requested) and eligible_count > normal_capacity
+    active_ceiling = adaptive_ceiling if ai_request_effective else normal_capacity
     resolved_max = min(active_ceiling, eligible_count)
-    resolved_base = min(reference_cap, eligible_count)
+    resolved_base = min(normal_capacity, eligible_count)
     return {
-        'normal_base': reference_cap,  # compatibility name: ceiling, never a minimum
-        'normal_round_max': reference_cap,
+        'normal_base': normal_capacity,
+        'normal_round_max': normal_capacity,
         'configured_normal_max': reference_cap,
-        'overflow_cap': max(0, active_ceiling - reference_cap),
+        'overflow_cap': max(0, active_ceiling - normal_capacity),
         'reference_cap': reference_cap,
         'adaptive_ceiling': adaptive_ceiling,
         'active_ceiling': active_ceiling,
@@ -397,7 +538,9 @@ def _model_matches(requested: str, installed: str) -> bool:
     return False
 
 # Ensures a usable Ollama model is available before planning.
-def ensure_ollama_model(ollama_url: str, requested_model: str, *, allow_pull: bool=True) -> tuple[str, dict[str, Any]]:
+def ensure_ollama_model(
+    ollama_url: str, requested_model: str, *, allow_pull: bool=True, pull_timeout: int | float=7200,
+) -> tuple[str, dict[str, Any]]:
 
     base = ollama_url.rstrip('/')
     diagnostics: dict[str, Any] = {'ollama_url': base, 'requested_model': requested_model, 'model_pull_attempted': False, 'fallback_model_used': False}
@@ -416,8 +559,15 @@ def ensure_ollama_model(ollama_url: str, requested_model: str, *, allow_pull: bo
     pull_error = ''
     if allow_pull:
         diagnostics['model_pull_attempted'] = True
+        pull_budget = max(1.0, float(pull_timeout))
+        diagnostics['model_pull_timeout_seconds'] = pull_budget
+        pull_deadline = time.monotonic() + pull_budget
         try:
-            response = requests.post(f'{base}/api/pull', json={'model': requested_model, 'stream': False}, timeout=(10, 7200))
+            response = requests.post(
+                f'{base}/api/pull',
+                json={'model': requested_model, 'stream': False},
+                timeout=shared.deadline_bounded_request_timeout((10.0, pull_budget), pull_deadline),
+            )
             if response.status_code >= 400:
                 raise RuntimeError(f'HTTP {response.status_code}: {_ollama_error(response)}')
             installed = _ollama_installed_models(base)
@@ -509,8 +659,8 @@ def _parse_ai_plan_content(content: str) -> dict[str, Any]:
     # is a per-row representation defect, not evidence that the rest of the batch's AI judgement is
     # untrustworthy. At scale (a balanced/deep run can produce 100+ batches) discarding the whole
     # batch over one bad row turns an isolated glitch into a full assessment failure. Python still
-    # never invents a priority or upgrades a candidate: a row that cannot be salvaged is dropped
-    # (and, if it was selected, simply excluded from the plan) rather than guessed at.
+    # never invents a priority or upgrades a candidate: an invalid ranking row is dropped, while
+    # an ID the model explicitly selected remains selected but unranked rather than being guessed at.
     priority_ids: set[str] = set()
     priority_values: dict[str, int] = {}
     normalized_priorities: list[dict[str, Any]] = []
@@ -586,25 +736,35 @@ def _parse_ai_plan_content(content: str) -> dict[str, Any]:
     value['selected_action_priorities'] = normalized_priorities
     missing = [candidate_id for candidate_id in selected if candidate_id not in priority_ids]
     if missing:
+        # A malformed/missing ranking row must not silently turn a valid AI selection into a
+        # deselection. Preserve only IDs the model actually selected and mark their ranking as
+        # unavailable; the merge stage will keep explicit priorities ahead of unranked selections
+        # and preserve model/batch order among the latter. No numeric priority is invented here.
         value.setdefault('_contract_normalizations', []).append({
-            'field': 'selected_action_ids',
-            'dropped_missing_priority_ids': missing,
+            'field': 'selected_action_priorities',
+            'selected_ids_without_valid_priority': missing,
         })
-        selected = [candidate_id for candidate_id in selected if candidate_id in priority_ids]
-        value['selected_action_ids'] = selected
+    value['selected_action_ids'] = selected
     return value
 
 
 # Compact view of ONE concrete action. Python already validated the request contract; the AI decides
 # whether this exact action is useful. Values that could contain credentials remain local/redacted.
 def _planner_candidate_view(action: dict[str, Any], candidate_id: str) -> dict[str, Any]:
+    # Candidate IDs map back to the exact local request contract. The model only needs a compact
+    # semantic view to decide usefulness; sending multi-kilobyte generated query strings (for
+    # example DataTables requests with hundreds of columns) wastes context without adding a
+    # meaningful planning signal.
+    target_url = str(action.get('target_url') or '')
+    compact_url = shared.compact_log_url(target_url, max_length=720)
     return {
         'id': candidate_id,
         'profile': str(action.get('profile') or ''),
         'tool': str(action.get('tool') or ''),
         'method': str(action.get('method') or 'GET'),
-        'url': str(action.get('target_url') or ''),
-        'parameters': [str(value) for value in action.get('parameters', [])][:8],
+        'url': compact_url,
+        'parameters': [str(value) for value in action.get('parameters', [])][:12],
+        'parameter_count': len([value for value in action.get('parameters', []) if str(value)]),
         'file_parameters': [str(value) for value in action.get('file_parameters', [])][:4],
         'token_parameters': [str(value) for value in action.get('token_parameters', [])][:4],
         'oast_class': str(action.get('oast_class') or ''),
@@ -709,8 +869,10 @@ def _ollama_stream_content(url: str, payload: dict[str, Any], *, response_kind: 
     def _attempt(budget: int) -> str:
         started = time.monotonic()
         chunks: list[str] = []
-        read_timeout = max(60, int(budget) + 60)
-        response = requests.post(url, json={**payload, 'stream': True}, stream=True, timeout=(10, read_timeout))
+        total_transport_budget = max(1.0, float(budget))
+        connect_timeout = min(10.0, max(0.5, total_transport_budget * 0.10))
+        read_timeout = max(0.5, total_transport_budget - connect_timeout)
+        response = requests.post(url, json={**payload, 'stream': True}, stream=True, timeout=(connect_timeout, read_timeout))
         try:
             if response.status_code >= 400:
                 raise RuntimeError(f'HTTP {response.status_code}: {_ollama_error(response)}')
@@ -771,8 +933,10 @@ def _ollama_stream_content(url: str, payload: dict[str, Any], *, response_kind: 
     retries_left = 1
     while True:
         remaining = total_timeout - (time.monotonic() - outer_started)
+        if remaining <= 0:
+            raise TimeoutError(f'Ollama request exceeded the {total_timeout}-second provider-call budget.')
         try:
-            return _attempt(max(1, int(remaining)))
+            return _attempt(max(1, int(math.ceil(remaining))))
         except RuntimeError as exc:
             remaining = total_timeout - (time.monotonic() - outer_started)
             if retries_left > 0 and _OLLAMA_RUNNER_CRASH_MARKER in str(exc) and remaining > 30:
@@ -792,7 +956,7 @@ def warm_ollama_model(ollama_url: str, model: str, *, timeout: int) -> dict[str,
 # Reuses the Snap4City TokenManager and preserves its authentication order.
 # When the credentials file still contains placeholders, cached access/refresh tokens are tried
 # first; interactive username/password entry is only the final fallback for this process.
-def _snap4city_token_manager(credentials_path: str) -> Any:
+def _snap4city_token_manager(credentials_path: str, *, timeout_seconds: float | None=None) -> Any:
     path = str(Path(credentials_path).expanduser().resolve())
     cached = _SNAP4CITY_TOKEN_MANAGERS.get(path)
     if cached is not None:
@@ -841,7 +1005,7 @@ def _snap4city_token_manager(credentials_path: str) -> Any:
     if manager.refresh_token:
         try:
             print('[*] Snap4City: cached access token is unavailable/expired; trying refresh token.', flush=True)
-            token_data = manager.get_token_via_refresh_token(manager.refresh_token)
+            token_data = manager.get_token_via_refresh_token(manager.refresh_token, timeout_seconds=timeout_seconds)
             if token_data and 'access_token' in token_data:
                 manager.save_token_data(token_data)
                 print('[+] Snap4City: access token refreshed successfully; interactive credentials are not required.', flush=True)
@@ -902,8 +1066,19 @@ def _snap4city_chat_content(
     total_timeout: int,
     temperature: float=0.0,
 ) -> str:
-    manager = _snap4city_token_manager(state['snap4city_credentials'])
-    access_token = manager.get_token()
+    provider_started = time.monotonic()
+    provider_deadline = provider_started + max(1.0, float(total_timeout))
+
+    def remaining_timeout() -> float:
+        remaining = provider_deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError(f'Snap4City provider call exceeded the {total_timeout}-second budget.')
+        return remaining
+
+    manager = _snap4city_token_manager(
+        state['snap4city_credentials'], timeout_seconds=remaining_timeout(),
+    )
+    access_token = manager.get_token(timeout_seconds=remaining_timeout())
     body = {
         'access_token': access_token,
         'endpoint': state['model'],
@@ -928,38 +1103,56 @@ def _snap4city_chat_content(
     if local_ip:
         headers['X-Forwarded-For'] = local_ip
         headers['X-Real-IP'] = local_ip
+
+    remaining = remaining_timeout()
+    connect_timeout = max(0.5, min(10.0, remaining * 0.10))
+    read_timeout = max(0.5, remaining - connect_timeout)
     response = requests.post(
         state['snap4city_api_url'],
         json=body,
         headers=headers,
-        timeout=(10, max(20, int(total_timeout))),
+        timeout=(connect_timeout, read_timeout),
+        stream=True,
     )
-    if response.status_code >= 400:
-        detail = (response.text or response.reason or 'unknown Snap4City error').strip()
-        try:
-            parsed_error = response.json()
-            if isinstance(parsed_error, dict):
-                detail = str(parsed_error.get('message') or parsed_error.get('detail') or parsed_error)
-        except ValueError:
-            pass
-        raise RuntimeError(f'HTTP {response.status_code}: {detail[:1000]}')
     try:
-        payload = response.json()
-    except ValueError as exc:
-        raise ValueError('Snap4City returned a non-JSON response.') from exc
-    if isinstance(payload, dict) and payload.get('choices'):
-        choice = payload['choices'][0] if isinstance(payload['choices'], list) else {}
-        message = choice.get('message', {}) if isinstance(choice, dict) else {}
-        content = message.get('content') if isinstance(message, dict) else None
-        if isinstance(content, str) and content.strip():
-            return content.strip()
-    # Keep compatibility with the endpoint's documented legacy envelope, even
-    # though tools=[]/tool_choice=none should normally force the OpenAI envelope.
-    if isinstance(payload, dict) and isinstance(payload.get('answer'), str) and payload['answer'].strip():
-        return payload['answer'].strip()
-    if isinstance(payload, dict) and (payload.get('message') or payload.get('detail')):
-        raise RuntimeError(str(payload.get('message') or payload.get('detail')))
-    raise ValueError('Snap4City completed without returning assistant content.')
+        raw = bytearray()
+        for chunk in response.iter_content(chunk_size=65536):
+            if time.monotonic() >= provider_deadline:
+                raise TimeoutError(f'Snap4City provider call exceeded the {total_timeout}-second budget.')
+            if not chunk:
+                continue
+            raw.extend(chunk)
+            if len(raw) > 4 * 1024 * 1024:
+                raise ValueError('Snap4City response exceeded the 4 MiB safety limit.')
+        text = bytes(raw).decode(response.encoding or 'utf-8', errors='replace')
+        if response.status_code >= 400:
+            detail = (text or response.reason or 'unknown Snap4City error').strip()
+            try:
+                parsed_error = json.loads(text) if text else {}
+                if isinstance(parsed_error, dict):
+                    detail = str(parsed_error.get('message') or parsed_error.get('detail') or parsed_error)
+            except ValueError:
+                pass
+            raise RuntimeError(f'HTTP {response.status_code}: {detail[:1000]}')
+        try:
+            payload = json.loads(text)
+        except ValueError as exc:
+            raise ValueError('Snap4City returned a non-JSON response.') from exc
+        if isinstance(payload, dict) and payload.get('choices'):
+            choice = payload['choices'][0] if isinstance(payload['choices'], list) else {}
+            message = choice.get('message', {}) if isinstance(choice, dict) else {}
+            content = message.get('content') if isinstance(message, dict) else None
+            if isinstance(content, str) and content.strip():
+                return content.strip()
+        # Keep compatibility with the endpoint's documented legacy envelope, even
+        # though tools=[]/tool_choice=none should normally force the OpenAI envelope.
+        if isinstance(payload, dict) and isinstance(payload.get('answer'), str) and payload['answer'].strip():
+            return payload['answer'].strip()
+        if isinstance(payload, dict) and (payload.get('message') or payload.get('detail')):
+            raise RuntimeError(str(payload.get('message') or payload.get('detail')))
+        raise ValueError('Snap4City completed without returning assistant content.')
+    finally:
+        response.close()
 
 
 # Authenticates and performs a minimal inference so --require-ai can fail before scanners start.
@@ -1101,6 +1294,9 @@ def _humanize_planner_reasoning(value: Any) -> str:
 
 
 def _planner_system_message() -> str:
+    fast_cap = int(ROUND_EXECUTION_ACTION_REFERENCE_CAPS['fast'])
+    balanced_cap = int(ROUND_EXECUTION_ACTION_REFERENCE_CAPS['balanced'])
+    deep_cap = int(ROUND_EXECUTION_ACTION_REFERENCE_CAPS['deep'])
     return (
         '[ROLE]\n'
         'You are the autonomous planner for an explicitly authorized web-security assessment. You decide which CONCRETE discovery-derived actions should execute. '
@@ -1116,12 +1312,14 @@ def _planner_system_message() -> str:
         '- DEFER an action only for a concrete reason such as semantic duplication, equivalent completed work, weak applicability, incompatibility, safety constraints already described, or very low expected value.\n'
         '- Different actions from the same tool can have very different value; judge them independently. Likewise, an important action from a tool whose other actions are weak must still be selectable.\n'
         '- Broad scanners and targeted specialists are complementary; neither category replaces the other automatically.\n'
+        '- Your global numeric priority order is also the exact execution order. Do not place many slow/equivalent specialist actions ahead of distinct high-value complementary actions unless their evidence justifies it; use lower priorities for repetitive low-yield work.\n'
+        '- FFUF and Arjun are discovery producers. Rank a useful producer early when its enrichment should improve later actions. When a selected producer reaches its position in YOUR global order, Python merges its result immediately before the next action, so later same-round consumers can use the expanded graph. Python never promotes a lower-priority producer ahead of your higher-priority action and never adds an unselected producer.\n'
         '- Previous findings raise follow-up priority when relevant but do not justify repeating equivalent completed work.\n'
         '- adaptive_candidate and coverage_reserve_hint are Python ranking hints only, not mandatory selections and not exclusions.\n'
-        '- FAST/BALANCED/DEEP normal global execution ceilings are 300/800/1144 concrete actions per round. Python may execute fewer because you selected fewer. '
-        'Set request_adaptive_extension=true only if useful selected work may need the bounded +12.5% ceiling; never request it merely to fill capacity.\n'
+        f'- FAST/BALANCED/DEEP configured reference capacities are {fast_cap}/{balanced_cap}/{deep_cap} concrete actions per round. They are not hard coverage caps: when needed, runtime admission grows to distribute the remaining eligible catalogue across the remaining rounds. Python never selects actions to fill that capacity. '
+        'Set request_adaptive_extension=true only when useful selected work should receive up to +12.5% capacity above the resolved normal round capacity; never request it merely to fill capacity.\n'
         '- For every selected_action_id, include one matching selected_action_priorities entry with an integer priority from 0 to 100. Use the same scale across batches: 100 = highest-value action for this assessment, 0 = selected only as a very low-priority fallback.\n'
-        '- Order selected_action_ids from highest to lowest priority within this batch. After all batches, Python merges selections by YOUR numeric priorities before applying per-tool/global ceilings; ties preserve your returned order.\n'
+        '- Order selected_action_ids from highest to lowest priority within this batch. After all batches, Python merges selections by YOUR numeric priorities before applying the resolved round admission capacity; ties preserve your returned order.\n'
         '- finish is a batch-local signal: set it true only when none of the candidates in this batch is useful.\n\n'
         '[OUTPUT CONTRACT]\n'
         'Return exactly one JSON object with these fields and no others: '
@@ -1210,15 +1408,35 @@ def ai_plan(state: AgentState) -> dict[str, Any]:
     system_message = _planner_system_message()
     provider = str(state.get('ai_provider') or 'ollama').lower()
     base = state['ollama_url'].rstrip('/')
-    planner_timeout_floor = 20 if mode == 'test' else 120
-    total_timeout = max(planner_timeout_floor, int(state.get('ai_timeout') or 480))
+    # --ai-timeout is a PER-ROUND planner control-plane budget, not a per-batch multiplier.
+    # Respect an explicit positive operator override exactly: the CLI already supplies the generous
+    # mode default when the user passes 0. Silently raising e.g. --ai-timeout 30 to 120 seconds would
+    # contradict the printed/configured budget and could push work past an operator-selected bound.
+    # Direct/programmatic callers still get the mode default when the state omits the value.
+    configured_planner_budget = int(state.get('ai_timeout') or AI_PLANNER_TIMEOUTS.get(mode, 480))
+    configured_planner_budget = max(1, configured_planner_budget)
+    workflow_planner_budget = max(1, int(AI_PLANNER_WORKFLOW_TIMEOUTS.get(mode, configured_planner_budget)))
+    prior_planner_seconds = sum(
+        max(0.0, float(row.get('planner_seconds') or 0.0))
+        for row in state.get('planner_audit', [])
+        if isinstance(row, dict)
+    )
+    remaining_workflow_planner_budget = max(0.0, float(workflow_planner_budget) - prior_planner_seconds)
+    future_rounds = max(0, int(state.get('max_rounds') or current_round) - current_round)
+    future_round_reserve = max(0, int(AI_PLANNER_FUTURE_ROUND_RESERVE_SECONDS.get(mode, 0)))
+    reserved_for_future_rounds = float(future_rounds * future_round_reserve)
+    if remaining_workflow_planner_budget > reserved_for_future_rounds:
+        workflow_cap_for_round = remaining_workflow_planner_budget - reserved_for_future_rounds
+    else:
+        workflow_cap_for_round = remaining_workflow_planner_budget / max(1, future_rounds + 1)
+    round_planner_budget = max(1.0, min(float(configured_planner_budget), workflow_cap_for_round))
     max_predict = AI_PLANNER_MAX_PREDICT.get(mode, 800)
     base_context_window = AI_PLANNER_CONTEXT_WINDOWS.get(mode, 6144)
     max_context_window = AI_PLANNER_CONTEXT_WINDOWS_MAX.get(mode, base_context_window)
 
     selected_ids: list[str] = []
     selected_id_set: set[str] = set()
-    selected_priority_by_id: dict[str, int] = {}
+    selected_priority_by_id: dict[str, int | None] = {}
     selected_first_seen: dict[str, int] = {}
     selected_actions: list[dict[str, Any]] = []
     reasoning_parts: list[str] = []
@@ -1230,6 +1448,12 @@ def ai_plan(state: AgentState) -> dict[str, Any]:
     total_context_bytes = 0
     max_context_used = 0
     planning_started = time.monotonic()
+    round_planner_deadline = min(
+        planning_started + float(round_planner_budget),
+        _assessment_execution_deadline(state),
+    )
+    planner_budget_exhausted = False
+    planner_budget_deferred_candidates = 0
 
     def build_batch_prompt(batch_number: int, batch_count: int, batch: list[dict[str, Any]], selected_count: int) -> dict[str, Any]:
         return {
@@ -1242,8 +1466,11 @@ def ai_plan(state: AgentState) -> dict[str, Any]:
             'batch_size_limit': batch_size,
             'total_concrete_action_candidates': len(concrete_pool),
             'total_eligible_action_candidates': eligible_candidate_count,
-            'normal_global_execution_ceiling': int(initial_budget['reference_cap']),
-            'adaptive_global_execution_ceiling': int(initial_budget['adaptive_ceiling']),
+            'configured_reference_capacity': int(initial_budget['reference_cap']),
+            'resolved_normal_round_capacity': int(initial_budget['normal_base']),
+            'adaptive_round_capacity': int(initial_budget['adaptive_ceiling']),
+            'remaining_rounds': int(initial_budget['remaining_rounds']),
+            'required_capacity_per_round': int(initial_budget['required_per_round']),
             'selected_so_far_count': selected_count,
             'discovery_summary': _planner_discovery_summary(state['discovery']),
             'previous_results': compact_results(state['results']),
@@ -1284,7 +1511,18 @@ def ai_plan(state: AgentState) -> dict[str, Any]:
 
     effective_batch_size = max((len(batch) for batch in batches), default=0)
 
-    def run_one_batch(batch_number: int, batch: list[dict[str, Any]]) -> tuple[dict[str, Any], str, int, int, str]:
+    def run_one_batch(batch_number: int, batch: list[dict[str, Any]], request_timeout: int) -> tuple[dict[str, Any], str, int, int, str]:
+        # Chat -> generate is a fallback path for ONE planner batch. Both provider calls must share
+        # the same batch fair-share deadline; otherwise a failed chat could consume `request_timeout`
+        # and the generate fallback could consume it again, silently doubling this batch's budget.
+        request_deadline = time.monotonic() + max(1.0, float(request_timeout))
+
+        def remaining_request_timeout() -> int:
+            remaining = request_deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError('planner batch provider-call budget exhausted')
+            return max(1, int(math.ceil(remaining)))
+
         prompt = build_batch_prompt(batch_number, len(batches), batch, len(selected_ids))
         prompt, context, context_window, candidate_count = _fit_planner_prompt_context(
             prompt, system_message,
@@ -1295,7 +1533,7 @@ def ai_plan(state: AgentState) -> dict[str, Any]:
         common_options = {'temperature': 0, 'num_predict': max_predict, 'num_ctx': context_window, 'top_p': 0.9}
         if provider == 'snap4city':
             content = _snap4city_chat_content(
-                state, system_message, context, total_timeout=total_timeout, temperature=0.0,
+                state, system_message, context, total_timeout=remaining_request_timeout(), temperature=0.0,
             )
             kind = 'snap4city'
         else:
@@ -1311,7 +1549,7 @@ def ai_plan(state: AgentState) -> dict[str, Any]:
             }
             try:
                 content = _ollama_stream_content(
-                    f'{base}/api/chat', chat_payload, response_kind='chat', total_timeout=total_timeout, early_json=True,
+                    f'{base}/api/chat', chat_payload, response_kind='chat', total_timeout=remaining_request_timeout(), early_json=True,
                 )
                 kind = 'chat'
             except Exception as chat_exc:
@@ -1324,7 +1562,7 @@ def ai_plan(state: AgentState) -> dict[str, Any]:
                     'keep_alive': '30m',
                 }
                 content = _ollama_stream_content(
-                    f'{base}/api/generate', generate_payload, response_kind='generate', total_timeout=total_timeout, early_json=True,
+                    f'{base}/api/generate', generate_payload, response_kind='generate', total_timeout=remaining_request_timeout(), early_json=True,
                 )
                 kind = 'generate'
         plan = _parse_ai_plan_content(content)
@@ -1334,12 +1572,51 @@ def ai_plan(state: AgentState) -> dict[str, Any]:
     # structured-output enforcement, so it occasionally emits one non-conformant field (e.g. a null
     # priority) in an otherwise-valid batch response. A single such slip must not discard every other
     # batch's AI-derived plan, so each batch gets same-content retries before it is treated as failed.
-    batch_max_attempts = 3
+    # Parser normalization already salvages isolated malformed priority rows. One retry is enough
+    # for genuinely malformed JSON/provider replies; three retries per batch multiplied planner
+    # latency on large BALANCED catalogs without improving useful coverage.
+    batch_max_attempts = 2
     for batch_number, batch in enumerate(batches, 1):
         batch_started = time.monotonic()
+        remaining_batches = max(1, len(batches) - batch_number + 1)
+        remaining_round_budget = max(0.0, round_planner_deadline - batch_started)
+        if remaining_round_budget <= 0:
+            planner_budget_exhausted = True
+            planner_budget_deferred_candidates += sum(len(value) for value in batches[batch_number - 1:])
+            print(
+                f'[!] AI planning round budget exhausted before batch {batch_number}/{len(batches)}; '
+                f'{planner_budget_deferred_candidates} candidate(s) remain unplanned and eligible for a later round.',
+                file=sys.stderr, flush=True,
+            )
+            if state.get('require_ai'):
+                raise RuntimeError(
+                    f'Strict agentic mode requires the full AI planning stage, but the per-round planner budget '
+                    f'({round_planner_budget}s) expired before batch {batch_number}/{len(batches)}.'
+                )
+            break
+        # Reserve a useful minimum for every later batch, then let the current batch borrow the
+        # remaining round slack. If the round is already too tight to honor those reserves, fall back
+        # to an equal share of what remains. Fast batches still return all unused time to later ones.
+        future_batch_count = max(0, remaining_batches - 1)
+        configured_future_batch_reserve = max(0.0, float(AI_PLANNER_FUTURE_BATCH_RESERVE_SECONDS.get(mode, 120)))
+        reserved_for_future_batches = configured_future_batch_reserve * future_batch_count
+        if remaining_round_budget > reserved_for_future_batches:
+            current_batch_budget = remaining_round_budget - reserved_for_future_batches
+        else:
+            current_batch_budget = remaining_round_budget / remaining_batches
+        batch_deadline = min(
+            round_planner_deadline,
+            batch_started + max(1.0, current_batch_budget),
+        )
         for attempt in range(1, batch_max_attempts + 1):
             try:
-                compact_plan, context, context_window, candidate_count, kind = run_one_batch(batch_number, batch)
+                remaining_batch_budget = max(0.0, batch_deadline - time.monotonic())
+                if remaining_batch_budget <= 0:
+                    raise TimeoutError(
+                        f'planner batch fair-share budget exhausted before attempt {attempt}'
+                    )
+                request_timeout = max(1, int(math.ceil(remaining_batch_budget)))
+                compact_plan, context, context_window, candidate_count, kind = run_one_batch(batch_number, batch, request_timeout)
                 endpoint_kinds.append(kind)
                 total_context_bytes += len(context.encode('utf-8'))
                 max_context_used = max(max_context_used, context_window)
@@ -1358,11 +1635,10 @@ def ai_plan(state: AgentState) -> dict[str, Any]:
                 for candidate_id in [str(value) for value in compact_plan.get('selected_action_ids', [])]:
                     if candidate_id not in valid_batch_ids or candidate_id in selected_id_set:
                         continue
-                    if candidate_id not in priority_map:
-                        raise ValueError(f'AI batch {batch_number} selected {candidate_id} without a priority.')
                     selected_id_set.add(candidate_id)
                     selected_first_seen[candidate_id] = len(selected_ids)
-                    selected_priority_by_id[candidate_id] = int(priority_map[candidate_id])
+                    explicit_priority = priority_map.get(candidate_id)
+                    selected_priority_by_id[candidate_id] = int(explicit_priority) if explicit_priority is not None else None
                     selected_ids.append(candidate_id)
                     selected_actions.append(dict(candidate_map[candidate_id]))
                     accepted_this_batch.append(candidate_id)
@@ -1378,23 +1654,34 @@ def ai_plan(state: AgentState) -> dict[str, Any]:
                     'context_bytes': len(context.encode('utf-8')),
                     'context_window': context_window,
                     'seconds': round(time.monotonic() - batch_started, 2),
+                    'allocated_budget_seconds': round(max(0.0, batch_deadline - batch_started), 2),
+                    'future_batch_reserve_seconds': round(configured_future_batch_reserve, 2),
+                    'reserved_for_future_batches_seconds': round(reserved_for_future_batches, 2),
+                    'request_timeout_seconds': request_timeout,
                     'contract_normalizations': list(compact_plan.get('_contract_normalizations') or []),
                 })
                 break
             except Exception as exc:
                 errors.append(f'batch {batch_number} attempt {attempt}/{batch_max_attempts}: {type(exc).__name__}: {exc}')
-                if attempt < batch_max_attempts:
+                if attempt < batch_max_attempts and time.monotonic() < batch_deadline:
                     print(
                         f'    AI planning: batch {batch_number}/{len(batches)} returned a malformed plan '
-                        f'({type(exc).__name__}: {exc}); asking the AI again for the same batch.',
+                        f'({type(exc).__name__}: {exc}); asking the AI again within the remaining per-round fair-share budget.',
                         flush=True,
                     )
                     continue
-                # Every attempt for this one batch failed. Python still never invents which of its
-                # candidates to select — but on a large run (100+ batches) an isolated, unsalvageable
-                # batch is not evidence that the AI itself is unusable. Skip only this batch (0 actions
-                # from it this round; its candidates remain eligible in later rounds) and keep planning
-                # the rest, instead of discarding every other batch's already-obtained AI judgement.
+                # Every attempt for this batch failed. Strict Agentic mode must fail rather than
+                # silently omit AI judgement for part of the catalog. Only non-strict mode may defer the
+                # failed batch; its candidates remain eligible in a later round and Python never invents
+                # substitute attacks for them.
+                if isinstance(exc, TimeoutError) or time.monotonic() >= batch_deadline:
+                    planner_budget_exhausted = True
+                    planner_budget_deferred_candidates += len(batch)
+                if state.get('require_ai'):
+                    raise RuntimeError(
+                        f'Strict agentic mode requires every planner batch to complete; batch '
+                        f'{batch_number}/{len(batches)} failed after {attempt} attempt(s): {type(exc).__name__}: {exc}'
+                    ) from exc
                 failed_batches.append(batch_number)
                 batch_diagnostics.append({
                     'batch': batch_number,
@@ -1403,6 +1690,9 @@ def ai_plan(state: AgentState) -> dict[str, Any]:
                     'selected_action_ids': [],
                     'endpoint': 'failed',
                     'seconds': round(time.monotonic() - batch_started, 2),
+                    'allocated_budget_seconds': round(max(0.0, batch_deadline - batch_started), 2),
+                    'future_batch_reserve_seconds': round(configured_future_batch_reserve, 2),
+                    'reserved_for_future_batches_seconds': round(reserved_for_future_batches, 2),
                     'error': f'{type(exc).__name__}: {exc}',
                     'skipped_after_exhausted_retries': True,
                 })
@@ -1423,7 +1713,13 @@ def ai_plan(state: AgentState) -> dict[str, Any]:
     # only priorities returned by the model; technical batch order is a tie-breaker only when the AI
     # assigned equal priority. This prevents an early prompt batch from winning a later execution cap
     # merely because it was evaluated first.
-    selected_ids.sort(key=lambda candidate_id: (-selected_priority_by_id[candidate_id], selected_first_seen[candidate_id]))
+    selected_ids.sort(
+        key=lambda candidate_id: (
+            selected_priority_by_id[candidate_id] is None,
+            -(selected_priority_by_id[candidate_id] if selected_priority_by_id[candidate_id] is not None else 0),
+            selected_first_seen[candidate_id],
+        )
+    )
     selected_actions = [dict(candidate_map[candidate_id]) for candidate_id in selected_ids]
 
     round_budget = _round_execution_budget(
@@ -1466,17 +1762,27 @@ def ai_plan(state: AgentState) -> dict[str, Any]:
         'planner_batch_count': len(batches),
         'planner_batches': batch_diagnostics,
         'planner_batch_failures': list(failed_batches),
+        'planner_round_budget_seconds': round(float(round_planner_budget), 2),
+        'planner_round_budget_configured_seconds': int(configured_planner_budget),
+        'planner_round_budget_effective_seconds': round(max(0.0, round_planner_deadline - planning_started), 2),
+        'planner_workflow_budget_seconds': int(workflow_planner_budget),
+        'planner_workflow_used_before_round_seconds': round(prior_planner_seconds, 2),
+        'planner_workflow_remaining_before_round_seconds': round(remaining_workflow_planner_budget, 2),
+        'planner_future_round_reserve_seconds': int(future_round_reserve),
+        'planner_future_rounds_after_current': int(future_rounds),
+        'planner_budget_exhausted': bool(planner_budget_exhausted),
+        'planner_budget_deferred_candidate_count': int(planner_budget_deferred_candidates),
         'selected_action_ids': selected_ids_admitted,
         'ai_selected_action_ids_before_cap': selected_ids,
         'ai_selected_action_priorities': {candidate_id: selected_priority_by_id[candidate_id] for candidate_id in selected_ids},
         'admitted_actions_per_profile': selected_per_profile,
         'admitted_action_count': len(selected_actions),
         'available_actions_per_profile': available_per_profile,
-        'round_execution_normal_base': int(round_budget['reference_cap']),
+        'round_execution_normal_base': int(round_budget['normal_base']),
         'round_execution_resolved_base': int(round_budget['resolved_base']),
         'round_execution_resolved_max': execution_max,
         'round_execution_overflow_cap': int(round_budget['overflow_cap']),
-        'round_execution_configured_normal_max': int(round_budget['reference_cap']),
+        'round_execution_configured_normal_max': int(round_budget['configured_normal_max']),
         'round_execution_reference_ceiling': int(round_budget['reference_cap']),
         'round_execution_adaptive_ceiling': int(round_budget['adaptive_ceiling']),
         'round_execution_active_ceiling': int(round_budget['active_ceiling']),
@@ -1736,18 +2042,21 @@ def _ai_analysis_batch(state: AgentState, batch: list[dict[str, Any]], all_candi
     started = time.monotonic()
     errors: list[str] = []
 
-    # For a one-finding request, reserve time for a compact rescue. TEST uses much smaller
-    # control-plane minima so a diagnostic run cannot inherit the normal 45--60 second retry floors.
+    # For a one-finding request, reserve time for a compact rescue when the parent slice is large
+    # enough. Preferred floors must never enlarge the timeout supplied by the adaptive parent: near
+    # a stage deadline a short final slice may legitimately run without enough time for a rescue.
+    parent_timeout = max(1, int(timeout))
     if mode == 'test':
         rescue_reserve = 10
         if len(batch) == 1:
-            chat_budget = max(15, min(int(timeout * 0.70), max(15, timeout - rescue_reserve)))
+            preferred_chat_budget = max(15, min(int(parent_timeout * 0.70), max(15, parent_timeout - rescue_reserve)))
         else:
-            chat_budget = max(15, min(int(timeout * 0.70), 30))
+            preferred_chat_budget = max(15, min(int(parent_timeout * 0.70), 30))
     elif len(batch) == 1:
-        chat_budget = max(60, min(int(timeout * 0.62), timeout - 45))
+        preferred_chat_budget = max(60, min(int(parent_timeout * 0.62), parent_timeout - 45))
     else:
-        chat_budget = max(55, min(int(timeout * 0.70), 105))
+        preferred_chat_budget = max(55, min(int(parent_timeout * 0.70), 105))
+    chat_budget = max(1, min(parent_timeout, int(preferred_chat_budget)))
 
     try:
         if provider == 'snap4city':
@@ -1979,7 +2288,24 @@ def analysis_node(state: AgentState) -> dict[str, Any]:
         candidates = candidates[:TEST_ANALYSIS_FINDING_LIMIT]
     default_batch_budget = AI_ANALYSIS_BATCH_TIMEOUTS.get(mode, 240)
     configured_budget = int(state.get('ai_timeout') or default_batch_budget)
-    batch_budget = min(configured_budget, default_batch_budget)
+    remaining_for_analysis = max(0, int(_assessment_analysis_deadline(state) - time.monotonic()))
+    configured_stage_budget = max(1, int(AI_ANALYSIS_STAGE_TIMEOUTS.get(mode, default_batch_budget)))
+    stage_budget = min(configured_stage_budget, remaining_for_analysis)
+    analysis_stage_deadline = min(
+        started + float(stage_budget),
+        _assessment_analysis_deadline(state),
+    )
+    if remaining_for_analysis < 45:
+        analysis = {
+            'status': 'partial', 'provider': str(state.get('ai_provider') or 'ollama'), 'model': state['model'],
+            'candidate_findings': len(candidates), 'candidate_findings_total': total_candidate_findings,
+            'analyzed_findings': 0, 'severity_changes': 0,
+            'errors': ['assessment wall-clock budget reserved for final report; AI narrative analysis skipped'],
+            'seconds': round(time.monotonic() - started, 2), 'diagnosis': 'assessment_time_budget_exhausted',
+        }
+        print('AI analysis: skipped because the hard assessment deadline is near; scanner evidence is retained.', flush=True)
+        return {'results': results, 'analysis': analysis}
+    batch_budget = min(configured_budget, default_batch_budget, remaining_for_analysis)
     batch_size = AI_ANALYSIS_BATCH_SIZES.get(mode, 8)
     analyzed = changed = 0
     errors: list[str] = []
@@ -1993,9 +2319,40 @@ def analysis_node(state: AgentState) -> dict[str, Any]:
         for batch_index in range(batch_count):
             batch = candidates[batch_index * batch_size:(batch_index + 1) * batch_size]
             try:
-                batch_deadline = time.monotonic() + batch_budget
+                now = time.monotonic()
+                remaining_hard = max(0, int(_assessment_analysis_deadline(state) - now))
+                remaining_stage = max(0.0, analysis_stage_deadline - now)
+                if remaining_hard < 45:
+                    errors.append('assessment wall-clock budget reached during AI analysis; remaining findings retained without AI rewrite')
+                    break
+                if remaining_stage < 45:
+                    message = 'aggregate AI analysis stage budget reached; remaining findings retain scanner/verifier evidence without AI rewrite'
+                    if state.get('require_ai'):
+                        raise TimeoutError(message)
+                    errors.append(message)
+                    break
+                remaining_batches = max(1, batch_count - batch_index)
+                future_batch_count = max(0, remaining_batches - 1)
+                future_batch_reserve = max(0.0, float(AI_ANALYSIS_FUTURE_BATCH_RESERVE_SECONDS.get(mode, 90)))
+                reserved_for_future_batches = future_batch_reserve * future_batch_count
+                if remaining_stage > reserved_for_future_batches:
+                    stage_slice = remaining_stage - reserved_for_future_batches
+                else:
+                    stage_slice = remaining_stage / remaining_batches
+                effective_batch_budget = min(float(batch_budget), float(remaining_hard), float(stage_slice))
+                if effective_batch_budget < 45:
+                    message = (
+                        f'analysis stage cannot allocate the 45s minimum to batch {batch_index + 1}/{batch_count} '
+                        f'within the remaining aggregate budget'
+                    )
+                    if state.get('require_ai'):
+                        raise TimeoutError(message)
+                    errors.append(message)
+                    break
+                effective_batch_budget_int = max(45, int(math.ceil(effective_batch_budget)))
+                batch_deadline = min(analysis_stage_deadline, time.monotonic() + effective_batch_budget)
                 rows = _ai_analysis_batch_adaptive(
-                    state, batch, candidates, batch_budget,
+                    state, batch, candidates, effective_batch_budget_int,
                     label=f'batch {batch_index + 1}/{batch_count}', deadline=batch_deadline,
                 )
                 batch_analyzed, batch_changed = _apply_analysis(rows, finding_map, state['model'], str(state.get('ai_provider') or 'ollama'))
@@ -2022,14 +2379,67 @@ def analysis_node(state: AgentState) -> dict[str, Any]:
         'errors': errors,
         'seconds': round(time.monotonic() - started, 2),
         'batch_timeout_seconds': batch_budget,
+        'stage_timeout_seconds': configured_stage_budget,
+        'stage_budget_effective_seconds': stage_budget,
+        'future_batch_reserve_seconds': int(AI_ANALYSIS_FUTURE_BATCH_RESERVE_SECONDS.get(mode, 90)),
         'policy': 'AI supplies the final severity and professional description/impact/consequence/recovery/remediation wording; browser verification constrains confidence independently from severity, while original scanner narrative, category, verification status and evidence remain preserved and scanner/verifier-controlled where applicable.',
     }
     print(f"AI analysis: finished; analyzed={analyzed}/{len(candidates)}; severity changes={changed}; {analysis['seconds']:.1f}s", flush=True)
     return {'results': results, 'analysis': analysis}
 
-# Keeps a small result summary that is safe to send back to the planner.
+# Keeps a bounded result summary that is safe to send back to the planner.
 def compact_results(results: dict[str, dict[str, Any]]) -> dict[str, Any]:
-    return {profile: {key: {'status': value.get('status'), 'target': value.get('target'), 'findings': len(value.get('vulnerabilities') or []), 'diagnosis': value.get('diagnosis'), 'output': str(value.get('output', ''))[:250]} for key, value in values.items() if isinstance(value, dict)} for profile, values in results.items()}
+    mode = str(shared.CURRENT_SCAN_MODE or 'balanced')
+    row_cap = max(1, int(PLANNER_PREVIOUS_RESULT_ROWS_PER_PROFILE.get(mode, 20)))
+    output_cap = max(80, int(PLANNER_PREVIOUS_RESULT_OUTPUT_CHARS.get(mode, 180)))
+    compact: dict[str, Any] = {}
+    for profile, values in results.items():
+        rows: list[tuple[int, int, str, dict[str, Any]]] = []
+        status_counts: dict[str, int] = {}
+        tool_counts: dict[str, int] = {}
+        total_findings = 0
+        if not isinstance(values, dict):
+            continue
+        for index, (key, value) in enumerate(values.items()):
+            if not isinstance(value, dict):
+                continue
+            status = str(value.get('status') or 'unknown').lower()
+            status_counts[status] = status_counts.get(status, 0) + 1
+            tool = str(value.get('tool') or str(key).split(':', 1)[0] or 'unknown').lower()
+            tool_counts[tool] = tool_counts.get(tool, 0) + 1
+            findings = len(value.get('vulnerabilities') or [])
+            total_findings += findings
+            # Findings and incomplete executions are the feedback most useful to the next round.
+            # Recent routine successes fill any remaining slots. Stable insertion order is retained
+            # as the final tie-break so the same run produces the same compact prompt.
+            importance = 300 if findings else (220 if status in {'error', 'partial'} else (160 if status == 'skipped' else 100))
+            rows.append((importance, index, str(key), value))
+        selected = sorted(rows, key=lambda item: (-item[0], -item[1]))[:row_cap]
+        selected.sort(key=lambda item: item[1])
+        compact_rows: list[dict[str, Any]] = []
+        for _, _, key, value in selected:
+            target = str(value.get('target') or value.get('url') or '')
+            compact_rows.append({
+                'key': key[:120],
+                'tool': str(value.get('tool') or key.split(':', 1)[0])[:32],
+                'status': str(value.get('status') or 'unknown')[:24],
+                'target': shared.compact_log_url(target, max_length=360),
+                'findings': len(value.get('vulnerabilities') or []),
+                'diagnosis': str(value.get('diagnosis') or '')[:120],
+                'output': str(value.get('output') or '')[:output_cap],
+            })
+        compact[profile] = {
+            'summary': {
+                'result_count': len(rows),
+                'status_counts': status_counts,
+                'tool_counts': tool_counts,
+                'finding_count': total_findings,
+                'representative_rows': len(compact_rows),
+                'omitted_rows': max(0, len(rows) - len(compact_rows)),
+            },
+            'representative_results': compact_rows,
+        }
+    return compact
 
 # Before planning, discovery gathers the real pages, forms, and request cases available on the target.
 def discovery_node(state: AgentState) -> dict[str, Any]:
@@ -2043,9 +2453,13 @@ def discovery_node(state: AgentState) -> dict[str, Any]:
             seeds=list(state.get('discovery_seeds') or []),
             forced_seeds=list(state.get('entry_points') or []),
             allow_state_changes=state_changes_allowed,
+            wall_clock_deadline=_assessment_execution_deadline(state),
         )
         if profile.get('cookies') and found.get('authentication_effective') is not False:
-            found = shared.authenticate_discovered_sibling_origins(found, state['target'], profile['cookies'], allow_state_changes=state_changes_allowed)
+            found = shared.authenticate_discovered_sibling_origins(
+                found, state['target'], profile['cookies'], allow_state_changes=state_changes_allowed,
+                wall_clock_deadline=_assessment_execution_deadline(state),
+            )
         discovery[profile['name']] = found
         diagnostics.extend(({'phase': 'discovery', 'profile': profile['name'], **item} for item in found['errors']))
         print(f"    {profile['name']}: {len(found.get('html_urls', []))} HTML pages, {len(found.get('request_cases', []))} request contracts, {len(found.get('browser_network_requests', []))} browser network requests, {len(found.get('browser_navigation_urls', []))} Chromium navigations, {len(found['jwt_tokens'])} JWTs")
@@ -2564,6 +2978,27 @@ def planner_node(state: AgentState) -> dict[str, Any]:
     round_number = state['round'] + 1
     notes = list(state['notes'])
     audit = list(state.get('planner_audit', []))
+    if _assessment_execution_budget_exhausted(state):
+        remaining = _assessment_remaining_seconds(state)
+        notes.append(
+            f'Round {round_number}: assessment execution wall-clock budget reached; '
+            f'{remaining:.0f}s remain reserved for verification/analysis/reporting.'
+        )
+        audit.append({
+            'round': round_number,
+            'planner_source': 'wall_clock_budget',
+            'planner_endpoint': 'not_required',
+            'eligible_action_count': 0,
+            'selected_action_count': 0,
+            'validated_concrete_action_count': 0,
+            'selected_actions': [],
+            'reasoning_summary': 'Execution wall-clock budget reached; proceeding to finalization.',
+            'assessment_remaining_seconds': round(remaining, 1),
+        })
+        return {
+            'plan': [], 'round': round_number, 'notes': notes, 'finished': True,
+            'planner_source': 'wall_clock_budget', 'planner_audit': audit,
+        }
     eligible = _eligible_action_catalog(state)
     if not eligible:
         notes.append(f'Round {round_number}: no eligible discovery-derived actions remain; no AI concrete-action selection call was required.')
@@ -2605,6 +3040,13 @@ def planner_node(state: AgentState) -> dict[str, Any]:
     review_selected_ids: list[str] = []
     review_reasoning = ''
     fallback_reason = ''
+    # Measure the AI attempt independently from success-only ai_plan diagnostics. This prevents a
+    # failed non-strict attempt from being recorded as zero seconds and then receiving the same
+    # workflow-wide planner budget again on the next round. Clearing here also prevents stale
+    # diagnostics from a previous successful round being attributed to a new failed attempt.
+    planner_attempt_started = time.monotonic()
+    planner_seconds = 0.0
+    LAST_AI_PLAN_DIAGNOSTICS.clear()
     try:
         decision = ai_plan(state)
         round_budget = _round_execution_budget(
@@ -2628,7 +3070,10 @@ def planner_node(state: AgentState) -> dict[str, Any]:
         finished = bool(decision.get('finish', False)) and (not plan)
         endpoint = str(LAST_AI_PLAN_DIAGNOSTICS.get('endpoint', 'unknown'))
         context_bytes = int(LAST_AI_PLAN_DIAGNOSTICS.get('context_bytes', 0) or 0)
-        planner_seconds = float(LAST_AI_PLAN_DIAGNOSTICS.get('seconds', 0) or 0)
+        planner_seconds = max(
+            float(LAST_AI_PLAN_DIAGNOSTICS.get('seconds', 0) or 0),
+            time.monotonic() - planner_attempt_started,
+        )
         candidate_count = int(LAST_AI_PLAN_DIAGNOSTICS.get('candidate_count', 0) or 0)
         detailed_candidate_count = int(LAST_AI_PLAN_DIAGNOSTICS.get('detailed_candidate_count', candidate_count) or 0)
         candidate_pool_count = int(LAST_AI_PLAN_DIAGNOSTICS.get('candidate_pool_count', candidate_count) or candidate_count)
@@ -2667,13 +3112,14 @@ def planner_node(state: AgentState) -> dict[str, Any]:
                 )
         before_global_cap = int(LAST_AI_PLAN_DIAGNOSTICS.get('expanded_before_global_cap', len(plan)) or len(plan))
         print(
-            f"    [ROUND BUDGET] actions={len(plan)}; normal ceiling={reference_round_cap}; "
-            f"adaptive ceiling={adaptive_round_ceiling}; active ceiling={active_round_ceiling}; "
+            f"    [ROUND BUDGET] actions={len(plan)}; reference capacity={reference_round_cap}; "
+            f"resolved normal capacity={resolved_round_base}; adaptive ceiling={adaptive_round_ceiling}; active ceiling={active_round_ceiling}; "
             f"AI extension request={'yes' if round_budget.get('adaptive_extension_ai_requested') else 'no'}; "
             f"before cap={before_global_cap}",
             flush=True,
         )
     except Exception as exc:
+        planner_seconds = max(0.0, time.monotonic() - planner_attempt_started)
         endpoint = str(LAST_AI_PLAN_DIAGNOSTICS.get('endpoint', 'unavailable'))
         context_bytes = int(LAST_AI_PLAN_DIAGNOSTICS.get('context_bytes', 0) or 0)
         if state.get('require_ai'):
@@ -2735,6 +3181,11 @@ def planner_node(state: AgentState) -> dict[str, Any]:
         'fallback_reason': fallback_reason,
         'selected_action_count': len(plan),
         'selected_actions': [_audit_action_summary(action) for action in plan],
+        'planner_seconds': round(float(planner_seconds), 2),
+        'planner_round_budget_seconds': float(LAST_AI_PLAN_DIAGNOSTICS.get('planner_round_budget_seconds', 0) or 0) if planner_source == 'ai' else 0.0,
+        'planner_round_budget_configured_seconds': int(LAST_AI_PLAN_DIAGNOSTICS.get('planner_round_budget_configured_seconds', 0) or 0) if planner_source == 'ai' else 0,
+        'planner_workflow_budget_seconds': int(LAST_AI_PLAN_DIAGNOSTICS.get('planner_workflow_budget_seconds', 0) or 0) if planner_source == 'ai' else 0,
+        'planner_workflow_used_before_round_seconds': float(LAST_AI_PLAN_DIAGNOSTICS.get('planner_workflow_used_before_round_seconds', 0) or 0) if planner_source == 'ai' else 0.0,
         'reasoning_summary': summary[:1500]})
     print(f'[*] Validated actions: {len(plan)}', flush=True)
     for action in plan:
@@ -2742,7 +3193,7 @@ def planner_node(state: AgentState) -> dict[str, Any]:
     return {'plan': plan, 'round': round_number, 'notes': notes, 'finished': finished, 'planner_source': planner_source, 'planner_audit': audit}
 
 # Action execution invokes one validated tool and stores the normalized result in planner state.
-async def execute_action(action: dict[str, Any], cookies: dict[str, str], discovery: dict[str, dict[str, Any]], allow_state_changes: bool | None=None, secondary_cookies: str='', identity_labels: dict[str, str] | None=None) -> tuple[dict[str, Any], dict[str, Any]]:
+async def execute_action(action: dict[str, Any], cookies: dict[str, str], discovery: dict[str, dict[str, Any]], allow_state_changes: bool | None=None, secondary_cookies: str='', identity_labels: dict[str, str] | None=None, deadline: float | None=None) -> tuple[dict[str, Any], dict[str, Any]]:
     tool = action['tool']
     profile = action['profile']
     server, function = REGISTRY[tool][:2]
@@ -2752,7 +3203,7 @@ async def execute_action(action: dict[str, Any], cookies: dict[str, str], discov
         oast_class = str(action.get('oast_class') or 'remote-fetch')
         oast_timeout = shared.oast_timeout_seconds(oast_class)
         request_url = _action_request_url(action, action['target_url'])
-        arguments = {'target_url': action['target_url'], 'injection_url': action['injection_url'], 'cookies': shared.scope_cookie_header(request_url, cookies.get(profile, '')), 'method': action.get('method', 'GET'), 'data': action.get('data', ''), 'parameter': (action.get('parameters') or [''])[0], 'timeout': oast_timeout, 'request_rate': shared.MAX_REQUEST_RATE, 'allow_state_changes': shared.state_changing_tests_allowed(action['target_url'], allow_state_changes)}
+        arguments = {'target_url': action['target_url'], 'injection_url': action['injection_url'], 'cookies': shared.scope_cookie_header(request_url, cookies.get(profile, '')), 'method': action.get('method', 'GET'), 'data': action.get('data', ''), 'parameter': (action.get('parameters') or [''])[0], 'timeout': oast_timeout, 'request_rate': shared.MAX_REQUEST_RATE, 'allow_state_changes': shared.state_changing_tests_allowed(action['target_url'], allow_state_changes), 'allow_tls_trust_retry': shared.url_in_authorized_scope(action['target_url'], request_url), 'authorized_origins': sorted(shared.AUTHORIZED_SCOPE_ORIGINS), 'allow_same_host_ports': bool(shared.ALLOW_SAME_HOST_PORTS)}
     else:
         profile_discovery = discovery.get(profile, {})
         labels = identity_labels or {}
@@ -2776,10 +3227,19 @@ async def execute_action(action: dict[str, Any], cookies: dict[str, str], discov
     request_url = _action_request_url(action, action['target_url'])
     effective_action_cookie = shared.scope_cookie_header(request_url, raw_profile_cookie)
     if raw_profile_cookie and (tool in authenticated_specialists or bool(action.get('sibling_broad'))):
+        if deadline is not None and float(deadline) - time.monotonic() <= 2.0:
+            return (action, {
+                'tool': tool, 'status': 'skipped', 'target': action['target_url'],
+                'output': 'Assessment wall-clock execution budget was exhausted before the authenticated session precheck could start.',
+                'vulnerabilities': [], 'diagnosis': 'assessment_time_budget_exhausted',
+                'timed_out': True, 'time_limit_reached': True,
+            })
         profile_discovery = discovery.get(profile, {})
         source_url = str(action.get('source_url') or '')
         method = str(action.get('method') or 'GET').upper()
-        probe_url = request_url if method in {'GET', 'HEAD'} else shared.select_application_session_probe_url(profile_discovery, request_url, source_url)
+        probe_url = shared.select_authenticated_precheck_probe_url(
+            profile_discovery, request_url, source_url, method,
+        )
         print(f'    [PRECHECK] {tool}: validating authenticated session with {shared.compact_log_url(probe_url)}', flush=True)
         # refresh_authenticated_session_state may use the synchronous Playwright authentication
         # helper when an application/path session must be repaired. execute_action runs inside the
@@ -2790,7 +3250,15 @@ async def execute_action(action: dict[str, Any], cookies: dict[str, str], discov
             shared.refresh_authenticated_session_state,
             request_url, raw_profile_cookie, probe_url,
             allow_state_changes=shared.state_changing_tests_allowed(action['target_url'], allow_state_changes),
+            deadline=deadline,
         )
+        if state_refresh.get('diagnosis') == 'assessment_time_budget_exhausted':
+            return (action, {
+                'tool': tool, 'status': 'skipped', 'target': action['target_url'],
+                'output': 'Assessment wall-clock execution budget was exhausted during the authenticated session precheck.',
+                'vulnerabilities': [], 'diagnosis': 'assessment_time_budget_exhausted',
+                'timed_out': True, 'time_limit_reached': True, 'state_refresh': state_refresh,
+            })
         if state_refresh.get('usable') is False or not state_refresh.get('credential_applied'):
             print(f'    [PARTIAL ] {tool}: authenticated session precheck failed', flush=True)
             return (action, {'tool': tool, 'status': 'partial', 'target': action['target_url'], 'output': 'The authenticated application session could not be re-established before the scanner.', 'vulnerabilities': [], 'diagnosis': 'authentication_precheck_failed', 'state_refresh': state_refresh})
@@ -2802,12 +3270,32 @@ async def execute_action(action: dict[str, Any], cookies: dict[str, str], discov
         print(f'    [SESSION ] {tool}: authenticated application session usable', flush=True)
     try:
         scanner_limit = float(arguments.get('timeout', 180))
+        if deadline is not None:
+            remaining = max(0.0, float(deadline) - time.monotonic())
+            if remaining <= 2.0:
+                return (action, {
+                    'tool': tool, 'status': 'skipped', 'target': action['target_url'],
+                    'output': 'Assessment wall-clock execution budget was exhausted before this action could start.',
+                    'vulnerabilities': [], 'diagnosis': 'assessment_time_budget_exhausted',
+                    'timed_out': True, 'time_limit_reached': True,
+                })
+            scanner_limit = max(1.0, min(scanner_limit, remaining))
+            if isinstance(arguments, dict) and 'timeout' in arguments:
+                arguments['timeout'] = scanner_limit
         spec = next((item for item in shared.ALL_TOOLS if item.name == tool), None)
+        hard_remaining = None if deadline is None else max(0.0, float(deadline) - time.monotonic())
+        if hard_remaining is not None and hard_remaining <= 0:
+            return (action, {
+                'tool': tool, 'status': 'skipped', 'target': action['target_url'],
+                'output': 'Assessment wall-clock execution budget was exhausted before the scanner transport could start.',
+                'vulnerabilities': [], 'diagnosis': 'assessment_time_budget_exhausted',
+                'timed_out': True, 'time_limit_reached': True,
+            })
         if spec is not None:
-            result = await call_mcp_with_progress(spec, arguments, timeout_seconds=scanner_limit)
+            result = await call_mcp_with_progress(spec, arguments, timeout_seconds=scanner_limit, hard_timeout_seconds=hard_remaining)
         else:
             print(f"    [RUNNING ] {tool}: {shared.compact_log_url(action['target_url'])} (scanner limit {scanner_limit:g}s)", flush=True)
-            result = await call_mcp(server, function, arguments, timeout_seconds=scanner_limit)
+            result = await call_mcp(server, function, arguments, timeout_seconds=scanner_limit, hard_timeout_seconds=hard_remaining)
         if state_refresh is not None:
             result['state_refresh'] = state_refresh
         return (action, result)
@@ -2818,52 +3306,40 @@ async def execute_action(action: dict[str, Any], cookies: dict[str, str], discov
             result['state_refresh'] = state_refresh
         return (action, result)
 
-# Orders one sequential round fairly across profile/tool buckets. This does not introduce scanner
-# concurrency or reduce coverage; it prevents a slow capability such as SQLMap from occupying the
-# first several hours of a large round before any faster complementary capability gets a chance.
+# Backward-compatible helper retained for older callers/checkpoint harnesses. In normal Agentic
+# execution the planner's global model-provided priority order is authoritative: Python must not
+# reshuffle selected actions by profile/tool class after the AI has ranked them. Scope, state-change,
+# per-tool resource and wall-clock guards still apply, but they validate/cap rather than choose order.
 def _fair_sequential_action_order(plan: list[dict[str, Any]], cookies: dict[str, str]) -> list[dict[str, Any]]:
-    profile_order = {name: index for index, name in enumerate(cookies)}
-    buckets: dict[tuple[str, str], list[dict[str, Any]]] = {}
-    for action in plan:
-        key = (str(action.get('profile') or ''), str(action.get('tool') or ''))
-        buckets.setdefault(key, []).append(action)
-    keys = sorted(
-        buckets,
-        key=lambda key: (
-            profile_order.get(key[0], 999),
-            shared.tool_execution_rank(key[1], bool(cookies.get(key[0], ''))),
-            key[1],
-        ),
-    )
-    offsets = {key: 0 for key in keys}
-    ordered: list[dict[str, Any]] = []
-    while True:
-        added = False
-        for key in keys:
-            index = offsets[key]
-            bucket = buckets[key]
-            if index >= len(bucket):
-                continue
-            ordered.append(bucket[index])
-            offsets[key] = index + 1
-            added = True
-        if not added:
-            break
-    return ordered
+    del cookies  # compatibility-only parameter; execution order comes from the AI-prioritized plan.
+    return list(plan)
 
 
 # Within each planner round, validated actions run before the model is asked to plan again.
-async def execute_plan(plan: list[dict[str, Any]], cookies: dict[str, str], discovery: dict[str, dict[str, Any]], allow_state_changes: bool | None=None, secondary_cookies: str='', identity_labels: dict[str, str] | None=None) -> list[tuple[dict[str, Any], dict[str, Any]]]:
+async def execute_plan(plan: list[dict[str, Any]], cookies: dict[str, str], discovery: dict[str, dict[str, Any]], allow_state_changes: bool | None=None, secondary_cookies: str='', identity_labels: dict[str, str] | None=None, deadline: float | None=None, on_action_result: Any | None=None) -> list[tuple[dict[str, Any], dict[str, Any]]]:
 
     ordered = _fair_sequential_action_order(plan, cookies)
     total = len(ordered)
     print(f'\n[*] Executing {total} validated action(s) sequentially. Progress heartbeat: every {shared.SCANNER_PROGRESS_INTERVAL}s.', flush=True)
     executed: list[tuple[dict[str, Any], dict[str, Any]]] = []
-    arjun_empty_limits: dict[str, int] = {}
     confirmed_oast_classes: set[tuple[str, str]] = set()
     jwt_result_cache: dict[str, dict[str, Any]] = {}
-    arjun_threshold = 2 if shared.CURRENT_SCAN_MODE == 'deep' else 1
     for index, action in enumerate(ordered, start=1):
+        if deadline is not None and time.monotonic() >= float(deadline):
+            deferred = ordered[index - 1:]
+            print(
+                f'\n[!] Assessment execution wall-clock budget reached after {len(executed)}/{total} action(s); '
+                f'{len(deferred)} remaining action(s) are recorded as time-budget skips so final reporting can proceed.',
+                flush=True,
+            )
+            for pending in deferred:
+                executed.append((pending, {
+                    'tool': pending['tool'], 'status': 'skipped', 'target': pending['target_url'],
+                    'output': 'Assessment wall-clock execution budget was exhausted before this action could start.',
+                    'diagnosis': 'assessment_time_budget_exhausted', 'vulnerabilities': [],
+                    'timed_out': True, 'time_limit_reached': True,
+                }))
+            break
         started = time.monotonic()
         print(f"\n[*] Action {index}/{total}: {action['profile']} / {action['tool']} / {shared.compact_log_url(action['target_url'])}", flush=True)
         try:
@@ -2875,10 +3351,8 @@ async def execute_plan(plan: list[dict[str, Any]], cookies: dict[str, str], disc
                 item = (action, reused)
             elif action['tool'] == 'interactsh' and oast_key in confirmed_oast_classes:
                 item = (action, {'tool': 'interactsh', 'status': 'skipped', 'target': action['target_url'], 'output': 'A callback was already confirmed for the same OAST class in this profile; the duplicate polling wait was omitted.', 'diagnosis': 'duplicate_oast_class_already_confirmed', 'vulnerabilities': []})
-            elif action['tool'] == 'arjun' and arjun_empty_limits.get(action['profile'], 0) >= arjun_threshold:
-                item = (action, {'tool': 'arjun', 'status': 'skipped', 'target': action['target_url'], 'output': 'Adaptive budget reallocation: earlier high-priority Arjun actions reached their full budget without discovering a parameter; this lower-priority repeat was skipped.', 'diagnosis': 'adaptive_budget_reallocated', 'vulnerabilities': []})
             else:
-                item = await execute_action(action, cookies, discovery, allow_state_changes=allow_state_changes, secondary_cookies=secondary_cookies, identity_labels=identity_labels)
+                item = await execute_action(action, cookies, discovery, allow_state_changes=allow_state_changes, secondary_cookies=secondary_cookies, identity_labels=identity_labels, deadline=deadline)
         except Exception as exc:
             message = f'Agent executor isolated failure: {type(exc).__name__}: {exc}'
             item = (action, {'tool': action['tool'], 'status': 'error', 'target': action['target_url'], 'output': message, 'vulnerabilities': [], 'diagnosis': diagnose_error(message), 'traceback': traceback.format_exc()})
@@ -2888,12 +3362,6 @@ async def execute_plan(plan: list[dict[str, Any]], cookies: dict[str, str], disc
             jwt_result_cache[str(action.get('jwt_token') or '')] = copy.deepcopy(result)
         if action['tool'] == 'interactsh' and result.get('callback_confirmed'):
             confirmed_oast_classes.add((action['profile'], str(action.get('oast_class') or 'remote-fetch')))
-        if action['tool'] == 'arjun':
-            found_parameters = shared.safe_int_metadata(result.get('phase_parameters', 0), 0)
-            if str(result.get('diagnosis', '')) in shared.TIME_LIMIT_DIAGNOSES and (not result.get('vulnerabilities')) and (found_parameters == 0):
-                arjun_empty_limits[action['profile']] = arjun_empty_limits.get(action['profile'], 0) + 1
-            elif result.get('diagnosis') != 'adaptive_budget_reallocated':
-                arjun_empty_limits[action['profile']] = 0
         elapsed = time.monotonic() - started
         vulnerabilities = result.get('vulnerabilities', [])
         finding_count = len(vulnerabilities) if isinstance(vulnerabilities, list) else 0
@@ -2901,11 +3369,88 @@ async def execute_plan(plan: list[dict[str, Any]], cookies: dict[str, str], disc
         diagnosis = str(result.get('diagnosis', '') or '')
         diagnosis_text = f'; diagnosis={diagnosis}' if diagnosis else ''
         print(f"    [FINISHED] {action['tool']}: status={status}; findings={finding_count}; elapsed={elapsed:.1f}s{diagnosis_text}", flush=True)
-    print(f'\n[*] Round action execution finished: {total}/{total} action(s).', flush=True)
+        if callable(on_action_result):
+            try:
+                on_action_result(action, result)
+            except Exception as exc:
+                warning = f'Immediate post-action processing failed: {type(exc).__name__}: {exc}'
+                result['post_action_processing_error'] = warning
+                print(f"    [WARNING] {warning}", file=sys.stderr, flush=True)
+    print(f'\n[*] Round action execution finished: {len(executed)}/{total} action result(s) recorded.', flush=True)
     return executed
 
+# Applies discovery-producing scanner output immediately so later actions in the same AI order can
+# consume the expanded graph. This mutates discovery only; result/accounting materialization remains
+# in _record_execution_batch(). Failures are isolated and reported on the scanner result.
+def _apply_discovery_enrichment(action: dict[str, Any], result: dict[str, Any], *, state: AgentState, discovery: dict[str, dict[str, Any]], profile_cookies: dict[str, str], deadline: float | None=None) -> int:
+    profile, tool = (str(action.get('profile') or ''), str(action.get('tool') or '').lower())
+    if tool not in DISCOVERY_ENRICHMENT_TOOLS or result.get('status') not in {'success', 'partial'}:
+        return 0
+    try:
+        if tool == 'ffuf':
+            before = len(discovery.get(profile, {}).get('request_cases', []))
+            enriched, urls = enrich_discovery_with_ffuf(discovery.get(profile, {}), result, state['target'])
+
+            # FFUF is a discovery producer, but its post-action crawl must not inherit the entire
+            # remaining assessment deadline. Otherwise one AI-selected FFUF action could turn into
+            # an hours-long enrichment phase and starve later actions in the model's priority order.
+            # Reuse FFUF's existing configured action timeout as the total post-action enrichment
+            # window; this preserves useful streaming discovery without adding a second magic budget.
+            mode = str(shared.CURRENT_SCAN_MODE or 'balanced').strip().lower()
+            mode_cfg = shared.SCAN_MODES.get(mode) or shared.SCAN_MODES['balanced']
+            balanced_ffuf_timeout = float(shared.SCAN_MODES['balanced']['broad']['ffuf'])
+            try:
+                configured_enrichment_seconds = float((mode_cfg.get('broad') or {}).get('ffuf') or balanced_ffuf_timeout)
+            except (TypeError, ValueError):
+                configured_enrichment_seconds = balanced_ffuf_timeout
+            configured_enrichment_seconds = max(0.0, configured_enrichment_seconds)
+            enrichment_started = time.monotonic()
+            enrichment_deadline = enrichment_started + configured_enrichment_seconds
+            if deadline is not None:
+                enrichment_deadline = min(enrichment_deadline, float(deadline))
+            enrichment_budget_seconds = max(0.0, enrichment_deadline - enrichment_started)
+            result['discovery_enrichment_budget_seconds'] = enrichment_budget_seconds
+            result['discovery_enrichment_budget_source'] = 'configured_ffuf_action_timeout'
+            result['discovery_enrichment_mode'] = mode if mode in shared.SCAN_MODES else 'balanced'
+
+            if enrichment_budget_seconds <= 0.0:
+                result['discovery_enrichment_time_limit_reached'] = True
+                discovery[profile] = enriched
+                return max(0, len(enriched.get('request_cases', [])) - before)
+
+            if urls and time.monotonic() < enrichment_deadline:
+                recrawl = discover_target_sync_safe(
+                    state['target'], profile_cookies.get(profile, ''), seeds=urls,
+                    allow_state_changes=shared.state_changing_tests_allowed(state['target'], state.get('allow_state_changes')),
+                    wall_clock_deadline=enrichment_deadline,
+                )
+                enriched = merge_discovery(enriched, recrawl)
+                print(f"    [DISCOVERY] {profile}: FFUF re-crawl expanded the surface to {len(enriched.get('html_urls', []))} HTML pages and {len(enriched.get('request_cases', []))} request cases.", flush=True)
+            if (
+                profile_cookies.get(profile, '')
+                and enriched.get('authentication_effective') is not False
+                and time.monotonic() < enrichment_deadline
+            ):
+                enriched = shared.authenticate_discovered_sibling_origins(
+                    enriched, state['target'], profile_cookies[profile],
+                    allow_state_changes=shared.state_changing_tests_allowed(state['target'], state.get('allow_state_changes')),
+                    wall_clock_deadline=enrichment_deadline,
+                )
+            if time.monotonic() >= enrichment_deadline:
+                result['discovery_enrichment_time_limit_reached'] = True
+            discovery[profile] = enriched
+            return max(0, len(enriched.get('request_cases', [])) - before)
+        discovery[profile], generated = enrich_discovery_with_arjun(discovery.get(profile, {}), result, action['target_url'])
+        return len(generated)
+    except Exception as exc:
+        message = f'Discovery enrichment failed after {tool}: {type(exc).__name__}: {exc}'
+        result['discovery_enrichment_error'] = message
+        print(f"    [DISCOVERY WARNING] {message}", file=sys.stderr, flush=True)
+        return 0
+
+
 # Records which actions ran and which ones remain available.
-def _record_execution_batch(executed: list[tuple[dict[str, Any], dict[str, Any]]], *, state: AgentState, results: dict[str, dict[str, Any]], discovery: dict[str, dict[str, Any]], completed: list[str], profile_cookies: dict[str, str]) -> int:
+def _record_execution_batch(executed: list[tuple[dict[str, Any], dict[str, Any]]], *, state: AgentState, results: dict[str, dict[str, Any]], discovery: dict[str, dict[str, Any]], completed: list[str], profile_cookies: dict[str, str], apply_discovery_enrichment: bool=True) -> int:
 
     new_attack_surface = 0
     batch_summary: dict[tuple[str, str], dict[str, int]] = {}
@@ -2913,7 +3458,12 @@ def _record_execution_batch(executed: list[tuple[dict[str, Any], dict[str, Any]]
         profile, tool = (action['profile'], action['tool'])
         profile_results = results.setdefault(profile, {})
         number = 1 + sum((key.startswith(f'{tool}:') for key in profile_results))
-        metadata = {key: action[key] for key in ('verification_source_result', 'verification_source_parameter', 'verification_source_path', 'verification_source_url') if key in action}
+        metadata = {key: action[key] for key in (
+            'verification_source_result', 'verification_source_parameter', 'verification_source_path', 'verification_source_url',
+            'final_xss_eligible_total', 'final_xss_selected_total', 'final_xss_deferred_total', 'final_xss_base', 'final_xss_max',
+            'adaptive_final_xss_budget', 'adaptive_final_xss_base', 'adaptive_final_xss_max', 'adaptive_final_xss_threshold',
+            'final_xss_priority_score',
+        ) if key in action}
         coverage_action_target = str(action.get('source_url') or action.get('target_url') or '') if tool == 'interactsh' else str(action.get('target_url') or '')
         coverage_action = {
             'tool': tool,
@@ -2962,20 +3512,10 @@ def _record_execution_batch(executed: list[tuple[dict[str, Any], dict[str, Any]]
             log_result(profile, tool, result, action['target_url'])
         if tool == 'zap':
             log_zap_session_diagnostics(result)
-        if tool == 'ffuf' and result.get('status') in {'success', 'partial'}:
-            before = len(discovery.get(profile, {}).get('request_cases', []))
-            enriched, urls = enrich_discovery_with_ffuf(discovery.get(profile, {}), result, state['target'])
-            if urls:
-                recrawl = discover_target_sync_safe(state['target'], profile_cookies.get(profile, ''), seeds=urls, allow_state_changes=shared.state_changing_tests_allowed(state['target'], state.get('allow_state_changes')))
-                enriched = merge_discovery(enriched, recrawl)
-                print(f"    [DISCOVERY] {profile}: FFUF re-crawl expanded the surface to {len(enriched.get('html_urls', []))} HTML pages and {len(enriched.get('request_cases', []))} request cases.", flush=True)
-            if profile_cookies.get(profile, '') and enriched.get('authentication_effective') is not False:
-                enriched = shared.authenticate_discovered_sibling_origins(enriched, state['target'], profile_cookies[profile], allow_state_changes=shared.state_changing_tests_allowed(state['target'], state.get('allow_state_changes')))
-            discovery[profile] = enriched
-            new_attack_surface += max(0, len(enriched.get('request_cases', [])) - before)
-        if tool == 'arjun' and result.get('status') in {'success', 'partial'}:
-            discovery[profile], generated = enrich_discovery_with_arjun(discovery.get(profile, {}), result, action['target_url'])
-            new_attack_surface += len(generated)
+        if apply_discovery_enrichment:
+            new_attack_surface += _apply_discovery_enrichment(
+                action, result, state=state, discovery=discovery, profile_cookies=profile_cookies,
+            )
 
     if batch_summary:
         print('    [ROUND RESULT SUMMARY] routine zero-finding successes are aggregated; detailed findings/partials/errors are printed above.', flush=True)
@@ -2996,17 +3536,23 @@ def executor_node(state: AgentState) -> dict[str, Any]:
     last_audit = audit[-1] if isinstance(audit, list) and audit and isinstance(audit[-1], dict) else {}
     mode = str(shared.CURRENT_SCAN_MODE or 'balanced')
     reference_cap = int(ROUND_EXECUTION_ACTION_REFERENCE_CAPS.get(mode, len(state['plan'])) or len(state['plan']))
-    adaptive_ceiling = int(ROUND_EXECUTION_ACTION_ADAPTIVE_CEILINGS.get(mode, reference_cap) or reference_cap)
-    # The executor never unlocks the emergency extension by itself: it only honors the active
-    # ceiling already resolved/audited by the planner. Without audit metadata it falls back to the
-    # safer normal reference ceiling.
-    active_ceiling = int(last_audit.get('round_action_active_ceiling_total', reference_cap) or reference_cap)
-    active_ceiling = max(1, min(active_ceiling, max(reference_cap, adaptive_ceiling)))
-    resolved_max = int(last_audit.get('round_action_resolved_max_total', active_ceiling) or active_ceiling)
-    execution_cap = max(1, min(active_ceiling, resolved_max))
-    guarded_plan = _fair_global_action_cap(list(state['plan']), execution_cap)
+    # The executor never chooses or unlocks extra work. It honors the capacity already resolved and
+    # audited by the planner. A missing audit remains conservative (static reference capacity), while
+    # a valid dynamic audit may legitimately exceed that reference so coverage is not re-clamped here.
+    if last_audit:
+        active_ceiling = max(1, int(last_audit.get('round_action_active_ceiling_total', reference_cap) or reference_cap))
+        resolved_max = max(1, int(last_audit.get('round_action_resolved_max_total', active_ceiling) or active_ceiling))
+        execution_cap = max(1, min(active_ceiling, resolved_max, len(state['plan'])))
+    else:
+        active_ceiling = reference_cap
+        resolved_max = reference_cap
+        execution_cap = max(1, min(reference_cap, len(state['plan'])))
+    # Preserve the planner/model priority order even if this defensive final guard ever needs to
+    # truncate. The planner already resolved the resource ceiling; this guard must not choose a
+    # different profile/tool mix.
+    guarded_plan = list(state['plan'])[:execution_cap]
     if len(guarded_plan) != len(state['plan']):
-        print(f"[!] Final round guard reduced plan from {len(state['plan'])} to {len(guarded_plan)} total action(s) (cap={execution_cap}).", flush=True)
+        print(f"[!] Final round guard reduced plan from {len(state['plan'])} to {len(guarded_plan)} total action(s) (cap={execution_cap}) while preserving AI priority order.", flush=True)
     cookies = {profile['name']: profile['cookies'] for profile in state['profiles']}
     identity_labels = {str(profile.get('name') or ''): str(profile.get('identity_ref') or profile.get('name') or '') for profile in state['profiles']}
     results = {profile: dict(values) for profile, values in state['results'].items()}
@@ -3014,16 +3560,28 @@ def executor_node(state: AgentState) -> dict[str, Any]:
     completed = list(state['completed'])
     profile_cookies = {profile['name']: profile['cookies'] for profile in state['profiles']}
     new_attack_surface = 0
-    discovery_stage = [action for action in guarded_plan if action['tool'] == 'ffuf']
-    remaining_stage = [action for action in guarded_plan if action['tool'] != 'ffuf']
-    if discovery_stage:
-        print('\n[*] Discovery enrichment stage: FFUF runs before ZAP/Nuclei.', flush=True)
-        ffuf_executed = asyncio.run(execute_plan(discovery_stage, cookies, discovery, allow_state_changes=state.get('allow_state_changes'), secondary_cookies=state.get('secondary_cookies', ''), identity_labels=identity_labels))
-        new_attack_surface += _record_execution_batch(ffuf_executed, state=state, results=results, discovery=discovery, completed=completed, profile_cookies=profile_cookies)
-        print('[*] FFUF enrichment is available to planned ZAP/Nuclei actions; any new parameter candidates will be available to a later planner round.', flush=True)
-    if remaining_stage:
-        executed = asyncio.run(execute_plan(remaining_stage, cookies, discovery, allow_state_changes=state.get('allow_state_changes'), secondary_cookies=state.get('secondary_cookies', ''), identity_labels=identity_labels))
-        new_attack_surface += _record_execution_batch(executed, state=state, results=results, discovery=discovery, completed=completed, profile_cookies=profile_cookies)
+    execution_deadline = _assessment_execution_deadline(state)
+    if guarded_plan:
+        # Preserve the exact AI priority sequence. Discovery producers are not promoted ahead of
+        # higher-priority work; instead, when FFUF/Arjun naturally completes at its AI-selected
+        # position, merge its output immediately so every later action in the same sequence sees the
+        # freshest graph. This avoids both stale same-round discovery and discovery-stage starvation.
+        def apply_live_enrichment(action: dict[str, Any], result: dict[str, Any]) -> None:
+            nonlocal new_attack_surface
+            new_attack_surface += _apply_discovery_enrichment(
+                action, result, state=state, discovery=discovery, profile_cookies=profile_cookies,
+                deadline=execution_deadline,
+            )
+
+        executed = asyncio.run(execute_plan(
+            guarded_plan, cookies, discovery, allow_state_changes=state.get('allow_state_changes'),
+            secondary_cookies=state.get('secondary_cookies', ''), identity_labels=identity_labels,
+            deadline=execution_deadline, on_action_result=apply_live_enrichment,
+        ))
+        _record_execution_batch(
+            executed, state=state, results=results, discovery=discovery, completed=completed,
+            profile_cookies=profile_cookies, apply_discovery_enrichment=False,
+        )
     next_state = dict(state)
     next_state.update(results=results, discovery=discovery, completed=completed)
     remaining = _remaining_eligible_actions(next_state)
@@ -3033,9 +3591,10 @@ def executor_node(state: AgentState) -> dict[str, Any]:
     # still-unexecuted actions, preserving --max-rounds as an upper bound rather than forcing
     # every configured round.
     feedback_round_due = state['round'] == 1 and state['max_rounds'] >= 2
-    can_continue = state['round'] < state['max_rounds'] and bool(feedback_round_due or new_attack_surface > 0 or remaining)
+    time_exhausted = _assessment_execution_budget_exhausted(state)
+    can_continue = (not time_exhausted) and state['round'] < state['max_rounds'] and bool(feedback_round_due or new_attack_surface > 0 or remaining)
     notes = list(state['notes'])
-    notes.append(f"Round {state['round']} execution: new request contracts={new_attack_surface}; remaining eligible actions={len(remaining)}; feedback round due={feedback_round_due}.")
+    notes.append(f"Round {state['round']} execution: new request contracts={new_attack_surface}; remaining eligible actions={len(remaining)}; feedback round due={feedback_round_due}; wall-clock exhausted={time_exhausted}; remaining seconds={_assessment_remaining_seconds(state):.0f}.")
     audit = [dict(item) for item in state.get('planner_audit', [])]
     if audit and int(audit[-1].get('round', 0) or 0) == state['round']:
         outcome_rows: list[dict[str, Any]] = []
@@ -3106,6 +3665,7 @@ def _final_browser_verification_actions(state: AgentState) -> list[dict[str, Any
                 action = {'profile': profile, 'tool': 'browser', 'target_url': selected['url'], 'method': selected.get('method', 'GET'), 'data': selected.get('data', ''), 'parameters': selected.get('parameters', []), 'jwt_token': '', 'injection_url': '', 'fields': selected.get('fields', []), 'source_url': selected.get('source_url', ''), 'client_sources': selected.get('client_sources', []), 'client_sinks': selected.get('client_sinks', []), 'verification_source_result': str(result_key), 'verification_source_parameter': parameter, 'verification_source_path': finding_path, 'verification_source_url': finding_url, 'reason': f"Final Chromium verification of XSS candidate from {result_key} parameter={parameter or 'n/a'}."}
                 ranked.append((shared.final_xss_verification_priority(finding, selected, context_score), action))
         for chosen in shared.select_adaptive_final_xss_candidates(ranked):
+            # Keep final-XSS eligible/selected/deferred accounting attached to the action for reporting/audit.
             action = dict(chosen)
             if chosen.get('adaptive_final_xss_budget'):
                 action['reason'] = 'Discovery ranking marked this as an adaptive final-XSS candidate; AI still decides execution. ' + str(action.get('reason') or '')
@@ -3152,7 +3712,7 @@ def _reconcile_final_browser_result(results: dict[str, dict[str, Any]], action: 
             finding.update(verification_status='browser-not-reproduced-bounded', confidence='low', browser_final_verification='not_reproduced', browser_confidence_ceiling='low', browser_verification_evidence=f"Chromium completed an exact-parameter bounded check for {parameter or 'the source parameter'} without marker execution or reflection.")
 
 # Runs the final authenticated logout lifecycle check after every other authenticated test.
-async def _final_logout_checks(state: AgentState, results: dict[str, dict[str, Any]]) -> int:
+async def _final_logout_checks(state: AgentState, results: dict[str, dict[str, Any]], *, deadline: float | None = None) -> int:
     executed = 0
     if not shared.state_changing_tests_allowed(state['target'], state.get('allow_state_changes')):
         for profile in state.get('profiles', []):
@@ -3183,19 +3743,27 @@ async def _final_logout_checks(state: AgentState, results: dict[str, dict[str, A
             continue
         probe_url = select_session_probe_url(discovery, state['target'])
         for index, logout_case in enumerate(logout_cases, start=1):
+            if deadline is not None and time.monotonic() >= float(deadline):
+                results.setdefault(name, {})['session_logout_final'] = make_skipped_result(
+                    'session-logout', state['target'],
+                    'Final verification time budget was exhausted before logout lifecycle validation.',
+                )
+                break
             logout_url = str(logout_case.get('url') or '')
             logout_cookies = shared.scope_cookie_header(logout_url, cookies)
             logout_probe = probe_url if shared.same_origin(logout_url, probe_url) else logout_url
             print(f'    [RUNNING ] session-logout: {shared.compact_log_url(logout_url)}', flush=True)
+            logout_remaining = 30.0 if deadline is None else max(1.0, float(deadline) - time.monotonic())
+            logout_scanner_timeout = max(1, min(25, int(logout_remaining)))
             result = await call_mcp(
                 'custom_checks/sessionServer.py', 'run_logout_check',
                 {
                     'target_url': state['target'], 'logout_url': logout_url, 'cookies': logout_cookies,
                     'probe_url': logout_probe, 'method': str(logout_case.get('method') or 'GET'),
-                    'data': str(logout_case.get('data') or ''), 'timeout': 25, 'request_rate': shared.MAX_REQUEST_RATE,
+                    'data': str(logout_case.get('data') or ''), 'timeout': logout_scanner_timeout, 'request_rate': shared.MAX_REQUEST_RATE,
                     'allow_state_changes': True,
                 },
-                timeout_seconds=30,
+                timeout_seconds=min(30.0, logout_remaining), hard_timeout_seconds=logout_remaining,
             )
             result['coverage_action'] = {
                 'tool': 'session-logout',
@@ -3230,18 +3798,42 @@ def verification_node(state: AgentState) -> dict[str, Any]:
 
     actions = _final_browser_verification_actions(state)
     notes = list(state.get('notes', []))
+    verification_selection_summary: dict[str, list[dict[str, Any]]] = {}
+    for action in actions:
+        profile_name = str(action.get('profile') or '')
+        row = {
+            'source_result': str(action.get('verification_source_result') or ''),
+            'method': str(action.get('method') or 'GET').upper(),
+            'url': str(action.get('target_url') or ''),
+            'parameters': [str(value) for value in action.get('parameters', []) if str(value)],
+        }
+        for accounting_key in (
+            'final_xss_eligible_total', 'final_xss_selected_total', 'final_xss_deferred_total',
+            'final_xss_base', 'final_xss_max', 'adaptive_final_xss_budget', 'adaptive_final_xss_base',
+            'adaptive_final_xss_max', 'adaptive_final_xss_threshold', 'final_xss_priority_score',
+        ):
+            if accounting_key in action:
+                row[accounting_key] = action[accounting_key]
+        verification_selection_summary.setdefault(profile_name, []).append(row)
     cookies = {profile['name']: profile['cookies'] for profile in state['profiles']}
     profile_cookies = dict(cookies)
     results = {profile: dict(values) for profile, values in state['results'].items()}
     discovery = {profile: dict(values) for profile, values in state['discovery'].items()}
     completed = list(state['completed'])
+    verification_deadline = _assessment_verification_deadline(state)
+    verification_started = time.monotonic()
+    verification_window = max(0.0, verification_deadline - verification_started)
+    safe_surface_deadline = min(
+        verification_deadline,
+        verification_started + verification_window * SAFE_SURFACE_FINALIZATION_SHARE,
+    )
 
     print('\n[*] Completion-driven safe surface sweep: replaying still-untested reachable non-destructive contexts.', flush=True)
     for profile in state['profiles']:
         profile_name = str(profile.get('name') or '')
         sweep = shared.run_safe_surface_sweep(
             state['target'], discovery.get(profile_name, {}), results.get(profile_name, {}),
-            str(profile.get('cookies') or ''),
+            str(profile.get('cookies') or ''), deadline=safe_surface_deadline,
         )
         results.setdefault(profile_name, {})['safe_surface_completion'] = sweep
         notes.append(
@@ -3263,7 +3855,11 @@ def verification_node(state: AgentState) -> dict[str, Any]:
         )
         print(f'\n[*] Final verification: validating {len(actions)} XSS candidate(s) with Chromium; per-profile={counts_text}.', flush=True)
         before_keys = {profile: set(values) for profile, values in results.items()}
-        executed = asyncio.run(execute_plan(actions, cookies, discovery, allow_state_changes=state.get('allow_state_changes'), secondary_cookies=state.get('secondary_cookies', ''), identity_labels={str(profile.get('name') or ''): str(profile.get('identity_ref') or profile.get('name') or '') for profile in state['profiles']}))
+        if time.monotonic() >= verification_deadline:
+            executed = []
+            notes.append('Final verification: verification-stage wall-clock budget was exhausted before Chromium validation.')
+        else:
+            executed = asyncio.run(execute_plan(actions, cookies, discovery, allow_state_changes=state.get('allow_state_changes'), secondary_cookies=state.get('secondary_cookies', ''), identity_labels={str(profile.get('name') or ''): str(profile.get('identity_ref') or profile.get('name') or '') for profile in state['profiles']}, deadline=verification_deadline))
         for action, browser_result in executed:
             _reconcile_final_browser_result(results, action, browser_result)
         _record_execution_batch(executed, state=state, results=results, discovery=discovery, completed=completed, profile_cookies=profile_cookies)
@@ -3274,9 +3870,12 @@ def verification_node(state: AgentState) -> dict[str, Any]:
         notes.append(f'Final verification: Chromium executed {len(executed)} candidate validation action(s).')
 
     print('\n[*] Final session lifecycle: validating discovered authenticated logout endpoint(s).', flush=True)
-    logout_executed = asyncio.run(_final_logout_checks({**state, 'discovery': discovery}, results))
+    logout_executed = asyncio.run(_final_logout_checks({**state, 'discovery': discovery}, results, deadline=verification_deadline))
     notes.append(f'Final session lifecycle: executed {logout_executed} authenticated logout validation action(s); anonymous profiles were excluded.')
-    return {'results': results, 'discovery': discovery, 'completed': completed, 'verification_done': True, 'notes': notes}
+    return {
+        'results': results, 'discovery': discovery, 'completed': completed, 'verification_done': True,
+        'verification_selection_summary': verification_selection_summary, 'notes': notes,
+    }
 
 # Decides whether the agent should plan again or enter final deterministic verification.
 def route_after_execution(state: AgentState) -> Literal['planner', 'verification']:
@@ -3314,6 +3913,7 @@ def report_node(state: AgentState) -> dict[str, Any]:
         'strict_ai_required': state.get('require_ai', False),
         'planner_source': state.get('planner_source', 'unknown'),
         'planner_audit': state.get('planner_audit', []),
+        'verification_selection': state.get('verification_selection_summary', {}),
         'ai_analysis': state.get('analysis', {}),
         'scan_mode': shared.CURRENT_SCAN_MODE,
         'request_rate_policy': shared.runtime_request_rate_policy(),
@@ -3337,7 +3937,23 @@ def report_node(state: AgentState) -> dict[str, Any]:
             if bool(profile.get('cookies')) and _profile_has_effective_auth(state, str(profile.get('name') or ''))
         ) >= 2,
         'orchestration': {'engine': 'langgraph', 'mode': 'agentic', 'nodes': ['discovery', 'planner', 'executor', 'verification', 'analysis', 'report']}}
-    report = asyncio.run(call_mcp('reporting/reportServer.py', 'generate_report', {'findings_summary': report_results, 'target_url': state['target'], 'output_name': output_name, 'assessment_context': context}))
+    report_deadline = _assessment_deadline(state)
+    report_emergency_reserve = 120.0
+    report_remaining = max(0.0, report_deadline - time.monotonic())
+    if report_remaining <= report_emergency_reserve + 5.0:
+        report = {
+            'tool': 'report', 'status': 'error', 'target': state['target'],
+            'diagnosis': 'assessment_time_budget_exhausted',
+            'output': 'The assessment wall-clock budget left insufficient time for MCP report rendering; emergency artifact recovery was used instead.',
+            'vulnerabilities': [],
+        }
+    else:
+        report_hard_timeout = max(5.0, report_remaining - report_emergency_reserve)
+        report = asyncio.run(call_mcp(
+            'reporting/reportServer.py', 'generate_report',
+            {'findings_summary': report_results, 'target_url': state['target'], 'output_name': output_name, 'assessment_context': context},
+            hard_timeout_seconds=report_hard_timeout,
+        ))
     if report.get('status') != 'success':
         if not any((report.get('json_filename'), report.get('html_filename'), report.get('pdf_filename'), report.get('review_snapshot_filename'))):
             report = shared.recover_normal_report_artifacts(output_name, report)

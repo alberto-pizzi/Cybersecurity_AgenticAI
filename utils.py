@@ -66,6 +66,49 @@ def safe_float_value(value: Any, default: float = 0.0) -> float:
     return number if math.isfinite(number) else float(default)
 
 
+def deadline_bounded_request_timeout(
+    configured_timeout: Any, deadline: float, *, connect_ratio: float = 0.25, minimum_component: float = 0.01,
+) -> tuple[float, float]:
+    """Return Requests connect/read timeouts whose combined allowance fits the remaining deadline.
+
+    Requests interprets a scalar or a ``(connect, read)`` tuple as independent socket phase
+    timeouts, not as one wall-clock total.  When a scanner already owns a monotonic deadline,
+    allowing each component to equal the whole remaining budget can approximately double the
+    intended phase allowance on a slow connection.  This helper preserves configured component
+    caps while splitting the currently remaining budget between connect and read.
+    """
+    left = float(deadline) - time.monotonic()
+    if left <= 0:
+        raise requests.Timeout("shared scanner deadline reached")
+
+    floor = max(0.001, min(float(minimum_component), left / 2.0))
+    if isinstance(configured_timeout, tuple) and len(configured_timeout) == 2:
+        connect_cap = max(floor, safe_float_value(configured_timeout[0], left))
+        read_cap = max(floor, safe_float_value(configured_timeout[1], left))
+        total_cap = connect_cap + read_cap
+        preferred_ratio = connect_cap / total_cap if total_cap > 0 else 0.25
+    elif configured_timeout is None:
+        connect_cap = read_cap = left
+        preferred_ratio = max(0.05, min(float(connect_ratio), 0.95))
+    else:
+        cap = max(floor, safe_float_value(configured_timeout, left))
+        connect_cap = read_cap = cap
+        preferred_ratio = max(0.05, min(float(connect_ratio), 0.95))
+
+    if connect_cap + read_cap <= left:
+        return float(connect_cap), float(read_cap)
+
+    connect_timeout = min(connect_cap, max(floor, left * preferred_ratio))
+    read_timeout = min(read_cap, max(floor, left - connect_timeout))
+
+    # Tiny floating-point/floor corrections must never inflate the pair beyond ``left``.
+    if connect_timeout + read_timeout > left:
+        read_timeout = max(0.001, left - connect_timeout)
+    if connect_timeout + read_timeout > left:
+        connect_timeout = max(0.001, left - read_timeout)
+    return float(connect_timeout), float(read_timeout)
+
+
 def safe_bool_value(value: Any, default: bool = False) -> bool:
     """Normalize bool-like scanner metadata without truthiness surprises."""
     if isinstance(value, bool):
@@ -192,6 +235,148 @@ def request_contract_state_change_reason(case: dict[str, Any]) -> str:
         return "state-changing POST route"
 
     query_pairs = [(str(name).lower(), str(value).lower()) for name, value in parse_qsl(parsed.query, keep_blank_values=True)]
+    content_type = str(case.get("content_type") or case.get("enctype") or "").lower()
+
+    def graphql_document_kind(value: str) -> str:
+        """Classify top-level GraphQL operation definitions without mistaking fields/names for them."""
+        text = str(value or "")
+        n = len(text)
+        i = 0
+        operation_types: list[str] = []
+        saw_fragment = False
+
+        def skip_ignored(pos: int) -> int:
+            while pos < n:
+                if text[pos].isspace() or text[pos] == ",":
+                    pos += 1
+                    continue
+                if text[pos] == "#":
+                    newline = text.find("\n", pos + 1)
+                    pos = n if newline < 0 else newline + 1
+                    continue
+                break
+            return pos
+
+        def read_name(pos: int) -> tuple[str, int]:
+            if pos >= n or not (text[pos].isalpha() or text[pos] == "_"):
+                return "", pos
+            end = pos + 1
+            while end < n and (text[end].isalnum() or text[end] == "_"):
+                end += 1
+            return text[pos:end], end
+
+        def skip_string(pos: int) -> int:
+            # GraphQL supports ordinary quoted strings and triple-quoted block strings. Braces and
+            # operation keywords inside either form are data, not document structure.
+            if text.startswith('"""', pos):
+                end = text.find('"""', pos + 3)
+                return n if end < 0 else end + 3
+            pos += 1
+            while pos < n:
+                if text[pos] == "\\":
+                    pos += 2
+                    continue
+                if text[pos] == '"':
+                    return pos + 1
+                pos += 1
+            return n
+
+        def skip_selection_set(pos: int) -> int:
+            depth = 0
+            while pos < n:
+                ch = text[pos]
+                if ch == '"':
+                    pos = skip_string(pos)
+                    continue
+                if ch == "#":
+                    pos = skip_ignored(pos)
+                    continue
+                if ch == "{":
+                    depth += 1
+                elif ch == "}":
+                    depth -= 1
+                    if depth <= 0:
+                        return pos + 1
+                pos += 1
+            return n
+
+        def find_selection_set(pos: int) -> int:
+            paren = bracket = object_depth = 0
+            while pos < n:
+                ch = text[pos]
+                if ch == '"':
+                    pos = skip_string(pos)
+                    continue
+                if ch == "#":
+                    pos = skip_ignored(pos)
+                    continue
+                if ch == "(":
+                    paren += 1
+                elif ch == ")" and paren:
+                    paren -= 1
+                elif ch == "[":
+                    bracket += 1
+                elif ch == "]" and bracket:
+                    bracket -= 1
+                elif ch == "{":
+                    if paren or bracket or object_depth:
+                        object_depth += 1
+                    else:
+                        return pos
+                elif ch == "}" and object_depth:
+                    object_depth -= 1
+                pos += 1
+            return -1
+
+        while True:
+            i = skip_ignored(i)
+            if i >= n:
+                break
+            if text[i] == "{":
+                operation_types.append("query")  # shorthand query operation
+                i = skip_selection_set(i)
+                continue
+            word, after_word = read_name(i)
+            if not word:
+                break
+            kind = word.lower()
+            if kind not in {"query", "mutation", "subscription", "fragment"}:
+                # A non-definition token at document level means this is not confidently parseable
+                # as GraphQL; the caller will keep a GraphQL route/content-type fail-closed.
+                break
+            selection = find_selection_set(after_word)
+            if selection < 0:
+                # A bare word such as ordinary search text `query=mutation` is not a GraphQL
+                # operation definition unless it actually owns a selection set.
+                break
+            if kind in {"query", "mutation", "subscription"}:
+                operation_types.append(kind)
+            else:
+                saw_fragment = True
+            i = skip_selection_set(selection)
+
+        if any(kind == "mutation" for kind in operation_types):
+            return "mutation"
+        if any(kind == "subscription" for kind in operation_types):
+            return "subscription"
+        if operation_types and all(kind == "query" for kind in operation_types):
+            return "query"
+        if saw_fragment:
+            return "fragment"
+        return ""
+
+    # GraphQL-over-HTTP normally rejects mutations sent with GET, but the central safety gate must
+    # not rely on the target being standards-compliant. Detect an actual GraphQL document in the
+    # URL before the generic GET early-return, while leaving ordinary ?query=search-text untouched.
+    url_graphql_values = [
+        value for name, value in query_pairs
+        if name == "query" or re.split(r"[.\[]", name)[-1].rstrip("]") == "query"
+    ]
+    url_graphql = str(url_graphql_values[-1] if url_graphql_values else "").strip()
+    url_graphql_kind = graphql_document_kind(url_graphql)
+    if method in {"GET", "HEAD", "OPTIONS"} and url_graphql_kind in {"mutation", "subscription"}:
+        return "state-changing GraphQL operation"
+
     # Only controller/action selectors make their *value* part of the current operation. Navigation
     # parameters (next/redirect/url/path/target/...) are deliberately not included: they do not by
     # themselves mutate the current request, and any resulting redirect is checked before following.
@@ -233,7 +418,6 @@ def request_contract_state_change_reason(case: dict[str, Any]) -> str:
         return f"HTTP method {method or 'UNKNOWN'} not proven read-only"
 
     file_parameters = {str(value).strip().lower() for value in case.get("file_parameters", []) if str(value).strip()}
-    content_type = str(case.get("content_type") or case.get("enctype") or "").lower()
     if file_parameters or "multipart/form-data" in content_type:
         return "file-upload POST contract"
 
@@ -278,19 +462,28 @@ def request_contract_state_change_reason(case: dict[str, Any]) -> str:
             if override and override not in {"GET", "HEAD", "OPTIONS"}:
                 return f"state-changing POST method override: {override}"
 
-    # GraphQL operation type is stronger evidence than variable names. A query may legitimately
-    # validate a proposed password/update object without persisting it; mutation/subscription remains
-    # blocked. This check therefore precedes generic mutating-field heuristics.
-    if "graphql" in path or any(name in {"query", "operationname", "variables"} for name in names):
-        if isinstance(payload, dict):
-            graphql = str(payload.get("query") or "").strip()
-        else:
-            graphql_values = [value for name, value in pairs if name == "query"]
-            graphql = str(graphql_values[-1] if graphql_values else raw_data).strip()
-        lowered = re.sub(r"^\s*(?:#[^\n]*\s*)*", "", graphql, flags=re.M).lower()
-        if lowered.startswith("query") or lowered.startswith("{"):
+    # GraphQL operation type is stronger evidence than variable names, but a generic form/API field
+    # named ``query`` is extremely common and must not by itself reclassify an ordinary read-only
+    # search endpoint as GraphQL. Treat the request as GraphQL only when the route/content type says
+    # so, or when a JSON/form ``query`` value actually looks like a GraphQL document. This preserves
+    # safe POST /search and POST /query coverage while still blocking mutation/subscription traffic.
+    graphql_values = [value for name, value in pairs if name == "query" or re.split(r"[.\[]", name)[-1].rstrip("]") == "query"]
+    if isinstance(payload, dict):
+        graphql = str(payload.get("query") or "").strip()
+    elif graphql_values:
+        graphql = str(graphql_values[-1]).strip()
+    elif raw_data and ("graphql" in path or "graphql" in content_type):
+        # application/graphql (and some GraphQL endpoints without an explicit content type) carry
+        # the GraphQL document directly in the POST body rather than in a form/JSON `query` field.
+        graphql = raw_data.strip()
+    else:
+        graphql = ""
+    graphql_kind = graphql_document_kind(graphql)
+    graphql_request = bool("graphql" in path or "graphql" in content_type or graphql_kind)
+    if graphql_request:
+        if graphql_kind == "query":
             return ""
-        if lowered.startswith("mutation") or lowered.startswith("subscription") or re.search(r"\b(?:mutation|subscription)\b", lowered):
+        if graphql_kind in {"mutation", "subscription"}:
             return "state-changing GraphQL operation"
         return "POST contract not proven read-only while state changes are disabled"
 
@@ -724,7 +917,7 @@ def runtime_container_route(target: str, scanner_container: str = "") -> dict[st
 
 
 # Applies target-specific preparation requests before a scanner starts.
-def apply_runtime_target_preparation(target: str, cookies: str, *, allow_state_changes: bool = False) -> dict[str, Any]:
+def apply_runtime_target_preparation(target: str, cookies: str, *, allow_state_changes: bool = False, deadline: float | None = None) -> dict[str, Any]:
 
 
     profile = target_runtime_profile(target)
@@ -742,6 +935,11 @@ def apply_runtime_target_preparation(target: str, cookies: str, *, allow_state_c
     conclusive = True
     transient_errors: list[str] = []
     for item in requests_spec[:8]:
+        if deadline is not None and time.monotonic() >= float(deadline):
+            conclusive = False
+            transient_errors.append("Timeout: shared preparation deadline reached")
+            outcomes.append({"skipped": True, "diagnosis": "assessment_time_budget_exhausted", "reason": "shared preparation deadline reached"})
+            break
         if not isinstance(item, dict):
             continue
         method = str(item.get("method") or "GET").upper()
@@ -773,7 +971,7 @@ def apply_runtime_target_preparation(target: str, cookies: str, *, allow_state_c
         try:
             response = request_same_origin_redirects(
                 method, url, session=session, data=request_data if method == "POST" else None,
-                timeout=(4, 15), allow_state_changes=bool(allow_state_changes),
+                timeout=(4, 15), deadline=deadline, allow_state_changes=bool(allow_state_changes),
             )
             accepted = item.get("accepted_statuses", [200, 204, 302])
             accepted_set = {int(value) for value in accepted if str(value).isdigit()}
@@ -823,13 +1021,7 @@ def request_with_retries(
                 if left <= 0:
                     errors.append("Timeout: shared scanner deadline reached")
                     break
-                configured = kwargs.get("timeout")
-                if isinstance(configured, tuple) and len(configured) == 2:
-                    kwargs["timeout"] = (min(float(configured[0]), left), min(float(configured[1]), left))
-                elif configured is not None:
-                    kwargs["timeout"] = min(float(configured), left)
-                else:
-                    kwargs["timeout"] = left
+                kwargs["timeout"] = deadline_bounded_request_timeout(kwargs.get("timeout"), float(deadline))
             if kwargs.get("allow_redirects"):
                 return request_same_origin_redirects(method, url, pacer=active_pacer, deadline=deadline, allow_state_changes=allow_state_changes, **kwargs), errors
             # Scanner helpers never inherit Requests' method-dependent redirect defaults. A caller
@@ -870,6 +1062,7 @@ def scanner_session_probe(
     pacer: RequestRatePacer | None = None,
     request_rate: Any = _REQUEST_RATE_UNSET,
     deadline: float | None = None,
+    allow_tls_trust_retry: bool = False,
 ) -> dict[str, Any]:
 
 
@@ -894,6 +1087,7 @@ def scanner_session_probe(
         request_rate=request_rate,
         deadline=deadline,
         allow_state_changes=False,
+        allow_tls_trust_retry=bool(allow_tls_trust_retry),
     )
     if response is None:
         return {
@@ -1007,7 +1201,8 @@ def exact_origin_url_regex(url: str) -> str:
 def request_same_origin_redirects(
     method: str, url: str, *, max_redirects: int = 5, session: requests.Session | None = None,
     pacer: RequestRatePacer | None = None, request_rate: Any = _REQUEST_RATE_UNSET,
-    deadline: float | None = None, allow_state_changes: bool = False, **kwargs: Any,
+    deadline: float | None = None, allow_state_changes: bool = False,
+    allow_tls_trust_retry: bool = False, **kwargs: Any,
 ) -> requests.Response:
     """Send one HTTP request and follow redirects only while they remain on the starting origin.
 
@@ -1022,6 +1217,16 @@ def request_same_origin_redirects(
     configured_timeout = kwargs.get('timeout')
     response: requests.Response | None = None
     active_pacer = pacer or RequestRatePacer(request_rate)
+    tls_trust_override = False
+
+    def _certificate_trust_error(exc: BaseException) -> bool:
+        message = str(exc or '').lower()
+        return any(token in message for token in (
+            'certificate verify failed', 'self signed certificate', 'self-signed certificate',
+            'unable to get local issuer certificate', 'unable to verify the first certificate',
+            'hostname mismatch', 'certificate has expired', 'certificate is not yet valid',
+        ))
+
     for _ in range(max(0, int(max_redirects)) + 1):
         requester = session.request if session is not None else requests.request
         if deadline is not None and float(deadline) - time.monotonic() <= 0:
@@ -1038,13 +1243,33 @@ def request_same_origin_redirects(
             left = float(deadline) - time.monotonic()
             if left <= 0:
                 raise requests.Timeout("shared scanner deadline reached")
-            if isinstance(configured_timeout, tuple) and len(configured_timeout) == 2:
-                kwargs['timeout'] = (min(float(configured_timeout[0]), left), min(float(configured_timeout[1]), left))
-            elif configured_timeout is not None:
-                kwargs['timeout'] = min(float(configured_timeout), left)
-            else:
-                kwargs['timeout'] = left
-        response = requester(method, current, allow_redirects=False, **kwargs)
+            kwargs['timeout'] = deadline_bounded_request_timeout(configured_timeout, float(deadline))
+        request_kwargs = dict(kwargs)
+        if tls_trust_override:
+            request_kwargs['verify'] = False
+        try:
+            response = requester(method, current, allow_redirects=False, **request_kwargs)
+        except requests.exceptions.SSLError as exc:
+            # When an explicitly authorized caller opts in, retry the exact same origin after a
+            # certificate trust failure. Protocol/cipher/handshake errors are never bypassed.
+            if (
+                not allow_tls_trust_retry
+                or tls_trust_override
+                or request_kwargs.get('verify') is False
+                or not _certificate_trust_error(exc)
+            ):
+                raise
+            active_pacer.wait()
+            if deadline is not None:
+                left = float(deadline) - time.monotonic()
+                if left <= 0:
+                    raise requests.Timeout("shared scanner deadline reached") from exc
+                request_kwargs['timeout'] = deadline_bounded_request_timeout(configured_timeout, float(deadline))
+            request_kwargs['verify'] = False
+            response = requester(method, current, allow_redirects=False, **request_kwargs)
+            tls_trust_override = True
+        if tls_trust_override:
+            response.headers['X-SecOps-TLS-Trust-Retry'] = 'authorized-origin-certificate-trust-only'
         if response.status_code not in {301, 302, 303, 307, 308}:
             return response
         location = str(response.headers.get('Location') or '').strip()

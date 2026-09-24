@@ -12,7 +12,7 @@ import orchestratorDeterministic as deterministic_core
 import orchestratorAgenticCore as agentic_core
 from assessmentConfig import default_max_rounds
 from orchestratorAgenticCore import (
-    AgentState, AI_PLANNER_TIMEOUTS, SNAP4CITY_DEFAULT_API_URL, resolve_ai_model,
+    AgentState, AI_PLANNER_TIMEOUTS, AI_PLANNER_WORKFLOW_TIMEOUTS, AI_ANALYSIS_STAGE_TIMEOUTS, SNAP4CITY_DEFAULT_API_URL, resolve_ai_model, assessment_wall_clock_budget_seconds,
     ensure_ollama_model, warm_ollama_model, ensure_snap4city_model,
     discovery_node, planner_node, executor_node, verification_node, analysis_node, report_node, route_after_execution,
     execute_action, execute_plan, validate_plan,
@@ -112,6 +112,9 @@ def main() -> int:
     )
     args = parser.parse_args()
 
+    if args.ai_timeout < 0:
+        parser.error('--ai-timeout must be 0 (mode default) or a positive number of seconds.')
+
     if not args.max_rounds:
         args.max_rounds = default_max_rounds(args.mode)
 
@@ -134,12 +137,20 @@ def main() -> int:
     globals()["CURRENT_SCAN_MODE"] = deterministic_core.CURRENT_SCAN_MODE
     globals()["ARJUN_TIMEOUT"] = deterministic_core.ARJUN_TIMEOUT
 
+    workflow_started_monotonic = time.monotonic()
+    wall_clock_budget_seconds = assessment_wall_clock_budget_seconds(args.mode)
+
     checks = run_preflight_checks(include_live=True)
     errors = print_preflight_report(checks, show_ok=args.preflight_only)
     if args.preflight_only:
         return 0 if not errors else 3
     if errors and not args.ignore_preflight_errors:
         return 3
+
+    print(
+        f"[*] Agentic wall-clock budget: {wall_clock_budget_seconds / 3600:.2f}h total "
+        f"(mode={args.mode}, including preflight/model preparation); finalization time is reserved automatically."
+    )
 
     target, profiles, _, secondary_cookie, injection = (
         prepare_cli_context(parser, args)
@@ -151,6 +162,15 @@ def main() -> int:
     if discovery_seeds:
         print(f"[*] Priority discovery seeds: {len(discovery_seeds)} URL(s) will be explored under normal discovery limits.")
     planner_timeout = args.ai_timeout or AI_PLANNER_TIMEOUTS[args.mode]
+    planner_workflow_timeout = AI_PLANNER_WORKFLOW_TIMEOUTS[args.mode]
+    print(
+        f"[*] AI planner control-plane limits: <= {planner_timeout}s per round; "
+        f"<= {planner_workflow_timeout}s cumulative across this assessment profile."
+    )
+    print(
+        f"[*] AI final-analysis control-plane limit: <= {AI_ANALYSIS_STAGE_TIMEOUTS[args.mode]}s "
+        f"aggregate for the complete post-scan analysis stage."
+    )
     selected_provider, requested_model, selection_diagnostics = resolve_ai_model(args.model)
     print(
         f"[*] AI selection: provider={selected_provider}; model={requested_model}; "
@@ -173,6 +193,7 @@ def main() -> int:
                 args.ollama_url,
                 requested_model,
                 allow_pull=not args.no_model_pull,
+                pull_timeout=planner_timeout,
             )
             print(
                 f"[*] Ollama ready: version={ai_diagnostics.get('ollama_version', 'unknown')}; "
@@ -255,7 +276,10 @@ def main() -> int:
         "planner_audit": [],
         "analysis": {},
         "verification_done": False,
+        "verification_selection_summary": {},
         "only_tool": args.only_tool,
+        "started_monotonic": workflow_started_monotonic,
+        "wall_clock_budget_seconds": wall_clock_budget_seconds,
     }
     started = time.time()
     try:

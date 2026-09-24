@@ -185,6 +185,40 @@ def _context_summary_html(context: dict[str, Any], toc: list[tuple[int, str, str
         if counts:
             rows.append(("Discovered surface", _esc(" | ".join(counts))))
 
+        fingerprints = data.get("origin_fingerprints") if isinstance(data.get("origin_fingerprints"), list) else []
+        if fingerprints:
+            fingerprint_parts = []
+            for item in fingerprints[:24]:
+                if not isinstance(item, dict):
+                    continue
+                origin = str(item.get("origin") or "unknown")
+                service_class = str(item.get("service_class") or "unknown")
+                status = safe_int_value(item.get("status"), 0)
+                server = str(item.get("server") or "").strip()
+                content_type = str(item.get("content_type") or "").split(";", 1)[0].strip()
+                title = str(item.get("title") or "").strip()[:80]
+                details = [service_class, f"HTTP {status}" if status else "status unknown"]
+                if server:
+                    details.append(f"Server={server[:60]}")
+                if content_type:
+                    details.append(content_type[:60])
+                if title:
+                    details.append(f"title={title}")
+                fingerprint_parts.append(f"{origin} [{'; '.join(details)}]")
+            if fingerprint_parts:
+                suffix = f" | +{len(fingerprints) - len(fingerprint_parts)} more" if len(fingerprints) > len(fingerprint_parts) else ""
+                rows.append(("Runtime origin fingerprints", _esc(" | ".join(fingerprint_parts) + suffix)))
+
+        service_discoveries = data.get("same_host_service_discoveries") if isinstance(data.get("same_host_service_discoveries"), list) else []
+        inventory_rows = []
+        for discovery_item in service_discoveries:
+            if isinstance(discovery_item, dict):
+                inventory_rows.extend(row for row in (discovery_item.get("service_inventory") or []) if isinstance(row, dict))
+        if inventory_rows:
+            web_count = sum(not safe_bool_value(row.get("inventory_only"), False) for row in inventory_rows)
+            inventory_only = sum(safe_bool_value(row.get("inventory_only"), False) for row in inventory_rows)
+            rows.append(("Runtime service inventory", _esc(f"classified web services {web_count}; non-HTTP/unconfirmed inventory-only services {inventory_only}; inventory-only entries are not counted as failed web coverage")))
+
         budget = data.get("budget_diagnostics") if isinstance(data.get("budget_diagnostics"), dict) else {}
         if budget:
             http_base = safe_int_value(budget.get("http_page_budget"), 0)
