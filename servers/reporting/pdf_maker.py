@@ -34,6 +34,19 @@ def html2pdf(html_path, pdf_path, *, timeout_seconds: int | float | None = None)
             )
         return remaining
 
+    # A shared deadline avoids timeout multiplication, but a single hung renderer must not consume
+    # the whole allowance and starve every fallback. Reserve a bounded tail for later renderers.
+    fallback_reserve = min(300.0, max(120.0, float(effective_timeout) * 0.20))
+    chromium_reserve = min(180.0, max(60.0, float(effective_timeout) * 0.10))
+
+    def stage_timeout(*, reserve_after: float = 0.0, ceiling: float | None = None) -> float:
+        remaining = remaining_budget()
+        reserve = min(max(0.0, float(reserve_after)), max(0.0, remaining - 1.0))
+        budget = max(1.0, remaining - reserve)
+        if ceiling is not None:
+            budget = min(budget, max(1.0, float(ceiling)))
+        return budget
+
     def chromium_fallback(previous_error: Exception | str) -> None:
         temporary_pdf.unlink(missing_ok=True)
         try:
@@ -93,7 +106,7 @@ def html2pdf(html_path, pdf_path, *, timeout_seconds: int | float | None = None)
                 text=True,
                 encoding="utf-8",
                 errors="replace",
-                timeout=remaining_budget(),
+                timeout=stage_timeout(reserve_after=fallback_reserve),
                 check=False,
             )
         except subprocess.TimeoutExpired as exc:
@@ -116,7 +129,7 @@ def html2pdf(html_path, pdf_path, *, timeout_seconds: int | float | None = None)
     # Keep Docker readiness probing proportional to the active render budget. In TEST the
     # conversion itself is bounded, so a fixed 60s image inspection would consume a disproportionate
     # fraction of the smoke-test report allowance before rendering even starts.
-    inspect_timeout = max(1.0, min(60.0, remaining_budget() * 0.20))
+    inspect_timeout = max(1.0, min(60.0, stage_timeout(reserve_after=chromium_reserve) * 0.20))
     try:
         inspect = subprocess.run(
             [docker, "image", "inspect", image],
@@ -160,7 +173,7 @@ def html2pdf(html_path, pdf_path, *, timeout_seconds: int | float | None = None)
             text=True,
             encoding="utf-8",
             errors="replace",
-            timeout=remaining_budget(),
+            timeout=stage_timeout(reserve_after=chromium_reserve),
             check=False,
         )
     except subprocess.TimeoutExpired as exc:

@@ -225,17 +225,21 @@ AGENTIC_WALL_CLOCK_BUDGETS = {
 # Reserve enough time for bounded verification/analysis/report generation. New specialist actions
 # are not started once only this reserve remains.
 AGENTIC_FINALIZATION_RESERVE_SECONDS = {
-    'test': 4 * 60,
-    'fast': 12 * 60,
-    'balanced': 25 * 60,
-    'deep': 35 * 60,
+    # Preserve the previous verification/analysis headroom while guaranteeing enough time for
+    # report transfer + PDF conversion near the hard assessment deadline.
+    'test': 15 * 60,
+    'fast': 25 * 60,
+    'balanced': 40 * 60,
+    'deep': 55 * 60,
 }
 
 
 # Finalization sub-reserves stay inside the hard wall-clock ceiling. They prevent
 # completion sweeps or AI narrative work from starving report generation.
 AGENTIC_REPORT_RESERVE_SECONDS = {
-    'test': 2 * 60, 'fast': 5 * 60, 'balanced': 10 * 60, 'deep': 15 * 60,
+    # The report node keeps a separate 120s emergency-artifact reserve. These values therefore
+    # guarantee roughly 11/16/23/33 minutes of normal MCP reporting time at the final boundary.
+    'test': 13 * 60, 'fast': 18 * 60, 'balanced': 25 * 60, 'deep': 35 * 60,
 }
 AGENTIC_ANALYSIS_RESERVE_SECONDS = {
     'test': 1 * 60, 'fast': 3 * 60, 'balanced': 5 * 60, 'deep': 7 * 60,
@@ -260,7 +264,11 @@ def _assessment_remaining_seconds(state: AgentState) -> float:
 def _assessment_finalization_reserve_seconds(state: AgentState) -> int:
     mode = str(shared.CURRENT_SCAN_MODE or 'balanced')
     configured = int(AGENTIC_FINALIZATION_RESERVE_SECONDS.get(mode, 25 * 60))
-    return min(configured, max(60, int(state.get('wall_clock_budget_seconds') or configured) // 4))
+    wall_clock = max(60, int(state.get('wall_clock_budget_seconds') or assessment_wall_clock_budget_seconds(mode)))
+    # Keep a safety clamp for unusually small/custom wall clocks without silently defeating the
+    # shipped TEST reserve (15 min inside a 45 min child). A quarter-wall cap reduced TEST to
+    # 11m15s and could make its nested 13-minute report reserve impossible by construction.
+    return min(configured, max(60, wall_clock // 2))
 
 
 def _assessment_execution_deadline(state: AgentState) -> float:

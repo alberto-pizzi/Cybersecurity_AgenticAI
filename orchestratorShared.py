@@ -61,16 +61,22 @@ MCP_REPORT_INLINE_MAX_BYTES = min(MCP_REPORT_MAX_BYTES, max(65536, safe_int_valu
 MCP_REPORT_CHUNK_BYTES = min(512 * 1024, max(16384, safe_int_value(os.getenv('SECOPS_MCP_REPORT_CHUNK_BYTES', str(64 * 1024)), 64 * 1024)))
 MCP_REPORT_MAX_CHUNKS = max(8, safe_int_value(os.getenv('SECOPS_REPORT_UPLOAD_MAX_CHUNKS', '2048'), 2048))
 MCP_REPORT_CHUNK_TIMEOUT = max(30.0, safe_float_value(os.getenv('SECOPS_MCP_REPORT_CHUNK_TIMEOUT', '120'), 120.0))
-MCP_REPORT_TRANSFER_TIMEOUT = max(MCP_REPORT_CHUNK_TIMEOUT, safe_float_value(os.getenv('SECOPS_MCP_REPORT_TRANSFER_TIMEOUT', '900'), 900.0))
-MCP_REPORT_PDF_TIMEOUT_HINT = max(300.0, safe_float_value(os.getenv('SECOPS_REPORT_PDF_TIMEOUT', '3600'), 3600.0))
-MCP_REPORT_RENDER_TIMEOUT = max(MCP_TOOL_TIMEOUT, MCP_REPORT_PDF_TIMEOUT_HINT + 300.0, safe_float_value(os.getenv('SECOPS_MCP_REPORT_RENDER_TIMEOUT', '4200'), 4200.0))
-MCP_REPORT_RENDER_SECONDS_PER_MIB = max(0.0, safe_float_value(os.getenv('SECOPS_MCP_REPORT_RENDER_SECONDS_PER_MIB', '60'), 60.0))
-MCP_REPORT_RENDER_TIMEOUT_MAX = max(MCP_REPORT_RENDER_TIMEOUT, safe_float_value(os.getenv('SECOPS_MCP_REPORT_RENDER_TIMEOUT_MAX', '7200'), 7200.0))
-# TEST verifies that report transport/rendering works, but must never inherit the multi-hour normal
-# report watchdog. The report server receives the same scan_mode and applies the render ceiling to
-# the actual WeasyPrint subprocess as well, so a cancelled HTTP request cannot leave it running for hours.
-TEST_REPORT_TRANSFER_TIMEOUT_SECONDS = max(30.0, safe_float_value(os.getenv('SECOPS_TEST_REPORT_TRANSFER_TIMEOUT', '60'), 60.0))
-TEST_REPORT_RENDER_TIMEOUT_SECONDS = max(60.0, safe_float_value(os.getenv('SECOPS_TEST_REPORT_RENDER_TIMEOUT', '180'), 180.0))
+# Reporting budgets are profile-specific and intentionally fit inside the Agentic report reserve.
+# For chunked reports the transfer and render maxima remain below the normal-report window even at
+# the hard assessment boundary, leaving a final margin for MCP return/serialization before the
+# separate 120-second emergency-artifact tail.
+REPORT_TRANSFER_TIMEOUT_SECONDS = {
+    'test': max(30.0, safe_float_value(os.getenv('SECOPS_TEST_REPORT_TRANSFER_TIMEOUT', '60'), 60.0)),
+    'fast': max(60.0, safe_float_value(os.getenv('SECOPS_FAST_REPORT_TRANSFER_TIMEOUT', '120'), 120.0)),
+    'balanced': max(60.0, safe_float_value(os.getenv('SECOPS_BALANCED_REPORT_TRANSFER_TIMEOUT', '180'), 180.0)),
+    'deep': max(60.0, safe_float_value(os.getenv('SECOPS_DEEP_REPORT_TRANSFER_TIMEOUT', '240'), 240.0)),
+}
+REPORT_RENDER_TIMEOUT_SECONDS = {
+    'test': max(120.0, safe_float_value(os.getenv('SECOPS_TEST_REPORT_RENDER_TIMEOUT', '540'), 540.0)),
+    'fast': max(180.0, safe_float_value(os.getenv('SECOPS_FAST_REPORT_RENDER_TIMEOUT', '780'), 780.0)),
+    'balanced': max(300.0, safe_float_value(os.getenv('SECOPS_BALANCED_REPORT_RENDER_TIMEOUT', '1140'), 1140.0)),
+    'deep': max(300.0, safe_float_value(os.getenv('SECOPS_DEEP_REPORT_RENDER_TIMEOUT', '1680'), 1680.0)),
+}
 # The generic MCP timeout is intentionally generous for normal assessments, but TEST is a smoke
 # profile and must not inherit a 20-minute control-plane watchdog. This ceiling applies only to
 # the requested MCP wait; scanner cleanup/serialization grace is added separately below.
@@ -1337,17 +1343,18 @@ def _server_report_progress_log() -> str:
         return ''
     return '\n'.join(lines[-8:])
 
-# Gives report rendering a dedicated budget independent from ordinary scanner calls.
+# Gives report transport/rendering a dedicated profile budget independent from ordinary scanner
+# calls. These maxima are deliberately aligned with the Agentic report reserves; unlike the older
+# generic 900s-transfer/4200-7200s-render values, the advertised timeout is actually usable before
+# the assessment hard deadline in every shipped profile.
 def _report_render_timeout(payload_bytes: int) -> float:
-    if CURRENT_SCAN_MODE == 'test':
-        return float(TEST_REPORT_RENDER_TIMEOUT_SECONDS)
-    mib = max(1, math.ceil(max(0, int(payload_bytes)) / float(1024 * 1024)))
-    adaptive = MCP_REPORT_RENDER_TIMEOUT + (mib * MCP_REPORT_RENDER_SECONDS_PER_MIB)
-    return min(MCP_REPORT_RENDER_TIMEOUT_MAX, max(MCP_REPORT_RENDER_TIMEOUT, adaptive))
+    mode = str(CURRENT_SCAN_MODE or 'balanced').strip().lower()
+    return float(REPORT_RENDER_TIMEOUT_SECONDS.get(mode, REPORT_RENDER_TIMEOUT_SECONDS['balanced']))
 
 
 def _report_transfer_timeout() -> float:
-    return float(TEST_REPORT_TRANSFER_TIMEOUT_SECONDS if CURRENT_SCAN_MODE == 'test' else MCP_REPORT_TRANSFER_TIMEOUT)
+    mode = str(CURRENT_SCAN_MODE or 'balanced').strip().lower()
+    return float(REPORT_TRANSFER_TIMEOUT_SECONDS.get(mode, REPORT_TRANSFER_TIMEOUT_SECONDS['balanced']))
 
 # Waits for a long report tool call while emitting terminal heartbeats and the latest server stage.
 async def _await_report_tool(client: Client, tool_name: str, arguments: dict[str, Any], *, timeout: float, label: str) -> Any:

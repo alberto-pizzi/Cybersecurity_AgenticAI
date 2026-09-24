@@ -30,6 +30,14 @@ REPORT_UPLOAD_TTL_SECONDS = max(60, safe_int_value(os.getenv("SECOPS_REPORT_UPLO
 REPORT_UPLOAD_MAX_BYTES = max(1024 * 1024, safe_int_value(os.getenv("SECOPS_REPORT_UPLOAD_MAX_BYTES", str(64 * 1024 * 1024)), 64 * 1024 * 1024))
 REPORT_UPLOAD_MAX_COMPRESSED_BYTES = REPORT_UPLOAD_MAX_BYTES + 1024 * 1024
 REPORT_UPLOAD_MAX_CHUNKS = max(8, safe_int_value(os.getenv("SECOPS_REPORT_UPLOAD_MAX_CHUNKS", "2048"), 2048))
+REPORT_PDF_TIMEOUT_SECONDS = {
+    # Keep the actual renderer deadline below the corresponding MCP render ceiling and below the
+    # normal report window guaranteed by the Agentic finalization reserve.
+    'test': max(180, safe_int_value(os.getenv("SECOPS_TEST_REPORT_PDF_TIMEOUT", "480"), 480)),
+    'fast': max(300, safe_int_value(os.getenv("SECOPS_FAST_REPORT_PDF_TIMEOUT", "720"), 720)),
+    'balanced': max(300, safe_int_value(os.getenv("SECOPS_BALANCED_REPORT_PDF_TIMEOUT", "1080"), 1080)),
+    'deep': max(300, safe_int_value(os.getenv("SECOPS_DEEP_REPORT_PDF_TIMEOUT", "1620"), 1620)),
+}
 _REPORT_UPLOADS: dict[str, dict] = {}
 _REPORT_UPLOAD_LOCK = threading.Lock()
 
@@ -244,11 +252,11 @@ def _generate_report(
         atomic_write_text(pdf_source_path, _render_html(payload, for_pdf=True))
         print(f"[REPORT SERVER] report {base}: starting PDF rendering.", flush=True)
         scan_mode = str(context.get("scan_mode") or "balanced").strip().lower()
-        pdf_timeout = 180 if scan_mode == "test" else None
+        pdf_timeout = REPORT_PDF_TIMEOUT_SECONDS.get(scan_mode, REPORT_PDF_TIMEOUT_SECONDS["balanced"])
         html2pdf(pdf_source_path, pdf_path, timeout_seconds=pdf_timeout)
         print(f"[REPORT SERVER] report {base}: PDF rendering completed; file={pdf_path}.", flush=True)
     except TimeoutError as exc:
-        # A bounded TEST render timeout is an expected resource limit, not a broken report stack.
+        # A bounded profile render timeout is an expected resource limit, not a broken report stack.
         # JSON/HTML/review artifacts were already written and remain valid for inspection.
         result = partial(
             "Report Generator", target_url,
