@@ -348,7 +348,17 @@ def _idor_forge_runtime_requirements(requirements: Path) -> list[str]:
         packages.append('matplotlib>=3.10,<4' if sys.version_info >= (3, 13) else 'matplotlib>=3.8,<4')
     return packages
 
-# Installs the upstream IDOR-Forge project and creates its launcher.
+# Runs the IDOR-Forge API/dependency contract inside its isolated interpreter.
+def _probe_idor_forge_runtime(venv_python: Path) -> subprocess.CompletedProcess[str]:
+    return run(
+        [str(venv_python), '-c', "import inspect, matplotlib; from core.IDORChecker import IDORChecker; init=inspect.signature(IDORChecker.__init__).parameters; check=inspect.signature(IDORChecker.check_idor).parameters; need_init={'url','delay','headers','timeout','verbose','max_workers','max_retries','logger'}; need_check={'test_values','method','max_workers'}; assert need_init.issubset(init), f'IDORChecker.__init__ missing {sorted(need_init-set(init))}'; assert need_check.issubset(check), f'IDORChecker.check_idor missing {sorted(need_check-set(check))}'; assert ({'param','parameter'} & set(check)), 'IDORChecker.check_idor missing object-reference parameter argument (param/parameter)'; assert callable(getattr(IDORChecker,'_generate_payloads',None)), 'IDORChecker._generate_payloads missing'; print('IDOR-Forge API contract OK')"],
+        required=False, capture=True, show_output=False, timeout=120, cwd=IDOR_FORGE_DIR,
+        env_overrides={'MPLBACKEND': 'Agg'},
+    )
+
+
+# Installs the upstream IDOR-Forge project and creates its launcher. A stale/corrupted isolated
+# environment is rebuilt once during setup; assessments themselves never mutate scanner runtimes.
 def install_idor_forge() -> dict[str, Any]:
     global _IDOR_FORGE_STATE
     clone_or_update(IDOR_FORGE_REPOSITORY, IDOR_FORGE_DIR)
@@ -359,15 +369,30 @@ def install_idor_forge() -> dict[str, Any]:
         raise RuntimeError('The IDOR-Forge checkout is incomplete.')
     venv_dir = IDOR_FORGE_DIR / '.venv'
     venv_python = venv_dir / ('Scripts/python.exe' if os.name == 'nt' else 'bin/python')
-    if not venv_python.is_file():
-        run([sys.executable, '-m', 'venv', str(venv_dir)], timeout=1200)
     runtime_requirements = _idor_forge_runtime_requirements(requirements)
-    print('[*] IDOR-Forge runtime dependencies: ' + ', '.join(runtime_requirements))
-    run([str(venv_python), '-m', 'pip', 'install', '--disable-pip-version-check', *runtime_requirements], timeout=3600, cwd=IDOR_FORGE_DIR)
-    probe = run([str(venv_python), '-c', "import inspect, matplotlib; from core.IDORChecker import IDORChecker; init=inspect.signature(IDORChecker.__init__).parameters; check=inspect.signature(IDORChecker.check_idor).parameters; need_init={'url','delay','headers','timeout','verbose','max_workers','max_retries','logger'}; need_check={'test_values','method','max_workers'}; assert need_init.issubset(init), f'IDORChecker.__init__ missing {sorted(need_init-set(init))}'; assert need_check.issubset(check), f'IDORChecker.check_idor missing {sorted(need_check-set(check))}'; assert ({'param','parameter'} & set(check)), 'IDORChecker.check_idor missing object-reference parameter argument (param/parameter)'; assert callable(getattr(IDORChecker,'_generate_payloads',None)), 'IDORChecker._generate_payloads missing'; print('IDOR-Forge API contract OK')"], required=False, capture=True, show_output=False, timeout=120, cwd=IDOR_FORGE_DIR, env_overrides={'MPLBACKEND': 'Agg'})
+
+    def install_runtime() -> None:
+        if not venv_python.is_file():
+            run([sys.executable, '-m', 'venv', str(venv_dir)], timeout=1200)
+        print('[*] IDOR-Forge runtime dependencies: ' + ', '.join(runtime_requirements))
+        # Upgrade pip in the isolated environment first so Python 3.13 wheels are resolved reliably.
+        run([str(venv_python), '-m', 'pip', 'install', '--disable-pip-version-check', '--upgrade', 'pip'], timeout=1200, cwd=IDOR_FORGE_DIR)
+        run([str(venv_python), '-m', 'pip', 'install', '--disable-pip-version-check', '--upgrade', *runtime_requirements], timeout=3600, cwd=IDOR_FORGE_DIR)
+
+    install_runtime()
+    probe = _probe_idor_forge_runtime(venv_python)
     if probe.returncode:
         detail = '\n'.join(filter(None, ((probe.stdout or '').strip(), (probe.stderr or '').strip())))
-        raise RuntimeError('IDOR-Forge dependency preflight failed.\n' + detail[-2500:])
+        print('[!] IDOR-Forge isolated runtime failed its post-install probe; rebuilding the venv once.\n' + detail[-1800:])
+        try:
+            shutil.rmtree(venv_dir)
+        except OSError as exc:
+            raise RuntimeError(f'Unable to rebuild stale IDOR-Forge environment {venv_dir}: {exc}') from exc
+        install_runtime()
+        probe = _probe_idor_forge_runtime(venv_python)
+    if probe.returncode:
+        detail = '\n'.join(filter(None, ((probe.stdout or '').strip(), (probe.stderr or '').strip())))
+        raise RuntimeError('IDOR-Forge dependency preflight still fails after one clean venv rebuild.\n' + detail[-2500:])
     launcher = write_launcher('idor-forge', [str(venv_python), str(entrypoint)])
     _IDOR_FORGE_STATE = {'repository': IDOR_FORGE_REPOSITORY, 'directory': str(IDOR_FORGE_DIR.resolve()), 'entrypoint': str(entrypoint.resolve()), 'checker': str(checker.resolve()), 'python': str(venv_python.resolve()), 'launcher': str(launcher.resolve()), 'preflight': 'ok'}
     print(f'[+] IDOR-Forge upstream runtime ready: {IDOR_FORGE_DIR}')

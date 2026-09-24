@@ -796,7 +796,7 @@ class ToolSpec:
     required: bool = True
 BASE_TOOLS = (ToolSpec('ffuf', 'pentest_tools/discovery/ffufServer.py', 'run_ffuf_fuzz', 'ffuf'), ToolSpec('zap', 'pentest_tools/scanning/zapServer.py', 'run_zap_scan', module='zapv2'), ToolSpec('nuclei', 'pentest_tools/scanning/nucleiServer.py', 'run_nuclei_scan', 'nuclei'), ToolSpec('session', 'custom_checks/sessionServer.py', 'run_session_scan'), ToolSpec('nikto', 'pentest_tools/scanning/niktoServer.py', 'run_nikto_scan', 'nikto'))
 ARJUN_TOOL = ToolSpec('arjun', 'pentest_tools/discovery/arjunServer.py', 'run_arjun_scan', 'arjun')
-PARAMETER_TOOLS = (ToolSpec('sqlmap', 'pentest_tools/exploitation/sqlmapServer.py', 'run_sqlmap_scan', 'sqlmap'), ToolSpec('dalfox', 'pentest_tools/exploitation/dalfoxServer.py', 'run_dalfox_scan', 'dalfox'), ToolSpec('commix', 'pentest_tools/exploitation/commixServer.py', 'run_commix_scan', 'commix'), ToolSpec('traversal', 'custom_checks/traversalServer.py', 'run_traversal_scan'), ToolSpec('idor', 'pentest_tools/exploitation/idorForgeServer.py', 'run_idor_check', 'idor-forge'))
+PARAMETER_TOOLS = (ToolSpec('sqlmap', 'pentest_tools/exploitation/sqlmapServer.py', 'run_sqlmap_scan', 'sqlmap'), ToolSpec('dalfox', 'pentest_tools/exploitation/dalfoxServer.py', 'run_dalfox_scan', 'dalfox'), ToolSpec('commix', 'pentest_tools/exploitation/commixServer.py', 'run_commix_scan', 'commix'), ToolSpec('traversal', 'custom_checks/traversalServer.py', 'run_traversal_scan'), ToolSpec('idor', 'pentest_tools/exploitation/idorForgeServer.py', 'run_idor_check', 'idor-forge', required=False))
 AUTHORIZATION_TOOL = ToolSpec('authorization', 'custom_checks/authorizationServer.py', 'run_authorization_scan')
 WORKFLOW_TOOLS = (ToolSpec('browser', 'custom_checks/browserServer.py', 'run_browser_scan', module='playwright', required=False), ToolSpec('workflow', 'custom_checks/workflowServer.py', 'run_workflow_scan'))
 OPTIONAL_TOOLS = (ToolSpec('jwt', 'custom_checks/jwtServer.py', 'run_jwt_scan', module='jwt'), ToolSpec('interactsh', 'pentest_tools/discovery/interactshServer.py', 'run_interactsh_client', 'interactsh-client', required=False), ToolSpec('report', 'reporting/reportServer.py', 'generate_report', module='weasyprint'))
@@ -2017,7 +2017,9 @@ def run_preflight_checks(*, include_live: bool=True) -> list[dict[str, str]]:
         if spec.name == 'idor':
             idor_ok, idor_detail = _idor_forge_runtime_check()
             checks.append({
-                'level': 'ok' if idor_ok else 'error',
+                # IDOR-Forge is a specialist. A stale isolated runtime must not discard an otherwise
+                # usable assessment; the IDOR action itself will remain unavailable until repaired.
+                'level': 'ok' if idor_ok else ('error' if spec.required else 'warning'),
                 'component': 'idor',
                 'cause': 'idor_forge_runtime_ok' if idor_ok else 'idor_forge_runtime_broken',
                 'detail': idor_detail,
