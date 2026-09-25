@@ -10,7 +10,9 @@ from typing import Any
 
 import orchestratorDeterministic as deterministic_core
 import orchestratorAgenticCore as agentic_core
+import orchestratorShared as shared
 from assessmentConfig import default_max_rounds
+from utils import AssessmentRateContractError, assessment_rate_contract
 from orchestratorAgenticCore import (
     AgentState, AI_PLANNER_TIMEOUTS, AI_PLANNER_WORKFLOW_TIMEOUTS, AI_ANALYSIS_STAGE_TIMEOUTS, SNAP4CITY_DEFAULT_API_URL, resolve_ai_model, assessment_execution_budget_seconds, assessment_wall_clock_budget_seconds,
     ensure_ollama_model, warm_ollama_model, ensure_snap4city_model,
@@ -290,7 +292,7 @@ def main() -> int:
     }
     started = time.time()
     try:
-        with assessment_rate_contract(MAX_REQUEST_RATE):
+        with assessment_rate_contract(shared.MAX_REQUEST_RATE):
             final = build_graph().invoke(initial)
     except AssessmentRateContractError as exc:
         print(f"[-] Assessment request-rate contract blocked target execution: {exc}", file=sys.stderr)
