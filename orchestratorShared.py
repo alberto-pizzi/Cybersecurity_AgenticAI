@@ -7683,7 +7683,7 @@ def select_browser_request_cases(discovery: dict[str, Any], limit: int | None=No
         catalog: list[dict[str, Any]] = []
         seen_catalog: set[tuple[str, tuple[str, str, tuple[tuple[str, str], ...]], str, tuple[str, ...]]] = set()
         shape_counts: Counter[tuple[Any, ...]] = Counter()
-        variant_cap = _specialist_variant_cap(tool)
+        variant_cap = _specialist_variant_cap('browser')
         fair_ranked = _family_fair_ranked_cases([(int(score), case) for score, _, case in ranked if score > 0])
         for score, case in fair_ranked:
             method = str(case.get('method', 'GET')).upper()
@@ -7702,7 +7702,7 @@ def select_browser_request_cases(discovery: dict[str, Any], limit: int | None=No
     unique_ranked: list[tuple[int, dict[str, Any]]] = []
     seen: set[tuple[str, str, tuple[str, ...]]] = set()
     shape_counts: dict[tuple[str, tuple[str, str, int, str], tuple[str, ...]], int] = {}
-    variant_cap = _specialist_variant_cap(tool)
+    variant_cap = _specialist_variant_cap('browser')
     for score, _, case in ranked:
         if score <= 0:
             continue
@@ -7810,7 +7810,7 @@ def select_workflow_request_cases(discovery: dict[str, Any], limit: int | None=N
         catalog: list[dict[str, Any]] = []
         seen_catalog: set[tuple[str, tuple[str, str, tuple[tuple[str, str], ...]], str, tuple[str, ...]]] = set()
         shape_counts: Counter[tuple[Any, ...]] = Counter()
-        variant_cap = _specialist_variant_cap(tool)
+        variant_cap = _specialist_variant_cap('workflow')
         fair_ranked = _family_fair_ranked_cases([(int(score), case) for score, _, case in sorted(ranked, key=lambda item: (-item[0], -item[1]))])
         for score, case in fair_ranked:
             method = str(case.get('method', 'POST')).upper()
@@ -7827,7 +7827,7 @@ def select_workflow_request_cases(discovery: dict[str, Any], limit: int | None=N
     unique_ranked: list[tuple[int, dict[str, Any]]] = []
     seen: set[tuple[str, str, tuple[str, ...]]] = set()
     shape_counts: dict[tuple[Any, ...], int] = {}
-    variant_cap = _specialist_variant_cap(tool)
+    variant_cap = _specialist_variant_cap('workflow')
     for score, _, case in sorted(ranked, key=lambda item: (-item[0], -item[1])):
         method = str(case.get('method', 'POST')).upper()
         url = str(case.get('url', ''))
@@ -7945,7 +7945,7 @@ def select_authorization_request_cases(discovery: dict[str, Any], limit: int | N
         catalog: list[dict[str, Any]] = []
         seen_catalog: set[tuple[str, str, str, tuple[str, ...]]] = set()
         shape_counts: Counter[tuple[tuple[str, str, tuple[str, ...]], tuple[str, ...]]] = Counter()
-        variant_cap = _specialist_variant_cap(tool)
+        variant_cap = _specialist_variant_cap('authorization')
         fair_ranked = _family_fair_ranked_cases([(int(score), case) for score, _, case in sorted(ranked, key=lambda item: (-item[0], -item[1]))])
         for score, case in fair_ranked:
             url = str(case.get('url') or '')
@@ -7964,7 +7964,7 @@ def select_authorization_request_cases(discovery: dict[str, Any], limit: int | N
     unique_ranked: list[tuple[int, dict[str, Any]]] = []
     seen: set[str] = set()
     shape_counts: dict[tuple[tuple[str, str, tuple[str, ...]], tuple[str, ...]], int] = {}
-    variant_cap = _specialist_variant_cap(tool)
+    variant_cap = _specialist_variant_cap('authorization')
     for score, _, case in sorted(ranked, key=lambda item: (-item[0], -item[1])):
         url = str(case.get('url') or '')
         params = tuple(sorted(str(value).lower() for value in case.get('parameters', []) if str(value)))
@@ -8240,7 +8240,6 @@ def endpoint_selection_decisions(
 
     raw_client = [item for item in discovery.get('client_side_candidates', []) if isinstance(item, dict)]
     client_keys = {_browser_url_key(str(item.get('url') or '')) for item in raw_client if str(item.get('url') or '')}
-    variant_cap = _specialist_variant_cap(tool)
     shape_frequency_by_tool = {tool: Counter(shape(tool, case) for case in cases) for tool in selected_by_tool}
 
     decisions: list[dict[str, Any]] = []
@@ -8304,7 +8303,7 @@ def endpoint_selection_decisions(
             duplicate_tools = [
                 tool for tool in eligible_tools
                 if shape(tool, case) in selected_shapes_by_tool.get(tool, set())
-                and shape_frequency_by_tool.get(tool, Counter())[shape(tool, case)] > variant_cap
+                and shape_frequency_by_tool.get(tool, Counter())[shape(tool, case)] > _specialist_variant_cap(tool)
             ]
             if duplicate_tools:
                 reason_code = 'DUPLICATE_ROUTE_VARIANT'
