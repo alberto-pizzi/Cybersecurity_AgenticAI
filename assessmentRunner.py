@@ -7,6 +7,7 @@ import hashlib
 import json
 import os
 import shutil
+import socket
 import subprocess
 import sys
 import tempfile
@@ -29,7 +30,7 @@ from assessmentConfig import (
     target_is_local,
     validate_authorization_scope,
 )
-from utils import atomic_write_text, canonical_cookie_header, cookie_header_fingerprint, cookie_names, normalized_origin, normalized_hostname, same_origin, scanner_request_rate_policy, safe_bool_value, safe_int_value
+from utils import atomic_write_text, canonical_cookie_header, cookie_header_fingerprint, cookie_names, normalized_origin, normalized_hostname, same_origin, scanner_request_rate_policy, secops_parallelism_policy, subprocess_parallelism_environment, safe_bool_value, safe_int_value
 from targetAuth import BrowserLoginError, browser_oidc_login_session
 
 
@@ -38,21 +39,98 @@ REPORTS_DIR = ROOT / "reports"
 
 # Last-resort parent watchdog. The Agentic child has a slightly shorter internal deadline so it
 # normally finalizes reports itself; this guard exists only for hangs outside the workflow guards.
+AGENTIC_PARENT_EXECUTION_BUDGET_SECONDS = {
+    'test': 60 * 60,
+    'fast': 10 * 60 * 60,
+    'balanced': 20 * 60 * 60,
+    'deep': 40 * 60 * 60,
+}
+AGENTIC_PARENT_FINALIZATION_BUDGET_SECONDS = {
+    'test': 40 * 60,
+    'fast': 180 * 60,
+    'balanced': 330 * 60,
+    'deep': 630 * 60,
+}
+# Parent-only emergency slack beyond the child's already-generous internal watchdog. This catches a
+# genuinely stuck process; it must never be the thing that decides normal scanner/AI/report coverage.
+AGENTIC_PARENT_WATCHDOG_SLACK_SECONDS = {
+    # Always wider than the child's own emergency slack (20m/2h/4h/8h respectively).
+    # This is intentionally generous because the parent timeout is a process-hang kill switch,
+    # not a coverage or finalization scheduler.
+    'test': 50 * 60,
+    'fast': 240 * 60,
+    'balanced': 480 * 60,
+    'deep': 960 * 60,
+}
 AGENTIC_JOB_WATCHDOG_SECONDS = {
-    # Parent last-resort guard at the default 10 req/s. The child owns normal finalization; this is
-    # deliberately wider than the child wall-clock floor and scales at lower configured rates.
-    'test': 75 * 60,
-    'fast': 11 * 60 * 60,
-    'balanced': 21 * 60 * 60,
-    'deep': 42 * 60 * 60,
+    mode: (
+        AGENTIC_PARENT_EXECUTION_BUDGET_SECONDS[mode]
+        + AGENTIC_PARENT_FINALIZATION_BUDGET_SECONDS[mode]
+        + AGENTIC_PARENT_WATCHDOG_SLACK_SECONDS[mode]
+    )
+    for mode in AGENTIC_PARENT_EXECUTION_BUDGET_SECONDS
 }
 
 
 def _agentic_parent_watchdog_seconds(mode: str, request_rate: float) -> float:
-    base = float(AGENTIC_JOB_WATCHDOG_SECONDS.get(str(mode or 'balanced').lower(), AGENTIC_JOB_WATCHDOG_SECONDS['balanced']))
+    mode = str(mode or 'balanced').lower()
     scale = max(1.0, 10.0 / max(1.0, float(request_rate or 10.0)))
-    return base * scale
+    execution = float(AGENTIC_PARENT_EXECUTION_BUDGET_SECONDS.get(mode, AGENTIC_PARENT_EXECUTION_BUDGET_SECONDS['balanced'])) * scale
+    finalization = float(AGENTIC_PARENT_FINALIZATION_BUDGET_SECONDS.get(mode, AGENTIC_PARENT_FINALIZATION_BUDGET_SECONDS['balanced']))
+    slack = float(AGENTIC_PARENT_WATCHDOG_SLACK_SECONDS.get(mode, AGENTIC_PARENT_WATCHDOG_SLACK_SECONDS['balanced']))
+    return execution + finalization + slack
 
+
+def _run_orchestrator_child(
+    command: list[str], *, cwd: Path, env: dict[str, str], timeout_seconds: float | None
+) -> tuple[int, bool]:
+    """Run one orchestrator child and normalize parent-watchdog expiry.
+
+    Scanner-level failures are handled inside the child and do not reach this boundary. A non-zero
+    return code here therefore means the orchestrator job itself failed and must be treated as a
+    fatal job boundary by the assessment runner.
+    """
+    try:
+        completed = subprocess.run(
+            command, cwd=cwd, check=False, env=env, timeout=timeout_seconds,
+        )
+        return int(completed.returncode), False
+    except subprocess.TimeoutExpired:
+        return 124, True
+
+
+def _child_exit_is_fatal(returncode: int) -> bool:
+    """Only a clean orchestrator exit is non-fatal at the runner boundary."""
+    return int(returncode) != 0
+
+
+def _service_tcp_reachable(target: str, *, attempts: int = 2, timeout_seconds: float = 1.5) -> tuple[bool, str]:
+    """Cheap pre-launch liveness check for configured HTTP/HTTPS jobs.
+
+    This deliberately opens TCP only; it does not send an HTTP request and therefore cannot duplicate
+    an application action or bypass the assessment request-rate gate. It prevents an enabled but
+    connection-refused sibling service from triggering a second full orchestrator after another job
+    has already completed/failed.
+    """
+    try:
+        parsed = urlparse(str(target or "").strip())
+        scheme = str(parsed.scheme or "").lower()
+        host = str(parsed.hostname or "").strip()
+        port = parsed.port or (443 if scheme == "https" else 80 if scheme == "http" else None)
+    except ValueError as exc:
+        return False, f"invalid target URL: {exc}"
+    if scheme not in {"http", "https"} or not host or port is None:
+        return False, "target is not an absolute HTTP/HTTPS endpoint"
+
+    errors: list[str] = []
+    for _ in range(max(1, min(int(attempts), 3))):
+        try:
+            with socket.create_connection((host, int(port)), timeout=max(0.2, min(float(timeout_seconds), 5.0))):
+                return True, f"tcp://{host}:{int(port)} reachable"
+        except OSError as exc:
+            errors.append(f"{type(exc).__name__}: {exc}")
+    detail = errors[-1] if errors else "connection failed"
+    return False, f"tcp://{host}:{int(port)} unreachable after {max(1, min(int(attempts), 3))} attempt(s): {detail}"
 
 
 # Resolves execution.request_rate without widening the accepted traffic envelope silently.
@@ -77,7 +155,7 @@ def _resolve_request_rate(config: dict[str, Any]) -> dict[str, Any]:
 
 # Propagates the normalized traffic policy to every child orchestrator/scanner process.
 def _request_rate_environment(base_env: dict[str, str], policy: dict[str, Any]) -> dict[str, str]:
-    env = dict(base_env)
+    env = subprocess_parallelism_environment(base_env, policy.get("effective", 10))
     env["SECOPS_MAX_REQUEST_RATE"] = str(policy.get("effective", 10))
     env["SECOPS_REQUEST_RATE_REQUESTED"] = str(policy.get("requested", ""))
     env["SECOPS_REQUEST_RATE_CONFIGURED"] = "1" if policy.get("configured") else "0"
@@ -478,6 +556,7 @@ def _resolve_job_cookie(
             initial_login=not bool(runtime.get("browser_login_completed")),
             expected_oidc_issuer=str(runtime.get("oidc_issuer") or ""),
             allow_credential_submit=not bool(runtime.get("credential_submit_used")),
+            request_rate=float((config.get("execution") or {}).get("request_rate") or 10),
         )
     except RuntimeError as first_exc:
         if bool(getattr(first_exc, "credential_submit_attempted", False)):
@@ -503,6 +582,7 @@ def _resolve_job_cookie(
                         initial_login=not bool(runtime.get("browser_login_completed")),
                         expected_oidc_issuer=str(runtime.get("oidc_issuer") or ""),
                         allow_credential_submit=not bool(runtime.get("credential_submit_used")),
+                        request_rate=float((config.get("execution") or {}).get("request_rate") or 10),
                     )
                 except RuntimeError as exc:
                     if bool(getattr(exc, "credential_submit_attempted", False)):
@@ -1127,8 +1207,17 @@ def _aggregate_report_inputs(results_data: dict[str, Any], config: dict[str, Any
         status = str(entry.get("status") or "unknown")
         status_counts[status] = status_counts.get(status, 0) + 1
 
+    try:
+        _aggregate_started = datetime.fromisoformat(str(results_data.get("generated_at") or "").replace("Z", "+00:00"))
+        if _aggregate_started.tzinfo is None:
+            _aggregate_started = _aggregate_started.replace(tzinfo=timezone.utc)
+        aggregate_execution_seconds = max(0.0, (datetime.now(timezone.utc) - _aggregate_started.astimezone(timezone.utc)).total_seconds())
+    except (TypeError, ValueError):
+        aggregate_execution_seconds = 0.0
+
     context = {
         "profiles": [{"name": name, "authenticated": authenticated} for name, authenticated in sorted(profiles.items())],
+        "assessment_execution_seconds": round(aggregate_execution_seconds, 3),
         "expected_tools": sorted(expected_tools),
         "discovery": discovery_by_entry,
         "endpoint_selection": endpoint_selection_by_entry,
@@ -1214,15 +1303,16 @@ def _generate_aggregate_report(results_data: dict[str, Any], config: dict[str, A
         "generated_at": datetime.now(timezone.utc),
         "target": target_label,
         "reporting_policy": "Scanner-grounded aggregate report for multiple authorized entry points of one logical target; observed facts are not invented and per-entry evidence remains traceable in the Results Data dataset.",
-        "executive_summary": _executive_text(summary, findings, context),
+        "executive_summary": _executive_text(summary, all_findings, context),
         "summary": summary,
         "coverage": coverage,
         "endpoint_coverage": endpoint_coverage,
         "endpoint_coverage_summary": endpoint_coverage_summary,
-        "security_findings_count": sum(item["category"] == "vulnerability" for item in findings),
-        "candidate_findings_count": sum(item["category"] == "candidate" for item in findings),
-        "observations_count": sum(item["category"] in {"discovery", "observation"} for item in findings),
-        "findings_count": len(findings),
+        "security_findings_count": sum(item["category"] == "vulnerability" for item in all_findings),
+        "candidate_findings_count": sum(item["category"] == "candidate" for item in all_findings),
+        "observations_count": sum(item["category"] in {"discovery", "observation"} for item in all_findings),
+        "findings_count": len(all_findings),
+        "assessment_execution_seconds": max(0.0, float(context.get("assessment_execution_seconds") or 0.0)),
         "findings": findings,
         "all_findings": all_findings,
         "findings_by_category": _finding_groups(findings),
@@ -1366,7 +1456,10 @@ def main() -> int:
     ai_group.add_argument("--no-require-ai", dest="require_ai", action="store_false", help="Allow the existing Agentic deterministic fallback when AI planning fails.")
     parser.add_argument("--dry-run", action="store_true", help="Validate and persist the job plan without executing scanners.")
     parser.add_argument("--only", default="", help="Optional exact service job id, for example web01/https-main.")
-    parser.add_argument("--stop-on-error", action="store_true", help="Stop after the first failed executable job.")
+    parser.add_argument(
+        "--stop-on-error", action="store_true",
+        help="Stop after the first blocked job as well; a non-zero executable orchestrator exit is always treated as fatal and stops automatically.",
+    )
     args = parser.parse_args()
 
     try:
@@ -1398,6 +1491,17 @@ def main() -> int:
         print(f"[RATE] Active-scanner request rate: {effective_rate:g} requests/second (configured; maximum 50).")
     else:
         print(f"[RATE] Active-scanner request rate: {effective_rate:g} requests/second (default; execution.request_rate not specified).")
+
+    parallelism_policy = secops_parallelism_policy(effective_rate)
+    print(
+        "[PARALLELISM] "
+        f"CPUs detected={parallelism_policy['detected_cpus']}; CPU budget={parallelism_policy['cpu_budget']}; "
+        f"profile coordinators={parallelism_policy['profile_workers']}; browser profiles={parallelism_policy['browser_profile_workers']}; "
+        f"heavy local slots={parallelism_policy['heavy_local_workers']}; network in-flight={parallelism_policy['network_workers']}; "
+        f"browser in-flight={parallelism_policy['browser_workers']}; scanner workers={parallelism_policy['scanner_workers']}. "
+        "Target request starts remain bounded by execution.request_rate.",
+        flush=True,
+    )
 
     if args.only:
         jobs = [job for job in jobs if job["id"] == args.only]
@@ -1432,6 +1536,7 @@ def main() -> int:
         "source_config": str(Path(args.config).expanduser().resolve()) if args.config else None,
         "configuration": redacted_configuration(config),
         "traffic_policy": dict(request_rate_policy),
+        "parallelism_policy": dict(parallelism_policy),
         "jobs": [],
         "report_artifacts": [],
         "reports_data": [],
@@ -1475,6 +1580,17 @@ def main() -> int:
             results_data["jobs"].append(record)
             print(f"[SKIP] {job['id']}: {job.get('unsupported_reason')}")
             continue
+        if not args.dry_run:
+            reachable, reachability_detail = _service_tcp_reachable(str(job.get("target") or ""))
+            record["reachability_precheck"] = {"reachable": bool(reachable), "detail": reachability_detail}
+            if not reachable:
+                record.update(
+                    status="skipped",
+                    reason=f"configured service endpoint is not TCP-reachable before assessment launch: {reachability_detail}",
+                )
+                results_data["jobs"].append(record)
+                print(f"[SKIP] {job['id']}: {record['reason']}", file=sys.stderr)
+                continue
         try:
             command = _build_command(
                 config, job, resolve_secrets=not args.dry_run, force_auth_only=args.auth_only, credential_cache=credential_cache, runtime_auth_cache=runtime_auth_cache
@@ -1504,14 +1620,10 @@ def main() -> int:
                 mode = str((config.get('execution') or {}).get('mode') or 'balanced').lower()
                 child_watchdog_seconds = _agentic_parent_watchdog_seconds(mode, effective_rate)
             try:
-                try:
-                    completed = subprocess.run(
-                        command, cwd=ROOT, check=False, env=child_env,
-                        timeout=child_watchdog_seconds,
-                    )
-                    completed_returncode = int(completed.returncode)
-                except subprocess.TimeoutExpired:
-                    completed_returncode = 124
+                completed_returncode, watchdog_expired = _run_orchestrator_child(
+                    command, cwd=ROOT, env=child_env, timeout_seconds=child_watchdog_seconds
+                )
+                if watchdog_expired:
                     record['watchdog_timeout_seconds'] = child_watchdog_seconds
                     record['reason'] = (
                         f"agentic orchestrator exceeded the parent watchdog ({child_watchdog_seconds:.0f}s) and was terminated; "
@@ -1574,11 +1686,32 @@ def main() -> int:
             if primary_artifact:
                 results_data["report_artifacts"].append(primary_artifact)
                 results_data["reports_data"].append(_embedded_report_data(primary_artifact))
-            if completed.returncode:
+            if _child_exit_is_fatal(completed_returncode):
                 exit_code = 1
-                if args.stop_on_error:
-                    results_data["jobs"].append(record)
-                    break
+                record["fatal_child_failure"] = True
+                pending_job_ids = [
+                    str(item.get("id") or "") for item in jobs[job_index:]
+                    if isinstance(item, dict) and str(item.get("id") or "").strip()
+                ]
+                results_data["termination"] = {
+                    "status": "aborted_after_fatal_child_failure",
+                    "failed_job_id": str(job.get("id") or ""),
+                    "returncode": completed_returncode,
+                    "reason": str(record.get("reason") or "orchestrator child failed"),
+                    "remaining_jobs_not_started": pending_job_ids,
+                }
+                results_data["jobs"].append(record)
+                _write_results_data(results_data_path, results_data)
+                remaining_note = (
+                    f"; {len(pending_job_ids)} remaining configured job(s) were not started"
+                    if pending_job_ids else ""
+                )
+                print(
+                    f"[ABORT] {job['id']}: fatal orchestrator exit {completed_returncode}{remaining_note}. "
+                    "Scanner-level errors remain non-fatal inside an otherwise successful orchestrator job.",
+                    file=sys.stderr, flush=True,
+                )
+                break
         results_data["jobs"].append(record)
         _write_results_data(results_data_path, results_data)
 

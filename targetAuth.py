@@ -6,7 +6,7 @@ import time
 from typing import Any, Iterable
 from urllib.parse import parse_qsl, urljoin, urlparse
 
-from utils import canonical_cookie_header, cookie_names, normalized_origin, request_contract_state_change_reason, same_origin
+from utils import RequestRatePacer, browser_workload_lease, canonical_cookie_header, cookie_names, normalized_hostname, normalized_origin, request_contract_state_change_reason, same_origin, scanner_request_rate
 
 
 class BrowserLoginError(RuntimeError):
@@ -462,6 +462,7 @@ def browser_oidc_login_session(
     include_configured_fallbacks: bool = True,
     expected_oidc_issuer: str = "",
     allow_credential_submit: bool = True,
+    request_rate: float | None = None,
 ) -> dict[str, Any]:
     """Obtain one origin-scoped application session without ever prompting for credentials.
 
@@ -514,8 +515,18 @@ def browser_oidc_login_session(
     # most one real username/password attempt. This prevents a stale/misrouted login flow from
     # multiplying password submissions across candidates.
     credential_submit_attempted = False
+    login_pacer = RequestRatePacer(scanner_request_rate(request_rate))
+    target_rate_host = normalized_hostname(urlparse(target_url).hostname or "")
 
-    with sync_playwright() as playwright:
+    browser_slot_wait_started = time.monotonic()
+    with browser_workload_lease(scanner_request_rate(request_rate), deadline=deadline) as browser_global_slot, sync_playwright() as playwright:
+        browser_global_slot_wait_seconds = max(0.0, time.monotonic() - browser_slot_wait_started)
+        if browser_global_slot is None:
+            raise BrowserLoginError(
+                f"Automatic browser login deadline expired while waiting for a shared VM Chromium slot for {origin}.",
+                attempted_candidates=attempted_candidates,
+                reason="browser_slot_timeout",
+            )
         try:
             if time.monotonic() >= deadline:
                 raise BrowserLoginError(
@@ -543,10 +554,31 @@ def browser_oidc_login_session(
         context_kwargs: dict[str, Any] = {
             "ignore_https_errors": True,
             "user_agent": "SecOps-Browser-Login/3.0",
+            # Playwright routing cannot reliably account for requests owned by a Service Worker.
+            # Block Service Workers during the bounded login flow so every request to the assessed
+            # application origin passes through the shared cross-process request-rate pacer.
+            "service_workers": "block",
         }
         if isinstance(storage_state, dict) and (storage_state.get("cookies") or storage_state.get("origins")):
             context_kwargs["storage_state"] = storage_state
         context = browser.new_context(**context_kwargs)
+
+        def pace_target_origin(route: Any) -> None:
+            request_url = str(route.request.url or "")
+            try:
+                request_host = normalized_hostname(urlparse(request_url).hostname or "")
+            except ValueError:
+                request_host = ""
+            # Authentication can legitimately traverse another authorized port of the same target
+            # hostname (for example a co-hosted IdP). Pacing the entire exact hostname prevents that
+            # transition from becoming a request-rate bypass without granting any additional scope.
+            if target_rate_host and request_host == target_rate_host:
+                if not login_pacer.wait(deadline):
+                    route.abort("timedout")
+                    return
+            route.continue_()
+
+        context.route("**/*", pace_target_origin)
         page = context.new_page()
         observed_auth_requests: list[str] = []
 
@@ -634,6 +666,8 @@ def browser_oidc_login_session(
                             "sso_reused": True,
                             "authentication_flow_observed": flow_observed,
                             "oidc_issuer": issuer,
+                            "browser_global_slot": int(browser_global_slot),
+                            "browser_global_slot_wait_seconds": round(browser_global_slot_wait_seconds, 3),
                         }
 
                 if username_field is None and password_field is None and login_trigger is not None:
@@ -668,6 +702,8 @@ def browser_oidc_login_session(
                                     "sso_reused": True,
                                     "authentication_flow_observed": flow_observed,
                                     "oidc_issuer": issuer,
+                                    "browser_global_slot": int(browser_global_slot),
+                                    "browser_global_slot_wait_seconds": round(browser_global_slot_wait_seconds, 3),
                                 }
                         page.wait_for_timeout(250)
 
@@ -699,6 +735,8 @@ def browser_oidc_login_session(
                                 "sso_reused": True,
                                 "authentication_flow_observed": flow_observed,
                                 "oidc_issuer": issuer,
+                                "browser_global_slot": int(browser_global_slot),
+                                "browser_global_slot_wait_seconds": round(browser_global_slot_wait_seconds, 3),
                             }
                     failures.append(f"{candidate}: login form/control not found")
                     continue
@@ -811,6 +849,8 @@ def browser_oidc_login_session(
                                 "sso_reused": False,
                                 "authentication_flow_observed": flow_observed,
                                 "oidc_issuer": issuer,
+                                "browser_global_slot": int(browser_global_slot),
+                                "browser_global_slot_wait_seconds": round(browser_global_slot_wait_seconds, 3),
                             }
                     diagnostic = _login_diagnostic(page)
                     if diagnostic.startswith("credentials_rejected:"):

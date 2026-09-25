@@ -5,13 +5,14 @@ import re
 import secrets
 import time
 from collections import Counter
+from concurrent.futures import ThreadPoolExecutor
 from http.cookies import SimpleCookie
 from typing import Any
 from urllib.parse import parse_qsl, urlparse
 
 import requests
 
-from utils import RequestRatePacer, parse_cookie_header, partial, request_contract_state_change_reason, request_same_origin_redirects, skipped, success
+from utils import RequestRatePacer, parse_cookie_header, partial, request_contract_state_change_reason, request_same_origin_redirects, secops_parallelism_policy, skipped, success
 
 from utils import same_origin
 
@@ -136,21 +137,56 @@ def run_session_scan(
     timeout = max(5, min(int(timeout), 604800))
     sample_count = max(3, min(int(sample_count), 10))
     pacer = RequestRatePacer(request_rate)
+    parallelism = secops_parallelism_policy(request_rate)
 
     deadline = wall_clock_deadline(timeout)
     request_timeout = proportional_budget(timeout, SESSION_REQUEST_RATIO)
     findings: list[dict[str, Any]] = []
-    diagnostics: dict[str, Any] = {"probe_url": selected_probe, "sample_count": sample_count, "request_timeout": request_timeout, "tool_timeout_seconds": timeout, "phase_ratio_policy": {"request": SESSION_REQUEST_RATIO}}
+    diagnostics: dict[str, Any] = {"probe_url": selected_probe, "sample_count": sample_count, "request_timeout": request_timeout, "tool_timeout_seconds": timeout, "parallelism_policy": parallelism, "phase_ratio_policy": {"request": SESSION_REQUEST_RATIO}}
 
     # Evaluate cookie attributes first, then use bounded samples for uniqueness and fixation indicators.
     baseline: requests.Response | None = None
-    try:
-        baseline = request_same_origin_redirects(
-            "GET", selected_probe, max_redirects=4, timeout=(max(1.0, request_timeout * 0.25), request_timeout), deadline=deadline,
-            headers={"User-Agent": "SecOps-Session-Analyzer/1.0", "Cache-Control": "no-cache"}, pacer=pacer, allow_state_changes=False,
+    authenticated: requests.Response | None = None
+
+    def initial_probe(authenticated_request: bool) -> requests.Response:
+        headers = {"User-Agent": "SecOps-Session-Analyzer/1.0", "Cache-Control": "no-cache"}
+        if authenticated_request and cookies:
+            headers["Cookie"] = cookies
+        return request_same_origin_redirects(
+            "GET", selected_probe, max_redirects=4,
+            timeout=(max(1.0, request_timeout * 0.25), request_timeout), deadline=deadline,
+            headers=headers, pacer=pacer, allow_state_changes=False,
         )
-    except requests.RequestException as exc:
-        diagnostics["anonymous_probe_error"] = f"{type(exc).__name__}: {exc}"
+
+    supplied_names = [name for name, _ in parse_cookie_header(cookies)] if cookies else []
+    supplied_session_names = [name for name in supplied_names if _is_session_cookie_name(name)]
+    diagnostics["supplied_cookie_names"] = supplied_names
+    diagnostics["supplied_session_cookie_names"] = supplied_session_names
+
+    initial_workers = max(1, min(2 if cookies else 1, int(parallelism.get("network_workers") or 1)))
+    if cookies and initial_workers > 1:
+        with ThreadPoolExecutor(max_workers=initial_workers, thread_name_prefix="secops-session-initial") as executor:
+            baseline_future = executor.submit(initial_probe, False)
+            authenticated_future = executor.submit(initial_probe, True)
+            try:
+                baseline = baseline_future.result()
+            except requests.RequestException as exc:
+                diagnostics["anonymous_probe_error"] = f"{type(exc).__name__}: {exc}"
+            try:
+                authenticated = authenticated_future.result()
+            except requests.RequestException as exc:
+                diagnostics["authenticated_probe_error"] = f"{type(exc).__name__}: {exc}"
+    else:
+        try:
+            baseline = initial_probe(False)
+        except requests.RequestException as exc:
+            diagnostics["anonymous_probe_error"] = f"{type(exc).__name__}: {exc}"
+        if cookies:
+            try:
+                authenticated = initial_probe(True)
+            except requests.RequestException as exc:
+                diagnostics["authenticated_probe_error"] = f"{type(exc).__name__}: {exc}"
+    diagnostics["initial_probe_workers"] = initial_workers
 
     set_cookie_rows: list[dict[str, Any]] = []
     if baseline is not None:
@@ -159,42 +195,35 @@ def run_session_scan(
         findings.extend(_cookie_attribute_findings(str(baseline.url), set_cookie_rows, urlparse(str(baseline.url)).scheme == "https"))
     diagnostics["anonymous_set_cookie"] = set_cookie_rows
 
-    supplied_names = [name for name, _ in parse_cookie_header(cookies)] if cookies else []
-    supplied_session_names = [name for name in supplied_names if _is_session_cookie_name(name)]
-    diagnostics["supplied_cookie_names"] = supplied_names
-    diagnostics["supplied_session_cookie_names"] = supplied_session_names
-    if cookies:
-        try:
-            authenticated = request_same_origin_redirects(
-                "GET", selected_probe, max_redirects=4, timeout=(max(1.0, request_timeout * 0.25), request_timeout), deadline=deadline,
-                headers={"User-Agent": "SecOps-Session-Analyzer/1.0", "Cache-Control": "no-cache", "Cookie": cookies}, pacer=pacer, allow_state_changes=False,
-            )
-            authenticated_rows: list[dict[str, Any]] = []
-            for header in _set_cookie_headers(authenticated):
-                authenticated_rows.extend(_parse_set_cookie(header))
-            diagnostics["authenticated_probe"] = {
-                "status": authenticated.status_code, "final_url": str(authenticated.url),
-                "login_detected": looks_like_login(authenticated, text_limit=60_000, paths=("/login", "/login.php", "/signin", "/auth"), words=("login", "sign in", "authenticate")),
-                "set_cookie": authenticated_rows,
-            }
-            findings.extend(_cookie_attribute_findings(str(authenticated.url), authenticated_rows, urlparse(str(authenticated.url)).scheme == "https"))
-        except requests.RequestException as exc:
-            diagnostics["authenticated_probe_error"] = f"{type(exc).__name__}: {exc}"
+    if authenticated is not None:
+        authenticated_rows: list[dict[str, Any]] = []
+        for header in _set_cookie_headers(authenticated):
+            authenticated_rows.extend(_parse_set_cookie(header))
+        diagnostics["authenticated_probe"] = {
+            "status": authenticated.status_code, "final_url": str(authenticated.url),
+            "login_detected": looks_like_login(authenticated, text_limit=60_000, paths=("/login", "/login.php", "/signin", "/auth"), words=("login", "sign in", "authenticate")),
+            "set_cookie": authenticated_rows,
+        }
+        findings.extend(_cookie_attribute_findings(str(authenticated.url), authenticated_rows, urlparse(str(authenticated.url)).scheme == "https"))
 
     # Sample fresh anonymous sessions to detect obvious reuse, short identifiers or weak entropy.
     samples: dict[str, list[str]] = {}
-    for _ in range(sample_count):
+    def sample_anonymous(_: int) -> list[tuple[str, str]]:
         if remaining_budget(deadline) <= 0:
-            break
+            return []
         session = requests.Session()
         try:
-            response = request_same_origin_redirects("GET", selected_probe, session=session, timeout=(max(1.0, request_timeout * 0.25), request_timeout), deadline=deadline,
+            request_same_origin_redirects("GET", selected_probe, session=session, timeout=(max(1.0, request_timeout * 0.25), request_timeout), deadline=deadline,
                 headers={"User-Agent": "SecOps-Session-Analyzer/1.0", "Cache-Control": "no-cache"}, pacer=pacer, allow_state_changes=False,
             )
         except requests.RequestException:
-            continue
-        for cookie in session.cookies:
-            samples.setdefault(str(cookie.name), []).append(str(cookie.value))
+            return []
+        return [(str(cookie.name), str(cookie.value)) for cookie in session.cookies]
+    sample_workers = max(1, min(sample_count, int(parallelism.get("network_workers") or 1)))
+    with ThreadPoolExecutor(max_workers=sample_workers, thread_name_prefix="secops-session") as executor:
+        for cookie_rows in executor.map(sample_anonymous, range(sample_count)):
+            for name, value in cookie_rows:
+                samples.setdefault(name, []).append(value)
     diagnostics["anonymous_cookie_samples"] = {
         name: {
             "count": len(values), "unique": len(set(values)), "lengths": sorted(set(len(value) for value in values)),
@@ -230,28 +259,33 @@ def run_session_scan(
             })
 
     if supplied_session_names:
-        fixation_rows: list[dict[str, Any]] = []
-        for name in supplied_session_names[:3]:
+        fixation_names = list(supplied_session_names[:3])
+        fixation_workers = max(1, min(len(fixation_names), int(parallelism.get("network_workers") or 1)))
+
+        def fixation_probe(name: str) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
             if remaining_budget(deadline) <= 0:
-                break
+                return None, None
             chosen = "SECOPS" + secrets.token_hex(12)
             try:
-                response = request_same_origin_redirects("GET", selected_probe, timeout=(max(1.0, request_timeout * 0.25), request_timeout), deadline=deadline,
+                response = request_same_origin_redirects(
+                    "GET", selected_probe,
+                    timeout=(max(1.0, request_timeout * 0.25), request_timeout), deadline=deadline,
                     headers={
                         "User-Agent": "SecOps-Session-Analyzer/1.0", "Cache-Control": "no-cache", "Cookie": f"{name}={chosen}",
                     }, pacer=pacer, allow_state_changes=False,
                 )
             except requests.RequestException:
-                continue
+                return None, None
             returned = response.cookies.get(name, "")
             rotated = bool(returned and returned != chosen)
             echoed = bool(returned and returned == chosen)
-            fixation_rows.append({
+            row = {
                 "cookie": name, "status": response.status_code, "returned_cookie": bool(returned), "rotated": rotated,
                 "echoed_attacker_value": echoed,
-            })
+            }
+            finding = None
             if echoed:
-                findings.append({
+                finding = {
                     "alert": f"Potential session fixation behavior for cookie '{name}'", "risk": "medium", "category": "candidate",
                     "verification_status": "server-echoed-attacker-session-id-needs-login-validation", "confidence": "medium",
                     "description": "The server explicitly returned the attacker-chosen session identifier instead of rotating it. A full fixation proof still requires authentication with that identifier.",
@@ -260,8 +294,18 @@ def run_session_scan(
                     "url": selected_probe, "method": "GET", "parameter": name,
                     "evidence": f"HTTP {response.status_code}; response Set-Cookie echoed the attacker value; login_detected={looks_like_login(response, text_limit=60_000, paths=("/login", "/login.php", "/signin", "/auth"), words=("login", "sign in", "authenticate"))}",
                     "owasp_category": "A07:2021 Identification and Authentication Failures", "cwe_id": "384",
-                })
+                }
+            return row, finding
+
+        fixation_rows: list[dict[str, Any]] = []
+        with ThreadPoolExecutor(max_workers=fixation_workers, thread_name_prefix="secops-session-fixation") as executor:
+            for row, finding in executor.map(fixation_probe, fixation_names):
+                if row is not None:
+                    fixation_rows.append(row)
+                if finding is not None:
+                    findings.append(finding)
         diagnostics["fixation_indicators"] = fixation_rows
+        diagnostics["fixation_workers"] = fixation_workers
 
     diagnostics["completed_anonymous_samples"] = sum(len(values) for values in samples.values())
     diagnostics["budget_exhausted"] = remaining_budget(deadline) <= 0
@@ -320,15 +364,26 @@ def run_logout_check(
         )
 
     diagnostics: dict[str, Any] = {"logout_url": logout_url, "probe_url": selected_probe, "method": method, "tool_timeout_seconds": timeout, "phase_ratio_policy": {"request": LOGOUT_REQUEST_RATIO}}
+    # Authenticated and anonymous pre-logout baselines are independent read-only GETs. Fetch both
+    # concurrently; the shared pacer still serializes request starts at execution.request_rate.
+    baseline_workers = max(1, min(2, int(secops_parallelism_policy(request_rate).get("network_workers") or 1)))
     try:
-        baseline = fetch(selected_probe, authenticated=True)
-        anonymous = fetch(selected_probe, authenticated=False)
+        if baseline_workers > 1:
+            with ThreadPoolExecutor(max_workers=baseline_workers, thread_name_prefix="secops-logout-baseline") as executor:
+                baseline_future = executor.submit(fetch, selected_probe, authenticated=True)
+                anonymous_future = executor.submit(fetch, selected_probe, authenticated=False)
+                baseline = baseline_future.result()
+                anonymous = anonymous_future.result()
+        else:
+            baseline = fetch(selected_probe, authenticated=True)
+            anonymous = fetch(selected_probe, authenticated=False)
     except requests.RequestException as exc:
         return partial(
             "Session Logout Verifier", logout_url,
             f"The authenticated/anonymous logout baseline could not be established: {type(exc).__name__}: {exc}",
             diagnosis="logout_baseline_request_failed", vulnerabilities=[], diagnostics=diagnostics,
         )
+    diagnostics["baseline_workers"] = baseline_workers
 
     baseline_login = looks_like_login(baseline, text_limit=80_000)
     anonymous_login = looks_like_login(anonymous, text_limit=80_000)

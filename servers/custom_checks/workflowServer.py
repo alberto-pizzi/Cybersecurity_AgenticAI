@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import html
+from concurrent.futures import ThreadPoolExecutor
 import json
 import re
 import secrets
@@ -9,7 +10,7 @@ from urllib.parse import parse_qsl, urljoin, urlparse
 
 import requests
 
-from utils import RequestRatePacer, partial, request_same_origin_redirects, skipped, success
+from utils import RequestRatePacer, partial, request_same_origin_redirects, secops_parallelism_policy, skipped, success
 
 from utils import same_origin
 
@@ -79,7 +80,7 @@ def _session(cookies: str) -> requests.Session:
 def _csrf_check(
     target_url: str, source_url: str, cookies: str, data: str,
     fields: list[dict[str, str]], token_parameters: list[str], timeout: int, allow_state_changes: bool,
-    pacer: RequestRatePacer, deadline: float,
+    pacer: RequestRatePacer, deadline: float, request_rate: float | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     findings: list[dict[str, Any]] = []
     diagnostic: dict[str, Any] = {"applicable": False}
@@ -156,7 +157,7 @@ def _csrf_check(
 def _upload_check(
     target_url: str, source_url: str, cookies: str, fields: list[dict[str, str]],
     file_parameters: list[str], timeout: int, allow_state_changes: bool, known_urls: list[str] | None,
-    pacer: RequestRatePacer, deadline: float,
+    pacer: RequestRatePacer, deadline: float, request_rate: float | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     findings: list[dict[str, Any]] = []
     diagnostic: dict[str, Any] = {"applicable": bool(file_parameters)}
@@ -216,13 +217,26 @@ def _upload_check(
             candidates.append(urljoin(directory, filename))
 
     directory_searches: list[dict[str, Any]] = []
-    for directory in list(dict.fromkeys(directory_candidates))[:10]:
+    parallelism = secops_parallelism_policy(request_rate)
+    unique_directories = list(dict.fromkeys(directory_candidates))[:10]
+    def fetch_directory(directory: str):
         if remaining_budget(deadline) <= 0:
-            break
+            return directory, None, requests.Timeout("shared workflow deadline reached")
+        local_session = _session(cookies)
         try:
-            listing = request_same_origin_redirects("GET", directory, session=session, allow_state_changes=False, timeout=(max(1.0, timeout * WORKFLOW_CONNECT_RATIO), timeout), pacer=pacer, deadline=deadline)
+            listing = request_same_origin_redirects("GET", directory, session=local_session, allow_state_changes=False, timeout=(max(1.0, timeout * WORKFLOW_CONNECT_RATIO), timeout), pacer=pacer, deadline=deadline)
+            return directory, listing, None
         except requests.RequestException as exc:
-            directory_searches.append({"url": directory, "error": f"{type(exc).__name__}: {exc}"})
+            return directory, None, exc
+    if unique_directories:
+        dir_workers = max(1, min(len(unique_directories), int(parallelism.get("network_workers") or 1)))
+        with ThreadPoolExecutor(max_workers=dir_workers, thread_name_prefix="secops-workflow-dir") as executor:
+            directory_results = list(executor.map(fetch_directory, unique_directories))
+    else:
+        directory_results = []
+    for directory, listing, directory_error in directory_results:
+        if directory_error is not None or listing is None:
+            directory_searches.append({"url": directory, "error": f"{type(directory_error).__name__}: {directory_error}"})
             continue
         discovered_links: list[str] = []
         for match in re.findall(r"(?:href|src)\s*=\s*['\"]([^'\"]+)['\"]", listing.text, re.I):
@@ -238,19 +252,31 @@ def _upload_check(
     # Verify candidate URLs and report exposure only when the uploaded marker is retrieved.
     candidates = [value for value in dict.fromkeys(candidates) if same_origin(target_url, value)]
     retrieved: list[dict[str, Any]] = []
-    for candidate in candidates[:8]:
+    retrieval_candidates = candidates[:8]
+    def fetch_candidate(candidate: str):
         if remaining_budget(deadline) <= 0:
-            break
+            return candidate, None
+        local_session = _session(cookies)
         try:
-            probe = request_same_origin_redirects("GET", candidate, session=session, allow_state_changes=False, timeout=(max(1.0, timeout * WORKFLOW_CONNECT_RATIO), timeout), pacer=pacer, deadline=deadline)
+            probe = request_same_origin_redirects("GET", candidate, session=local_session, allow_state_changes=False, timeout=(max(1.0, timeout * WORKFLOW_CONNECT_RATIO), timeout), pacer=pacer, deadline=deadline)
+            return candidate, probe
         except requests.RequestException:
+            return candidate, None
+    if retrieval_candidates:
+        retrieval_workers = max(1, min(len(retrieval_candidates), int(parallelism.get("network_workers") or 1)))
+        with ThreadPoolExecutor(max_workers=retrieval_workers, thread_name_prefix="secops-workflow-get") as executor:
+            retrieval_results = list(executor.map(fetch_candidate, retrieval_candidates))
+    else:
+        retrieval_results = []
+    for candidate, probe in retrieval_results:
+        if probe is None:
             continue
         present = marker in probe.text
         retrieved.append({
             "url": str(probe.url), "status": probe.status_code,
             "marker_present": present, "content_type": probe.headers.get("Content-Type", ""),
         })
-        if present:
+        if present and not findings:
             html_served = "html" in str(probe.headers.get("Content-Type") or "").lower()
             findings.append({
                 "alert": "User-controlled HTML file upload is web-accessible" if html_served else "Uploaded user-controlled file is web-accessible",
@@ -270,7 +296,7 @@ def _upload_check(
                 ),
                 "owasp_category": "A04:2021 Insecure Design", "cwe_id": "434",
             })
-            break
+    diagnostic["parallelism_policy"] = parallelism
     diagnostic["directory_searches"] = directory_searches
     diagnostic["retrieval_candidates"] = candidates[:20]
     diagnostic["retrieval_attempts"] = retrieved
@@ -450,7 +476,7 @@ def run_workflow_scan(
         )
         upload_findings, upload_diag = _upload_check(
             target_url, source_url, cookies, rows, file_parameters, phase_budgets["upload"], allow_state_changes, known_urls, pacer,
-            min(action_deadline, wall_clock_deadline(phase_budgets["upload"])),
+            min(action_deadline, wall_clock_deadline(phase_budgets["upload"])), request_rate,
         )
         captcha_findings, captcha_diag = _captcha_check(
             target_url, cookies, data, rows, phase_budgets["captcha"], allow_state_changes, pacer,

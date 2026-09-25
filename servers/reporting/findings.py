@@ -105,6 +105,13 @@ def _normalize_finding(raw: dict[str, Any], profile: str, tool: str) -> dict[str
     # while preserving the original scanner values here for audit.
     ai_analysis_raw = raw.get("ai_analysis") if isinstance(raw.get("ai_analysis"), dict) else {}
     ai_analysis = _redact_value(ai_analysis_raw) if ai_analysis_raw else {}
+    ai_analysis_status_raw = raw.get("ai_analysis_status") if isinstance(raw.get("ai_analysis_status"), dict) else {}
+    ai_analysis_status = _redact_value(ai_analysis_status_raw) if ai_analysis_status_raw else {}
+    ai_analysis_coverage = ([{
+        "profile": profile,
+        "tool": tool,
+        **ai_analysis_status,
+    }] if ai_analysis_status else [])
     scanner_risk = _redact_text(raw.get("scanner_risk") or "").strip()
     scanner_confidence = _redact_text(raw.get("scanner_confidence") or raw.get("confidence") or "not supplied").strip()
     scanner_description = _redact_text(raw.get("scanner_description") or "").strip()
@@ -114,14 +121,32 @@ def _normalize_finding(raw: dict[str, Any], profile: str, tool: str) -> dict[str
     scanner_solution = _redact_text(raw.get("scanner_solution") or "").strip()
 
     data_quality_notes: list[str] = []
-    if not description:
+    # When Agentic AI enriched a finding, the primary narrative fields above may now be populated
+    # even though the scanner did not originally provide them. Base provenance notes on the
+    # preserved scanner_* values in that case so the human report never makes AI-authored wording
+    # look scanner-authored. Deterministic/non-AI findings keep using their primary fields.
+    ai_enriched = bool(ai_analysis) or str(ai_analysis_status.get("status") or "") in {"analyzed", "reused_equivalent"}
+    scanner_had_description = bool(scanner_description) if ai_enriched else bool(description)
+    scanner_had_impact = bool(scanner_impact) if ai_enriched else bool(impact)
+    scanner_had_solution = bool(scanner_solution) if ai_enriched else bool(solution)
+    if not scanner_had_description:
         data_quality_notes.append(
+            "The scanner did not supply a narrative description; any populated primary description is AI-authored, while scanner evidence and structured fields remain separate."
+            if ai_enriched else
             "The scanner did not supply a narrative description; the report retained only the actual structured fields and evidence."
         )
-    if not impact:
-        data_quality_notes.append("The scanner did not provide a separate impact statement; the report did not infer one.")
-    if not solution:
-        data_quality_notes.append("The scanner did not provide remediation guidance; the report did not invent a recommendation.")
+    if not scanner_had_impact:
+        data_quality_notes.append(
+            "The scanner did not provide a separate impact statement; any populated primary impact is AI-authored."
+            if ai_enriched else
+            "The scanner did not provide a separate impact statement; the report did not infer one."
+        )
+    if not scanner_had_solution:
+        data_quality_notes.append(
+            "The scanner did not provide remediation guidance; any populated primary remediation is AI-authored."
+            if ai_enriched else
+            "The scanner did not provide remediation guidance; the report did not invent a recommendation."
+        )
     if not evidence:
         data_quality_notes.append("No request, response, payload, matcher, or other evidence was supplied by the scanner.")
 
@@ -135,7 +160,7 @@ def _normalize_finding(raw: dict[str, Any], profile: str, tool: str) -> dict[str
             "references", "reference", "attack_preconditions", "preconditions",
             "owasp_category", "payload", "payloads",
             "scanner_risk", "scanner_confidence", "scanner_description",
-            "scanner_impact", "scanner_consequences", "scanner_recovery", "scanner_solution", "ai_analysis",
+            "scanner_impact", "scanner_consequences", "scanner_recovery", "scanner_solution", "ai_analysis", "ai_analysis_status",
             "aggregate_source_entry_point", "aggregate_source_job_id", "aggregate_source_report_id",
         }
         and value not in (None, "", [], {})
@@ -150,6 +175,8 @@ def _normalize_finding(raw: dict[str, Any], profile: str, tool: str) -> dict[str
         "confidence": _redact_text(raw.get("confidence") or "not supplied"),
         "scanner_confidence": scanner_confidence,
         "ai_analysis": ai_analysis,
+        "ai_analysis_status": ai_analysis_status,
+        "ai_analysis_coverage": ai_analysis_coverage,
         "scanner_risk": scanner_risk,
         "scanner_description": scanner_description,
         "scanner_impact": scanner_impact,
@@ -344,12 +371,28 @@ def _merge_finding_rows(existing: dict[str, Any], row: dict[str, Any], profile: 
     corroboration.append({
         "tool": tool,
         "profile": profile,
+        "method": row.get("method", ""),
+        "parameter": row.get("parameter", ""),
         "verification_status": row.get("verification_status", ""),
+        "confidence": row.get("confidence", ""),
         "risk": row.get("risk", ""),
         "url": row.get("url", ""),
+        "description": row.get("description", ""),
+        "technical_details": row.get("technical_details", ""),
+        "evidence": row.get("evidence", ""),
+        "impact": row.get("impact", ""),
+        "consequences": row.get("consequences", ""),
+        "recovery": row.get("recovery", ""),
+        "solution": row.get("solution", ""),
+        "ai_analysis_status": row.get("ai_analysis_status", {}),
         "source_entry_point": row.get("source_entry_point", ""),
         "source_job_id": row.get("source_job_id", ""),
+        "source_report_id": row.get("source_report_id", ""),
     })
+    ai_coverage = existing.setdefault("ai_analysis_coverage", [])
+    for coverage_row in row.get("ai_analysis_coverage") or []:
+        if isinstance(coverage_row, dict) and coverage_row not in ai_coverage:
+            ai_coverage.append(coverage_row)
     if _finding_strength(row) > _finding_strength(existing):
         for key in (
             "alert", "risk", "category", "verification_status", "confidence",
@@ -358,7 +401,7 @@ def _merge_finding_rows(existing: dict[str, Any], row: dict[str, Any], profile: 
             "payloads", "references", "identifiers", "data_quality_notes", "scanner_fields",
             "method", "parameter",
             "scanner_risk", "scanner_confidence", "scanner_description",
-            "scanner_impact", "scanner_consequences", "scanner_recovery", "scanner_solution", "ai_analysis",
+            "scanner_impact", "scanner_consequences", "scanner_recovery", "scanner_solution", "ai_analysis", "ai_analysis_status",
             "source_entry_point", "source_job_id", "source_report_id",
         ):
             if row.get(key) not in (None, "", [], {}):
@@ -382,10 +425,18 @@ def flatten_findings(results: dict[str, Any]) -> list[dict[str, Any]]:
             if row.get("category") in {"vulnerability", "candidate"}:
                 family = _finding_family(row)
                 parameter = str(row.get("parameter") or "").lower()
+                method = str(row.get("method") or "").upper()
+                # A route/parameter family alone is not a safe semantic identity. GET and POST can
+                # exercise different handlers, so method is part of the dedup key. Profiles may still
+                # corroborate the same underlying issue, but their evidence is preserved explicitly in
+                # corroborating_findings instead of being silently discarded.
                 if family in {"stored-xss", "dom-xss", "reflected-xss", "xss"}:
-                    fingerprint = (family, _finding_route_key(str(row.get("url") or "")), parameter, _xss_context_key(str(row.get("url") or ""), parameter))
+                    fingerprint = (
+                        method, family, _finding_route_key(str(row.get("url") or "")),
+                        parameter, _xss_context_key(str(row.get("url") or ""), parameter),
+                    )
                 else:
-                    fingerprint = (family, _finding_route_key(str(row.get("url") or "")), parameter)
+                    fingerprint = (method, family, _finding_route_key(str(row.get("url") or "")), parameter)
             else:
                 fingerprint = (
                     str(row.get("tool") or ""),
@@ -470,7 +521,13 @@ def _truncate_human_value(value: Any, *, string_limit: int = 1400, list_limit: i
 
 
 def _human_readable_findings(findings: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], dict[str, int]]:
-    """Keep all vulnerabilities/candidates while bounding repetitive low-value detail."""
+    """Keep every security finding while bounding repetitive informational detail in HTML/PDF.
+
+    The normalized JSON remains complete.  The human-readable report intentionally caps only the
+    lower-value observation/discovery detail rows so a noisy scanner cannot make the PDF effectively
+    unbounded.  Aggregate counts are always computed from the complete normalized finding set, not
+    from this display-limited list.
+    """
     limits = {"observation": 35, "discovery": 25}
     kept: list[dict[str, Any]] = []
     omitted = {"observation": 0, "discovery": 0}

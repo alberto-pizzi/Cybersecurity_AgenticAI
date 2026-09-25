@@ -12,7 +12,7 @@ import orchestratorDeterministic as deterministic_core
 import orchestratorAgenticCore as agentic_core
 from assessmentConfig import default_max_rounds
 from orchestratorAgenticCore import (
-    AgentState, AI_PLANNER_TIMEOUTS, AI_PLANNER_WORKFLOW_TIMEOUTS, AI_ANALYSIS_STAGE_TIMEOUTS, SNAP4CITY_DEFAULT_API_URL, resolve_ai_model, assessment_wall_clock_budget_seconds,
+    AgentState, AI_PLANNER_TIMEOUTS, AI_PLANNER_WORKFLOW_TIMEOUTS, AI_ANALYSIS_STAGE_TIMEOUTS, SNAP4CITY_DEFAULT_API_URL, resolve_ai_model, assessment_execution_budget_seconds, assessment_wall_clock_budget_seconds,
     ensure_ollama_model, warm_ollama_model, ensure_snap4city_model,
     discovery_node, planner_node, executor_node, verification_node, analysis_node, report_node, route_after_execution,
     execute_action, execute_plan, validate_plan,
@@ -108,7 +108,7 @@ def main() -> int:
         "--ai-timeout",
         type=int,
         default=0,
-        help="AI planning budget per round; the analysis stage also derives its bounded per-batch budget from this value. 0 selects mode-specific defaults.",
+        help="AI planning budget per round only; final finding analysis has independent mode-specific phase and per-batch budgets. 0 selects planner defaults.",
     )
     args = parser.parse_args()
 
@@ -137,8 +137,8 @@ def main() -> int:
     globals()["CURRENT_SCAN_MODE"] = deterministic_core.CURRENT_SCAN_MODE
     globals()["ARJUN_TIMEOUT"] = deterministic_core.ARJUN_TIMEOUT
 
-    workflow_started_monotonic = time.monotonic()
     wall_clock_budget_seconds = assessment_wall_clock_budget_seconds(args.mode)
+    execution_budget_seconds = assessment_execution_budget_seconds(args.mode)
 
     checks = run_preflight_checks(include_live=True)
     errors = print_preflight_report(checks, show_ok=args.preflight_only)
@@ -148,8 +148,12 @@ def main() -> int:
         return 3
 
     print(
-        f"[*] Agentic wall-clock budget: {wall_clock_budget_seconds / 3600:.2f}h total "
-        f"(mode={args.mode}, including preflight/model preparation); finalization time is reserved automatically."
+        f"[*] Agentic operational execution budget: {execution_budget_seconds / 3600:.2f}h "
+        f"(mode={args.mode}); final verification, AI analysis and reporting use additional protected phase budgets."
+    )
+    print(
+        f"[*] Agentic internal last-resort watchdog: {wall_clock_budget_seconds / 3600:.2f}h; "
+        "this is hang/deadlock protection, not the normal scheduling limit."
     )
 
     target, profiles, _, secondary_cookie, injection = (
@@ -244,6 +248,8 @@ def main() -> int:
         )
 
     ai_diagnostics['selection'] = selection_diagnostics
+    workflow_started_monotonic = time.monotonic()
+
     initial: AgentState = {
         "target": target,
         "entry_points": entry_points,
@@ -280,10 +286,15 @@ def main() -> int:
         "only_tool": args.only_tool,
         "started_monotonic": workflow_started_monotonic,
         "wall_clock_budget_seconds": wall_clock_budget_seconds,
+        "execution_budget_seconds": execution_budget_seconds,
     }
     started = time.time()
     try:
-        final = build_graph().invoke(initial)
+        with assessment_rate_contract(MAX_REQUEST_RATE):
+            final = build_graph().invoke(initial)
+    except AssessmentRateContractError as exc:
+        print(f"[-] Assessment request-rate contract blocked target execution: {exc}", file=sys.stderr)
+        return 5
     except KeyboardInterrupt:
         return 130
     except Exception as exc:

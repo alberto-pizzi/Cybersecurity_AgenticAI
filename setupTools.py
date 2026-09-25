@@ -54,7 +54,12 @@ RELEASE_TOOLS = {'nuclei': ('projectdiscovery/nuclei', 'nuclei'), 'ffuf': ('ffuf
 # failures such as the historical Nikto '-nocheck' incompatibility.
 ARJUN_REQUIRED_FLAGS = ('-u', '-m', '-w', '-t', '-T', '-c', '-q', '--include', '--headers', '--disable-redirects')
 SQLMAP_API_REQUIRED_FLAGS = ('-s', '-H', '-p', '--username', '--password')
-COMMIX_REQUIRED_FLAGS = ('--url', '--batch', '--ignore-session', '--disable-coloring', '--ignore-redirects', '--level', '--timeout', '--retries', '--drop-set-cookie', '--time-limit', '--delay', '--technique', '--data', '-p', '--cookie')
+SQLMAP_SCAN_REQUIRED_FLAGS = (
+    '--url', '--batch', '--level', '--risk', '--technique', '--time-sec', '--timeout', '--retries',
+    '--threads', '--delay', '--flush-session', '--skip-waf', '--drop-set-cookie', '--time-limit',
+    '--ignore-redirects', '--method', '--data', '--cookie', '-p',
+)
+COMMIX_REQUIRED_FLAGS = ('--url', '--batch', '--ignore-session', '--disable-coloring', '--ignore-redirects', '--level', '--timeout', '--retries', '--drop-set-cookie', '--time-limit', '--delay', '--threads', '--technique', '--data', '-p', '--cookie')
 FFUF_REQUIRED_FLAGS = ('-u', '-w', '-of', '-o', '-ac', '-t', '-rate', '-timeout', '-maxtime', '-noninteractive', '-b')
 INTERACTSH_REQUIRED_FLAGS = ('-n', '-pi', '-json', '-v', '-duc', '-ps', '-psf', '-o')
 DALFOX_V3_REQUIRED_FLAGS = ('--format', '--output', '--param', '--cookies', '--no-color', '--silence', '--method', '--data')
@@ -303,7 +308,17 @@ def install_repository_tool(name: str, repository: str, script_name: str) -> Non
     # install is therefore not sufficient proof that the runtime wrapper can find what it needs.
     # Keep one initializer-managed checkout on every OS and make the launcher point to that checkout.
     if script.is_file():
-        print(f'[+] {name} managed repository available: {script}')
+        # Managed repository tools are expected to be refreshed when initScript verifies scanners.
+        # The old early-return left SQLMap/Commix indefinitely stale, so a wrapper could correctly
+        # validate a newer option contract in source while the VM kept an older checkout forever.
+        # clone_or_update is fail-safe: a fetch failure keeps the existing checkout, after which the
+        # explicit CLI/API contract validation below decides whether that checkout is usable.
+        if (destination / '.git').is_dir():
+            clone_or_update(repository, destination)
+        else:
+            print(f'[+] {name} managed script exists without Git metadata; validating existing runtime: {script}')
+        if not script.is_file():
+            raise RuntimeError(f'Missing {script_name} after refreshing {name}.')
         write_launcher(name, [sys.executable, str(script)])
         return
     if external:
@@ -1036,10 +1051,20 @@ def _validate_cli_contract(name: str, command: list[str], required_flags: tuple[
 def validate_scanner_cli_contracts() -> dict[str, Any]:
     results: dict[str, Any] = {}
     sqlmap_api = LOCAL_OPT / 'sqlmap' / 'sqlmapapi.py'
+    sqlmap_scan = LOCAL_OPT / 'sqlmap' / 'sqlmap.py'
     if sqlmap_api.is_file():
         results['sqlmap-api'] = _validate_cli_contract(
             'SQLMap REST API', [sys.executable, str(sqlmap_api), '-h'],
             SQLMAP_API_REQUIRED_FLAGS, accepted_codes=(0,),
+        )
+    if sqlmap_scan.is_file():
+        # The REST wrapper submits SQLMap's argparse destination names (e.g. timeLimit,
+        # dropSetCookie, ignoreRedirects). Requiring the corresponding public scanner flags at
+        # initialization catches stale/incompatible managed checkouts before an assessment can
+        # spend hours only to fail on an unknown option/REST field.
+        results['sqlmap-scan'] = _validate_cli_contract(
+            'SQLMap scanner', [sys.executable, str(sqlmap_scan), '-hh'],
+            SQLMAP_SCAN_REQUIRED_FLAGS, accepted_codes=(0,),
         )
     commix_script = LOCAL_OPT / 'commix' / 'commix.py'
     if commix_script.is_file():
@@ -1064,20 +1089,40 @@ def validate_scanner_cli_contracts() -> dict[str, Any]:
         legacy = run([dalfox, 'url', '--help'], required=False, capture=True, show_output=False, timeout=90)
         scan_help, legacy_help = _process_output(scan, 16000), _process_output(legacy, 16000)
         v3_required = DALFOX_V3_REQUIRED_FLAGS
-        v3_ok = all(_help_has_flag(scan_help, flag) for flag in v3_required)
+        v3_worker_ok = _help_has_flag(scan_help, '--workers') or _help_has_flag(scan_help, '--worker')
+        v3_rate_flag = next((flag for flag in ('--rate-limit', '--rl', '-r') if _help_has_flag(scan_help, flag)), '')
+        v3_delay_ok = _help_has_flag(scan_help, '--delay')
+        v3_ok = (
+            scan.returncode in (0, 1, 2)
+            and all(_help_has_flag(scan_help, flag) for flag in v3_required)
+            and v3_worker_ok
+            and bool(v3_rate_flag or v3_delay_ok)
+        )
         v2_param_ok = _help_has_flag(legacy_help, '--param') or _help_has_flag(legacy_help, '-p')
         v2_cookie_ok = _help_has_flag(legacy_help, '--cookies') or _help_has_flag(legacy_help, '--cookie')
+        v2_worker_ok = _help_has_flag(legacy_help, '--workers') or _help_has_flag(legacy_help, '--worker')
+        v2_rate_flag = next((flag for flag in ('--rate-limit', '--rl', '-r') if _help_has_flag(legacy_help, flag)), '')
+        v2_delay_ok = _help_has_flag(legacy_help, '--delay')
         v2_required = DALFOX_V2_REQUIRED_FLAGS
         v2_ok = (
             bool(legacy_help)
             and legacy.returncode in (0, 1, 2)
             and v2_param_ok
             and v2_cookie_ok
+            and v2_worker_ok
+            and bool(v2_rate_flag or v2_delay_ok)
             and all(_help_has_flag(legacy_help, flag) for flag in v2_required)
         )
         if not (v3_ok or v2_ok):
-            raise RuntimeError('Dalfox CLI contract validation failed: neither supported scan-mode nor legacy URL-mode help was detected.')
-        results['dalfox'] = {'v3': v3_ok, 'v2': v2_ok}
+            raise RuntimeError(
+                'Dalfox CLI contract validation failed: neither scan-mode nor legacy URL-mode exposes '
+                'the request/method/cookie contract plus bounded worker and aggregate-rate/serial-delay controls.'
+            )
+        results['dalfox'] = {
+            'v3': v3_ok, 'v2': v2_ok,
+            'v3_rate_control': v3_rate_flag or ('--delay(serial)' if v3_delay_ok else ''),
+            'v2_rate_control': v2_rate_flag or ('--delay(serial)' if v2_delay_ok else ''),
+        }
     nuclei_mode = str(_NUCLEI_ENGINE_STATE.get('execution_mode') or '')
     nuclei = command_path('nuclei')
     if nuclei and nuclei_mode != 'docker_official_image':

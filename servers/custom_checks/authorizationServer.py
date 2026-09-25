@@ -1,13 +1,14 @@
 from __future__ import annotations
 
 import hashlib
+from concurrent.futures import ThreadPoolExecutor
 import re
 from typing import Any
 from urllib.parse import parse_qsl, urljoin, urlparse
 
 import requests
 
-from utils import MAX_AUTHENTICATED_IDENTITIES, RequestRatePacer, canonical_cookie_header, cookie_header_fingerprint, deadline_bounded_request_timeout, partial, request_contract_state_change_reason, skipped, success
+from utils import MAX_AUTHENTICATED_IDENTITIES, RequestRatePacer, canonical_cookie_header, cookie_header_fingerprint, deadline_bounded_request_timeout, partial, request_contract_state_change_reason, secops_parallelism_policy, skipped, success
 
 from utils import same_origin
 
@@ -71,7 +72,8 @@ def _safe_get(url: str, cookies: str, request_budget: float, pacer: RequestRateP
         if state_reason:
             return None, "state_change_target_blocked:" + state_reason
         try:
-            pacer.wait()
+            if not pacer.wait(deadline):
+                return None, "time_limit_reached"
             request_timeout = deadline_bounded_request_timeout(
                 (max(0.01, float(request_budget) * 0.25), max(0.01, float(request_budget))), deadline,
             )
@@ -264,23 +266,43 @@ def run_authorization_scan(
             diagnosis="authorization_candidate_not_relevant", relevance_score=relevance_score, relevance_reasons=relevance_reasons,
         )
     planned_identity_requests = max(2, 2 + len(supplied_alternates))
-    # Keep the action wall-clock bounded while giving every configured identity a fair chance.
-    # For the historical primary+anonymous(+one alternate) case this stays close to the previous
-    # 30% per-request budget; with many identities it contracts automatically instead of letting
-    # the first accounts consume the entire action timeout.
+    parallelism = secops_parallelism_policy(request_rate)
+    identity_workers = max(1, min(planned_identity_requests, int(parallelism.get("network_workers") or 1)))
+    identity_waves = max(1, (planned_identity_requests + identity_workers - 1) // identity_workers)
+    # All identity reads are independent and read-only, so launch the primary, anonymous and
+    # alternate identities through one bounded pool.  The shared RequestRatePacer remains the
+    # authoritative request-start ceiling; concurrency only hides target latency.  Budget each
+    # request by the number of expected waves rather than by the raw identity count, otherwise a
+    # large configured identity set would be needlessly starved even though the requests overlap.
     fair_request_budget = max(2.0, min(
         proportional_budget(timeout, AUTHORIZATION_IDENTITY_RATIO),
-        (float(timeout) * 0.85) / float(planned_identity_requests),
+        (float(timeout) * 0.85) / float(identity_waves),
     ))
-    primary, primary_guard = _safe_get(target_url, cookies, fair_request_budget, pacer, deadline)
-    anonymous, anonymous_guard = _safe_get(target_url, "", fair_request_budget, pacer, deadline)
+    primary: requests.Response | None = None
+    primary_guard = ""
+    anonymous: requests.Response | None = None
+    anonymous_guard = ""
     alternate_responses: list[tuple[str, requests.Response | None, str]] = []
-    for index, alternate_cookie in enumerate(supplied_alternates):
-        if remaining_budget(deadline) <= 0:
-            alternate_responses.append((labels[index], None, "time_limit_reached"))
-            break
-        response, guard = _safe_get(target_url, alternate_cookie, fair_request_budget, pacer, deadline)
-        alternate_responses.append((labels[index], response, str(guard or "")))
+    identity_specs = [("primary", cookies), ("anonymous", ""), *alternate_pairs]
+    identity_results: dict[str, tuple[requests.Response | None, str]] = {}
+    if remaining_budget(deadline) > 0:
+        with ThreadPoolExecutor(max_workers=identity_workers, thread_name_prefix="secops-authz") as executor:
+            futures = [
+                (label, executor.submit(_safe_get, target_url, cookie, fair_request_budget, pacer, deadline))
+                for label, cookie in identity_specs
+            ]
+            for label, future in futures:
+                try:
+                    response, guard = future.result()
+                except Exception as exc:
+                    response, guard = None, f"transport_unavailable:{type(exc).__name__}"
+                identity_results[label] = (response, str(guard or ""))
+    primary, primary_guard = identity_results.get("primary", (None, "time_limit_reached" if remaining_budget(deadline) <= 0 else "transport_unavailable:not_executed"))
+    anonymous, anonymous_guard = identity_results.get("anonymous", (None, "time_limit_reached" if remaining_budget(deadline) <= 0 else "transport_unavailable:not_executed"))
+    alternate_responses = [
+        (label, *identity_results.get(label, (None, "time_limit_reached" if remaining_budget(deadline) <= 0 else "transport_unavailable:not_executed")))
+        for label, _ in alternate_pairs
+    ]
 
     if primary is None or primary.status_code >= 400 or looks_like_login(primary, text_limit=80_000):
         timed_out = primary_guard == "time_limit_reached"
@@ -301,7 +323,10 @@ def run_authorization_scan(
         "invalid_identity_labels": invalid_alternate_labels,
         "relevance_score": relevance_score, "relevance_reasons": relevance_reasons,
         "tool_timeout_seconds": timeout,
+        "parallelism_policy": parallelism,
         "identity_request_budget_seconds": round(fair_request_budget, 3),
+        "identity_workers": identity_workers,
+        "identity_waves": identity_waves,
         "phase_ratio_policy": {"identity_request_max_ratio": AUTHORIZATION_IDENTITY_RATIO, "shared_budget_fraction": 0.85},
     }
     if anonymous is not None:

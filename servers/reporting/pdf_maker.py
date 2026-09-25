@@ -11,13 +11,13 @@ import time
 import uuid
 from pathlib import Path
 
-from utils import ROOT_DIR, safe_int_value, safe_float_value
+from utils import ROOT_DIR, heavy_compute_workload_lease, safe_int_value, safe_float_value, subprocess_parallelism_environment
 
 REPORT_PDF_TIMEOUT_SECONDS = max(300, safe_int_value(os.getenv("SECOPS_REPORT_PDF_TIMEOUT", "3600"), 3600))
 
 
 # Converts an HTML report to PDF via native WeasyPrint, falling back to the report Docker image
-def html2pdf(html_path, pdf_path, *, timeout_seconds: int | float | None = None):
+def _html2pdf_under_heavy_slot(html_path, pdf_path, *, timeout_seconds: int | float | None = None):
     html_path = Path(html_path).resolve()
     pdf_path = Path(pdf_path).resolve()
     pdf_path.parent.mkdir(parents=True, exist_ok=True)
@@ -25,6 +25,9 @@ def html2pdf(html_path, pdf_path, *, timeout_seconds: int | float | None = None)
     effective_timeout = REPORT_PDF_TIMEOUT_SECONDS if timeout_seconds is None else max(30, safe_int_value(safe_float_value(timeout_seconds, REPORT_PDF_TIMEOUT_SECONDS), REPORT_PDF_TIMEOUT_SECONDS))
     conversion_started = time.monotonic()
     conversion_deadline = conversion_started + float(effective_timeout)
+    # PDF rendering is local CPU work. Keep renderer subprocesses inside the same VM CPU policy so
+    # native libraries cannot inherit a host-wide BLAS/OpenMP pool and oversubscribe the machine.
+    renderer_env = subprocess_parallelism_environment(os.environ.copy())
 
     def remaining_budget(*, minimum: float = 0.05) -> float:
         remaining = conversion_deadline - time.monotonic()
@@ -107,7 +110,7 @@ def html2pdf(html_path, pdf_path, *, timeout_seconds: int | float | None = None)
                 encoding="utf-8",
                 errors="replace",
                 timeout=stage_timeout(reserve_after=fallback_reserve),
-                check=False,
+                check=False, env=renderer_env,
             )
         except subprocess.TimeoutExpired as exc:
             temporary_pdf.unlink(missing_ok=True)
@@ -134,7 +137,7 @@ def html2pdf(html_path, pdf_path, *, timeout_seconds: int | float | None = None)
         inspect = subprocess.run(
             [docker, "image", "inspect", image],
             cwd=str(ROOT_DIR), capture_output=True, text=True, encoding="utf-8", errors="replace",
-            timeout=inspect_timeout, check=False,
+            timeout=inspect_timeout, check=False, env=renderer_env,
         )
     except subprocess.TimeoutExpired:
         return chromium_fallback(f"Report Docker image inspection exceeded {inspect_timeout}s; native={native_error}")
@@ -174,7 +177,7 @@ def html2pdf(html_path, pdf_path, *, timeout_seconds: int | float | None = None)
             encoding="utf-8",
             errors="replace",
             timeout=stage_timeout(reserve_after=chromium_reserve),
-            check=False,
+            check=False, env=renderer_env,
         )
     except subprocess.TimeoutExpired as exc:
         temporary_pdf.unlink(missing_ok=True)
@@ -189,3 +192,33 @@ def html2pdf(html_path, pdf_path, *, timeout_seconds: int | float | None = None)
 
     os.replace(temporary_pdf, pdf_path)
     print("Weasyprint Docker fallback: PDF converted into", pdf_path, file=sys.stderr)
+
+def html2pdf(html_path, pdf_path, *, timeout_seconds: int | float | None = None):
+    """Render a report under the VM-wide heavyweight local-work budget.
+
+    Waiting for the shared slot counts against the same caller-visible timeout, so concurrency
+    control cannot silently multiply report finalization time.
+    """
+    effective_timeout = REPORT_PDF_TIMEOUT_SECONDS if timeout_seconds is None else max(
+        30, safe_int_value(safe_float_value(timeout_seconds, REPORT_PDF_TIMEOUT_SECONDS), REPORT_PDF_TIMEOUT_SECONDS)
+    )
+    deadline = time.monotonic() + float(effective_timeout)
+    wait_started = time.monotonic()
+    with heavy_compute_workload_lease(deadline=deadline) as heavy_slot:
+        waited = time.monotonic() - wait_started
+        if heavy_slot is None:
+            raise TimeoutError(
+                f"PDF conversion could not acquire a VM heavyweight-work slot within {effective_timeout}s."
+            )
+        remaining = deadline - time.monotonic()
+        if remaining < 30.0:
+            raise TimeoutError(
+                f"PDF conversion spent {waited:.2f}s waiting for VM resources and has insufficient "
+                "rendering budget remaining."
+            )
+        print(
+            f"PDF VM resource slot={heavy_slot}; wait={waited:.2f}s; remaining={remaining:.2f}s",
+            file=sys.stderr,
+        )
+        return _html2pdf_under_heavy_slot(html_path, pdf_path, timeout_seconds=remaining)
+

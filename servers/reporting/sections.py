@@ -466,7 +466,17 @@ def _render_severity_legend(toc: list[tuple[int, str, str]], context_value: dict
     )
     ai_assessment = context_value.get("ai_analysis", {}) if isinstance(context_value, dict) else {}
     assessed = safe_int_value(ai_assessment.get("analyzed_findings", 0), 0) if isinstance(ai_assessment, dict) else 0
+    unassessed = safe_int_value(ai_assessment.get('candidate_findings_unanalyzed', 0), 0) if isinstance(ai_assessment, dict) else 0
     if assessed:
+        reused = safe_int_value(ai_assessment.get('analysis_findings_reused_from_equivalent_group', 0), 0) if isinstance(ai_assessment, dict) else 0
+        reuse_note = (
+            f' Strictly equivalent instances may reuse one AI assessment to spend the protected analysis budget on unique security contexts; {reused} instance(s) used this path in this run, while each retained its own scanner evidence.'
+            if reused else ''
+        )
+        incomplete_note = (
+            f' {unassessed} security finding(s) did not receive AI post-analysis; those cards are explicitly marked and retain their complete scanner/verifier information without an AI-authored rewrite.'
+            if unassessed else ''
+        )
         methodology = (
             '<p class="section-note">For this agentic run, severity, description, security impact and recommended '
             'remediation are independently post-assessed by the configured AI provider/model from the scanner/verifier evidence; each is marked '
@@ -477,14 +487,20 @@ def _render_severity_legend(toc: list[tuple[int, str, str]], context_value: dict
             'guide the AI risk classification. Each finding also carries two distinct confidence values: “Tool '
             'confidence” in the badge row is the scanner/verifier\'s own confidence in the evidence rule that confirmed '
             'it, while “AI assessment confidence” inside the Agentic risk assessment box is the AI\'s confidence in its '
-            'own independent severity judgement - the two are not interchangeable.</p>'
+            'own independent severity judgement - the two are not interchangeable.'
+            + _esc(reuse_note + incomplete_note)
+            + '</p>'
         )
     else:
+        ai_unassessed_note = (
+            f' AI post-analysis did not cover {unassessed} confirmed/candidate finding(s); each remains fully reported from scanner/verifier evidence and is explicitly marked as not AI-analyzed.'
+            if unassessed else ''
+        )
         methodology = (
             '<p class="section-note">Severity is the risk rating supplied by the originating scanner for each finding, '
             'escalated to a confirmed vulnerability only when the tool-specific evidence rule described in '
             '“Methodology” is satisfied. The definitions below describe what each rating means for '
-            'prioritization; they are not recalculated per finding.</p>'
+            'prioritization; they are not recalculated per finding.' + _esc(ai_unassessed_note) + '</p>'
         )
     return (
         f"{heading}"
@@ -722,11 +738,21 @@ def _render_cover(
     assessor_display = payload.get("assessor") or "SecOps Automated Assessment Platform"
     report_version = payload.get("report_version") or "n/a"
     report_id = payload.get("report_id") or "n/a"
+    execution_seconds = safe_float_value(payload.get("assessment_execution_seconds"), 0.0)
+    if execution_seconds >= 3600:
+        execution_display = f"{execution_seconds / 3600:.2f} h ({execution_seconds:.0f} s)"
+    elif execution_seconds >= 60:
+        execution_display = f"{execution_seconds / 60:.1f} min ({execution_seconds:.0f} s)"
+    elif execution_seconds > 0:
+        execution_display = f"{execution_seconds:.1f} s"
+    else:
+        execution_display = "n/a"
     cover_rows: list[tuple[str, str]] = [
         ("Client", _esc(CLIENT_NAME)),
         ("Target", _esc(client_display)),
         ("Assessor / team", _esc(assessor_display)),
         ("Assessment date(s)", _esc(assessment_dates)),
+        ("Assessment execution time", _esc(execution_display)),
         ("Report issue date", generated_display),
         ("Report version / ID", _esc(f"{report_version} / {report_id}")),
         ("AI model used", _ai_model_display(context)),

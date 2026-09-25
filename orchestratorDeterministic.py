@@ -31,7 +31,7 @@ from orchestratorShared import (
     tool_action_limit, tool_execution_rank, write_emergency_json_report,
     _server_python, _tool_case_skip_reason,
 )
-from utils import normalize_url, same_origin, scanner_session_probe
+from utils import AssessmentRateContractError, assessment_rate_contract, normalize_url, same_origin, scanner_session_probe
 
 # The compatibility self-test looks for Client(url), mcp_http_handshake_ok, ToolSpec("idor", "pentest_tools/exploitation/idorForgeServer.py", "run_idor_check", "idor-forge"), and ToolSpec("report", "reporting/reportServer.py", "generate_report", module="weasyprint").
 
@@ -83,6 +83,7 @@ class DeterministicState(TypedDict, total=False):
     oast_selection_summary: dict[str, list[dict[str, Any]]]
     assessment_context: dict[str, Any]
     report_status: dict[str, Any]
+    assessment_started_monotonic: float
 
 # Discovers pages, forms, and request cases separately for every active profile.
 async def deterministic_discovery_node(state: DeterministicState) -> dict[str, Any]:
@@ -95,13 +96,50 @@ async def deterministic_discovery_node(state: DeterministicState) -> dict[str, A
     diagnostics: list[dict[str, Any]] = []
     results = {profile['name']: {} for profile in profiles}
     workflow_state_changes = state_changing_tests_allowed(target, allow_state_changes)
+    print(
+        f"    [DISCOVERY] sweep servizi same-host avvio: enabled={shared.DISCOVER_SAME_HOST_SERVICES}; "
+        f"network_inflight={shared.DISCOVERY_NETWORK_MAX_INFLIGHT}; rate={shared.MAX_REQUEST_RATE:g} req/s.",
+        flush=True,
+    )
+    shared_service_discovery = await asyncio.to_thread(shared.discover_same_host_web_services, target)
+    print(
+        f"    [DISCOVERY] sweep servizi same-host completato: porte={int(shared_service_discovery.get('ports_probed', 0) or 0)}/"
+        f"{int(shared_service_discovery.get('candidate_ports_planned', 0) or 0)}; "
+        f"servizi_web={len(shared_service_discovery.get('web_services', []) or [])}; "
+        f"cache_hit={bool(shared_service_discovery.get('cache_hit', False))}; "
+        f"elapsed={float(shared_service_discovery.get('duration_seconds', 0.0) or 0.0):.1f}s.",
+        flush=True,
+    )
+    profile_workers = max(1, min(len(profiles) or 1, int(shared.PARALLELISM_POLICY.get('profile_workers') or 1)))
+    profile_semaphore = asyncio.Semaphore(profile_workers)
+
+    async def _discover_profile(profile: dict[str, Any]) -> tuple[str, dict[str, Any]]:
+        async with profile_semaphore:
+            name = str(profile.get('name') or '')
+            print(
+                f"    [DISCOVERY] profilo {name or '?'} core avvio: authenticated={bool(profile.get('cookies'))}; "
+                f"shared_network_pool={shared.DISCOVERY_NETWORK_MAX_INFLIGHT}; browser_slots={int(shared.PARALLELISM_POLICY.get('browser_profile_workers') or 1)}.",
+                flush=True,
+            )
+            found = await asyncio.to_thread(
+                discover_target, target, profile.get('cookies', ''), shared.MAX_CRAWL_PAGES,
+                list(state.get('discovery_seeds') or []), list(state.get('entry_points') or []),
+                allow_state_changes=workflow_state_changes,
+                precomputed_same_host_service_discovery=shared_service_discovery,
+            )
+            print(
+                f"    [DISCOVERY] profilo {name or '?'} core completato "
+                f"({len(found.get('html_urls', []))} HTML, {len(found.get('request_cases', []))} contratti).",
+                flush=True,
+            )
+            return name, found
+
+    discovered_profiles = await asyncio.gather(*(_discover_profile(profile) for profile in profiles))
+    profile_results = {name: found for name, found in discovered_profiles}
+
     for profile in profiles:
         name = profile['name']
-        found = await asyncio.to_thread(
-            discover_target, target, profile['cookies'], shared.MAX_CRAWL_PAGES,
-            list(state.get('discovery_seeds') or []), list(state.get('entry_points') or []),
-            allow_state_changes=workflow_state_changes,
-        )
+        found = profile_results[name]
         if profile.get('cookies') and found.get('authentication_effective') is not False:
             found = await asyncio.to_thread(
                 shared.authenticate_discovered_sibling_origins, found, target, profile['cookies'],
@@ -136,6 +174,10 @@ async def deterministic_discovery_node(state: DeterministicState) -> dict[str, A
             print(f"      [DISCOVERY] Budget adattivo Chromium: base={browser_budget}, overflow={browser_overflow}, tentativi={browser_attempted}/{browser_max_budget}.")
         if browser_remaining and browser_attempted >= browser_max_budget:
             print(f"      [DISCOVERY] Budget massimo navigazioni Chromium saturo: {browser_attempted}/{browser_max_budget}; restano {browser_remaining} candidati in coda.")
+        browser_slot_wait = float(budget.get('browser_slot_wait_seconds', 0.0) or 0.0)
+        browser_slots = int(budget.get('browser_profile_slots', 1) or 1)
+        if browser_slot_wait >= 0.05:
+            print(f"      [DISCOVERY] Attesa slot CPU Chromium={browser_slot_wait:.2f}s; slot profilo browser concorrenti={browser_slots}.")
         script_done = int(budget.get('scripts_processed', 0) or 0)
         script_budget = int(budget.get('script_budget', 0) or 0)
         script_attempts = int(budget.get('script_requests_attempted', 0) or 0)
@@ -936,7 +978,8 @@ async def deterministic_report_node(state: DeterministicState) -> dict[str, Any]
         'discover_same_host_services': shared.DISCOVER_SAME_HOST_SERVICES,
         'authentication_scope_policy': ('authenticated destinations try an applicable existing cookie first; when same-host multi-port is enabled, the raw cookie may be tried on another authorized port of the exact same hostname and scheme and must validate; if rejected, saved browser/OIDC state is tried, followed by the username/password resolved once by the runner if the login flow requests them; a conclusively rejected speculative raw cookie is remembered per cookie+origin so later scanners do not retry it; raw cookies are never copied to a different hostname and no second child-console prompt is opened'),
         'redirect_scope_policy': ('active scanners use explicit-origin authorization; same-host multi-port expansion is ' + ('enabled (exact hostname, HTTP/HTTPS services across authorized ports)' if shared.ALLOW_SAME_HOST_PORTS else 'disabled') + '; sensitive HTTP helpers stay same-origin, while project discovery follows bounded redirects only across destinations authorized before the run; external scanner processes do not autonomously follow redirects, so tool-internal redirect-dependent behavior is intentionally conservative; ZAP adds an exact-origin context plus in-scope-only active scans and Protected mode; browser authentication may traverse an external IdP without authorizing it for active testing'),
-        'damage_recovery_policy': 'Confirmed findings retain scanner evidence and receive conservative consequence and recovery/restoration guidance when the originating tool does not provide it. Potential damage is never reported as observed damage without supporting evidence.'}
+        'damage_recovery_policy': 'Confirmed findings retain scanner evidence and receive conservative consequence and recovery/restoration guidance when the originating tool does not provide it. Potential damage is never reported as observed damage without supporting evidence.',
+        'assessment_execution_seconds': round(max(0.0, time.monotonic() - float(state.get('assessment_started_monotonic') or time.monotonic())), 3)}
     context['orchestration'] = {'engine': 'langgraph', 'mode': 'deterministic', 'nodes': ['discovery', 'broad_scan', 'parameter_scan', 'authorization', 'browser_workflow', 'special_checks', 'verification', 'report']}
     print('\n[*] Generazione report...')
     output_name = str(os.environ.get('SECOPS_REPORT_RUN_ID') or f'SecOps_Assessment_{datetime.now():%Y%m%d_%H%M%S_%f}_{os.getpid()}_{uuid.uuid4().hex[:8]}')
@@ -955,7 +998,7 @@ async def deterministic_report_node(state: DeterministicState) -> dict[str, Any]
 # The deterministic pipeline executes the full graph and returns the state produced by its final node.
 async def run_pipeline(target: str, profiles: list[dict[str, str]], injection_url: str, allow_state_changes: bool | None=None, secondary_cookies: str='', entry_points: list[str] | None=None, discovery_seeds: list[str] | None=None) -> dict[str, Any]:
     # The deterministic graph starts from a fresh state containing discovery, results, and scan settings.
-    initial: DeterministicState = {'target': target, 'entry_points': list(entry_points or []), 'discovery_seeds': list(discovery_seeds or []), 'profiles': profiles, 'injection_url': injection_url, 'allow_state_changes': allow_state_changes, 'secondary_cookies': secondary_cookies}
+    initial: DeterministicState = {'target': target, 'entry_points': list(entry_points or []), 'discovery_seeds': list(discovery_seeds or []), 'profiles': profiles, 'injection_url': injection_url, 'allow_state_changes': allow_state_changes, 'secondary_cookies': secondary_cookies, 'assessment_started_monotonic': time.monotonic()}
     final = await build_deterministic_graph().ainvoke(initial)
     return {'results': final['results'], 'discovery': final['discovery'], 'diagnostics': final['diagnostics'], 'report_status': final['report_status']}
 
@@ -1171,24 +1214,28 @@ def main() -> int:
         print(f"[*] Priority discovery seeds: {len(discovery_seeds)} URL(s) will be explored under normal discovery limits.")
     if args.tool:
         try:
-            result = asyncio.run(
-                run_single_tool_debug(
-                    tool=args.tool,
-                    target=target,
-                    cookies=cookie,
-                    secondary_cookies=secondary_cookie,
-                    mode=args.mode,
-                    explicit_url=args.tool_url,
-                    method=args.method,
-                    data=args.data,
-                    parameters=_parse_parameter_argument(args.parameters),
-                    jwt_token=args.jwt_token,
-                    injection_url=injection_url,
-                    timeout_override=args.tool_timeout,
-                    diagnostic_only=args.diagnostic_only,
-                    allow_state_changes=args.allow_state_changes,
+            with assessment_rate_contract(shared.MAX_REQUEST_RATE):
+                result = asyncio.run(
+                    run_single_tool_debug(
+                        tool=args.tool,
+                        target=target,
+                        cookies=cookie,
+                        secondary_cookies=secondary_cookie,
+                        mode=args.mode,
+                        explicit_url=args.tool_url,
+                        method=args.method,
+                        data=args.data,
+                        parameters=_parse_parameter_argument(args.parameters),
+                        jwt_token=args.jwt_token,
+                        injection_url=injection_url,
+                        timeout_override=args.tool_timeout,
+                        diagnostic_only=args.diagnostic_only,
+                        allow_state_changes=args.allow_state_changes,
+                    )
                 )
-            )
+        except AssessmentRateContractError as exc:
+            print(f"[-] Assessment request-rate contract blocked target execution: {exc}", file=sys.stderr)
+            return 5
         except (ValueError, RuntimeError) as exc:
             parser.error(str(exc))
         profile_name = "authenticated" if cookie else "anonymous"
@@ -1212,17 +1259,21 @@ def main() -> int:
     print(f"[*] Profiles: {', '.join(profile['name'] for profile in profiles)}")
     started = time.time()
     try:
-        final = asyncio.run(
-            run_pipeline(
-                target,
-                profiles,
-                injection_url,
-                allow_state_changes=args.allow_state_changes,
-                secondary_cookies=secondary_cookie,
-                entry_points=entry_points,
-                discovery_seeds=discovery_seeds,
+        with assessment_rate_contract(shared.MAX_REQUEST_RATE):
+            final = asyncio.run(
+                run_pipeline(
+                    target,
+                    profiles,
+                    injection_url,
+                    allow_state_changes=args.allow_state_changes,
+                    secondary_cookies=secondary_cookie,
+                    entry_points=entry_points,
+                    discovery_seeds=discovery_seeds,
+                )
             )
-        )
+    except AssessmentRateContractError as exc:
+        print(f"[-] Assessment request-rate contract blocked target execution: {exc}", file=sys.stderr)
+        return 5
     except KeyboardInterrupt:
         print("\n[!] Workflow interrupted by the operator.", file=sys.stderr)
         return 130

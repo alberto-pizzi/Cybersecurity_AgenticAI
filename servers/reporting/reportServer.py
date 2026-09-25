@@ -32,11 +32,12 @@ REPORT_UPLOAD_MAX_COMPRESSED_BYTES = REPORT_UPLOAD_MAX_BYTES + 1024 * 1024
 REPORT_UPLOAD_MAX_CHUNKS = max(8, safe_int_value(os.getenv("SECOPS_REPORT_UPLOAD_MAX_CHUNKS", "2048"), 2048))
 REPORT_PDF_TIMEOUT_SECONDS = {
     # Keep the actual renderer deadline below the corresponding MCP render ceiling and below the
-    # normal report window guaranteed by the Agentic finalization reserve.
-    'test': max(180, safe_int_value(os.getenv("SECOPS_TEST_REPORT_PDF_TIMEOUT", "480"), 480)),
-    'fast': max(300, safe_int_value(os.getenv("SECOPS_FAST_REPORT_PDF_TIMEOUT", "720"), 720)),
-    'balanced': max(300, safe_int_value(os.getenv("SECOPS_BALANCED_REPORT_PDF_TIMEOUT", "1080"), 1080)),
-    'deep': max(300, safe_int_value(os.getenv("SECOPS_DEEP_REPORT_PDF_TIMEOUT", "1620"), 1620)),
+    # normal report window guaranteed by the Agentic reporting phase. These are generous safety
+    # ceilings; successful HTML/PDF generation returns immediately and does not consume the window.
+    'test': max(180, safe_int_value(os.getenv("SECOPS_TEST_REPORT_PDF_TIMEOUT", "840"), 840)),
+    'fast': max(300, safe_int_value(os.getenv("SECOPS_FAST_REPORT_PDF_TIMEOUT", "2940"), 2940)),
+    'balanced': max(300, safe_int_value(os.getenv("SECOPS_BALANCED_REPORT_PDF_TIMEOUT", "4740"), 4740)),
+    'deep': max(300, safe_int_value(os.getenv("SECOPS_DEEP_REPORT_PDF_TIMEOUT", "8040"), 8040)),
 }
 _REPORT_UPLOADS: dict[str, dict] = {}
 _REPORT_UPLOAD_LOCK = threading.Lock()
@@ -207,15 +208,16 @@ def _generate_report(
         "generated_at": datetime.now(timezone.utc),
         "target": target_url,
         "reporting_policy": "Scanner-grounded: observed facts are not invented; potential consequences and recovery guidance remain explicitly conditional when damage is not evidenced.",
-        "executive_summary": _executive_text(summary, findings),
+        "executive_summary": _executive_text(summary, all_findings, context),
         "summary": summary,
         "coverage": coverage,
         "endpoint_coverage": endpoint_coverage,
         "endpoint_coverage_summary": endpoint_coverage_summary,
-        "security_findings_count": sum(item["category"] == "vulnerability" for item in findings),
-        "candidate_findings_count": sum(item["category"] == "candidate" for item in findings),
-        "observations_count": sum(item["category"] in {"discovery", "observation"} for item in findings),
-        "findings_count": len(findings),
+        "security_findings_count": sum(item["category"] == "vulnerability" for item in all_findings),
+        "candidate_findings_count": sum(item["category"] == "candidate" for item in all_findings),
+        "observations_count": sum(item["category"] in {"discovery", "observation"} for item in all_findings),
+        "findings_count": len(all_findings),
+        "assessment_execution_seconds": max(0.0, float(context.get("assessment_execution_seconds") or 0.0)) if isinstance(context, dict) else 0.0,
         "findings": findings,
         "all_findings": all_findings,
         "findings_by_category": _finding_groups(findings),
@@ -266,7 +268,7 @@ def _generate_report(
         result.update(
             json_filename=str(json_path.resolve()),
             review_snapshot_filename=str(review_snapshot_path.resolve()) if review_snapshot_path.is_file() else None,
-            html_filename=str(html_path.resolve()), pdf_filename=None, findings_count=len(findings),
+            html_filename=str(html_path.resolve()), pdf_filename=None, findings_count=len(all_findings),
             local_json_generated=json_path.is_file(), local_html_generated=html_path.is_file(),
             local_review_snapshot_generated=review_snapshot_path.is_file(), local_pdf_generated=False,
         )
@@ -276,7 +278,7 @@ def _generate_report(
         result.update(
             json_filename=str(json_path.resolve()),
             review_snapshot_filename=str(review_snapshot_path.resolve()) if review_snapshot_path.is_file() else None,
-            html_filename=str(html_path.resolve()), pdf_filename=None, findings_count=len(findings),
+            html_filename=str(html_path.resolve()), pdf_filename=None, findings_count=len(all_findings),
         )
         return result
     finally:
@@ -307,7 +309,7 @@ def _generate_report(
         local_html_generated=True,
         local_json_generated=True,
         local_review_snapshot_generated=True,
-        findings_count=len(findings),
+        findings_count=len(all_findings),
         security_findings_count=payload["security_findings_count"],
         candidate_findings_count=payload["candidate_findings_count"],
         observations_count=payload["observations_count"],

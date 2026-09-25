@@ -3,6 +3,7 @@ import argparse
 import atexit
 import ast
 import contextlib
+import copy
 import asyncio
 import functools
 import base64
@@ -46,7 +47,7 @@ with warnings.catch_warnings():
         # Keep lightweight CLI surfaces such as --help/--list-tools available before the
         # runtime environment is initialized. Live preflight reports the missing dependency.
         Client = None  # type: ignore[assignment,misc]
-from utils import RequestRatePacer, apply_runtime_target_preparation, absolute_url, atomic_write_text, canonical_cookie_header, cookie_header_fingerprint, cookie_names, load_runtime_config, normalize_url, normalized_origin, normalized_hostname, parse_cookie_header, request_same_origin_redirects, request_contract_state_change_reason, ROOT_DIR, same_origin, sanitize_discovered_url, scanner_session_probe, secops_source_fingerprint, request_body_fingerprint, SERVERS_DIR, target_runtime_profile, url_in_authorized_scope as _url_in_explicit_scope, MCP_UNIFIED_SERVICE, mcp_http_port, mcp_http_url, scanner_request_rate, runtime_request_rate_policy, request_rate_budget_scale, rate_aware_network_budget, MAX_AUTHENTICATED_IDENTITIES, valid_identity_label, safe_int_value, safe_bool_value, safe_float_value, deadline_bounded_request_timeout
+from utils import RequestRatePacer, apply_runtime_target_preparation, absolute_url, atomic_write_text, canonical_cookie_header, cookie_header_fingerprint, cookie_names, load_runtime_config, normalize_url, normalized_origin, normalized_hostname, parse_cookie_header, request_same_origin_redirects, request_contract_state_change_reason, ROOT_DIR, same_origin, sanitize_discovered_url, scanner_session_probe, secops_source_fingerprint, request_body_fingerprint, SERVERS_DIR, target_runtime_profile, url_in_authorized_scope as _url_in_explicit_scope, MCP_UNIFIED_SERVICE, mcp_http_port, mcp_http_url, scanner_request_rate, runtime_request_rate_policy, request_rate_budget_scale, rate_aware_network_budget, MAX_AUTHENTICATED_IDENTITIES, valid_identity_label, safe_int_value, safe_bool_value, safe_float_value, deadline_bounded_request_timeout, secops_parallelism_policy, subprocess_parallelism_environment, browser_workload_lease
 from targetAuth import BrowserLoginError, _capture_storage_state, _looks_like_application_login_entry, browser_oidc_login_session
 ROOT = Path(ROOT_DIR).resolve()
 SERVERS = Path(SERVERS_DIR).resolve()
@@ -68,15 +69,15 @@ MCP_REPORT_CHUNK_TIMEOUT = max(30.0, safe_float_value(os.getenv('SECOPS_MCP_REPO
 # separate 120-second emergency-artifact tail.
 REPORT_TRANSFER_TIMEOUT_SECONDS = {
     'test': max(30.0, safe_float_value(os.getenv('SECOPS_TEST_REPORT_TRANSFER_TIMEOUT', '60'), 60.0)),
-    'fast': max(60.0, safe_float_value(os.getenv('SECOPS_FAST_REPORT_TRANSFER_TIMEOUT', '120'), 120.0)),
-    'balanced': max(60.0, safe_float_value(os.getenv('SECOPS_BALANCED_REPORT_TRANSFER_TIMEOUT', '180'), 180.0)),
-    'deep': max(60.0, safe_float_value(os.getenv('SECOPS_DEEP_REPORT_TRANSFER_TIMEOUT', '240'), 240.0)),
+    'fast': max(60.0, safe_float_value(os.getenv('SECOPS_FAST_REPORT_TRANSFER_TIMEOUT', '180'), 180.0)),
+    'balanced': max(60.0, safe_float_value(os.getenv('SECOPS_BALANCED_REPORT_TRANSFER_TIMEOUT', '300'), 300.0)),
+    'deep': max(60.0, safe_float_value(os.getenv('SECOPS_DEEP_REPORT_TRANSFER_TIMEOUT', '480'), 480.0)),
 }
 REPORT_RENDER_TIMEOUT_SECONDS = {
-    'test': max(120.0, safe_float_value(os.getenv('SECOPS_TEST_REPORT_RENDER_TIMEOUT', '540'), 540.0)),
-    'fast': max(180.0, safe_float_value(os.getenv('SECOPS_FAST_REPORT_RENDER_TIMEOUT', '780'), 780.0)),
-    'balanced': max(300.0, safe_float_value(os.getenv('SECOPS_BALANCED_REPORT_RENDER_TIMEOUT', '1140'), 1140.0)),
-    'deep': max(300.0, safe_float_value(os.getenv('SECOPS_DEEP_REPORT_RENDER_TIMEOUT', '1680'), 1680.0)),
+    'test': max(120.0, safe_float_value(os.getenv('SECOPS_TEST_REPORT_RENDER_TIMEOUT', '900'), 900.0)),
+    'fast': max(180.0, safe_float_value(os.getenv('SECOPS_FAST_REPORT_RENDER_TIMEOUT', '3000'), 3000.0)),
+    'balanced': max(300.0, safe_float_value(os.getenv('SECOPS_BALANCED_REPORT_RENDER_TIMEOUT', '4800'), 4800.0)),
+    'deep': max(300.0, safe_float_value(os.getenv('SECOPS_DEEP_REPORT_RENDER_TIMEOUT', '8100'), 8100.0)),
 }
 # The generic MCP timeout is intentionally generous for normal assessments, but TEST is a smoke
 # profile and must not inherit a 20-minute control-plane watchdog. This ceiling applies only to
@@ -88,7 +89,41 @@ TERMINAL_URL_MAX = max(120, safe_int_value(os.getenv('SECOPS_TERMINAL_URL_MAX', 
 
 MAX_REQUEST_RATE = scanner_request_rate()
 REQUEST_INTERVAL_SECONDS = 1.0 / MAX_REQUEST_RATE
+PARALLELISM_POLICY = secops_parallelism_policy(MAX_REQUEST_RATE)
+_BROWSER_DISCOVERY_MAX_CONCURRENT = max(1, int(PARALLELISM_POLICY.get('browser_profile_workers') or 1))
+_BROWSER_DISCOVERY_SEMAPHORE = threading.BoundedSemaphore(_BROWSER_DISCOVERY_MAX_CONCURRENT)
 _DISCOVERY_REQUEST_PACER = RequestRatePacer(MAX_REQUEST_RATE)
+_DISCOVERY_PROGRESS_LOCK = threading.Lock()
+_DISCOVERY_PROGRESS_LAST = 0.0
+_DISCOVERY_PROGRESS_LAST_STARTS = 0
+DISCOVERY_PROGRESS_INTERVAL_SECONDS = max(5.0, min(300.0, safe_float_value(os.getenv('SECOPS_DISCOVERY_PROGRESS_INTERVAL', '30'), 30.0)))
+
+def _discovery_progress(phase: str, detail: str = '') -> None:
+    """Emit one aggregate discovery heartbeat without flooding concurrent profile logs."""
+    global _DISCOVERY_PROGRESS_LAST, _DISCOVERY_PROGRESS_LAST_STARTS
+    now = time.monotonic()
+    with _DISCOVERY_PROGRESS_LOCK:
+        if _DISCOVERY_PROGRESS_LAST <= 0.0:
+            _DISCOVERY_PROGRESS_LAST = now
+            _DISCOVERY_PROGRESS_LAST_STARTS = int(_DISCOVERY_REQUEST_PACER.stats().get('request_starts', 0) or 0)
+            return
+        elapsed = now - _DISCOVERY_PROGRESS_LAST
+        if elapsed < DISCOVERY_PROGRESS_INTERVAL_SECONDS:
+            return
+        stats = _DISCOVERY_REQUEST_PACER.stats()
+        starts = int(stats.get('request_starts', 0) or 0)
+        recent_rate = max(0.0, (starts - _DISCOVERY_PROGRESS_LAST_STARTS) / max(0.001, elapsed))
+        _DISCOVERY_PROGRESS_LAST = now
+        _DISCOVERY_PROGRESS_LAST_STARTS = starts
+    suffix = f' | {detail}' if detail else ''
+    effective_rate = max(0.001, float(stats.get('last_effective_shared_rate', MAX_REQUEST_RATE) or MAX_REQUEST_RATE))
+    utilization = max(0.0, min(999.0, (recent_rate / effective_rate) * 100.0))
+    print(
+        f"[DISCOVERY PROGRESS] {phase}: aggregate target starts≈{recent_rate:.2f} req/s "
+        f"(configured={MAX_REQUEST_RATE:g}, effective_shared={effective_rate:g}, utilization≈{utilization:.0f}%); "
+        f"starts={starts}; throttle_wait={float(stats.get('throttle_sleep_seconds', 0.0) or 0.0):.1f}s{suffix}",
+        flush=True,
+    )
 
 def _pace_http_request(deadline: float | None = None) -> bool:
     # Shared across project-controlled Python processes. Worker concurrency can hide network latency
@@ -162,7 +197,15 @@ BROWSER_DISCOVERY_MIN_SECONDS = 120.0
 BROWSER_DISCOVERY_MIN_SECONDS_BY_MODE = {'test': float(TEST_DISCOVERY_TIME_BUDGET_SECONDS)}
 # Concurrency hides socket/response latency only. The cross-process pacer remains authoritative,
 # and this in-flight ceiling is intentionally profile-independent so DEEP is deeper, not more aggressive.
-DISCOVERY_NETWORK_MAX_INFLIGHT = max(1, min(32, safe_int_value(os.getenv('SECOPS_DISCOVERY_MAX_INFLIGHT', '6'), 6)))
+_DISCOVERY_AUTO_INFLIGHT = int(PARALLELISM_POLICY.get('network_workers') or 1)
+DISCOVERY_NETWORK_MAX_INFLIGHT = max(1, min(64, safe_int_value(os.getenv('SECOPS_DISCOVERY_MAX_INFLIGHT', str(_DISCOVERY_AUTO_INFLIGHT)), _DISCOVERY_AUTO_INFLIGHT)))
+# One lazy worker pool is shared by all in-process discovery profiles/phases. Without this,
+# anonymous/authenticated discovery could each create a full HTTP/JS/source-map pool and multiply
+# runnable threads even though every target request start was already globally rate-paced. Sharing
+# the pool keeps aggregate in-flight Python discovery I/O bounded while preserving concurrency.
+_DISCOVERY_NETWORK_EXECUTOR = ThreadPoolExecutor(
+    max_workers=DISCOVERY_NETWORK_MAX_INFLIGHT, thread_name_prefix='secops-discovery-net'
+)
 FINAL_BROWSER_VERIFICATION_LIMITS = {'test': 2, 'fast': 12, 'balanced': 96, 'deep': 200}
 FINAL_BROWSER_VERIFICATION_MAX_LIMITS = {'test': 3, 'fast': 20, 'balanced': 160, 'deep': 320}
 JWT_TOKEN_LIMITS = {'test': 4, 'fast': 16, 'balanced': 64, 'deep': 192}
@@ -228,6 +271,7 @@ SPECIALIST_TOOL_VARIANT_LIMITS = {
     'sqlmap': {'test': 1, 'fast': 1, 'balanced': 2, 'deep': 3},
     'dalfox': {'test': 1, 'fast': 1, 'balanced': 2, 'deep': 3},
     'commix': {'test': 1, 'fast': 1, 'balanced': 2, 'deep': 3},
+    'interactsh': {'test': 1, 'fast': 1, 'balanced': 2, 'deep': 3},
     'browser': {'test': 1, 'fast': 2, 'balanced': 3, 'deep': 4},
     'workflow': {'test': 1, 'fast': 2, 'balanced': 3, 'deep': 4},
     'idor': {'test': 1, 'fast': 3, 'balanced': 8, 'deep': 12},
@@ -248,6 +292,11 @@ ALLOW_SAME_HOST_PORTS = False
 DISCOVER_SAME_HOST_SERVICES = False
 PRIMARY_SCOPE_TARGET = ''
 SAME_HOST_SERVICE_DISCOVERY_CACHE: dict[tuple[str, str, int, str, int], dict[str, Any]] = {}
+# Profile discovery can run concurrently. Protect the host-level cache itself and serialize only
+# duplicate sweeps for the same hostname/mode; different hosts remain free to overlap behind the
+# shared network executor and cross-process request-rate pacer.
+SAME_HOST_SERVICE_DISCOVERY_CACHE_LOCK = threading.RLock()
+SAME_HOST_SERVICE_DISCOVERY_HOST_LOCKS: dict[tuple[str, str], threading.Lock] = {}
 SAME_HOST_SERVICE_DISCOVERY_TIME_SPENT_SECONDS = 0.0
 SAME_HOST_SERVICE_DISCOVERY_TIME_LOCK = threading.Lock()
 AUTHENTICATED_ORIGIN_COOKIES: dict[tuple[str, str], str] = {}
@@ -319,7 +368,9 @@ def configure_authorized_scope(
     REJECTED_SPECULATIVE_RAW_COOKIE_KEYS.clear()
     with AUTH_SESSION_VALIDATION_CACHE_LOCK:
         AUTH_SESSION_VALIDATION_CACHE.clear()
-    SAME_HOST_SERVICE_DISCOVERY_CACHE.clear()
+    with SAME_HOST_SERVICE_DISCOVERY_CACHE_LOCK:
+        SAME_HOST_SERVICE_DISCOVERY_CACHE.clear()
+        SAME_HOST_SERVICE_DISCOVERY_HOST_LOCKS.clear()
     with SAME_HOST_SERVICE_DISCOVERY_TIME_LOCK:
         SAME_HOST_SERVICE_DISCOVERY_TIME_SPENT_SECONDS = 0.0
     for value in origins or []:
@@ -800,7 +851,9 @@ def configure_scan_mode(mode: str) -> None:
     # process cannot combine a fresh time allowance with stale TCP/HTTP classifications. Within
     # one assessment configure_scan_mode() is not called again, so anonymous/authenticated profiles
     # still reuse the same exact-host cache as intended.
-    SAME_HOST_SERVICE_DISCOVERY_CACHE.clear()
+    with SAME_HOST_SERVICE_DISCOVERY_CACHE_LOCK:
+        SAME_HOST_SERVICE_DISCOVERY_CACHE.clear()
+        SAME_HOST_SERVICE_DISCOVERY_HOST_LOCKS.clear()
     with SAME_HOST_SERVICE_DISCOVERY_TIME_LOCK:
         SAME_HOST_SERVICE_DISCOVERY_TIME_SPENT_SECONDS = 0.0
 TIME_LIMIT_DIAGNOSES = {'timeout', 'time_limit_reached', 'timeout_with_partial_results', 'timeout_with_confirmed_finding', 'bounded_partial_scan'}
@@ -1085,7 +1138,10 @@ def _server_python() -> str:
 # Builds the environment passed to a new MCP server process.
 def _server_env() -> dict[str, str]:
     configure_runtime_path()
-    env = {str(key): str(value) for key, value in os.environ.items()}
+    # Clamp nested BLAS/OpenMP/Go pools even when the orchestrator is started directly instead of
+    # through assessmentRunner.py. MCP tools already own bounded Python/network concurrency, so an
+    # inherited host-wide thread count must not multiply CPU use inside the shared server process.
+    env = subprocess_parallelism_environment({str(key): str(value) for key, value in os.environ.items()}, MAX_REQUEST_RATE)
     paths = [part for part in env.get('PYTHONPATH', '').split(os.pathsep) if part]
     if str(SERVERS) not in paths:
         paths.insert(0, str(SERVERS))
@@ -1989,7 +2045,9 @@ def _idor_forge_runtime_check() -> tuple[bool, str]:
         return False, f'IDOR-Forge runtime probe failed: {type(exc).__name__}: {exc}'
     detail = '\n'.join(part for part in (completed.stdout or '', completed.stderr or '') if part).strip()
     if completed.returncode != 0:
-        return False, (detail[-2500:] or f'IDOR-Forge runtime probe exit={completed.returncode}') + ' | rerun initScript.py without --skip-scanners.'
+        lines = [line.strip() for line in detail.splitlines() if line.strip()]
+        concise = lines[-1] if lines else f'IDOR-Forge runtime probe exit={completed.returncode}'
+        return False, concise[-1200:] + ' | bounded native IDOR differential remains available; rerun initScript.py without --skip-scanners to restore upstream IDOR-Forge.'
     return True, detail[-1200:] or 'IDOR-Forge isolated runtime/API contract OK.'
 
 
@@ -2043,11 +2101,12 @@ def run_preflight_checks(*, include_live: bool=True) -> list[dict[str, str]]:
         if spec.name == 'idor':
             idor_ok, idor_detail = _idor_forge_runtime_check()
             checks.append({
-                # IDOR-Forge is a specialist. A stale isolated runtime must not discard an otherwise
-                # usable assessment; the IDOR action itself will remain unavailable until repaired.
+                # The upstream runtime is optional at execution time because the wrapper has a bounded
+                # native object-reference differential fallback. Keep the missing dependency visible
+                # without incorrectly reporting that IDOR coverage is entirely unavailable.
                 'level': 'ok' if idor_ok else ('error' if spec.required else 'warning'),
                 'component': 'idor',
-                'cause': 'idor_forge_runtime_ok' if idor_ok else 'idor_forge_runtime_broken',
+                'cause': 'idor_forge_runtime_ok' if idor_ok else 'idor_forge_upstream_unavailable_native_fallback_ready',
                 'detail': idor_detail,
             })
         if spec.name == 'report':
@@ -2528,6 +2587,8 @@ def _request_with_tls_trust_retry(
     """
     configured_timeout = kwargs.get('timeout')
     request_kwargs = dict(kwargs)
+    if not _pace_http_request(deadline):
+        raise requests.Timeout('shared discovery deadline reached while waiting for request-rate slot')
     if deadline is not None:
         request_kwargs['timeout'] = deadline_bounded_request_timeout(configured_timeout, float(deadline))
     try:
@@ -2542,7 +2603,8 @@ def _request_with_tls_trust_retry(
                 raise requests.Timeout('shared discovery deadline reached before TLS trust retry') from exc
             retry_kwargs['timeout'] = deadline_bounded_request_timeout(configured_timeout, float(deadline))
         else:
-            _pace_http_request()
+            if not _pace_http_request():
+                raise requests.Timeout('shared discovery rate-state unavailable before TLS trust retry') from exc
         with warnings.catch_warnings():
             warnings.filterwarnings('ignore', message='Unverified HTTPS request.*')
             response = session.request(method, url, **retry_kwargs)
@@ -2568,8 +2630,6 @@ def _safe_crawl_get(
         if _destructive_crawl_url(current):
             return (response, current, f'destructive_url_blocked:{current}')
         request_headers = {'Cookie': scope_cookie_header(current, cookies)} if scope_cookie_header(current, cookies) else {}
-        if not _pace_http_request(deadline):
-            return (response, current, 'shared_time_limit_reached')
         try:
             response, _, _ = _request_with_tls_trust_retry(
                 session, 'GET', current, timeout=timeout, allow_redirects=False, headers=request_headers, deadline=deadline,
@@ -3157,6 +3217,72 @@ def _browser_request_state_reason(request: Any, allow_state_changes: bool=False)
 
 # Uses Chromium as a bounded dynamic discovery queue so rendered navigation and XHR/fetch contracts become scanner inputs.
 def _browser_network_discovery(target: str, cookies: str, html_urls: list[str], forced_urls: list[str] | None=None, priority_urls: list[str] | None=None, allow_state_changes: bool=False, wall_clock_deadline: float | None=None) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[str], list[dict[str, Any]], dict[str, Any]]:
+    """Run Chromium discovery behind a CPU-aware profile slot.
+
+    Profile-level HTTP/JS discovery may overlap, but Chromium/DOM work is materially heavier than
+    socket waits. The slot budget therefore prevents anonymous/authenticated profiles from launching
+    too many browser workloads at once on a small VM. Waiting for a slot does not consume a target
+    request-rate token and the inner browser budget starts only after the slot is acquired.
+    """
+    wait_started = time.monotonic()
+    deadline = None
+    if wall_clock_deadline is not None:
+        try:
+            deadline = float(wall_clock_deadline)
+        except (TypeError, ValueError):
+            deadline = None
+    acquired = False
+    while not acquired:
+        if deadline is not None:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                waited = max(0.0, time.monotonic() - wait_started)
+                return ([], [], [], [{
+                    'url': target, 'type': 'BrowserDiscoveryDeadline',
+                    'message': 'Assessment discovery deadline reached while waiting for a CPU-aware Chromium slot.',
+                }], {
+                    'wall_clock_exhausted': True, 'browser_slot_wait_seconds': round(waited, 3),
+                    'browser_profile_slots': _BROWSER_DISCOVERY_MAX_CONCURRENT,
+                })
+            acquired = _BROWSER_DISCOVERY_SEMAPHORE.acquire(timeout=min(1.0, remaining))
+        else:
+            acquired = _BROWSER_DISCOVERY_SEMAPHORE.acquire(timeout=1.0)
+        if not acquired:
+            _discovery_progress(
+                'Chromium slot',
+                f'profile={"authenticated" if cookies else "anonymous"} slots={_BROWSER_DISCOVERY_MAX_CONCURRENT}',
+            )
+    local_waited = max(0.0, time.monotonic() - wait_started)
+    try:
+        global_wait_started = time.monotonic()
+        with browser_workload_lease(MAX_REQUEST_RATE, deadline=deadline) as global_slot:
+            global_waited = max(0.0, time.monotonic() - global_wait_started)
+            waited = local_waited + global_waited
+            if global_slot is None:
+                return ([], [], [], [{
+                    'url': target, 'type': 'BrowserDiscoveryDeadline',
+                    'message': 'Assessment discovery deadline reached while waiting for the shared VM Chromium slot.',
+                }], {
+                    'wall_clock_exhausted': True, 'browser_slot_wait_seconds': round(waited, 3),
+                    'browser_profile_slots': _BROWSER_DISCOVERY_MAX_CONCURRENT,
+                    'browser_global_slot_wait_seconds': round(global_waited, 3),
+                    'browser_global_slot': None,
+                })
+            request_cases, observed, navigated, errors, budget_info = _browser_network_discovery_impl(
+                target, cookies, html_urls, forced_urls=forced_urls, priority_urls=priority_urls,
+                allow_state_changes=allow_state_changes, wall_clock_deadline=wall_clock_deadline,
+            )
+            budget_info = dict(budget_info or {})
+            budget_info['browser_slot_wait_seconds'] = round(waited, 3)
+            budget_info['browser_profile_slots'] = _BROWSER_DISCOVERY_MAX_CONCURRENT
+            budget_info['browser_global_slot_wait_seconds'] = round(global_waited, 3)
+            budget_info['browser_global_slot'] = int(global_slot)
+            return request_cases, observed, navigated, errors, budget_info
+    finally:
+        _BROWSER_DISCOVERY_SEMAPHORE.release()
+
+
+def _browser_network_discovery_impl(target: str, cookies: str, html_urls: list[str], forced_urls: list[str] | None=None, priority_urls: list[str] | None=None, allow_state_changes: bool=False, wall_clock_deadline: float | None=None) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[str], list[dict[str, Any]], dict[str, Any]]:
 
     limits = DISCOVERY_LIMITS.get(CURRENT_SCAN_MODE, DISCOVERY_LIMITS['balanced'])
     forced_set = { _clean_url(value) for value in forced_urls or [] if value and url_in_authorized_scope(target, value) }
@@ -3263,6 +3389,9 @@ def _browser_network_discovery(target: str, cookies: str, html_urls: list[str], 
             context_kwargs: dict[str, Any] = {
                 'ignore_https_errors': True,
                 'user_agent': 'SecOps-Browser-Discovery/1.0',
+                # Service Worker-owned requests can bypass Playwright route interception. Blocking
+                # them makes the shared pacer authoritative for every in-scope discovery request.
+                'service_workers': 'block',
             }
             runtime_state = _runtime_target_auth_for_cookie(cookies) if cookies else {}
             runtime_storage = runtime_state.get('storage_state') if isinstance(runtime_state.get('storage_state'), dict) else None
@@ -3442,6 +3571,10 @@ def _browser_network_discovery(target: str, cookies: str, html_urls: list[str], 
             base_scores: list[int] = []
             adaptive_threshold: int | None = None
             while queue and len(visited) < navigation_max_budget and time.monotonic() < browser_deadline:
+                _discovery_progress(
+                    'Chromium',
+                    f'profile={"authenticated" if cookies else "anonymous"} navigated={len(visited)}/{navigation_max_budget} queued={len(queue)}',
+                )
                 best_index = min(
                     range(len(queue)),
                     key=lambda index: _discovery_family_fairness_key(target, queue[index], family_visits, queue[index] in priority_set),
@@ -3758,7 +3891,9 @@ def _cached_same_host_service_discovery(hostname: str) -> dict[str, Any] | None:
     """
     host = normalized_hostname(hostname)
     matches: list[dict[str, Any]] = []
-    for key, value in SAME_HOST_SERVICE_DISCOVERY_CACHE.items():
+    with SAME_HOST_SERVICE_DISCOVERY_CACHE_LOCK:
+        cache_items = list(SAME_HOST_SERVICE_DISCOVERY_CACHE.items())
+    for key, value in cache_items:
         if not isinstance(key, tuple) or len(key) < 2 or key[0] != host or key[1] != CURRENT_SCAN_MODE:
             continue
         if isinstance(value, dict):
@@ -3773,6 +3908,17 @@ def _cached_same_host_service_discovery(hostname: str) -> dict[str, Any] | None:
             float(row.get('duration_seconds', 0.0) or 0.0),
         ),
     ))
+
+
+def _same_host_service_discovery_host_lock(hostname: str) -> threading.Lock:
+    """Return one process-local single-flight lock for an exact hostname and scan mode."""
+    key = (normalized_hostname(hostname), CURRENT_SCAN_MODE)
+    with SAME_HOST_SERVICE_DISCOVERY_CACHE_LOCK:
+        lock = SAME_HOST_SERVICE_DISCOVERY_HOST_LOCKS.get(key)
+        if lock is None:
+            lock = threading.Lock()
+            SAME_HOST_SERVICE_DISCOVERY_HOST_LOCKS[key] = lock
+        return lock
 
 
 def _bounded_service_getaddrinfo(hostname: str, timeout: float, *, attempts: int = 2) -> list[tuple[Any, ...]]:
@@ -4017,7 +4163,7 @@ def _tcp_port_open_any(
     return '', attempts, False
 
 
-def discover_same_host_web_services(
+def _discover_same_host_web_services_locked(
     target: str, candidate_cap: int | None=None, *, time_budget_seconds: float | None=None,
 ) -> dict[str, Any]:
     parsed = urlparse(normalize_url(target))
@@ -4044,7 +4190,8 @@ def discover_same_host_web_services(
     }
     if not DISCOVER_SAME_HOST_SERVICES or not ALLOW_SAME_HOST_PORTS or not hostname or cap <= 0:
         return empty
-    cached = SAME_HOST_SERVICE_DISCOVERY_CACHE.get(cache_key)
+    with SAME_HOST_SERVICE_DISCOVERY_CACHE_LOCK:
+        cached = SAME_HOST_SERVICE_DISCOVERY_CACHE.get(cache_key)
     if not isinstance(cached, dict):
         # The TCP/service sweep is host-level: if another profile or application view already scanned
         # this exact hostname with a different candidate share, reuse that result rather than scanning
@@ -4152,7 +4299,7 @@ def discover_same_host_web_services(
         )
         return row
 
-    executor = ThreadPoolExecutor(max_workers=DISCOVERY_NETWORK_MAX_INFLIGHT, thread_name_prefix='secops-port')
+    executor = _DISCOVERY_NETWORK_EXECUTOR
     pending: dict[Any, tuple[int, int]] = {}
     next_index = 1
     try:
@@ -4172,6 +4319,10 @@ def discover_same_host_web_services(
                 time_budget_exhausted = True
                 break
             done, _ = wait(set(pending), timeout=min(0.5, remaining), return_when=FIRST_COMPLETED)
+            _discovery_progress(
+                'same-host service sweep',
+                f'probed={ports_probed}/{len(ports)} pending={len(pending)} inflight_cap={DISCOVERY_NETWORK_MAX_INFLIGHT}',
+            )
             if not done:
                 continue
             for future in done:
@@ -4222,7 +4373,8 @@ def discover_same_host_web_services(
     finally:
         for future in pending:
             future.cancel()
-        executor.shutdown(wait=True, cancel_futures=True)
+        # Shared discovery executor stays alive for later HTTP/JS/profile work; running probes are
+        # deadline-aware and queued probes are cancelled above.
     if next_index <= len(ports) or pending:
         time_budget_exhausted = True
 
@@ -4267,8 +4419,35 @@ def discover_same_host_web_services(
         'candidate_order_policy': 'runtime-observed/configured-ports -> runtime-service-frequency -> stratified-full-range',
         'network_max_inflight': DISCOVERY_NETWORK_MAX_INFLIGHT,
     }
-    SAME_HOST_SERVICE_DISCOVERY_CACHE[cache_key] = dict(result)
+    with SAME_HOST_SERVICE_DISCOVERY_CACHE_LOCK:
+        SAME_HOST_SERVICE_DISCOVERY_CACHE[cache_key] = dict(result)
     return result
+
+
+def discover_same_host_web_services(
+    target: str, candidate_cap: int | None=None, *, time_budget_seconds: float | None=None,
+) -> dict[str, Any]:
+    """Run host-level service discovery once at a time per exact hostname/mode.
+
+    Anonymous/authenticated profile coordinators can reach this function concurrently after their
+    application discovery diverges. The first caller performs the sweep; followers for the same
+    hostname wait on the keyed lock and then reuse the completed host-level cache. Different hosts
+    are not serialized and all target starts remain governed by the shared pacer.
+    """
+    try:
+        parsed = urlparse(normalize_url(target))
+        hostname = normalized_hostname(parsed.hostname or '')
+    except Exception:
+        hostname = ''
+    if not hostname:
+        return _discover_same_host_web_services_locked(
+            target, candidate_cap=candidate_cap, time_budget_seconds=time_budget_seconds,
+        )
+    host_lock = _same_host_service_discovery_host_lock(hostname)
+    with host_lock:
+        return _discover_same_host_web_services_locked(
+            target, candidate_cap=candidate_cap, time_budget_seconds=time_budget_seconds,
+        )
 
 DISCOVERY_METADATA_PATHS = (
     'robots.txt', 'sitemap.xml', 'sitemap_index.xml', 'openapi.json', 'swagger.json',
@@ -4458,6 +4637,7 @@ def discover_target(
     forced_seeds: list[str] | None=None, *, expand_authorized_service_hosts: bool=True,
     same_host_service_candidate_cap: int | None=None, allow_state_changes: bool=False,
     wall_clock_deadline: float | None=None,
+    precomputed_same_host_service_discovery: dict[str, Any] | None=None,
 ) -> dict[str, Any]:
 
     session = requests.Session()
@@ -4496,9 +4676,14 @@ def discover_target(
     same_host_time_budget = None
     if external_discovery_deadline is not None:
         same_host_time_budget = max(0.0, external_discovery_deadline - time.monotonic())
-    same_host_service_discovery = discover_same_host_web_services(
-        target, candidate_cap=same_host_service_candidate_cap, time_budget_seconds=same_host_time_budget,
-    )
+    if isinstance(precomputed_same_host_service_discovery, dict):
+        # Service probing is identity-independent. Reuse one result across concurrent discovery
+        # profiles instead of spending the target rate budget probing the same ports repeatedly.
+        same_host_service_discovery = copy.deepcopy(precomputed_same_host_service_discovery)
+    else:
+        same_host_service_discovery = discover_same_host_web_services(
+            target, candidate_cap=same_host_service_candidate_cap, time_budget_seconds=same_host_time_budget,
+        )
     discovered_service_roots = {
         _clean_url(str(row.get('url') or ''))
         for row in same_host_service_discovery.get('web_services', [])
@@ -4626,7 +4811,7 @@ def discover_target(
     http_base_scores: list[int] = []
     http_adaptive_threshold: int | None = None
 
-    HTTP_DISCOVERY_PREFETCH_MAX = max(1, min(DISCOVERY_NETWORK_MAX_INFLIGHT, 4))
+    HTTP_DISCOVERY_PREFETCH_MAX = max(1, DISCOVERY_NETWORK_MAX_INFLIGHT)
     http_worker_local = threading.local()
     http_adaptive_stopped = False
 
@@ -4705,8 +4890,11 @@ def discover_target(
             batch.append(item)
         if not batch:
             break
-        with ThreadPoolExecutor(max_workers=min(HTTP_DISCOVERY_PREFETCH_MAX, len(batch)), thread_name_prefix='secops-http') as executor:
-            fetched = list(executor.map(fetch_http_candidate, batch))
+        fetched = list(_DISCOVERY_NETWORK_EXECUTOR.map(fetch_http_candidate, batch))
+        _discovery_progress(
+            'HTTP crawler',
+            f'profile={"authenticated" if cookies else "anonymous"} pages={pages_processed}/{page_max_budget} attempts={http_attempts}/{attempt_budget} queued={len(queue)} inflight_cap={HTTP_DISCOVERY_PREFETCH_MAX}',
+        )
         for item, response, final, redirect_issue, fetch_error in fetched:
             requested = str(item['requested'])
             requested_score = int(item['requested_score'])
@@ -4890,8 +5078,13 @@ def discover_target(
 
             script_results: list[tuple[requests.Response | None, str, str, BaseException | None]] = []
             if script_batch:
-                with ThreadPoolExecutor(max_workers=min(DISCOVERY_NETWORK_MAX_INFLIGHT, len(script_batch)), thread_name_prefix='secops-js') as executor:
-                    script_results = list(executor.map(fetch_script_asset, script_batch))
+                script_results = list(_DISCOVERY_NETWORK_EXECUTOR.map(fetch_script_asset, script_batch))
+                _discovery_progress(
+                    'JavaScript assets',
+                    f'profile={"authenticated" if cookies else "anonymous"} processed={len(scanned_script_urls)}/{script_budget} attempts={len(attempted_script_urls)}/{script_attempt_budget}',
+                )
+            source_map_candidates: list[tuple[str, str]] = []
+            source_map_candidate_urls: set[str] = set()
             for script_url, (script_response, script_final, script_issue, script_error) in zip(script_batch, script_results):
                 if script_error is not None:
                     errors.append({'url': script_url, 'type': type(script_error).__name__, 'message': f'JavaScript fetch: {script_error}'})
@@ -4930,25 +5123,60 @@ def discover_target(
                 if js_sources and js_sinks:
                     client_side_candidates.append({'url': final, 'script_url': script_final, 'sources': js_sources, 'sinks': js_sinks, 'evidence_source': 'authorized_scope_script'})
 
-                # Source maps can expose original modules and API literals hidden by minification. They
-                # share the script attempt/useful budgets and never widen scope.
+                # Source maps can expose original modules and API literals hidden by minification.
+                # Queue them here and fetch independent maps in bounded waves after the script batch.
+                # The global RequestRatePacer remains authoritative, while the wave size is capped by
+                # the remaining useful/attempt budgets so concurrency never creates speculative extra
+                # target requests merely because several maps were discovered at once.
                 for map_url in _source_map_urls(script_response.text, script_final):
                     if (
                         map_url in attempted_script_urls
-                        or len(scanned_script_urls) >= script_budget
-                        or len(attempted_script_urls) >= script_attempt_budget
+                        or map_url in source_map_candidate_urls
                         or not url_in_authorized_scope(target, map_url)
                         or not http_discovery_time_left()
                     ):
                         continue
-                    attempted_script_urls.add(map_url)
-                    try:
-                        map_response, map_final, map_issue = _safe_crawl_get(
-                            session, map_url, target, timeout=discovery_request_timeout(4, 15), max_redirects=4,
-                            cookies=cookies, deadline=http_discovery_deadline,
-                        )
-                    except requests.RequestException as exc:
-                        errors.append({'url': map_url, 'type': type(exc).__name__, 'message': f'Source-map fetch: {exc}'})
+                    source_map_candidate_urls.add(map_url)
+                    source_map_candidates.append((map_url, script_final))
+
+            def fetch_source_map(job: tuple[str, str]) -> tuple[tuple[str, str], requests.Response | None, str, str, BaseException | None]:
+                map_url, _ = job
+                worker_session = getattr(asset_worker_local, 'session', None)
+                if worker_session is None:
+                    worker_session = requests.Session()
+                    asset_worker_local.session = worker_session
+                try:
+                    map_response, map_final, map_issue = _safe_crawl_get(
+                        worker_session, map_url, target, timeout=discovery_request_timeout(4, 15), max_redirects=4,
+                        cookies=cookies, deadline=http_discovery_deadline,
+                    )
+                    return job, map_response, map_final, map_issue, None
+                except requests.RequestException as exc:
+                    return job, None, map_url, '', exc
+
+            source_map_cursor = 0
+            while source_map_cursor < len(source_map_candidates) and http_discovery_time_left():
+                remaining_attempt_slots = max(0, script_attempt_budget - len(attempted_script_urls))
+                remaining_useful_slots = max(0, script_budget - len(scanned_script_urls))
+                wave_size = min(
+                    len(source_map_candidates) - source_map_cursor,
+                    DISCOVERY_NETWORK_MAX_INFLIGHT,
+                    remaining_attempt_slots,
+                    remaining_useful_slots,
+                )
+                if wave_size <= 0:
+                    break
+                wave = source_map_candidates[source_map_cursor:source_map_cursor + wave_size]
+                source_map_cursor += wave_size
+                attempted_script_urls.update(map_url for map_url, _ in wave)
+                map_results = list(_DISCOVERY_NETWORK_EXECUTOR.map(fetch_source_map, wave))
+                _discovery_progress(
+                    'JavaScript source maps',
+                    f'profile={"authenticated" if cookies else "anonymous"} processed={len(scanned_script_urls)}/{script_budget} attempts={len(attempted_script_urls)}/{script_attempt_budget}',
+                )
+                for (map_url, source_script), map_response, map_final, map_issue, map_error in map_results:
+                    if map_error is not None:
+                        errors.append({'url': map_url, 'type': type(map_error).__name__, 'message': f'Source-map fetch: {map_error}'})
                         continue
                     if map_response is None or map_issue or map_response.status_code >= 400:
                         continue
@@ -4965,7 +5193,7 @@ def discover_target(
                         if not isinstance(source_text, str) or not source_text:
                             continue
                         virtual_source = f'{map_final}#source-{source_index}'
-                        for hint in [*_javascript_endpoint_hints(source_text, script_final, target), *_literal_navigation_hints(source_text, script_final, target)]:
+                        for hint in [*_javascript_endpoint_hints(source_text, source_script, target), *_literal_navigation_hints(source_text, source_script, target)]:
                             hinted_url = str(hint.get('url') or '')
                             hint_method = str(hint.get('method') or 'GET').upper()
                             key = (hint_method, hinted_url)
@@ -5105,6 +5333,7 @@ def discover_target(
         'request_rate_throttle_sleep_seconds': float(rate_stats.get('throttle_sleep_seconds', 0.0) or 0.0),
         'network_max_inflight': DISCOVERY_NETWORK_MAX_INFLIGHT,
         'http_prefetch_max': HTTP_DISCOVERY_PREFETCH_MAX,
+        'parallelism_policy': dict(PARALLELISM_POLICY),
         'request_case_duplicates_consolidated_online': int(getattr(request_cases, 'duplicates_consolidated', 0) or 0),
         'request_case_source_counts': dict(sorted(case_source_counts.items())),
         'http_page_budget': page_budget,
@@ -5136,6 +5365,8 @@ def discover_target(
         'browser_wall_clock_exhausted': bool(browser_budget_info.get('wall_clock_exhausted', False)),
         'browser_navigation_retries': int(browser_budget_info.get('navigation_retries', 0) or 0),
         'browser_dom_retries': int(browser_budget_info.get('dom_retries', 0) or 0),
+        'browser_slot_wait_seconds': float(browser_budget_info.get('browser_slot_wait_seconds', 0.0) or 0.0),
+        'browser_profile_slots': int(browser_budget_info.get('browser_profile_slots', _BROWSER_DISCOVERY_MAX_CONCURRENT) or _BROWSER_DISCOVERY_MAX_CONCURRENT),
         'browser_dead_404_410': int(browser_budget_info.get('dead_404_410', 0) or 0),
         'browser_external_subresource_requests': int(browser_budget_info.get('external_subresource_requests', 0) or 0),
         'browser_external_navigation_requests_blocked': int(browser_budget_info.get('external_navigation_requests_blocked', 0) or 0),
@@ -5253,6 +5484,7 @@ def discover_target_sync_safe(
     forced_seeds: list[str] | None=None, *, expand_authorized_service_hosts: bool=True,
     same_host_service_candidate_cap: int | None=None, allow_state_changes: bool=False,
     wall_clock_deadline: float | None=None,
+    precomputed_same_host_service_discovery: dict[str, Any] | None=None,
 ) -> dict[str, Any]:
     try:
         asyncio.get_running_loop()
@@ -5262,6 +5494,7 @@ def discover_target_sync_safe(
             expand_authorized_service_hosts=expand_authorized_service_hosts,
             same_host_service_candidate_cap=same_host_service_candidate_cap,
             allow_state_changes=allow_state_changes, wall_clock_deadline=wall_clock_deadline,
+            precomputed_same_host_service_discovery=precomputed_same_host_service_discovery,
         )
     with ThreadPoolExecutor(max_workers=1, thread_name_prefix='secops-discovery') as executor:
         return executor.submit(
@@ -5269,6 +5502,7 @@ def discover_target_sync_safe(
             expand_authorized_service_hosts=expand_authorized_service_hosts,
             same_host_service_candidate_cap=same_host_service_candidate_cap,
             allow_state_changes=allow_state_changes, wall_clock_deadline=wall_clock_deadline,
+            precomputed_same_host_service_discovery=precomputed_same_host_service_discovery,
         ).result()
 
 def _discovered_scope_origin_evidence(discovery: dict[str, Any], target: str) -> dict[str, dict[str, int]]:
@@ -5494,7 +5728,8 @@ def _runtime_auth_probe(origin: str, cookie: str, probe_url: str, *, deadline: f
     anonymous: dict[str, Any] = {}
     distinguished: bool | None = None
     try:
-        _pace_http_request()
+        # request_same_origin_redirects owns pacing for every hop. Avoid consuming a second
+        # global rate slot before entering the helper, which would unnecessarily halve throughput.
         response = request_same_origin_redirects(
             'GET', probe_url,
             headers={'Cache-Control': 'no-cache', 'User-Agent': 'SecOps-Runtime-Auth-Anonymous/1.0'},
@@ -5620,6 +5855,7 @@ def ensure_runtime_authenticated_request(request_url: str, current_cookie: str='
             # spend the real password attempt. Same-origin application repair may consume the one
             # per-identity attempt only when the parent has not already done so.
             allow_credential_submit=allow_credential_submit,
+            request_rate=MAX_REQUEST_RATE,
         )
     except RuntimeError as exc:
         if bool(getattr(exc, 'credential_submit_attempted', False)):
@@ -5941,6 +6177,7 @@ def authenticate_discovered_sibling_origins(discovery: dict[str, Any], target: s
                 # consume or repeat the real username/password attempt merely because they share
                 # the authorized hostname on another port.
                 allow_credential_submit=False,
+                request_rate=MAX_REQUEST_RATE,
             )
         except RuntimeError as exc:
             message = str(exc)
@@ -7410,16 +7647,23 @@ def run_safe_surface_sweep(
         for case in candidates
     ])
     selected = [case for _, case in ranked[:cap]] if cap else []
-    session = requests.Session()
-    session.headers.update({'User-Agent': 'SecOps-SafeSurface/1.0', 'Accept': '*/*', 'Origin': 'https://secops.invalid'})
     completed: list[dict[str, Any]] = []
     errors: list[dict[str, Any]] = []
     timed_out = False
     tls_fallbacks = 0
-    for case in selected:
+    surface_worker_local = threading.local()
+
+    def surface_session() -> requests.Session:
+        session = getattr(surface_worker_local, 'session', None)
+        if session is None:
+            session = requests.Session()
+            session.headers.update({'User-Agent': 'SecOps-SafeSurface/1.0', 'Accept': '*/*', 'Origin': 'https://secops.invalid'})
+            surface_worker_local.session = session
+        return session
+
+    def probe_surface(case: dict[str, Any]) -> tuple[str, dict[str, Any] | None, dict[str, Any] | None, int]:
         if time.monotonic() >= deadline:
-            timed_out = True
-            break
+            return 'timeout', None, None, 0
         url = str(case.get('url') or '')
         method = str(case.get('method') or 'GET').upper()
         headers: dict[str, str] = {}
@@ -7430,15 +7674,11 @@ def run_safe_surface_sweep(
         if content_type:
             headers['Content-Type'] = content_type
         try:
-            if not _pace_http_request(deadline):
-                timed_out = True
-                break
             response, tls_retry, _ = _request_with_tls_trust_retry(
-                session, method, url, data=str(case.get('data') or '') if method == 'POST' else None,
+                surface_session(), method, url, data=str(case.get('data') or '') if method == 'POST' else None,
                 headers=headers, allow_redirects=False, timeout=(4.0, 12.0), deadline=deadline,
             )
-            tls_fallbacks += int(tls_retry)
-            completed.append({
+            row = {
                 'url': url, 'method': method, 'parameters': list(case.get('parameters') or []),
                 'status_code': int(response.status_code), 'response_content_type': str(response.headers.get('Content-Type') or ''),
                 'location': str(response.headers.get('Location') or ''),
@@ -7448,9 +7688,33 @@ def run_safe_surface_sweep(
                 'x_content_type_options': str(response.headers.get('X-Content-Type-Options') or ''),
                 'hsts': str(response.headers.get('Strict-Transport-Security') or ''),
                 'tls_trust_fallback': bool(tls_retry),
-            })
+            }
+            return 'ok', row, None, int(bool(tls_retry))
+        except requests.Timeout:
+            return 'timeout', None, None, 0
         except requests.RequestException as exc:
-            errors.append({'url': url, 'method': method, 'error': f'{type(exc).__name__}: {exc}'})
+            return 'error', None, {'url': url, 'method': method, 'error': f'{type(exc).__name__}: {exc}'}, 0
+
+    # Every selected context is already filtered through allow_state_changes=False and is independent
+    # completion evidence. Parallelize only the network wait, while the shared cross-process pacer in
+    # `_request_with_tls_trust_retry` remains the single aggregate request-start authority. Worker
+    # count is CPU/rate aware so slow targets can use the configured rate without creating an
+    # unbounded thread pool on small VMs. executor.map preserves the ranked selection order.
+    surface_workers = max(1, min(len(selected) or 1, int(PARALLELISM_POLICY.get('network_workers') or 1)))
+    if selected:
+        if surface_workers > 1:
+            with ThreadPoolExecutor(max_workers=surface_workers, thread_name_prefix='secops-safe-surface') as executor:
+                probe_results = list(executor.map(probe_surface, selected))
+        else:
+            probe_results = [probe_surface(case) for case in selected]
+        for outcome, row, error, tls_retry_count in probe_results:
+            tls_fallbacks += int(tls_retry_count)
+            if outcome == 'ok' and row is not None:
+                completed.append(row)
+            elif outcome == 'error' and error is not None:
+                errors.append(error)
+            elif outcome == 'timeout':
+                timed_out = True
     elapsed = round(time.monotonic() - started, 3)
     untouched = max(0, len(selected) - len(completed) - len(errors))
     status = 'partial' if timed_out or untouched or errors else 'success'
@@ -8413,11 +8677,23 @@ def select_oast_request_cases(discovery: dict[str, Any], target: str, limit: int
         ranked.append((score, {'target_url': target, 'source_url': url, 'injection_url': injection_url, 'method': method, 'data': injection_data, 'parameter': parameter, 'parameters': [parameter], 'priority_score': score, 'oast_class': 'command' if command_context else 'remote-fetch'}))
     selected: list[dict[str, Any]] = []
     seen: set[tuple[str, str, str]] = set()
+    variant_cap = _specialist_variant_cap('interactsh')
+    shape_counts: dict[tuple[Any, ...], int] = {}
     for _, candidate in sorted(ranked, key=lambda item: (-item[0], item[1]['injection_url'])):
         key = (candidate['method'], candidate['injection_url'], candidate['data'])
         if key in seen:
             continue
+        source_url = str(candidate.get('source_url') or candidate.get('injection_url') or '')
+        shape = (
+            str(candidate.get('method') or 'GET').upper(),
+            _structural_route_signature(source_url),
+            str(candidate.get('parameter') or '').lower(),
+            str(candidate.get('oast_class') or ''),
+        )
+        if shape_counts.get(shape, 0) >= variant_cap:
+            continue
         seen.add(key)
+        shape_counts[shape] = shape_counts.get(shape, 0) + 1
         selected.append(candidate)
         if (not agentic_catalog) and len(selected) >= max(1, int(limit)):
             break
@@ -9055,6 +9331,11 @@ def build_tool_arguments(tool: str, target_url: str, cookies: str, discovery: di
 
     case = case or {}
     effective_cookies = scope_cookie_header(target_url, cookies)
+    # JWT analysis is purely local and has a deliberately tiny MCP signature. Keep it separate from
+    # the common target+cookie argument seed so a future generic call cannot reintroduce an invalid
+    # `cookies` keyword (the agentic/deterministic execution paths already build JWT args directly).
+    if tool == 'jwt':
+        return {'target_url': target_url, 'jwt_token': str(case.get('jwt_token') or '')}
     arguments: dict[str, Any] = {'target_url': target_url, 'cookies': effective_cookies}
     if tool in {'ffuf', 'nikto', 'nuclei', 'zap', 'arjun', 'sqlmap', 'dalfox', 'commix', 'session', 'traversal', 'authorization', 'workflow', 'browser', 'idor'}:
         # Pass the normalized rate in every MCP call. This keeps per-assessment configuration

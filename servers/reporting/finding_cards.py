@@ -16,6 +16,8 @@ from .toc import _heading
 def _finding_card(item: dict[str, Any], index: int, toc: list[tuple[int, str, str]]) -> str:
     notes = item.get("data_quality_notes") or []
     ai_analysis = item.get("ai_analysis") if isinstance(item.get("ai_analysis"), dict) else {}
+    ai_analysis_status = item.get("ai_analysis_status") if isinstance(item.get("ai_analysis_status"), dict) else {}
+    ai_analysis_coverage = item.get("ai_analysis_coverage") if isinstance(item.get("ai_analysis_coverage"), list) else []
     narrative_fallbacks = set(ai_analysis.get("narrative_fallbacks") or []) if ai_analysis else set()
 
     # Marks a field "AI_SUFFIX" only when the AI actually supplied its own
@@ -25,6 +27,19 @@ def _finding_card(item: dict[str, Any], index: int, toc: list[tuple[int, str, st
         if not ai_analysis or field_key in narrative_fallbacks:
             return ""
         return f" {AI_SUFFIX}"
+
+    def _narrative_value(field_key: str, *, evidence_hint: bool = False) -> Any:
+        value = item.get(field_key)
+        if value not in (None, "", [], {}):
+            return value
+        status = str(ai_analysis_status.get('status') or '')
+        if status.startswith('not_analyzed'):
+            suffix = " See the scanner/verifier evidence in this finding." if evidence_hint else ""
+            return (
+                "Not supplied by the scanner/verifier, and no AI narrative was produced for this finding."
+                + suffix
+            )
+        return value
 
     heading = _heading(
         3, f"{index}. {item['alert']}", toc,
@@ -43,6 +58,11 @@ def _finding_card(item: dict[str, Any], index: int, toc: list[tuple[int, str, st
             + _field('AI severity rationale', ai_analysis.get('rationale'))
             + _field('Assessment model', ai_analysis.get('model'))
         )
+        if ai_analysis.get('equivalent_analysis_reused'):
+            ai_rows += _field(
+                'AI assessment reuse',
+                f"Reused from strictly equivalent finding {ai_analysis.get('equivalent_analysis_source_finding') or 'representative'}; this finding keeps its own scanner evidence.",
+            )
         ai_block = f'<div class="quality"><b class="quality-title">Agentic risk assessment</b><dl>{ai_rows}</dl></div>'
 
         original_risk = ai_analysis.get("scanner_risk") or item.get("scanner_risk") or "not supplied"
@@ -61,6 +81,38 @@ def _finding_card(item: dict[str, Any], index: int, toc: list[tuple[int, str, st
         if item.get('scanner_solution') and item.get('scanner_solution') != item.get('solution'):
             scanner_rows += _field('Scanner recommended remediation', item.get('scanner_solution'))
         scanner_block = f'<div class="scanner-original"><b class="quality-title">Original scanner assessment <span>(secondary audit)</span></b><dl>{scanner_rows}</dl></div>'
+
+    ai_status_block = ""
+    if ai_analysis_status:
+        status = str(ai_analysis_status.get('status') or 'unknown')
+        labels = {
+            'analyzed': 'Analyzed directly by AI',
+            'reused_equivalent': 'AI analysis reused from a strictly equivalent finding',
+            'not_analyzed_budget': 'Not analyzed by AI — analysis time budget exhausted',
+            'not_analyzed_profile_limit': 'Not analyzed by AI — TEST profile analysis limit',
+            'not_analyzed_ai_error': 'Not analyzed by AI — AI batch error',
+            'not_analyzed_ai_incomplete_response': 'Not analyzed by AI — incomplete AI response',
+            'pending': 'AI analysis status unresolved',
+        }
+        coverage_counts: dict[str, int] = {}
+        for row in ai_analysis_coverage:
+            if not isinstance(row, dict):
+                continue
+            key = str(row.get('status') or 'unknown')
+            coverage_counts[key] = coverage_counts.get(key, 0) + 1
+        coverage_text = ', '.join(f'{key}: {value}' for key, value in sorted(coverage_counts.items()))
+        status_rows = (
+            _field('AI analysis status', labels.get(status, status.replace('_', ' ')))
+            + _field('AI coverage reason', ai_analysis_status.get('reason'))
+        )
+        if coverage_text and len(ai_analysis_coverage) > 1:
+            status_rows += _field('AI coverage across merged/corroborating evidence', coverage_text)
+        if status.startswith('not_analyzed'):
+            status_rows += _field(
+                'Interpretation source',
+                'Scanner/verifier evidence and original scanner narrative only; this finding is still fully included in the report and was not dropped because AI coverage was incomplete.',
+            )
+        ai_status_block = f'<div class="quality"><b class="quality-title">AI analysis coverage</b><dl>{status_rows}</dl></div>'
     return f"""
 <article class="finding risk-{_esc(item['risk'])}">
 {heading}
@@ -76,17 +128,17 @@ def _finding_card(item: dict[str, Any], index: int, toc: list[tuple[int, str, st
 {_field('Source job(s)', ', '.join(item.get('source_job_ids') or []))}
 {_field('HTTP method', item.get('method'))}
 {_field('Parameter', item.get('parameter'))}
-{_field('Description' + _ai_suffix('description'), item.get('description'))}
-{_field('Why the evidence confirms or suggests the issue', item.get('technical_details'))}
-{_field('Attack preconditions', item.get('attack_preconditions'))}
+{_field('Description' + _ai_suffix('description'), _narrative_value('description', evidence_hint=True))}
+{_field('Why the evidence confirms or suggests the issue', _narrative_value('technical_details', evidence_hint=True))}
+{_field('Attack preconditions', _narrative_value('attack_preconditions'))}
 </dl>
 {_snippet_field('Payload / test input', item.get('payload') or '; '.join(item.get('payloads') or []))}
 {_snippet_field('Evidence', item.get('evidence'))}
 <dl>
-{_field('Security impact' + _ai_suffix('impact'), item.get('impact'))}
-{_field('Potential consequences / damage' + _ai_suffix('consequences'), item.get('consequences'))}
-{_field('Recovery / restoration actions' + _ai_suffix('recovery'), item.get('recovery'))}
-{_field('Recommended remediation' + _ai_suffix('solution'), item.get('solution'))}
+{_field('Security impact' + _ai_suffix('impact'), _narrative_value('impact'))}
+{_field('Potential consequences / damage' + _ai_suffix('consequences'), _narrative_value('consequences'))}
+{_field('Recovery / restoration actions' + _ai_suffix('recovery'), _narrative_value('recovery'))}
+{_field('Recommended remediation' + _ai_suffix('solution'), _narrative_value('solution'))}
 </dl>
 {_snippet_field('Reproduction / validation steps', item.get('reproduction'))}
 <dl>
@@ -94,6 +146,7 @@ def _finding_card(item: dict[str, Any], index: int, toc: list[tuple[int, str, st
 </dl>
 {('<p class="field-label">Identifiers</p>' + _render_list(item.get('identifiers') or [])) if item.get('identifiers') else ''}
 {('<p class="field-label">References</p>' + _render_list(item.get('references') or [])) if item.get('references') else ''}
+{ai_status_block}
 {ai_block}
 {scanner_block}
 {('<div class="quality"><b>Data-quality notes</b>' + _render_list(notes) + '</div>') if notes else ''}

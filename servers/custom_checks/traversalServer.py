@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 import re
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
 import requests
 
-from utils import RequestRatePacer, request_contract_state_change_reason, request_same_origin_redirects, partial, scanner_session_probe, skipped, success
+from utils import RequestRatePacer, request_contract_state_change_reason, request_same_origin_redirects, partial, scanner_session_probe, secops_parallelism_policy, skipped, success
 
 from core.scannerCommon import mutate_parameter, proportional_budget, remaining_budget, service, wall_clock_deadline
 
@@ -97,19 +98,29 @@ def run_traversal_scan(
 
     attempts: list[dict[str, Any]] = []
     findings: list[dict[str, Any]] = []
-    # Confirm only known file markers that are absent from the benign response.
+    parallelism = secops_parallelism_policy(request_rate)
+    # Confirm only known file markers that are absent from the benign response. Independent
+    # read-only payloads for one parameter run concurrently behind the shared request pacer.
     budget_exhausted = False
     for parameter in candidates[:parameter_limit]:
-        for payload, marker, label in PROBES:
-            if remaining_budget(deadline) <= 0:
-                budget_exhausted = True
-                break
+        if remaining_budget(deadline) <= 0:
+            budget_exhausted = True
+            break
+        def run_probe(spec: tuple[str, re.Pattern[str], str]):
+            payload, marker, label = spec
             probe_url, probe_data = mutate_parameter(target_url, method, data, parameter, payload, case_insensitive=True)
             try:
                 response = _request(probe_url, cookies, method, probe_data, pacer, min(request_budget, max(1.0, remaining_budget(deadline))), deadline, bool(allow_state_changes))
+                return payload, marker, label, response, None
             except requests.RequestException as exc:
+                return payload, marker, label, None, exc
+        worker_count = max(1, min(len(PROBES), int(parallelism.get("network_workers") or 1)))
+        with ThreadPoolExecutor(max_workers=worker_count, thread_name_prefix="secops-traversal") as executor:
+            probe_results = list(executor.map(run_probe, PROBES))
+        for payload, marker, label, response, probe_error in probe_results:
+            if probe_error is not None or response is None:
                 attempts.append({
-                    "parameter": parameter, "payload": payload, "source": label, "error": f"{type(exc).__name__}: {exc}",
+                    "parameter": parameter, "payload": payload, "source": label, "error": f"{type(probe_error).__name__}: {probe_error}",
                 })
                 continue
             baseline_match = marker.search(baseline.text) if baseline is not None else None
@@ -169,6 +180,7 @@ def run_traversal_scan(
         "authenticated": bool(cookies), "session_probe": session_probe,
         "execution_mode": "bounded_known_file_markers", "per_request_budget_seconds": request_budget,
         "tool_timeout_seconds": timeout, "phase_ratio_policy": {"session": TRAVERSAL_SESSION_RATIO, "request": TRAVERSAL_REQUEST_RATIO},
+        "parallelism_policy": parallelism,
         "scan_profile": profile, "parameter_limit": parameter_limit,
         "baseline_available": baseline is not None, "baseline_error": baseline_error,
     }

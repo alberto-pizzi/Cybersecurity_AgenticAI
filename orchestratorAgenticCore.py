@@ -14,6 +14,8 @@ import uuid
 import time
 import traceback
 import warnings
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from contextlib import nullcontext
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Literal, TypedDict
@@ -21,6 +23,7 @@ from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 
 warnings.filterwarnings("ignore", message=r".*authlib\.jose.*deprecated.*")
 import requests
+from utils import heavy_compute_workload_lease
 import orchestratorShared as shared
 from orchestratorShared import (
     BROAD_SCANNER_TIMEOUTS, PARAMETER_TOOL_TIMEOUTS,
@@ -79,6 +82,7 @@ class AgentState(TypedDict):
     only_tool: str
     started_monotonic: float
     wall_clock_budget_seconds: int
+    execution_budget_seconds: int
 # CPU-only Ollama hosts can take far longer than 720s to prefill+decode a JSON-schema-constrained
 # plan (no tokens at all until prefill finishes), so these budgets stay generous by default.
 AI_PLANNER_TIMEOUTS = {
@@ -144,9 +148,9 @@ PLANNER_CONTEXT_SAFETY_TOKENS = 512
 PLANNER_PREVIOUS_RESULT_ROWS_PER_PROFILE = {'test': 6, 'fast': 12, 'balanced': 20, 'deep': 28}
 PLANNER_PREVIOUS_RESULT_OUTPUT_CHARS = {'test': 120, 'fast': 160, 'balanced': 180, 'deep': 220}
 
-# Same CPU-only-Ollama rationale as AI_PLANNER_TIMEOUTS above: this is a hard ceiling on
-# batch_budget (analysis_node caps it with min(ai_timeout, this value)), so raising --ai-timeout
-# alone does not help this stage unless this dict is also raised.
+# Per-batch final-analysis ceilings. These are intentionally independent from the CLI
+# --ai-timeout option, which belongs only to planner rounds. Mixing the two previously allowed a
+# small planner timeout to silently disable otherwise well-budgeted final AI interpretation.
 AI_ANALYSIS_BATCH_TIMEOUTS = {
     'test': 60,
     'fast': 480,
@@ -157,10 +161,14 @@ AI_ANALYSIS_BATCH_TIMEOUTS = {
 # remain useful rescue bounds, but repeated finding batches must not multiply into hours after the
 # scanners have already finished. The assessment/report deadlines still provide the outer guard.
 AI_ANALYSIS_STAGE_TIMEOUTS = {
-    'test': 60,
-    'fast': 900,
-    'balanced': 1800,
-    'deep': 2700,
+    # Final AI interpretation is a first-class assessment phase, not spare-time cleanup.
+    # These ceilings match the protected analysis windows below. They are phase budgets, not a
+    # subtraction from scanner coverage: the global watchdog is deliberately wider than the sum
+    # of the operational execution and finalization windows.
+    'test': 10 * 60,
+    'fast': 90 * 60,
+    'balanced': 180 * 60,
+    'deep': 360 * 60,
 }
 AI_ANALYSIS_FUTURE_BATCH_RESERVE_SECONDS = {
     'test': 12,
@@ -174,6 +182,30 @@ TEST_ANALYSIS_FINDING_LIMIT = 1
 AI_ANALYSIS_MAX_PREDICT = {'test': 400, 'fast': 520, 'balanced': 850, 'deep': 1200}
 AI_ANALYSIS_RESCUE_MAX_PREDICT = {'test': 260, 'fast': 340, 'balanced': 460, 'deep': 600}
 AI_ANALYSIS_CONTEXT_WINDOWS = {'test': 4096, 'fast': 6144, 'balanced': 8192, 'deep': 12288}
+
+
+class AnalysisBudgetExhausted(TimeoutError):
+    """Local final-analysis deadline exhaustion with any already-completed AI rows attached."""
+
+    def __init__(self, message: str, *, partial_rows: list[dict[str, Any]] | None = None) -> None:
+        super().__init__(message)
+        self.partial_rows = list(partial_rows or [])
+
+def _ai_exception_is_timeout(exc: BaseException | None) -> bool:
+    """Return True only for a real timeout in an AI exception/cause chain.
+
+    A provider HTTP/contract failure that merely happens near the batch deadline must not be
+    downgraded to a benign budget exhaustion under --require-ai.
+    """
+    seen: set[int] = set()
+    current = exc
+    while isinstance(current, BaseException) and id(current) not in seen:
+        seen.add(id(current))
+        if isinstance(current, (TimeoutError, requests.exceptions.Timeout)):
+            return True
+        current = current.__cause__ or current.__context__
+    return False
+
 LAST_AI_PLAN_DIAGNOSTICS: dict[str, Any] = {}
 BROAD_COVERAGE_TOOLS = ('ffuf', 'zap', 'nuclei', 'session', 'nikto')
 # These tools are discovery producers: when the AI selects them, their output must be merged before
@@ -217,73 +249,117 @@ ROUND_EXECUTION_ACTION_ADAPTIVE_CEILINGS = {
     for mode, reference in ROUND_EXECUTION_ACTION_REFERENCE_CAPS.items()
 }
 
-# Hard wall-clock ceilings for the complete Agentic child workflow, including preflight and model
-# preparation. They are deliberately wide last-resort safety guards, not normal scheduling targets;
-# ordinary runtime reduction comes from deduplication/reuse/concurrency controls. The parent runner
-# remains wider than the child so finalization normally completes inside the workflow itself.
-AGENTIC_WALL_CLOCK_BUDGETS = {
-    # These are safety-watchdog floors at the default 10 req/s, not scheduling targets. Normal
-    # assessments should finish earlier through deduplication and lower local overhead. At slower
-    # configured rates assessment_wall_clock_budget_seconds() scales the watchdog conservatively.
+# Operational pre-finalization coverage budgets. These retain the historical 1h/10h/20h/40h
+# profile envelopes and are independent from verification, AI interpretation and report rendering.
+# Lower target request rates expand only this target-traffic-dependent phase.
+AGENTIC_EXECUTION_PHASE_BUDGETS = {
     'test': 60 * 60,
     'fast': 10 * 60 * 60,
     'balanced': 20 * 60 * 60,
     'deep': 40 * 60 * 60,
 }
-# Reserve enough time for bounded verification/analysis/report generation. New specialist actions
-# are not started once only this reserve remains.
-AGENTIC_FINALIZATION_RESERVE_SECONDS = {
-    # Preserve the previous verification/analysis headroom while guaranteeing enough time for
-    # report transfer + PDF conversion near the hard assessment deadline.
-    'test': 15 * 60,
-    'fast': 25 * 60,
-    'balanced': 40 * 60,
-    'deep': 55 * 60,
-}
 
-
-# Finalization sub-reserves stay inside the hard wall-clock ceiling. They prevent
-# completion sweeps or AI narrative work from starving report generation.
-AGENTIC_REPORT_RESERVE_SECONDS = {
-    # The report node keeps a separate 120s emergency-artifact reserve. These values therefore
-    # guarantee roughly 11/16/23/33 minutes of normal MCP reporting time at the final boundary.
-    'test': 13 * 60, 'fast': 18 * 60, 'balanced': 25 * 60, 'deep': 35 * 60,
+# Finalization phase budgets are ADDITIVE to the operational execution envelope. They do not eat
+# scanner/planner time. Every stage receives an explicit deadline in forward order:
+# execution -> verification -> AI analysis -> reporting. The final hard watchdog sits beyond all
+# four stages and is only a hang/deadlock safety net.
+AGENTIC_VERIFICATION_RESERVE_SECONDS = {
+    'test': 10 * 60,
+    'fast': 30 * 60,
+    'balanced': 60 * 60,
+    'deep': 120 * 60,
 }
 AGENTIC_ANALYSIS_RESERVE_SECONDS = {
-    'test': 1 * 60, 'fast': 3 * 60, 'balanced': 5 * 60, 'deep': 7 * 60,
+    'test': 10 * 60,
+    'fast': 90 * 60,
+    'balanced': 180 * 60,
+    'deep': 360 * 60,
+}
+AGENTIC_REPORT_RESERVE_SECONDS = {
+    'test': 20 * 60,
+    'fast': 60 * 60,
+    'balanced': 90 * 60,
+    'deep': 150 * 60,
+}
+AGENTIC_FINALIZATION_RESERVE_SECONDS = {
+    mode: (
+        AGENTIC_VERIFICATION_RESERVE_SECONDS[mode]
+        + AGENTIC_ANALYSIS_RESERVE_SECONDS[mode]
+        + AGENTIC_REPORT_RESERVE_SECONDS[mode]
+    )
+    for mode in AGENTIC_EXECUTION_PHASE_BUDGETS
+}
+
+# Extra time that belongs to no normal stage. If normal phase budgets are respected this should
+# never be consumed; it exists only so cleanup/emergency-artifact recovery or an unexpected hang is
+# not killed exactly at a legitimate phase boundary.
+AGENTIC_WATCHDOG_SAFETY_MARGIN_SECONDS = {
+    'test': 20 * 60,
+    'fast': 120 * 60,
+    'balanced': 240 * 60,
+    'deep': 480 * 60,
+}
+
+# Compatibility/public table for the internal child hard guard at rate=10. This is intentionally
+# much wider than normal work: execution + finalization + emergency watchdog slack.
+AGENTIC_WALL_CLOCK_BUDGETS = {
+    mode: (
+        AGENTIC_EXECUTION_PHASE_BUDGETS[mode]
+        + AGENTIC_FINALIZATION_RESERVE_SECONDS[mode]
+        + AGENTIC_WATCHDOG_SAFETY_MARGIN_SECONDS[mode]
+    )
+    for mode in AGENTIC_EXECUTION_PHASE_BUDGETS
 }
 SAFE_SURFACE_FINALIZATION_SHARE = 0.35
 
 
-def assessment_wall_clock_budget_seconds(mode: str) -> int:
-    base = int(AGENTIC_WALL_CLOCK_BUDGETS.get(str(mode or 'balanced').lower(), AGENTIC_WALL_CLOCK_BUDGETS['balanced']))
-    # The global watchdog must never become the hidden coverage limiter when an operator chooses a
-    # lower request_rate. Keep the rate-10 floor and expand it proportionally below the default.
+def assessment_execution_budget_seconds(mode: str) -> int:
+    mode = str(mode or 'balanced').lower()
+    base = int(AGENTIC_EXECUTION_PHASE_BUDGETS.get(mode, AGENTIC_EXECUTION_PHASE_BUDGETS['balanced']))
+    # Only the target-traffic-dependent operational phase expands at lower configured request rates.
+    # Final AI/report work is independent from the target request-rate contract and therefore keeps
+    # stable, explicit phase budgets.
     return int(math.ceil(base * shared.request_rate_budget_scale(shared.MAX_REQUEST_RATE)))
 
 
+def assessment_wall_clock_budget_seconds(mode: str) -> int:
+    mode = str(mode or 'balanced').lower()
+    execution = assessment_execution_budget_seconds(mode)
+    finalization = int(AGENTIC_FINALIZATION_RESERVE_SECONDS.get(mode, AGENTIC_FINALIZATION_RESERVE_SECONDS['balanced']))
+    watchdog_slack = int(AGENTIC_WATCHDOG_SAFETY_MARGIN_SECONDS.get(mode, AGENTIC_WATCHDOG_SAFETY_MARGIN_SECONDS['balanced']))
+    return execution + finalization + watchdog_slack
+
+
+def _assessment_started(state: AgentState) -> float:
+    return float(state.get('started_monotonic') or time.monotonic())
+
+
 def _assessment_deadline(state: AgentState) -> float:
-    started = float(state.get('started_monotonic') or time.monotonic())
+    # Last-resort internal safety boundary. Normal stages use the forward phase deadlines below and
+    # should never need this slack.
     budget = int(state.get('wall_clock_budget_seconds') or assessment_wall_clock_budget_seconds(shared.CURRENT_SCAN_MODE))
-    return started + max(60, budget)
+    return _assessment_started(state) + max(60, budget)
 
 
 def _assessment_remaining_seconds(state: AgentState) -> float:
     return max(0.0, _assessment_deadline(state) - time.monotonic())
 
 
+def _assessment_execution_budget_seconds(state: AgentState) -> int:
+    explicit = int(state.get('execution_budget_seconds') or 0)
+    if explicit > 0:
+        return explicit
+    return assessment_execution_budget_seconds(shared.CURRENT_SCAN_MODE)
+
+
 def _assessment_finalization_reserve_seconds(state: AgentState) -> int:
     mode = str(shared.CURRENT_SCAN_MODE or 'balanced')
-    configured = int(AGENTIC_FINALIZATION_RESERVE_SECONDS.get(mode, 25 * 60))
-    wall_clock = max(60, int(state.get('wall_clock_budget_seconds') or assessment_wall_clock_budget_seconds(mode)))
-    # Keep a safety clamp for unusually small/custom wall clocks without silently defeating the
-    # shipped TEST reserve (15 min inside a 45 min child). A quarter-wall cap reduced TEST to
-    # 11m15s and could make its nested 13-minute report reserve impossible by construction.
-    return min(configured, max(60, wall_clock // 2))
+    return int(AGENTIC_FINALIZATION_RESERVE_SECONDS.get(mode, AGENTIC_FINALIZATION_RESERVE_SECONDS['balanced']))
 
 
-def _assessment_execution_deadline(state: AgentState) -> float:
-    return _assessment_deadline(state) - _assessment_finalization_reserve_seconds(state)
+def _assessment_verification_reserve_seconds(state: AgentState) -> float:
+    mode = str(shared.CURRENT_SCAN_MODE or 'balanced')
+    return float(AGENTIC_VERIFICATION_RESERVE_SECONDS.get(mode, AGENTIC_VERIFICATION_RESERVE_SECONDS['balanced']))
 
 
 def _assessment_report_reserve_seconds(state: AgentState) -> float:
@@ -296,12 +372,20 @@ def _assessment_analysis_reserve_seconds(state: AgentState) -> float:
     return float(AGENTIC_ANALYSIS_RESERVE_SECONDS.get(mode, AGENTIC_ANALYSIS_RESERVE_SECONDS['balanced']))
 
 
-def _assessment_analysis_deadline(state: AgentState) -> float:
-    return _assessment_deadline(state) - _assessment_report_reserve_seconds(state)
+def _assessment_execution_deadline(state: AgentState) -> float:
+    return _assessment_started(state) + float(_assessment_execution_budget_seconds(state))
 
 
 def _assessment_verification_deadline(state: AgentState) -> float:
-    return _assessment_analysis_deadline(state) - _assessment_analysis_reserve_seconds(state)
+    return _assessment_execution_deadline(state) + _assessment_verification_reserve_seconds(state)
+
+
+def _assessment_analysis_deadline(state: AgentState) -> float:
+    return _assessment_verification_deadline(state) + _assessment_analysis_reserve_seconds(state)
+
+
+def _assessment_report_deadline(state: AgentState) -> float:
+    return _assessment_analysis_deadline(state) + _assessment_report_reserve_seconds(state)
 
 
 def _assessment_execution_budget_exhausted(state: AgentState) -> bool:
@@ -322,7 +406,7 @@ def _round_execution_budget(state: AgentState, eligible: list[dict[str, Any]], r
     reference cap is a planning reference, not a hard coverage cap: normal admission capacity grows
     when necessary to distribute the complete remaining eligible catalogue across the remaining
     planner rounds. The AI still decides which concrete actions are useful and their priority. The
-    wall-clock/finalization deadline remains the hard runtime guard.
+    execution-phase deadline remains the normal runtime guard; verification/AI/report have separate additive deadlines.
     """
     mode = str(shared.CURRENT_SCAN_MODE or 'balanced')
     reference_cap = max(1, int(ROUND_EXECUTION_ACTION_REFERENCE_CAPS.get(mode, 800)))
@@ -523,6 +607,27 @@ def resolve_ai_model(requested_model: str) -> tuple[str, str, dict[str, Any]]:
     }
 
 
+def _ollama_uses_local_compute(ollama_url: str) -> bool:
+    """Return whether an Ollama endpoint consumes compute on this VM/process host."""
+    try:
+        host = str(urlparse(str(ollama_url or "")).hostname or "").strip().lower().rstrip(".")
+    except Exception:
+        host = ""
+    return host in {"", "localhost", "127.0.0.1", "::1"}
+
+
+def _ollama_resource_lease(ollama_url: str, *, deadline: float | None):
+    """Serialize heavyweight local Ollama work across assessment processes.
+
+    A single local inference/model load normally consumes the useful CPU/GPU budget already, so
+    concurrent assessment requests tend to increase latency and memory pressure rather than useful
+    throughput. Remote Ollama endpoints do not consume VM compute and therefore skip this lease.
+    """
+    if not _ollama_uses_local_compute(ollama_url):
+        return nullcontext(-1)
+    return heavy_compute_workload_lease(deadline=deadline)
+
+
 # Turns an Ollama error response into a readable message.
 def _ollama_error(response: requests.Response) -> str:
     try:
@@ -582,20 +687,24 @@ def ensure_ollama_model(
         diagnostics['model_pull_timeout_seconds'] = pull_budget
         pull_deadline = time.monotonic() + pull_budget
         try:
-            response = requests.post(
-                f'{base}/api/pull',
-                json={'model': requested_model, 'stream': False},
-                timeout=shared.deadline_bounded_request_timeout((10.0, pull_budget), pull_deadline),
-            )
-            if response.status_code >= 400:
-                raise RuntimeError(f'HTTP {response.status_code}: {_ollama_error(response)}')
-            installed = _ollama_installed_models(base)
-            diagnostics['installed_models_after_pull'] = installed
-            matched = next((name for name in installed if _model_matches(requested_model, name)), '')
-            if matched:
-                diagnostics.update(model_ready=True, selected_model=matched)
-                return (matched, diagnostics)
-            pull_error = 'Ollama pull completed but the requested model was not listed by /api/tags.'
+            with _ollama_resource_lease(base, deadline=pull_deadline) as resource_slot:
+                if resource_slot is None:
+                    raise TimeoutError('Ollama model preparation deadline reached while waiting for the shared local-AI slot.')
+                diagnostics['local_ai_resource_slot'] = int(resource_slot) if int(resource_slot) >= 0 else None
+                response = requests.post(
+                    f'{base}/api/pull',
+                    json={'model': requested_model, 'stream': False},
+                    timeout=shared.deadline_bounded_request_timeout((10.0, pull_budget), pull_deadline),
+                )
+                if response.status_code >= 400:
+                    raise RuntimeError(f'HTTP {response.status_code}: {_ollama_error(response)}')
+                installed = _ollama_installed_models(base)
+                diagnostics['installed_models_after_pull'] = installed
+                matched = next((name for name in installed if _model_matches(requested_model, name)), '')
+                if matched:
+                    diagnostics.update(model_ready=True, selected_model=matched)
+                    return (matched, diagnostics)
+                pull_error = 'Ollama pull completed but the requested model was not listed by /api/tags.'
         except Exception as exc:
             pull_error = f'{type(exc).__name__}: {exc}'
     diagnostics['model_pull_error'] = pull_error
@@ -949,20 +1058,24 @@ def _ollama_stream_content(url: str, payload: dict[str, Any], *, response_kind: 
     # the next request, so one short-delayed retry recovers without failing the
     # whole batch outright.
     outer_started = time.monotonic()
-    retries_left = 1
-    while True:
-        remaining = total_timeout - (time.monotonic() - outer_started)
-        if remaining <= 0:
-            raise TimeoutError(f'Ollama request exceeded the {total_timeout}-second provider-call budget.')
-        try:
-            return _attempt(max(1, int(math.ceil(remaining))))
-        except RuntimeError as exc:
+    provider_deadline = outer_started + max(1.0, float(total_timeout))
+    with _ollama_resource_lease(url, deadline=provider_deadline) as resource_slot:
+        if resource_slot is None:
+            raise TimeoutError(f'Ollama request exceeded the {total_timeout}-second provider-call budget while waiting for the shared local-AI slot.')
+        retries_left = 1
+        while True:
             remaining = total_timeout - (time.monotonic() - outer_started)
-            if retries_left > 0 and _OLLAMA_RUNNER_CRASH_MARKER in str(exc) and remaining > 30:
-                retries_left -= 1
-                time.sleep(3)
-                continue
-            raise
+            if remaining <= 0:
+                raise TimeoutError(f'Ollama request exceeded the {total_timeout}-second provider-call budget.')
+            try:
+                return _attempt(max(1, int(math.ceil(remaining))))
+            except RuntimeError as exc:
+                remaining = total_timeout - (time.monotonic() - outer_started)
+                if retries_left > 0 and _OLLAMA_RUNNER_CRASH_MARKER in str(exc) and remaining > 30:
+                    retries_left -= 1
+                    time.sleep(3)
+                    continue
+                raise
 
 # Sends a small request so the model is ready before planning starts.
 def warm_ollama_model(ollama_url: str, model: str, *, timeout: int) -> dict[str, Any]:
@@ -1883,6 +1996,125 @@ def _analysis_catalog(results: dict[str, dict[str, Any]]) -> tuple[list[dict[str
             })
     return candidates, finding_map
 
+
+def _analysis_candidate_priority(item: dict[str, Any]) -> tuple[int, int, int, str, str, str]:
+    """Stable evidence-first ordering used only when the AI analysis stage cannot cover every finding.
+
+    Scanner/verifier findings are never deleted or reclassified by this helper. It only decides which
+    findings receive scarce post-scan AI narrative time first so a very large result set cannot make
+    strict Agentic mode fail before analyzing even one finding.
+    """
+    risk_rank = {"critical": 5, "high": 4, "medium": 3, "low": 2, "info": 1}.get(
+        str(item.get("scanner_risk") or "").lower(), 0
+    )
+    category_rank = 2 if str(item.get("category") or "").lower() == "vulnerability" else 1
+    verification = str(item.get("verification_status") or "").lower()
+    confidence = str(item.get("verification_confidence") or "").lower()
+    verification_rank = 0
+    if any(token in verification for token in ("confirmed", "verified", "scanner-confirmed", "exploited")):
+        verification_rank = 3
+    elif any(token in verification for token in ("candidate", "needs", "manual", "unverified")):
+        verification_rank = 1
+    elif confidence in {"high", "medium"}:
+        verification_rank = 2
+    return (
+        category_rank, risk_rank, verification_rank,
+        str(item.get("tool") or ""), str(item.get("profile") or ""), str(item.get("id") or ""),
+    )
+
+
+def _analysis_endpoint_group_key(raw_url: Any) -> str:
+    """Normalize only the endpoint identity used for strict narrative reuse.
+
+    Query *values* are deliberately excluded because the parameter name is a separate group-key
+    component. Origin and path remain exact: findings on another host, port or path never share an
+    AI assessment merely because their alert text looks similar.
+    """
+    raw = str(raw_url or '').strip()
+    if not raw:
+        return ''
+    try:
+        parsed = urlparse(raw)
+    except Exception:
+        return raw.lower()
+    scheme = str(parsed.scheme or '').lower()
+    authority = str(parsed.netloc or '').lower()
+    path = str(parsed.path or '/')
+    return f'{scheme}://{authority}{path}' if scheme or authority else path
+
+
+def _analysis_equivalence_key(item: dict[str, Any]) -> tuple[Any, ...]:
+    """Return a deliberately strict key for safe AI-narrative reuse.
+
+    Reuse is allowed only when scanner/tool, identity profile, vulnerability type, endpoint path,
+    parameter, method, severity and verification state agree. Different evidence is still preserved
+    on every original finding; only the expensive post-scan AI interpretation is shared.
+    """
+    normalize = lambda value: re.sub(r'\s+', ' ', str(value or '').strip().lower())
+    cves = item.get('cve_ids') if isinstance(item.get('cve_ids'), list) else []
+    return (
+        normalize(item.get('profile')),
+        normalize(item.get('tool')),
+        normalize(item.get('alert')),
+        normalize(item.get('category')),
+        normalize(item.get('scanner_risk')),
+        normalize(item.get('verification_status')),
+        normalize(item.get('verification_confidence')),
+        _analysis_endpoint_group_key(item.get('url')),
+        normalize(item.get('method')),
+        normalize(item.get('parameter')),
+        normalize(item.get('cwe_id')),
+        normalize(item.get('owasp_category')),
+        tuple(sorted(normalize(value) for value in cves if normalize(value))),
+    )
+
+
+def _analysis_representative_groups(
+    candidates: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], dict[str, list[str]]]:
+    """Collapse only strictly equivalent findings into one AI workload representative."""
+    grouped: dict[tuple[Any, ...], list[dict[str, Any]]] = {}
+    for item in candidates:
+        grouped.setdefault(_analysis_equivalence_key(item), []).append(item)
+
+    representatives: list[dict[str, Any]] = []
+    members_by_representative: dict[str, list[str]] = {}
+    for members in grouped.values():
+        representative = dict(members[0])
+        representative_id = str(representative.get('id') or '')
+        member_ids = [str(item.get('id') or '') for item in members if str(item.get('id') or '')]
+        representative['equivalent_finding_count'] = len(member_ids)
+        representatives.append(representative)
+        members_by_representative[representative_id] = member_ids or [representative_id]
+
+    representatives.sort(key=_analysis_candidate_priority, reverse=True)
+    return representatives, members_by_representative
+
+
+def _expand_equivalent_analysis_rows(
+    rows: list[dict[str, Any]], members_by_representative: dict[str, list[str]],
+) -> list[dict[str, Any]]:
+    """Fan one AI assessment back onto equivalent originals without merging their evidence."""
+    expanded: list[dict[str, Any]] = []
+    for row in rows:
+        representative_id = str(row.get('id') or '')
+        member_ids = members_by_representative.get(representative_id) or [representative_id]
+        for member_id in member_ids:
+            cloned = copy.deepcopy(row)
+            cloned['id'] = member_id
+            if member_id != representative_id:
+                cloned['_analysis_reused_from'] = representative_id
+            expanded.append(cloned)
+    return expanded
+
+
+def _analysis_budget_estimated_batch_capacity(mode: str, stage_budget_seconds: float) -> int:
+    """Conservative planning estimate only; actual admission is elapsed-time adaptive."""
+    minimum_batch_seconds = 45.0
+    reserve = max(minimum_batch_seconds, float(AI_ANALYSIS_FUTURE_BATCH_RESERVE_SECONDS.get(mode, 90)))
+    return max(0, int(float(stage_budget_seconds) // reserve))
+
+
 # Parses one structured batch returned by the AI analysis stage.
 def _parse_analysis_content(content: str) -> list[dict[str, Any]]:
     raw = str(content or '').strip()
@@ -2060,6 +2292,7 @@ def _ai_analysis_batch(state: AgentState, batch: list[dict[str, Any]], all_candi
     expected = {str(item['id']) for item in batch}
     started = time.monotonic()
     errors: list[str] = []
+    first_error: BaseException | None = None
 
     # For a one-finding request, reserve time for a compact rescue when the parent slice is large
     # enough. Preferred floors must never enlarge the timeout supplied by the adaptive parent: near
@@ -2095,6 +2328,7 @@ def _ai_analysis_batch(state: AgentState, batch: list[dict[str, Any]], all_candi
             )
         return _analysis_quality_check(_parse_analysis_content(content), expected)
     except Exception as exc:
+        first_error = exc
         errors.append(f'chat: {type(exc).__name__}: {exc}')
         if len(batch) > 1:
             raise RuntimeError('; '.join(errors)) from exc
@@ -2102,7 +2336,10 @@ def _ai_analysis_batch(state: AgentState, batch: list[dict[str, Any]], all_candi
     remaining = max(0, int(timeout - (time.monotonic() - started)))
     rescue_minimum = 8 if mode == 'test' else 40
     if remaining < rescue_minimum:
-        raise RuntimeError('; '.join(errors + ['single-finding rescue skipped: analysis budget exhausted']))
+        message = '; '.join(errors + ['single-finding rescue skipped: analysis budget exhausted'])
+        if _ai_exception_is_timeout(first_error):
+            raise AnalysisBudgetExhausted(message) from first_error
+        raise RuntimeError(message) from first_error
 
     rescue_system = (
         system_message
@@ -2156,10 +2393,24 @@ def _ai_analysis_batch_adaptive(
     remaining = max(0, int(deadline - time.monotonic()))
     attempt_floor = 12 if shared.CURRENT_SCAN_MODE == 'test' else 45
     if remaining < attempt_floor:
-        raise TimeoutError(f'{label} exhausted its shared analysis batch budget before another AI attempt could start.')
+        raise AnalysisBudgetExhausted(f'{label} exhausted its shared analysis batch budget before another AI attempt could start.')
     try:
         return _ai_analysis_batch(state, batch, all_candidates, remaining)
-    except Exception:
+    except Exception as exc:
+        # If the model/transport consumed the shared batch deadline, this is phase-budget
+        # exhaustion rather than a provider-contract failure. Preserve scanner evidence and let
+        # analysis_node continue with later groups even under --require-ai. An immediate provider
+        # error while substantial batch time remains is still propagated and remains fatal in
+        # strict mode.
+        remaining_after_error = max(0, int(deadline - time.monotonic()))
+        if remaining_after_error < attempt_floor:
+            if _ai_exception_is_timeout(exc):
+                raise AnalysisBudgetExhausted(
+                    f'{label} exhausted its shared analysis batch budget while waiting for AI output.'
+                ) from exc
+            # A real provider/contract failure does not become benign merely because it arrived
+            # near the deadline. Let strict mode treat it as the AI failure it actually is.
+            raise
         if len(batch) <= 1:
             raise
         midpoint = max(1, len(batch) // 2)
@@ -2168,6 +2419,10 @@ def _ai_analysis_batch_adaptive(
         remaining = max(0, int(deadline - time.monotonic()))
         split_floor = 24 if shared.CURRENT_SCAN_MODE == 'test' else 90
         if remaining < split_floor:
+            if _ai_exception_is_timeout(exc):
+                raise AnalysisBudgetExhausted(
+                    f'{label} exhausted its shared analysis batch budget before split retries could complete.'
+                ) from exc
             raise
         print(
             f'    AI analysis: {label} did not complete cleanly; retrying as smaller AI batches '
@@ -2176,17 +2431,46 @@ def _ai_analysis_batch_adaptive(
         )
         rows: list[dict[str, Any]] = []
         # Allocate the first child only its proportional share of the remaining wall-clock time;
-        # the second child receives whatever remains under the same parent deadline.
+        # the second child receives whatever remains under the same parent deadline. If one child
+        # later exhausts the shared deadline, preserve rows already completed by the sibling instead
+        # of throwing away valid AI work for the whole parent batch.
         left_floor = 12 if shared.CURRENT_SCAN_MODE == 'test' else 45
         left_share = max(left_floor, int(remaining * (len(left) / max(1, len(batch)))))
         left_deadline = min(deadline, time.monotonic() + left_share)
-        rows.extend(_ai_analysis_batch_adaptive(
-            state, left, all_candidates, timeout, label=f'{label}.1', deadline=left_deadline,
-        ))
-        rows.extend(_ai_analysis_batch_adaptive(
-            state, right, all_candidates, timeout, label=f'{label}.2', deadline=deadline,
-        ))
+        try:
+            rows.extend(_ai_analysis_batch_adaptive(
+                state, left, all_candidates, timeout, label=f'{label}.1', deadline=left_deadline,
+            ))
+        except AnalysisBudgetExhausted as exc:
+            raise AnalysisBudgetExhausted(str(exc), partial_rows=[*rows, *exc.partial_rows]) from exc
+        try:
+            rows.extend(_ai_analysis_batch_adaptive(
+                state, right, all_candidates, timeout, label=f'{label}.2', deadline=deadline,
+            ))
+        except AnalysisBudgetExhausted as exc:
+            raise AnalysisBudgetExhausted(str(exc), partial_rows=[*rows, *exc.partial_rows]) from exc
         return rows
+
+
+def _set_finding_ai_analysis_status(
+    finding_map: dict[str, dict[str, Any]], finding_ids: list[str] | set[str] | tuple[str, ...], *,
+    status: str, reason: str, provider: str, model: str, representative_id: str = '', overwrite: bool = True,
+) -> None:
+    """Attach an explicit per-finding AI coverage state without altering scanner evidence."""
+    for finding_id in finding_ids:
+        finding = finding_map.get(str(finding_id or ''))
+        if not isinstance(finding, dict):
+            continue
+        current = finding.get('ai_analysis_status') if isinstance(finding.get('ai_analysis_status'), dict) else {}
+        if not overwrite and str(current.get('status') or '') in {'analyzed', 'reused_equivalent'}:
+            continue
+        finding['ai_analysis_status'] = {
+            'status': str(status or 'unknown'),
+            'reason': str(reason or ''),
+            'provider': str(provider or ''),
+            'model': str(model or ''),
+            'representative_finding': str(representative_id or ''),
+        }
 
 
 # Applies the AI narrative as the final report wording while preserving every
@@ -2283,7 +2567,19 @@ def _apply_analysis(rows: list[dict[str, Any]], finding_map: dict[str, dict[str,
             'rationale': str(row.get('rationale') or '').strip()[:1000],
             'short_ai_fields': sorted(short_fields),
             'narrative_fallbacks': narrative_fallbacks,
+            'equivalent_analysis_reused': bool(row.get('_analysis_reused_from')),
+            'equivalent_analysis_source_finding': str(row.get('_analysis_reused_from') or ''),
         }
+        reused_from = str(row.get('_analysis_reused_from') or '')
+        _set_finding_ai_analysis_status(
+            finding_map, [finding_id],
+            status='reused_equivalent' if reused_from else 'analyzed',
+            reason=(
+                f'AI assessment reused from strictly equivalent representative {reused_from}; individual scanner evidence retained.'
+                if reused_from else 'Finding was directly post-assessed by the configured AI provider.'
+            ),
+            provider=provider, model=model, representative_id=reused_from,
+        )
         analyzed += 1
         changed += applied_risk != original_risk
     return analyzed, changed
@@ -2300,99 +2596,286 @@ def analysis_node(state: AgentState) -> dict[str, Any]:
 
     started = time.monotonic()
     mode = shared.CURRENT_SCAN_MODE
+    provider = str(state.get('ai_provider') or 'ollama')
+    model = str(state.get('model') or '')
     total_candidate_findings = len(candidates)
-    if mode == 'test' and total_candidate_findings > TEST_ANALYSIS_FINDING_LIMIT:
-        # One bounded batch is enough to prove the analysis path and structured-output contract.
-        # TEST deliberately leaves the remaining scanner findings untouched for the real profiles.
-        candidates = candidates[:TEST_ANALYSIS_FINDING_LIMIT]
+    _set_finding_ai_analysis_status(
+        finding_map, [str(item.get('id') or '') for item in candidates],
+        status='pending',
+        reason='Queued for post-scan AI interpretation; scanner/verifier evidence remains authoritative if AI coverage is incomplete.',
+        provider=provider, model=model,
+    )
+    representatives, members_by_representative = _analysis_representative_groups(candidates)
+    representative_total = len(representatives)
+    equivalent_findings_collapsed = max(0, total_candidate_findings - representative_total)
+
+    test_findings_deferred = 0
+    test_representatives_deferred = 0
+    if mode == 'test' and len(representatives) > TEST_ANALYSIS_FINDING_LIMIT:
+        kept = representatives[:TEST_ANALYSIS_FINDING_LIMIT]
+        deferred_reps = representatives[TEST_ANALYSIS_FINDING_LIMIT:]
+        test_representatives_deferred = len(deferred_reps)
+        test_findings_deferred = sum(len(members_by_representative.get(str(item.get('id') or ''), [])) for item in deferred_reps)
+        for deferred in deferred_reps:
+            representative_id = str(deferred.get('id') or '')
+            _set_finding_ai_analysis_status(
+                finding_map, members_by_representative.get(representative_id, [representative_id]),
+                status='not_analyzed_profile_limit',
+                reason='TEST is a smoke/regression profile and intentionally limits final AI interpretation to one strict representative finding.',
+                provider=provider, model=model, representative_id=representative_id,
+            )
+        representatives = kept
+
     default_batch_budget = AI_ANALYSIS_BATCH_TIMEOUTS.get(mode, 240)
-    configured_budget = int(state.get('ai_timeout') or default_batch_budget)
     remaining_for_analysis = max(0, int(_assessment_analysis_deadline(state) - time.monotonic()))
     configured_stage_budget = max(1, int(AI_ANALYSIS_STAGE_TIMEOUTS.get(mode, default_batch_budget)))
     stage_budget = min(configured_stage_budget, remaining_for_analysis)
-    analysis_stage_deadline = min(
-        started + float(stage_budget),
-        _assessment_analysis_deadline(state),
-    )
+    analysis_stage_deadline = min(started + float(stage_budget), _assessment_analysis_deadline(state))
+
     if remaining_for_analysis < 45:
+        pending_ids = [
+            finding_id for finding_id, finding in finding_map.items()
+            if isinstance(finding, dict)
+            and str((finding.get('ai_analysis_status') or {}).get('status') or '') == 'pending'
+        ]
+        _set_finding_ai_analysis_status(
+            finding_map, pending_ids,
+            status='not_analyzed_budget',
+            reason='The protected AI-analysis phase had less than the minimum safe batch window remaining; scanner/verifier information is fully retained.',
+            provider=provider, model=model,
+        )
         analysis = {
-            'status': 'partial', 'provider': str(state.get('ai_provider') or 'ollama'), 'model': state['model'],
-            'candidate_findings': len(candidates), 'candidate_findings_total': total_candidate_findings,
+            'status': 'partial', 'provider': provider, 'model': model,
+            'candidate_findings': len(representatives), 'candidate_findings_total': total_candidate_findings,
+            'analysis_representative_findings_total': representative_total,
+            'equivalent_findings_collapsed': equivalent_findings_collapsed,
             'analyzed_findings': 0, 'severity_changes': 0,
-            'errors': ['assessment wall-clock budget reserved for final report; AI narrative analysis skipped'],
+            'candidate_findings_unanalyzed': total_candidate_findings,
+            'errors': ['protected AI-analysis phase had insufficient remaining time for a safe model call; scanner/verifier evidence retained'],
             'seconds': round(time.monotonic() - started, 2), 'diagnosis': 'assessment_time_budget_exhausted',
         }
-        print('AI analysis: skipped because the hard assessment deadline is near; scanner evidence is retained.', flush=True)
+        print('AI analysis: protected analysis phase had insufficient time for a safe model call; scanner evidence is retained.', flush=True)
         return {'results': results, 'analysis': analysis}
-    batch_budget = min(configured_budget, default_batch_budget, remaining_for_analysis)
+
+    batch_budget = min(default_batch_budget, remaining_for_analysis)
     batch_size = AI_ANALYSIS_BATCH_SIZES.get(mode, 8)
-    analyzed = changed = 0
+    estimated_batch_capacity = _analysis_budget_estimated_batch_capacity(mode, stage_budget)
+    analyzed = changed = direct_representatives_analyzed = 0
+    direct_representative_ids: set[str] = set()
+    budget_deferred_representative_ids: set[str] = set()
+    error_deferred_representative_ids: set[str] = set()
+    incomplete_response_representative_ids: set[str] = set()
     errors: list[str] = []
-    batch_count = (len(candidates) + batch_size - 1) // batch_size
+    batch_count = (len(representatives) + batch_size - 1) // batch_size
+
+    if equivalent_findings_collapsed:
+        print(
+            f'AI analysis: {total_candidate_findings} findings -> {representative_total} strict equivalent group(s); '
+            f'{equivalent_findings_collapsed} duplicate instance(s) can reuse group analysis while preserving individual evidence.',
+            flush=True,
+        )
+
     if batch_budget < 45:
-        message = f'analysis batch time budget is too small: {batch_budget}s; minimum is 45s'
-        if state.get('require_ai'):
-            raise RuntimeError(f'Strict agentic mode requires AI analysis: {message}')
+        message = f'analysis batch time budget is too small: {batch_budget}s; minimum is 45s; scanner evidence retained'
         errors.append(message)
+        budget_deferred_representative_ids.update(str(item.get('id') or '') for item in representatives)
     else:
         for batch_index in range(batch_count):
-            batch = candidates[batch_index * batch_size:(batch_index + 1) * batch_size]
+            batch = representatives[batch_index * batch_size:(batch_index + 1) * batch_size]
             try:
                 now = time.monotonic()
-                remaining_hard = max(0, int(_assessment_analysis_deadline(state) - now))
+                remaining_hard = max(0.0, _assessment_analysis_deadline(state) - now)
                 remaining_stage = max(0.0, analysis_stage_deadline - now)
                 if remaining_hard < 45:
                     errors.append('assessment wall-clock budget reached during AI analysis; remaining findings retained without AI rewrite')
+                    budget_deferred_representative_ids.update(
+                        str(item.get('id') or '') for item in representatives[batch_index * batch_size:]
+                    )
                     break
                 if remaining_stage < 45:
-                    message = 'aggregate AI analysis stage budget reached; remaining findings retain scanner/verifier evidence without AI rewrite'
-                    if state.get('require_ai'):
-                        raise TimeoutError(message)
-                    errors.append(message)
+                    errors.append('aggregate AI analysis stage budget reached; remaining findings retain scanner/verifier evidence without AI rewrite')
+                    budget_deferred_representative_ids.update(
+                        str(item.get('id') or '') for item in representatives[batch_index * batch_size:]
+                    )
                     break
+
+                # Do not pre-reserve time for the entire remaining catalog: that was the starvation
+                # bug. Protect only a few future batches while allowing fast successful generations
+                # to continue until the real stage deadline. This makes coverage depend on measured
+                # AI throughput rather than a pessimistic static finding cap.
                 remaining_batches = max(1, batch_count - batch_index)
                 future_batch_count = max(0, remaining_batches - 1)
-                future_batch_reserve = max(0.0, float(AI_ANALYSIS_FUTURE_BATCH_RESERVE_SECONDS.get(mode, 90)))
-                reserved_for_future_batches = future_batch_reserve * future_batch_count
-                if remaining_stage > reserved_for_future_batches:
-                    stage_slice = remaining_stage - reserved_for_future_batches
-                else:
-                    stage_slice = remaining_stage / remaining_batches
+                protected_future_batches = min(future_batch_count, {'test': 0, 'fast': 2, 'balanced': 3, 'deep': 4}.get(mode, 3))
+                future_batch_reserve = max(45.0, float(AI_ANALYSIS_FUTURE_BATCH_RESERVE_SECONDS.get(mode, 90)))
+                max_protected_seconds = max(0.0, remaining_stage - 45.0)
+                protected_seconds = min(max_protected_seconds, future_batch_reserve * protected_future_batches)
+                stage_slice = max(45.0, remaining_stage - protected_seconds)
                 effective_batch_budget = min(float(batch_budget), float(remaining_hard), float(stage_slice))
                 if effective_batch_budget < 45:
-                    message = (
+                    errors.append(
                         f'analysis stage cannot allocate the 45s minimum to batch {batch_index + 1}/{batch_count} '
-                        f'within the remaining aggregate budget'
+                        f'within the remaining aggregate budget; scanner evidence retained'
                     )
-                    if state.get('require_ai'):
-                        raise TimeoutError(message)
-                    errors.append(message)
+                    budget_deferred_representative_ids.update(
+                        str(item.get('id') or '') for item in representatives[batch_index * batch_size:]
+                    )
                     break
+
                 effective_batch_budget_int = max(45, int(math.ceil(effective_batch_budget)))
                 batch_deadline = min(analysis_stage_deadline, time.monotonic() + effective_batch_budget)
                 rows = _ai_analysis_batch_adaptive(
-                    state, batch, candidates, effective_batch_budget_int,
+                    state, batch, representatives, effective_batch_budget_int,
                     label=f'batch {batch_index + 1}/{batch_count}', deadline=batch_deadline,
                 )
-                batch_analyzed, batch_changed = _apply_analysis(rows, finding_map, state['model'], str(state.get('ai_provider') or 'ollama'))
+                direct_ids = {str(row.get('id') or '') for row in rows if str(row.get('id') or '')}
+                expected_ids = {str(item.get('id') or '') for item in batch if str(item.get('id') or '')}
+                missing_ids = expected_ids - direct_ids
+                if missing_ids:
+                    incomplete_response_representative_ids.update(missing_ids)
+                    errors.append(
+                        f'batch {batch_index + 1}/{batch_count}: AI response omitted {len(missing_ids)} representative finding(s); '
+                        'their scanner/verifier data were retained without AI rewrite'
+                    )
+                expanded_rows = _expand_equivalent_analysis_rows(rows, members_by_representative)
+                batch_analyzed, batch_changed = _apply_analysis(
+                    expanded_rows, finding_map, state['model'], str(state.get('ai_provider') or 'ollama')
+                )
+                # A syntactically present row can still be rejected by _apply_analysis (for example
+                # an invalid risk/confidence enum). Count a representative as directly analyzed only
+                # when its original finding actually carries an analyzed/reused status afterwards.
+                successfully_applied_ids = {
+                    representative_id for representative_id in direct_ids
+                    if str((finding_map.get(representative_id, {}).get('ai_analysis_status') or {}).get('status') or '')
+                    in {'analyzed', 'reused_equivalent'}
+                }
+                invalid_applied_ids = direct_ids - successfully_applied_ids
+                if invalid_applied_ids:
+                    incomplete_response_representative_ids.update(invalid_applied_ids)
+                    errors.append(
+                        f'batch {batch_index + 1}/{batch_count}: {len(invalid_applied_ids)} returned representative row(s) '
+                        'failed AI analysis validation; scanner/verifier data were retained without AI rewrite'
+                    )
+                direct_representative_ids.update(successfully_applied_ids)
+                direct_representatives_analyzed += len(successfully_applied_ids)
                 analyzed += batch_analyzed
                 changed += batch_changed
-                print(f'    AI analysis: batch {batch_index + 1}/{batch_count}: analyzed={batch_analyzed}; severity changes={batch_changed}', flush=True)
+                print(
+                    f'    AI analysis: batch {batch_index + 1}/{batch_count}: representatives={len(direct_ids)}; '
+                    f'findings covered={batch_analyzed}; severity changes={batch_changed}', flush=True,
+                )
+            except AnalysisBudgetExhausted as exc:
+                message = f'batch {batch_index + 1}: {type(exc).__name__}: {exc}'
+                errors.append(message)
+                expected_ids = {str(item.get('id') or '') for item in batch if str(item.get('id') or '')}
+                partial_rows = [row for row in getattr(exc, 'partial_rows', []) if isinstance(row, dict)]
+                direct_ids = {str(row.get('id') or '') for row in partial_rows if str(row.get('id') or '')}
+                successfully_applied_ids: set[str] = set()
+                partial_analyzed = partial_changed = 0
+                if partial_rows:
+                    expanded_rows = _expand_equivalent_analysis_rows(partial_rows, members_by_representative)
+                    partial_analyzed, partial_changed = _apply_analysis(
+                        expanded_rows, finding_map, state['model'], str(state.get('ai_provider') or 'ollama')
+                    )
+                    successfully_applied_ids = {
+                        representative_id for representative_id in direct_ids
+                        if str((finding_map.get(representative_id, {}).get('ai_analysis_status') or {}).get('status') or '')
+                        in {'analyzed', 'reused_equivalent'}
+                    }
+                    invalid_partial_ids = direct_ids - successfully_applied_ids
+                    if invalid_partial_ids:
+                        incomplete_response_representative_ids.update(invalid_partial_ids)
+                    direct_representative_ids.update(successfully_applied_ids)
+                    direct_representatives_analyzed += len(successfully_applied_ids)
+                    analyzed += partial_analyzed
+                    changed += partial_changed
+                budget_deferred_representative_ids.update(expected_ids - direct_ids)
+                print(
+                    f'    AI analysis: {message}; this is bounded phase-budget exhaustion, not an AI provider failure. '
+                    f'Preserved {len(successfully_applied_ids)} completed representative row(s); remaining scanner/verifier data retained. '
+                    'Continuing with later representative groups while time remains.',
+                    file=sys.stderr, flush=True,
+                )
             except Exception as exc:
                 message = f'batch {batch_index + 1}: {type(exc).__name__}: {exc}'
                 errors.append(message)
                 if state.get('require_ai'):
                     raise RuntimeError(f'Strict agentic mode requires AI analysis: {message}') from exc
+                error_deferred_representative_ids.update(
+                    str(item.get('id') or '') for item in batch if str(item.get('id') or '')
+                )
                 print(f'    AI analysis: {message}; scanner data retained for this batch.', file=sys.stderr, flush=True)
 
+    # Make AI coverage explicit on every original security finding. No vulnerability/candidate is
+    # removed merely because AI coverage ended: each retains scanner/verifier evidence and a reason.
+    for representative_id in budget_deferred_representative_ids:
+        _set_finding_ai_analysis_status(
+            finding_map, members_by_representative.get(representative_id, [representative_id]),
+            status='not_analyzed_budget',
+            reason='Protected AI-analysis time was exhausted before this strict representative group could be post-assessed; scanner/verifier information is retained in full.',
+            provider=provider, model=model, representative_id=representative_id, overwrite=False,
+        )
+    for representative_id in error_deferred_representative_ids:
+        _set_finding_ai_analysis_status(
+            finding_map, members_by_representative.get(representative_id, [representative_id]),
+            status='not_analyzed_ai_error',
+            reason='AI analysis for this batch failed while strict AI was disabled; scanner/verifier information is retained in full.',
+            provider=provider, model=model, representative_id=representative_id, overwrite=False,
+        )
+    for representative_id in incomplete_response_representative_ids:
+        _set_finding_ai_analysis_status(
+            finding_map, members_by_representative.get(representative_id, [representative_id]),
+            status='not_analyzed_ai_incomplete_response',
+            reason='The AI response did not return a valid row for this finding; scanner/verifier information is retained in full.',
+            provider=provider, model=model, representative_id=representative_id, overwrite=False,
+        )
+    # Defensive closure: no candidate may leave the analysis node with an ambiguous pending state.
+    still_pending = [
+        finding_id for finding_id, finding in finding_map.items()
+        if isinstance(finding, dict)
+        and str((finding.get('ai_analysis_status') or {}).get('status') or '') == 'pending'
+    ]
+    if still_pending:
+        _set_finding_ai_analysis_status(
+            finding_map, still_pending,
+            status='not_analyzed_budget',
+            reason='AI analysis ended before this finding received a model assessment; scanner/verifier information is retained in full.',
+            provider=provider, model=model, overwrite=False,
+        )
+
+    budget_deferred = sum(
+        len(members_by_representative.get(representative_id, []))
+        for representative_id in budget_deferred_representative_ids
+    )
+    reused_findings = max(0, analyzed - direct_representatives_analyzed)
+    unanalyzed_findings = max(0, total_candidate_findings - analyzed)
+    status = 'success' if not errors and (unanalyzed_findings == 0 or mode == 'test') else 'partial'
+
     analysis = {
-        'status': 'success' if not errors else 'partial',
-        'provider': str(state.get('ai_provider') or 'ollama'),
-        'model': state['model'],
-        'candidate_findings': len(candidates),
+        'status': status,
+        'provider': provider,
+        'model': model,
+        'candidate_findings': len(representatives),
         'candidate_findings_total': total_candidate_findings,
+        'analysis_representative_findings_total': representative_total,
+        'equivalent_findings_collapsed': equivalent_findings_collapsed,
+        'analysis_representatives_directly_analyzed': direct_representatives_analyzed,
+        'analysis_findings_reused_from_equivalent_group': reused_findings,
+        'candidate_findings_unanalyzed': unanalyzed_findings,
+        'candidate_findings_deferred_budget': budget_deferred,
+        'candidate_findings_deferred_ai_error': sum(
+            len(members_by_representative.get(representative_id, []))
+            for representative_id in error_deferred_representative_ids
+        ),
+        'candidate_findings_deferred_incomplete_ai_response': sum(
+            len(members_by_representative.get(representative_id, []))
+            for representative_id in incomplete_response_representative_ids
+        ),
+        # Compatibility key: now a conservative throughput estimate, not a hard admission cap.
+        'analysis_budget_batch_limit': estimated_batch_capacity,
+        'analysis_budget_policy': 'elapsed-time adaptive over strict equivalent-finding representatives; no static hard finding cap',
         'test_finding_limit': TEST_ANALYSIS_FINDING_LIMIT if mode == 'test' else 0,
-        'test_findings_deferred': max(0, total_candidate_findings - len(candidates)) if mode == 'test' else 0,
+        'test_representatives_deferred': test_representatives_deferred if mode == 'test' else 0,
+        'test_findings_deferred': test_findings_deferred if mode == 'test' else 0,
         'analyzed_findings': analyzed,
         'severity_changes': changed,
         'errors': errors,
@@ -2401,9 +2884,13 @@ def analysis_node(state: AgentState) -> dict[str, Any]:
         'stage_timeout_seconds': configured_stage_budget,
         'stage_budget_effective_seconds': stage_budget,
         'future_batch_reserve_seconds': int(AI_ANALYSIS_FUTURE_BATCH_RESERVE_SECONDS.get(mode, 90)),
-        'policy': 'AI supplies the final severity and professional description/impact/consequence/recovery/remediation wording; browser verification constrains confidence independently from severity, while original scanner narrative, category, verification status and evidence remain preserved and scanner/verifier-controlled where applicable.',
+        'policy': 'AI supplies the final severity and professional description/impact/consequence/recovery/remediation wording; strictly equivalent findings may reuse one AI assessment while retaining individual scanner evidence; browser verification constrains confidence independently from severity, while original scanner narrative, category, verification status and evidence remain preserved and scanner/verifier-controlled where applicable.',
     }
-    print(f"AI analysis: finished; analyzed={analyzed}/{len(candidates)}; severity changes={changed}; {analysis['seconds']:.1f}s", flush=True)
+    print(
+        f"AI analysis: finished; analyzed={analyzed}/{total_candidate_findings}; direct groups={direct_representatives_analyzed}/{representative_total}; "
+        f"reused={reused_findings}; severity changes={changed}; {analysis['seconds']:.1f}s",
+        flush=True,
+    )
     return {'results': results, 'analysis': analysis}
 
 # Keeps a bounded result summary that is safe to send back to the planner.
@@ -2465,19 +2952,63 @@ def discovery_node(state: AgentState) -> dict[str, Any]:
     active_profiles = ', '.join(str(profile.get('name') or '') for profile in state['profiles']) or 'none'
     print(f'\n[*] Discovery of active profiles: {active_profiles}')
     discovery, diagnostics = ({}, list(state['diagnostics']))
-    for profile in state['profiles']:
-        state_changes_allowed = shared.state_changing_tests_allowed(state['target'], state.get('allow_state_changes'))
+    state_changes_allowed = shared.state_changing_tests_allowed(state['target'], state.get('allow_state_changes'))
+    assessment_deadline = _assessment_execution_deadline(state)
+    service_time_budget = None if assessment_deadline is None else max(0.0, assessment_deadline - time.monotonic())
+    print(
+        f"    [DISCOVERY] same-host service sweep start: enabled={shared.DISCOVER_SAME_HOST_SERVICES}; "
+        f"network_inflight={shared.DISCOVERY_NETWORK_MAX_INFLIGHT}; rate={shared.MAX_REQUEST_RATE:g} req/s.",
+        flush=True,
+    )
+    shared_service_discovery = shared.discover_same_host_web_services(
+        state['target'], time_budget_seconds=service_time_budget,
+    )
+    print(
+        f"    [DISCOVERY] same-host service sweep complete: ports={int(shared_service_discovery.get('ports_probed', 0) or 0)}/"
+        f"{int(shared_service_discovery.get('candidate_ports_planned', 0) or 0)}; "
+        f"web_services={len(shared_service_discovery.get('web_services', []) or [])}; "
+        f"cache_hit={bool(shared_service_discovery.get('cache_hit', False))}; "
+        f"elapsed={float(shared_service_discovery.get('duration_seconds', 0.0) or 0.0):.1f}s.",
+        flush=True,
+    )
+    profile_results: dict[str, dict[str, Any]] = {}
+    profile_workers = max(1, min(len(state['profiles']) or 1, int(shared.PARALLELISM_POLICY.get('profile_workers') or 1)))
+
+    def _discover_profile(profile: dict[str, Any]) -> tuple[str, dict[str, Any]]:
+        name = str(profile.get('name') or '')
+        print(
+            f"    [DISCOVERY] profile {name or '?'} core start: authenticated={bool(profile.get('cookies'))}; "
+            f"shared_network_pool={shared.DISCOVERY_NETWORK_MAX_INFLIGHT}; browser_slots={int(shared.PARALLELISM_POLICY.get('browser_profile_workers') or 1)}.",
+            flush=True,
+        )
         found = discover_target_sync_safe(
-            state['target'], profile['cookies'],
+            state['target'], profile.get('cookies', ''),
             seeds=list(state.get('discovery_seeds') or []),
             forced_seeds=list(state.get('entry_points') or []),
             allow_state_changes=state_changes_allowed,
-            wall_clock_deadline=_assessment_execution_deadline(state),
+            wall_clock_deadline=assessment_deadline,
+            precomputed_same_host_service_discovery=shared_service_discovery,
         )
+        return name, found
+
+    if state['profiles']:
+        with ThreadPoolExecutor(max_workers=profile_workers, thread_name_prefix='secops-profile-discovery') as executor:
+            futures = {executor.submit(_discover_profile, profile): str(profile.get('name') or '') for profile in state['profiles']}
+            for future in as_completed(futures):
+                name, found = future.result()
+                profile_results[name] = found
+                print(
+                    f"    [DISCOVERY] profile {name or '?'} core discovery complete "
+                    f"({len(found.get('html_urls', []))} HTML, {len(found.get('request_cases', []))} contracts).",
+                    flush=True,
+                )
+
+    for profile in state['profiles']:
+        found = profile_results[str(profile.get('name') or '')]
         if profile.get('cookies') and found.get('authentication_effective') is not False:
             found = shared.authenticate_discovered_sibling_origins(
                 found, state['target'], profile['cookies'], allow_state_changes=state_changes_allowed,
-                wall_clock_deadline=_assessment_execution_deadline(state),
+                wall_clock_deadline=assessment_deadline,
             )
         discovery[profile['name']] = found
         diagnostics.extend(({'phase': 'discovery', 'profile': profile['name'], **item} for item in found['errors']))
@@ -2508,6 +3039,10 @@ def discovery_node(state: AgentState) -> dict[str, Any]:
             print(f"      [DISCOVERY] Chromium adaptive navigation budget: base={browser_budget}, overflow={browser_overflow}, attempted={browser_attempted}/{browser_max_budget}.")
         if browser_remaining and browser_attempted >= browser_max_budget:
             print(f"      [DISCOVERY] Chromium navigation max budget saturated: {browser_attempted}/{browser_max_budget}; {browser_remaining} queued candidate(s) remain.")
+        browser_slot_wait = float(budget.get('browser_slot_wait_seconds', 0.0) or 0.0)
+        browser_slots = int(budget.get('browser_profile_slots', 1) or 1)
+        if browser_slot_wait >= 0.05:
+            print(f"      [DISCOVERY] Chromium CPU-slot wait={browser_slot_wait:.2f}s; concurrent browser profile slots={browser_slots}.")
         script_done = int(budget.get('scripts_processed', 0) or 0)
         script_budget = int(budget.get('script_budget', 0) or 0)
         script_attempts = int(budget.get('script_requests_attempted', 0) or 0)
@@ -3856,8 +4391,11 @@ def verification_node(state: AgentState) -> dict[str, Any]:
     results = {profile: dict(values) for profile, values in state['results'].items()}
     discovery = {profile: dict(values) for profile, values in state['discovery'].items()}
     completed = list(state['completed'])
-    verification_deadline = _assessment_verification_deadline(state)
     verification_started = time.monotonic()
+    verification_deadline = min(
+        _assessment_verification_deadline(state),
+        verification_started + _assessment_verification_reserve_seconds(state),
+    )
     verification_window = max(0.0, verification_deadline - verification_started)
     safe_surface_deadline = min(
         verification_deadline,
@@ -3958,6 +4496,15 @@ def report_node(state: AgentState) -> dict[str, Any]:
         'authentication_scope_policy': ('authenticated destinations try an applicable existing cookie first; when same-host multi-port is enabled, the raw cookie may be tried on another authorized port of the exact same hostname and scheme and must validate; if rejected, saved browser/OIDC state is tried, followed by the username/password resolved once by the runner if the login flow requests them; a conclusively rejected speculative raw cookie is remembered per cookie+origin so later scanners do not retry it; raw cookies are never copied to a different hostname and no second child-console prompt is opened'),
         'redirect_scope_policy': ('active scanners use explicit-origin authorization; same-host multi-port expansion is ' + ('enabled (exact hostname, HTTP/HTTPS services across authorized ports)' if shared.ALLOW_SAME_HOST_PORTS else 'disabled') + '; sensitive HTTP helpers stay same-origin, while project discovery follows bounded redirects only across destinations authorized before the run; external scanner processes do not autonomously follow redirects, so tool-internal redirect-dependent behavior is intentionally conservative; ZAP adds an exact-origin context plus in-scope-only active scans and Protected mode; browser authentication may traverse an external IdP without authorizing it for active testing'),
         'runtime_platform': platform.platform(),
+        'assessment_execution_seconds': round(max(0.0, time.monotonic() - _assessment_started(state)), 3),
+        'timing_budget_policy': {
+            'execution_budget_seconds': _assessment_execution_budget_seconds(state),
+            'verification_budget_seconds': _assessment_verification_reserve_seconds(state),
+            'ai_analysis_budget_seconds': _assessment_analysis_reserve_seconds(state),
+            'report_budget_seconds': _assessment_report_reserve_seconds(state),
+            'internal_watchdog_seconds': int(state.get('wall_clock_budget_seconds') or assessment_wall_clock_budget_seconds(shared.CURRENT_SCAN_MODE)),
+            'watchdog_policy': 'last-resort hang/deadlock guard; normal scheduling is controlled by explicit phase budgets',
+        },
         'python_executable': sys.executable,
         'mcp_server_python': shared._server_python(),
         'remaining_eligible_actions_at_report': len(remaining),
@@ -3973,14 +4520,19 @@ def report_node(state: AgentState) -> dict[str, Any]:
             if bool(profile.get('cookies')) and _profile_has_effective_auth(state, str(profile.get('name') or ''))
         ) >= 2,
         'orchestration': {'engine': 'langgraph', 'mode': 'agentic', 'nodes': ['discovery', 'planner', 'executor', 'verification', 'analysis', 'report']}}
-    report_deadline = _assessment_deadline(state)
+    report_started = time.monotonic()
+    report_deadline = min(
+        _assessment_report_deadline(state),
+        report_started + _assessment_report_reserve_seconds(state),
+        _assessment_deadline(state),
+    )
     report_emergency_reserve = 120.0
     report_remaining = max(0.0, report_deadline - time.monotonic())
     if report_remaining <= report_emergency_reserve + 5.0:
         report = {
             'tool': 'report', 'status': 'error', 'target': state['target'],
             'diagnosis': 'assessment_time_budget_exhausted',
-            'output': 'The assessment wall-clock budget left insufficient time for MCP report rendering; emergency artifact recovery was used instead.',
+            'output': 'The dedicated report phase left insufficient time for normal MCP report rendering; emergency artifact recovery was used instead.',
             'vulnerabilities': [],
         }
     else:

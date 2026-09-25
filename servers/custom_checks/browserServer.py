@@ -4,10 +4,11 @@ import asyncio
 import re
 import secrets
 import shutil
+import time
 from typing import Any
 from urllib.parse import quote, urlparse
 
-from utils import RequestRatePacer, failure, parse_cookie_header, partial, request_contract_state_change_reason, scanner_request_rate, skipped, success, same_origin, url_in_authorized_scope
+from utils import RequestRatePacer, browser_workload_lease, failure, parse_cookie_header, partial, request_contract_state_change_reason, scanner_request_rate, secops_parallelism_policy, skipped, success, same_origin, url_in_authorized_scope
 
 from core.scannerCommon import mutate_parameter, proportional_budget, service
 
@@ -25,7 +26,7 @@ NEGATIVE_SUBMIT_RE = re.compile(r"(?:clear|delete|remove|reset|cancel|logout|dro
 BROWSER_NAVIGATION_RATIO = 0.25
 BROWSER_SETTLE_RATIO_OF_NAV = 0.02
 BROWSER_POST_SUBMIT_SETTLE_RATIO_OF_NAV = 0.04
-BROWSER_NETWORK_MAX_INFLIGHT = max(1, min(16, int(__import__('os').getenv('SECOPS_BROWSER_MAX_INFLIGHT', '8'))))
+BROWSER_NETWORK_MAX_INFLIGHT = int(secops_parallelism_policy().get('browser_workers') or 1)
 # One persistent Chromium process per asyncio event loop; every scanner action still receives a
 # fresh isolated BrowserContext, so cookies/storage never leak between identities or request cases.
 _BROWSER_RUNTIME: dict[int, dict[str, Any]] = {}
@@ -541,7 +542,10 @@ async def _run_browser_scan_core(
     timeout_ms = navigation_timeout * 1000
     findings: list[dict[str, Any]] = []
     effective_request_rate = scanner_request_rate(request_rate)
+    parallelism = secops_parallelism_policy(effective_request_rate)
+    browser_network_max_inflight = max(1, int(parallelism.get("browser_workers") or BROWSER_NETWORK_MAX_INFLIGHT))
     navigation_pacer = RequestRatePacer(effective_request_rate)
+    action_deadline = time.monotonic() + float(timeout)
     blocked_top_level_urls: list[str] = []
     diagnostics: dict[str, Any] = {
         "method": str(method or "GET").upper(), "parameters": parameters, "fields": fields, "source_url": source_url,
@@ -549,176 +553,194 @@ async def _run_browser_scan_core(
         "client_sources": client_sources, "client_sinks": client_sinks,
         "allow_state_changes": bool(allow_state_changes), "playwright_api": "async",
         "request_rate": effective_request_rate, "authorized_navigation_origins": authorized_origins, "allow_same_host_ports": bool(allow_same_host_ports),
+        "network_max_inflight": browser_network_max_inflight, "parallelism_policy": parallelism,
         "tool_timeout_seconds": timeout, "navigation_timeout_seconds": navigation_timeout,
         "phase_ratio_policy": {"navigation": BROWSER_NAVIGATION_RATIO},
     }
 
-    timed_out = False
+    browser_slot_wait_started = time.monotonic()
+    browser_slot_cm = browser_workload_lease(effective_request_rate, deadline=action_deadline)
+    browser_global_slot = await asyncio.to_thread(browser_slot_cm.__enter__)
+    browser_global_slot_wait_seconds = max(0.0, time.monotonic() - browser_slot_wait_started)
+    diagnostics["browser_global_slot_wait_seconds"] = round(browser_global_slot_wait_seconds, 3)
+    diagnostics["browser_global_slot"] = None if browser_global_slot is None else int(browser_global_slot)
+    if browser_global_slot is None:
+        await asyncio.to_thread(browser_slot_cm.__exit__, None, None, None)
+        return partial(
+            "Browser XSS and Workflow Verifier", target_url,
+            "Browser verification reached its shared action time budget while waiting for a VM-level Chromium slot.",
+            diagnosis="time_limit_reached", timed_out=True, time_limit_reached=True,
+            vulnerabilities=[], diagnostics=diagnostics, verified_parameters=[], query_attempt_count=0,
+        )
     try:
-        async with asyncio.timeout(timeout):
-            try:
-                browser, browser_executable, managed_browser_error = await _persistent_browser(async_playwright, PlaywrightError)
-            except PlaywrightError as exc:
-                return skipped(
-                    "Browser XSS and Workflow Verifier", target_url,
-                    f"Playwright Chromium is not installed: {exc}. Run: python -m playwright install chromium",
-                    diagnosis="missing_playwright_browser",
-                )
-            diagnostics["browser_executable"] = browser_executable
-            diagnostics["browser_process_reused"] = True
-            if managed_browser_error:
-                diagnostics["managed_browser_error"] = managed_browser_error
-            context = await browser.new_context(ignore_https_errors=True)
-            try:
-                in_scope_slots = asyncio.Semaphore(BROWSER_NETWORK_MAX_INFLIGHT)
-                paced_request_ids: set[int] = set()
-
-                def release_in_scope_slot(request: Any) -> None:
-                    key = id(request)
-                    if key in paced_request_ids:
-                        paced_request_ids.discard(key)
-                        in_scope_slots.release()
-
-                context.on("requestfinished", release_in_scope_slot)
-                context.on("requestfailed", release_in_scope_slot)
-
-                async def scope_route(route: Any, request: Any) -> None:
-                    # Permit third-party assets needed to render the authorized application, but never
-                    # allow this verification browser to turn a redirect/navigation into a new active target.
-                    try:
-                        is_navigation = bool(request.is_navigation_request())
-                    except Exception:
-                        is_navigation = str(getattr(request, "resource_type", "") or "") == "document"
-                    request_url = str(getattr(request, "url", "") or "")
-                    request_method = str(getattr(request, "method", "GET") or "GET").upper()
-                    in_scope = bool(request_url) and url_in_authorized_scope(
-                        target_url, request_url, authorized_origins, allow_same_host_ports=bool(allow_same_host_ports),
+        timed_out = False
+        try:
+            async with asyncio.timeout(timeout):
+                try:
+                    browser, browser_executable, managed_browser_error = await _persistent_browser(async_playwright, PlaywrightError)
+                except PlaywrightError as exc:
+                    return skipped(
+                        "Browser XSS and Workflow Verifier", target_url,
+                        f"Playwright Chromium is not installed: {exc}. Run: python -m playwright install chromium",
+                        diagnosis="missing_playwright_browser",
                     )
-                    if is_navigation and request_url and not in_scope:
-                        if request_url not in blocked_top_level_urls:
-                            blocked_top_level_urls.append(request_url)
-                        await route.abort("blockedbyclient")
-                        return
-                    # External dependencies are rendering-only regardless of allow_state_changes:
-                    # authorization never extends to third-party POST/PUT/PATCH/DELETE requests merely
-                    # because the assessed application emitted them from JavaScript.
-                    if not in_scope and request_method not in {"GET", "HEAD", "OPTIONS"}:
-                        diagnostics.setdefault("scope_blocked_requests", []).append({
-                            "url": request_url, "method": request_method, "reason": "external non-read-only dependency",
-                        })
-                        await route.abort("blockedbyclient")
-                        return
+                diagnostics["browser_executable"] = browser_executable
+                diagnostics["browser_process_reused"] = True
+                if managed_browser_error:
+                    diagnostics["managed_browser_error"] = managed_browser_error
+                context = await browser.new_context(ignore_https_errors=True, service_workers="block")
+                try:
+                    in_scope_slots = asyncio.Semaphore(browser_network_max_inflight)
+                    paced_request_ids: set[int] = set()
 
-                    # For authorized traffic, apply the same fail-closed request-contract policy used
-                    # by the orchestrators so page JavaScript cannot bypass allow_state_changes. Include
-                    # Content-Type because multipart/file submissions must never be mistaken for an opaque
-                    # harmless POST.
-                    if not allow_state_changes:
-                        post_data = str(getattr(request, "post_data", "") or "")
-                        raw_headers = getattr(request, "headers", {})
-                        request_headers = dict(raw_headers) if isinstance(raw_headers, dict) else {}
-                        content_type = str(request_headers.get("content-type") or request_headers.get("Content-Type") or "")
-                        state_reason = request_contract_state_change_reason({
-                            "url": request_url, "method": request_method, "data": post_data, "parameters": [],
-                            "headers": request_headers, "content_type": content_type,
-                        })
-                        if state_reason:
-                            diagnostics.setdefault("state_policy_blocked_requests", []).append({
-                                "url": request_url, "method": request_method, "reason": state_reason,
+                    def release_in_scope_slot(request: Any) -> None:
+                        key = id(request)
+                        if key in paced_request_ids:
+                            paced_request_ids.discard(key)
+                            in_scope_slots.release()
+
+                    context.on("requestfinished", release_in_scope_slot)
+                    context.on("requestfailed", release_in_scope_slot)
+
+                    async def scope_route(route: Any, request: Any) -> None:
+                        # Permit third-party assets needed to render the authorized application, but never
+                        # allow this verification browser to turn a redirect/navigation into a new active target.
+                        try:
+                            is_navigation = bool(request.is_navigation_request())
+                        except Exception:
+                            is_navigation = str(getattr(request, "resource_type", "") or "") == "document"
+                        request_url = str(getattr(request, "url", "") or "")
+                        request_method = str(getattr(request, "method", "GET") or "GET").upper()
+                        in_scope = bool(request_url) and url_in_authorized_scope(
+                            target_url, request_url, authorized_origins, allow_same_host_ports=bool(allow_same_host_ports),
+                        )
+                        if is_navigation and request_url and not in_scope:
+                            if request_url not in blocked_top_level_urls:
+                                blocked_top_level_urls.append(request_url)
+                            await route.abort("blockedbyclient")
+                            return
+                        # External dependencies are rendering-only regardless of allow_state_changes:
+                        # authorization never extends to third-party POST/PUT/PATCH/DELETE requests merely
+                        # because the assessed application emitted them from JavaScript.
+                        if not in_scope and request_method not in {"GET", "HEAD", "OPTIONS"}:
+                            diagnostics.setdefault("scope_blocked_requests", []).append({
+                                "url": request_url, "method": request_method, "reason": "external non-read-only dependency",
                             })
                             await route.abort("blockedbyclient")
                             return
-                    acquired = False
-                    if in_scope:
-                        await in_scope_slots.acquire()
-                        acquired = True
-                        paced_request_ids.add(id(request))
-                        paced = await asyncio.to_thread(navigation_pacer.wait)
-                        if paced is False:
-                            paced_request_ids.discard(id(request))
-                            in_scope_slots.release()
-                            await route.abort("timedout")
-                            return
-                    try:
-                        await route.continue_()
-                    except Exception:
-                        if acquired and id(request) in paced_request_ids:
-                            paced_request_ids.discard(id(request))
-                            in_scope_slots.release()
-                        raise
 
-                await context.route("**/*", scope_route)
-                if cookies:
-                    await context.add_cookies(_browser_cookies(target_url, cookies))
-                page = await context.new_page()
-                page.set_default_timeout(timeout_ms)
+                        # For authorized traffic, apply the same fail-closed request-contract policy used
+                        # by the orchestrators so page JavaScript cannot bypass allow_state_changes. Include
+                        # Content-Type because multipart/file submissions must never be mistaken for an opaque
+                        # harmless POST.
+                        if not allow_state_changes:
+                            post_data = str(getattr(request, "post_data", "") or "")
+                            raw_headers = getattr(request, "headers", {})
+                            request_headers = dict(raw_headers) if isinstance(raw_headers, dict) else {}
+                            content_type = str(request_headers.get("content-type") or request_headers.get("Content-Type") or "")
+                            state_reason = request_contract_state_change_reason({
+                                "url": request_url, "method": request_method, "data": post_data, "parameters": [],
+                                "headers": request_headers, "content_type": content_type,
+                            })
+                            if state_reason:
+                                diagnostics.setdefault("state_policy_blocked_requests", []).append({
+                                    "url": request_url, "method": request_method, "reason": state_reason,
+                                })
+                                await route.abort("blockedbyclient")
+                                return
+                        acquired = False
+                        if in_scope:
+                            await in_scope_slots.acquire()
+                            acquired = True
+                            paced_request_ids.add(id(request))
+                            paced = await asyncio.to_thread(navigation_pacer.wait, action_deadline)
+                            if paced is False:
+                                paced_request_ids.discard(id(request))
+                                in_scope_slots.release()
+                                await route.abort("timedout")
+                                return
+                        try:
+                            await route.continue_()
+                        except Exception:
+                            if acquired and id(request) in paced_request_ids:
+                                paced_request_ids.discard(id(request))
+                                in_scope_slots.release()
+                            raise
 
-                if initial_reason:
-                    # The original contract may be a state-changing POST/GET. Do not mutate or navigate it;
-                    # retain only safe DOM/client-source analysis on the page that exposed the contract.
-                    query_findings, query_attempts = [], []
-                    diagnostics["query_checks_skipped_reason"] = "initial request contract is state-changing; safe source-page analysis only"
-                else:
-                    query_findings, query_attempts = await _query_checks(page, target_url, parameters, timeout_ms)
-                findings.extend(query_findings)
-                source_findings, source_attempts = await _client_source_checks(
-                    page, analysis_start_url, timeout_ms, client_sources, client_sinks
-                )
-                findings.extend(source_findings)
-                diagnostics["dom_attempts"] = [*query_attempts, *source_attempts]
-                diagnostics["verified_parameters"] = sorted({
-                    str(item.get("parameter") or "") for item in query_attempts
-                    if isinstance(item, dict) and str(item.get("parameter") or "")
-                })
-                diagnostics["query_attempt_count"] = len(query_attempts)
+                    await context.route("**/*", scope_route)
+                    if cookies:
+                        await context.add_cookies(_browser_cookies(target_url, cookies))
+                    page = await context.new_page()
+                    page.set_default_timeout(timeout_ms)
 
-                if str(method or "GET").upper() == "POST":
-                    stored_findings, stored_diag = await _stored_check(
-                        context, page, target_url, source_url, parameters, fields, timeout_ms, allow_state_changes,
+                    if initial_reason:
+                        # The original contract may be a state-changing POST/GET. Do not mutate or navigate it;
+                        # retain only safe DOM/client-source analysis on the page that exposed the contract.
+                        query_findings, query_attempts = [], []
+                        diagnostics["query_checks_skipped_reason"] = "initial request contract is state-changing; safe source-page analysis only"
+                    else:
+                        query_findings, query_attempts = await _query_checks(page, target_url, parameters, timeout_ms)
+                    findings.extend(query_findings)
+                    source_findings, source_attempts = await _client_source_checks(
+                        page, analysis_start_url, timeout_ms, client_sources, client_sinks
                     )
-                    findings.extend(stored_findings)
-                    diagnostics["stored"] = stored_diag
-                else:
-                    diagnostics["stored"] = {"attempted": False, "reason": "request method is not POST"}
-                diagnostics["blocked_external_top_level_navigations"] = len(blocked_top_level_urls)
-                diagnostics["blocked_external_top_level_urls"] = blocked_top_level_urls[:20]
-            finally:
-                await context.close()
-    except TimeoutError:
-        timed_out = True
-        diagnostics["time_limit_reached"] = True
-        diagnostics["time_limit_phase"] = "browser_verification"
-    except Exception as exc:
-        return failure(
-            "Browser XSS and Workflow Verifier", target_url,
-            f"Browser verification failed: {type(exc).__name__}: {exc}", diagnosis="browser_runtime_error",
-        )
+                    findings.extend(source_findings)
+                    diagnostics["dom_attempts"] = [*query_attempts, *source_attempts]
+                    diagnostics["verified_parameters"] = sorted({
+                        str(item.get("parameter") or "") for item in query_attempts
+                        if isinstance(item, dict) and str(item.get("parameter") or "")
+                    })
+                    diagnostics["query_attempt_count"] = len(query_attempts)
 
-    unique: list[dict[str, Any]] = []
-    seen: set[tuple[str, str, str]] = set()
-    for item in findings:
-        key = (
-            str(item.get("verification_status") or ""), str(item.get("parameter") or ""),
-            urlparse(str(item.get("url") or target_url)).path,
-        )
-        if key not in seen:
-            seen.add(key)
-            unique.append(item)
-    result_kwargs = {
-        "vulnerabilities": unique, "diagnostics": diagnostics,
-        "verified_parameters": list(diagnostics.get("verified_parameters") or []),
-        "query_attempt_count": int(diagnostics.get("query_attempt_count") or 0),
-    }
-    if timed_out:
-        return partial(
+                    if str(method or "GET").upper() == "POST":
+                        stored_findings, stored_diag = await _stored_check(
+                            context, page, target_url, source_url, parameters, fields, timeout_ms, allow_state_changes,
+                        )
+                        findings.extend(stored_findings)
+                        diagnostics["stored"] = stored_diag
+                    else:
+                        diagnostics["stored"] = {"attempted": False, "reason": "request method is not POST"}
+                    diagnostics["blocked_external_top_level_navigations"] = len(blocked_top_level_urls)
+                    diagnostics["blocked_external_top_level_urls"] = blocked_top_level_urls[:20]
+                finally:
+                    await context.close()
+        except TimeoutError:
+            timed_out = True
+            diagnostics["time_limit_reached"] = True
+            diagnostics["time_limit_phase"] = "browser_verification"
+        except Exception as exc:
+            return failure(
+                "Browser XSS and Workflow Verifier", target_url,
+                f"Browser verification failed: {type(exc).__name__}: {exc}", diagnosis="browser_runtime_error",
+            )
+
+        unique: list[dict[str, Any]] = []
+        seen: set[tuple[str, str, str]] = set()
+        for item in findings:
+            key = (
+                str(item.get("verification_status") or ""), str(item.get("parameter") or ""),
+                urlparse(str(item.get("url") or target_url)).path,
+            )
+            if key not in seen:
+                seen.add(key)
+                unique.append(item)
+        result_kwargs = {
+            "vulnerabilities": unique, "diagnostics": diagnostics,
+            "verified_parameters": list(diagnostics.get("verified_parameters") or []),
+            "query_attempt_count": int(diagnostics.get("query_attempt_count") or 0),
+        }
+        if timed_out:
+            return partial(
+                "Browser XSS and Workflow Verifier", target_url,
+                f"Browser verification reached its shared time budget. Findings preserved: {len(unique)}.",
+                diagnosis="time_limit_reached", timed_out=True, time_limit_reached=True, **result_kwargs,
+            )
+        return success(
             "Browser XSS and Workflow Verifier", target_url,
-            f"Browser verification reached its shared time budget. Findings preserved: {len(unique)}.",
-            diagnosis="time_limit_reached", timed_out=True, time_limit_reached=True, **result_kwargs,
+            f"Browser verification completed. Findings: {len(unique)}.", **result_kwargs,
         )
-    return success(
-        "Browser XSS and Workflow Verifier", target_url,
-        f"Browser verification completed. Findings: {len(unique)}.", **result_kwargs,
-    )
+    finally:
+        await asyncio.to_thread(browser_slot_cm.__exit__, None, None, None)
 
 # Use async Chromium to verify DOM, reflected and stored XSS with harmless markers.
 @mcp.tool()

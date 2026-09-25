@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import errno
 import hashlib
 import json
 import math
@@ -10,10 +11,10 @@ import subprocess
 import tempfile
 import threading
 import time
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from pathlib import Path
 from typing import Any, Callable, Iterable
-from urllib.parse import parse_qsl, urljoin, urlparse, urlunparse
+from urllib.parse import parse_qsl, unquote, urljoin, urlparse, urlunparse
 
 import requests
 
@@ -639,7 +640,12 @@ def valid_identity_label(value: str) -> bool:
 _REQUEST_RATE_UNSET = object()
 
 def scanner_request_rate_policy(value: Any = _REQUEST_RATE_UNSET) -> dict[str, Any]:
-    use_environment = value is _REQUEST_RATE_UNSET
+    # Tool/MCP function signatures use ``None`` as their natural optional default. Treating that
+    # as an explicit invalid value used to fall back to 10 req/s instead of inheriting the
+    # assessment's SECOPS_MAX_REQUEST_RATE. That could exceed a configured low rate whenever a
+    # caller omitted the explicit request_rate argument. Both omitted and None now inherit the
+    # assessment environment; an actually supplied non-None value is still validated normally.
+    use_environment = value is _REQUEST_RATE_UNSET or value is None
     env_value = os.getenv("SECOPS_MAX_REQUEST_RATE") if use_environment else None
     raw = env_value if env_value not in (None, "") else (DEFAULT_REQUEST_RATE if use_environment else value)
     fallback_reason = ""
@@ -675,6 +681,136 @@ def scanner_request_rate(value: Any = _REQUEST_RATE_UNSET) -> float:
     return float(scanner_request_rate_policy(value)["effective"])
 
 
+def available_cpu_count() -> int:
+    """Return the CPU count this process can actually use inside a VM/container/cpuset.
+
+    Python 3.13 exposes ``os.process_cpu_count()`` which honors process CPU availability. Older
+    runtimes fall back to sched_getaffinity/os.cpu_count. The result is always at least one.
+    """
+    candidates: list[int] = []
+    process_cpu_count = getattr(os, "process_cpu_count", None)
+    if callable(process_cpu_count):
+        try:
+            value = process_cpu_count()
+            if value:
+                candidates.append(int(value))
+        except (OSError, TypeError, ValueError):
+            pass
+    if hasattr(os, "sched_getaffinity"):
+        try:
+            candidates.append(len(os.sched_getaffinity(0)))
+        except (OSError, TypeError):
+            pass
+    try:
+        value = os.cpu_count()
+        if value:
+            candidates.append(int(value))
+    except (OSError, TypeError, ValueError):
+        pass
+    return max(1, min(value for value in candidates if value > 0) if candidates else 1)
+
+
+def secops_parallelism_policy(value: Any = _REQUEST_RATE_UNSET) -> dict[str, Any]:
+    """Derive bounded CPU/network concurrency from the configured target request rate.
+
+    Network workers are intentionally allowed to outnumber CPUs because they spend most of their
+    lifetime waiting for sockets/TLS/server responses. CPU-heavy child processes use a much tighter
+    budget. None of these worker counts changes the authoritative request-start ceiling: project
+    HTTP helpers still pass through ``RequestRatePacer`` and external scanners still receive their
+    native aggregate rate/delay setting.
+    """
+    rate = max(1.0, scanner_request_rate(value))
+    detected_cpus = available_cpu_count()
+
+    raw_cpu_budget = os.getenv("SECOPS_CPU_BUDGET", "").strip()
+    if raw_cpu_budget:
+        requested_cpu_budget = safe_int_value(raw_cpu_budget, detected_cpus)
+        cpu_budget = max(1, min(detected_cpus, requested_cpu_budget))
+        cpu_budget_source = "SECOPS_CPU_BUDGET"
+    else:
+        reserve_default = 1 if detected_cpus >= 4 else 0
+        reserve = max(0, min(detected_cpus - 1, safe_int_value(os.getenv("SECOPS_CPU_RESERVE", reserve_default), reserve_default)))
+        cpu_budget = max(1, detected_cpus - reserve)
+        cpu_budget_source = "auto"
+
+    network_hard_cap = max(1, min(64, safe_int_value(os.getenv("SECOPS_NETWORK_MAX_INFLIGHT", "32"), 32)))
+    browser_hard_cap = max(1, min(32, safe_int_value(os.getenv("SECOPS_BROWSER_MAX_INFLIGHT", "16"), 16)))
+    scanner_hard_cap = max(1, min(32, safe_int_value(os.getenv("SECOPS_SCANNER_MAX_WORKERS", "8"), 8)))
+    profile_hard_cap = max(1, min(4, safe_int_value(os.getenv("SECOPS_PROFILE_DISCOVERY_WORKERS", "4"), 4)))
+    heavy_local_hard_cap = max(1, min(8, safe_int_value(os.getenv("SECOPS_HEAVY_LOCAL_WORKERS", "4"), 4)))
+
+    # Roughly 1.5 seconds of target latency can be hidden at the configured request rate without
+    # creating unbounded thread pools. The CPU multiplier is deliberately high only for I/O waits.
+    network_rate_need = max(1, int(math.ceil(rate * 1.5)))
+    network_cpu_cap = max(1, cpu_budget * 8)
+    network_workers = max(1, min(network_hard_cap, network_rate_need, network_cpu_cap))
+
+    # Browser route callbacks do more Python/DOM work than plain HTTP fetches, so keep a tighter
+    # in-flight bound while still allowing enough outstanding requests to hide normal latency.
+    browser_rate_need = max(1, int(math.ceil(rate)))
+    browser_cpu_cap = max(1, cpu_budget * 4)
+    browser_workers = max(1, min(browser_hard_cap, browser_rate_need, browser_cpu_cap))
+
+    # Native scanners may create CPU work per response/template. Their concurrency therefore stays
+    # close to the usable CPU budget; their native rate flag/delay remains the traffic authority.
+    scanner_workers = max(1, min(scanner_hard_cap, int(math.ceil(rate)), cpu_budget * 2))
+
+    # Discovery profile coordinators are allowed to overlap up to the usable CPU budget. Their
+    # HTTP/JS work shares one process-wide network pool, so increasing profile coordinators no
+    # longer multiplies discovery worker threads. Chromium itself is heavier: a separate browser
+    # profile-slot budget keeps only about one browser workload per two usable CPUs active at once.
+    profile_workers = max(1, min(profile_hard_cap, cpu_budget))
+
+    # Chromium, local LLM inference/model loading and PDF rendering can each consume a sizeable
+    # fraction of the VM CPU/RAM even when their child thread pools are individually clamped.
+    # Give all such workloads one shared VM-wide slot family. On small VMs this intentionally
+    # serializes heavy local work; larger VMs gain one slot per roughly two usable CPUs.
+    heavy_local_workers = max(1, min(heavy_local_hard_cap, max(1, cpu_budget // 2)))
+    browser_profile_workers = max(1, min(profile_workers, heavy_local_workers))
+
+    return {
+        "request_rate": rate,
+        "detected_cpus": detected_cpus,
+        "cpu_budget": cpu_budget,
+        "cpu_budget_source": cpu_budget_source,
+        "network_workers": network_workers,
+        "browser_workers": browser_workers,
+        "scanner_workers": scanner_workers,
+        "profile_workers": profile_workers,
+        "browser_profile_workers": browser_profile_workers,
+        "heavy_local_workers": heavy_local_workers,
+        "network_hard_cap": network_hard_cap,
+        "browser_hard_cap": browser_hard_cap,
+        "scanner_hard_cap": scanner_hard_cap,
+        "profile_hard_cap": profile_hard_cap,
+        "heavy_local_hard_cap": heavy_local_hard_cap,
+    }
+
+
+def subprocess_parallelism_environment(base_env: dict[str, str] | None = None, value: Any = _REQUEST_RATE_UNSET) -> dict[str, str]:
+    """Return a child-process environment that prevents nested CPU-pool oversubscription.
+
+    Scanner children must not inherit a workstation/VM shell setting that exceeds the SecOps CPU
+    budget. ``SECOPS_CPU_BUDGET``/``SECOPS_CPU_RESERVE`` are the operator-facing controls; inherited
+    Go/OpenMP/BLAS thread counts are normalized here so nested libraries cannot multiply worker
+    counts behind an already-concurrent scanner process.
+    """
+    env = dict(base_env or os.environ)
+    policy = secops_parallelism_policy(value)
+    cpu_budget = max(1, int(policy["cpu_budget"]))
+    # Go scanners may otherwise use every visible CPU even when SecOps intentionally reserved one.
+    # Set the project budget explicitly rather than setdefault(): a larger inherited GOMAXPROCS
+    # would bypass the anti-oversubscription policy. Operators wanting a smaller budget should use
+    # SECOPS_CPU_BUDGET, which feeds the same central policy.
+    env["GOMAXPROCS"] = str(cpu_budget)
+    # External scanner processes may import NumPy/matplotlib or native libraries. Their own SecOps
+    # worker count already provides concurrency, so nested math-library pools stay single-threaded.
+    for name in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS", "NUMEXPR_NUM_THREADS"):
+        env[name] = "1"
+    env.setdefault("MPLBACKEND", "Agg")
+    return env
+
+
 def request_rate_budget_scale(value: Any = _REQUEST_RATE_UNSET, *, reference_rate: float = DEFAULT_REQUEST_RATE) -> float:
     """Return the conservative wall-clock expansion required by a lower configured request rate.
 
@@ -703,8 +839,11 @@ def rate_aware_network_budget(base_seconds: Any, value: Any = _REQUEST_RATE_UNSE
     return max(float(minimum_seconds or 0.0), adjusted)
 
 
-_GLOBAL_RATE_CLIENT_TTL_SECONDS = 120.0
+_GLOBAL_RATE_CLIENT_TTL_SECONDS = max(5.0, min(120.0, safe_float_value(os.getenv("SECOPS_RATE_CLIENT_TTL_SECONDS", "15"), 15.0)))
 _GLOBAL_RATE_LOCAL_FALLBACK_LOCK = threading.Lock()
+_GLOBAL_TRAFFIC_LOCAL_FALLBACK_LOCK = threading.Lock()
+_RESOURCE_SLOT_FALLBACK_GUARD = threading.Lock()
+_RESOURCE_SLOT_FALLBACK_LOCKS: dict[str, threading.Lock] = {}
 
 def _global_request_rate_state_path() -> Path:
     configured = str(os.getenv("SECOPS_GLOBAL_RATE_STATE") or "").strip()
@@ -717,34 +856,112 @@ def _global_request_rate_state_path() -> Path:
     safe_owner = re.sub(r"[^A-Za-z0-9_.-]+", "_", owner) or "default"
     return Path(tempfile.gettempdir()) / f"secops-global-request-rate-{safe_owner}.json"
 
-@contextmanager
-def _cross_process_rate_lock(path: Path):
-    """Serialize request starts across SecOps Python processes on the same host.
 
-    Linux/Debian is the assessment runtime, while the Windows fallback keeps local development
-    functional. If an OS-level lock is unavailable the existing in-process lock still fails safe
-    for one process rather than preventing the assessment from running.
+def _global_target_traffic_lock_path() -> Path:
+    state_path = _global_request_rate_state_path()
+    return state_path.with_suffix(state_path.suffix + ".traffic.lock")
+
+
+def _assessment_rate_contract_state_path() -> Path:
+    configured = str(os.getenv("SECOPS_ASSESSMENT_RATE_CONTRACT_STATE") or "").strip()
+    if configured:
+        return Path(configured).expanduser()
+    state_path = _global_request_rate_state_path()
+    return state_path.with_suffix(state_path.suffix + ".assessment-contract.json")
+
+
+def _assessment_rate_contract_lock_path() -> Path:
+    state_path = _assessment_rate_contract_state_path()
+    return state_path.with_suffix(state_path.suffix + ".lock")
+
+
+class AssessmentRateContractError(RuntimeError):
+    """Raised when concurrent target-execution windows disagree on request rate."""
+
+
+def _rate_client_process_alive(client_key: str) -> bool:
+    """Best-effort liveness check for a pacer client key.
+
+    Old state files previously retained exited assessment PIDs for the full TTL, which could keep a
+    later run artificially throttled below its configured rate. Unknown/legacy keys fail open to
+    TTL handling; explicit dead PIDs are removed immediately.
+    """
+    raw = str(client_key or "")
+    pid_text = raw.split(":", 1)[0]
+    try:
+        pid = int(pid_text)
+    except (TypeError, ValueError):
+        return True
+    if pid <= 0:
+        return False
+    if pid == os.getpid():
+        return True
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError as exc:
+        return exc.errno != errno.ESRCH
+
+
+@contextmanager
+def _cross_process_file_lock(
+    path: Path, *, exclusive: bool, deadline: float | None, fallback_lock: threading.Lock,
+):
+    """Acquire a deadline-aware cross-process file lock.
+
+    Debian/Linux uses shared locks for project-controlled request starts and an exclusive lock for
+    unmanaged/native scanners. Windows development falls back to an exclusive one-byte lock because
+    msvcrt has no shared-lock equivalent. Returning ``False`` lets callers honor their wall-clock
+    deadline instead of blocking indefinitely behind another assessment process.
     """
     path.parent.mkdir(parents=True, exist_ok=True)
     handle = open(path, "a+b")
     locked = False
+    local_locked = False
+    use_local_fallback = False
     try:
-        try:
-            if os.name == "nt":
-                import msvcrt
-                handle.seek(0, os.SEEK_END)
-                if handle.tell() == 0:
-                    handle.write(b"0")
-                    handle.flush()
-                handle.seek(0)
-                msvcrt.locking(handle.fileno(), msvcrt.LK_LOCK, 1)
+        while not locked and not local_locked:
+            if deadline is not None and time.monotonic() >= float(deadline):
+                yield False
+                return
+            try:
+                if os.name == "nt":
+                    import msvcrt
+                    handle.seek(0, os.SEEK_END)
+                    if handle.tell() == 0:
+                        handle.write(b"0")
+                        handle.flush()
+                    handle.seek(0)
+                    msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+                else:
+                    import fcntl
+                    flag = fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH
+                    fcntl.flock(handle.fileno(), flag | fcntl.LOCK_NB)
+                locked = True
+                break
+            except ImportError:
+                use_local_fallback = True
+                break
+            except (BlockingIOError, OSError):
+                remaining = None if deadline is None else max(0.0, float(deadline) - time.monotonic())
+                if remaining is not None and remaining <= 0.0:
+                    yield False
+                    return
+                time.sleep(min(0.05, remaining) if remaining is not None else 0.05)
+        if use_local_fallback:
+            if deadline is None:
+                fallback_lock.acquire()
+                local_locked = True
             else:
-                import fcntl
-                fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
-            locked = True
-        except (ImportError, OSError):
-            _GLOBAL_RATE_LOCAL_FALLBACK_LOCK.acquire()
-        yield
+                local_locked = fallback_lock.acquire(timeout=max(0.0, float(deadline) - time.monotonic()))
+                if not local_locked:
+                    yield False
+                    return
+        yield True
     finally:
         try:
             if locked:
@@ -755,11 +972,291 @@ def _cross_process_rate_lock(path: Path):
                 else:
                     import fcntl
                     fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
-            elif _GLOBAL_RATE_LOCAL_FALLBACK_LOCK.locked():
-                _GLOBAL_RATE_LOCAL_FALLBACK_LOCK.release()
+            if local_locked:
+                fallback_lock.release()
         finally:
             handle.close()
 
+
+@contextmanager
+def _cross_process_rate_lock(path: Path, deadline: float | None = None):
+    with _cross_process_file_lock(
+        path, exclusive=True, deadline=deadline, fallback_lock=_GLOBAL_RATE_LOCAL_FALLBACK_LOCK,
+    ) as acquired:
+        yield acquired
+
+
+def _load_assessment_rate_contract_state(path: Path) -> dict[str, Any]:
+    if not path.exists():
+        return {"version": 1, "clients": {}}
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        raise AssessmentRateContractError(
+            f"cannot safely read assessment-rate contract state {path}: {type(exc).__name__}: {exc}"
+        ) from exc
+    if not isinstance(raw, dict) or not isinstance(raw.get("clients", {}), dict):
+        raise AssessmentRateContractError(
+            f"assessment-rate contract state {path} is malformed; refusing target execution"
+        )
+    return raw
+
+
+def _live_assessment_rate_clients(state: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    live: dict[str, dict[str, Any]] = {}
+    for key, metadata in dict(state.get("clients") or {}).items():
+        client_key = str(key or "")
+        if not _rate_client_process_alive(client_key):
+            continue
+        if not isinstance(metadata, dict):
+            raise AssessmentRateContractError(
+                f"live assessment-rate client {client_key!r} has malformed metadata"
+            )
+        raw_rate = metadata.get("rate")
+        try:
+            rate = float(raw_rate)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise AssessmentRateContractError(
+                f"live assessment-rate client {client_key!r} has invalid rate {raw_rate!r}"
+            ) from exc
+        if (
+            not math.isfinite(rate) or not rate.is_integer()
+            or rate < 1.0 or rate > REQUEST_RATE_HARD_CAP
+        ):
+            raise AssessmentRateContractError(
+                f"live assessment-rate client {client_key!r} has unsafe rate {raw_rate!r}"
+            )
+        item = dict(metadata)
+        item["rate"] = float(rate)
+        live[client_key] = item
+    return live
+
+
+@contextmanager
+def assessment_rate_contract(request_rate: Any = _REQUEST_RATE_UNSET, *, deadline: float | None = None):
+    """Require one configured target rate across concurrent SecOps execution windows.
+
+    Python-controlled requests can dynamically share the minimum active pacer rate, but a native
+    scanner receives its aggregate rate when the command is built and cannot be retuned while it
+    owns the exclusive target-traffic lease.  Therefore two independently launched assessments
+    using different configured rates must never have overlapping target-execution windows.
+
+    Same-rate windows are allowed concurrently.  State and lock failures are fail-closed: refusing
+    to begin target execution is safer than allowing a native scanner to exceed another active
+    assessment's configured contract. Dead process entries are pruned on every acquire/release.
+    """
+    rate = scanner_request_rate(request_rate)
+    state_path = _assessment_rate_contract_state_path()
+    lock_path = _assessment_rate_contract_lock_path()
+    client_key = f"{os.getpid()}:{threading.get_ident()}:{time.monotonic_ns()}"
+    acquired_contract = False
+
+    lock_deadline = deadline if deadline is not None else time.monotonic() + 10.0
+    try:
+        with _cross_process_rate_lock(lock_path, deadline=lock_deadline) as locked:
+            if not locked:
+                raise AssessmentRateContractError(
+                    "timed out acquiring the cross-process assessment-rate contract lock"
+                )
+            state = _load_assessment_rate_contract_state(state_path)
+            clients = _live_assessment_rate_clients(state)
+            conflicting = {
+                key: float(meta["rate"])
+                for key, meta in clients.items()
+                if abs(float(meta["rate"]) - rate) > 1e-9
+            }
+            if conflicting:
+                active_rates = sorted({value for value in conflicting.values()})
+                formatted = ", ".join(f"{value:g}" for value in active_rates)
+                raise AssessmentRateContractError(
+                    f"configured request rate {rate:g} req/s conflicts with active SecOps "
+                    f"target-execution rate(s) {formatted} req/s; use the same execution.request_rate "
+                    "for concurrent assessments or run them sequentially"
+                )
+            now = time.time()
+            clients[client_key] = {
+                "pid": os.getpid(),
+                "rate": float(rate),
+                "started": now,
+                "seen": now,
+            }
+            payload = {
+                "version": 1,
+                "configured_rate": float(rate),
+                "clients": clients,
+                "updated": now,
+            }
+            try:
+                atomic_write_text(state_path, json.dumps(payload, sort_keys=True, separators=(",", ":")))
+            except Exception as exc:
+                raise AssessmentRateContractError(
+                    f"cannot safely persist assessment-rate contract state {state_path}: "
+                    f"{type(exc).__name__}: {exc}"
+                ) from exc
+            acquired_contract = True
+        yield {
+            "acquired": True,
+            "request_rate": float(rate),
+            "client_key": client_key,
+            "state_path": str(state_path),
+        }
+    finally:
+        if acquired_contract:
+            cleanup_deadline = time.monotonic() + 10.0
+            try:
+                with _cross_process_rate_lock(lock_path, deadline=cleanup_deadline) as locked:
+                    if locked:
+                        state = _load_assessment_rate_contract_state(state_path)
+                        clients = _live_assessment_rate_clients(state)
+                        clients.pop(client_key, None)
+                        now = time.time()
+                        payload = {
+                            "version": 1,
+                            "configured_rate": (
+                                float(next(iter(clients.values()))["rate"]) if clients else None
+                            ),
+                            "clients": clients,
+                            "updated": now,
+                        }
+                        atomic_write_text(
+                            state_path, json.dumps(payload, sort_keys=True, separators=(",", ":"))
+                        )
+            except Exception:
+                # Cleanup failure can only leave a conservative stale lease. The next process prunes
+                # it after this PID exits; never turn cleanup into a second exception over the scan.
+                pass
+
+
+def _resource_slot_lock(resource: str, slot: int) -> tuple[Path, threading.Lock]:
+    safe = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(resource or "resource")).strip("._") or "resource"
+    path = _global_request_rate_state_path().with_suffix(
+        _global_request_rate_state_path().suffix + f".{safe}.slot{int(slot)}.lock"
+    )
+    key = str(path)
+    with _RESOURCE_SLOT_FALLBACK_GUARD:
+        fallback = _RESOURCE_SLOT_FALLBACK_LOCKS.get(key)
+        if fallback is None:
+            fallback = threading.Lock()
+            _RESOURCE_SLOT_FALLBACK_LOCKS[key] = fallback
+    return path, fallback
+
+
+@contextmanager
+def cross_process_resource_slot(resource: str, slots: int, *, deadline: float | None = None):
+    """Acquire one bounded cross-process slot for a heavyweight local resource.
+
+    Unlike target traffic pacing, this lease controls local CPU/RAM-heavy work such as Chromium.
+    Multiple assessment processes therefore share the same VM-level slot budget instead of each
+    independently launching up to its own local concurrency cap.  Slot acquisition never consumes a
+    target request token and is deadline-aware.
+    """
+    slot_count = max(1, min(32, int(slots or 1)))
+    held = None
+    held_slot: int | None = None
+    try:
+        while held is None:
+            now = time.monotonic()
+            if deadline is not None and now >= float(deadline):
+                yield None
+                return
+            for slot in range(slot_count):
+                now = time.monotonic()
+                if deadline is not None and now >= float(deadline):
+                    yield None
+                    return
+                # Probe each slot briefly rather than blocking on slot 0 while another slot is free.
+                probe_deadline = now + 0.01
+                if deadline is not None:
+                    probe_deadline = min(probe_deadline, float(deadline))
+                path, fallback = _resource_slot_lock(resource, slot)
+                candidate = _cross_process_file_lock(
+                    path, exclusive=True, deadline=probe_deadline, fallback_lock=fallback,
+                )
+                acquired = candidate.__enter__()
+                if acquired:
+                    held = candidate
+                    held_slot = slot
+                    break
+                candidate.__exit__(None, None, None)
+            if held is None:
+                remaining = None if deadline is None else max(0.0, float(deadline) - time.monotonic())
+                if remaining is not None and remaining <= 0.0:
+                    yield None
+                    return
+                time.sleep(min(0.05, remaining) if remaining is not None else 0.05)
+        yield held_slot
+    finally:
+        if held is not None:
+            held.__exit__(None, None, None)
+
+
+@contextmanager
+def heavy_compute_workload_lease(request_rate: Any = _REQUEST_RATE_UNSET, *, deadline: float | None = None):
+    """Share the VM budget used by CPU/RAM-heavy local SecOps workloads.
+
+    Chromium, local Ollama inference/model preparation and report rendering all compete for the
+    same physical VM resources.  A common cross-process slot family prevents independently started
+    assessments from multiplying those heavyweight workloads while leaving I/O-bound request
+    concurrency free to hide network latency.
+    """
+    policy = secops_parallelism_policy(request_rate)
+    slots = max(1, int(policy.get("heavy_local_workers") or 1))
+    with cross_process_resource_slot("heavy-local", slots, deadline=deadline) as slot:
+        yield slot
+
+
+@contextmanager
+def browser_workload_lease(request_rate: Any = _REQUEST_RATE_UNSET, *, deadline: float | None = None):
+    """Share the common VM heavyweight-work budget for Chromium workloads."""
+    with heavy_compute_workload_lease(request_rate, deadline=deadline) as slot:
+        yield slot
+
+
+@contextmanager
+def target_traffic_lease(*, exclusive: bool, deadline: float | None = None):
+    """Coordinate native scanners with project-controlled requests across assessment processes.
+
+    Project-controlled HTTP/TCP starts take a shared lease briefly while the global rate token is
+    assigned. A native scanner, whose internal requests cannot consume Python tokens one by one,
+    takes the exclusive lease for its bounded execution window and receives its own aggregate native
+    rate/delay option. This prevents native scanners and Python helpers (or two native scanners) from
+    multiplying the target traffic ceiling on the same VM user account.
+    """
+    with _cross_process_file_lock(
+        _global_target_traffic_lock_path(), exclusive=bool(exclusive), deadline=deadline,
+        fallback_lock=_GLOBAL_TRAFFIC_LOCAL_FALLBACK_LOCK,
+    ) as acquired:
+        yield acquired
+
+
+
+@contextmanager
+def native_target_workload_lease(request_rate: Any = _REQUEST_RATE_UNSET, *, deadline: float | None = None):
+    """Acquire VM-heavy capacity before exclusive unmanaged/native target traffic.
+
+    Lock ordering is deliberate: heavy-local first, target-traffic second. A Chromium workload can
+    therefore finish the project-controlled requests it already owns before a native scanner takes
+    the exclusive traffic lease; reversing the order could deadlock a small VM when only one heavy
+    slot exists. The returned diagnostics separate resource wait from target-traffic wait.
+    """
+    heavy_started = time.monotonic()
+    with heavy_compute_workload_lease(request_rate, deadline=deadline) as heavy_slot:
+        heavy_wait = time.monotonic() - heavy_started
+        if heavy_slot is None:
+            yield {
+                "acquired": False, "heavy_slot": None,
+                "heavy_wait_seconds": heavy_wait, "target_wait_seconds": 0.0,
+                "diagnosis": "heavy_resource_lease_timeout",
+            }
+            return
+        traffic_started = time.monotonic()
+        with target_traffic_lease(exclusive=True, deadline=deadline) as traffic_acquired:
+            target_wait = time.monotonic() - traffic_started
+            yield {
+                "acquired": bool(traffic_acquired), "heavy_slot": heavy_slot,
+                "heavy_wait_seconds": heavy_wait, "target_wait_seconds": target_wait,
+                "diagnosis": "" if traffic_acquired else "target_traffic_lease_timeout",
+            }
 
 class RequestRatePacer:
     """Assessment-host request-start pacer for project-controlled network helpers.
@@ -787,58 +1284,90 @@ class RequestRatePacer:
         self._last_effective_rate = self.rate
 
     def _wait_shared(self, deadline: float | None = None) -> bool:
-        with _cross_process_rate_lock(self._lock_path):
-            now = time.time()
-            state: dict[str, Any] = {}
-            try:
-                if self._state_path.is_file():
-                    loaded = json.loads(self._state_path.read_text(encoding="utf-8"))
-                    if isinstance(loaded, dict):
-                        state = loaded
-            except (OSError, ValueError, TypeError, json.JSONDecodeError):
-                state = {}
-            clients = state.get("clients") if isinstance(state.get("clients"), dict) else {}
-            fresh_clients: dict[str, dict[str, float]] = {}
-            for key, row in clients.items():
-                if not isinstance(row, dict):
-                    continue
-                seen = safe_float_value(row.get("seen"), 0.0)
-                rate = safe_float_value(row.get("rate"), 0.0)
-                if rate >= 1.0 and seen > 0.0 and now - seen <= _GLOBAL_RATE_CLIENT_TTL_SECONDS:
-                    fresh_clients[str(key)] = {"rate": rate, "seen": seen}
-            fresh_clients[self._client_key] = {"rate": self.rate, "seen": now}
-            effective_rate = min(row["rate"] for row in fresh_clients.values()) if fresh_clients else self.rate
-            interval = 1.0 / max(1.0, effective_rate)
-            last_start = safe_float_value(state.get("last_start"), 0.0)
-            # Wall-clock jumps or stale files must not create an unbounded sleep after reboot/NTP.
-            if last_start <= 0.0 or last_start > now + 5.0 or now - last_start > 3600.0:
-                last_start = 0.0
-            delay = max(0.0, interval - (now - last_start))
-            if deadline is not None:
-                remaining = float(deadline) - time.monotonic()
-                if remaining <= delay:
-                    return False
-            self._wait_count += 1
-            self._last_effective_rate = effective_rate
-            self._throttle_seconds += delay
-            if delay > 0.0:
-                time.sleep(delay)
-            if deadline is not None and time.monotonic() >= float(deadline):
+        with target_traffic_lease(exclusive=False, deadline=deadline) as traffic_acquired:
+            if not traffic_acquired:
                 return False
-            started = time.time()
-            payload = {
-                "last_start": started,
-                "effective_rate": effective_rate,
-                "clients": fresh_clients,
-                "updated": started,
-            }
-            try:
-                atomic_write_text(self._state_path, json.dumps(payload, sort_keys=True))
-            except OSError:
-                # The OS lock still serialized this call; retain an in-process timestamp if the
-                # state file itself became temporarily unwritable.
-                pass
-            return True
+            with _cross_process_rate_lock(self._lock_path, deadline=deadline) as rate_acquired:
+                if not rate_acquired:
+                    return False
+                now = time.time()
+                state: dict[str, Any] = {}
+                state_corrupt = False
+                try:
+                    if self._state_path.is_file():
+                        loaded = json.loads(self._state_path.read_text(encoding="utf-8"))
+                        if isinstance(loaded, dict):
+                            state = loaded
+                        else:
+                            state_corrupt = True
+                except OSError:
+                    # If the shared state cannot be read, fail closed. Starting a target request
+                    # without knowing the last cross-process start could violate the configured
+                    # maximum rate. Callers treat False as a bounded timeout/defer condition.
+                    return False
+                except (ValueError, TypeError, json.JSONDecodeError):
+                    # A malformed state file may have been left by an interrupted/legacy process.
+                    # Recover conservatively by forcing one full configured interval before the
+                    # next token rather than resetting the history and allowing an immediate burst.
+                    state_corrupt = True
+                    state = {}
+                clients = state.get("clients") if isinstance(state.get("clients"), dict) else {}
+                fresh_clients: dict[str, dict[str, float]] = {}
+                current_pid_prefix = f"{os.getpid()}:"
+                for key, row in clients.items():
+                    if not isinstance(row, dict):
+                        continue
+                    key_text = str(key)
+                    # A current-PID entry with a different configured rate belongs to an older
+                    # pacer instance (or a reused PID after restart); do not let it self-throttle
+                    # the current process until TTL expiry.
+                    if key_text.startswith(current_pid_prefix) and key_text != self._client_key:
+                        continue
+                    seen = safe_float_value(row.get("seen"), 0.0)
+                    rate = safe_float_value(row.get("rate"), 0.0)
+                    if (
+                        rate >= 1.0 and seen > 0.0
+                        and now - seen <= _GLOBAL_RATE_CLIENT_TTL_SECONDS
+                        and _rate_client_process_alive(key_text)
+                    ):
+                        fresh_clients[key_text] = {"rate": rate, "seen": seen}
+                fresh_clients[self._client_key] = {"rate": self.rate, "seen": now}
+                effective_rate = min(row["rate"] for row in fresh_clients.values()) if fresh_clients else self.rate
+                interval = 1.0 / max(1.0, effective_rate)
+                last_start = safe_float_value(state.get("last_start"), 0.0)
+                # Wall-clock jumps or stale files must not create an unbounded sleep after reboot/NTP.
+                if last_start <= 0.0 or last_start > now + 5.0 or now - last_start > 3600.0:
+                    last_start = 0.0
+                if state_corrupt:
+                    # Unknown previous state => assume a request could have started just now.
+                    last_start = now
+                delay = max(0.0, interval - (now - last_start))
+                if deadline is not None:
+                    remaining = float(deadline) - time.monotonic()
+                    if remaining <= delay:
+                        return False
+                self._last_effective_rate = effective_rate
+                self._throttle_seconds += delay
+                if delay > 0.0:
+                    time.sleep(delay)
+                if deadline is not None and time.monotonic() >= float(deadline):
+                    return False
+                started = time.time()
+                payload = {
+                    "last_start": started,
+                    "effective_rate": effective_rate,
+                    "clients": fresh_clients,
+                    "updated": started,
+                }
+                try:
+                    atomic_write_text(self._state_path, json.dumps(payload, sort_keys=True))
+                except OSError:
+                    # Never grant a target request when the cross-process timestamp cannot be
+                    # persisted: another process could otherwise acquire the lock immediately and
+                    # start a second request without observing this token. Fail closed instead.
+                    return False
+                self._wait_count += 1
+                return True
 
     def wait(self, deadline: float | None = None) -> bool:
         with self._lock:
@@ -1196,7 +1725,8 @@ def request_with_retries(
                 )
                 if state_reason:
                     raise requests.RequestException(f"state-change policy blocked request before send: {state_reason}")
-            active_pacer.wait()
+            if not active_pacer.wait(deadline):
+                raise requests.Timeout("shared scanner deadline reached while waiting for request-rate slot")
             return requests.request(method=method, url=url, **kwargs), errors
         except (requests.Timeout, requests.ConnectionError) as exc:
             errors.append(f"{type(exc).__name__}: {exc}")
@@ -1400,7 +1930,8 @@ def request_same_origin_redirects(
             )
             if state_reason:
                 raise requests.RequestException(f"state-change policy blocked request before send: {state_reason}")
-        active_pacer.wait()
+        if not active_pacer.wait(deadline):
+            raise requests.Timeout("shared scanner deadline reached while waiting for request-rate slot")
         if deadline is not None:
             left = float(deadline) - time.monotonic()
             if left <= 0:
@@ -1421,7 +1952,8 @@ def request_same_origin_redirects(
                 or not _certificate_trust_error(exc)
             ):
                 raise
-            active_pacer.wait()
+            if not active_pacer.wait(deadline):
+                raise requests.Timeout("shared scanner deadline reached while waiting for TLS-retry request-rate slot")
             if deadline is not None:
                 left = float(deadline) - time.monotonic()
                 if left <= 0:
@@ -1532,12 +2064,49 @@ def trim_process_output(result: dict[str, Any], limit: int) -> dict[str, Any]:
     return result
 
 
+_UNRESOLVED_ROUTE_TEMPLATE_SEGMENT = re.compile(
+    r'^(?::[A-Za-z_][A-Za-z0-9_-]*\??|\{[A-Za-z_][A-Za-z0-9_.-]*\}|<[A-Za-z_][A-Za-z0-9_.:-]*>|\[[A-Za-z_][A-Za-z0-9_.-]*\]|\$\{[A-Za-z_][A-Za-z0-9_.-]*\})$'
+)
+
+
+def unresolved_route_template_url(url: str) -> bool:
+    """Return True for client/framework route templates that are not concrete network targets.
+
+    Only whole path segments with explicit placeholder syntax are rejected. Colons/brackets inside
+    ordinary concrete path text and all query values remain untouched.
+    """
+    try:
+        path = unquote(str(urlparse(str(url or '')).path or ''))
+    except Exception:
+        return False
+    return any(
+        bool(_UNRESOLVED_ROUTE_TEMPLATE_SEGMENT.fullmatch(segment))
+        for segment in path.split('/') if segment
+    )
+
+
 # Removes stray whitespace from discovered URL authorities without touching path/query data.
 def sanitize_discovered_url(url: str) -> str:
     raw = str(url or "").strip()
     if not raw:
         return ""
     parsed = urlparse(raw)
+    if unresolved_route_template_url(raw):
+        # Client-side routers and source maps commonly expose patterns such as /:realm or /{id}.
+        # They are useful static evidence but are not concrete URLs and must never become active
+        # scanner targets.
+        return ""
+    if "\\" in raw:
+        # Raw backslashes are not a stable HTTP URL representation and in discovery data almost
+        # always come from JavaScript/regex/source-map text (for example ``\x3c`` or ``[^\/]``).
+        # Real network URLs use percent encoding instead, so retain the source evidence elsewhere
+        # but do not promote this fragment to an active target.
+        return ""
+    if re.search(r';[A-Za-z_$][A-Za-z0-9_$]*\.[A-Za-z_$][A-Za-z0-9_$]*\?\(', raw) and '==' in str(parsed.query or ''):
+        # Source extraction can splice minified JavaScript expressions into a URL-looking token,
+        # e.g. ``vendor/;e.action?(t=e.action==``. Require both code-shaped path and comparison
+        # syntax so ordinary semicolon/matrix parameters are not rejected.
+        return ""
     basename = str(parsed.path or '').rstrip('/').rsplit('/', 1)[-1]
     if re.fullmatch(r'\.(?:php|phtml|jsp|jspx|asp|aspx|html?|cgi|pl|py|rb)', basename, re.I):
         # Dynamic source extraction can occasionally concatenate an empty route stem with a file
@@ -1656,6 +2225,7 @@ def run_process(
     cwd: Path | None = None,
     progress_callback: Callable[[], None] | None = None,
     progress_interval: float = 5.0,
+    target_traffic: bool = True,
 ) -> dict[str, Any]:
 
     executable = find_executable(command[0])
@@ -1663,58 +2233,85 @@ def run_process(
         return failure(tool, target, f"Executable not found: {command[0]}", diagnosis="missing_executable")
 
     resolved_command = [executable, *command[1:]]
-    env = os.environ.copy()
+    env = subprocess_parallelism_environment(os.environ.copy())
     env.setdefault("PYTHONUTF8", "1")
     env.setdefault("PYTHONIOENCODING", "utf-8")
     started = time.monotonic()
+    process_deadline = started + max(1.0, float(timeout))
+    external_lease_wait_seconds = 0.0
+    external_resource_wait_seconds = 0.0
     try:
-        if progress_callback is None:
-            completed = subprocess.run(
-                resolved_command,
-                cwd=str(cwd) if cwd else None,
-                env=env,
-                capture_output=True,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                timeout=max(1, int(timeout)),
-                shell=False,
-            )
-        else:
-            # A progress callback is used by scanners such as Nuclei that write structured
-            # findings incrementally to disk. Polling communicate() lets the wrapper snapshot
-            # those artifacts while the child is still running without introducing scanner
-            # concurrency or changing its stdout/stderr contract.
-            process = subprocess.Popen(
-                resolved_command,
-                cwd=str(cwd) if cwd else None,
-                env=env,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                shell=False,
-            )
-            stdout = stderr = ""
-            timeout_seconds = max(1.0, float(timeout))
-            interval = max(0.5, min(float(progress_interval), timeout_seconds))
-            while True:
-                remaining = timeout_seconds - (time.monotonic() - started)
-                if remaining <= 0:
-                    process.kill()
-                    stdout, stderr = process.communicate()
-                    raise subprocess.TimeoutExpired(resolved_command, timeout_seconds, output=stdout, stderr=stderr)
-                try:
-                    stdout, stderr = process.communicate(timeout=min(interval, remaining))
-                    break
-                except subprocess.TimeoutExpired:
+        # Native target scanners cannot consume Python rate tokens request-by-request, so they hold
+        # the exclusive target-traffic lease and enforce the configured aggregate rate internally.
+        # Purely local capability/help subprocesses explicitly opt out and must not idle target I/O
+        # from another assessment while they inspect a binary on the VM.
+        lease_context = (
+            native_target_workload_lease(deadline=process_deadline)
+            if target_traffic else nullcontext({
+                "acquired": True, "heavy_slot": -1, "heavy_wait_seconds": 0.0,
+                "target_wait_seconds": 0.0, "diagnosis": "",
+            })
+        )
+        with lease_context as lease_state:
+            external_lease_wait_seconds = float(lease_state.get("target_wait_seconds", 0.0)) if target_traffic else 0.0
+            external_resource_wait_seconds = float(lease_state.get("heavy_wait_seconds", 0.0)) if target_traffic else 0.0
+            if not lease_state.get("acquired"):
+                return failure(
+                    tool, target,
+                    "Native scanner could not acquire the bounded VM/target execution lease before its deadline.",
+                    diagnosis=str(lease_state.get("diagnosis") or "native_workload_lease_timeout"),
+                    timed_out=True, duration_seconds=round(time.monotonic() - started, 3),
+                    command=resolved_command,
+                    external_rate_lease_wait_seconds=round(external_lease_wait_seconds, 3),
+                    external_resource_lease_wait_seconds=round(external_resource_wait_seconds, 3),
+                )
+            remaining_timeout = max(0.001, process_deadline - time.monotonic())
+            if progress_callback is None:
+                completed = subprocess.run(
+                    resolved_command,
+                    cwd=str(cwd) if cwd else None,
+                    env=env,
+                    capture_output=True,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    timeout=remaining_timeout,
+                    shell=False,
+                )
+            else:
+                # A progress callback is used by scanners such as Nuclei that write structured
+                # findings incrementally to disk. Polling communicate() lets the wrapper snapshot
+                # those artifacts while the child is still running without introducing scanner
+                # concurrency or changing its stdout/stderr contract.
+                process = subprocess.Popen(
+                    resolved_command,
+                    cwd=str(cwd) if cwd else None,
+                    env=env,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    shell=False,
+                )
+                stdout = stderr = ""
+                interval = max(0.5, min(float(progress_interval), remaining_timeout))
+                while True:
+                    remaining = process_deadline - time.monotonic()
+                    if remaining <= 0:
+                        process.kill()
+                        stdout, stderr = process.communicate()
+                        raise subprocess.TimeoutExpired(resolved_command, max(1.0, float(timeout)), output=stdout, stderr=stderr)
                     try:
-                        progress_callback()
-                    except Exception:
-                        # Checkpointing/telemetry must never abort the scanner itself.
-                        pass
-            completed = subprocess.CompletedProcess(resolved_command, process.returncode, stdout or "", stderr or "")
+                        stdout, stderr = process.communicate(timeout=min(interval, remaining))
+                        break
+                    except subprocess.TimeoutExpired:
+                        try:
+                            progress_callback()
+                        except Exception:
+                            # Checkpointing/telemetry must never abort the scanner itself.
+                            pass
+                completed = subprocess.CompletedProcess(resolved_command, process.returncode, stdout or "", stderr or "")
     # A timeout keeps any useful output instead of hiding work the scanner already completed.
     except subprocess.TimeoutExpired as exc:
         stdout = _decode_timeout_output(exc.stdout)
@@ -1734,6 +2331,8 @@ def run_process(
             timed_out=True,
             duration_seconds=round(time.monotonic() - started, 3),
             command=resolved_command,
+            external_rate_lease_wait_seconds=round(external_lease_wait_seconds, 3),
+            external_resource_lease_wait_seconds=round(external_resource_wait_seconds, 3),
         )
     except OSError as exc:
         return failure(
@@ -1743,6 +2342,8 @@ def run_process(
             diagnosis="process_start_failed",
             duration_seconds=round(time.monotonic() - started, 3),
             command=resolved_command,
+            external_rate_lease_wait_seconds=round(external_lease_wait_seconds, 3),
+            external_resource_lease_wait_seconds=round(external_resource_wait_seconds, 3),
         )
 
     stdout = completed.stdout or ""
@@ -1760,6 +2361,8 @@ def run_process(
             diagnosis="scanner_runtime_dependency_missing",
             duration_seconds=round(time.monotonic() - started, 3),
             command=resolved_command,
+            external_rate_lease_wait_seconds=round(external_lease_wait_seconds, 3),
+            external_resource_lease_wait_seconds=round(external_resource_wait_seconds, 3),
             matched_startup_error=fatal_pattern,
         )
 
@@ -1774,6 +2377,8 @@ def run_process(
             diagnosis="unexpected_exit_code",
             duration_seconds=round(time.monotonic() - started, 3),
             command=resolved_command,
+            external_rate_lease_wait_seconds=round(external_lease_wait_seconds, 3),
+            external_resource_lease_wait_seconds=round(external_resource_wait_seconds, 3),
         )
 
     return success(
@@ -1785,6 +2390,8 @@ def run_process(
         stderr=stderr,
         command=resolved_command,
         duration_seconds=round(time.monotonic() - started, 3),
+        external_rate_lease_wait_seconds=round(external_lease_wait_seconds, 3),
+        external_resource_lease_wait_seconds=round(external_resource_wait_seconds, 3),
     )
 
 

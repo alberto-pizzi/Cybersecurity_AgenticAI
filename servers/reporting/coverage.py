@@ -16,6 +16,30 @@ from .text_utils import _esc, _redact_text
 from .toc import _heading
 from utils import request_body_fingerprint, safe_bool_value, safe_int_value
 
+_ENDPOINT_METADATA_ONLY_SOURCES = frozenset({
+    "configured entry point",
+    "agentic catalog eligibility",
+    "deterministic selector",
+    "scanner target",
+})
+
+
+def _endpoint_row_was_observed(row: dict[str, Any]) -> bool:
+    """Return True only when coverage has evidence the endpoint was actually seen/reached.
+
+    Configuration/planner metadata alone must not be presented as discovery evidence.  A concrete
+    test execution is sufficient evidence even for legacy rows whose discovery-source field is empty.
+    """
+    if safe_bool_value(row.get("tested_by_broad_or_specialist"), False) or safe_bool_value(row.get("tested_by_safe_surface"), False):
+        return True
+    sources = {
+        str(value).strip().lower()
+        for value in (row.get("discovery_sources") or [])
+        if str(value).strip()
+    }
+    return any(source not in _ENDPOINT_METADATA_ONLY_SOURCES for source in sources)
+
+
 # Reclassifies a raw tool result's status, catching disguised failures/timeouts
 def _effective_status(result: dict[str, Any]) -> tuple[str, str]:
     status = str(result.get("status") or "unknown").lower()
@@ -329,8 +353,17 @@ def build_endpoint_coverage(results: dict[str, Any], context: dict[str, Any]) ->
     # Aggregate reports carry the source job on result objects. Single-entry reports leave it blank.
     for path, result in _iter_leaf_results(results):
         profile = str(path[0] if path else "")
-        tool_from_path = str(path[1] if len(path) > 1 else "").split(":", 1)[0]
-        tool = str(result.get("tool") or tool_from_path).lower()
+        tool_from_path = str(path[1] if len(path) > 1 else "").split(":", 1)[0].strip().lower()
+        display_tool = str(result.get("tool") or "").strip().lower()
+        # The result payload carries a human-facing tool label (e.g. "OWASP ZAP", "JWT Analyzer"),
+        # while the result-tree key is the canonical orchestrator tool id used by coverage rules.
+        # Prefer that canonical key so display labels cannot bypass tool-specific coverage semantics.
+        display_aliases = {
+            "owasp zap": "zap",
+            "jwt analyzer": "jwt",
+            "idor-forge": "idor",
+        }
+        tool = tool_from_path or display_aliases.get(display_tool, display_tool)
         if tool == "jwt":
             continue
         source_job = str(result.get("aggregate_source_job_id") or "")
@@ -406,6 +439,54 @@ def build_endpoint_coverage(results: dict[str, Any], context: dict[str, Any]) ->
         # Broad scanners can test many concrete URLs inside one MCP invocation. Record those exact
         # targets so the endpoint matrix does not attribute all broad coverage only to the root URL.
         # This records execution coverage only; it does not promote broad scans to specialist findings.
+        # A preserved scanner finding is concrete evidence that its own endpoint was exercised, even
+        # when the overall tool result is PARTIAL (for example a time-limited FFUF/SQLMap run).
+        # Do not infer this from ZAP alerts because passive ZAP observations can be produced without
+        # an active attack against the alert URL; targeted ZAP active-scan evidence is handled below.
+        finding_evidence_tools = {
+            "ffuf", "arjun", "sqlmap", "commix", "dalfox", "idor", "idor-forge",
+            "authorization", "traversal", "session", "workflow", "browser", "interactsh",
+            "nikto", "nuclei",
+        }
+        if tool in finding_evidence_tools and status != "skipped":
+            for finding in result.get("vulnerabilities", []) if isinstance(result.get("vulnerabilities"), list) else []:
+                if not isinstance(finding, dict):
+                    continue
+                finding_url = str(finding.get("url") or "").strip()
+                if not finding_url:
+                    continue
+                # Scanner evidence must not make an unexpected cross-origin redirect look like
+                # authorized endpoint coverage. The action target itself already represents the
+                # authorized origin selected by the orchestrator.
+                try:
+                    target_origin = urlparse(target)
+                    finding_origin = urlparse(finding_url)
+                    target_port = target_origin.port or (443 if target_origin.scheme.lower() == "https" else 80)
+                    finding_port = finding_origin.port or (443 if finding_origin.scheme.lower() == "https" else 80)
+                    same_action_origin = (
+                        target_origin.scheme.lower() == finding_origin.scheme.lower()
+                        and (target_origin.hostname or "").lower() == (finding_origin.hostname or "").lower()
+                        and target_port == finding_port
+                    )
+                except ValueError:
+                    same_action_origin = False
+                if not same_action_origin:
+                    continue
+                finding_method = str(finding.get("method") or action.get("method") or result.get("request_method") or "GET").upper()
+                nested = ensure_row(
+                    source_job, profile, finding_method, finding_url,
+                    entry_point=source_entry, source="Scanner finding evidence",
+                    body_fingerprint=str(action.get("body_fingerprint") or ""),
+                )
+                label = f"{tool_label} finding evidence ({status})"
+                if label not in nested["tests"]:
+                    nested["tests"].append(label)
+                if nested["status"] not in {"HTTP 404", "HTTP 410"}:
+                    nested["status"] = "Tested"
+                    nested["tested_by_broad_or_specialist"] = True
+                    nested["reason_code"] = "TESTED"
+                    nested["reason"] = "A preserved scanner finding proves that this endpoint received a concrete security-tool execution."
+
         if tool == "nuclei" and status != "skipped":
             nuclei_targets: list[tuple[str, str, str]] = []
             if status == "success":
@@ -471,8 +552,12 @@ def build_endpoint_coverage(results: dict[str, Any], context: dict[str, Any]) ->
             continue
         if str(row.get("reason_code") or "") == "NO_TEST_EXECUTION_RECORDED" and not row.get("selector_eligible_tools"):
             row["status"] = "Skipped"
-            row["reason_code"] = "NO_COMPATIBLE_PARAMETERS"
-            row["reason"] = "The reachable page/request context exposed no compatible application parameter or dedicated request-level input for the specialist selectors."
+            if safe_bool_value(row.get("configured_entry_point"), False) and not _endpoint_row_was_observed(row):
+                row["reason_code"] = "ENTRY_POINT_NOT_OBSERVED"
+                row["reason"] = "The configured entry point was not observed by discovery or by a concrete security-tool execution."
+            else:
+                row["reason_code"] = "NO_COMPATIBLE_PARAMETERS"
+                row["reason"] = "The reachable page/request context exposed no compatible application parameter or dedicated request-level input for the specialist selectors."
 
     status_rank = {"Tested": 0, "Execution error": 1, "Skipped": 2, "Discovered only": 3, "HTTP 404": 4, "HTTP 410": 5}
     output = list(rows.values())
@@ -486,16 +571,19 @@ def build_endpoint_coverage(results: dict[str, Any], context: dict[str, Any]) ->
 # Summarizes endpoint/request coverage globally and independently for each assessment profile.
 def summarize_endpoint_coverage(rows: list[dict[str, Any]]) -> dict[str, Any]:
     def summarize_rows(items: list[dict[str, Any]]) -> dict[str, Any]:
-        total = len(items)
-        dead = sum(str(row.get("status") or "") in {"HTTP 404", "HTTP 410"} for row in items)
-        out_scope = sum(str(row.get("reason_code") or "") == "OUT_OF_SCOPE" for row in items)
+        # Configuration/planner rows remain visible for entry-point accounting but must not inflate
+        # discovery/reachability metrics until discovery or a concrete execution actually sees them.
+        observed_items = [row for row in items if _endpoint_row_was_observed(row)]
+        total = len(observed_items)
+        dead = sum(str(row.get("status") or "") in {"HTTP 404", "HTTP 410"} for row in observed_items)
+        out_scope = sum(str(row.get("reason_code") or "") == "OUT_OF_SCOPE" for row in observed_items)
         reachable = max(0, total - dead - out_scope)
-        tested = sum(str(row.get("status") or "") == "Tested" for row in items)
-        broad_specialist_tested = sum(str(row.get("status") or "") == "Tested" and safe_bool_value(row.get("tested_by_broad_or_specialist"), False) for row in items)
-        safe_surface_only = sum(str(row.get("status") or "") == "Tested" and safe_bool_value(row.get("tested_by_safe_surface"), False) and not safe_bool_value(row.get("tested_by_broad_or_specialist"), False) for row in items)
-        discovered_only = sum(str(row.get("status") or "") == "Discovered only" for row in items)
-        skipped = sum(str(row.get("status") or "") == "Skipped" for row in items)
-        errors = sum(str(row.get("status") or "") == "Execution error" for row in items)
+        tested = sum(str(row.get("status") or "") == "Tested" for row in observed_items)
+        broad_specialist_tested = sum(str(row.get("status") or "") == "Tested" and safe_bool_value(row.get("tested_by_broad_or_specialist"), False) for row in observed_items)
+        safe_surface_only = sum(str(row.get("status") or "") == "Tested" and safe_bool_value(row.get("tested_by_safe_surface"), False) and not safe_bool_value(row.get("tested_by_broad_or_specialist"), False) for row in observed_items)
+        discovered_only = sum(str(row.get("status") or "") == "Discovered only" for row in observed_items)
+        skipped = sum(str(row.get("status") or "") == "Skipped" for row in observed_items)
+        errors = sum(str(row.get("status") or "") == "Execution error" for row in observed_items)
         coverage = (100.0 * tested / reachable) if reachable else 0.0
         broad_specialist_coverage = (100.0 * broad_specialist_tested / reachable) if reachable else 0.0
         explicit = [row for row in items if safe_bool_value(row.get("configured_entry_point"), False)]
@@ -602,6 +690,82 @@ def _render_endpoint_coverage(rows: list[dict[str, Any]], toc: list[tuple[int, s
     )
     origin_html = '<table><thead><tr><th>Runtime origin / web root</th><th>Discovered</th><th>Specialist-tested</th><th>Safe-only</th><th>Skipped</th><th>Errors</th></tr></thead><tbody>' + origin_rows + '</tbody></table>'
 
+    # Keep two endpoint-level coverage lists in the existing coverage section.  These are intentionally
+    # URL/path lists, not execution/action logs: one records every in-scope endpoint observed during
+    # discovery, and one records endpoints that received at least one broad/specialist security test.
+    # A bounded display cap prevents pathological crawls from making the human-readable report unbounded;
+    # the complete request-context matrix remains available in the JSON artifact (and HTML matrix).
+    endpoint_list_limit = min(1000, max(50, safe_int_value(os.getenv("SECOPS_REPORT_ENDPOINT_LIST_ROWS", "300"), 300)))
+
+    def endpoint_identity(value: Any) -> tuple[str, str]:
+        clean = _redact_text(value).strip()
+        if not clean:
+            return "", ""
+        try:
+            parsed = urlparse(clean)
+            if parsed.scheme and parsed.netloc:
+                # Scheme/host names are case-insensitive, but URL paths may be case-sensitive.
+                # Preserve path case in the identity so /Admin and /admin are not collapsed.
+                display = urlunparse((parsed.scheme.lower(), parsed.netloc.lower(), parsed.path or "/", "", "", ""))
+            else:
+                display = clean.split("?", 1)[0].split("#", 1)[0]
+        except (TypeError, ValueError):
+            display = clean.split("?", 1)[0].split("#", 1)[0]
+        return display, display
+
+    observed_by_key: dict[str, str] = {}
+    attacked_by_key: dict[str, str] = {}
+    for row in rows:
+        if str(row.get("reason_code") or "").upper() == "OUT_OF_SCOPE":
+            continue
+        key, display = endpoint_identity(row.get("url"))
+        if not key:
+            continue
+        if _endpoint_row_was_observed(row):
+            observed_by_key.setdefault(key, display)
+        if safe_bool_value(row.get("tested_by_broad_or_specialist"), False):
+            # A concrete security execution is itself evidence that this endpoint was reached even
+            # if a malformed/legacy result omitted its discovery-source annotation.
+            observed_by_key.setdefault(key, display)
+            attacked_by_key.setdefault(key, display)
+
+    observed_endpoints = [observed_by_key[key] for key in sorted(observed_by_key)]
+    attacked_endpoints = [attacked_by_key[key] for key in sorted(attacked_by_key)]
+
+    def render_endpoint_list(title: str, endpoint_rows: list[str], description: str) -> str:
+        shown = endpoint_rows[:endpoint_list_limit]
+        omitted_count = max(0, len(endpoint_rows) - len(shown))
+        table_rows = ''.join(
+            f'<tr><td class="idx">{index}</td><td>{_esc(url)}</td></tr>'
+            for index, url in enumerate(shown, start=1)
+        )
+        omitted_note = (
+            f'<p class="section-note"><strong>Display cap:</strong> showing {len(shown)} of {len(endpoint_rows)} endpoints; '
+            f'{omitted_count} additional endpoint(s) are retained in the complete endpoint coverage dataset.</p>'
+            if omitted_count else ''
+        )
+        empty_row = '<tr><td colspan="2">None recorded.</td></tr>' if not table_rows else ''
+        return (
+            f'<h3>{_esc(title)} ({len(endpoint_rows)})</h3>'
+            f'<p class="section-note">{_esc(description)}</p>'
+            f'{omitted_note}'
+            '<table><thead><tr><th>#</th><th>Endpoint</th></tr></thead>'
+            f'<tbody>{table_rows}{empty_row}</tbody></table>'
+        )
+
+    endpoint_lists_html = (
+        render_endpoint_list(
+            "Endpoints observed / discovered",
+            observed_endpoints,
+            "Unique in-scope endpoint URLs observed during discovery. Query values, request bodies, tools and individual attack executions are intentionally not listed here.",
+        )
+        + render_endpoint_list(
+            "Endpoints security-tested at least once",
+            attacked_endpoints,
+            "Unique endpoint URLs that received at least one broad or specialist security-tool execution. This is an endpoint list, not a list of attacks; repeated tools, profiles and attempts are collapsed.",
+        )
+    )
+
     aggregate = any(str(row.get("job_id") or "") for row in rows)
     display_rows = list(rows)
     detail_note = ""
@@ -650,6 +814,7 @@ def _render_endpoint_coverage(rows: list[dict[str, Any]], toc: list[tuple[int, s
         'Configured entry-point coverage counts the supplied URLs themselves: a value such as 0/N means none of those N exact request contexts received a concrete security-tool execution, not that the complete assessment executed zero attacks.</p>'
         f'<table><thead><tr><th>Metric</th>{summary_head}</tr></thead><tbody>{"".join(summary_rows)}</tbody></table>'
         f'{high_value_html}{class_html}{family_html}{origin_html}'
+        f'{endpoint_lists_html}'
         '<p class="section-note">Total tested coverage counts any active check. Broad/specialist tested coverage excludes safe-surface-only contexts, preventing a shallow completion replay from being presented as specialist attack coverage. Out-of-scope references and HTTP 404/410 responses are excluded from both denominators.</p>'
         f'{detail_note}'
         '<table><thead><tr><th>#</th><th>Profile / job</th><th>Method</th><th>Endpoint</th><th>Body ctx</th><th>Discovered by</th><th>Security tests</th><th>Status</th><th>Reason code</th><th>Reason</th></tr></thead>'
@@ -832,10 +997,26 @@ def _executive_text(summary: dict[str, Any], findings: list[dict[str, Any]], con
     constraints = len(summary.get("coverage_constraints") or [])
     ai_assessment = (context or {}).get("ai_analysis", {}) if isinstance(context, dict) else {}
     assessed = safe_int_value(ai_assessment.get("analyzed_findings", 0), 0) if isinstance(ai_assessment, dict) else 0
+    unassessed = safe_int_value(ai_assessment.get('candidate_findings_unanalyzed', 0), 0) if isinstance(ai_assessment, dict) else 0
     if assessed:
+        reused = safe_int_value(ai_assessment.get('analysis_findings_reused_from_equivalent_group', 0), 0) if isinstance(ai_assessment, dict) else 0
+        direct = safe_int_value(ai_assessment.get('analysis_representatives_directly_analyzed', assessed), assessed) if isinstance(ai_assessment, dict) else assessed
+        reuse_note = (
+            f" {direct} strict representative finding(s) were sent directly to the model; {reused} equivalent instance(s) reused that analysis while retaining their own scanner evidence."
+            if reused else ''
+        )
+        incomplete_note = (
+            f" {unassessed} confirmed/candidate finding(s) did not receive an AI rewrite; they remain fully present with scanner/verifier evidence and are explicitly marked as not AI-analyzed."
+            if unassessed else ''
+        )
         assessment_note = (
             f" The configured AI provider/model post-assessed {assessed} confirmed/candidate finding(s), independently enriching severity, description, "
             "impact and remediation while the scanner/verifier evidence and confirmation category remained immutable."
+            + reuse_note + incomplete_note
+        )
+    elif unassessed:
+        assessment_note = (
+            f" AI post-analysis did not cover {unassessed} confirmed/candidate finding(s); all remain fully present with scanner/verifier evidence and are explicitly marked as not AI-analyzed."
         )
     else:
         assessment_note = ""

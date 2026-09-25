@@ -192,7 +192,8 @@ def request_retry(
                 )
                 if state_reason:
                     raise requests.RequestException(f"state-change policy blocked request before send: {state_reason}")
-            active_pacer.wait()
+            if not active_pacer.wait(deadline):
+                raise requests.Timeout("shared scanner deadline reached while waiting for request-rate slot")
             return session.request(method, url, **kwargs)
         except (requests.Timeout, requests.ConnectionError) as exc:
             last = exc
