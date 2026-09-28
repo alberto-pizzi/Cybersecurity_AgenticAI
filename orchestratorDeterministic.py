@@ -96,20 +96,8 @@ async def deterministic_discovery_node(state: DeterministicState) -> dict[str, A
     diagnostics: list[dict[str, Any]] = []
     results = {profile['name']: {} for profile in profiles}
     workflow_state_changes = state_changing_tests_allowed(target, allow_state_changes)
-    print(
-        f"    [DISCOVERY] sweep servizi same-host avvio: enabled={shared.DISCOVER_SAME_HOST_SERVICES}; "
-        f"network_inflight={shared.DISCOVERY_NETWORK_MAX_INFLIGHT}; rate={shared.MAX_REQUEST_RATE:g} req/s.",
-        flush=True,
-    )
-    shared_service_discovery = await asyncio.to_thread(shared.discover_same_host_web_services, target)
-    print(
-        f"    [DISCOVERY] sweep servizi same-host completato: porte={int(shared_service_discovery.get('ports_probed', 0) or 0)}/"
-        f"{int(shared_service_discovery.get('candidate_ports_planned', 0) or 0)}; "
-        f"servizi_web={len(shared_service_discovery.get('web_services', []) or [])}; "
-        f"cache_hit={bool(shared_service_discovery.get('cache_hit', False))}; "
-        f"elapsed={float(shared_service_discovery.get('duration_seconds', 0.0) or 0.0):.1f}s.",
-        flush=True,
-    )
+    # Crawl the application first. The host-wide port sweep is a secondary breadth stage so it
+    # cannot delay the primary web/session discovery that feeds the security-tool selectors.
     profile_workers = max(1, min(len(profiles) or 1, int(shared.PARALLELISM_POLICY.get('profile_workers') or 1)))
     profile_semaphore = asyncio.Semaphore(profile_workers)
 
@@ -125,7 +113,8 @@ async def deterministic_discovery_node(state: DeterministicState) -> dict[str, A
                 discover_target, target, profile.get('cookies', ''), shared.MAX_CRAWL_PAGES,
                 list(state.get('discovery_seeds') or []), list(state.get('entry_points') or []),
                 allow_state_changes=workflow_state_changes,
-                precomputed_same_host_service_discovery=shared_service_discovery,
+                expand_authorized_service_hosts=False,
+                defer_same_host_service_discovery=True,
             )
             print(
                 f"    [DISCOVERY] profilo {name or '?'} core completato "
@@ -136,6 +125,82 @@ async def deterministic_discovery_node(state: DeterministicState) -> dict[str, A
 
     discovered_profiles = await asyncio.gather(*(_discover_profile(profile) for profile in profiles))
     profile_results = {name: found for name, found in discovered_profiles}
+
+    service_time_budget = shared.same_host_service_initial_time_budget_seconds()
+    print(
+        f"    [DISCOVERY] sweep servizi same-host avvio dopo il crawl applicativo primario: "
+        f"enabled={shared.DISCOVER_SAME_HOST_SERVICES}; budget={service_time_budget:.1f}s; "
+        f"network_inflight={shared.DISCOVERY_NETWORK_MAX_INFLIGHT}; rate={shared.MAX_REQUEST_RATE:g} req/s.",
+        flush=True,
+    )
+    shared_service_discovery = await asyncio.to_thread(
+        shared.discover_same_host_web_services, target, time_budget_seconds=service_time_budget,
+    )
+    print(
+        f"    [DISCOVERY] sweep servizi same-host completato: porte={int(shared_service_discovery.get('ports_probed', 0) or 0)}/"
+        f"{int(shared_service_discovery.get('candidate_ports_planned', 0) or 0)}; "
+        f"servizi_web={len(shared_service_discovery.get('web_services', []) or [])}; "
+        f"cache_hit={bool(shared_service_discovery.get('cache_hit', False))}; "
+        f"elapsed={float(shared_service_discovery.get('duration_seconds', 0.0) or 0.0):.1f}s.",
+        flush=True,
+    )
+
+    service_continuation_needed = bool(
+        int(shared_service_discovery.get('candidate_ports_deferred', 0) or 0) > 0
+        and shared.same_host_service_remaining_time_budget_seconds() > 0
+    )
+
+    async def _merge_service_profile(profile: dict[str, Any]) -> tuple[str, dict[str, Any]]:
+        async with profile_semaphore:
+            name = str(profile.get('name') or '')
+            merged = await asyncio.to_thread(
+                shared.merge_primary_same_host_service_discovery,
+                profile_results[name], target, str(profile.get('cookies') or ''), shared_service_discovery,
+                max_pages=shared.MAX_CRAWL_PAGES, allow_state_changes=workflow_state_changes,
+                # Targeted sibling-host port expansion runs before the primary full continuation so a
+                # dense primary host cannot consume the entire shared service budget first.
+                expand_authorized_service_hosts=True,
+            )
+            return name, merged
+
+    merged_profiles = await asyncio.gather(*(_merge_service_profile(profile) for profile in profiles))
+    profile_results = {name: found for name, found in merged_profiles}
+
+    continuation_budget = shared.same_host_service_remaining_time_budget_seconds()
+    if service_continuation_needed and continuation_budget > 0:
+        print(
+            f"    [DISCOVERY] continuazione sweep same-host: porte_rimanenti="
+            f"{int(shared_service_discovery.get('candidate_ports_deferred', 0) or 0)}; "
+            f"budget={continuation_budget:.1f}s.",
+            flush=True,
+        )
+        continued_service_discovery = await asyncio.to_thread(
+            shared.discover_same_host_web_services, target,
+            time_budget_seconds=continuation_budget, resume_from=shared_service_discovery,
+        )
+        print(
+            f"    [DISCOVERY] continuazione sweep completata: porte_cumulative="
+            f"{int(continued_service_discovery.get('ports_probed', 0) or 0)}/"
+            f"{int(continued_service_discovery.get('candidate_ports_planned', 0) or 0)}; "
+            f"questa_passata={int(continued_service_discovery.get('ports_probed_this_call', 0) or 0)}; "
+            f"nuovi_servizi_web={len(continued_service_discovery.get('new_web_services_this_call', []) or [])}; "
+            f"elapsed={float(continued_service_discovery.get('duration_seconds', 0.0) or 0.0):.1f}s.",
+            flush=True,
+        )
+
+        async def _merge_continued_service_profile(profile: dict[str, Any]) -> tuple[str, dict[str, Any]]:
+            async with profile_semaphore:
+                name = str(profile.get('name') or '')
+                merged = await asyncio.to_thread(
+                    shared.merge_primary_same_host_service_discovery,
+                    profile_results[name], target, str(profile.get('cookies') or ''), continued_service_discovery,
+                    max_pages=shared.MAX_CRAWL_PAGES, allow_state_changes=workflow_state_changes,
+                    expand_authorized_service_hosts=True,
+                )
+                return name, merged
+
+        merged_profiles = await asyncio.gather(*(_merge_continued_service_profile(profile) for profile in profiles))
+        profile_results = {name: found for name, found in merged_profiles}
 
     for profile in profiles:
         name = profile['name']
@@ -235,6 +300,8 @@ async def deterministic_broad_scan_node(state: DeterministicState) -> dict[str, 
                 allowed_origins: set[str] | None = None
                 if cookies:
                     for origin, _ in shared.discovered_scope_origin_ranking(discovery[name], target):
+                        if not shared.runtime_sibling_auth_origin_allows_authenticated_broad(discovery[name], origin):
+                            continue
                         target_url = shared.authenticated_broad_target(discovery[name], origin, cookies)
                         if target_url:
                             authenticated_targets[origin] = target_url
@@ -248,11 +315,11 @@ async def deterministic_broad_scan_node(state: DeterministicState) -> dict[str, 
                 sibling_ranking = sibling_selection['ranking']
                 selected_siblings = [origin for origin, _ in sibling_selection['selected']]
                 if name == 'anonymous':
-                    sibling_origins = selected_siblings
+                    sibling_origins = [shared.broad_discovery_target(discovery[name], origin) for origin in selected_siblings]
                 elif cookies:
                     sibling_origins = [authenticated_targets[origin] for origin in selected_siblings if origin in authenticated_targets]
                 elif not anonymous_available:
-                    sibling_origins = selected_siblings
+                    sibling_origins = [shared.broad_discovery_target(discovery[name], origin) for origin in selected_siblings]
                 if sibling_ranking and sibling_origins:
                     auth_count = sum(1 for origin in sibling_origins if bool(cookies and shared.scope_cookie_header(origin, cookies)))
                     mode_note = f'; origin-specific authenticated sessions={auth_count}' if cookies else ''
@@ -474,7 +541,12 @@ async def deterministic_authorization_node(state: DeterministicState) -> dict[st
             if (shared.scope_cookie_header(str(case.get('url') or ''), cookies) or shared.runtime_target_auth_available(cookies, str(case.get('url') or '')))
             and (state_changes_allowed or not shared.request_case_state_change_reason(case))
         ]
-        authorization_selection_summary[name] = [{'method': 'GET', 'url': str(case.get('url', '')), 'parameters': list(case.get('parameters', [])), 'priority_score': case.get('priority_score'), 'adaptive_budget': bool(case.get('adaptive_budget')), 'adaptive_budget_evidence': list(case.get('adaptive_budget_evidence', []))} for case in cases]
+        authorization_selection_summary[name] = [{
+            'method': str(case.get('method', 'GET')).upper(), 'url': str(case.get('url', '')),
+            'parameters': list(case.get('parameters', [])), 'content_type': str(case.get('content_type') or case.get('enctype') or ''),
+            'priority_score': case.get('priority_score'), 'adaptive_budget': bool(case.get('adaptive_budget')),
+            'adaptive_budget_evidence': list(case.get('adaptive_budget_evidence', [])),
+        } for case in cases]
         comparison_identities = [
             {'label': str(other.get('identity_ref') or other.get('name') or 'alternate'), 'cookies': str(other.get('cookies') or '')}
             for other in profiles
@@ -494,13 +566,41 @@ async def deterministic_authorization_node(state: DeterministicState) -> dict[st
                 arguments = build_tool_arguments('authorization', case_url, cookies, discovery[name], case=case, secondary_cookies=secondary_cookies, comparison_identities=comparison_identities, allow_state_changes=False, timeout_override=PARAMETER_TOOL_TIMEOUTS.get('authorization', 40))
                 result = await call_mcp_with_progress(AUTHORIZATION_TOOL, arguments, timeout_seconds=PARAMETER_TOOL_TIMEOUTS.get('authorization', 40) + 30)
                 result['session_state_refresh'] = state_refresh
-            _tag_coverage_action(result, 'authorization', target_url=str(case.get('url', target)), method='GET', parameters=list(case.get('parameters', [])), source_url=str(case.get('source_url', '')), data=str(case.get('data') or ''))
+            _tag_coverage_action(
+                result, 'authorization', target_url=str(case.get('url', target)),
+                method=str(case.get('method', 'GET')).upper(), parameters=list(case.get('parameters', [])),
+                source_url=str(case.get('source_url', '')), data=str(case.get('data') or ''),
+            )
             runs.append(result)
             log_result(name, 'authorization', result, str(case.get('url', target)))
         results[name]['authorization'] = aggregate_runs('authorization', target, runs) if runs else make_skipped_result('authorization', target, 'No discovered read-only request contained a plausible identity, object or privileged-resource signal.')
         if not runs:
             log_result(name, 'authorization', results[name]['authorization'], target)
     return {'results': results, 'authorization_selection_summary': authorization_selection_summary}
+
+def _no_cookie_request_execution_key(tool: str, case: dict[str, Any]) -> tuple[Any, ...]:
+    """Exact request-contract identity for cross-profile no-cookie execution reuse.
+
+    This dedupe exists to avoid rerunning the *same* anonymous request under multiple profile labels;
+    it must not collapse distinct bodies, encodings or workflow/file metadata inside one profile.
+    """
+    field_shape = tuple(sorted(
+        (str(field.get('name') or ''), str(field.get('type') or ''), str(field.get('tag') or ''))
+        for field in case.get('fields', []) if isinstance(field, dict) and str(field.get('name') or '')
+    ))
+    return (
+        str(tool or '').lower(),
+        str(case.get('method', 'GET')).upper(),
+        shared.semantic_request_identity_url(str(case.get('url') or '')),
+        str(case.get('data') or ''),
+        tuple(sorted(str(value) for value in case.get('parameters', []) if str(value))),
+        tuple(sorted(str(value) for value in case.get('file_parameters', []) if str(value))),
+        tuple(sorted(str(value) for value in case.get('token_parameters', []) if str(value))),
+        field_shape,
+        str(case.get('content_type') or '').lower(),
+        str(case.get('enctype') or '').lower(),
+    )
+
 
 # Once parameter scanners finish, browser and workflow checks reuse the latest discovery state.
 async def deterministic_browser_workflow_node(state: DeterministicState) -> dict[str, Any]:
@@ -512,7 +612,7 @@ async def deterministic_browser_workflow_node(state: DeterministicState) -> dict
     session_state = state.get('profile_session_state', {})
     selection_summary: dict[str, dict[str, list[dict[str, Any]]]] = {}
     specs = {spec.name: spec for spec in WORKFLOW_TOOLS}
-    no_cookie_workflow_executions: set[tuple[str, str, str, tuple[str, ...]]] = set()
+    no_cookie_workflow_executions: set[tuple[Any, ...]] = set()
 
     # A selected request case is executed and converted into the common tool-result format.
     async def run_case(tool: str, case: dict[str, Any], cookies: str, profile_discovery: dict[str, Any], probe_url: str) -> dict[str, Any]:
@@ -550,7 +650,7 @@ async def deterministic_browser_workflow_node(state: DeterministicState) -> dict
             selected: list[dict[str, Any]] = []
             for case in cases:
                 case_url = str(case.get('url') or '')
-                key = (tool, str(case.get('method', 'GET')).upper(), case_url, tuple(sorted(str(value).lower() for value in case.get('parameters', []) if str(value))))
+                key = _no_cookie_request_execution_key(tool, case)
                 applicable_cookie = shared.scope_cookie_header(case_url, cookies)
                 can_refresh_identity = bool(cookies and shared.runtime_target_auth_available(cookies, case_url))
                 if cookies and not applicable_cookie and not can_refresh_identity:
@@ -641,7 +741,7 @@ async def deterministic_special_checks_node(state: DeterministicState) -> dict[s
             oast_timeout = shared.oast_timeout_seconds('explicit' if injection_url else oast_class)
             oast_request_url = str(oast_case.get('injection_url') or '').replace('FUZZ', 'secops-oast-placeholder')
             oast_cookies = shared.scope_cookie_header(oast_request_url, profile['cookies'])
-            result = await call_mcp_with_progress(interactsh_spec, {'target_url': target, 'injection_url': oast_case['injection_url'], 'cookies': oast_cookies, 'method': oast_case.get('method', 'GET'), 'data': oast_case.get('data', ''), 'parameter': oast_case.get('parameter', ''), 'timeout': oast_timeout, 'request_rate': shared.MAX_REQUEST_RATE, 'allow_state_changes': shared.state_changing_tests_allowed(target, state.get('allow_state_changes')), 'allow_tls_trust_retry': shared.url_in_authorized_scope(target, oast_request_url), 'authorized_origins': sorted(shared.AUTHORIZED_SCOPE_ORIGINS), 'allow_same_host_ports': bool(shared.ALLOW_SAME_HOST_PORTS)}, timeout_seconds=oast_timeout + 35)
+            result = await call_mcp_with_progress(interactsh_spec, {'target_url': target, 'injection_url': oast_case['injection_url'], 'cookies': oast_cookies, 'method': oast_case.get('method', 'GET'), 'data': oast_case.get('data', ''), 'content_type': oast_case.get('content_type', ''), 'parameter': oast_case.get('parameter', ''), 'timeout': oast_timeout, 'request_rate': shared.MAX_REQUEST_RATE, 'allow_state_changes': shared.state_changing_tests_allowed(target, state.get('allow_state_changes')), 'allow_tls_trust_retry': shared.url_in_authorized_scope(target, oast_request_url), 'authorized_origins': sorted(shared.AUTHORIZED_SCOPE_ORIGINS), 'allow_same_host_ports': bool(shared.ALLOW_SAME_HOST_PORTS)}, timeout_seconds=oast_timeout + 35)
             result['oast_class'] = oast_class
             _tag_coverage_action(result, 'interactsh', target_url=str(oast_case.get('source_url') or target), method=str(oast_case.get('method', 'GET')), parameters=list(oast_case.get('parameters', [])), source_url=str(oast_case.get('source_url', '')), data=str(oast_case.get('data') or ''))
             interactsh_runs.append(result)

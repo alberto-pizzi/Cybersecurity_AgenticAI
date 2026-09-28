@@ -230,7 +230,7 @@ def build_endpoint_coverage(results: dict[str, Any], context: dict[str, Any]) ->
     def ensure_row(job_id: str, profile: str, method: str, url: str, *, entry_point: str = "", source: str = "Discovery", body_fingerprint: str = "") -> dict[str, Any]:
         clean_url = _redact_text(url).strip()
         normalized_method = str(method or "GET").upper()
-        body_key = str(body_fingerprint or "") if normalized_method == "POST" else ""
+        body_key = str(body_fingerprint or "") if normalized_method not in {"GET", "HEAD"} else ""
         key = (str(job_id or ""), str(profile or ""), normalized_method, _endpoint_coverage_url_key(clean_url), body_key)
         row = rows.get(key)
         if row is None:

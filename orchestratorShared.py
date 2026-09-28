@@ -181,10 +181,15 @@ DISCOVERY_LIMITS = {
     # TEST remains a smoke profile. FAST/BALANCED/DEEP have larger ceilings because robots/sitemap/
     # OpenAPI/source-map/FFUF enrichment can legitimately create far more useful surface than the
     # previous HTML-only oriented defaults. Wall-clock budgets are scaled separately by request_rate.
-    'test': {'crawl_pages': 8, 'crawl_pages_max': 16, 'browser_pages': 4, 'browser_pages_max': 8, 'browser_per_origin_pages': 8, 'browser_menu_clicks_per_page': 2, 'browser_dom_passes': 1, 'scripts': 12, 'route_variants': 2, 'per_origin_pages': 10, 'same_host_service_candidates': 32, 'same_host_service_time_budget_seconds': 12, 'same_host_service_initial_time_budget_seconds': 6, 'same_host_service_expansion_hosts': 2, 'same_host_service_expansion_recrawl_pages': 6},
-    'fast': {'crawl_pages': 180, 'crawl_pages_max': 500, 'browser_pages': 100, 'browser_pages_max': 320, 'browser_per_origin_pages': 280, 'browser_menu_clicks_per_page': 20, 'browser_dom_passes': 4, 'scripts': 256, 'route_variants': 10, 'per_origin_pages': 420, 'same_host_service_candidates': 4096, 'same_host_service_time_budget_seconds': 600, 'same_host_service_initial_time_budget_seconds': 420, 'same_host_service_expansion_hosts': 12, 'same_host_service_expansion_recrawl_pages': 48},
-    'balanced': {'crawl_pages': 1200, 'crawl_pages_max': 3000, 'browser_pages': 750, 'browser_pages_max': 2200, 'browser_per_origin_pages': 1900, 'browser_menu_clicks_per_page': 96, 'browser_dom_passes': 8, 'scripts': 1800, 'route_variants': 24, 'per_origin_pages': 2500, 'same_host_service_candidates': 32768, 'same_host_service_time_budget_seconds': 5400, 'same_host_service_initial_time_budget_seconds': 3900, 'same_host_service_expansion_hosts': 48, 'same_host_service_expansion_recrawl_pages': 180},
-    'deep': {'crawl_pages': 2500, 'crawl_pages_max': 8000, 'browser_pages': 1500, 'browser_pages_max': 4500, 'browser_per_origin_pages': 4000, 'browser_menu_clicks_per_page': 180, 'browser_dom_passes': 12, 'scripts': 3500, 'route_variants': 40, 'per_origin_pages': 6500, 'same_host_service_candidates': 65535, 'same_host_service_time_budget_seconds': 10800, 'same_host_service_initial_time_budget_seconds': 7800, 'same_host_service_expansion_hosts': 160, 'same_host_service_expansion_recrawl_pages': 400},
+    # Service-sweep total time leaves headroom for two resolved addresses at the default 10 req/s
+    # plus one bounded targeted expansion pool.  The initial slice intentionally stays much smaller
+    # so application crawling/authentication still happens first; only the continuation envelope grows.
+    # Sibling hostnames discovered from live in-scope URLs receive a smaller priority-port pool rather
+    # than a second full-range sweep.  Paths/endpoints on one hostname never duplicate the TCP sweep.
+    'test': {'crawl_pages': 8, 'crawl_pages_max': 16, 'browser_pages': 4, 'browser_pages_max': 8, 'browser_per_origin_pages': 8, 'browser_menu_clicks_per_page': 2, 'browser_dom_passes': 1, 'scripts': 12, 'route_variants': 2, 'per_origin_pages': 10, 'same_host_service_candidates': 32, 'same_host_service_expansion_candidates': 16, 'same_host_service_time_budget_seconds': 15, 'same_host_service_initial_time_budget_seconds': 6, 'same_host_service_expansion_hosts': 2, 'same_host_service_expansion_recrawl_pages': 6},
+    'fast': {'crawl_pages': 180, 'crawl_pages_max': 500, 'browser_pages': 100, 'browser_pages_max': 320, 'browser_per_origin_pages': 280, 'browser_menu_clicks_per_page': 20, 'browser_dom_passes': 4, 'scripts': 256, 'route_variants': 10, 'per_origin_pages': 420, 'same_host_service_candidates': 4096, 'same_host_service_expansion_candidates': 1024, 'same_host_service_time_budget_seconds': 1200, 'same_host_service_initial_time_budget_seconds': 120, 'same_host_service_expansion_hosts': 12, 'same_host_service_expansion_recrawl_pages': 48},
+    'balanced': {'crawl_pages': 1200, 'crawl_pages_max': 3000, 'browser_pages': 750, 'browser_pages_max': 2200, 'browser_per_origin_pages': 1900, 'browser_menu_clicks_per_page': 96, 'browser_dom_passes': 8, 'scripts': 1800, 'route_variants': 24, 'per_origin_pages': 2500, 'same_host_service_candidates': 32768, 'same_host_service_expansion_candidates': 4096, 'same_host_service_time_budget_seconds': 8400, 'same_host_service_initial_time_budget_seconds': 540, 'same_host_service_expansion_hosts': 48, 'same_host_service_expansion_recrawl_pages': 180},
+    'deep': {'crawl_pages': 2500, 'crawl_pages_max': 8000, 'browser_pages': 1500, 'browser_pages_max': 4500, 'browser_per_origin_pages': 4000, 'browser_menu_clicks_per_page': 180, 'browser_dom_passes': 12, 'scripts': 3500, 'route_variants': 40, 'per_origin_pages': 6500, 'same_host_service_candidates': 65535, 'same_host_service_expansion_candidates': 8192, 'same_host_service_time_budget_seconds': 16500, 'same_host_service_initial_time_budget_seconds': 1080, 'same_host_service_expansion_hosts': 160, 'same_host_service_expansion_recrawl_pages': 400},
 }
 HTTP_ATTEMPT_BUDGET_FACTORS = {'test': 1.0, 'fast': 1.75, 'balanced': 2.0, 'deep': 2.0}
 SCRIPT_ATTEMPT_BUDGET_FACTORS = {'test': 1.0, 'fast': 1.5, 'balanced': 1.75, 'deep': 1.75}
@@ -195,6 +200,16 @@ SCRIPT_ATTEMPT_BUDGET_FACTORS = {'test': 1.0, 'fast': 1.5, 'balanced': 1.75, 'de
 BROWSER_DISCOVERY_SECONDS_PER_BASE_PAGE = 4.0
 BROWSER_DISCOVERY_MIN_SECONDS = 120.0
 BROWSER_DISCOVERY_MIN_SECONDS_BY_MODE = {'test': float(TEST_DISCOVERY_TIME_BUDGET_SECONDS)}
+# Adaptive DOM settle must save idle time without declaring an AJAX-driven page complete too early.
+# Keep most of the former fixed dwell as a minimum and require repeated stable samples before exit.
+BROWSER_SETTLE_MIN_FRACTION = 0.70
+BROWSER_SETTLE_MIN_MS = 120
+BROWSER_SETTLE_STABLE_SAMPLES = 2
+# Dynamic menu/API responses often contain navigation URLs that never appear as DOM hrefs. Parsing
+# already-downloaded textual browser responses adds no target requests and closes that generic gap.
+BROWSER_RESPONSE_PARSE_LIMITS = {'test': 8, 'fast': 64, 'balanced': 256, 'deep': 512}
+BROWSER_RESPONSE_PARSE_BYTE_LIMITS = {'test': 256 * 1024, 'fast': 2 * 1024 * 1024, 'balanced': 8 * 1024 * 1024, 'deep': 16 * 1024 * 1024}
+BROWSER_RESPONSE_PER_BODY_BYTES = 512 * 1024
 # Concurrency hides socket/response latency only. The cross-process pacer remains authoritative,
 # and this in-flight ceiling is intentionally profile-independent so DEEP is deeper, not more aggressive.
 _DISCOVERY_AUTO_INFLIGHT = int(PARALLELISM_POLICY.get('network_workers') or 1)
@@ -292,11 +307,18 @@ ALLOW_SAME_HOST_PORTS = False
 DISCOVER_SAME_HOST_SERVICES = False
 PRIMARY_SCOPE_TARGET = ''
 SAME_HOST_SERVICE_DISCOVERY_CACHE: dict[tuple[str, str, int, str, int], dict[str, Any]] = {}
-# Profile discovery can run concurrently. Protect the host-level cache itself and serialize only
-# duplicate sweeps for the same hostname/mode; different hosts remain free to overlap behind the
-# shared network executor and cross-process request-rate pacer.
+# Profile discovery can run concurrently. Protect the host-level cache itself and serialize duplicate
+# sweeps for the same hostname/mode. Uncached sibling-host expansion sweeps also use one process-local
+# lease below: one sweep already saturates the shared request-rate pacer, so overlapping two would not
+# add useful throughput and would double-count the service-discovery wall-clock allowance.
 SAME_HOST_SERVICE_DISCOVERY_CACHE_LOCK = threading.RLock()
 SAME_HOST_SERVICE_DISCOVERY_HOST_LOCKS: dict[tuple[str, str], threading.Lock] = {}
+# Different authenticated/anonymous profiles can discover different authorized sibling hostnames at
+# the same time. Their TCP sweeps share one 10 req/s pacer, so overlapping them cannot increase
+# useful throughput but would make the service-discovery wall-clock budget count the same elapsed
+# interval more than once. Serialize only the uncached sibling-host TCP sweep itself; recrawls and
+# ordinary application discovery remain concurrent.
+SAME_HOST_SERVICE_DISCOVERY_EXPANSION_SWEEP_LOCK = threading.Lock()
 SAME_HOST_SERVICE_DISCOVERY_TIME_SPENT_SECONDS = 0.0
 SAME_HOST_SERVICE_DISCOVERY_TIME_LOCK = threading.Lock()
 AUTHENTICATED_ORIGIN_COOKIES: dict[tuple[str, str], str] = {}
@@ -320,7 +342,7 @@ RUNTIME_AUTH_ORIGIN_LIMITS = {'test': 2, 'fast': 12, 'balanced': 32, 'deep': 64}
 # One authenticated enrichment pass must be bounded globally; otherwise a 60s browser timeout can
 # multiply by every discovered same-host service/application. Deferred origins remain eligible in
 # later passes, so this limits wall-clock amplification without marking them permanently failed.
-RUNTIME_AUTH_PASS_TIMEOUTS = {'test': TEST_DISCOVERY_TIME_BUDGET_SECONDS, 'fast': 180, 'balanced': 720, 'deep': 1800}
+RUNTIME_AUTH_PASS_TIMEOUTS = {'test': TEST_DISCOVERY_TIME_BUDGET_SECONDS, 'fast': 300, 'balanced': 1200, 'deep': 2700}
 RUNTIME_AUTH_SIBLING_SSO_TIMEOUTS = {'test': 5, 'fast': 10, 'balanced': 15, 'deep': 20}
 # Candidate application entry points are bounded per origin/root, but the login helper shares one
 # total deadline across all entries. This keeps authentication bounded while avoiding an arbitrary
@@ -880,7 +902,7 @@ WORKFLOW_TOOLS = (ToolSpec('browser', 'custom_checks/browserServer.py', 'run_bro
 OPTIONAL_TOOLS = (ToolSpec('jwt', 'custom_checks/jwtServer.py', 'run_jwt_scan', module='jwt'), ToolSpec('interactsh', 'pentest_tools/discovery/interactshServer.py', 'run_interactsh_client', 'interactsh-client', required=False), ToolSpec('report', 'reporting/reportServer.py', 'generate_report', module='weasyprint'))
 ALL_TOOLS = (*BASE_TOOLS, ARJUN_TOOL, *PARAMETER_TOOLS, AUTHORIZATION_TOOL, *WORKFLOW_TOOLS, *OPTIONAL_TOOLS)
 TOOL_SCOPES = {'ffuf': 'base', 'zap': 'base', 'nuclei': 'base', 'session': 'base', 'nikto': 'base', 'arjun': 'url', 'sqlmap': 'parameterized', 'dalfox': 'parameterized', 'commix': 'parameterized', 'traversal': 'parameterized', 'idor': 'object-reference', 'authorization': 'authorization', 'browser': 'browser', 'workflow': 'workflow', 'jwt': 'jwt', 'interactsh': 'oast'}
-TOOL_DESCRIPTIONS = {'ffuf': 'Hidden resource and endpoint discovery with credential-isolated path fuzzing.', 'zap': 'Session-aware crawling, passive analysis and prioritized active testing.', 'nuclei': 'Template-based exposure, misconfiguration, known-vulnerability and bounded DAST checks on discovered parameterized URLs.', 'session': 'Cookie flags, bounded session uniqueness and fixation indicators.', 'nikto': 'Web-server hardening and exposed-resource checks.', 'arjun': 'Hidden GET/POST parameter discovery.', 'sqlmap': 'SQL-injection confirmation on discovered request contracts.', 'dalfox': 'Reflected and stored XSS testing.', 'commix': 'Operating-system command-injection testing.', 'traversal': 'Path-traversal and local-file-inclusion verification.', 'idor': 'Single-reference object differential checks for numeric, UUID, hexadecimal and digit-bearing opaque identifiers.', 'authorization': 'Read-only anonymous and multi-account cross-identity authorization differentials on discovered high-value GET requests.', 'browser': 'Chromium verification of DOM, reflected and stored XSS using harmless markers.', 'workflow': 'Bounded CSRF, upload, authentication-throttling and CAPTCHA workflow checks.', 'jwt': 'JWT structure and claim analysis.', 'interactsh': 'Out-of-band callback confirmation.'}
+TOOL_DESCRIPTIONS = {'ffuf': 'Hidden resource and endpoint discovery with credential-isolated path fuzzing.', 'zap': 'Session-aware crawling, passive analysis and prioritized active testing.', 'nuclei': 'Template-based exposure, misconfiguration, known-vulnerability and bounded DAST checks on discovered parameterized URLs.', 'session': 'Cookie flags, bounded session uniqueness and fixation indicators.', 'nikto': 'Web-server hardening and exposed-resource checks.', 'arjun': 'Hidden GET/POST parameter discovery.', 'sqlmap': 'SQL-injection confirmation on discovered request contracts.', 'dalfox': 'Reflected and stored XSS testing.', 'commix': 'Operating-system command-injection testing.', 'traversal': 'Path-traversal and local-file-inclusion verification.', 'idor': 'Single-reference object differential checks for numeric, UUID, hexadecimal and digit-bearing opaque identifiers.', 'authorization': 'Read-only anonymous and multi-account cross-identity authorization differentials on discovered high-value GET/POST request contracts.', 'browser': 'Chromium verification of DOM, reflected and stored XSS using harmless markers.', 'workflow': 'Bounded CSRF, upload, authentication-throttling and CAPTCHA workflow checks.', 'jwt': 'JWT structure and claim analysis.', 'interactsh': 'Out-of-band callback confirmation.'}
 
 # The agentic registry exposes the MCP tools available to the planner.
 def agentic_registry() -> dict[str, tuple[str, str, str, str]]:
@@ -2182,23 +2204,47 @@ class LinkFormParser(HTMLParser):
         self.scripts: list[str] = []
         self.forms: list[dict[str, Any]] = []
         self.current: dict[str, Any] | None = None
+        self.base_href: str = ''
 
     # Records useful values whenever the parser encounters a relevant start tag.
     def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
         values = {str(name).lower(): value for name, value in attrs if name}
         tag = tag.lower()
-        if tag in {'a', 'area'} and values.get('href'):
+        if tag == 'base' and values.get('href') and not self.base_href:
+            self.base_href = str(values['href'])
+        elif tag in {'a', 'area', 'link'} and values.get('href'):
             self.links.append(str(values['href']))
-        elif tag in {'iframe', 'frame'} and values.get('src'):
+        elif tag in {'iframe', 'frame', 'embed'} and values.get('src'):
             self.links.append(str(values['src']))
+        elif tag == 'object' and values.get('data'):
+            self.links.append(str(values['data']))
+        elif tag == 'meta' and str(values.get('http-equiv') or '').strip().lower() == 'refresh':
+            content = str(values.get('content') or '')
+            match = re.search(r'(?i)(?:^|;)\s*url\s*=\s*[\"\']?([^\"\';]+)', content)
+            if match and match.group(1).strip():
+                self.links.append(match.group(1).strip())
         elif tag == 'script' and values.get('src'):
             self.scripts.append(str(values['src']))
+        elif tag == 'option' and values.get('value'):
+            option_value = str(values.get('value') or '').strip()
+            if option_value.startswith(('http://', 'https://', '/', './', '../')) or re.search(r'(?i)\.(?:php\d?|phtml|jsp|jspx|asp|aspx|cgi|pl|do|action|html?)(?:[/?#]|$)', option_value):
+                self.links.append(option_value)
         elif tag == 'form':
-            self.current = {'action': values.get('action', ''), 'method': str(values.get('method', 'get')).lower(), 'enctype': str(values.get('enctype', 'application/x-www-form-urlencoded')).lower(), 'fields': []}
-        elif tag in {'input', 'textarea', 'select', 'button'} and self.current and values.get('name'):
-            field_type = str(values.get('type', tag)).lower()
-            self.current['fields'].append({'name': str(values['name']), 'value': str(values.get('value', '')), 'type': field_type, 'tag': tag})
-        for attr in ('data-href', 'data-url', 'data-link', 'data-src', 'formaction'):
+            self.current = {'action': values.get('action', ''), 'method': str(values.get('method', 'get')).lower(), 'enctype': str(values.get('enctype', 'application/x-www-form-urlencoded')).lower(), 'fields': [], 'submitters': []}
+        elif tag in {'input', 'textarea', 'select', 'button'} and self.current:
+            if values.get('name'):
+                field_type = str(values.get('type', tag)).lower()
+                self.current['fields'].append({'name': str(values['name']), 'value': str(values.get('value', '')), 'type': field_type, 'tag': tag})
+            # Submit controls may override action/method/enctype independently from the parent form.
+            # Treat these as request contracts, not generic links: crawling a POST formaction as GET
+            # both loses specialist coverage and can send the wrong method to the application.
+            if tag in {'input', 'button'} and any(values.get(key) for key in ('formaction', 'formmethod', 'formenctype')):
+                self.current['submitters'].append({
+                    'action': str(values.get('formaction') or ''),
+                    'method': str(values.get('formmethod') or '').lower(),
+                    'enctype': str(values.get('formenctype') or '').lower(),
+                })
+        for attr in ('data-href', 'data-url', 'data-link', 'data-linkurl', 'data-src', 'data-route', 'data-endpoint', 'data-path', 'data-redirect', 'data-page', 'data-target'):
             value = str(values.get(attr) or '').strip()
             if value and not value.startswith('#'):
                 self.links.append(value)
@@ -2208,6 +2254,33 @@ class LinkFormParser(HTMLParser):
         if tag.lower() == 'form' and self.current:
             self.forms.append(self.current)
             self.current = None
+
+def _html_form_request_variants(form: dict[str, Any]) -> list[dict[str, str]]:
+    """Return the parent form contract plus distinct submit-control overrides."""
+    variants = [{
+        'action': str(form.get('action') or ''),
+        'method': str(form.get('method') or 'get'),
+        'enctype': str(form.get('enctype') or 'application/x-www-form-urlencoded'),
+        'source': 'form',
+    }]
+    for submitter in form.get('submitters', []) if isinstance(form.get('submitters'), list) else []:
+        if not isinstance(submitter, dict):
+            continue
+        variants.append({
+            'action': str(submitter.get('action') or form.get('action') or ''),
+            'method': str(submitter.get('method') or form.get('method') or 'get'),
+            'enctype': str(submitter.get('enctype') or form.get('enctype') or 'application/x-www-form-urlencoded'),
+            'source': 'form_submitter_override',
+        })
+    output: list[dict[str, str]] = []
+    seen: set[tuple[str, str, str]] = set()
+    for row in variants:
+        key = (str(row['action']), str(row['method']).lower(), str(row['enctype']).lower())
+        if key in seen:
+            continue
+        seen.add(key)
+        output.append(row)
+    return output
 
 # Removes fragments and sanitizes stray whitespace from discovered URL authorities.
 def _clean_url(url: str) -> str:
@@ -2228,7 +2301,23 @@ def _normalize_redundant_base_path_link(target: str, candidate: str) -> str:
 
 # Crawler filtering keeps only URLs that are safe and useful to follow.
 def _crawlable_url(url: str) -> bool:
-    path = urlparse(url).path.lower()
+    try:
+        parsed = urlparse(str(url or ''))
+    except ValueError:
+        return False
+    if parsed.scheme.lower() not in {'http', 'https'} or not parsed.netloc:
+        return False
+    raw_path = str(parsed.path or '/')
+    # Literal extraction from minified JavaScript can otherwise turn syntax fragments/wildcards
+    # into HTTP paths (for example `/js/*/` or `/).replace/`). They are not concrete request
+    # destinations and generate large 404 waves that displace real application discovery. Apply
+    # this only to the path: bracketed query parameter names remain fully supported.
+    decoded_path = unquote(raw_path)
+    if any(token in decoded_path for token in ('*', '${', '{{', '}}', '`', '\\', '(', ')', '[', ']', '<', '>')):
+        return False
+    if any(ord(char) < 32 or ord(char) == 127 for char in decoded_path):
+        return False
+    path = raw_path.lower()
     return not path.endswith(('.css', '.js', '.mjs', '.map', '.png', '.jpg', '.jpeg', '.gif', '.svg', '.ico', '.woff', '.woff2', '.ttf', '.eot', '.pdf', '.zip', '.gz', '.tar', '.mp3', '.mp4', '.webm'))
 
 # Route fingerprints ignore ordinary changing values while preserving values that select distinct internal resources.
@@ -2303,8 +2392,9 @@ def _discovery_route_signature(url: str) -> tuple[str, str, tuple[str, ...]]:
     return (normalized_origin(url), parsed.path.rstrip('/') or '/', tuple(sorted(tokens)))
 
 # Request-level injection scanners normally care about method/path/parameter shape, not ordinary
-# parameter values. Semantic routing values remain distinct only for traversal/LFI, where the value
-# can literally choose a different server-side file/module and therefore represents distinct risk.
+# parameter values. Case-level shape accounting below adds semantic identity only when an observed
+# value selects a local/internal resource; ordinary IDs/search terms remain consolidated. Traversal
+# keeps its URL routing semantics universally because routing values are its primary risk surface.
 @functools.lru_cache(maxsize=65536)
 def _structural_route_signature(url: str) -> tuple[str, str, tuple[str, ...]]:
     parsed = urlparse(str(url or ''))
@@ -2336,9 +2426,10 @@ def _specialist_route_signature(tool: str, url: str) -> tuple[str, str, tuple[st
 def _request_body_shape(case: dict[str, Any]) -> tuple[Any, ...]:
     """Return a value-insensitive structural body signature for conservative scanner dedup.
 
-    Field names/nesting/content type remain visible while volatile values, CSRF tokens and IDs do not
-    multiply otherwise equivalent scanner actions. If parsing fails, parameter names and a coarse body
-    class are retained rather than treating every concrete body value as a new family.
+    Encoding is part of the contract: urlencoded, text/plain, multipart, JSON, XML and GraphQL must
+    never collapse into one family merely because their field names happen to match.  Values stay
+    value-insensitive except where a higher-level semantic-routing identity explicitly preserves an
+    internal module/file selector.
     """
     method = str(case.get('method') or 'GET').upper()
     if method == 'GET':
@@ -2370,11 +2461,30 @@ def _request_body_shape(case: dict[str, Any]) -> tuple[Any, ...]:
             return ('json', tuple(sorted(set(walk(payload)))), field_names)
         except Exception:
             return ('json-unparsed', field_names)
+    if 'graphql' in content_type:
+        return ('graphql-raw', field_names)
+    if 'multipart/form-data' in content_type:
+        return ('multipart', field_names)
+    if 'xml' in content_type:
+        return ('xml', field_names)
+    if content_type == 'text/plain':
+        line_names = tuple(sorted({
+            line.split('=', 1)[0].strip().lower()
+            for line in data.replace('\r\n', '\n').split('\n')
+            if '=' in line and line.split('=', 1)[0].strip()
+        }))
+        return ('text-plain', line_names, field_names)
+    if content_type == 'application/x-www-form-urlencoded':
+        try:
+            form_names = tuple(sorted({name.lower() for name, _ in parse_qsl(data, keep_blank_values=True)}))
+        except Exception:
+            form_names = ()
+        return ('form-urlencoded', form_names, field_names)
     if data:
         try:
             form_names = tuple(sorted({name.lower() for name, _ in parse_qsl(data, keep_blank_values=True)}))
             if form_names:
-                return ('form', form_names, field_names)
+                return ('form-untyped', form_names, field_names)
         except Exception:
             pass
     return (content_type or 'body', field_names)
@@ -2384,7 +2494,15 @@ def _specialist_case_shape(tool: str, case: dict[str, Any]) -> tuple[Any, ...]:
     url = str(case.get('url') or '')
     method = str(case.get('method') or 'GET').upper()
     params = tuple(sorted(str(v).lower() for v in case.get('parameters', []) if str(v)))
-    return (method, _specialist_route_signature(tool, url), params, _request_body_shape(case))
+    route_signature = _specialist_route_signature(tool, url)
+    # A local file/module selected by a routing value can dispatch the same wrapper path to a
+    # different server-side handler. Collapsing every such value into the ordinary value-variant
+    # cap can therefore hide discovered backend modules from injection specialists. Preserve only
+    # the semantic internal-resource identity here: unrelated IDs/search values remain structural
+    # and keep the normal small per-shape cap. Traversal already uses this signature universally.
+    if str(tool or '').lower() in {'sqlmap', 'dalfox', 'commix', 'traversal'} and _parameter_values_reference_internal_resource(case):
+        route_signature = _case_internal_resource_route_signature(case)
+    return (method, route_signature, params, _request_body_shape(case))
 
 # Request-level scanners need fewer value-only variants than discovery. Keeping this limit separate
 # preserves broad discovery evidence without repeatedly executing the same scanner against ephemeral
@@ -2494,6 +2612,22 @@ def _application_family_key(url: str) -> tuple[str, str]:
         return ('', '/')
     segments = [segment for segment in str(parsed.path or '/').split('/') if segment]
     return (normalized_origin(url), '/' + (segments[0].lower() if segments else ''))
+
+
+def _application_root_url(url: str) -> str:
+    """Promote any observed nested route to its generic top-level application root.
+
+    This is intentionally derived only from runtime URLs. It has no knowledge of application names,
+    compose files or external route inventories, and adds at most one root per observed path family.
+    """
+    try:
+        parsed = urlparse(str(url or ''))
+    except ValueError:
+        return ''
+    segments = [segment for segment in str(parsed.path or '/').split('/') if segment]
+    if not segments or parsed.scheme.lower() not in {'http', 'https'} or not parsed.netloc:
+        return ''
+    return urlunparse((parsed.scheme, parsed.netloc, '/' + segments[0] + '/', '', '', ''))
 
 
 def _discovery_diversity_score(target: str, url: str, family_visits: Counter[tuple[str, str]]) -> int:
@@ -2716,6 +2850,42 @@ def _looks_like_login(response: requests.Response) -> bool:
     auth_words = any((term in text for term in ('login', 'log in', 'sign in', 'signin', 'authenticate')))
     return path.endswith(('/login', '/login.php', '/signin', '/sign-in', '/auth')) or (password_field and auth_words)
 
+# Encode one observed HTML form contract without changing its declared enctype.
+def _encode_observed_form_body(
+    pairs: list[tuple[str, str]], file_parameters: list[str], enctype: str,
+) -> tuple[str, str]:
+    base_type = str(enctype or 'application/x-www-form-urlencoded').split(';', 1)[0].strip().lower()
+    if not base_type or base_type == 'application/x-www-form-urlencoded':
+        return urlencode(pairs), 'application/x-www-form-urlencoded'
+    if base_type == 'text/plain':
+        body = ''.join(f'{name}={value}\r\n' for name, value in pairs)
+        return body, 'text/plain'
+    if base_type == 'multipart/form-data':
+        # A deterministic boundary keeps dedupe stable while producing a syntactically valid
+        # multipart request contract for passive/bounded consumers. File inputs are represented as
+        # empty file parts; no local path or invented target content is introduced.
+        boundary = '----SecOpsObservedFormBoundary'
+        chunks: list[str] = []
+        def token(value: str) -> str:
+            return str(value).replace('\r', '').replace('\n', '').replace('"', '%22')
+        for name, value in pairs:
+            chunks.extend((
+                f'--{boundary}\r\n',
+                f'Content-Disposition: form-data; name="{token(name)}"\r\n\r\n',
+                f'{value}\r\n',
+            ))
+        for name in file_parameters:
+            chunks.extend((
+                f'--{boundary}\r\n',
+                f'Content-Disposition: form-data; name="{token(name)}"; filename=""\r\n',
+                'Content-Type: application/octet-stream\r\n\r\n',
+                '\r\n',
+            ))
+        chunks.append(f'--{boundary}--\r\n')
+        return ''.join(chunks), f'multipart/form-data; boundary={boundary}'
+    # Unknown form encodings are retained as metadata but not silently reinterpreted as URL-encoded.
+    return '', base_type
+
 # Converts one HTML form into the request-case format used by scanners.
 def _form_case(action: str, method: str, fields: list[dict[str, str]], source_url: str, enctype: str='application/x-www-form-urlencoded') -> dict[str, Any] | None:
 
@@ -2750,7 +2920,7 @@ def _form_case(action: str, method: str, fields: list[dict[str, str]], source_ur
         return None
     if not testable and (not file_parameters) and (not token_parameters):
         return None
-    encoded = urlencode(pairs)
+    form_enctype = str(enctype or 'application/x-www-form-urlencoded').lower()
     if method == 'GET':
         if not pairs:
             return None
@@ -2758,34 +2928,33 @@ def _form_case(action: str, method: str, fields: list[dict[str, str]], source_ur
         field_names = {name.lower() for name, _ in pairs}
         existing = [(name, value) for name, value in parse_qsl(parsed.query, keep_blank_values=True) if name.lower() not in field_names]
         url = urlunparse(parsed._replace(query=urlencode([*existing, *pairs])))
-        data = ''
+        data, content_type = ('', '')
     else:
-        url, data = (action, encoded)
-    return {'url': url, 'method': method, 'data': data, 'parameters': list(dict.fromkeys(testable)), 'file_parameters': list(dict.fromkeys(file_parameters)), 'token_parameters': list(dict.fromkeys(token_parameters)), 'fields': normalized_fields, 'enctype': str(enctype or 'application/x-www-form-urlencoded').lower(), 'source_url': source_url, 'form_action': action}
+        url = action
+        data, content_type = _encode_observed_form_body(pairs, file_parameters, form_enctype)
+    return {
+        'url': url, 'method': method, 'data': data, 'parameters': list(dict.fromkeys(testable)),
+        'file_parameters': list(dict.fromkeys(file_parameters)), 'token_parameters': list(dict.fromkeys(token_parameters)),
+        'fields': normalized_fields, 'enctype': form_enctype, 'content_type': content_type,
+        'source_url': source_url, 'form_action': action,
+    }
 
 # Removes duplicate request cases while keeping the best available data.
 class _RequestCaseAccumulator(list[dict[str, Any]]):
     """Online exact-semantic dedup for discovery request contracts.
 
-    This removes only contracts that the final deduper would already collapse. It preserves first-seen
-    ordering and merges lightweight provenance so early dedup does not throw away discovery evidence.
+    The online accumulator deliberately uses the *same* identity as the final deduper.  Keeping two
+    independent approximations here previously allowed the early stage to erase semantically distinct
+    form encodings or internal-resource body routes before the final/specialist logic could see them.
     """
     def __init__(self) -> None:
         super().__init__()
-        self._index: dict[tuple[str, str, tuple[str, ...]], int] = {}
+        self._index: dict[tuple[Any, ...], int] = {}
         self.duplicates_consolidated = 0
 
     @staticmethod
-    def _key(case: dict[str, Any]) -> tuple[str, str, tuple[str, ...]] | None:
-        names = [
-            *[str(value) for value in case.get('parameters', []) if value],
-            *[str(value) for value in case.get('file_parameters', []) if value],
-            *[str(value) for value in case.get('token_parameters', []) if value],
-        ]
-        semantic = _semantic_request_url_key(str(case.get('url', '')))
-        if not semantic or not names:
-            return None
-        return (str(case.get('method', 'GET')).upper(), semantic, tuple(sorted(set(names))))
+    def _key(case: dict[str, Any]) -> tuple[Any, ...] | None:
+        return _request_case_dedupe_key(case)
 
     def append(self, case: dict[str, Any]) -> None:  # type: ignore[override]
         if not isinstance(case, dict):
@@ -2817,17 +2986,161 @@ class _RequestCaseAccumulator(list[dict[str, Any]]):
                 self.append(value)
 
 
+def _graphql_document_identity(document: str) -> str:
+    """Return a formatting-insensitive, token-safe identity for one GraphQL document.
+
+    GraphQL ignores whitespace, commas and ``#`` comments between lexical tokens, but simply deleting
+    those characters is unsafe: ``query Foo`` and ``queryFoo`` are different token streams even
+    though naive whitespace stripping makes them identical.  Tokenize the bounded document instead.
+    String/block-string bytes are preserved conservatively; semantically equivalent block strings
+    may therefore remain separate, which costs a little dedupe but can never erase a distinct query.
+    """
+    text = str(document or '')[:200000]
+    tokens: list[str] = []
+    index = 0
+    length = len(text)
+    name_re = re.compile(r'[_A-Za-z][_0-9A-Za-z]*')
+    number_re = re.compile(r'-?(?:0|[1-9][0-9]*)(?:\.[0-9]+)?(?:[eE][+-]?[0-9]+)?')
+    punctuators = set('!$&():=@[]{|}')
+
+    while index < length:
+        ch = text[index]
+        # GraphQL treats Unicode BOM, whitespace and commas as ignored lexical separators.
+        if ch == '\ufeff' or ch.isspace() or ch == ',':
+            index += 1
+            continue
+        if ch == '#':
+            index += 1
+            while index < length and text[index] not in '\r\n':
+                index += 1
+            continue
+        if text.startswith('"""', index):
+            begin = index
+            index += 3
+            while index < length:
+                if text.startswith('\\"""', index):
+                    index += 4
+                    continue
+                if text.startswith('"""', index):
+                    index += 3
+                    break
+                index += 1
+            tokens.append('B:' + text[begin:index])
+            continue
+        if ch == '"':
+            begin = index
+            index += 1
+            escaped = False
+            while index < length:
+                current = text[index]
+                index += 1
+                if escaped:
+                    escaped = False
+                    continue
+                if current == '\\':
+                    escaped = True
+                    continue
+                if current == '"':
+                    break
+            tokens.append('S:' + text[begin:index])
+            continue
+        if text.startswith('...', index):
+            tokens.append('P:...')
+            index += 3
+            continue
+        match = name_re.match(text, index)
+        if match:
+            tokens.append('N:' + match.group(0))
+            index = match.end()
+            continue
+        match = number_re.match(text, index)
+        if match:
+            tokens.append('D:' + match.group(0))
+            index = match.end()
+            continue
+        if ch in punctuators:
+            tokens.append('P:' + ch)
+            index += 1
+            continue
+        # Invalid/future syntax is still given a collision-resistant identity instead of being
+        # dropped.  Keeping the literal code point makes this fail conservative for dedupe.
+        tokens.append('U:' + ch)
+        index += 1
+
+    if not tokens:
+        return ''
+    canonical = '\x1f'.join(tokens)
+    return hashlib.sha256(canonical.encode('utf-8', errors='ignore')).hexdigest()[:20]
+
+
+def _request_case_dedupe_key(case: dict[str, Any]) -> tuple[Any, ...] | None:
+    """Canonical identity shared by online and final request-case dedupe stages."""
+    method = str(case.get('method', 'GET')).upper()
+    names = [
+        *[str(value) for value in case.get('parameters', []) if value],
+        *[str(value) for value in case.get('file_parameters', []) if value],
+        *[str(value) for value in case.get('token_parameters', []) if value],
+    ]
+    evidence_field_names = [
+        str(field.get('name') or '')
+        for field in case.get('fields', []) if isinstance(field, dict) and str(field.get('name') or '')
+    ] if isinstance(case.get('fields'), list) else []
+    identity_names = tuple(sorted(set([*names, *evidence_field_names])))
+    data = str(case.get('data') or '')
+    content_type = str(case.get('content_type') or case.get('enctype') or '').split(';', 1)[0].strip().lower()
+    structured_body = bool(
+        method != 'GET' and data.strip() and (
+            any(token in content_type for token in ('json', 'graphql', 'xml', 'multipart/'))
+            or str(case.get('discovery_source') or '').lower() == 'playwright_network'
+        )
+    )
+    if not identity_names and structured_body:
+        identity_names = ('@structured-body',)
+
+    semantic_resource_identity: tuple[str, ...] = ()
+    if _parameter_values_reference_internal_resource(case):
+        _, _, route_tokens = _case_internal_resource_route_signature(case)
+        semantic_resource_identity = tuple(sorted(
+            str(token) for token in route_tokens if str(token).startswith('@')
+        ))
+
+    graphql_document = ''
+    if data.strip():
+        if 'graphql' in content_type:
+            graphql_document = data.strip()
+        elif 'json' in content_type or data.lstrip().startswith(('{', '[')):
+            try:
+                decoded = json.loads(data)
+            except Exception:
+                decoded = None
+            if isinstance(decoded, dict) and isinstance(decoded.get('query'), str):
+                graphql_document = str(decoded.get('query') or '').strip()
+    graphql_identity = _graphql_document_identity(graphql_document) if graphql_document else ''
+
+    body_identity_shape = _request_body_shape(case) if method != 'GET' and data.strip() else ()
+    if graphql_identity:
+        body_identity_shape = ('graphql',)
+
+    semantic_url = _semantic_request_url_key(str(case.get('url', '')))
+    if not semantic_url or not identity_names:
+        return None
+    return (
+        method, semantic_url, identity_names, body_identity_shape,
+        semantic_resource_identity, graphql_identity,
+    )
+
+
 def _dedupe_request_cases(cases: list[dict[str, Any]]) -> list[dict[str, Any]]:
     unique: list[dict[str, Any]] = []
-    seen: set[tuple[str, str, tuple[str, ...]]] = set()
+    seen: set[tuple[Any, ...]] = set()
     for case in cases:
-        names = [*[str(value) for value in case.get('parameters', []) if value], *[str(value) for value in case.get('file_parameters', []) if value], *[str(value) for value in case.get('token_parameters', []) if value]]
-        key = (str(case.get('method', 'GET')).upper(), _semantic_request_url_key(str(case.get('url', ''))), tuple(sorted(set(names))))
-        if not key[1] or not key[2] or key in seen:
+        key = _request_case_dedupe_key(case)
+        if key is None or key in seen:
             continue
         seen.add(key)
         unique.append(case)
     return unique
+
 
 # Score how closely a discovered request case matches the non-payload context of one XSS finding.
 def xss_verification_context_score(finding_url: str, case_url: str, parameter: str) -> int:
@@ -3008,20 +3321,38 @@ def _javascript_endpoint_hints(text: str, base_url: str, target: str) -> list[di
 
     value = str(text or '')[:1000000]
     patterns = (
-        (re.compile(r"fetch\s*\(\s*[\"']([^\"']+)[\"']\s*,\s*\{[^}]{0,800}?method\s*:\s*[\"'](GET|POST|PUT|PATCH|DELETE)[\"']", re.I | re.S), 'fetch-options'),
+        (re.compile(r"fetch\s*\(\s*[\"']([^\"']+)[\"']\s*,\s*\{[^}]{0,800}?[\"']?method[\"']?\s*:\s*[\"'](GET|POST|PUT|PATCH|DELETE)[\"']", re.I | re.S), 'fetch-options'),
         (re.compile(r"fetch\s*\(\s*[\"']([^\"']+)[\"']", re.I), 'fetch-get'),
         (re.compile(r"axios\.(get|post|put|patch|delete)\s*\(\s*[\"']([^\"']+)[\"']", re.I), 'method-first'),
         (re.compile(r"\.open\s*\(\s*[\"'](GET|POST|PUT|PATCH|DELETE)[\"']\s*,\s*[\"']([^\"']+)[\"']", re.I), 'method-first'),
         (re.compile(r"\$\.(get|post)\s*\(\s*[\"']([^\"']+)[\"']", re.I), 'method-first'),
-        (re.compile(r"\$\.ajax\s*\(\s*\{[^}]{0,1000}?url\s*:\s*[\"']([^\"']+)[\"'][^}]{0,1000}?(?:method|type)\s*:\s*[\"'](GET|POST|PUT|PATCH|DELETE)[\"']", re.I | re.S), 'url-method'),
-        (re.compile(r"axios\s*\(\s*\{[^}]{0,1000}?url\s*:\s*[\"']([^\"']+)[\"'][^}]{0,1000}?method\s*:\s*[\"'](GET|POST|PUT|PATCH|DELETE)[\"']", re.I | re.S), 'url-method'),
+        (re.compile(r"\$\.ajax\s*\(\s*\{[^}]{0,1000}?[\"']?url[\"']?\s*:\s*[\"']([^\"']+)[\"'][^}]{0,1000}?[\"']?(?:method|type)[\"']?\s*:\s*[\"'](GET|POST|PUT|PATCH|DELETE)[\"']", re.I | re.S), 'url-method'),
+        (re.compile(r"axios\s*\(\s*\{[^}]{0,1000}?[\"']?url[\"']?\s*:\s*[\"']([^\"']+)[\"'][^}]{0,1000}?[\"']?method[\"']?\s*:\s*[\"'](GET|POST|PUT|PATCH|DELETE)[\"']", re.I | re.S), 'url-method'),
+        (re.compile(r"\$\.ajax\s*\(\s*\{[^}]{0,1000}?[\"']?(?:method|type)[\"']?\s*:\s*[\"'](GET|POST|PUT|PATCH|DELETE)[\"'][^}]{0,1000}?[\"']?url[\"']?\s*:\s*[\"']([^\"']+)[\"']", re.I | re.S), 'method-first'),
+        (re.compile(r"axios\s*\(\s*\{[^}]{0,1000}?[\"']?method[\"']?\s*:\s*[\"'](GET|POST|PUT|PATCH|DELETE)[\"'][^}]{0,1000}?[\"']?url[\"']?\s*:\s*[\"']([^\"']+)[\"']", re.I | re.S), 'method-first'),
     )
     hints: list[dict[str, str]] = []
     seen: set[tuple[str, str]] = set()
-    explicit_fetch_starts = {match.start() for match in patterns[0][0].finditer(value)}
+
+    def fetch_get_is_unambiguous(match: re.Match[str]) -> bool:
+        # `fetch(url)` defaults to GET. A second object literal also defaults to GET when it has no
+        # method property. But `fetch(url, optionsVariable)` or a dynamic `method:` expression is
+        # unknowable statically and must not be mislabeled as GET.
+        tail = value[match.end():match.end() + 1000]
+        second_arg = re.match(r'\s*,\s*(.*)', tail, re.S)
+        if not second_arg:
+            return True
+        remainder = second_arg.group(1).lstrip()
+        if not remainder.startswith('{'):
+            return False
+        object_fragment = remainder[1:].split('}', 1)[0]
+        if re.search(r'["\']?method["\']?\s*:', object_fragment, re.I):
+            return False
+        return True
+
     for pattern, kind in patterns:
         for match in pattern.finditer(value):
-            if kind == 'fetch-get' and match.start() in explicit_fetch_starts:
+            if kind == 'fetch-get' and not fetch_get_is_unambiguous(match):
                 continue
             if kind in {'fetch-options', 'url-method'}:
                 raw_url, method = match.group(1), match.group(2).upper()
@@ -3036,7 +3367,7 @@ def _javascript_endpoint_hints(text: str, base_url: str, target: str) -> list[di
                 url = _normalize_redundant_base_path_link(target, _clean_url(absolute_url(base_url, raw_url)))
             except Exception:
                 continue
-            if not url_in_authorized_scope(target, url) or _destructive_crawl_url(url):
+            if not url_in_authorized_scope(target, url) or not _crawlable_url(url) or _destructive_crawl_url(url):
                 continue
             key = (method, url)
             if key in seen:
@@ -3046,6 +3377,29 @@ def _javascript_endpoint_hints(text: str, base_url: str, target: str) -> list[di
             if len(hints) >= 160:
                 return hints
     return hints
+
+def _append_script_endpoint_hints(
+    destination: list[dict[str, str]], seen: set[tuple[str, str]], rows: Any,
+) -> int:
+    """Append method+URL endpoint hints once while preserving bounded source metadata."""
+    added = 0
+    for raw in rows if isinstance(rows, list) else []:
+        if not isinstance(raw, dict):
+            continue
+        method = str(raw.get('method') or 'GET').upper()
+        url = str(raw.get('url') or '')
+        key = (method, url)
+        if not url or key in seen:
+            continue
+        seen.add(key)
+        destination.append({
+            'method': method, 'url': url,
+            **({'source': str(raw.get('source') or '')} if raw.get('source') else {}),
+            **({'source_url': str(raw.get('source_url') or '')} if raw.get('source_url') else {}),
+        })
+        added += 1
+    return added
+
 
 # Extracts literal navigation targets embedded in HTML, inline JavaScript, JSON menu data, and event handlers.
 def _literal_navigation_hints(text: str, base_url: str, target: str, limit: int=320) -> list[dict[str, str]]:
@@ -3061,7 +3415,7 @@ def _literal_navigation_hints(text: str, base_url: str, target: str, limit: int=
         flags=re.I,
     )
     keyed = re.compile(
-        r'''(?ix)\b(?:href|url|uri|link|linkurl|redirect|redirect_uri|page|path|route|target|endpoint|src|action)\b\s*[:=]\s*["']([^"']{1,420})["']'''
+        r'''(?ix)["']?\b(?:href|url|uri|link|linkurl|redirect|redirect_uri|page|path|route|target|endpoint|src|action)\b["']?\s*[:=]\s*["']([^"']{1,420})["']'''
     )
     calls = re.compile(
         r'''(?ix)(?:window\.open|location\.assign|location\.replace)\s*\(\s*["']([^"']{1,420})["']'''
@@ -3071,7 +3425,7 @@ def _literal_navigation_hints(text: str, base_url: str, target: str, limit: int=
     )
     quoted = re.compile(r'''["']([^"'<>\r\n]{2,420})["']''')
 
-    def plausible(raw: str) -> bool:
+    def plausible(raw: str, *, explicit_route_context: bool=False) -> bool:
         candidate = str(raw or '').strip()
         lowered = candidate.lower()
         if not candidate or lowered.startswith(('#', 'javascript:', 'data:', 'mailto:', 'tel:')):
@@ -3084,21 +3438,28 @@ def _literal_navigation_hints(text: str, base_url: str, target: str, limit: int=
             return True
         if SEMANTIC_ROUTING_VALUE_RE.search(candidate):
             return True
-        return candidate.endswith('/') and '/' in candidate
+        if candidate.endswith('/') and '/' in candidate:
+            return True
+        # A value attached to an explicit routing key/callsite is stronger evidence than an arbitrary
+        # quoted JavaScript string. Accept extensionless relative routes such as ``api/v2/devices``
+        # only in that explicit context and only when they remain path-like rather than code/text.
+        if explicit_route_context and '/' in candidate and re.fullmatch(r"[A-Za-z0-9._~:/?@!$&'+,;=%\-]+", candidate):
+            return True
+        return False
 
-    raw_values: list[str] = []
+    raw_values: list[tuple[str, bool]] = []
     for pattern in (keyed, calls, assignments):
-        raw_values.extend(match.group(1) for match in pattern.finditer(value))
+        raw_values.extend((match.group(1), True) for match in pattern.finditer(value))
     for match in quoted.finditer(value):
         raw = match.group(1)
         if plausible(raw):
-            raw_values.append(raw)
+            raw_values.append((raw, False))
 
     hints: list[dict[str, str]] = []
     seen: set[str] = set()
-    for raw in raw_values:
+    for raw, explicit_route_context in raw_values:
         raw = _normalize_literal_url_token(raw)
-        if not raw or not plausible(raw):
+        if not raw or not plausible(raw, explicit_route_context=explicit_route_context):
             continue
         try:
             candidate = _normalize_redundant_base_path_link(target, _clean_url(absolute_url(base_url, raw)))
@@ -3114,6 +3475,180 @@ def _literal_navigation_hints(text: str, base_url: str, target: str, limit: int=
             break
     return hints
 
+# Extract navigation and request-contract hints from an already-downloaded textual browser response.
+# Runtime-loaded JavaScript chunks are important for SPAs because their lazy routes/API literals may
+# never exist in the initial HTML or static script list. Parsing the bytes Chromium already fetched
+# adds no target traffic.
+def _browser_text_response_discovery(
+    text: str, response_url: str, target: str, *, javascript: bool=False,
+) -> tuple[list[str], list[dict[str, Any]], list[str]]:
+    navigation = [
+        str(row.get('url') or '') for row in _literal_navigation_hints(text, response_url, target)
+        if isinstance(row, dict) and str(row.get('url') or '')
+    ]
+    if javascript:
+        for hint in _javascript_endpoint_hints(text, response_url, target):
+            if not isinstance(hint, dict) or str(hint.get('method') or 'GET').upper() != 'GET':
+                continue
+            hinted_url = str(hint.get('url') or '')
+            if hinted_url:
+                navigation.append(hinted_url)
+    document = _json_discovery_document(text)
+    openapi_cases, openapi_get_urls = _openapi_request_cases(document, response_url, target)
+    return list(dict.fromkeys(navigation)), openapi_cases, list(dict.fromkeys(openapi_get_urls))
+
+
+def _browser_response_header_discovery_urls(headers: Any, response_url: str, target: str) -> list[str]:
+    """Return safe in-scope navigation hints carried by an already-observed browser response."""
+    if not isinstance(headers, dict):
+        return []
+    candidates: list[str] = []
+    candidates.extend(_link_header_urls(str(headers.get('link') or headers.get('Link') or ''), response_url))
+    for key in ('location', 'Location', 'content-location', 'Content-Location'):
+        raw = str(headers.get(key) or '').strip()
+        if raw:
+            candidates.append(urljoin(response_url, raw))
+    refresh = str(headers.get('refresh') or headers.get('Refresh') or '').strip()
+    if refresh:
+        match = re.search(r'(?i)(?:^|;)\s*url\s*=\s*["\']?([^"\';]+)', refresh)
+        if match and match.group(1).strip():
+            candidates.append(urljoin(response_url, match.group(1).strip()))
+
+    output: list[str] = []
+    seen: set[str] = set()
+    for raw in candidates:
+        try:
+            candidate = _normalize_redundant_base_path_link(target, _clean_url(str(raw or '')))
+        except Exception:
+            continue
+        if (
+            not candidate or candidate in seen
+            or not url_in_authorized_scope(target, candidate)
+            or not _crawlable_url(candidate)
+            or _destructive_crawl_url(candidate)
+        ):
+            continue
+        seen.add(candidate)
+        output.append(candidate)
+        if len(output) >= 64:
+            break
+    return output
+
+
+def _browser_rendered_form_cases(
+    rendered_html: str, page_url: str, target: str, *, allow_state_changes: bool=False, limit: int=256,
+) -> list[dict[str, Any]]:
+    """Extract bounded request contracts from JavaScript-rendered forms without submitting them."""
+    parser = LinkFormParser()
+    try:
+        parser.feed(str(rendered_html or '')[:2000000])
+        parser.close()
+    except Exception:
+        return []
+    document_base = str(page_url or target)
+    if parser.base_href:
+        try:
+            base_candidate = _clean_url(absolute_url(document_base, parser.base_href))
+            if base_candidate and url_in_authorized_scope(target, base_candidate):
+                document_base = base_candidate
+        except Exception:
+            pass
+    output: list[dict[str, Any]] = []
+    seen: set[tuple[str, str, str]] = set()
+    for form in parser.forms:
+        if not isinstance(form, dict):
+            continue
+        fields = [field for field in form.get('fields', []) if isinstance(field, dict)]
+        for variant in _html_form_request_variants(form):
+            try:
+                action = _normalize_redundant_base_path_link(
+                    target, _clean_url(absolute_url(document_base, variant.get('action') or document_base)),
+                )
+            except Exception:
+                continue
+            if not action or not url_in_authorized_scope(target, action) or _destructive_crawl_url(action):
+                continue
+            case = _form_case(
+                action, str(variant.get('method') or 'get'), fields, str(page_url or action),
+                str(variant.get('enctype') or 'application/x-www-form-urlencoded'),
+            )
+            if not case:
+                continue
+            state_change_reason = request_case_state_change_reason(case) if not allow_state_changes else ''
+            if state_change_reason:
+                # Keep zero-traffic form evidence for structural workflow analysis. Active request
+                # scanners still apply the central state-change policy before any network I/O.
+                case['state_change_reason'] = state_change_reason
+                case['structural_only_when_state_changes_disabled'] = True
+            case['discovery_source'] = 'playwright_rendered_form'
+            key = (str(case.get('method') or 'GET'), str(case.get('url') or ''), str(case.get('data') or ''))
+            if key in seen:
+                continue
+            seen.add(key)
+            output.append(case)
+            if len(output) >= max(1, int(limit)):
+                return output
+    return output
+
+
+def _browser_client_fragment_url(raw: str, base_url: str, target: str) -> str:
+    """Normalize one SPA hash-route for browser-only navigation without turning it into HTTP crawl input."""
+    text = str(raw or '').strip()
+    if not re.match(r'^#!?/', text):
+        return ''
+    fragment = text[1:]
+    route_path = fragment[1:] if fragment.startswith('!') else fragment
+    if not route_path.startswith('/') or any(token in route_path for token in ('${', '{{', '}}', '`', '<', '>')):
+        return ''
+    try:
+        base = urlparse(str(base_url or target))
+        candidate = urlunparse(base._replace(fragment=fragment))
+        pseudo = urlunparse(base._replace(path=route_path.split('?', 1)[0] or '/', query=route_path.split('?', 1)[1] if '?' in route_path else '', fragment=''))
+    except Exception:
+        return ''
+    if not url_in_authorized_scope(target, candidate) or _destructive_crawl_url(pseudo):
+        return ''
+    return candidate
+
+def _browser_discovery_signature(url: str) -> tuple[Any, ...]:
+    """Keep distinct client-side hash routes distinct while preserving normal HTTP route semantics."""
+    signature = _discovery_route_signature(url)
+    try:
+        fragment = str(urlparse(url).fragment or '')
+    except ValueError:
+        fragment = ''
+    if fragment:
+        return (*signature, f'#{fragment[:512]}')
+    return signature
+
+
+def _browser_response_body_discovery_eligible(
+    method: str, resource_type: str, status: int, content_type: str, *, blocked_before_send: bool=False,
+) -> bool:
+    """Return whether an already-received browser body is useful to parse locally for discovery.
+
+    Parsing creates no requests. GET document/XHR/fetch remains the baseline; GET JavaScript adds
+    lazy SPA chunks, while body-bearing/non-GET methods are admitted only for XHR/fetch requests
+    that actually reached the target (so the browser state-policy guard already approved them).
+    """
+    if blocked_before_send or not (200 <= int(status or 0) < 400):
+        return False
+    method = str(method or 'GET').upper()
+    resource_type = str(resource_type or '').lower()
+    response_type = str(content_type or '').lower()
+    textual = (
+        not response_type
+        or any(token in response_type for token in ('json', 'javascript', 'ecmascript', 'text/', 'xml', 'html'))
+    )
+    if not textual:
+        return False
+    if method == 'GET':
+        return resource_type in {'document', 'xhr', 'fetch', 'script'}
+    if method in {'POST', 'PUT', 'PATCH', 'DELETE'}:
+        return resource_type in {'xhr', 'fetch'}
+    return False
+
+
 # Converts one browser-observed request into the normalized request-contract shape.
 def _browser_network_case(url: str, method: str, data: str, content_type: str, source_url: str, resource_type: str) -> dict[str, Any] | None:
 
@@ -3125,6 +3660,7 @@ def _browser_network_case(url: str, method: str, data: str, content_type: str, s
     fields: list[dict[str, str]] = []
     body = str(data or '')
     lowered_type = str(content_type or '').lower()
+    structured_body = False
 
     def add_json_fields(value: Any, prefix: str='', depth: int=0) -> None:
         if depth > 4 or len(fields) >= 80:
@@ -3153,9 +3689,53 @@ def _browser_network_case(url: str, method: str, data: str, content_type: str, s
             except Exception:
                 decoded = None
             if decoded is not None:
+                structured_body = True
                 add_json_fields(decoded)
+        elif 'graphql' in lowered_type or '/graphql' in parsed.path.lower():
+            # Raw application/graphql requests carry the GraphQL document directly rather than in
+            # a JSON ``query`` field. Preserve the observed body for Nuclei DAST. Variable names
+            # are evidence only: they are not normal query/form parameters and therefore must not
+            # be handed to specialists whose mutator only understands URL/form encoding.
+            structured_body = True
+            for variable in dict.fromkeys(re.findall(r'\$([A-Za-z_][A-Za-z0-9_]*)', body[:200000])):
+                if len(fields) < 80:
+                    fields.append({'name': variable, 'value': '', 'type': 'graphql-variable', 'tag': 'network'})
+        elif 'xml' in lowered_type or body.lstrip().startswith('<?xml'):
+            # Parse only XML names with bounded regular expressions. The original body remains the
+            # scanner input; this avoids entity expansion/parser side effects while keeping XML/XXE
+            # request contracts visible to DAST and compatible specialists.
+            structured_body = True
+            for match in re.finditer(r'<\s*(?![!?/])([A-Za-z_][\w:.-]*)\b([^<>]{0,2000})>', body[:200000]):
+                tag_name = match.group(1).split(':')[-1]
+                parameters.append(tag_name)
+                if len(fields) < 80:
+                    fields.append({'name': tag_name, 'value': '', 'type': 'xml-element', 'tag': 'network'})
+                for attr in re.findall(r'([A-Za-z_][\w:.-]*)\s*=', match.group(2)):
+                    attr_name = attr.split(':')[-1]
+                    parameters.append(attr_name)
+                    if len(fields) < 80:
+                        fields.append({'name': attr_name, 'value': '', 'type': 'xml-attribute', 'tag': 'network'})
+                if len(fields) >= 80:
+                    break
+        elif 'multipart/form-data' in lowered_type:
+            # Keep the exact observed multipart body for Nuclei DAST but do not expose multipart
+            # field names as ordinary mutable parameters: the request-level mutators do not rebuild
+            # multipart boundaries safely. Names remain bounded evidence only.
+            structured_body = True
+            for match in re.finditer(r'(?im)^Content-Disposition:\s*form-data;[^\r\n]*\bname=\"([^\"]{1,256})\"([^\r\n]*)', body[:400000]):
+                name = str(match.group(1) or '').strip()
+                if not name or len(fields) >= 80:
+                    continue
+                suffix = str(match.group(2) or '')
+                field_type = 'multipart-file' if re.search(r'\bfilename=\"', suffix, re.I) else 'multipart-field'
+                fields.append({'name': name, 'value': '', 'type': field_type, 'tag': 'network'})
+        elif body.strip():
+            # Unknown textual/binary-ish POST contracts are still valuable DAST evidence when the
+            # central state-change classifier proves the route read-only. Preserve bytes exactly and
+            # leave parameters empty so incompatible specialists cannot fabricate a mutation.
+            structured_body = True
     parameters = list(dict.fromkeys((str(name) for name in parameters if str(name))))
-    if not parameters:
+    if not parameters and not structured_body:
         return None
     return {
         'url': url, 'method': method, 'data': body, 'parameters': parameters, 'file_parameters': [],
@@ -3169,22 +3749,53 @@ def _browser_network_case(url: str, method: str, data: str, content_type: str, s
 # their DOM is otherwise usable, so walk elements directly inside page context.
 def _browser_dom_navigation_values(page: Any) -> list[Any]:
     values = page.evaluate(
-        """() => {
-            const attrs = ['href','src','action','formaction','data-href','data-url','data-link','data-src'];
+        r"""() => {
+            const attrs = ['href','src','data-href','data-url','data-link','data-linkurl','data-src','data-route','data-endpoint','data-path','data-redirect','data-page','data-target'];
             const out = [];
-            const root = document.documentElement;
-            if (!root) return out;
-            const walker = document.createTreeWalker(root, NodeFilter.SHOW_ELEMENT);
-            let element = root;
-            while (element) {
+            const maxValues = 2048;
+            const scanElement = (element) => {
+                if (!element || out.length >= maxValues) return;
                 for (const name of attrs) {
                     try {
                         const value = element.getAttribute && element.getAttribute(name);
                         if (value) out.push(value);
                     } catch (_) {}
                 }
-                element = walker.nextNode();
-            }
+                if (element.tagName && element.tagName.toLowerCase() === 'meta') {
+                    try {
+                        const equiv = String(element.getAttribute('http-equiv') || '').toLowerCase();
+                        const content = String(element.getAttribute('content') || '');
+                        if (equiv === 'refresh') {
+                            const match = content.match(/(?:^|;)\s*url\s*=\s*["']?([^"';]+)/i);
+                            if (match && match[1]) out.push(match[1].trim());
+                        }
+                    } catch (_) {}
+                }
+                if (element.tagName && element.tagName.toLowerCase() === 'option') {
+                    try {
+                        const optionValue = String(element.getAttribute('value') || '').trim();
+                        if (/^(?:https?:\/\/|\/|\.\.?\/)/i.test(optionValue) || /\.(?:php\d?|phtml|jsp|jspx|asp|aspx|cgi|pl|do|action|html?)(?:[/?#]|$)/i.test(optionValue)) out.push(optionValue);
+                    } catch (_) {}
+                }
+                // Open Shadow DOM is already present in the browser and costs no target request to inspect.
+                // Closed shadow roots remain inaccessible and are deliberately not bypassed.
+                try {
+                    if (element.shadowRoot) scanRoot(element.shadowRoot);
+                } catch (_) {}
+            };
+            const scanRoot = (root) => {
+                if (!root || out.length >= maxValues) return;
+                if (root.nodeType === Node.ELEMENT_NODE) scanElement(root);
+                const walker = document.createTreeWalker(root, NodeFilter.SHOW_ELEMENT);
+                let element = walker.nextNode();
+                while (element && out.length < maxValues) {
+                    scanElement(element);
+                    element = walker.nextNode();
+                }
+            };
+            const root = document.documentElement;
+            if (!root) return out;
+            scanRoot(root);
             return out;
         }"""
     ) or []
@@ -3194,6 +3805,66 @@ def _browser_dom_navigation_values(page: Any) -> list[Any]:
         return list(values)
     return []
 
+
+def _browser_shadow_dom_form_cases(
+    page: Any, base_url: str, target: str, *, allow_state_changes: bool=False, limit: int=128,
+) -> list[dict[str, Any]]:
+    """Extract request contracts from forms inside already-rendered open Shadow DOM roots."""
+    try:
+        snapshots = page.evaluate(
+            r"""() => {
+                const out = [];
+                const maxForms = 128;
+                const seen = new Set();
+                const visit = (root) => {
+                    if (!root || out.length >= maxForms || !root.querySelectorAll) return;
+                    for (const host of root.querySelectorAll('*')) {
+                        if (out.length >= maxForms) break;
+                        let shadow = null;
+                        try { shadow = host.shadowRoot; } catch (_) { shadow = null; }
+                        if (!shadow) continue;
+                        try {
+                            for (const form of shadow.querySelectorAll('form')) {
+                                if (out.length >= maxForms) break;
+                                if (!seen.has(form)) {
+                                    seen.add(form);
+                                    out.push(String(form.outerHTML || ''));
+                                }
+                            }
+                        } catch (_) {}
+                        visit(shadow);
+                    }
+                };
+                visit(document);
+                return out;
+            }"""
+        ) or []
+    except Exception:
+        return []
+    if not isinstance(snapshots, (list, tuple)):
+        return []
+    output: list[dict[str, Any]] = []
+    seen: set[tuple[Any, ...]] = set()
+    max_cases = max(1, int(limit))
+    for snapshot in list(snapshots)[:128]:
+        if len(output) >= max_cases:
+            break
+        html = str(snapshot or '').strip()
+        if not html:
+            continue
+        for case in _browser_rendered_form_cases(
+            html, base_url, target, allow_state_changes=allow_state_changes,
+            limit=max_cases - len(output),
+        ):
+            case['discovery_source'] = 'playwright_shadow_form'
+            key = _request_case_dedupe_key(case)
+            if key is None or key in seen:
+                continue
+            seen.add(key)
+            output.append(case)
+            if len(output) >= max_cases:
+                break
+    return output
 
 def _browser_request_state_reason(request: Any, allow_state_changes: bool=False) -> str:
     if allow_state_changes:
@@ -3324,6 +3995,9 @@ def _browser_network_discovery_impl(target: str, cookies: str, html_urls: list[s
         'external_subresource_requests': 0,
         'external_navigation_requests_blocked': 0,
         'external_origins_observed': [],
+        'textual_responses_parsed': 0, 'textual_response_bytes_parsed': 0,
+        'textual_response_navigation_candidates': 0,
+        'family_roots_promoted': 0, 'adaptive_low_value_deferred': 0,
     }
     if time.monotonic() >= browser_deadline:
         budget_info['wall_clock_exhausted'] = True
@@ -3350,21 +4024,34 @@ def _browser_network_discovery_impl(target: str, cookies: str, html_urls: list[s
     observed: list[dict[str, Any]] = []
     cases: list[dict[str, Any]] = []
     errors: list[dict[str, Any]] = []
+    runtime_script_endpoint_hints: list[dict[str, str]] = []
+    runtime_script_endpoint_keys: set[tuple[str, str]] = set()
+    rendered_form_case_keys: set[tuple[str, str, str]] = set()
+    rendered_form_case_limit = max(16, min(512, navigation_max_budget))
     current_source = {'url': target_url}
     request_rows: dict[int, dict[str, Any]] = {}
     request_cases_by_id: dict[int, dict[str, Any]] = {}
     external_browser_origins: set[str] = set()
+    promoted_browser_roots: set[str] = set()
+    browser_family_root_limit = max(4, min(256, max(1, navigation_max_budget // 4)))
+    browser_response_parse_limit = max(1, int(BROWSER_RESPONSE_PARSE_LIMITS.get(CURRENT_SCAN_MODE, 64)))
+    browser_response_byte_limit = max(BROWSER_RESPONSE_PER_BODY_BYTES, int(BROWSER_RESPONSE_PARSE_BYTE_LIMITS.get(CURRENT_SCAN_MODE, 2 * 1024 * 1024)))
+    browser_response_parsed = 0
+    browser_response_bytes = 0
 
-    def enqueue_dynamic(raw_url: str, *, force: bool=False) -> None:
+    def enqueue_dynamic(raw_url: str, *, force: bool=False, promote_root: bool=True, preserve_client_fragment: bool=False) -> None:
         try:
-            candidate = _normalize_redundant_base_path_link(target, _clean_url(raw_url))
+            if preserve_client_fragment:
+                candidate = _browser_client_fragment_url(raw_url, current_source.get('url') or target_url, target)
+            else:
+                candidate = _normalize_redundant_base_path_link(target, _clean_url(raw_url))
         except Exception:
             return
         if not candidate or candidate in queued or candidate in visited:
             return
         if not url_in_authorized_scope(target, candidate) or not _crawlable_url(candidate) or _destructive_crawl_url(candidate):
             return
-        signature = _discovery_route_signature(candidate)
+        signature = _browser_discovery_signature(candidate)
         origin = normalized_origin(candidate)
         variant_limit = _discovery_variant_limit(candidate, route_variant_limit)
         if not force and queued_signatures[signature] >= variant_limit:
@@ -3374,6 +4061,14 @@ def _browser_network_discovery_impl(target: str, cookies: str, html_urls: list[s
         queued.add(candidate)
         queued_signatures[signature] += 1
         queue.append(candidate)
+        if promote_root and len(promoted_browser_roots) < browser_family_root_limit:
+            family_root = _application_root_url(candidate)
+            if family_root and family_root != candidate and family_root not in promoted_browser_roots:
+                promoted_browser_roots.add(family_root)
+                before = len(queued)
+                enqueue_dynamic(family_root, promote_root=False)
+                if len(queued) > before:
+                    budget_info['family_roots_promoted'] = int(budget_info.get('family_roots_promoted', 0) or 0) + 1
 
     enqueue_dynamic(target_url, force=True)
     for value in sorted(forced_set):
@@ -3447,7 +4142,9 @@ def _browser_network_discovery_impl(target: str, cookies: str, html_urls: list[s
                     return
                 method = str(request.method or 'GET').upper()
                 resource_type = str(request.resource_type or '')
-                if resource_type not in {'document', 'xhr', 'fetch'} and not urlparse(url).query:
+                # Keep dynamically loaded JavaScript even without a query string: lazy SPA chunks can
+                # contain authorized route/API literals absent from the initial HTML/static script graph.
+                if resource_type not in {'document', 'xhr', 'fetch', 'script'} and not urlparse(url).query:
                     return
                 headers = request.headers or {}
                 content_type = str(headers.get('content-type') or '')
@@ -3465,6 +4162,7 @@ def _browser_network_discovery_impl(target: str, cookies: str, html_urls: list[s
                     enqueue_dynamic(url)
 
             def record_response(response: Any) -> None:
+                nonlocal browser_response_parsed, browser_response_bytes
                 request = response.request
                 row = request_rows.get(id(request))
                 if row is None:
@@ -3477,11 +4175,87 @@ def _browser_network_discovery_impl(target: str, cookies: str, html_urls: list[s
                     headers = response.headers or {}
                 except Exception:
                     headers = {}
-                response_type = str(headers.get('content-type') or '').lower()
+                response_type = str(headers.get('content-type') or headers.get('Content-Type') or '').lower()
                 row.update(response_observed=True, response_status=status, response_ok=200 <= status < 400, response_content_type=response_type)
+
+                # Browser-only XHR/fetch/document responses can expose pagination, canonical-resource
+                # and redirect targets in headers even when the body contains no links. Feed those
+                # already-observed hints through the same scope/destructive/crawlability guards used
+                # by normal dynamic discovery before scheduling any follow-up GET.
+                response_url = _clean_url(str(getattr(response, 'url', '') or row.get('url') or ''))
+                header_added = 0
+                for header_url in _browser_response_header_discovery_urls(headers, response_url, target):
+                    before = len(queued)
+                    enqueue_dynamic(header_url)
+                    if len(queued) > before:
+                        header_added += 1
+                if header_added:
+                    budget_info['response_header_navigation_candidates'] = int(
+                        budget_info.get('response_header_navigation_candidates', 0) or 0
+                    ) + header_added
+
                 case = request_cases_by_id.get(id(request))
                 if case is not None:
                     case['browser_response'] = {'observed': True, 'status': status, 'ok': 200 <= status < 400, 'content_type': response_type}
+
+                # Inspect already-downloaded textual bodies for navigation/menu/API URLs. This creates
+                # no extra target traffic. Besides GET document/XHR/fetch, include lazy-loaded script
+                # chunks and POST XHR/fetch responses that actually passed the state-policy route guard.
+                method = str(row.get('method') or 'GET').upper()
+                resource_type = str(row.get('resource_type') or '')
+                if (
+                    _browser_response_body_discovery_eligible(
+                        method, resource_type, status, response_type,
+                        blocked_before_send=bool(row.get('blocked_before_send')),
+                    )
+                    and browser_response_parsed < browser_response_parse_limit
+                    and browser_response_bytes < browser_response_byte_limit
+                ):
+                    try:
+                        body = str(response.text() or '')
+                    except Exception:
+                        body = ''
+                    if body:
+                        remaining_bytes = max(0, browser_response_byte_limit - browser_response_bytes)
+                        body = body[:min(BROWSER_RESPONSE_PER_BODY_BYTES, remaining_bytes)]
+                        if body:
+                            browser_response_parsed += 1
+                            browser_response_bytes += len(body.encode('utf-8', errors='ignore'))
+                            added = 0
+                            is_javascript_response = (
+                                resource_type == 'script' or 'javascript' in response_type or 'ecmascript' in response_type
+                            )
+                            if is_javascript_response:
+                                for endpoint_hint in _javascript_endpoint_hints(body, response_url, target):
+                                    hint_method = str(endpoint_hint.get('method') or 'GET').upper()
+                                    hint_url = str(endpoint_hint.get('url') or '')
+                                    hint_key = (hint_method, hint_url)
+                                    if not hint_url or hint_key in runtime_script_endpoint_keys:
+                                        continue
+                                    runtime_script_endpoint_keys.add(hint_key)
+                                    runtime_script_endpoint_hints.append({
+                                        'method': hint_method, 'url': hint_url,
+                                        'source': 'browser_runtime_javascript', 'source_url': response_url,
+                                    })
+                            navigation_hints, openapi_cases, openapi_get_urls = _browser_text_response_discovery(
+                                body, response_url, target, javascript=is_javascript_response,
+                            )
+                            for navigation_url in navigation_hints:
+                                before = len(queued)
+                                enqueue_dynamic(navigation_url)
+                                if len(queued) > before:
+                                    added += 1
+                            if openapi_cases:
+                                for openapi_case in openapi_cases:
+                                    cases.append(openapi_case)
+                                for openapi_url in openapi_get_urls:
+                                    before = len(queued)
+                                    enqueue_dynamic(openapi_url)
+                                    if len(queued) > before:
+                                        added += 1
+                            budget_info['textual_responses_parsed'] = browser_response_parsed
+                            budget_info['textual_response_bytes_parsed'] = browser_response_bytes
+                            budget_info['textual_response_navigation_candidates'] = int(budget_info.get('textual_response_navigation_candidates', 0) or 0) + added
 
             def record_failed(request: Any) -> None:
                 row = request_rows.get(id(request))
@@ -3512,15 +4286,20 @@ def _browser_network_discovery_impl(target: str, cookies: str, html_urls: list[s
                 return max(1, min(int(cap_ms), int(remaining * 1000)))
 
             def wait_for_browser_settle(max_ms: int) -> None:
-                """Wait up to max_ms, but return early once DOM/network counters stabilize.
+                """Wait for delayed AJAX/menu work without restoring an unconditional fixed sleep.
 
-                This keeps the former upper bound for slow SPAs while avoiding a fixed sleep on pages
-                that are already quiescent. If page.evaluate is unavailable during a navigation race,
-                the loop simply consumes the old bounded wait rather than shortening coverage.
+                A previous optimization could return after the first repeated DOM/resource sample,
+                often ~100-160 ms after navigation. That is too early for common delayed menu/XHR
+                population and can shrink the discovered application graph. We now require a minimum
+                dwell plus multiple stable samples, while still returning before max_ms on truly idle pages.
                 """
                 budget = remaining_browser_ms(max_ms)
                 if budget <= 1:
                     return
+                minimum_dwell = min(
+                    budget,
+                    max(BROWSER_SETTLE_MIN_MS, int(math.ceil(float(budget) * BROWSER_SETTLE_MIN_FRACTION))),
+                )
                 quantum = max(30, min(80, max(30, budget // 3)))
                 waited = 0
                 previous: tuple[str, int, int] | None = None
@@ -3546,7 +4325,8 @@ def _browser_network_discovery_impl(target: str, cookies: str, html_urls: list[s
                     else:
                         stable_hits = 0
                     previous = signature
-                    if stable_hits >= 1:
+                    if waited >= minimum_dwell and stable_hits >= BROWSER_SETTLE_STABLE_SAMPLES:
+                        budget_info['adaptive_settle_early_returns'] = int(budget_info.get('adaptive_settle_early_returns', 0) or 0) + 1
                         return
 
             def navigate_with_retry(value: str) -> Any:
@@ -3586,11 +4366,13 @@ def _browser_network_discovery_impl(target: str, cookies: str, html_urls: list[s
                         cutoff_score = min(base_scores) if base_scores else value_score
                         adaptive_threshold = max(1, int(cutoff_score * 0.75))
                     if value_score < adaptive_threshold and family_visits.get(_application_family_key(value), 0) > 0:
-                        break
+                        queue.pop(best_index)
+                        budget_info['adaptive_low_value_deferred'] = int(budget_info.get('adaptive_low_value_deferred', 0) or 0) + 1
+                        continue
                 value = queue.pop(best_index)
                 if value in visited:
                     continue
-                signature = _discovery_route_signature(value)
+                signature = _browser_discovery_signature(value)
                 origin_key = normalized_origin(value)
                 forced_value = value in forced_set
                 variant_limit = _discovery_variant_limit(value, route_variant_limit)
@@ -3600,7 +4382,7 @@ def _browser_network_discovery_impl(target: str, cookies: str, html_urls: list[s
                 visited_signatures[signature] += 1
                 origin_visits[origin_key] += 1
                 family_visits[_application_family_key(value)] += 1
-                if len(visited) <= navigation_budget and _discovery_route_signature(value) != _discovery_route_signature(target_url):
+                if len(visited) <= navigation_budget and _browser_discovery_signature(value) != _browser_discovery_signature(target_url):
                     base_scores.append(value_score)
                 current_source['url'] = value
                 try:
@@ -3612,22 +4394,30 @@ def _browser_network_discovery_impl(target: str, cookies: str, html_urls: list[s
                         budget_info['dead_404_410'] = int(budget_info.get('dead_404_410', 0) or 0) + 1
                         continue
                     if not response_type or 'html' in response_type:
-                        navigated.append(value)
+                        if urlparse(value).fragment:
+                            budget_info['client_fragment_routes_visited'] = int(
+                                budget_info.get('client_fragment_routes_visited', 0) or 0
+                            ) + 1
+                        else:
+                            navigated.append(value)
 
-                    def collect_dom_navigation() -> None:
+                    def collect_dom_navigation(
+                        dom_context: Any=page, base_url: str | None=None, *, allow_client_fragments: bool=True,
+                    ) -> None:
                         if time.monotonic() >= browser_deadline:
                             return
+                        context_base = str(base_url or getattr(dom_context, 'url', '') or page.url or value)
                         raw_values: list[Any] = []
                         for dom_attempt in range(2):
                             try:
-                                raw_values = _browser_dom_navigation_values(page)
+                                raw_values = _browser_dom_navigation_values(dom_context)
                                 break
                             except Exception as dom_exc:
                                 if dom_attempt or not transient_browser_error(dom_exc):
                                     raise
                                 budget_info['dom_retries'] = int(budget_info.get('dom_retries', 0) or 0) + 1
                                 try:
-                                    page.wait_for_load_state('domcontentloaded', timeout=remaining_browser_ms(3000))
+                                    dom_context.wait_for_load_state('domcontentloaded', timeout=remaining_browser_ms(3000))
                                 except Exception:
                                     pass
                                 wait_for_browser_settle(180)
@@ -3635,21 +4425,62 @@ def _browser_network_discovery_impl(target: str, cookies: str, html_urls: list[s
                             if time.monotonic() >= browser_deadline:
                                 break
                             text = str(raw or '').strip()
-                            if not text or text.startswith('#'):
-                                continue
-                            try:
-                                candidate = absolute_url(str(page.url or value), text)
-                            except Exception:
+                            if not text:
                                 continue
                             before = len(queued)
-                            enqueue_dynamic(candidate)
+                            if text.startswith('#'):
+                                if not allow_client_fragments:
+                                    continue
+                                enqueue_dynamic(text, preserve_client_fragment=True, promote_root=False)
+                            else:
+                                try:
+                                    candidate = absolute_url(context_base, text)
+                                except Exception:
+                                    continue
+                                enqueue_dynamic(candidate)
                             if len(queued) > before:
                                 budget_info['dom_navigation_candidates'] = int(budget_info.get('dom_navigation_candidates', 0) or 0) + 1
                         try:
-                            rendered = page.content()
+                            rendered = dom_context.content()
                         except Exception:
                             rendered = ''
-                        for hint in _literal_navigation_hints(rendered, str(page.url or value), target):
+                        if rendered and len(rendered_form_case_keys) < rendered_form_case_limit:
+                            remaining_form_slots = rendered_form_case_limit - len(rendered_form_case_keys)
+                            for rendered_case in _browser_rendered_form_cases(
+                                rendered, context_base, target,
+                                allow_state_changes=allow_state_changes, limit=remaining_form_slots,
+                            ):
+                                rendered_key = (
+                                    str(rendered_case.get('method') or 'GET'),
+                                    str(rendered_case.get('url') or ''),
+                                    str(rendered_case.get('data') or ''),
+                                )
+                                if rendered_key in rendered_form_case_keys:
+                                    continue
+                                rendered_form_case_keys.add(rendered_key)
+                                cases.append(rendered_case)
+                                budget_info['rendered_form_cases'] = int(
+                                    budget_info.get('rendered_form_cases', 0) or 0
+                                ) + 1
+                        if len(rendered_form_case_keys) < rendered_form_case_limit:
+                            remaining_shadow_slots = rendered_form_case_limit - len(rendered_form_case_keys)
+                            for shadow_case in _browser_shadow_dom_form_cases(
+                                dom_context, context_base, target,
+                                allow_state_changes=allow_state_changes, limit=remaining_shadow_slots,
+                            ):
+                                shadow_key = (
+                                    str(shadow_case.get('method') or 'GET'),
+                                    str(shadow_case.get('url') or ''),
+                                    str(shadow_case.get('data') or ''),
+                                )
+                                if shadow_key in rendered_form_case_keys:
+                                    continue
+                                rendered_form_case_keys.add(shadow_key)
+                                cases.append(shadow_case)
+                                budget_info['shadow_form_cases'] = int(
+                                    budget_info.get('shadow_form_cases', 0) or 0
+                                ) + 1
+                        for hint in _literal_navigation_hints(rendered, context_base, target):
                             before = len(queued)
                             enqueue_dynamic(str(hint.get('url') or ''))
                             if len(queued) > before:
@@ -3704,9 +4535,33 @@ def _browser_network_discovery_impl(target: str, cookies: str, html_urls: list[s
                                 completed_dom_passes += 1
                             budget_info['dom_rescan_passes'] = int(budget_info.get('dom_rescan_passes', 0) or 0) + max(0, completed_dom_passes - 1)
                     for frame in page.frames:
-                        frame_url = str(frame.url or '')
+                        try:
+                            if frame == page.main_frame:
+                                continue
+                        except Exception:
+                            pass
+                        frame_url = str(getattr(frame, 'url', '') or '')
                         if frame_url and frame_url != value:
                             enqueue_dynamic(frame_url)
+                        frame_base = frame_url
+                        try:
+                            parsed_frame = urlparse(frame_base)
+                        except Exception:
+                            parsed_frame = None
+                        if parsed_frame and parsed_frame.scheme.lower() in {'http', 'https'}:
+                            if not url_in_authorized_scope(target, frame_base):
+                                continue
+                        elif (not frame_base) or frame_base.lower().startswith(('about:blank', 'about:srcdoc')):
+                            frame_base = str(page.url or value)
+                        else:
+                            continue
+                        if not frame_base or not url_in_authorized_scope(target, frame_base):
+                            continue
+                        try:
+                            collect_dom_navigation(frame, frame_base, allow_client_fragments=False)
+                            budget_info['frame_dom_scans'] = int(budget_info.get('frame_dom_scans', 0) or 0) + 1
+                        except Exception:
+                            continue
                 except Exception as exc:
                     errors.append({'url': value, 'type': 'BrowserDiscoveryNavigation', 'message': f'{type(exc).__name__}: {exc}'})
             budget_info.update(
@@ -3746,7 +4601,10 @@ def _browser_network_discovery_impl(target: str, cookies: str, html_urls: list[s
         wall_clock_elapsed_seconds=round(time.monotonic() - browser_started, 3),
         wall_clock_exhausted=bool(budget_info.get('wall_clock_exhausted')) or bool(queue and time.monotonic() >= browser_deadline),
         external_origins_observed=sorted(external_browser_origins),
+        runtime_script_endpoint_hints=len(runtime_script_endpoint_hints),
     )
+    # Transient transfer to discover_target(): removed before diagnostics are exposed to reports.
+    budget_info['_runtime_script_endpoint_hints'] = runtime_script_endpoint_hints
     return (_dedupe_request_cases(cases), unique_observed, list(dict.fromkeys(navigated)), errors, budget_info)
 
 
@@ -3867,6 +4725,22 @@ def _same_host_service_time_limits() -> tuple[float, float]:
     return total, min(total, initial)
 
 
+def same_host_service_remaining_time_budget_seconds() -> float:
+    """Return the still-unspent host-service discovery allowance for the active profile."""
+    return max(0.0, float(_same_host_service_time_remaining_seconds()))
+
+
+def same_host_service_initial_time_budget_seconds() -> float:
+    """Return the bounded primary-host service-sweep slice for the active profile.
+
+    The larger same-host service budget is retained for later expansion/retries.  Keeping this
+    initial slice deliberately smaller prevents TCP breadth from delaying application crawling
+    and aging authenticated sessions before the web surface has been enumerated.
+    """
+    _, initial = _same_host_service_time_limits()
+    return max(0.0, float(initial))
+
+
 def _same_host_service_time_remaining_seconds() -> float:
     total, _ = _same_host_service_time_limits()
     with SAME_HOST_SERVICE_DISCOVERY_TIME_LOCK:
@@ -3883,20 +4757,25 @@ def _consume_same_host_service_time(seconds: float) -> None:
         SAME_HOST_SERVICE_DISCOVERY_TIME_SPENT_SECONDS += value
 
 
-def _cached_same_host_service_discovery(hostname: str) -> dict[str, Any] | None:
-    """Return the best service scan already completed for one exact hostname in this process.
+def _cached_same_host_service_discovery(
+    hostname: str, *, minimum_candidate_cap: int=0,
+) -> dict[str, Any] | None:
+    """Return the best completed service scan covering at least the requested candidate cap.
 
     Port discovery is host-level, so anonymous/authenticated profiles and later application recrawls
-    reuse the same TCP/HTTP classification instead of paying for another sweep with a different cap.
+    reuse the same TCP/HTTP classification instead of paying for another equivalent sweep. A smaller
+    completed sweep must not satisfy a later broader request, otherwise a low-cap first caller can
+    permanently hide higher-numbered ports from the rest of the assessment.
     """
     host = normalized_hostname(hostname)
+    minimum_cap = max(0, int(minimum_candidate_cap or 0))
     matches: list[dict[str, Any]] = []
     with SAME_HOST_SERVICE_DISCOVERY_CACHE_LOCK:
         cache_items = list(SAME_HOST_SERVICE_DISCOVERY_CACHE.items())
     for key, value in cache_items:
         if not isinstance(key, tuple) or len(key) < 2 or key[0] != host or key[1] != CURRENT_SCAN_MODE:
             continue
-        if isinstance(value, dict):
+        if isinstance(value, dict) and int(value.get('candidate_cap', 0) or 0) >= minimum_cap:
             matches.append(value)
     if not matches:
         return None
@@ -3989,7 +4868,7 @@ def _resolve_service_discovery_address(
     remaining = 3.0 if deadline is None else max(0.0, float(deadline) - time.monotonic())
     # DNS is part of the same service-discovery wall-clock budget.  Three seconds is enough for the
     # normal local/university resolver path while preventing resolver retries from violating the
-    # advertised 4/12/20 minute global ceilings.
+    # active profile's rate-aware global service-discovery envelope.
     infos = _bounded_service_getaddrinfo(hostname, min(3.0, remaining))
     addresses: list[str] = []
     for info in infos:
@@ -4165,6 +5044,7 @@ def _tcp_port_open_any(
 
 def _discover_same_host_web_services_locked(
     target: str, candidate_cap: int | None=None, *, time_budget_seconds: float | None=None,
+    resume_from: dict[str, Any] | None=None,
 ) -> dict[str, Any]:
     parsed = urlparse(normalize_url(target))
     hostname = normalized_hostname(parsed.hostname or '')
@@ -4196,7 +5076,7 @@ def _discover_same_host_web_services_locked(
         # The TCP/service sweep is host-level: if another profile or application view already scanned
         # this exact hostname with a different candidate share, reuse that result rather than scanning
         # the host again. Application recrawls still run with the current profile/session later.
-        cached = _cached_same_host_service_discovery(hostname)
+        cached = _cached_same_host_service_discovery(hostname, minimum_candidate_cap=cap)
     if isinstance(cached, dict):
         result = dict(cached)
         previous_ports = int(result.get('ports_probed', 0) or 0)
@@ -4226,6 +5106,22 @@ def _discover_same_host_web_services_locked(
         result['global_time_remaining_after_seconds'] = round(_same_host_service_time_remaining_seconds(), 3)
         return result
     if local_time_budget <= 0:
+        previous = resume_from if isinstance(resume_from, dict) else {}
+        if normalized_hostname(str(previous.get('hostname') or '')) == hostname:
+            result = dict(previous)
+            result.update({
+                'enabled': True,
+                'cache_hit': False,
+                'time_budget_seconds': 0.0,
+                'time_budget_exhausted': True,
+                'ports_probed_this_call': 0,
+                'tcp_connection_attempts_this_call': 0,
+                'new_web_services_this_call': [],
+                'resumed_from_previous_sweep': True,
+                'global_time_remaining_before_seconds': round(remaining_global, 3),
+                'global_time_remaining_after_seconds': round(remaining_global, 3),
+            })
+            return result
         return {
             **empty, 'enabled': True, 'time_budget_exhausted': True, 'cache_hit': False,
             'global_time_remaining_after_seconds': round(remaining_global, 3),
@@ -4249,9 +5145,37 @@ def _discover_same_host_web_services_locked(
         # host-level service cache; a later authorized profile may retry if global budget remains.
         return result
 
-    web_services: list[dict[str, Any]] = []
+    previous_scan = resume_from if isinstance(resume_from, dict) else {}
+    if normalized_hostname(str(previous_scan.get('hostname') or '')) != hostname:
+        previous_scan = {}
+    previous_completed_ports: set[int] = set()
+    for raw_port in previous_scan.get('completed_port_numbers', []) or []:
+        try:
+            port_value = int(raw_port)
+        except (TypeError, ValueError):
+            continue
+        if 1 <= port_value <= 65535:
+            previous_completed_ports.add(port_value)
+    web_services: list[dict[str, Any]] = [
+        dict(row) for row in previous_scan.get('web_services', []) or [] if isinstance(row, dict)
+    ]
     open_unconfirmed: list[int] = []
-    classification_deferred: list[int] = []
+    for raw_port in previous_scan.get('open_web_unconfirmed_ports', []) or []:
+        try:
+            port_value = int(raw_port)
+        except (TypeError, ValueError):
+            continue
+        if 1 <= port_value <= 65535:
+            open_unconfirmed.append(port_value)
+    classification_deferred_set: set[int] = set()
+    for raw_port in previous_scan.get('classification_deferred_ports', []) or []:
+        try:
+            port_value = int(raw_port)
+        except (TypeError, ValueError):
+            continue
+        if 1 <= port_value <= 65535 and port_value not in previous_completed_ports:
+            classification_deferred_set.add(port_value)
+    probe_worker_errors: list[dict[str, Any]] = []
     preferred_ports = [original_port]
     for observed_origin in sorted(AUTHORIZED_SCOPE_ORIGINS):
         try:
@@ -4265,10 +5189,22 @@ def _discover_same_host_web_services_locked(
             continue
     preferred_ports = list(dict.fromkeys(preferred_ports))
     ports = _stratified_tcp_port_order(cap, preferred_ports)
-    ports_probed = 0
-    tcp_connection_attempts = 0
+    previous_completed_ports.intersection_update(ports)
+    pending_port_items = [
+        (index, port) for index, port in enumerate(ports, start=1)
+        if port not in previous_completed_ports
+    ]
+    ports_probed_this_call = 0
+    completed_this_call: set[int] = set()
+    tcp_connection_attempts_this_call = 0
+    previous_tcp_attempts = int(previous_scan.get('tcp_connection_attempts', 0) or 0)
     time_budget_exhausted = False
     probe_addresses = [address, *[value for value in addresses if value != address]]
+    # Request-start floor for the TCP stage alone. It is diagnostic, not a deadline override: open
+    # ports may additionally require HTTP+HTTPS classification starts. Keeping it in Results Data
+    # makes future budget tuning evidence-based, especially on multi-A/dual-stack hosts.
+    tcp_start_floor_full = (len(ports) * max(1, len(probe_addresses))) / max(1.0, float(MAX_REQUEST_RATE))
+    tcp_start_floor_this_call = (len(pending_port_items) * max(1, len(probe_addresses))) / max(1.0, float(MAX_REQUEST_RATE))
     # Every TCP-open candidate is classified with BOTH HTTP and HTTPS while deadline remains.
     # Bounded worker concurrency hides connect/handshake latency, but every connection/request start
     # still passes through the cross-process global pacer. The in-flight ceiling is the same for all
@@ -4301,17 +5237,17 @@ def _discover_same_host_web_services_locked(
 
     executor = _DISCOVERY_NETWORK_EXECUTOR
     pending: dict[Any, tuple[int, int]] = {}
-    next_index = 1
+    next_pending_index = 0
     try:
-        while (next_index <= len(ports) or pending) and time.monotonic() < deadline:
+        while (next_pending_index < len(pending_port_items) or pending) and time.monotonic() < deadline:
             while (
-                next_index <= len(ports)
+                next_pending_index < len(pending_port_items)
                 and len(pending) < DISCOVERY_NETWORK_MAX_INFLIGHT
                 and time.monotonic() < deadline
             ):
-                item = (next_index, ports[next_index - 1])
+                item = pending_port_items[next_pending_index]
                 pending[executor.submit(probe_port, item)] = item
-                next_index += 1
+                next_pending_index += 1
             if not pending:
                 break
             remaining = max(0.0, deadline - time.monotonic())
@@ -4321,35 +5257,49 @@ def _discover_same_host_web_services_locked(
             done, _ = wait(set(pending), timeout=min(0.5, remaining), return_when=FIRST_COMPLETED)
             _discovery_progress(
                 'same-host service sweep',
-                f'probed={ports_probed}/{len(ports)} pending={len(pending)} inflight_cap={DISCOVERY_NETWORK_MAX_INFLIGHT}',
+                f'completed={len(previous_completed_ports) + len(completed_this_call)}/{len(ports)} '
+                f'this_call={ports_probed_this_call} pending={len(pending)} inflight_cap={DISCOVERY_NETWORK_MAX_INFLIGHT}',
             )
             if not done:
                 continue
             for future in done:
-                pending.pop(future, None)
+                submitted_item = pending.pop(future, None)
                 try:
                     row = future.result()
-                except Exception:
+                except Exception as exc:
+                    index, port = submitted_item if submitted_item is not None else (0, 0)
+                    probe_worker_errors.append({
+                        'index': int(index or 0), 'port': int(port or 0),
+                        'error': f'{type(exc).__name__}: {exc}',
+                    })
+                    # This candidate remains deferred rather than silently disappearing. Do not
+                    # cache the host-level sweep below: another authorized profile may retry a
+                    # transient worker failure instead of inheriting an incomplete inventory.
                     continue
                 index = int(row.get('index') or 0)
                 port = int(row.get('port') or 0)
                 attempts = int(row.get('attempts') or 0)
-                tcp_connection_attempts += attempts
+                tcp_connection_attempts_this_call += attempts
                 if row.get('deadline') or row.get('tcp_deferred'):
                     time_budget_exhausted = True
                     continue
-                ports_probed += 1
+                ports_probed_this_call += 1
                 open_address = str(row.get('open_address') or '')
                 if not open_address:
+                    completed_this_call.add(port)
+                    classification_deferred_set.discard(port)
                     continue
                 plain_ok = bool(row.get('plain_ok'))
                 tls_ok = bool(row.get('tls_ok'))
                 plain_deferred = bool(row.get('plain_deferred'))
                 tls_deferred = bool(row.get('tls_deferred'))
                 if plain_deferred or tls_deferred:
-                    classification_deferred.append(port)
+                    classification_deferred_set.add(port)
                     if time.monotonic() >= deadline:
                         time_budget_exhausted = True
+                else:
+                    completed_this_call.add(port)
+                    classification_deferred_set.discard(port)
                 if plain_ok:
                     authority_host = _http_authority_host(hostname)
                     root = f'http://{authority_host}' + ('' if port == 80 else f':{port}') + '/'
@@ -4375,12 +5325,13 @@ def _discover_same_host_web_services_locked(
             future.cancel()
         # Shared discovery executor stays alive for later HTTP/JS/profile work; running probes are
         # deadline-aware and queued probes are cancelled above.
-    if next_index <= len(ports) or pending:
+    if next_pending_index < len(pending_port_items) or pending:
         time_budget_exhausted = True
 
     elapsed = time.monotonic() - started
     _consume_same_host_service_time(elapsed)
-    if ports_probed < len(ports) and time.monotonic() >= deadline:
+    completed_ports = previous_completed_ports | completed_this_call
+    if len(completed_ports) < len(ports) and time.monotonic() >= deadline:
         time_budget_exhausted = True
 
     unique_services: list[dict[str, Any]] = []
@@ -4403,29 +5354,57 @@ def _discover_same_host_web_services_locked(
     ]
     result = {
         'enabled': True, 'hostname': hostname, 'resolved_address': address, 'resolved_addresses': addresses,
-        'candidate_cap': cap, 'candidate_ports_planned': len(ports), 'ports_probed': ports_probed,
-        'candidate_ports_deferred': max(0, len(ports) - ports_probed),
-        'tcp_connection_attempts': tcp_connection_attempts,
+        'candidate_cap': cap, 'candidate_ports_planned': len(ports), 'ports_probed': len(completed_ports),
+        'ports_probed_this_call': ports_probed_this_call,
+        'completed_port_numbers': sorted(completed_ports),
+        'candidate_ports_deferred': max(0, len(ports) - len(completed_ports)),
+        'tcp_connection_attempts': previous_tcp_attempts + tcp_connection_attempts_this_call,
+        'tcp_connection_attempts_this_call': tcp_connection_attempts_this_call,
         'resolved_address_count': len(addresses),
         'web_services': unique_services, 'service_inventory': service_inventory,
         'open_web_unconfirmed_ports': sorted(set(open_unconfirmed)),
-        'classification_deferred_ports': sorted(set(classification_deferred)),
+        'classification_deferred_ports': sorted(classification_deferred_set),
+        'probe_worker_errors': probe_worker_errors,
+        'probe_worker_error_count': len(probe_worker_errors),
         'duration_seconds': round(elapsed, 3), 'cache_hit': False,
         'time_budget_seconds': round(local_time_budget, 3), 'time_budget_exhausted': bool(time_budget_exhausted),
         'global_time_budget_seconds': round(total_time_budget, 3),
         'global_time_remaining_before_seconds': round(remaining_global, 3),
         'global_time_remaining_after_seconds': round(_same_host_service_time_remaining_seconds(), 3),
         'runtime_observed_port_priority_count': min(cap, len(preferred_ports)),
+        'tcp_request_start_floor_seconds_full_candidate_set': round(tcp_start_floor_full, 3),
+        'tcp_request_start_floor_seconds_this_call': round(tcp_start_floor_this_call, 3),
         'candidate_order_policy': 'runtime-observed/configured-ports -> runtime-service-frequency -> stratified-full-range',
         'network_max_inflight': DISCOVERY_NETWORK_MAX_INFLIGHT,
+        'resumed_from_previous_sweep': bool(previous_scan),
+        'previous_completed_ports': len(previous_completed_ports),
     }
-    with SAME_HOST_SERVICE_DISCOVERY_CACHE_LOCK:
-        SAME_HOST_SERVICE_DISCOVERY_CACHE[cache_key] = dict(result)
+    current_service_keys = {
+        (str(row.get('scheme') or ''), int(row.get('port') or 0), str(row.get('url') or ''))
+        for row in previous_scan.get('web_services', []) or [] if isinstance(row, dict)
+    }
+    result['new_web_services_this_call'] = [
+        dict(row) for row in unique_services
+        if (str(row.get('scheme') or ''), int(row.get('port') or 0), str(row.get('url') or '')) not in current_service_keys
+    ]
+    incomplete_due_to_time = bool(time_budget_exhausted and len(completed_ports) < len(ports))
+    if not probe_worker_errors and not incomplete_due_to_time:
+        with SAME_HOST_SERVICE_DISCOVERY_CACHE_LOCK:
+            SAME_HOST_SERVICE_DISCOVERY_CACHE[cache_key] = dict(result)
+    else:
+        if probe_worker_errors:
+            result['cache_suppressed_due_to_worker_errors'] = True
+        if incomplete_due_to_time:
+            # A bounded initial sweep is intentionally partial. Caching it as host-complete would
+            # prevent a later authorized continuation/retry from using the remaining global service
+            # budget, because host-level cache lookup accepts any prior candidate share.
+            result['cache_suppressed_due_to_time_budget'] = True
     return result
 
 
 def discover_same_host_web_services(
     target: str, candidate_cap: int | None=None, *, time_budget_seconds: float | None=None,
+    resume_from: dict[str, Any] | None=None,
 ) -> dict[str, Any]:
     """Run host-level service discovery once at a time per exact hostname/mode.
 
@@ -4441,12 +5420,12 @@ def discover_same_host_web_services(
         hostname = ''
     if not hostname:
         return _discover_same_host_web_services_locked(
-            target, candidate_cap=candidate_cap, time_budget_seconds=time_budget_seconds,
+            target, candidate_cap=candidate_cap, time_budget_seconds=time_budget_seconds, resume_from=resume_from,
         )
     host_lock = _same_host_service_discovery_host_lock(hostname)
     with host_lock:
         return _discover_same_host_web_services_locked(
-            target, candidate_cap=candidate_cap, time_budget_seconds=time_budget_seconds,
+            target, candidate_cap=candidate_cap, time_budget_seconds=time_budget_seconds, resume_from=resume_from,
         )
 
 DISCOVERY_METADATA_PATHS = (
@@ -4455,7 +5434,11 @@ DISCOVERY_METADATA_PATHS = (
 )
 DISCOVERY_METADATA_PATH_COUNTS = {'test': 2, 'fast': 6, 'balanced': 10, 'deep': 10}
 FFUF_WORDLIST_LIMITS = {'test': 64, 'fast': 600, 'balanced': 2500, 'deep': 6000}
-FFUF_APPLICATION_ROOT_LIMITS = {'test': 1, 'fast': 4, 'balanced': 12, 'deep': 24}
+# High-value FFUF probes are cheap enough to cover substantially more runtime-discovered
+# application roots. The compact general wordlist remains separately capped so breadth does not
+# turn into hours of low-value repetition. Both root sets come only from live discovery evidence.
+FFUF_APPLICATION_ROOT_LIMITS = {'test': 2, 'fast': 12, 'balanced': 48, 'deep': 128}
+FFUF_GENERAL_ROOT_LIMITS = {'test': 1, 'fast': 4, 'balanced': 12, 'deep': 24}
 FFUF_BUDGET_SAFETY_MULTIPLIER = 1.50
 
 
@@ -4477,10 +5460,11 @@ def _ffuf_application_roots(discovery: dict[str, Any], target_url: str) -> list[
     for value in values:
         if not value or normalized_origin(value) != origin:
             continue
-        family_origin, family_path = _application_family_key(value)
-        if family_origin != origin or family_path == '/':
+        # Family keys intentionally lowercase path segments for fairness accounting, but a fuzzing
+        # target must preserve the server-observed path spelling on case-sensitive deployments.
+        candidate = _application_root_url(value)
+        if not candidate or normalized_origin(candidate) != origin or candidate == root:
             continue
-        candidate = root.rstrip('/') + family_path + '/'
         if candidate in seen:
             continue
         seen.add(candidate)
@@ -4493,7 +5477,8 @@ def _ffuf_runtime_budget_seconds(discovery: dict[str, Any], target_url: str) -> 
     roots = _ffuf_application_roots(discovery, target_url)
     word_count = max(1, int(FFUF_WORDLIST_LIMITS.get(CURRENT_SCAN_MODE, 600)))
     priority_count = 40
-    request_count = max(1, len(roots) * (word_count + priority_count))
+    general_roots = max(1, min(len(roots), int(FFUF_GENERAL_ROOT_LIMITS.get(CURRENT_SCAN_MODE, 4))))
+    request_count = max(1, len(roots) * priority_count + general_roots * word_count)
     minimum_network = request_count / max(1.0, float(MAX_REQUEST_RATE))
     workload_budget = math.ceil(minimum_network * FFUF_BUDGET_SAFETY_MULTIPLIER + 120.0)
     return max(int(BROAD_SCANNER_TIMEOUTS.get('ffuf', 120)), int(workload_budget))
@@ -4638,6 +5623,7 @@ def discover_target(
     same_host_service_candidate_cap: int | None=None, allow_state_changes: bool=False,
     wall_clock_deadline: float | None=None,
     precomputed_same_host_service_discovery: dict[str, Any] | None=None,
+    defer_same_host_service_discovery: bool=False,
 ) -> dict[str, Any]:
 
     session = requests.Session()
@@ -4680,6 +5666,33 @@ def discover_target(
         # Service probing is identity-independent. Reuse one result across concurrent discovery
         # profiles instead of spending the target rate budget probing the same ports repeatedly.
         same_host_service_discovery = copy.deepcopy(precomputed_same_host_service_discovery)
+    elif defer_same_host_service_discovery:
+        # Application-first discovery: an orchestrator may deliberately defer the host-wide TCP
+        # sweep until the primary web surface and authenticated session have been enumerated.
+        # This placeholder is explicit so report telemetry can distinguish "deferred" from
+        # "disabled by policy" without performing any network operation here.
+        total_service_budget, initial_service_budget = _same_host_service_time_limits()
+        try:
+            parsed_target = urlparse(normalize_url(target))
+            deferred_hostname = normalized_hostname(parsed_target.hostname or '')
+        except Exception:
+            deferred_hostname = ''
+        same_host_service_discovery = {
+            'enabled': bool(DISCOVER_SAME_HOST_SERVICES and ALLOW_SAME_HOST_PORTS),
+            'deferred': True,
+            'defer_reason': 'application-discovery-first',
+            'hostname': deferred_hostname,
+            'candidate_cap': int(same_host_service_candidate_cap or 0),
+            'candidate_ports_planned': 0, 'ports_probed': 0, 'candidate_ports_deferred': 0,
+            'tcp_connection_attempts': 0, 'resolved_address_count': 0,
+            'web_services': [], 'service_inventory': [], 'open_web_unconfirmed_ports': [],
+            'classification_deferred_ports': [], 'duration_seconds': 0.0, 'cache_hit': False,
+            'time_budget_seconds': round(initial_service_budget, 3), 'time_budget_exhausted': False,
+            'global_time_budget_seconds': round(total_service_budget, 3),
+            'global_time_remaining_before_seconds': round(_same_host_service_time_remaining_seconds(), 3),
+            'global_time_remaining_after_seconds': round(_same_host_service_time_remaining_seconds(), 3),
+            'network_max_inflight': DISCOVERY_NETWORK_MAX_INFLIGHT,
+        }
     else:
         same_host_service_discovery = discover_same_host_web_services(
             target, candidate_cap=same_host_service_candidate_cap, time_budget_seconds=same_host_time_budget,
@@ -4727,6 +5740,8 @@ def discover_target(
     attempt_factor = max(1.0, float(HTTP_ATTEMPT_BUDGET_FACTORS.get(CURRENT_SCAN_MODE, 1.5)))
     attempt_budget = max(page_max_budget, int(math.ceil(page_max_budget * attempt_factor)))
     per_origin_attempt_limit = max(per_origin_limit, int(math.ceil(per_origin_limit * attempt_factor)))
+    promoted_http_roots: set[str] = set()
+    http_family_root_limit = max(4, min(256, max(1, page_max_budget // 4)))
 
     def record_coverage_skip(raw_url: str, reason_code: str, reason: str, *, method: str='GET', source_url: str='') -> None:
         value = str(raw_url or '').strip()
@@ -4753,7 +5768,7 @@ def discover_target(
             if origin and not url_in_authorized_scope(target, value):
                 out_of_scope_origins.add(origin)
 
-    def enqueue(raw_url: str, *, force: bool=False, source_url: str='') -> None:
+    def enqueue(raw_url: str, *, force: bool=False, source_url: str='', promote_root: bool=True) -> None:
         nonlocal skipped_route_variants, skipped_origin_budget, skipped_out_of_scope
         try:
             value = _normalize_redundant_base_path_link(target, _clean_url(raw_url))
@@ -4785,6 +5800,11 @@ def discover_target(
         queued.add(value)
         queued_signatures[signature] += 1
         queue.append(value)
+        if promote_root and len(promoted_http_roots) < http_family_root_limit:
+            family_root = _application_root_url(value)
+            if family_root and family_root != value and family_root not in promoted_http_roots:
+                promoted_http_roots.add(family_root)
+                enqueue(family_root, source_url=value, promote_root=False)
 
     for value in initial:
         enqueue(value, force=value in explicit_seed_urls)
@@ -4813,6 +5833,10 @@ def discover_target(
 
     HTTP_DISCOVERY_PREFETCH_MAX = max(1, DISCOVERY_NETWORK_MAX_INFLIGHT)
     http_worker_local = threading.local()
+    # Worker Sessions preserve connection pooling without fragmenting server-issued session state.
+    # The canonical crawler jar is synchronized at batch boundaries/worker request boundaries so
+    # anonymous PHP/JSESSIONID-style sessions discovered on one worker are visible to later work.
+    http_cookie_jar_lock = threading.Lock()
     http_adaptive_stopped = False
 
     def dequeue_http_candidate(batch_origin_reservations: Counter[str]) -> dict[str, Any] | None:
@@ -4829,8 +5853,9 @@ def discover_target(
                     cutoff_score = min(http_base_scores) if http_base_scores else requested_score
                     http_adaptive_threshold = max(1, int(cutoff_score * 0.75))
                 if requested_score < http_adaptive_threshold and family_useful_visits.get(_application_family_key(requested), 0) > 0:
-                    http_adaptive_stopped = True
-                    return None
+                    requested = queue.pop(best_index)
+                    record_coverage_skip(requested, 'BUDGET_LOW_PRIORITY', 'Adaptive overflow deferred this lower-value repeat-family route while preserving higher-value queued work.')
+                    continue
             requested = queue.pop(best_index)
             if requested in visited:
                 continue
@@ -4870,14 +5895,23 @@ def discover_target(
             worker_session = requests.Session()
             worker_session.headers.update(dict(session.headers))
             http_worker_local.session = worker_session
+        # Copy server-issued cookies learned by any earlier worker/batch. Explicit supplied Cookie
+        # headers remain origin-scoped by `_safe_crawl_get`; this synchronization only preserves
+        # ordinary Set-Cookie session continuity that the old single Session naturally provided.
+        with http_cookie_jar_lock:
+            worker_session.cookies.update(session.cookies)
         requested = str(item['requested'])
         try:
             response, final, redirect_issue = _safe_crawl_get(
                 worker_session, requested, target, timeout=discovery_request_timeout(5, 15),
                 max_redirects=5, cookies=cookies, deadline=http_discovery_deadline,
             )
+            with http_cookie_jar_lock:
+                session.cookies.update(worker_session.cookies)
             return item, response, final, redirect_issue, None
         except requests.RequestException as exc:
+            with http_cookie_jar_lock:
+                session.cookies.update(worker_session.cookies)
             return item, None, requested, '', exc
 
     while queue and pages_processed < page_max_budget and http_attempts < attempt_budget and http_discovery_time_left() and not http_adaptive_stopped:
@@ -5018,8 +6052,16 @@ def discover_target(
             except Exception as exc:
                 errors.append({'url': final, 'type': type(exc).__name__, 'message': f'HTML parse: {exc}'})
                 continue
+            document_base = final
+            if parser.base_href:
+                try:
+                    base_candidate = _clean_url(absolute_url(final, parser.base_href))
+                    if base_candidate and url_in_authorized_scope(target, base_candidate):
+                        document_base = base_candidate
+                except Exception:
+                    pass
 
-            for hint in _literal_navigation_hints(response.text, final, target):
+            for hint in _literal_navigation_hints(response.text, document_base, target):
                 hinted_url = str(hint.get('url') or '')
                 if not hinted_url:
                     continue
@@ -5045,7 +6087,7 @@ def discover_target(
             ranked_scripts: list[str] = []
             for source in parser.scripts:
                 try:
-                    script_url = _normalize_redundant_base_path_link(target, _clean_url(absolute_url(final, source)))
+                    script_url = _normalize_redundant_base_path_link(target, _clean_url(absolute_url(document_base, source)))
                 except Exception:
                     continue
                 if not url_in_authorized_scope(target, script_url) or _destructive_crawl_url(script_url) or script_url in attempted_script_urls:
@@ -5066,14 +6108,24 @@ def discover_target(
                 worker_session = getattr(asset_worker_local, 'session', None)
                 if worker_session is None:
                     worker_session = requests.Session()
+                    worker_session.headers.update(dict(session.headers))
                     asset_worker_local.session = worker_session
+                # JavaScript and source-map workers must inherit server-issued discovery cookies too.
+                # Without this, session-bound bundles can become invisible even though the HTML page
+                # that referenced them was fetched successfully by another HTTP worker.
+                with http_cookie_jar_lock:
+                    worker_session.cookies.update(session.cookies)
                 try:
                     response_value, final_value, issue_value = _safe_crawl_get(
                         worker_session, script_url, target, timeout=discovery_request_timeout(4, 12),
                         max_redirects=4, cookies=cookies, deadline=http_discovery_deadline,
                     )
+                    with http_cookie_jar_lock:
+                        session.cookies.update(worker_session.cookies)
                     return response_value, final_value, issue_value, None
                 except requests.RequestException as exc:
+                    with http_cookie_jar_lock:
+                        session.cookies.update(worker_session.cookies)
                     return None, script_url, '', exc
 
             script_results: list[tuple[requests.Response | None, str, str, BaseException | None]] = []
@@ -5144,14 +6196,21 @@ def discover_target(
                 worker_session = getattr(asset_worker_local, 'session', None)
                 if worker_session is None:
                     worker_session = requests.Session()
+                    worker_session.headers.update(dict(session.headers))
                     asset_worker_local.session = worker_session
+                with http_cookie_jar_lock:
+                    worker_session.cookies.update(session.cookies)
                 try:
                     map_response, map_final, map_issue = _safe_crawl_get(
                         worker_session, map_url, target, timeout=discovery_request_timeout(4, 15), max_redirects=4,
                         cookies=cookies, deadline=http_discovery_deadline,
                     )
+                    with http_cookie_jar_lock:
+                        session.cookies.update(worker_session.cookies)
                     return job, map_response, map_final, map_issue, None
                 except requests.RequestException as exc:
+                    with http_cookie_jar_lock:
+                        session.cookies.update(worker_session.cookies)
                     return job, None, map_url, '', exc
 
             source_map_cursor = 0
@@ -5210,7 +6269,7 @@ def discover_target(
 
             for href in parser.links:
                 try:
-                    candidate = _normalize_redundant_base_path_link(target, _clean_url(absolute_url(final, href)))
+                    candidate = _normalize_redundant_base_path_link(target, _clean_url(absolute_url(document_base, href)))
                 except Exception:
                     continue
                 if not url_in_authorized_scope(target, candidate):
@@ -5237,31 +6296,43 @@ def discover_target(
                     enqueue(candidate, source_url=final)
 
             for form in parser.forms:
-                try:
-                    action = _normalize_redundant_base_path_link(target, _clean_url(absolute_url(final, form['action'] or final)))
-                except Exception:
-                    continue
-                if not url_in_authorized_scope(target, action):
-                    skipped_out_of_scope += 1
-                    record_coverage_skip(action, 'OUT_OF_SCOPE', 'Form action discovered in HTML was outside the explicitly authorized HTTP scope.', method=str(form.get('method', 'get')), source_url=final)
-                    continue
-                if _destructive_crawl_url(action):
-                    destructive_skipped.add(action)
-                    record_coverage_skip(action, 'STATE_CHANGE_BLOCKED', 'Destructive or state-changing form action was excluded by the discovery safety policy.', method=str(form.get('method', 'get')), source_url=final)
-                    fields = [field for field in form.get('fields', []) if isinstance(field, dict)]
-                    destructive_case = _form_case(action, str(form.get('method', 'get')), fields, final, str(form.get('enctype', '')))
-                    if destructive_case:
-                        destructive_case['destructive_kind'] = 'logout' if _is_logout_url(action) else 'other'
-                        destructive_request_cases.append(destructive_case)
-                    continue
                 fields = [field for field in form.get('fields', []) if isinstance(field, dict)]
                 if fields:
                     form_urls.add(final)
-                case = _form_case(action, str(form.get('method', 'get')), fields, final, str(form.get('enctype', '')))
-                if case:
-                    request_cases.append(case)
-                    if case['method'] == 'GET':
-                        parameterized.add(case['url'])
+                variants = _html_form_request_variants(form)
+                variant_seen: set[tuple[str, str, str]] = set()
+                for variant in variants:
+                    try:
+                        action = _normalize_redundant_base_path_link(
+                            target, _clean_url(absolute_url(document_base, variant['action'] or final)),
+                        )
+                    except Exception:
+                        continue
+                    method = str(variant.get('method') or 'get').lower()
+                    enctype = str(variant.get('enctype') or 'application/x-www-form-urlencoded').lower()
+                    variant_key = (action, method, enctype)
+                    if variant_key in variant_seen:
+                        continue
+                    variant_seen.add(variant_key)
+                    if not url_in_authorized_scope(target, action):
+                        skipped_out_of_scope += 1
+                        record_coverage_skip(action, 'OUT_OF_SCOPE', 'Form action discovered in HTML was outside the explicitly authorized HTTP scope.', method=method, source_url=final)
+                        continue
+                    if _destructive_crawl_url(action):
+                        destructive_skipped.add(action)
+                        record_coverage_skip(action, 'STATE_CHANGE_BLOCKED', 'Destructive or state-changing form action was excluded by the discovery safety policy.', method=method, source_url=final)
+                        destructive_case = _form_case(action, method, fields, final, enctype)
+                        if destructive_case:
+                            destructive_case['destructive_kind'] = 'logout' if _is_logout_url(action) else 'other'
+                            destructive_case['discovery_source'] = str(variant.get('source') or 'form')
+                            destructive_request_cases.append(destructive_case)
+                        continue
+                    case = _form_case(action, method, fields, final, enctype)
+                    if case:
+                        case['discovery_source'] = str(variant.get('source') or 'form')
+                        request_cases.append(case)
+                        if case['method'] == 'GET':
+                            parameterized.add(case['url'])
 
     browser_cases, browser_network_requests, browser_navigation_urls, browser_errors, browser_budget_info = _browser_network_discovery(
         target, cookies, sorted(html_urls), sorted(explicit_seed_urls), sorted(priority_seed_urls),
@@ -5271,6 +6342,8 @@ def discover_target(
     html_urls.update(browser_navigation_urls)
     visited.update(browser_navigation_urls)
     errors.extend(browser_errors)
+    browser_script_endpoint_hints = browser_budget_info.pop('_runtime_script_endpoint_hints', []) if isinstance(browser_budget_info, dict) else []
+    _append_script_endpoint_hints(script_endpoint_hints, script_endpoint_hint_keys, browser_script_endpoint_hints)
     for case in browser_cases:
         if str(case.get('method') or '').upper() == 'GET' and urlparse(str(case.get('url') or '')).query:
             parameterized.add(str(case['url']))
@@ -5345,6 +6418,7 @@ def discover_target(
         'http_attempt_budget_factor': attempt_factor,
         'http_requests_attempted': http_attempts,
         'http_remaining_candidates': len(queue),
+        'http_family_roots_promoted': len(promoted_http_roots),
         'http_page_budget_saturated': bool(queue and pages_processed >= page_budget),
         'http_page_max_budget_saturated': bool(queue and pages_processed >= page_max_budget),
         'http_attempt_budget_saturated': bool(queue and http_attempts >= attempt_budget),
@@ -5358,6 +6432,11 @@ def discover_target(
         'browser_pages_attempted': int(browser_budget_info.get('attempted', 0) or 0),
         'browser_adaptive_overflow_used': int(browser_budget_info.get('adaptive_overflow_used', 0) or 0),
         'browser_remaining_candidates': int(browser_budget_info.get('remaining_candidates', 0) or 0),
+        'browser_family_roots_promoted': int(browser_budget_info.get('family_roots_promoted', 0) or 0),
+        'browser_textual_responses_parsed': int(browser_budget_info.get('textual_responses_parsed', 0) or 0),
+        'browser_textual_response_bytes_parsed': int(browser_budget_info.get('textual_response_bytes_parsed', 0) or 0),
+        'browser_textual_response_navigation_candidates': int(browser_budget_info.get('textual_response_navigation_candidates', 0) or 0),
+        'browser_adaptive_low_value_deferred': int(browser_budget_info.get('adaptive_low_value_deferred', 0) or 0),
         'browser_adaptive_threshold': browser_budget_info.get('adaptive_threshold'),
         'browser_max_budget_saturated': bool(browser_budget_info.get('max_saturated', False)),
         'browser_wall_clock_budget_seconds': float(browser_budget_info.get('wall_clock_budget_seconds', 0.0) or 0.0),
@@ -5365,6 +6444,10 @@ def discover_target(
         'browser_wall_clock_exhausted': bool(browser_budget_info.get('wall_clock_exhausted', False)),
         'browser_navigation_retries': int(browser_budget_info.get('navigation_retries', 0) or 0),
         'browser_dom_retries': int(browser_budget_info.get('dom_retries', 0) or 0),
+        'browser_adaptive_settle_early_returns': int(browser_budget_info.get('adaptive_settle_early_returns', 0) or 0),
+        'browser_settle_min_fraction': BROWSER_SETTLE_MIN_FRACTION,
+        'browser_settle_min_ms': BROWSER_SETTLE_MIN_MS,
+        'browser_settle_stable_samples': BROWSER_SETTLE_STABLE_SAMPLES,
         'browser_slot_wait_seconds': float(browser_budget_info.get('browser_slot_wait_seconds', 0.0) or 0.0),
         'browser_profile_slots': int(browser_budget_info.get('browser_profile_slots', _BROWSER_DISCOVERY_MAX_CONCURRENT) or _BROWSER_DISCOVERY_MAX_CONCURRENT),
         'browser_dead_404_410': int(browser_budget_info.get('dead_404_410', 0) or 0),
@@ -5405,6 +6488,8 @@ def discover_target(
         'same_host_service_global_time_remaining_seconds': safe_float_value(same_host_service_discovery.get('global_time_remaining_after_seconds'), 0.0),
         'same_host_service_candidate_order_policy': str(same_host_service_discovery.get('candidate_order_policy') or ''),
         'same_host_service_network_max_inflight': safe_int_value(same_host_service_discovery.get('network_max_inflight'), DISCOVERY_NETWORK_MAX_INFLIGHT),
+        'same_host_service_tcp_start_floor_seconds_full_candidate_set': safe_float_value(same_host_service_discovery.get('tcp_request_start_floor_seconds_full_candidate_set'), 0.0),
+        'same_host_service_tcp_start_floor_seconds_this_call': safe_float_value(same_host_service_discovery.get('tcp_request_start_floor_seconds_this_call'), 0.0),
         'same_host_web_services_discovered': len(same_host_service_discovery.get('web_services') or []),
         'same_host_open_web_unconfirmed_ports': len(same_host_service_discovery.get('open_web_unconfirmed_ports') or []),
         'same_host_classification_deferred_ports': len(same_host_service_discovery.get('classification_deferred_ports') or []),
@@ -5485,6 +6570,7 @@ def discover_target_sync_safe(
     same_host_service_candidate_cap: int | None=None, allow_state_changes: bool=False,
     wall_clock_deadline: float | None=None,
     precomputed_same_host_service_discovery: dict[str, Any] | None=None,
+    defer_same_host_service_discovery: bool=False,
 ) -> dict[str, Any]:
     try:
         asyncio.get_running_loop()
@@ -5495,6 +6581,7 @@ def discover_target_sync_safe(
             same_host_service_candidate_cap=same_host_service_candidate_cap,
             allow_state_changes=allow_state_changes, wall_clock_deadline=wall_clock_deadline,
             precomputed_same_host_service_discovery=precomputed_same_host_service_discovery,
+            defer_same_host_service_discovery=defer_same_host_service_discovery,
         )
     with ThreadPoolExecutor(max_workers=1, thread_name_prefix='secops-discovery') as executor:
         return executor.submit(
@@ -5503,6 +6590,7 @@ def discover_target_sync_safe(
             same_host_service_candidate_cap=same_host_service_candidate_cap,
             allow_state_changes=allow_state_changes, wall_clock_deadline=wall_clock_deadline,
             precomputed_same_host_service_discovery=precomputed_same_host_service_discovery,
+            defer_same_host_service_discovery=defer_same_host_service_discovery,
         ).result()
 
 def _discovered_scope_origin_evidence(discovery: dict[str, Any], target: str) -> dict[str, dict[str, int]]:
@@ -5611,6 +6699,90 @@ def sibling_broad_origin_limit() -> int:
     return sibling_broad_origin_limits()[1]
 
 
+RUNTIME_SIBLING_AUTH_POSITIVE_STATUSES = frozenset({'authenticated', 'reused'})
+RUNTIME_SIBLING_AUTH_NEGATIVE_STATUSES = frozenset({
+    'failed', 'failed_validation', 'no_auth_entry_observed', 'session_only_credentials_required',
+})
+
+
+def runtime_sibling_auth_origin_status(discovery: dict[str, Any], origin: str) -> str:
+    """Return the latest conclusive runtime-auth verdict for one sibling origin.
+
+    Cookie domain/path syntax alone does not prove that a sibling application on another authorized
+    port accepts the identity. Discovery already records a bounded runtime SSO verdict; planner
+    broad actions must honor conclusive negative evidence instead of repeatedly failing prechecks.
+    """
+    normalized = normalized_origin(origin)
+    if not normalized:
+        return ''
+    latest = ''
+    conclusive = RUNTIME_SIBLING_AUTH_POSITIVE_STATUSES | RUNTIME_SIBLING_AUTH_NEGATIVE_STATUSES
+    for row in discovery.get('runtime_sibling_authentication', []) or []:
+        if not isinstance(row, dict):
+            continue
+        if normalized_origin(str(row.get('origin') or '')) != normalized:
+            continue
+        status = str(row.get('status') or '').strip().lower()
+        if status in conclusive:
+            latest = status
+    return latest
+
+
+def runtime_sibling_auth_origin_allows_authenticated_broad(discovery: dict[str, Any], origin: str) -> bool:
+    """Fail closed only after a conclusive negative sibling-auth discovery verdict."""
+    return runtime_sibling_auth_origin_status(discovery, origin) not in RUNTIME_SIBLING_AUTH_NEGATIVE_STATUSES
+
+
+def broad_discovery_target(discovery: dict[str, Any], origin: str) -> str:
+    """Choose a concrete observed application path for broad scanning on one origin.
+
+    External scanners deliberately do not follow arbitrary redirects. Targeting only the bare
+    sibling origin can therefore miss an application mounted under an observed path such as
+    ``/console/``. The target is derived exclusively from runtime discovery and never from a
+    compose/inventory file. Query/fragment values are removed because broad scanners need the
+    application path, while request-level specialists retain exact query contracts separately.
+    """
+    normalized = normalized_origin(origin)
+    if not normalized:
+        return ''
+    scored: dict[str, int] = {}
+
+    def add(value: Any, bonus: int) -> None:
+        url = str(value or '').strip()
+        if not url or not same_origin(normalized, url):
+            return
+        if _browser_static_resource(url) or _destructive_crawl_url(url) or _ephemeral_identity_flow_url(url):
+            return
+        try:
+            parsed = urlparse(url)
+        except ValueError:
+            return
+        path = str(parsed.path or '/')
+        # Broad scanners should start at an application mount/root, not at a random deep endpoint.
+        # The top-level family root is still derived only from the observed URL and preserves path
+        # case (e.g. /AppOne/ stays /AppOne/).
+        candidate = _application_root_url(url) if path not in {'', '/'} else normalized + '/'
+        score = int(bonus) + _discovery_url_score(url)
+        if path not in {'', '/'}:
+            score += 24
+        scored[candidate] = max(scored.get(candidate, -10_000), score)
+
+    for value in discovery.get('proactive_service_roots', []) or []:
+        add(value, 100)
+    for value in discovery.get('html_urls', []) or []:
+        add(value, 80)
+    for value in discovery.get('browser_navigation_urls', []) or []:
+        add(value, 70)
+    for row in discovery.get('request_cases', []) or []:
+        if isinstance(row, dict):
+            add(row.get('url'), 55)
+    for value in discovery.get('urls', []) or []:
+        add(value, 20)
+    if scored:
+        return sorted(scored.items(), key=lambda item: (-item[1], len(urlparse(item[0]).path), item[0]))[0][0]
+    return normalized + '/'
+
+
 def authenticated_broad_target(discovery: dict[str, Any], origin: str, raw_profile_cookie: str='') -> str:
     """Return a safe application URL on an origin where the authenticated cookie is actually applicable.
 
@@ -5643,7 +6815,15 @@ def authenticated_broad_target(discovery: dict[str, Any], origin: str, raw_profi
             continue
         seen.add(url)
         unique.append(url)
-    unique.sort(key=lambda url: (0 if url.rstrip('/') == normalized else 1, -_discovery_url_score(url), len(url), url))
+    # Prefer a concrete observed application path over the bare origin whenever the same
+    # authenticated cookie is applicable there. Broad scanners do not follow arbitrary redirects,
+    # so starting at '/' can miss an application mounted below a discovered path.
+    preferred_mount = broad_discovery_target(discovery, normalized)
+    unique.sort(key=lambda url: (
+        0 if preferred_mount and (url == preferred_mount or url.startswith(preferred_mount)) else 1,
+        0 if url.rstrip('/') != normalized else 1,
+        -_discovery_url_score(url), len(url), url,
+    ))
     for url in unique:
         if scope_cookie_header(url, raw_profile_cookie):
             return url
@@ -6129,7 +7309,7 @@ def authenticate_discovered_sibling_origins(discovery: dict[str, Any], target: s
     recrawl_minimum = 1 if CURRENT_SCAN_MODE == 'test' else 10
     auth_timeout_minimum = 1 if CURRENT_SCAN_MODE == 'test' else 30
     recrawl_pages = max(recrawl_minimum, int(RUNTIME_AUTH_RECRAWL_PAGES.get(CURRENT_SCAN_MODE, 60)))
-    auth_pass_budget = max(auth_timeout_minimum, int(math.ceil(rate_aware_network_budget(RUNTIME_AUTH_PASS_TIMEOUTS.get(CURRENT_SCAN_MODE, 720), MAX_REQUEST_RATE))))
+    auth_pass_budget = max(auth_timeout_minimum, int(math.ceil(rate_aware_network_budget(RUNTIME_AUTH_PASS_TIMEOUTS.get(CURRENT_SCAN_MODE, RUNTIME_AUTH_PASS_TIMEOUTS['balanced']), MAX_REQUEST_RATE))))
     auth_pass_deadline = time.monotonic() + auth_pass_budget
     if wall_clock_deadline is not None:
         try:
@@ -6468,6 +7648,145 @@ def merge_discovery(left: dict[str, Any], right: dict[str, Any]) -> dict[str, An
     merged['budget_diagnostics'] = {**left_budget, **right_budget}
     return merged
 
+def merge_primary_same_host_service_discovery(
+    discovery: dict[str, Any], target: str, cookies: str, service_discovery: dict[str, Any], *,
+    max_pages: int=MAX_CRAWL_PAGES, allow_state_changes: bool=False,
+    wall_clock_deadline: float | None=None, expand_authorized_service_hosts: bool=True,
+) -> dict[str, Any]:
+    """Attach a deferred primary-host service sweep and crawl newly classified web roots.
+
+    Primary application discovery deliberately runs first.  This function is the second stage: it
+    records the host-level inventory, then performs one bounded application recrawl seeded only by
+    confirmed HTTP/HTTPS service roots.  Authentication/preparation state from the primary crawl is
+    authoritative and cannot be overwritten by a secondary service-root crawl.
+    """
+    scan = copy.deepcopy(service_discovery if isinstance(service_discovery, dict) else {})
+    primary = dict(discovery)
+    primary_budget = dict(primary.get('budget_diagnostics') or {})
+    primary_auth_effective = primary.get('authentication_effective')
+    primary_auth_note = primary.get('authentication_note')
+    primary_auth_probe = primary.get('authentication_probe')
+    primary_target_preparation = primary.get('target_preparation')
+
+    inventory_roots = sorted({
+        _clean_url(str(row.get('url') or ''))
+        for row in scan.get('web_services', []) or []
+        if isinstance(row, dict) and row.get('url') and url_in_authorized_scope(target, str(row.get('url')))
+    } - {''})
+    recrawl_rows = (
+        scan.get('new_web_services_this_call', [])
+        if 'new_web_services_this_call' in scan
+        else scan.get('web_services', [])
+    ) or []
+    roots = sorted({
+        _clean_url(str(row.get('url') or ''))
+        for row in recrawl_rows
+        if isinstance(row, dict) and row.get('url') and url_in_authorized_scope(target, str(row.get('url')))
+    } - {''})
+    existing_roots = {str(value) for value in primary.get('proactive_service_roots', []) if str(value)}
+    all_roots = sorted(existing_roots | set(inventory_roots))
+
+    service_rows = [
+        row for row in primary.get('same_host_service_discoveries', []) or []
+        if isinstance(row, dict) and not row.get('deferred')
+    ]
+    if scan and scan.get('enabled'):
+        service_rows.append(scan)
+    primary['same_host_service_discovery'] = scan
+    primary['same_host_service_discoveries'] = service_rows
+    primary['proactive_service_roots'] = all_roots
+
+    service_budget_fields = {
+        'same_host_service_candidate_cap': safe_int_value(scan.get('candidate_cap'), 0),
+        'same_host_service_candidate_ports_planned': safe_int_value(scan.get('candidate_ports_planned'), 0),
+        'same_host_service_ports_probed': safe_int_value(scan.get('ports_probed'), 0),
+        'same_host_service_candidate_ports_deferred': safe_int_value(scan.get('candidate_ports_deferred'), 0),
+        'same_host_service_tcp_connection_attempts': safe_int_value(scan.get('tcp_connection_attempts'), 0),
+        'same_host_service_resolved_address_count': safe_int_value(scan.get('resolved_address_count'), 0),
+        'same_host_service_tcp_start_floor_seconds_full_candidate_set': safe_float_value(scan.get('tcp_request_start_floor_seconds_full_candidate_set'), 0.0),
+        'same_host_service_tcp_start_floor_seconds_this_call': safe_float_value(scan.get('tcp_request_start_floor_seconds_this_call'), 0.0),
+        'same_host_service_reused_ports_probed': safe_int_value(scan.get('reused_ports_probed'), 0),
+        'same_host_service_cache_hit': safe_bool_metadata(scan.get('cache_hit'), False),
+        'same_host_service_time_budget_seconds': safe_float_value(scan.get('time_budget_seconds'), 0.0),
+        'same_host_service_time_budget_exhausted': safe_bool_metadata(scan.get('time_budget_exhausted'), False),
+        'same_host_service_global_time_budget_seconds': safe_float_value(scan.get('global_time_budget_seconds'), 0.0),
+        'same_host_service_global_time_remaining_seconds': safe_float_value(scan.get('global_time_remaining_after_seconds'), 0.0),
+        'same_host_service_candidate_order_policy': str(scan.get('candidate_order_policy') or ''),
+        'same_host_service_network_max_inflight': safe_int_value(scan.get('network_max_inflight'), DISCOVERY_NETWORK_MAX_INFLIGHT),
+        'same_host_web_services_discovered': len(scan.get('web_services') or []),
+        'same_host_open_web_unconfirmed_ports': len(scan.get('open_web_unconfirmed_ports') or []),
+        'same_host_classification_deferred_ports': len(scan.get('classification_deferred_ports') or []),
+        'same_host_service_discovery_seconds': safe_float_value(scan.get('duration_seconds'), 0.0),
+        'same_host_service_deferred_until_after_primary_discovery': True,
+        'same_host_service_primary_roots_discovered': len(inventory_roots),
+        'same_host_service_primary_new_roots_recrawled': len(roots),
+    }
+    primary['budget_diagnostics'] = {**primary_budget, **service_budget_fields}
+
+    if not roots:
+        return expand_discovered_authorized_host_services(
+            primary, target, cookies, max_pages=max_pages, allow_state_changes=allow_state_changes,
+            wall_clock_deadline=wall_clock_deadline,
+        ) if expand_authorized_service_hosts else primary
+
+    if wall_clock_deadline is not None:
+        try:
+            if time.monotonic() >= float(wall_clock_deadline):
+                primary['budget_diagnostics']['same_host_service_primary_recrawl_skipped_deadline'] = True
+                return primary
+        except (TypeError, ValueError):
+            pass
+
+    limits = DISCOVERY_LIMITS.get(CURRENT_SCAN_MODE, DISCOVERY_LIMITS['balanced'])
+    recrawl_pages = max(
+        len(roots),
+        min(int(max_pages), int(limits.get('same_host_service_expansion_recrawl_pages', max_pages) or max_pages)),
+    )
+    try:
+        recrawl = discover_target(
+            target, cookies, max_pages=recrawl_pages, seeds=roots, forced_seeds=roots,
+            expand_authorized_service_hosts=False, allow_state_changes=allow_state_changes,
+            wall_clock_deadline=wall_clock_deadline,
+            precomputed_same_host_service_discovery=scan,
+        )
+        merged = merge_discovery(primary, recrawl)
+        merged = dict(merged)
+        merged['authentication_effective'] = primary_auth_effective
+        merged['authentication_note'] = primary_auth_note
+        merged['authentication_probe'] = primary_auth_probe
+        merged['target_preparation'] = primary_target_preparation
+        merged['same_host_service_discovery'] = scan
+        merged['same_host_service_discoveries'] = service_rows
+        merged['proactive_service_roots'] = all_roots
+        recrawl_budget = dict(recrawl.get('budget_diagnostics') or {})
+        merged['budget_diagnostics'] = {
+            **primary_budget,
+            **service_budget_fields,
+            'same_host_service_primary_recrawl_pages_limit': recrawl_pages,
+            'same_host_service_primary_roots_recrawled': len(roots),
+            'same_host_service_primary_recrawl_http_pages': int(recrawl_budget.get('http_pages_processed', 0) or 0),
+            'same_host_service_primary_recrawl_browser_pages': int(recrawl_budget.get('browser_pages_attempted', 0) or 0),
+            'same_host_service_primary_recrawl_request_cases': len(recrawl.get('request_cases') or []),
+        }
+    except Exception as exc:
+        merged = dict(primary)
+        merged['errors'] = [
+            *merged.get('errors', []),
+            {'url': target, 'type': 'PrimaryServiceDiscoveryRecrawl', 'message': f'{type(exc).__name__}: {exc}'},
+        ]
+        merged['budget_diagnostics'] = {
+            **primary.get('budget_diagnostics', {}),
+            'same_host_service_primary_recrawl_error': f'{type(exc).__name__}: {exc}',
+        }
+
+    if expand_authorized_service_hosts:
+        merged = expand_discovered_authorized_host_services(
+            merged, target, cookies, max_pages=max_pages, allow_state_changes=allow_state_changes,
+            wall_clock_deadline=wall_clock_deadline,
+        )
+    return merged
+
+
 # Returns authorized origins actually evidenced by the current discovery snapshot. Port expansion is
 # host-level: multiple paths/applications on the same hostname do not trigger duplicate TCP sweeps.
 def _observed_authorized_origins(discovery: dict[str, Any], target: str) -> list[str]:
@@ -6517,14 +7836,34 @@ def _service_expansion_host_ranking(discovery: dict[str, Any], target: str) -> l
     return sorted(ranked, key=lambda item: (-item[2], item[0], item[1]))
 
 
-def _service_discovery_row_has_probe_coverage(row: dict[str, Any]) -> bool:
-    """Return True only when a prior service-discovery row represents real probe coverage.
+def _service_discovery_row_has_probe_coverage(
+    row: dict[str, Any], *, minimum_candidate_cap: int=0,
+) -> bool:
+    """Return True only when a prior row completely covers the requested candidate share.
 
-    DNS/pre-probe failures and deadline exhaustion before the first candidate remain retryable in a
-    later bounded expansion pass. Cached rows and rows that actually probed at least one candidate
-    are complete enough to suppress a duplicate sweep of the same exact hostname.
+    A partial/time-limited row is valuable resume evidence, but it must never suppress a later
+    bounded continuation. Likewise, a completed low-cap sweep cannot stand in for a larger fair
+    share merely because it probed at least one port.
     """
     if not isinstance(row, dict):
+        return False
+    try:
+        candidate_cap = int(row.get('candidate_cap', 0) or 0)
+    except (TypeError, ValueError):
+        candidate_cap = 0
+    if candidate_cap < max(0, int(minimum_candidate_cap or 0)):
+        return False
+    try:
+        deferred = int(row.get('candidate_ports_deferred', 0) or 0)
+    except (TypeError, ValueError):
+        deferred = 0
+    if deferred > 0 or safe_bool_metadata(row.get('time_budget_exhausted'), False):
+        return False
+    try:
+        worker_errors = int(row.get('probe_worker_error_count', 0) or 0)
+    except (TypeError, ValueError):
+        worker_errors = 1
+    if row.get('error') or worker_errors > 0:
         return False
     if safe_bool_metadata(row.get('cache_hit'), False):
         return True
@@ -6539,21 +7878,57 @@ def _service_discovery_row_has_probe_coverage(row: dict[str, Any]) -> bool:
     return ports_probed > 0 or reused_ports > 0
 
 
+def _best_same_host_service_resume_row(discovery: dict[str, Any], hostname: str) -> dict[str, Any] | None:
+    """Return the strongest observed row for resuming one exact hostname, including partial rows."""
+    host = normalized_hostname(hostname)
+    candidates: list[dict[str, Any]] = []
+    for row in discovery.get('same_host_service_discoveries', []) or []:
+        if not isinstance(row, dict):
+            continue
+        row_host = normalized_hostname(str(row.get('expansion_hostname') or row.get('hostname') or ''))
+        if row_host != host:
+            continue
+        try:
+            completed = int(row.get('ports_probed', 0) or 0)
+            candidate_cap = int(row.get('candidate_cap', 0) or 0)
+        except (TypeError, ValueError):
+            continue
+        if completed <= 0 and not row.get('completed_port_numbers'):
+            continue
+        candidates.append(dict(row))
+    if not candidates:
+        return None
+    return max(
+        candidates,
+        key=lambda row: (
+            int(row.get('ports_probed', 0) or 0),
+            int(row.get('candidate_cap', 0) or 0),
+            -int(row.get('candidate_ports_deferred', 0) or 0),
+        ),
+    )
+
+
 def expand_discovered_authorized_host_services(
     discovery: dict[str, Any], target: str, cookies: str, *, max_pages: int=MAX_CRAWL_PAGES,
     allow_state_changes: bool=False, wall_clock_deadline: float | None=None,
 ) -> dict[str, Any]:
     """Expand proactive HTTP/HTTPS port discovery to newly observed, already-authorized hostnames.
 
-    The configured per-mode port candidate budget is reused as one shared expansion budget and is
-    divided across the newly observed hostnames. This broadens host coverage without multiplying the
-    port-probe budget by the number of discovered origins. No hostname is authorized by this helper.
+    A dedicated per-mode priority-port pool is shared across newly observed authorized hostnames.
+    Partial/lower-cap prior rows are resume evidence rather than proof of complete coverage. This
+    broadens host coverage without multiplying a full-range port budget by the number of origins.
+    No hostname is authorized by this helper.
     """
     if not DISCOVER_SAME_HOST_SERVICES or not ALLOW_SAME_HOST_PORTS:
         return discovery
     limits = DISCOVERY_LIMITS.get(CURRENT_SCAN_MODE, DISCOVERY_LIMITS['balanced'])
     host_limit = max(0, int(limits.get('same_host_service_expansion_hosts', 0) or 0))
-    total_candidate_budget = max(0, int(limits.get('same_host_service_candidates', 0) or 0))
+    # Expansion is intentionally a priority-port sweep, not another full primary-host range.
+    # The shared pool is divided across observed *hostnames* (never paths/endpoints), and the same
+    # runtime service-frequency ordering still puts likely HTTP/application ports first.
+    total_candidate_budget = max(0, int(
+        limits.get('same_host_service_expansion_candidates', limits.get('same_host_service_candidates', 0)) or 0
+    ))
     if host_limit <= 0 or total_candidate_budget <= 0:
         return discovery
     external_expansion_deadline = None
@@ -6563,13 +7938,18 @@ def expand_discovered_authorized_host_services(
         except (TypeError, ValueError):
             external_expansion_deadline = None
     ranked = _service_expansion_host_ranking(discovery, target)
+    # A host is considered covered only when the observed row completed at least the fair baseline
+    # share implied by the number of currently observed hosts. Partial or lower-cap rows stay pending
+    # and are resumed below. This prevents one early short expansion from becoming a permanent blind spot.
+    fair_host_count = max(1, min(host_limit, len(ranked)))
+    fair_baseline_cap = max(1, int(math.ceil(total_candidate_budget / fair_host_count)))
     already_scanned_hosts = {
         normalized_hostname(str(row.get('expansion_hostname') or row.get('hostname') or ''))
         for row in discovery.get('same_host_service_discoveries', [])
         if (
             isinstance(row, dict)
             and str(row.get('expansion_hostname') or row.get('hostname') or '').strip()
-            and _service_discovery_row_has_probe_coverage(row)
+            and _service_discovery_row_has_probe_coverage(row, minimum_candidate_cap=fair_baseline_cap)
         )
     }
     pending_ranked = [item for item in ranked if item[0] not in already_scanned_hosts]
@@ -6582,6 +7962,7 @@ def expand_discovered_authorized_host_services(
             'same_host_service_expansion_hosts_pending': len(pending_ranked),
             'same_host_service_expansion_hosts_scanned': 0,
             'same_host_service_expansion_candidate_budget': total_candidate_budget,
+            'same_host_service_expansion_policy': 'targeted-priority-ports-per-observed-authorized-hostname',
             'same_host_service_expansion_candidate_budget_consumed': 0,
             'same_host_service_expansion_candidate_budget_remaining': total_candidate_budget,
             'same_host_service_expansion_ports_probed': 0,
@@ -6591,9 +7972,14 @@ def expand_discovered_authorized_host_services(
         result['budget_diagnostics'] = base_budget
         return result
 
-    # Cached hosts consume no new TCP candidate/time budget. Split the shared candidate budget only
-    # across exact hostnames that have not already been scanned during this assessment process.
-    uncached_hosts = [host for host, _, _ in selected if _cached_same_host_service_discovery(host) is None]
+    # A smaller earlier sweep is useful resume evidence, but it must not suppress the larger fair
+    # share required by this targeted expansion.  Treat a host as already covered only when its
+    # cached candidate cap reaches the current per-host reference share; otherwise resume from it.
+    per_host_reference_cap = max(1, total_candidate_budget // max(1, len(selected)))
+    uncached_hosts = [
+        host for host, _, _ in selected
+        if _cached_same_host_service_discovery(host, minimum_candidate_cap=per_host_reference_cap) is None
+    ]
     uncached_count = len(uncached_hosts)
     # Candidate capacity is a shared expansion pool just like wall-clock time. Allocate an equal
     # share of what remains to each still-pending uncached host, then subtract only the ports that
@@ -6616,6 +8002,7 @@ def expand_discovered_authorized_host_services(
     tcp_connection_attempts = 0
     resolved_address_count = 0
     classification_deferred_ports = 0
+    tcp_start_floor_seconds = 0.0
     web_services_discovered = 0
     roots_recrawled = 0
     hosts_newly_scanned = 0
@@ -6629,28 +8016,72 @@ def expand_discovered_authorized_host_services(
         if external_expansion_deadline is not None and time.monotonic() >= external_expansion_deadline:
             hosts_deferred_time_budget += max(1, len(selected) - index)
             break
-        cached_before = _cached_same_host_service_discovery(host) is not None
+        sufficient_cache = _cached_same_host_service_discovery(
+            host, minimum_candidate_cap=per_host_reference_cap,
+        )
+        resume_scan = _cached_same_host_service_discovery(host) if sufficient_cache is None else None
+        if sufficient_cache is None:
+            observed_resume = _best_same_host_service_resume_row(discovery, host)
+            if observed_resume is not None and (
+                resume_scan is None
+                or int(observed_resume.get('ports_probed', 0) or 0) > int(resume_scan.get('ports_probed', 0) or 0)
+            ):
+                resume_scan = observed_resume
+        cached_before = sufficient_cache is not None
+        became_cached_while_waiting = False
         if cached_before:
-            # Any positive cap reaches the host-level cache; no TCP work is performed.
-            host_cap = 1
+            # Ask for the reference share so the host-level cache can satisfy the call without work.
+            host_cap = per_host_reference_cap
             host_time_budget = 0.0
+            scan = discover_same_host_web_services(
+                origin, candidate_cap=host_cap, time_budget_seconds=host_time_budget,
+                resume_from=resume_scan,
+            )
         else:
             if remaining_uncached_hosts <= 0 or remaining_candidate_budget <= 0:
                 continue
-            quotient, remainder = divmod(remaining_candidate_budget, remaining_uncached_hosts)
-            host_cap = quotient + (1 if remainder else 0)
-            if host_cap <= 0:
-                continue
-            remaining_time = _same_host_service_time_remaining_seconds()
-            # Fairly share BOTH remaining candidate capacity and remaining wall-clock time over
-            # the exact hostnames still waiting to be scanned. Unused capacity from this host is
-            # recycled after the call based on actual ports_probed.
-            host_time_budget = remaining_time / remaining_uncached_hosts if remaining_time > 0 else 0.0
-            if external_expansion_deadline is not None:
-                host_time_budget = min(host_time_budget, max(0.0, external_expansion_deadline - time.monotonic()))
-        scan = discover_same_host_web_services(
-            origin, candidate_cap=host_cap, time_budget_seconds=host_time_budget,
-        )
+            # Profile discovery branches can reach different sibling hosts concurrently. One TCP sweep
+            # already has enough in-flight work to saturate the shared request-start pacer, so running
+            # another sweep in parallel only double-counts the process-wide time allowance. Serialize
+            # uncached sibling sweeps, then re-check the cache because another profile may have covered
+            # this host while we waited.
+            with SAME_HOST_SERVICE_DISCOVERY_EXPANSION_SWEEP_LOCK:
+                sufficient_cache = _cached_same_host_service_discovery(
+                    host, minimum_candidate_cap=per_host_reference_cap,
+                )
+                if sufficient_cache is not None:
+                    cached_before = True
+                    became_cached_while_waiting = True
+                    host_cap = per_host_reference_cap
+                    host_time_budget = 0.0
+                    resume_scan = None
+                    scan = discover_same_host_web_services(
+                        origin, candidate_cap=host_cap, time_budget_seconds=host_time_budget,
+                        resume_from=resume_scan,
+                    )
+                else:
+                    resume_scan = _cached_same_host_service_discovery(host)
+                    observed_resume = _best_same_host_service_resume_row(discovery, host)
+                    if observed_resume is not None and (
+                        resume_scan is None
+                        or int(observed_resume.get('ports_probed', 0) or 0) > int(resume_scan.get('ports_probed', 0) or 0)
+                    ):
+                        resume_scan = observed_resume
+                    quotient, remainder = divmod(remaining_candidate_budget, remaining_uncached_hosts)
+                    host_cap = quotient + (1 if remainder else 0)
+                    if host_cap <= 0:
+                        continue
+                    remaining_time = _same_host_service_time_remaining_seconds()
+                    # Fairly share BOTH remaining candidate capacity and remaining wall-clock time over
+                    # the exact hostnames still waiting to be scanned. Unused capacity from this host is
+                    # recycled after the call based on actual ports_probed.
+                    host_time_budget = remaining_time / remaining_uncached_hosts if remaining_time > 0 else 0.0
+                    if external_expansion_deadline is not None:
+                        host_time_budget = min(host_time_budget, max(0.0, external_expansion_deadline - time.monotonic()))
+                    scan = discover_same_host_web_services(
+                        origin, candidate_cap=host_cap, time_budget_seconds=host_time_budget,
+                        resume_from=resume_scan,
+                    )
         scan_row = dict(scan)
         scan_row['expansion_origin'] = origin
         scan_row['expansion_hostname'] = host
@@ -6659,15 +8090,25 @@ def expand_discovered_authorized_host_services(
         scan_row['expansion_time_budget_seconds'] = round(host_time_budget, 3)
         scan_row['expansion_allocation_policy'] = 'equal-share-of-remaining-time-and-candidates-with-unused-capacity-recycled'
         all_discoveries.append(scan_row)
-        current_ports = int(scan.get('ports_probed', 0) or 0)
+        current_ports_total = int(scan.get('ports_probed', 0) or 0)
+        # A resumed host scan reports cumulative coverage in ports_probed. Expansion capacity, however,
+        # is a budget for NEW candidate work in this pass: subtracting the cumulative count would charge
+        # already-completed ports a second time and unfairly starve later discovered hostnames.
+        current_ports = int(scan.get('ports_probed_this_call', current_ports_total) or 0)
         ports_probed += current_ports
         reused_ports += int(scan.get('reused_ports_probed', 0) or 0)
         candidate_ports_deferred += int(scan.get('candidate_ports_deferred', 0) or 0)
         tcp_connection_attempts += int(scan.get('tcp_connection_attempts', 0) or 0)
         resolved_address_count += int(scan.get('resolved_address_count', 0) or 0)
         classification_deferred_ports += len(scan.get('classification_deferred_ports') or [])
+        tcp_start_floor_seconds += safe_float_value(scan.get('tcp_request_start_floor_seconds_this_call'), 0.0)
         if not cached_before:
             remaining_candidate_budget = max(0, remaining_candidate_budget - current_ports)
+            remaining_uncached_hosts = max(0, remaining_uncached_hosts - 1)
+        elif became_cached_while_waiting:
+            # This host was counted as pending when this invocation began but another profile covered
+            # it while we waited for the expansion-sweep lease. Keep the unused candidate pool and
+            # remove only the now-satisfied host from the denominator for later fair shares.
             remaining_uncached_hosts = max(0, remaining_uncached_hosts - 1)
         if scan.get('cache_hit'):
             hosts_reused_cached += 1
@@ -6736,6 +8177,7 @@ def expand_discovered_authorized_host_services(
         'same_host_service_expansion_tcp_connection_attempts': tcp_connection_attempts,
         'same_host_service_expansion_resolved_address_count': resolved_address_count,
         'same_host_service_expansion_classification_deferred_ports': classification_deferred_ports,
+        'same_host_service_expansion_tcp_start_floor_seconds': round(tcp_start_floor_seconds, 3),
         'same_host_service_expansion_web_services_discovered': web_services_discovered,
         'same_host_service_expansion_roots_recrawled': roots_recrawled,
         'same_host_service_expansion_time_allocation_policy': 'equal-share-of-remaining-time-and-candidates-with-unused-capacity-recycled',
@@ -6987,39 +8429,156 @@ def _case_parameters(case: dict[str, Any]) -> set[str]:
     parameters.update((name.lower() for name, _ in _filtered_query_pairs(parsed.query)))
     return parameters
 
+def _native_structured_specialist_case(tool: str, case: dict[str, Any]) -> bool:
+    """Return whether a scanner can discover fields natively from an observed body.
+
+    This is intentionally narrower than the generic DAST request-case definition.  SQLMap and
+    Commix have native JSON/XML body parsers; Dalfox v3 additionally understands multipart bodies.
+    Raw ``application/graphql`` documents stay Nuclei-only here because the supported Dalfox
+    GraphQL contract is the JSON operation+variables shape and Commix examples likewise use JSON.
+    The request must be an actually observed POST body and still passes the central state-change
+    filter before this helper is consulted.
+    """
+    name = str(tool or '').lower()
+    if name not in {'sqlmap', 'dalfox', 'commix'}:
+        return False
+    if str(case.get('method') or 'GET').upper() != 'POST':
+        return False
+    data = str(case.get('data') or '')
+    if not data.strip():
+        return False
+    content_type = str(case.get('content_type') or case.get('enctype') or '').lower()
+    stripped = data.lstrip()
+    # A raw application/graphql document can begin with ``{`` but it is not JSON.  Do not route it
+    # to JSON-native SQLMap/Commix handling merely because of that first byte.  Nuclei keeps the raw
+    # contract; JSON-wrapped GraphQL remains eligible because its media type/body are genuinely JSON.
+    raw_graphql = 'graphql' in content_type and 'json' not in content_type
+    if raw_graphql:
+        return False
+    is_json = 'json' in content_type or ((not content_type) and stripped.startswith(('{', '[')))
+    is_xml = 'xml' in content_type or ((not content_type) and stripped.startswith('<?xml'))
+    is_multipart = 'multipart/form-data' in content_type
+    if is_json or is_xml:
+        return True
+    return bool(name == 'dalfox' and is_multipart)
+
 INTERNAL_RESOURCE_VALUE_PATTERN = re.compile(r'\.(php\d?|phtml|jsp|jspx|asp|aspx|cgi|pl|do|action|html?)(?:[/?]|$)')
+
+
+def _normalized_internal_resource_value(raw: Any) -> str:
+    """Return a bounded semantic identity for one local/internal-resource value, or ''."""
+    try:
+        value = unquote(unquote(str(raw or ''))).strip()
+    except Exception:
+        value = str(raw or '').strip()
+    lowered = value.lower()
+    if not lowered:
+        return ''
+    if lowered.startswith('file:'):
+        return lowered[:512]
+    # Absolute/protocol-relative web URLs are navigation or remote-fetch values rather than
+    # local-file selectors. Local paths, encoded traversal sequences and file: values remain eligible.
+    parsed_value = urlparse(value)
+    if lowered.startswith('//') or parsed_value.scheme.lower() in {'http', 'https'} or parsed_value.netloc:
+        return ''
+    if not (
+        INTERNAL_RESOURCE_VALUE_PATTERN.search(lowered)
+        or '../' in lowered
+        or '..%2f' in lowered
+        or '..\\' in lowered
+        or lowered.startswith('/etc/')
+    ):
+        return ''
+    semantic = _semantic_routing_value(value)
+    return (semantic or lowered)[:512]
+
+
+def _case_named_observed_values(case: dict[str, Any], *, maximum: int=64) -> list[tuple[str, str, str]]:
+    """Collect bounded named values from query, normalized fields and an explicitly observed body."""
+    limit = max(1, int(maximum))
+    values: list[tuple[str, str, str]] = []
+
+    def add(location: str, name: Any, raw: Any) -> None:
+        if len(values) >= limit:
+            return
+        key = str(name or '').strip()
+        if not key:
+            return
+        values.append((location, key, str(raw or '')))
+
+    for name, value in _filtered_query_pairs(urlparse(str(case.get('url', ''))).query):
+        add('query', name, value)
+        if len(values) >= limit:
+            return values
+
+    for field in case.get('fields', []) if isinstance(case.get('fields'), list) else []:
+        if not isinstance(field, dict):
+            continue
+        field_value = field.get('value')
+        if field_value is None or field_value == '':
+            continue
+        add('field', field.get('name'), field_value)
+        if len(values) >= limit:
+            return values
+
+    data = str(case.get('data') or '').strip()
+    if not data or len(values) >= limit:
+        return values
+    content_type = str(case.get('content_type') or case.get('enctype') or '').lower()
+    if 'json' in content_type or data.startswith(('{', '[')):
+        try:
+            payload = json.loads(data)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            payload = None
+        if payload is not None:
+            def walk(value: Any, path: str='', depth: int=0) -> None:
+                if len(values) >= limit or depth > 4:
+                    return
+                if isinstance(value, dict):
+                    for key, child in value.items():
+                        child_path = f'{path}.{key}' if path else str(key)
+                        walk(child, child_path, depth + 1)
+                        if len(values) >= limit:
+                            break
+                elif isinstance(value, list):
+                    for index, child in enumerate(value[:16]):
+                        child_path = f'{path}[{index}]' if path else f'[{index}]'
+                        walk(child, child_path, depth + 1)
+                        if len(values) >= limit:
+                            break
+                elif isinstance(value, (str, int, float, bool)) and path:
+                    add('json', path, value)
+            walk(payload)
+            return values
+
+    # Form bodies are common even when the content-type metadata is absent in imported request
+    # evidence. parse_qsl is deliberately bounded by the shared output limit above.
+    if '=' in data:
+        for name, value in parse_qsl(data, keep_blank_values=True):
+            add('body', name, value)
+            if len(values) >= limit:
+                break
+    return values
+
+
+def _case_internal_resource_route_signature(case: dict[str, Any]) -> tuple[str, str, tuple[str, ...]]:
+    """Structural route plus only semantic values that select local/internal resources."""
+    url = str(case.get('url') or '')
+    origin, path, query_names = _structural_route_signature(url)
+    tokens: set[str] = set(query_names)
+    for location, name, raw in _case_named_observed_values(case):
+        semantic = _normalized_internal_resource_value(raw)
+        if semantic:
+            tokens.add(f'@{location}:{name.lower()}:{semantic}')
+    return (origin, path, tuple(sorted(tokens)))
+
 
 # Generic (application-agnostic) detector for a parameter whose VALUE, not just its name, selects
 # an internal server-side file or module (e.g. redirect=devices.php, page=admin/setup.jsp,
-# tpl=../../etc/passwd). Name-based hint sets like TRAVERSAL_HINTS miss this whole vulnerability
-# class whenever the application uses an otherwise-unremarkable parameter name (redirect, tab,
-# mod, scr, ...) to route to a file by value, which is a common local-file-inclusion and path-
-# traversal pattern independent of the specific target application.
+# tpl=../../etc/passwd). It covers URL query values plus explicitly observed form/JSON body values;
+# state-changing POSTs are still removed earlier unless the assessment explicitly allows them.
 def _parameter_values_reference_internal_resource(case: dict[str, Any]) -> bool:
-    values: list[str] = [value for _, value in parse_qsl(urlparse(str(case.get('url', ''))).query, keep_blank_values=True)]
-    for field in case.get('fields', []) if isinstance(case.get('fields'), list) else []:
-        if isinstance(field, dict) and field.get('value'):
-            values.append(str(field['value']))
-    for raw in values:
-        try:
-            value = unquote(unquote(str(raw or ''))).strip()
-        except Exception:
-            value = str(raw or '').strip()
-        lowered = value.lower()
-        if not lowered:
-            continue
-        if lowered.startswith('file:'):
-            return True
-        # Absolute/protocol-relative web URLs are navigation or remote-fetch values rather than
-        # local-file selectors. Local paths, encoded traversal sequences and file: values remain eligible.
-        parsed_value = urlparse(value)
-        if lowered.startswith('//') or parsed_value.scheme.lower() in {'http', 'https'} or parsed_value.netloc:
-            continue
-        if INTERNAL_RESOURCE_VALUE_PATTERN.search(lowered):
-            return True
-        if '../' in lowered or '..%2f' in lowered or '..\\' in lowered or lowered.startswith('/etc/'):
-            return True
-    return False
+    return any(_normalized_internal_resource_value(raw) for _, _, raw in _case_named_observed_values(case))
 
 # A redirect/link wrapper whose routing values are exclusively absolute web URLs belongs to open-
 # redirect/SSRF/navigation analysis, not local-file traversal. Relative/local values are deliberately
@@ -7165,7 +8724,11 @@ def _tool_case_priority(tool: str, case: dict[str, Any], authenticated_profile: 
 # determine whether a concrete action exists at all; heuristic vulnerability-class ranking must not.
 def tool_case_hard_skip_reason(tool: str, case: dict[str, Any]) -> str:
     name = str(tool or '').lower()
-    if not _clean_case_parameter_names(case.get('parameters', [])) and not (name == 'idor' and _object_reference_locations(case)):
+    if (
+        not _clean_case_parameter_names(case.get('parameters', []))
+        and not _native_structured_specialist_case(name, case)
+        and not (name == 'idor' and _object_reference_locations(case))
+    ):
         return 'The request has no testable application parameter for this parameter scanner.'
     if _is_auto_index_case(case):
         return 'Directory-index sorting parameters are navigation controls, not application inputs.'
@@ -7364,7 +8927,11 @@ def select_tool_request_cases(discovery: dict[str, Any], tool: str, limit: int |
             continue
         if str(case.get('method', 'GET')).upper() not in {'GET', 'POST'}:
             continue
-        if not case.get('parameters') and not (tool == 'idor' and _object_reference_locations(case)):
+        if (
+            not case.get('parameters')
+            and not _native_structured_specialist_case(tool, case)
+            and not (tool == 'idor' and _object_reference_locations(case))
+        ):
             continue
         case_url = str(case.get('url') or '')
         case_authenticated = authenticated_profile and (not credential_cookies or bool(scope_cookie_header(case_url, credential_cookies)))
@@ -7393,7 +8960,15 @@ def select_tool_request_cases(discovery: dict[str, Any], tool: str, limit: int |
             browser_response = case.get('browser_response') if isinstance(case.get('browser_response'), dict) else {}
             if browser_response.get('observed') is True and safe_int_metadata(browser_response.get('status'), 0) in {404, 410}:
                 continue
-            if method not in {'GET', 'POST'} or not url or (not clean_parameters and not (tool == 'idor' and _object_reference_locations(case))):
+            if (
+                method not in {'GET', 'POST'}
+                or not url
+                or (
+                    not clean_parameters
+                    and not _native_structured_specialist_case(tool, case)
+                    and not (tool == 'idor' and _object_reference_locations(case))
+                )
+            ):
                 continue
             if tool_case_hard_skip_reason(tool, case):
                 continue
@@ -7402,7 +8977,7 @@ def select_tool_request_cases(discovery: dict[str, Any], tool: str, limit: int |
             candidate_rows.append((int(heuristic), {**case, '_agentic_source_index': index}))
         fair_rows = _family_fair_ranked_cases(sorted(candidate_rows, key=lambda item: -item[0]))
         catalog: list[dict[str, Any]] = []
-        seen_catalog: set[tuple[str, tuple[str, str, tuple[tuple[str, str], ...]], str, tuple[str, ...]]] = set()
+        seen_catalog: set[tuple[str, tuple[str, str, tuple[tuple[str, str], ...]], str, tuple[str, ...], str]] = set()
         shape_counts: Counter[tuple[Any, ...]] = Counter()
         variant_cap = _specialist_variant_cap(tool)
         for heuristic, case in fair_rows:
@@ -7423,7 +8998,7 @@ def select_tool_request_cases(discovery: dict[str, Any], tool: str, limit: int |
         )
 
     unique_ranked: list[tuple[int, dict[str, Any]]] = []
-    seen: set[tuple[str, str, tuple[str, ...]]] = set()
+    seen: set[tuple[str, str, tuple[str, ...], str]] = set()
     shape_counts: dict[tuple[Any, ...], int] = {}
     variant_cap = _specialist_variant_cap(tool)
     for score, _, case in sorted(ranked, key=lambda item: (-item[0], -item[1])):
@@ -8051,7 +9626,11 @@ def select_workflow_request_cases(discovery: dict[str, Any], limit: int | None=N
 
     effective_limit = int(limit or PARAMETER_TOOL_CASE_LIMITS.get('workflow', 3))
     ranked: list[tuple[int, int, dict[str, Any]]] = []
-    for index, case in enumerate(discovery.get('request_cases', [])):
+    workflow_evidence = [
+        *[case for case in discovery.get('request_cases', []) if isinstance(case, dict)],
+        *[case for case in discovery.get('destructive_request_cases', []) if isinstance(case, dict)],
+    ]
+    for index, case in enumerate(workflow_evidence):
         if not isinstance(case, dict):
             continue
         if _ephemeral_identity_flow_url(str(case.get('url') or '')) or _volatile_identity_callback_url(str(case.get('url') or '')):
@@ -8080,8 +9659,9 @@ def select_workflow_request_cases(discovery: dict[str, Any], limit: int | None=N
             method = str(case.get('method', 'POST')).upper()
             url = str(case.get('url') or '')
             fields = tuple(sorted(_case_field_names(case)))
-            key = (method, _semantic_request_url_key(url), str(case.get('data') or ''), fields)
-            shape = (method, _structural_route_signature(url), fields)
+            enctype = str(case.get('enctype') or case.get('content_type') or 'application/x-www-form-urlencoded').split(';', 1)[0].strip().lower()
+            key = (method, _semantic_request_url_key(url), str(case.get('data') or ''), fields, enctype)
+            shape = (method, _structural_route_signature(url), fields, enctype)
             if key in seen_catalog or shape_counts[shape] >= variant_cap:
                 continue
             seen_catalog.add(key)
@@ -8096,8 +9676,9 @@ def select_workflow_request_cases(discovery: dict[str, Any], limit: int | None=N
         method = str(case.get('method', 'POST')).upper()
         url = str(case.get('url', ''))
         fields = tuple(sorted(_case_field_names(case)))
-        key = (method, _semantic_request_url_key(url), fields)
-        shape = (method, _structural_route_signature(url), fields)
+        enctype = str(case.get('enctype') or case.get('content_type') or 'application/x-www-form-urlencoded').split(';', 1)[0].strip().lower()
+        key = (method, _semantic_request_url_key(url), fields, enctype)
+        shape = (method, _structural_route_signature(url), fields, enctype)
         if key in seen or shape_counts.get(shape, 0) >= variant_cap:
             continue
         seen.add(key)
@@ -8122,7 +9703,16 @@ def select_arjun_candidates(discovery: dict[str, Any], target: str, limit: int=M
     for url in candidates:
         parsed = urlparse(url)
         path = parsed.path.lower()
-        if _destructive_crawl_url(url) or _is_auto_index_url(url) or path.endswith(('/login.php', '/login')):
+        if (
+            _destructive_crawl_url(url)
+            or _is_auto_index_url(url)
+            or path.endswith(('/login.php', '/login'))
+            or _ephemeral_identity_flow_url(url)
+            or _volatile_identity_callback_url(url)
+        ):
+            # One-shot OAuth/OIDC transaction URLs are protocol plumbing rather than stable
+            # application parameter surfaces. Keep stable application SSO routes, but do not spend
+            # hidden-parameter budget on state/nonce/session_code/code_challenge variants.
             continue
         related_cases = case_by_url.get(url, [])
         has_form = url in form_urls
@@ -8153,7 +9743,7 @@ def select_arjun_candidates(discovery: dict[str, Any], target: str, limit: int=M
     for score, url in ranked:
         best[url] = max(score, best.get(url, score))
     return [url for url, _ in sorted(best.items(), key=lambda item: (-item[1], item[0]))[:limit]]
-AUTHORIZATION_PATH_HINTS = {'admin', 'account', 'accounts', 'profile', 'profiles', 'user', 'users', 'member', 'members', 'order', 'orders', 'invoice', 'invoices', 'document', 'documents', 'download', 'downloads', 'report', 'reports', 'record', 'records', 'settings', 'manage', 'management', 'role', 'roles', 'permission', 'permissions', 'api', 'private', 'internal', 'dashboard', 'billing', 'payment', 'payments'}
+AUTHORIZATION_PATH_HINTS = {'graphql', 'admin', 'account', 'accounts', 'profile', 'profiles', 'user', 'users', 'member', 'members', 'order', 'orders', 'invoice', 'invoices', 'document', 'documents', 'download', 'downloads', 'report', 'reports', 'record', 'records', 'settings', 'manage', 'management', 'role', 'roles', 'permission', 'permissions', 'api', 'private', 'internal', 'dashboard', 'billing', 'payment', 'payments'}
 AUTHORIZATION_PARAMETER_HINTS = {'id', 'uid', 'user', 'user_id', 'userid', 'account', 'account_id', 'member', 'member_id', 'profile', 'profile_id', 'order', 'order_id', 'invoice', 'invoice_id', 'document', 'document_id', 'record', 'record_id', 'file', 'file_id', 'download', 'report', 'report_id', 'customer', 'customer_id', 'owner', 'owner_id', 'tenant', 'tenant_id', 'role', 'role_id'}
 AUTHORIZATION_EXCLUDED_PATH_HINTS = {'login', 'signin', 'sign-in', 'logout', 'signout', 'logoff', 'csrf', 'captcha', 'xss', 'sqli', 'exec', 'command', 'docs', 'documentation', 'instructions', 'help', 'about', 'changelog', 'license', 'copying', 'readme', 'static', 'assets'}
 
@@ -8162,7 +9752,16 @@ def _authorization_case_priority(case: dict[str, Any]) -> int:
 
     url = str(case.get('url') or '')
     method = str(case.get('method') or 'GET').upper()
-    if not url or method != 'GET' or _is_auto_index_case(case) or _destructive_crawl_url(url):
+    if (
+        not url
+        or method not in {'GET', 'POST'}
+        or request_case_state_change_reason(case)
+        or _is_auto_index_case(case)
+        or _destructive_crawl_url(url)
+        or _browser_static_resource(url)
+    ):
+        # Static assets can contain authorization-looking path words (for example ``dashboard``)
+        # plus cache query parameters. They are not object/function authorization surfaces.
         return -1000
     parsed = urlparse(url)
     path_tokens = {token for token in re.split('[^a-z0-9_-]+', parsed.path.lower()) if token}
@@ -8192,7 +9791,12 @@ def _authorization_case_priority(case: dict[str, Any]) -> int:
 def select_authorization_request_cases(discovery: dict[str, Any], limit: int | None=None, *, agentic_catalog: bool=False) -> list[dict[str, Any]]:
 
     effective_limit = int(limit or PARAMETER_TOOL_CASE_LIMITS.get('authorization', 3))
-    cases = [dict(case) for case in discovery.get('request_cases', []) if isinstance(case, dict)]
+    cases = [
+        dict(case) for case in discovery.get('request_cases', [])
+        if isinstance(case, dict)
+        and str(case.get('method', 'GET')).upper() in {'GET', 'POST'}
+        and not request_case_state_change_reason(case)
+    ]
     known = {str(case.get('url') or '') for case in cases}
     for value in discovery.get('parameterized_urls', []):
         url = str(value or '')
@@ -8216,8 +9820,9 @@ def select_authorization_request_cases(discovery: dict[str, Any], limit: int | N
             method = str(case.get('method', 'GET')).upper()
             fields = tuple(sorted(_case_field_names(case)))
             params = tuple(sorted(str(value).lower() for value in case.get('parameters', []) if str(value)))
-            key = (method, semantic_request_identity_url(url), str(case.get('data') or ''), fields)
-            shape = (_structural_route_signature(url), tuple(sorted(set(fields) | set(params))))
+            content_type = str(case.get('content_type') or case.get('enctype') or '').split(';', 1)[0].strip().lower()
+            key = (method, semantic_request_identity_url(url), str(case.get('data') or ''), fields, content_type)
+            shape = (method, _structural_route_signature(url), tuple(sorted(set(fields) | set(params))), content_type)
             if not url or key in seen_catalog or shape_counts[shape] >= variant_cap:
                 continue
             seen_catalog.add(key)
@@ -8226,16 +9831,19 @@ def select_authorization_request_cases(discovery: dict[str, Any], limit: int | N
         return catalog
 
     unique_ranked: list[tuple[int, dict[str, Any]]] = []
-    seen: set[str] = set()
-    shape_counts: dict[tuple[tuple[str, str, tuple[str, ...]], tuple[str, ...]], int] = {}
+    seen: set[tuple[Any, ...]] = set()
+    shape_counts: dict[tuple[Any, ...], int] = {}
     variant_cap = _specialist_variant_cap('authorization')
     for score, _, case in sorted(ranked, key=lambda item: (-item[0], -item[1])):
         url = str(case.get('url') or '')
+        method = str(case.get('method', 'GET')).upper()
         params = tuple(sorted(str(value).lower() for value in case.get('parameters', []) if str(value)))
-        shape = (_structural_route_signature(url), params)
-        if not url or url in seen or shape_counts.get(shape, 0) >= variant_cap:
+        content_type = str(case.get('content_type') or case.get('enctype') or '').split(';', 1)[0].strip().lower()
+        identity = _request_case_dedupe_key(case)
+        shape = (method, _structural_route_signature(url), params, content_type)
+        if not url or identity is None or identity in seen or shape_counts.get(shape, 0) >= variant_cap:
             continue
-        seen.add(url)
+        seen.add(identity)
         shape_counts[shape] = shape_counts.get(shape, 0) + 1
         unique_ranked.append((int(score), case))
 
@@ -8243,9 +9851,12 @@ def select_authorization_request_cases(discovery: dict[str, Any], limit: int | N
         extras: list[tuple[int, dict[str, Any]]] = []
         for case in cases:
             url = str(case.get('url') or '')
-            if not url or url in seen or str(case.get('method', 'GET')).upper() != 'GET':
+            if not url or str(case.get('method', 'GET')).upper() != 'GET':
                 continue
-            if _is_auto_index_case(case) or _destructive_crawl_url(url):
+            identity = _request_case_dedupe_key(case)
+            if identity is None or identity in seen:
+                continue
+            if _is_auto_index_case(case) or _destructive_crawl_url(url) or _browser_static_resource(url):
                 continue
             path = urlparse(url).path.lower()
             if any(token in path for token in ('csrf', 'captcha')):
@@ -8253,7 +9864,7 @@ def select_authorization_request_cases(discovery: dict[str, Any], limit: int | N
             if not list(case.get('parameters') or []) and not urlparse(url).query:
                 continue
             params = tuple(sorted(str(value).lower() for value in case.get('parameters', []) if str(value)))
-            shape = (_structural_route_signature(url), params)
+            shape = ('GET', _structural_route_signature(url), params, '')
             if shape_counts.get(shape, 0) >= variant_cap:
                 continue
             score = _risk_terms(path) + (12 if urlparse(url).query else 0)
@@ -8261,19 +9872,71 @@ def select_authorization_request_cases(discovery: dict[str, Any], limit: int | N
         for score, case in sorted(extras, key=lambda item: (-item[0], str(item[1].get('url') or '')))[:max(0, min(6, effective_limit - len(unique_ranked)))]:
             url = str(case.get('url') or '')
             params = tuple(sorted(str(value).lower() for value in case.get('parameters', []) if str(value)))
-            shape = (_structural_route_signature(url), params)
-            if url in seen or shape_counts.get(shape, 0) >= variant_cap:
+            shape = ('GET', _structural_route_signature(url), params, '')
+            identity = _request_case_dedupe_key(case)
+            if identity is None or identity in seen or shape_counts.get(shape, 0) >= variant_cap:
                 continue
-            seen.add(url)
+            seen.add(identity)
             shape_counts[shape] = shape_counts.get(shape, 0) + 1
             unique_ranked.append((int(score), case))
 
     return _select_with_adaptive_specialist_budget('authorization', unique_ranked, effective_limit)
 
+def _arjun_script_hint_cases(
+    discovery: dict[str, Any], target: str, *, allow_state_changes: bool=False,
+) -> list[dict[str, Any]]:
+    """Promote stable JS/source-map endpoint hints to hidden-parameter discovery candidates.
+
+    JavaScript often names an API endpoint before any concrete request containing parameters is
+    observed. Arjun is specifically useful in that situation. Preserve only GET and state-policy-safe
+    POST hints; no guessed request body is invented and unsafe/state-changing routes remain excluded.
+    """
+    output: list[dict[str, Any]] = []
+    seen: set[tuple[str, str]] = set()
+    for raw in discovery.get('script_endpoint_hints', []) or []:
+        if not isinstance(raw, dict):
+            continue
+        method = str(raw.get('method') or 'GET').upper()
+        if method not in {'GET', 'POST'}:
+            continue
+        try:
+            url = normalize_url(str(raw.get('url') or ''))
+        except Exception:
+            continue
+        if not url or not url_in_authorized_scope(target, url):
+            continue
+        path = urlparse(url).path.lower()
+        if (
+            _destructive_crawl_url(url) or _is_auto_index_url(url) or _browser_static_resource(url)
+            or path.endswith(('/login.php', '/login'))
+            or _ephemeral_identity_flow_url(url) or _volatile_identity_callback_url(url)
+        ):
+            continue
+        params = _query_parameter_names(url)
+        candidate = {
+            'url': url, 'method': method, 'data': '', 'parameters': params,
+            'fields': [], 'file_parameters': [], 'token_parameters': [],
+            'source_url': str(raw.get('source_url') or raw.get('url') or url),
+            'discovery_source': 'javascript_endpoint_hint',
+        }
+        if (not allow_state_changes) and request_case_state_change_reason(candidate):
+            continue
+        key = (method, semantic_request_identity_url(url))
+        if key in seen:
+            continue
+        seen.add(key)
+        output.append(candidate)
+    return output
+
+
 # Chooses and limits the endpoints sent to Arjun.
 def select_arjun_request_cases(discovery: dict[str, Any], target: str, limit: int=MAX_ARJUN_ENDPOINTS, *, allow_state_changes: bool=False, agentic_catalog: bool=False) -> list[dict[str, Any]]:
 
     effective_limit = int(limit)
+    arjun_cases = [
+        *[case for case in discovery.get('request_cases', []) if isinstance(case, dict)],
+        *_arjun_script_hint_cases(discovery, target, allow_state_changes=allow_state_changes),
+    ]
     if agentic_catalog:
         catalog: list[dict[str, Any]] = []
         seen_catalog: set[tuple[str, str, str]] = set()
@@ -8282,7 +9945,7 @@ def select_arjun_request_cases(discovery: dict[str, Any], target: str, limit: in
         # Hidden-parameter discovery rarely benefits from many value-only variants of one endpoint;
         # keep at most two per structural shape even in deep mode.
         variant_cap = max(1, min(2, _specialist_variant_cap()))
-        for raw_case in discovery.get('request_cases', []):
+        for raw_case in arjun_cases:
             if not isinstance(raw_case, dict):
                 continue
             url = normalize_url(str(raw_case.get('url') or ''))
@@ -8290,7 +9953,11 @@ def select_arjun_request_cases(discovery: dict[str, Any], target: str, limit: in
             if not url or method not in {'GET', 'POST'} or not url_in_authorized_scope(target, url):
                 continue
             path = urlparse(url).path.lower()
-            if _destructive_crawl_url(url) or _is_auto_index_url(url) or path.endswith(('/login.php', '/login')):
+            if (
+                _destructive_crawl_url(url) or _is_auto_index_url(url)
+                or path.endswith(('/login.php', '/login'))
+                or _ephemeral_identity_flow_url(url) or _volatile_identity_callback_url(url)
+            ):
                 continue
             if _browser_static_resource(url):
                 continue
@@ -8316,7 +9983,11 @@ def select_arjun_request_cases(discovery: dict[str, Any], target: str, limit: in
             if not url or not url_in_authorized_scope(target, url) or semantic_request_identity_url(url) in represented_urls:
                 continue
             path = urlparse(url).path.lower()
-            if _destructive_crawl_url(url) or _is_auto_index_url(url) or _browser_static_resource(url) or path.endswith(('/login.php', '/login')):
+            if (
+                _destructive_crawl_url(url) or _is_auto_index_url(url) or _browser_static_resource(url)
+                or path.endswith(('/login.php', '/login'))
+                or _ephemeral_identity_flow_url(url) or _volatile_identity_callback_url(url)
+            ):
                 continue
             key = ('GET', semantic_request_identity_url(url), '')
             params = tuple(sorted(name.lower() for name in _query_parameter_names(url)))
@@ -8331,7 +10002,7 @@ def select_arjun_request_cases(discovery: dict[str, Any], target: str, limit: in
 
     ranked: list[tuple[int, dict[str, Any]]] = []
     represented_paths: set[str] = set()
-    for case in discovery.get('request_cases', []):
+    for case in arjun_cases:
         if not isinstance(case, dict):
             continue
         url = normalize_url(str(case.get('url') or ''))
@@ -8341,7 +10012,10 @@ def select_arjun_request_cases(discovery: dict[str, Any], target: str, limit: in
         parsed = urlparse(url)
         path = parsed.path.lower()
         represented_paths.add(path)
-        if _destructive_crawl_url(url) or path.endswith(('/login.php', '/login')):
+        if (
+            _destructive_crawl_url(url) or path.endswith(('/login.php', '/login'))
+            or _ephemeral_identity_flow_url(url) or _volatile_identity_callback_url(url)
+        ):
             continue
         parameters = [str(value) for value in case.get('parameters', []) if str(value)]
         fields = [item for item in case.get('fields', []) if isinstance(item, dict)]
@@ -8364,7 +10038,7 @@ def select_arjun_request_cases(discovery: dict[str, Any], target: str, limit: in
                 score -= 6
         if score < 12:
             continue
-        ranked.append((score, {'url': url, 'method': method, 'data': str(case.get('data') or ''), 'parameters': parameters}))
+        ranked.append((score, {'url': url, 'method': method, 'data': str(case.get('data') or ''), 'parameters': parameters, 'content_type': str(case.get('content_type') or case.get('enctype') or ''), 'enctype': str(case.get('enctype') or case.get('content_type') or '')}))
     for url in select_arjun_candidates(discovery, target, limit=max(effective_limit * 3, 6)):
         parsed = urlparse(url)
         path = parsed.path.lower()
@@ -8379,7 +10053,11 @@ def select_arjun_request_cases(discovery: dict[str, Any], target: str, limit: in
         existing_paths = {urlparse(str(item[1].get('url') or '')).path.lower() for item in ranked}
         for raw_url in discovery.get('html_urls', []) or discovery.get('urls', []):
             url = normalize_url(str(raw_url or ''))
-            if not url or not url_in_authorized_scope(target, url) or urlparse(url).query or _destructive_crawl_url(url):
+            if (
+                not url or not url_in_authorized_scope(target, url) or urlparse(url).query
+                or _destructive_crawl_url(url)
+                or _ephemeral_identity_flow_url(url) or _volatile_identity_callback_url(url)
+            ):
                 continue
             path = urlparse(url).path.lower()
             if path in existing_paths or path.endswith(('/login.php', '/login')):
@@ -8635,6 +10313,35 @@ def _replace_parameter_value(pairs: list[tuple[str, str]], parameter: str, value
         updated.append((parameter, value))
     return updated
 
+def _replace_json_named_path(data: str, path: str, value: str) -> str:
+    """Replace one already-observed JSON scalar path without inventing keys or array entries."""
+    try:
+        payload = json.loads(str(data or ''))
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return ''
+    tokens: list[str | int] = []
+    for key, index in re.findall(r'([^.\[\]]+)|\[(\d+)\]', str(path or '')):
+        tokens.append(int(index) if index else key)
+    if not tokens:
+        return ''
+    cursor: Any = payload
+    try:
+        for token in tokens[:-1]:
+            cursor = cursor[token]
+        leaf = tokens[-1]
+        original = cursor[leaf]
+        if isinstance(original, (dict, list)):
+            return ''
+        cursor[leaf] = value
+    except (KeyError, IndexError, TypeError):
+        return ''
+    return json.dumps(payload, separators=(',', ':'), ensure_ascii=False)
+
+
+def _oast_parameter_leaf(path: str) -> str:
+    cleaned = re.sub(r'\[\d+\]', '', str(path or ''))
+    return cleaned.rsplit('.', 1)[-1].lower()
+
 # Chooses request cases that can support out-of-band callback checks.
 def select_oast_request_cases(discovery: dict[str, Any], target: str, limit: int=1, *, allow_state_changes: bool=False, agentic_catalog: bool=False) -> list[dict[str, Any]]:
 
@@ -8650,31 +10357,69 @@ def select_oast_request_cases(discovery: dict[str, Any], target: str, limit: int
         if (not allow_state_changes) and request_case_state_change_reason({**case, 'url': url, 'method': method}):
             continue
         query_pairs = parse_qsl(urlparse(url).query, keep_blank_values=True)
-        body_pairs = parse_qsl(str(case.get('data') or ''), keep_blank_values=True) if method == 'POST' else []
-        names = {str(value).lower() for value in case.get('parameters', []) if str(value)}
-        names.update((name.lower() for name, _ in query_pairs))
-        names.update((name.lower() for name, _ in body_pairs))
-        strong = [name for name in names if name in OAST_PARAMETER_SCORES]
-        path_bonus = 35 if any((hint in path for hint in OAST_PATH_HINTS)) else 0
-        if not strong:
+        data = str(case.get('data') or '')
+        content_type = str(case.get('content_type') or case.get('enctype') or '').strip()
+        lowered_content_type = content_type.lower()
+        body_pairs: list[tuple[str, str]] = []
+        json_candidates: list[tuple[str, str]] = []
+        if method == 'POST':
+            if 'json' in lowered_content_type or data.lstrip().startswith(('{', '[')):
+                for location, observed_path, _ in _case_named_observed_values(case):
+                    if location != 'json':
+                        continue
+                    leaf = _oast_parameter_leaf(observed_path)
+                    if leaf in OAST_PARAMETER_SCORES:
+                        json_candidates.append((observed_path, leaf))
+            elif ('application/x-www-form-urlencoded' in lowered_content_type) or (not lowered_content_type and '=' in data):
+                body_pairs = parse_qsl(data, keep_blank_values=True)
+            else:
+                # XML, GraphQL and multipart require format-aware mutation. Do not reinterpret them
+                # as form-urlencoded OAST probes merely because a field name looks interesting.
+                continue
+
+        parameter_location = ''
+        parameter = ''
+        parameter_leaf = ''
+        candidates: list[tuple[str, str, str]] = []
+        for name, _ in query_pairs:
+            leaf = str(name).lower()
+            if leaf in OAST_PARAMETER_SCORES:
+                candidates.append(('query', str(name), leaf))
+        for name, _ in body_pairs:
+            leaf = str(name).lower()
+            if leaf in OAST_PARAMETER_SCORES:
+                candidates.append(('body', str(name), leaf))
+        candidates.extend(('json', full_path, leaf) for full_path, leaf in json_candidates)
+        if not candidates:
             continue
-        parameter = max(strong, key=lambda name: OAST_PARAMETER_SCORES[name])
-        score = OAST_PARAMETER_SCORES[parameter] + path_bonus + (8 if method == 'POST' else 0)
-        command_context = parameter in OAST_COMMAND_PARAMETERS and any((hint in path for hint in ('exec', 'command', 'cmd', 'ping', 'shell')))
+        parameter_location, parameter, parameter_leaf = max(candidates, key=lambda row: OAST_PARAMETER_SCORES[row[2]])
+        path_bonus = 35 if any((hint in path for hint in OAST_PATH_HINTS)) else 0
+        score = OAST_PARAMETER_SCORES[parameter_leaf] + path_bonus + (8 if method == 'POST' else 0)
+        command_context = parameter_leaf in OAST_COMMAND_PARAMETERS and any((hint in path for hint in ('exec', 'command', 'cmd', 'ping', 'shell')))
         if command_context:
-            replacement = '127.0.0.1; ping -c 1 FUZZ' if parameter in {'ip', 'host', 'hostname', 'target', 'domain', 'ping'} else 'ping -c 1 FUZZ'
+            replacement = '127.0.0.1; ping -c 1 FUZZ' if parameter_leaf in {'ip', 'host', 'hostname', 'target', 'domain', 'ping'} else 'ping -c 1 FUZZ'
             score += 45
         else:
-            replacement = 'http://FUZZ/' if parameter in OAST_URL_VALUE_PARAMETERS else 'FUZZ'
+            replacement = 'http://FUZZ/' if parameter_leaf in OAST_URL_VALUE_PARAMETERS else 'FUZZ'
         if method == 'GET':
             parsed = urlparse(url)
             injected_pairs = _replace_parameter_value(query_pairs, parameter, replacement)
             injection_url = urlunparse(parsed._replace(query=urlencode(injected_pairs), fragment=''))
             injection_data = ''
+        elif parameter_location == 'json':
+            injection_url = url
+            injection_data = _replace_json_named_path(data, parameter, replacement)
+            if not injection_data:
+                continue
         else:
             injection_url = url
             injection_data = urlencode(_replace_parameter_value(body_pairs, parameter, replacement))
-        ranked.append((score, {'target_url': target, 'source_url': url, 'injection_url': injection_url, 'method': method, 'data': injection_data, 'parameter': parameter, 'parameters': [parameter], 'priority_score': score, 'oast_class': 'command' if command_context else 'remote-fetch'}))
+        ranked.append((score, {
+            'target_url': target, 'source_url': url, 'injection_url': injection_url, 'method': method,
+            'data': injection_data, 'parameter': parameter, 'parameters': [parameter],
+            'content_type': content_type, 'priority_score': score,
+            'oast_class': 'command' if command_context else 'remote-fetch',
+        }))
     selected: list[dict[str, Any]] = []
     seen: set[tuple[str, str, str]] = set()
     variant_cap = _specialist_variant_cap('interactsh')
@@ -9351,6 +11096,7 @@ def build_tool_arguments(tool: str, target_url: str, cookies: str, discovery: di
             roots = _ffuf_application_roots(discovery, target_url)
             arguments['timeout'] = timeout_override or _ffuf_runtime_budget_seconds(discovery, target_url)
             arguments['roots'] = roots
+            arguments['general_root_limit'] = int(FFUF_GENERAL_ROOT_LIMITS.get(CURRENT_SCAN_MODE, 4))
             arguments['wordlist_limit'] = int(FFUF_WORDLIST_LIMITS.get(CURRENT_SCAN_MODE, 600))
             arguments['session_probe_url'] = select_session_probe_url(discovery, target_url)
             arguments['allow_same_host_ports'] = ALLOW_SAME_HOST_PORTS
@@ -9388,10 +11134,26 @@ def build_tool_arguments(tool: str, target_url: str, cookies: str, discovery: di
         elif tool == 'nuclei':
             state_changes_allowed = state_changing_tests_allowed(target_url, allow_state_changes)
             safe_request_cases = _request_cases_for_state_policy(discovery.get('request_cases', []), state_changes_allowed)
+            # Nuclei DAST normally consolidates ordinary value-only variants of one request shape.
+            # Preserve a bounded semantic identity only when an observed value actually selects a
+            # different local/internal backend resource (for example page=module-a.php vs
+            # page=module-b.php). This mirrors the specialist routing distinction without turning
+            # volatile IDs/search values into unbounded DAST inputs.
+            nuclei_request_cases: list[dict[str, Any]] = []
+            for raw_case in safe_request_cases:
+                if not isinstance(raw_case, dict):
+                    continue
+                enriched_case = dict(raw_case)
+                if _parameter_values_reference_internal_resource(enriched_case):
+                    _, _, route_tokens = _case_internal_resource_route_signature(enriched_case)
+                    semantic_tokens = [token for token in route_tokens if str(token).startswith('@')]
+                    if semantic_tokens:
+                        enriched_case['semantic_internal_resource_identity'] = semantic_tokens[:32]
+                nuclei_request_cases.append(enriched_case)
             arguments.update({
                 'seed_urls': discovery.get('urls', []),
                 'priority_seed_urls': discovery.get('explicit_entry_points', []),
-                'request_cases': safe_request_cases,
+                'request_cases': nuclei_request_cases,
                 'allow_state_changes': state_changes_allowed,
                 'scan_profile': CURRENT_SCAN_MODE,
                 'max_targets': 32 if CURRENT_SCAN_MODE == 'test' else 2048 if CURRENT_SCAN_MODE == 'deep' else 1024 if CURRENT_SCAN_MODE == 'balanced' else 128,
@@ -9405,8 +11167,15 @@ def build_tool_arguments(tool: str, target_url: str, cookies: str, discovery: di
     data = str(case.get('data') or '')
     parameters = list(case.get('parameters') or [])
     if tool == 'arjun':
+        content_type = str(case.get('content_type') or case.get('enctype') or '').lower()
+        arjun_method = method
+        if method == 'POST':
+            if 'json' in content_type or data.lstrip().startswith(('{', '[')):
+                arjun_method = 'JSON'
+            elif 'xml' in content_type or data.lstrip().startswith('<?xml'):
+                arjun_method = 'XML'
         arguments.update({
-            'method': method, 'data': data, 'known_parameters': parameters,
+            'method': arjun_method, 'data': data, 'known_parameters': parameters,
             'timeout': timeout_override or ARJUN_TIMEOUT,
             'authorized_origins': sorted(AUTHORIZED_SCOPE_ORIGINS),
             'allow_same_host_ports': ALLOW_SAME_HOST_PORTS,
@@ -9419,8 +11188,13 @@ def build_tool_arguments(tool: str, target_url: str, cookies: str, discovery: di
             arguments['session_probe_url'] = select_application_session_probe_url(
                 discovery, target_url, str(case.get('source_url') or '')
             )
+        if tool in {'sqlmap', 'dalfox', 'commix'}:
+            arguments['content_type'] = str(case.get('content_type') or case.get('enctype') or '')
         if tool == 'traversal':
             arguments['scan_profile'] = CURRENT_SCAN_MODE
+            arguments['content_type'] = str(case.get('content_type') or case.get('enctype') or '')
+        elif tool == 'idor':
+            arguments['content_type'] = str(case.get('content_type') or case.get('enctype') or '')
     elif tool == 'authorization':
         comparison_rows: list[dict[str, str]] = []
         seen_cookies: set[str] = set()
@@ -9439,7 +11213,8 @@ def build_tool_arguments(tool: str, target_url: str, cookies: str, discovery: di
             'secondary_cookies': legacy_secondary,
             'identity_cookies': [row['cookies'] for row in comparison_rows],
             'identity_labels': [row['label'] for row in comparison_rows],
-            'method': 'GET', 'data': '', 'parameters': parameters,
+            'method': method, 'data': data, 'parameters': parameters,
+            'content_type': str(case.get('content_type') or case.get('enctype') or ''),
             'timeout': timeout_override or PARAMETER_TOOL_TIMEOUTS[tool],
         })
     elif tool in {'browser', 'workflow'}:

@@ -279,6 +279,7 @@ def _context_summary_html(context: dict[str, Any], toc: list[tuple[int, str, str
             service_global_budget = safe_float_value(budget.get("same_host_service_global_time_budget_seconds"), 0.0)
             service_global_remaining = safe_float_value(budget.get("same_host_service_global_time_remaining_seconds"), 0.0)
             service_time_exhausted = safe_bool_value(budget.get("same_host_service_time_budget_exhausted"), False)
+            service_tcp_floor = safe_float_value(budget.get("same_host_service_tcp_start_floor_seconds_this_call"), 0.0)
             expansion_hosts = safe_int_value(budget.get("same_host_service_expansion_hosts_scanned"), 0)
             expansion_reused = safe_int_value(budget.get("same_host_service_expansion_hosts_reused_cached"), 0)
             expansion_deferred = safe_int_value(budget.get("same_host_service_expansion_hosts_deferred_time_budget"), 0)
@@ -291,6 +292,7 @@ def _context_summary_html(context: dict[str, Any], toc: list[tuple[int, str, str
             expansion_tcp_attempts = safe_int_value(budget.get("same_host_service_expansion_tcp_connection_attempts"), 0)
             expansion_resolved_addresses = safe_int_value(budget.get("same_host_service_expansion_resolved_address_count"), 0)
             expansion_classification_deferred = safe_int_value(budget.get("same_host_service_expansion_classification_deferred_ports"), 0)
+            expansion_tcp_floor = safe_float_value(budget.get("same_host_service_expansion_tcp_start_floor_seconds"), 0.0)
             expansion_roots = safe_int_value(budget.get("same_host_service_expansion_web_services_discovered"), 0)
             expansion_candidate_budget = safe_int_value(budget.get("same_host_service_expansion_candidate_budget"), 0)
             expansion_candidate_consumed = safe_int_value(budget.get("same_host_service_expansion_candidate_budget_consumed"), expansion_ports)
@@ -307,7 +309,8 @@ def _context_summary_html(context: dict[str, Any], toc: list[tuple[int, str, str
                     f", TCP attempts {service_tcp_attempts}, resolved addresses {service_resolved_addresses}, "
                     f"deferred candidates {service_deferred_candidates}, classification-deferred ports {service_classification_deferred}"
                 )
-                pieces.append(f"primary-host service discovery ports {service_ports}, web roots {service_roots}{timing}{reuse}{probe_detail}")
+                floor_note = f", TCP-start floor {service_tcp_floor:.1f}s" if service_tcp_floor else ""
+                pieces.append(f"primary-host service discovery ports {service_ports}, web roots {service_roots}{timing}{reuse}{probe_detail}{floor_note}")
             if expansion_hosts or expansion_reused or expansion_deferred or expansion_failed_preprobe or expansion_observed:
                 considered = expansion_considered or (expansion_hosts + expansion_reused + expansion_deferred + expansion_failed_preprobe)
                 allocation = ""
@@ -321,13 +324,15 @@ def _context_summary_html(context: dict[str, Any], toc: list[tuple[int, str, str
                         f", candidate pool {expansion_candidate_consumed}/{expansion_candidate_budget} consumed, "
                         f"{expansion_candidate_remaining} remaining"
                     )
+                floor_text = f", TCP-start floor {expansion_tcp_floor:.1f}s" if expansion_tcp_floor else ""
                 pieces.append(
                     f"authorized discovered-host service expansion: considered {considered}/{expansion_observed}, "
                     f"new TCP sweeps {expansion_hosts}, cached host scans reused {expansion_reused}, "
                     f"time-budget deferred {expansion_deferred}, pre-probe failures {expansion_failed_preprobe}, new port probes {expansion_ports}, "
                     f"reused prior probes {expansion_reused_ports}, TCP attempts {expansion_tcp_attempts}, "
                     f"resolved-address observations {expansion_resolved_addresses}, deferred candidates {expansion_deferred_candidates}, "
-                    f"classification-deferred ports {expansion_classification_deferred}, web roots {expansion_roots}{candidate_text}{allocation}"
+                    f"classification-deferred ports {expansion_classification_deferred}, web roots {expansion_roots}"
+                    f"{floor_text}{candidate_text}{allocation}"
                 )
             if service_global_budget:
                 service_global_used = max(0.0, service_global_budget - service_global_remaining)
@@ -531,7 +536,11 @@ def _render_conclusion(summary: dict[str, Any], findings: list[dict[str, Any]], 
     risks = summary.get("risk_counts", {})
     confirmed = sum(item["category"] == "vulnerability" for item in findings)
     candidates = sum(item["category"] == "candidate" for item in findings)
-    if risks.get("critical") or risks.get("high"):
+    severe_confirmed = any(
+        item.get("category") == "vulnerability" and str(item.get("risk") or "").lower() in {"critical", "high"}
+        for item in findings
+    )
+    if severe_confirmed:
         posture = (
             "at least one Critical or High severity finding was confirmed. This should be treated as the immediate "
             "remediation priority before the affected functionality is exposed to untrusted users."

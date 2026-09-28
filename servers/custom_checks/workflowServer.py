@@ -65,6 +65,31 @@ def _pairs_from_case(data: str, fields: list[dict[str, str]]) -> list[tuple[str,
         result.append((field["name"], value))
     return result
 
+
+def _workflow_post_payload(
+    pairs: list[tuple[str, str]], fields: list[dict[str, str]], enctype: str,
+) -> tuple[dict[str, Any], dict[str, str], str]:
+    """Build a POST payload that preserves the observed HTML form encoding.
+
+    Active workflow checks must not silently reinterpret multipart/text forms as
+    application/x-www-form-urlencoded.  Multipart forms that contain file inputs are
+    deliberately not replayed by CSRF/CAPTCHA/auth probes because omitting or inventing
+    a file would no longer represent the observed request contract; the dedicated upload
+    check owns that workflow instead.
+    """
+    content_type = str(enctype or "application/x-www-form-urlencoded").split(";", 1)[0].strip().lower()
+    if not content_type or content_type == "application/x-www-form-urlencoded":
+        return {"data": list(pairs)}, {}, ""
+    if content_type == "text/plain":
+        body = "".join(f"{name}={value}\r\n" for name, value in pairs)
+        return {"data": body}, {"Content-Type": "text/plain"}, ""
+    if content_type == "multipart/form-data":
+        if any(str(field.get("type") or "").lower() == "file" for field in fields):
+            return {}, {}, "multipart_file_field_requires_dedicated_upload_check"
+        # requests generates the multipart boundary when text parts are supplied through files=.
+        return {"files": [(name, (None, value)) for name, value in pairs]}, {}, ""
+    return {}, {}, f"unsupported_form_enctype:{content_type}"
+
 # Create an authenticated requests session for bounded workflow checks.
 def _session(cookies: str) -> requests.Session:
     session = requests.Session()
@@ -79,7 +104,7 @@ def _session(cookies: str) -> requests.Session:
 # Check whether state-changing requests enforce the discovered anti-CSRF token.
 def _csrf_check(
     target_url: str, source_url: str, cookies: str, data: str,
-    fields: list[dict[str, str]], token_parameters: list[str], timeout: int, allow_state_changes: bool,
+    fields: list[dict[str, str]], token_parameters: list[str], enctype: str, timeout: int, allow_state_changes: bool,
     pacer: RequestRatePacer, deadline: float, request_rate: float | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     findings: list[dict[str, Any]] = []
@@ -115,12 +140,21 @@ def _csrf_check(
     if stripped == original:
         return findings, diagnostic
 
+    baseline_payload, baseline_headers, skip_reason = _workflow_post_payload(original, fields, enctype)
+    stripped_payload, stripped_headers, stripped_skip = _workflow_post_payload(stripped, fields, enctype)
+    skip_reason = skip_reason or stripped_skip
+    if skip_reason:
+        diagnostic["active_probe_skipped"] = skip_reason
+        return findings, diagnostic
+
     session = _session(cookies)
     try:
-        baseline = request_same_origin_redirects("POST", target_url, session=session, data=original, allow_state_changes=True, timeout=(max(1.0, timeout * WORKFLOW_CONNECT_RATIO), timeout), pacer=pacer, deadline=deadline,
-            headers={"Referer": source_url or target_url, "Origin": f"{parsed.scheme}://{parsed.netloc}"},
+        baseline_headers.update({"Referer": source_url or target_url, "Origin": f"{parsed.scheme}://{parsed.netloc}"})
+        stripped_headers.update({"Sec-Fetch-Site": "cross-site"})
+        baseline = request_same_origin_redirects("POST", target_url, session=session, allow_state_changes=True, timeout=(max(1.0, timeout * WORKFLOW_CONNECT_RATIO), timeout), pacer=pacer, deadline=deadline,
+            headers=baseline_headers, **baseline_payload,
         )
-        without_token = request_same_origin_redirects("POST", target_url, session=session, data=stripped, allow_state_changes=True, timeout=(max(1.0, timeout * WORKFLOW_CONNECT_RATIO), timeout), pacer=pacer, deadline=deadline, headers={"Sec-Fetch-Site": "cross-site"})
+        without_token = request_same_origin_redirects("POST", target_url, session=session, allow_state_changes=True, timeout=(max(1.0, timeout * WORKFLOW_CONNECT_RATIO), timeout), pacer=pacer, deadline=deadline, headers=stripped_headers, **stripped_payload)
     except requests.RequestException as exc:
         diagnostic["error"] = f"{type(exc).__name__}: {exc}"
         return findings, diagnostic
@@ -312,7 +346,7 @@ def _upload_check(
 
 # Run bounded authentication attempts to detect missing throttling or challenge behavior.
 def _authentication_check(
-    target_url: str, fields: list[dict[str, str]], timeout: int, method: str, pacer: RequestRatePacer,
+    target_url: str, fields: list[dict[str, str]], timeout: int, method: str, enctype: str, pacer: RequestRatePacer,
     allow_state_changes: bool, deadline: float,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     findings: list[dict[str, Any]] = []
@@ -350,7 +384,11 @@ def _authentication_check(
             if str(method or "POST").upper() == "GET":
                 response = request_same_origin_redirects("GET", target_url, session=session, params=payload, allow_state_changes=True, timeout=(max(1.0, timeout * WORKFLOW_CONNECT_RATIO), timeout), pacer=pacer, deadline=deadline)
             else:
-                response = request_same_origin_redirects("POST", target_url, session=session, data=payload, allow_state_changes=True, timeout=(max(1.0, timeout * WORKFLOW_CONNECT_RATIO), timeout), pacer=pacer, deadline=deadline)
+                post_payload, post_headers, skip_reason = _workflow_post_payload(list(payload.items()), fields, enctype)
+                if skip_reason:
+                    diagnostic["active_probe_skipped"] = skip_reason
+                    break
+                response = request_same_origin_redirects("POST", target_url, session=session, allow_state_changes=True, timeout=(max(1.0, timeout * WORKFLOW_CONNECT_RATIO), timeout), pacer=pacer, deadline=deadline, headers=post_headers, **post_payload)
         except requests.RequestException as exc:
             attempts.append({"error": f"{type(exc).__name__}: {exc}"})
             break
@@ -381,7 +419,7 @@ def _authentication_check(
 
 # Inspect the CAPTCHA workflow for recognizable challenge fields and bypass indicators.
 def _captcha_check(
-    target_url: str, cookies: str, data: str, fields: list[dict[str, str]], timeout: int, allow_state_changes: bool,
+    target_url: str, cookies: str, data: str, fields: list[dict[str, str]], enctype: str, timeout: int, allow_state_changes: bool,
     pacer: RequestRatePacer, deadline: float,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     names = [field["name"] for field in fields]
@@ -405,9 +443,13 @@ def _captcha_check(
         return findings, diagnostic
     pairs = _pairs_from_case(data, fields)
     stripped = [(name, value) for name, value in pairs if name not in set(captcha_names)]
+    post_payload, post_headers, skip_reason = _workflow_post_payload(stripped, fields, enctype)
+    if skip_reason:
+        diagnostic["active_probe_skipped"] = skip_reason
+        return findings, diagnostic
     session = _session(cookies)
     try:
-        response = request_same_origin_redirects("POST", target_url, session=session, data=stripped, allow_state_changes=True, timeout=(max(1.0, timeout * WORKFLOW_CONNECT_RATIO), timeout), pacer=pacer, deadline=deadline)
+        response = request_same_origin_redirects("POST", target_url, session=session, allow_state_changes=True, timeout=(max(1.0, timeout * WORKFLOW_CONNECT_RATIO), timeout), pacer=pacer, deadline=deadline, headers=post_headers, **post_payload)
     except requests.RequestException as exc:
         diagnostic["error"] = f"{type(exc).__name__}: {exc}"
         return findings, diagnostic
@@ -471,7 +513,7 @@ def run_workflow_scan(
 
     if method == "POST":
         csrf_findings, csrf_diag = _csrf_check(
-            target_url, source_url, cookies, data, rows, token_parameters, phase_budgets["csrf"], allow_state_changes, pacer,
+            target_url, source_url, cookies, data, rows, token_parameters, enctype, phase_budgets["csrf"], allow_state_changes, pacer,
             min(action_deadline, wall_clock_deadline(phase_budgets["csrf"])),
         )
         upload_findings, upload_diag = _upload_check(
@@ -479,7 +521,7 @@ def run_workflow_scan(
             min(action_deadline, wall_clock_deadline(phase_budgets["upload"])), request_rate,
         )
         captcha_findings, captcha_diag = _captcha_check(
-            target_url, cookies, data, rows, phase_budgets["captcha"], allow_state_changes, pacer,
+            target_url, cookies, data, rows, enctype, phase_budgets["captcha"], allow_state_changes, pacer,
             min(action_deadline, wall_clock_deadline(phase_budgets["captcha"])),
         )
     else:
@@ -493,7 +535,7 @@ def run_workflow_scan(
     diagnostics["upload"] = upload_diag
     diagnostics["captcha"] = captcha_diag
 
-    auth_findings, auth_diag = _authentication_check(target_url, rows, phase_budgets["authentication"], method, pacer, allow_state_changes, min(action_deadline, wall_clock_deadline(phase_budgets["authentication"])))
+    auth_findings, auth_diag = _authentication_check(target_url, rows, phase_budgets["authentication"], method, enctype, pacer, allow_state_changes, min(action_deadline, wall_clock_deadline(phase_budgets["authentication"])))
     findings.extend(auth_findings)
     diagnostics["authentication"] = auth_diag
 

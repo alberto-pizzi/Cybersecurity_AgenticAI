@@ -1,4 +1,5 @@
 from __future__ import annotations
+import ast
 import json
 import importlib.metadata
 import inspect
@@ -18,7 +19,7 @@ from pathlib import Path
 from typing import Any
 import requests
 from packaging.requirements import Requirement
-from utils import ROOT_DIR, WORDLISTS_DIR, MCP_SERVER_PORTS, atomic_write_text, mcp_http_url
+from utils import ROOT_DIR, WORDLISTS_DIR, MCP_SERVER_PORTS, atomic_write_text, mcp_http_url, python_cli_option_numeric_type
 ROOT = Path(ROOT_DIR).resolve()
 LOCAL_ROOT = Path.home() / '.local'
 LOCAL_BIN = LOCAL_ROOT / 'bin'
@@ -585,6 +586,7 @@ def _nikto_health(perl: Path, script: Path, launcher: Path | None=None) -> tuple
 NIKTO_DOCKER_IMAGE = 'ghcr.io/sullo/nikto:latest'
 NUCLEI_DOCKER_IMAGE = 'projectdiscovery/nuclei:latest'
 NUCLEI_MIN_DAST_VERSION = (3, 11, 1)
+DALFOX_GRAPHQL_XML_MIN_VERSION = (3, 2, 3)
 REPORT_DOCKER_SOURCE_IMAGE = 'secopspentest/reportingpdf:v1.0'
 
 
@@ -597,6 +599,10 @@ def _nuclei_version_tuple(text: str) -> tuple[int, int, int]:
 
 def _nuclei_version_supported(text: str) -> bool:
     return _nuclei_version_tuple(text) >= NUCLEI_MIN_DAST_VERSION
+
+def _dalfox_version_tuple(text: str) -> tuple[int, int, int]:
+    match = re.search(r"(?i)\bv?(\d+)\.(\d+)\.(\d+)\b", str(text or ""))
+    return tuple(int(match.group(index)) for index in range(1, 4)) if match else (0, 0, 0)
 
 # Docker image lookup avoids pulling an image that is already available locally.
 def _docker_image_ready(image: str) -> bool:
@@ -1037,6 +1043,66 @@ def verify_nuclei_dast_runtime(engine: dict[str, Any], templates: dict[str, Any]
     return state
 
 # Validate option names used by CLI wrappers so incompatible releases fail during initialization, not mid-assessment.
+def _commix_non_file_technique_contract(commix_script: Path) -> dict[str, Any]:
+    """Read Commix's installed technique alphabet without importing the scanner package."""
+    settings_file = commix_script.parent / 'src' / 'utils' / 'settings.py'
+    if not settings_file.is_file():
+        return {'available': [], 'safe_non_file': ['t'], 'source': 'compatibility_fallback_time_based'}
+    try:
+        tree = ast.parse(settings_file.read_text(encoding='utf-8', errors='replace'), filename=str(settings_file))
+        for node in tree.body:
+            if not isinstance(node, (ast.Assign, ast.AnnAssign)):
+                continue
+            names: list[str] = []
+            value = None
+            if isinstance(node, ast.Assign):
+                names = [target.id for target in node.targets if isinstance(target, ast.Name)]
+                value = node.value
+            elif isinstance(node.target, ast.Name):
+                names = [node.target.id]
+                value = node.value
+            if 'AVAILABLE_TECHNIQUES' not in names or value is None:
+                continue
+            raw = ast.literal_eval(value)
+            if not isinstance(raw, (list, tuple, set)):
+                break
+            available = [str(item).strip().lower() for item in raw if str(item).strip()]
+            safe = [letter for letter in available if letter in {'c', 'e', 'r', 't'}]
+            return {'available': available, 'safe_non_file': list(dict.fromkeys(safe)), 'source': 'installed_settings'}
+    except (OSError, SyntaxError, ValueError, TypeError):
+        pass
+    return {'available': [], 'safe_non_file': ['t'], 'source': 'compatibility_fallback_time_based'}
+
+
+def _commix_request_contract(commix_script: Path) -> dict[str, Any]:
+    menu_file = commix_script.parent / 'src' / 'utils' / 'menu.py'
+    if not menu_file.is_file():
+        return {'header_flag': '', 'method_supported': False, 'source': 'menu_missing'}
+    try:
+        text = menu_file.read_text(encoding='utf-8', errors='replace')
+    except OSError:
+        return {'header_flag': '', 'method_supported': False, 'source': 'menu_unreadable'}
+    header_flag = next((flag for flag in ('--header', '-H', '--headers') if re.search(rf"['\"]{re.escape(flag)}['\"]", text)), '')
+    method_supported = re.search(r"['\"]--method['\"]", text) is not None
+    return {'header_flag': header_flag, 'method_supported': method_supported, 'source': 'installed_parser'}
+
+
+def _commix_delay_contract(commix_script: Path) -> dict[str, Any]:
+    """Describe how the installed Commix checkout parses --delay.
+
+    Fractional pacing is enabled only when the actual parser source explicitly declares a float.
+    Legacy/int/untyped/unknown checkouts stay on the conservative integer-delay fallback.
+    """
+    menu_file = commix_script.parent / 'src' / 'utils' / 'menu.py'
+    parser_type = python_cli_option_numeric_type(menu_file, '--delay')
+    return {
+        'parser_type': parser_type,
+        'fractional_supported': parser_type == 'float',
+        'source': 'installed_menu_ast' if menu_file.is_file() else 'menu_source_missing',
+        'menu_file': str(menu_file),
+    }
+
+
 def _validate_cli_contract(name: str, command: list[str], required_flags: tuple[str, ...], *, accepted_codes: tuple[int, ...]=(0, 1, 2)) -> dict[str, Any]:
     result = run(command, required=False, capture=True, show_output=False, timeout=90)
     help_text = _process_output(result, 20000)
@@ -1073,6 +1139,15 @@ def validate_scanner_cli_contracts() -> dict[str, Any]:
             COMMIX_REQUIRED_FLAGS,
             accepted_codes=(0,),
         )
+        technique_contract = _commix_non_file_technique_contract(commix_script)
+        if not technique_contract.get('safe_non_file'):
+            raise RuntimeError(
+                'Commix CLI contract validation failed: the installed checkout exposes no recognized non-file injection technique, '
+                'so allow_state_changes=false cannot be enforced safely.'
+            )
+        results['commix']['techniques'] = technique_contract
+        results['commix']['delay'] = _commix_delay_contract(commix_script)
+        results['commix']['request_contract'] = _commix_request_contract(commix_script)
     ffuf = command_path('ffuf')
     if ffuf:
         results['ffuf'] = _validate_cli_contract(
@@ -1085,6 +1160,8 @@ def validate_scanner_cli_contracts() -> dict[str, Any]:
         )
     dalfox = command_path('dalfox')
     if dalfox:
+        version_probe = run([dalfox, '--version'], required=False, capture=True, show_output=False, timeout=30)
+        dalfox_version = _dalfox_version_tuple(_process_output(version_probe, 1000))
         scan = run([dalfox, 'scan', '--help'], required=False, capture=True, show_output=False, timeout=90)
         legacy = run([dalfox, 'url', '--help'], required=False, capture=True, show_output=False, timeout=90)
         scan_help, legacy_help = _process_output(scan, 16000), _process_output(legacy, 16000)
@@ -1092,6 +1169,7 @@ def validate_scanner_cli_contracts() -> dict[str, Any]:
         v3_worker_ok = _help_has_flag(scan_help, '--workers') or _help_has_flag(scan_help, '--worker')
         v3_rate_flag = next((flag for flag in ('--rate-limit', '--rl', '-r') if _help_has_flag(scan_help, flag)), '')
         v3_delay_ok = _help_has_flag(scan_help, '--delay')
+        v3_header_flag = next((flag for flag in ('--headers', '--header', '-H') if _help_has_flag(scan_help, flag)), '')
         v3_ok = (
             scan.returncode in (0, 1, 2)
             and all(_help_has_flag(scan_help, flag) for flag in v3_required)
@@ -1103,6 +1181,7 @@ def validate_scanner_cli_contracts() -> dict[str, Any]:
         v2_worker_ok = _help_has_flag(legacy_help, '--workers') or _help_has_flag(legacy_help, '--worker')
         v2_rate_flag = next((flag for flag in ('--rate-limit', '--rl', '-r') if _help_has_flag(legacy_help, flag)), '')
         v2_delay_ok = _help_has_flag(legacy_help, '--delay')
+        v2_header_flag = next((flag for flag in ('--headers', '--header', '-H') if _help_has_flag(legacy_help, flag)), '')
         v2_required = DALFOX_V2_REQUIRED_FLAGS
         v2_ok = (
             bool(legacy_help)
@@ -1122,6 +1201,11 @@ def validate_scanner_cli_contracts() -> dict[str, Any]:
             'v3': v3_ok, 'v2': v2_ok,
             'v3_rate_control': v3_rate_flag or ('--delay(serial)' if v3_delay_ok else ''),
             'v2_rate_control': v2_rate_flag or ('--delay(serial)' if v2_delay_ok else ''),
+            'v3_content_type_header_flag': v3_header_flag,
+            'v2_content_type_header_flag': v2_header_flag,
+            'structured_body_contract_supported': bool((v3_ok and v3_header_flag) or (v2_ok and v2_header_flag)),
+            'version': '.'.join(map(str, dalfox_version)) if dalfox_version != (0, 0, 0) else 'unknown',
+            'graphql_xml_native_discovery_supported': bool(v3_ok and dalfox_version >= DALFOX_GRAPHQL_XML_MIN_VERSION),
         }
     nuclei_mode = str(_NUCLEI_ENGINE_STATE.get('execution_mode') or '')
     nuclei = command_path('nuclei')

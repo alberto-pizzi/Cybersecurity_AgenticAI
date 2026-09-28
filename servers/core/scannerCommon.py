@@ -135,6 +135,32 @@ def process_text(result: dict[str, Any]) -> str:
     return "\n".join(str(result.get(key, "")) for key in ("stdout", "stderr", "output"))
 
 # Replace one query/form parameter without changing the rest of the request.
+def parameter_mutation_supported(
+    url: str, method: str, data: str, parameter: str, *, case_insensitive: bool = False,
+) -> bool:
+    """Return whether the local quick-probe mutator can really replace this parameter.
+
+    The project mutator intentionally understands URL query strings and
+    application/x-www-form-urlencoded bodies. Raw JSON/XML/GraphQL/multipart bodies are preserved
+    for the official scanners, but must not be rewritten as if they were form data by the lightweight
+    project pre-verifiers.
+    """
+    method = str(method or 'GET').upper()
+    source = urlparse(str(url or '')).query if method == 'GET' else str(data or '')
+    key = str(parameter or '')
+    if not key:
+        return False
+    wanted = key.lower() if case_insensitive else key
+    try:
+        pairs = parse_qsl(source, keep_blank_values=True)
+    except Exception:
+        return False
+    for name, _ in pairs:
+        candidate = str(name).lower() if case_insensitive else str(name)
+        if candidate == wanted:
+            return True
+    return False
+
 def mutate_parameter(
     url: str, method: str, data: str, parameter: str, value: str, *, case_insensitive: bool = False, clear_fragment: bool = False,
     append_if_missing: bool = True, replace_all: bool = False,
@@ -159,6 +185,78 @@ def mutate_parameter(
         fragment = "" if clear_fragment else parsed.fragment
         return urlunparse(parsed._replace(query=encoded, fragment=fragment)), ""
     return url, encoded
+
+
+def mutate_observed_parameter(
+    url: str, method: str, data: str, parameter: str, value: str, *, content_type: str = "", case_insensitive: bool = False,
+) -> tuple[str, str, bool, str]:
+    """Mutate one *observed* query/form/JSON parameter without fabricating a new input.
+
+    Lightweight project verifiers normally use :func:`mutate_parameter`, which intentionally supports
+    only query strings and URL-encoded form bodies. Traversal/LFI additionally benefits from replaying
+    JSON request contracts learned from Chromium. This helper therefore adds bounded exact-path JSON
+    mutation while remaining fail-closed for XML, GraphQL, multipart and unknown raw bodies.
+    """
+    method = str(method or 'GET').upper()
+    key = str(parameter or '')
+    if not key:
+        return str(url or ''), str(data or ''), False, 'missing_parameter'
+    if parameter_mutation_supported(url, method, data, key, case_insensitive=case_insensitive):
+        mutated_url, mutated_data = mutate_parameter(
+            url, method, data, key, value, case_insensitive=case_insensitive, append_if_missing=False,
+        )
+        return mutated_url, mutated_data, True, 'query' if method == 'GET' else 'form'
+    if method == 'GET':
+        return str(url or ''), str(data or ''), False, 'parameter_not_observed'
+
+    lowered_type = str(content_type or '').lower()
+    raw = str(data or '')
+    if not raw.strip() or not ('json' in lowered_type or raw.lstrip().startswith(('{', '['))):
+        return str(url or ''), raw, False, 'unsupported_body_shape'
+    try:
+        payload = json.loads(raw)
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return str(url or ''), raw, False, 'invalid_json'
+
+    wanted = key.lower() if case_insensitive else key
+    replaced = False
+
+    def walk(node: Any, prefix: str = '', depth: int = 0) -> None:
+        nonlocal replaced
+        if replaced or depth > 8:
+            return
+        if isinstance(node, dict):
+            for child_key in list(node.keys())[:128]:
+                child_path = f'{prefix}.{child_key}' if prefix else str(child_key)
+                candidate = child_path.lower() if case_insensitive else child_path
+                child = node[child_key]
+                if candidate == wanted and not isinstance(child, (dict, list)):
+                    node[child_key] = value
+                    replaced = True
+                    return
+                walk(child, child_path, depth + 1)
+                if replaced:
+                    return
+        elif isinstance(node, list):
+            for index, child in enumerate(node[:128]):
+                child_path = f'{prefix}[{index}]' if prefix else f'[{index}]'
+                candidate = child_path.lower() if case_insensitive else child_path
+                if candidate == wanted and not isinstance(child, (dict, list)):
+                    node[index] = value
+                    replaced = True
+                    return
+                walk(child, child_path, depth + 1)
+                if replaced:
+                    return
+
+    walk(payload)
+    if not replaced:
+        return str(url or ''), raw, False, 'json_path_not_observed'
+    try:
+        encoded = json.dumps(payload, ensure_ascii=False, separators=(',', ':'))
+    except (TypeError, ValueError):
+        return str(url or ''), raw, False, 'json_reencode_failed'
+    return str(url or ''), encoded, True, 'json'
 
 # Retry transient transport failures and re-raise the last Requests error.
 def request_retry(

@@ -1,14 +1,16 @@
 from __future__ import annotations
 
+import json
 import re
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any
+from urllib.parse import parse_qsl, urlparse
 
 import requests
 
 from utils import RequestRatePacer, request_contract_state_change_reason, request_same_origin_redirects, partial, scanner_session_probe, secops_parallelism_policy, skipped, success
 
-from core.scannerCommon import mutate_parameter, proportional_budget, remaining_budget, service, wall_clock_deadline
+from core.scannerCommon import mutate_observed_parameter, proportional_budget, remaining_budget, service, wall_clock_deadline
 
 mcp, _serve = service("Path Traversal and LFI Verifier", "traversal")
 
@@ -27,14 +29,83 @@ PROBES = (
 )
 
 # Send one bounded traversal request while preserving the discovered request contract.
-def _request(url: str, cookies: str, method: str, data: str, pacer: RequestRatePacer, read_timeout: float, deadline: float, allow_state_changes: bool = False) -> requests.Response:
+def _request(
+    url: str, cookies: str, method: str, data: str, pacer: RequestRatePacer, read_timeout: float, deadline: float,
+    allow_state_changes: bool = False, content_type: str = "",
+) -> requests.Response:
     headers = {"Cache-Control": "no-cache", "User-Agent": "SecOps-Path-Traversal-Verifier/1.0"}
     if cookies:
         headers["Cookie"] = cookies
+    if method.upper() != "GET" and str(content_type or '').strip():
+        headers["Content-Type"] = str(content_type).strip()
     return request_same_origin_redirects(
         method, url, data=data if method != "GET" else None, headers=headers,
         timeout=(max(1.0, read_timeout * 0.25), max(1.0, read_timeout)), pacer=pacer, deadline=deadline, allow_state_changes=bool(allow_state_changes),
     )
+
+
+
+def _parameter_leaf(name: str) -> str:
+    cleaned = re.sub(r'\[\d+\]', '', str(name or ''))
+    return cleaned.rsplit('.', 1)[-1].strip().lower()
+
+
+def _observed_parameter_value(url: str, method: str, data: str, parameter: str, content_type: str = '') -> str:
+    """Return the exact observed scalar value for one query/form/JSON parameter path."""
+    method = str(method or 'GET').upper()
+    wanted = str(parameter or '').lower()
+    if not wanted:
+        return ''
+    source = urlparse(str(url or '')).query if method == 'GET' else str(data or '')
+    if method == 'GET' or 'application/x-www-form-urlencoded' in str(content_type or '').lower():
+        for name, value in parse_qsl(source, keep_blank_values=True):
+            if str(name).lower() == wanted:
+                return str(value)
+        return ''
+    raw = str(data or '')
+    if method != 'GET' and ('json' in str(content_type or '').lower() or raw.lstrip().startswith(('{', '['))):
+        try:
+            payload = json.loads(raw)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return ''
+        found = ''
+        def walk(node: Any, prefix: str = '', depth: int = 0) -> None:
+            nonlocal found
+            if found or depth > 8:
+                return
+            if isinstance(node, dict):
+                for key in list(node.keys())[:128]:
+                    path = f'{prefix}.{key}' if prefix else str(key)
+                    child = node[key]
+                    if path.lower() == wanted and not isinstance(child, (dict, list)):
+                        found = '' if child is None else str(child)
+                        return
+                    walk(child, path, depth + 1)
+                    if found:
+                        return
+            elif isinstance(node, list):
+                for index, child in enumerate(node[:128]):
+                    path = f'{prefix}[{index}]' if prefix else f'[{index}]'
+                    if path.lower() == wanted and not isinstance(child, (dict, list)):
+                        found = '' if child is None else str(child)
+                        return
+                    walk(child, path, depth + 1)
+                    if found:
+                        return
+        walk(payload)
+        return found
+    return ''
+
+
+def _looks_like_internal_resource(value: str) -> bool:
+    lowered = str(value or '').strip().lower()
+    if not lowered:
+        return False
+    if lowered.startswith('file:') or lowered.startswith('/etc/'):
+        return True
+    if '../' in lowered or '..%2f' in lowered or '..\\' in lowered:
+        return True
+    return bool(re.search(r'\.(?:php\d?|phtml|jsp|jspx|asp|aspx|cgi|pl|do|action|html?)(?:[/?#]|$)', lowered))
 
 # Extract a compact response excerpt around the marker used for LFI verification.
 def _excerpt(text: str, match: re.Match[str] | None, limit: int = 1000) -> str:
@@ -49,6 +120,7 @@ def _excerpt(text: str, match: re.Match[str] | None, limit: int = 1000) -> str:
 def run_traversal_scan(
     target_url: str, cookies: str = "", method: str = "GET", data: str = "", parameters: list[str] | None = None, timeout: int = 30,
     scan_profile: str = "balanced", request_rate: float | None = None, allow_state_changes: bool = False, session_probe_url: str = "", session_prevalidated: bool = False,
+    content_type: str = "",
 ) -> dict:
 
     method = str(method or "GET").upper()
@@ -68,10 +140,14 @@ def run_traversal_scan(
     state_reason = request_contract_state_change_reason({"url": target_url, "method": method, "data": data, "parameters": parameters or []}) if not allow_state_changes else ""
     if state_reason:
         return skipped("Path Traversal/LFI", target_url, f"Traversal request blocked by allow_state_changes=false: {state_reason}.", diagnosis="state_change_policy_blocked", allow_state_changes=False)
-    candidates = [
-        value for value in dict.fromkeys(str(item) for item in (parameters or []) if str(item))
-        if value.lower() in PATH_PARAMETERS and value.lower() not in CONTROL_PARAMETERS
-    ]
+    candidates: list[str] = []
+    for value in dict.fromkeys(str(item) for item in (parameters or []) if str(item)):
+        leaf = _parameter_leaf(value)
+        observed = _observed_parameter_value(target_url, method, data, value, content_type)
+        if leaf in CONTROL_PARAMETERS:
+            continue
+        if leaf in PATH_PARAMETERS or _looks_like_internal_resource(observed):
+            candidates.append(value)
     if not candidates:
         return success(
             "Path Traversal/LFI", target_url, "No file/path/include-style parameter was available for a bounded traversal probe.",
@@ -80,7 +156,7 @@ def run_traversal_scan(
 
     probe_target = str(session_probe_url or target_url)
     probe_method, probe_data = ("GET", "") if session_probe_url else (method, data)
-    session_probe = ({'performed': False, 'authenticated': True, 'conclusive': True, 'prevalidated_by_orchestrator': True} if session_prevalidated else scanner_session_probe(probe_target, cookies, probe_method, probe_data, timeout=min(proportional_budget(timeout, TRAVERSAL_SESSION_RATIO), max(1, int(remaining_budget(deadline)))), attempts=1, pacer=pacer, deadline=deadline))
+    session_probe = ({'performed': False, 'authenticated': True, 'conclusive': True, 'prevalidated_by_orchestrator': True} if session_prevalidated else scanner_session_probe(probe_target, cookies, probe_method, probe_data, timeout=min(proportional_budget(timeout, TRAVERSAL_SESSION_RATIO), max(1, int(remaining_budget(deadline)))), attempts=1, pacer=pacer, deadline=deadline, allow_tls_trust_retry=True))
     if cookies and session_probe.get("performed") and session_probe.get("conclusive") and session_probe.get("authenticated") is False:
         return partial(
             "Path Traversal/LFI", target_url,
@@ -92,7 +168,7 @@ def run_traversal_scan(
     baseline: requests.Response | None = None
     baseline_error = ""
     try:
-        baseline = _request(target_url, cookies, method, data, pacer, min(request_budget, max(1.0, remaining_budget(deadline))), deadline, bool(allow_state_changes))
+        baseline = _request(target_url, cookies, method, data, pacer, min(request_budget, max(1.0, remaining_budget(deadline))), deadline, bool(allow_state_changes), content_type)
     except requests.RequestException as exc:
         baseline_error = f"{type(exc).__name__}: {exc}"
 
@@ -108,9 +184,17 @@ def run_traversal_scan(
             break
         def run_probe(spec: tuple[str, re.Pattern[str], str]):
             payload, marker, label = spec
-            probe_url, probe_data = mutate_parameter(target_url, method, data, parameter, payload, case_insensitive=True)
+            probe_url, probe_data, mutated, mutation_mode = mutate_observed_parameter(
+                target_url, method, data, parameter, payload, content_type=content_type, case_insensitive=True,
+            )
+            if not mutated:
+                return payload, marker, label, None, ValueError(f'unsupported traversal mutation for {parameter}: {mutation_mode}')
             try:
-                response = _request(probe_url, cookies, method, probe_data, pacer, min(request_budget, max(1.0, remaining_budget(deadline))), deadline, bool(allow_state_changes))
+                response = _request(
+                    probe_url, cookies, method, probe_data, pacer,
+                    min(request_budget, max(1.0, remaining_budget(deadline))), deadline,
+                    bool(allow_state_changes), content_type,
+                )
                 return payload, marker, label, response, None
             except requests.RequestException as exc:
                 return payload, marker, label, None, exc
@@ -183,6 +267,7 @@ def run_traversal_scan(
         "parallelism_policy": parallelism,
         "scan_profile": profile, "parameter_limit": parameter_limit,
         "baseline_available": baseline is not None, "baseline_error": baseline_error,
+        "content_type": str(content_type or ''),
     }
     if budget_exhausted:
         return partial(

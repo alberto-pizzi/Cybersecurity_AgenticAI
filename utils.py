@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 import errno
 import hashlib
 import json
@@ -25,6 +26,57 @@ WORDLISTS_DIR = ROOT_DIR / "wordlists"
 LOCAL_BIN = Path.home() / ".local" / "bin"
 
 _SOURCE_FINGERPRINT_CACHE: str | None = None
+
+
+def python_cli_option_numeric_type(source_file: str | Path, option_name: str) -> str:
+    """Return an explicitly declared numeric parser type for one CLI option.
+
+    This is deliberately fail-closed: only an AST-visible ``type=float``/``type="float"``
+    or ``type=int``/``type="int"`` on the call that declares *option_name* is trusted.
+    Missing, untyped, computed or conflicting declarations return ``unknown`` (or ``missing``
+    when the option declaration itself is absent).  Scanner wrappers can therefore enable
+    fractional rate controls only when the installed checkout proves it supports them.
+    """
+    path = Path(source_file)
+    if not path.is_file() or not str(option_name or '').strip():
+        return "missing"
+    try:
+        tree = ast.parse(path.read_text(encoding="utf-8", errors="replace"), filename=str(path))
+    except (OSError, SyntaxError, ValueError, TypeError):
+        return "unknown"
+
+    declarations: list[str] = []
+    wanted = str(option_name).strip()
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        option_declared = any(
+            isinstance(arg, ast.Constant) and isinstance(arg.value, str) and arg.value.strip() == wanted
+            for arg in node.args
+        )
+        if not option_declared:
+            continue
+        type_kw = next((kw.value for kw in node.keywords if kw.arg == "type"), None)
+        if type_kw is None:
+            declarations.append("unknown")
+            continue
+        declared = "unknown"
+        if isinstance(type_kw, ast.Name) and type_kw.id in {"float", "int"}:
+            declared = type_kw.id
+        elif isinstance(type_kw, ast.Constant) and str(type_kw.value).strip().lower() in {"float", "int"}:
+            declared = str(type_kw.value).strip().lower()
+        elif isinstance(type_kw, ast.Attribute) and type_kw.attr in {"float", "int"}:
+            declared = type_kw.attr
+        declarations.append(declared)
+
+    if not declarations:
+        return "missing"
+    unique = set(declarations)
+    if unique == {"float"}:
+        return "float"
+    if unique == {"int"}:
+        return "int"
+    return "unknown"
 
 
 def safe_int_value(value: Any, default: int = 0) -> int:
@@ -581,9 +633,9 @@ def request_invocation_state_change_reason(
     })
 
 # Returns a non-reversible identifier for one HTTP request body contract. The report uses this
-# only to keep distinct POST bodies separate without exposing submitted values or credentials.
+# only to keep distinct body-bearing request contracts separate without exposing submitted values or credentials.
 def request_body_fingerprint(method: str, data: str = "", parameters: Iterable[str] | None = None) -> str:
-    if str(method or "GET").upper() != "POST":
+    if str(method or "GET").upper() in {"GET", "HEAD"}:
         return ""
     payload = str(data or "")
     names = sorted({str(value).strip().lower() for value in (parameters or []) if str(value).strip()})

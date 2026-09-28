@@ -14,6 +14,7 @@ import uuid
 import time
 import traceback
 import warnings
+from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import nullcontext
 from datetime import datetime
@@ -885,12 +886,14 @@ def _planner_candidate_view(action: dict[str, Any], candidate_id: str) -> dict[s
     # meaningful planning signal.
     target_url = str(action.get('target_url') or '')
     compact_url = shared.compact_log_url(target_url, max_length=720)
+    _family_origin, family_path = shared._application_family_key(target_url)
     return {
         'id': candidate_id,
         'profile': str(action.get('profile') or ''),
         'tool': str(action.get('tool') or ''),
         'method': str(action.get('method') or 'GET'),
         'url': compact_url,
+        'application_family': family_path or '/',
         'parameters': [str(value) for value in action.get('parameters', [])][:12],
         'parameter_count': len([value for value in action.get('parameters', []) if str(value)]),
         'file_parameters': [str(value) for value in action.get('file_parameters', [])][:4],
@@ -904,10 +907,12 @@ def _planner_candidate_view(action: dict[str, Any], candidate_id: str) -> dict[s
 
 
 def _fair_planner_action_order(actions: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Interleave profile/tool buckets without deciding which actions are useful.
+    """Interleave profile/tool buckets and application families without selecting actions.
 
-    This is prompt scheduling only. Every input action is returned exactly once. The purpose is to
-    prevent an early large tool/profile bucket from occupying all of the first planner batch.
+    Every input action is returned exactly once. The outer round-robin preserves profile/tool
+    fairness; an inner family round-robin prevents one large SPA/application family from filling the
+    early positions of a tool bucket. This changes prompt scheduling only: the AI still decides every
+    concrete selection.
     """
     buckets: dict[tuple[str, str], list[dict[str, Any]]] = {}
     order: list[tuple[str, str]] = []
@@ -917,13 +922,40 @@ def _fair_planner_action_order(actions: list[dict[str, Any]]) -> list[dict[str, 
             buckets[key] = []
             order.append(key)
         buckets[key].append(action)
+
+    def family_interleave(bucket: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        families: dict[tuple[str, str], list[dict[str, Any]]] = {}
+        family_order: list[tuple[str, str]] = []
+        for action in bucket:
+            family = shared._application_family_key(str(action.get('target_url') or ''))
+            if family not in families:
+                families[family] = []
+                family_order.append(family)
+            families[family].append(action)
+        family_offsets = {family: 0 for family in family_order}
+        interleaved: list[dict[str, Any]] = []
+        while len(interleaved) < len(bucket):
+            added = False
+            for family in family_order:
+                index = family_offsets[family]
+                rows = families[family]
+                if index >= len(rows):
+                    continue
+                interleaved.append(rows[index])
+                family_offsets[family] = index + 1
+                added = True
+            if not added:
+                break
+        return interleaved
+
+    fair_buckets = {key: family_interleave(bucket) for key, bucket in buckets.items()}
     offsets = {key: 0 for key in order}
     output: list[dict[str, Any]] = []
     while len(output) < len(actions):
         added = False
         for key in order:
             index = offsets[key]
-            bucket = buckets[key]
+            bucket = fair_buckets[key]
             if index >= len(bucket):
                 continue
             output.append(bucket[index])
@@ -1335,6 +1367,7 @@ def action_id(action: dict[str, Any]) -> str:
         str(action.get('profile', '')), str(action.get('tool', '')), target_identity,
         str(action.get('method', '')), str(action.get('data', '')), ','.join(parameter_names),
         ','.join(file_names), ','.join(token_names), ','.join(field_names),
+        str(action.get('content_type', '')).lower(), str(action.get('enctype', '')).lower(),
         str(action.get('jwt_token', '')), str(action.get('injection_url', '')),
     ))
 
@@ -1436,8 +1469,8 @@ def _planner_system_message() -> str:
         '[OBJECTIVE]\n'
         'Choose the useful concrete actions that maximize complementary security evidence. Python does not choose attacks for you: it only discovers/normalizes candidates, removes invalid or unsafe work, batches the catalog for context size, and enforces the final traffic/time ceiling.\n\n'
         '[INPUT CONTRACT]\n'
-        'The user message contains one batch of concrete candidate_actions, discovery summary, previous results and round resource ceilings. '
-        'If the full catalog is larger than this batch, other batches are evaluated separately; therefore judge every candidate in this batch on its own evidence and complementarity.\n\n'
+        'The user message contains one batch of concrete candidate_actions, discovery summary, previous results, selections already made in earlier batches of this round, and round resource ceilings. '
+        'If the full catalog is larger than this batch, other batches are evaluated separately; judge every candidate in this batch on its own evidence while using selected_so_far_by_tool and selected_so_far_by_application_family to avoid unnecessary same-round concentration.\n\n'
         '[DECISION RULES]\n'
         '- Evaluate EVERY candidate action in candidate_actions. Do not choose a tool first and then assume all of its requests should run.\n'
         '- SELECT an action ID when that exact request/scanner action is useful, complementary or independently evidentiary.\n'
@@ -1452,6 +1485,7 @@ def _planner_system_message() -> str:
         'Set request_adaptive_extension=true only when useful selected work should receive up to +12.5% capacity above the resolved normal round capacity; never request it merely to fill capacity.\n'
         '- For every selected_action_id, include one matching selected_action_priorities entry with an integer priority from 0 to 100. Use the same scale across batches: 100 = highest-value action for this assessment, 0 = selected only as a very low-priority fallback.\n'
         '- Order selected_action_ids from highest to lowest priority within this batch. After all batches, Python merges selections by YOUR numeric priorities before applying the resolved round admission capacity; ties preserve your returned order.\n'
+        '- If final_planning_round=true, there is NO later planner opportunity. Do not defer a distinct, safe, useful action merely because it could be run later; only defer it for an actual duplication/applicability/value reason. Preserve breadth across application_family values when useful actions exist in multiple families.\n'
         '- finish is a batch-local signal: set it true only when none of the candidates in this batch is useful.\n\n'
         '[OUTPUT CONTRACT]\n'
         'Return exactly one JSON object with these fields and no others: '
@@ -1588,6 +1622,15 @@ def ai_plan(state: AgentState) -> dict[str, Any]:
     planner_budget_deferred_candidates = 0
 
     def build_batch_prompt(batch_number: int, batch_count: int, batch: list[dict[str, Any]], selected_count: int) -> dict[str, Any]:
+        selected_tool_counts: Counter[str] = Counter()
+        selected_family_counts: Counter[str] = Counter()
+        for selected_id in selected_ids:
+            selected_action = candidate_map.get(selected_id)
+            if not isinstance(selected_action, dict):
+                continue
+            selected_tool_counts[str(selected_action.get('tool') or '')] += 1
+            _, selected_family = shared._application_family_key(str(selected_action.get('target_url') or ''))
+            selected_family_counts[selected_family or '/'] += 1
         return {
             'target': state['target'],
             'round': current_round,
@@ -1602,8 +1645,11 @@ def ai_plan(state: AgentState) -> dict[str, Any]:
             'resolved_normal_round_capacity': int(initial_budget['normal_base']),
             'adaptive_round_capacity': int(initial_budget['adaptive_ceiling']),
             'remaining_rounds': int(initial_budget['remaining_rounds']),
+            'final_planning_round': bool(current_round >= int(state.get('max_rounds', 1) or 1)),
             'required_capacity_per_round': int(initial_budget['required_per_round']),
             'selected_so_far_count': selected_count,
+            'selected_so_far_by_tool': dict(sorted(selected_tool_counts.items())),
+            'selected_so_far_by_application_family': dict(sorted(selected_family_counts.items())),
             'discovery_summary': _planner_discovery_summary(state['discovery']),
             'previous_results': compact_results(state['results']),
             'available_tools': registry,
@@ -2954,23 +3000,9 @@ def discovery_node(state: AgentState) -> dict[str, Any]:
     discovery, diagnostics = ({}, list(state['diagnostics']))
     state_changes_allowed = shared.state_changing_tests_allowed(state['target'], state.get('allow_state_changes'))
     assessment_deadline = _assessment_execution_deadline(state)
-    service_time_budget = None if assessment_deadline is None else max(0.0, assessment_deadline - time.monotonic())
-    print(
-        f"    [DISCOVERY] same-host service sweep start: enabled={shared.DISCOVER_SAME_HOST_SERVICES}; "
-        f"network_inflight={shared.DISCOVERY_NETWORK_MAX_INFLIGHT}; rate={shared.MAX_REQUEST_RATE:g} req/s.",
-        flush=True,
-    )
-    shared_service_discovery = shared.discover_same_host_web_services(
-        state['target'], time_budget_seconds=service_time_budget,
-    )
-    print(
-        f"    [DISCOVERY] same-host service sweep complete: ports={int(shared_service_discovery.get('ports_probed', 0) or 0)}/"
-        f"{int(shared_service_discovery.get('candidate_ports_planned', 0) or 0)}; "
-        f"web_services={len(shared_service_discovery.get('web_services', []) or [])}; "
-        f"cache_hit={bool(shared_service_discovery.get('cache_hit', False))}; "
-        f"elapsed={float(shared_service_discovery.get('duration_seconds', 0.0) or 0.0):.1f}s.",
-        flush=True,
-    )
+    # Preserve the primary application frontier first. A full same-host TCP sweep used to run here
+    # synchronously and could delay web crawling/authenticated discovery by tens of minutes.
+    # Service breadth is still retained, but it runs only after every primary profile has completed.
     profile_results: dict[str, dict[str, Any]] = {}
     profile_workers = max(1, min(len(state['profiles']) or 1, int(shared.PARALLELISM_POLICY.get('profile_workers') or 1)))
 
@@ -2987,7 +3019,8 @@ def discovery_node(state: AgentState) -> dict[str, Any]:
             forced_seeds=list(state.get('entry_points') or []),
             allow_state_changes=state_changes_allowed,
             wall_clock_deadline=assessment_deadline,
-            precomputed_same_host_service_discovery=shared_service_discovery,
+            expand_authorized_service_hosts=False,
+            defer_same_host_service_discovery=True,
         )
         return name, found
 
@@ -3002,6 +3035,99 @@ def discovery_node(state: AgentState) -> dict[str, Any]:
                     f"({len(found.get('html_urls', []))} HTML, {len(found.get('request_cases', []))} contracts).",
                     flush=True,
                 )
+
+    # The primary-host port sweep is intentionally secondary to application discovery. Keep its
+    # first slice bounded; the larger shared budget remains available for later authorized-host
+    # expansion instead of aging the web session before crawling starts.
+    service_time_budget = shared.same_host_service_initial_time_budget_seconds()
+    if assessment_deadline is not None:
+        service_time_budget = min(service_time_budget, max(0.0, assessment_deadline - time.monotonic()))
+    print(
+        f"    [DISCOVERY] same-host service sweep start after primary app crawl: enabled={shared.DISCOVER_SAME_HOST_SERVICES}; "
+        f"budget={service_time_budget:.1f}s; network_inflight={shared.DISCOVERY_NETWORK_MAX_INFLIGHT}; "
+        f"rate={shared.MAX_REQUEST_RATE:g} req/s.",
+        flush=True,
+    )
+    shared_service_discovery = shared.discover_same_host_web_services(
+        state['target'], time_budget_seconds=service_time_budget,
+    )
+    print(
+        f"    [DISCOVERY] same-host service sweep complete: ports={int(shared_service_discovery.get('ports_probed', 0) or 0)}/"
+        f"{int(shared_service_discovery.get('candidate_ports_planned', 0) or 0)}; "
+        f"web_services={len(shared_service_discovery.get('web_services', []) or [])}; "
+        f"cache_hit={bool(shared_service_discovery.get('cache_hit', False))}; "
+        f"elapsed={float(shared_service_discovery.get('duration_seconds', 0.0) or 0.0):.1f}s.",
+        flush=True,
+    )
+
+    service_continuation_needed = bool(
+        int(shared_service_discovery.get('candidate_ports_deferred', 0) or 0) > 0
+        and shared.same_host_service_remaining_time_budget_seconds() > 0
+    )
+
+    def _merge_service_profile(profile: dict[str, Any]) -> tuple[str, dict[str, Any]]:
+        name = str(profile.get('name') or '')
+        found = profile_results[name]
+        merged = shared.merge_primary_same_host_service_discovery(
+            found, state['target'], str(profile.get('cookies') or ''), shared_service_discovery,
+            max_pages=shared.MAX_CRAWL_PAGES, allow_state_changes=state_changes_allowed,
+            wall_clock_deadline=assessment_deadline,
+            # Targeted sibling-host port expansion runs before the primary full continuation so a
+            # dense primary host cannot consume the entire shared service budget first.
+            expand_authorized_service_hosts=True,
+        )
+        return name, merged
+
+    if state['profiles']:
+        with ThreadPoolExecutor(max_workers=profile_workers, thread_name_prefix='secops-service-root-recrawl') as executor:
+            futures = {executor.submit(_merge_service_profile, profile): str(profile.get('name') or '') for profile in state['profiles']}
+            for future in as_completed(futures):
+                name, found = future.result()
+                profile_results[name] = found
+                print(
+                    f"    [DISCOVERY] profile {name or '?'} service-root merge complete "
+                    f"({len(found.get('proactive_service_roots', []))} roots, {len(found.get('html_urls', []))} HTML total).",
+                    flush=True,
+                )
+
+    continuation_budget = shared.same_host_service_remaining_time_budget_seconds()
+    if assessment_deadline is not None:
+        continuation_budget = min(continuation_budget, max(0.0, assessment_deadline - time.monotonic()))
+    if service_continuation_needed and continuation_budget > 0:
+        print(
+            f"    [DISCOVERY] same-host service sweep continuation: remaining_ports="
+            f"{int(shared_service_discovery.get('candidate_ports_deferred', 0) or 0)}; "
+            f"budget={continuation_budget:.1f}s.",
+            flush=True,
+        )
+        continued_service_discovery = shared.discover_same_host_web_services(
+            state['target'], time_budget_seconds=continuation_budget, resume_from=shared_service_discovery,
+        )
+        print(
+            f"    [DISCOVERY] same-host service continuation complete: cumulative_ports="
+            f"{int(continued_service_discovery.get('ports_probed', 0) or 0)}/"
+            f"{int(continued_service_discovery.get('candidate_ports_planned', 0) or 0)}; "
+            f"this_call={int(continued_service_discovery.get('ports_probed_this_call', 0) or 0)}; "
+            f"new_web_services={len(continued_service_discovery.get('new_web_services_this_call', []) or [])}; "
+            f"elapsed={float(continued_service_discovery.get('duration_seconds', 0.0) or 0.0):.1f}s.",
+            flush=True,
+        )
+
+        def _merge_continued_service_profile(profile: dict[str, Any]) -> tuple[str, dict[str, Any]]:
+            name = str(profile.get('name') or '')
+            merged = shared.merge_primary_same_host_service_discovery(
+                profile_results[name], state['target'], str(profile.get('cookies') or ''), continued_service_discovery,
+                max_pages=shared.MAX_CRAWL_PAGES, allow_state_changes=state_changes_allowed,
+                wall_clock_deadline=assessment_deadline, expand_authorized_service_hosts=True,
+            )
+            return name, merged
+
+        if state['profiles']:
+            with ThreadPoolExecutor(max_workers=profile_workers, thread_name_prefix='secops-service-continuation-recrawl') as executor:
+                futures = {executor.submit(_merge_continued_service_profile, profile): str(profile.get('name') or '') for profile in state['profiles']}
+                for future in as_completed(futures):
+                    name, found = future.result()
+                    profile_results[name] = found
 
     for profile in state['profiles']:
         found = profile_results[str(profile.get('name') or '')]
@@ -3118,6 +3244,11 @@ def _agentic_sibling_selection(state: AgentState, profile_name: str, tool: str) 
     allowed_origins: set[str] | None = None
     if authenticated:
         for origin, _ in shared.discovered_scope_origin_ranking(found, state['target']):
+            if not shared.runtime_sibling_auth_origin_allows_authenticated_broad(found, origin):
+                # Discovery already tried this sibling and conclusively found no usable authenticated
+                # entry/session. Keep anonymous broad coverage, but do not waste an authenticated
+                # scanner action that will immediately fail its own auth precheck.
+                continue
             target_url = shared.authenticated_broad_target(found, origin, raw_cookie)
             if target_url:
                 authenticated_targets[origin] = target_url
@@ -3128,6 +3259,12 @@ def _agentic_sibling_selection(state: AgentState, profile_name: str, tool: str) 
         allowed_origins=allowed_origins,
         exclude_origins=_completed_sibling_origins(state, profile_name, tool),
     )
+    if not authenticated:
+        # Preserve an observed application mount path on sibling services. Broad scanners do not
+        # autonomously follow redirects, so reducing ``origin/app/`` back to ``origin/`` can lose
+        # real service coverage even though discovery already found the application.
+        for origin, _ in selection.get('ranking', selection.get('selected', [])):
+            authenticated_targets[origin] = shared.broad_discovery_target(found, origin)
     return selection, authenticated_targets
 
 # Discovery evidence is converted into tool actions that the planner can safely choose.
@@ -3175,13 +3312,13 @@ def discovery_candidate_actions(state: AgentState) -> list[dict[str, Any]]:
                 })
         for case in select_arjun_request_cases(state['discovery'].get(name, {}), state['target'], allow_state_changes=state_changes_allowed, agentic_catalog=True):
             adaptive = bool(case.get('adaptive_budget'))
-            actions.append({'profile': name, 'tool': 'arjun', 'target_url': case['url'], 'method': case.get('method', 'GET'), 'data': case.get('data', ''), 'parameters': case.get('parameters', []), 'jwt_token': '', 'injection_url': '', 'adaptive_budget': adaptive, 'priority_score': case.get('priority_score'), 'reason': ('Discovery ranking marked this as an adaptive high-value candidate; AI still decides execution. ' if adaptive else '') + 'Hidden-parameter discovery using the real request method and body.'})
+            actions.append({'profile': name, 'tool': 'arjun', 'target_url': case['url'], 'method': case.get('method', 'GET'), 'data': case.get('data', ''), 'parameters': case.get('parameters', []), 'content_type': case.get('content_type', case.get('enctype', '')), 'jwt_token': '', 'injection_url': '', 'adaptive_budget': adaptive, 'priority_score': case.get('priority_score'), 'reason': ('Discovery ranking marked this as an adaptive high-value candidate; AI still decides execution. ' if adaptive else '') + 'Hidden-parameter discovery using the real request method and body.'})
         for tool in ('sqlmap', 'dalfox', 'commix', 'traversal', 'idor'):
             for case in select_tool_request_cases(state['discovery'].get(name, {}), tool, authenticated_profile=authenticated, allow_state_changes=state_changes_allowed, credential_cookies=_profile_cookie(state, name), agentic_catalog=True):
                 adaptive = bool(case.get('adaptive_budget'))
                 coverage_reserve = bool(case.get('coverage_reserve'))
                 prefix = f'Discovery ranking marked this as an adaptive high-value candidate for {tool}; AI still decides execution. ' if adaptive else 'Discovery marked this as a routing-value traversal/LFI candidate; AI still decides execution. ' if coverage_reserve else ''
-                actions.append({'profile': name, 'tool': tool, 'target_url': case['url'], 'method': case.get('method', 'GET'), 'data': case.get('data', ''), 'parameters': case.get('parameters', []), 'jwt_token': '', 'injection_url': '', 'adaptive_budget': adaptive, 'coverage_reserve': coverage_reserve, 'priority_score': case.get('priority_score'), 'reason': prefix + f'Concrete discovered request candidate for {tool}.'})
+                actions.append({'profile': name, 'tool': tool, 'target_url': case['url'], 'method': case.get('method', 'GET'), 'data': case.get('data', ''), 'parameters': case.get('parameters', []), 'content_type': case.get('content_type', case.get('enctype', '')), 'enctype': case.get('enctype', case.get('content_type', '')), 'jwt_token': '', 'injection_url': '', 'adaptive_budget': adaptive, 'coverage_reserve': coverage_reserve, 'priority_score': case.get('priority_score'), 'reason': prefix + f'Concrete discovered request candidate for {tool}.'})
         if authenticated:
             raw_cookie = _profile_cookie(state, name)
             for case in select_authorization_request_cases(state['discovery'].get(name, {}), agentic_catalog=True):
@@ -3191,7 +3328,16 @@ def discovery_candidate_actions(state: AgentState) -> list[dict[str, Any]]:
                 if not (shared.scope_cookie_header(case_url, raw_cookie) or shared.runtime_target_auth_available(raw_cookie, case_url)):
                     continue
                 adaptive = bool(case.get('adaptive_budget'))
-                actions.append({'profile': name, 'tool': 'authorization', 'target_url': case['url'], 'method': 'GET', 'data': '', 'parameters': case.get('parameters', []), 'jwt_token': '', 'injection_url': '', 'adaptive_budget': adaptive, 'priority_score': case.get('priority_score'), 'reason': ('Discovery ranking marked this as an adaptive high-value authorization candidate; AI still decides execution. ' if adaptive else '') + 'Read-only authorization differential candidate derived from an identity, object or privileged-resource signal.'})
+                actions.append({
+                    'profile': name, 'tool': 'authorization', 'target_url': case['url'],
+                    'method': str(case.get('method', 'GET')).upper(), 'data': str(case.get('data') or ''),
+                    'parameters': case.get('parameters', []),
+                    'content_type': case.get('content_type', case.get('enctype', '')),
+                    'enctype': case.get('enctype', case.get('content_type', '')),
+                    'jwt_token': '', 'injection_url': '', 'adaptive_budget': adaptive,
+                    'priority_score': case.get('priority_score'),
+                    'reason': ('Discovery ranking marked this as an adaptive high-value authorization candidate; AI still decides execution. ' if adaptive else '') + 'Read-only authorization differential candidate derived from an identity, object or privileged-resource signal.',
+                })
         for case in select_browser_request_cases(state['discovery'].get(name, {}), agentic_catalog=True):
             if (not state_changes_allowed) and shared.request_case_state_change_reason(case):
                 continue
@@ -3205,14 +3351,17 @@ def discovery_candidate_actions(state: AgentState) -> list[dict[str, Any]]:
                 'injection_url': '',
                 'fields': case.get('fields', []),
                 'source_url': case.get('source_url', ''),
+                'content_type': case.get('content_type', case.get('enctype', '')),
+                'enctype': case.get('enctype', case.get('content_type', '')),
                 'client_sources': case.get('client_sources', []),
                 'client_sinks': case.get('client_sinks', []),
                 'adaptive_budget': bool(case.get('adaptive_budget')),
                 'priority_score': case.get('priority_score'),
                 'reason': ('Discovery ranking marked this as an adaptive high-value candidate; AI still decides execution. ' if case.get('adaptive_budget') else '') + 'Browser verification candidate derived from XSS-like parameters or client-side source/sink evidence.'})
         for case in select_workflow_request_cases(state['discovery'].get(name, {}), agentic_catalog=True):
-            if (not state_changes_allowed) and shared.request_case_state_change_reason(case):
-                continue
+            # Workflow remains useful when state changes are disabled: the server performs structural
+            # CSRF/upload/auth/CAPTCHA analysis and gates every active state-changing probe internally.
+            # Dropping mutative forms here made Agentic coverage weaker than Deterministic coverage.
             actions.append({'profile': name,
                 'tool': 'workflow',
                 'target_url': case['url'],
@@ -3226,6 +3375,7 @@ def discovery_candidate_actions(state: AgentState) -> list[dict[str, Any]]:
                 'file_parameters': case.get('file_parameters', []),
                 'token_parameters': case.get('token_parameters', []),
                 'enctype': case.get('enctype', ''),
+                'content_type': case.get('content_type', case.get('enctype', '')),
                 'adaptive_budget': bool(case.get('adaptive_budget')),
                 'priority_score': case.get('priority_score'),
                 'reason': ('Discovery ranking marked this as an adaptive high-value candidate; AI still decides execution. ' if case.get('adaptive_budget') else '') + 'Multi-step workflow candidate derived from discovered form metadata.'})
@@ -3236,8 +3386,51 @@ def discovery_candidate_actions(state: AgentState) -> list[dict[str, Any]]:
             actions.append({'profile': name, 'tool': 'interactsh', 'target_url': state['target'], 'method': 'GET', 'data': '', 'parameters': ['explicit'], 'jwt_token': '', 'injection_url': state['injection_url'], 'oast_class': 'explicit', 'reason': 'Configured OAST URL.'})
         else:
             for case in select_oast_request_cases(state['discovery'].get(name, {}), state['target'], allow_state_changes=state_changes_allowed, agentic_catalog=True):
-                actions.append({'profile': name, 'tool': 'interactsh', 'target_url': state['target'], 'method': case.get('method', 'GET'), 'data': case.get('data', ''), 'parameters': case.get('parameters', []), 'jwt_token': '', 'injection_url': case.get('injection_url', ''), 'oast_class': case.get('oast_class', 'remote-fetch'), 'reason': f"Discovered OAST-capable candidate parameter: {case.get('parameter', 'unknown')}."})
+                actions.append({'profile': name, 'tool': 'interactsh', 'target_url': state['target'], 'method': case.get('method', 'GET'), 'data': case.get('data', ''), 'parameters': case.get('parameters', []), 'content_type': case.get('content_type', ''), 'jwt_token': '', 'injection_url': case.get('injection_url', ''), 'oast_class': case.get('oast_class', 'remote-fetch'), 'reason': f"Discovered OAST-capable candidate parameter: {case.get('parameter', 'unknown')}."})
     return _dedupe_no_cookie_profile_actions(state, actions)
+
+def _proposal_matches_discovery_case(case: dict[str, Any], raw: dict[str, Any], target_url: str, method: str='') -> bool:
+    """Require the planner-selected local action to map back to the same discovered request contract."""
+    if str(case.get('url') or '') != str(target_url or ''):
+        return False
+    if method and str(case.get('method', 'GET')).upper() != str(method).upper():
+        return False
+    if 'data' in raw and str(case.get('data') or '') != str(raw.get('data') or ''):
+        return False
+    if 'parameters' in raw:
+        left = sorted(str(value) for value in case.get('parameters', []) if str(value))
+        right = sorted(str(value) for value in raw.get('parameters', []) if str(value))
+        if left != right:
+            return False
+    raw_content_type = str(raw.get('content_type') or '').strip().lower()
+    if raw_content_type:
+        candidate_type = str(case.get('content_type') or case.get('enctype') or '').strip().lower()
+        if candidate_type != raw_content_type:
+            return False
+    raw_enctype = str(raw.get('enctype') or '').strip().lower()
+    if raw_enctype:
+        candidate_enctype = str(case.get('enctype') or case.get('content_type') or '').strip().lower()
+        if candidate_enctype != raw_enctype:
+            return False
+    for field_name in ('file_parameters', 'token_parameters'):
+        if field_name in raw:
+            left = sorted(str(value) for value in case.get(field_name, []) if str(value))
+            right = sorted(str(value) for value in raw.get(field_name, []) if str(value))
+            if left != right:
+                return False
+    if 'fields' in raw:
+        def field_shape(values: Any) -> list[tuple[str, str, str]]:
+            return sorted(
+                (str(value.get('name') or ''), str(value.get('type') or ''), str(value.get('tag') or ''))
+                for value in (values or []) if isinstance(value, dict) and str(value.get('name') or '')
+            )
+        if field_shape(case.get('fields')) != field_shape(raw.get('fields')):
+            return False
+    raw_source = str(raw.get('source_url') or '')
+    if raw_source and str(case.get('source_url') or '') != raw_source:
+        return False
+    return True
+
 
 # Planner validation compares proposed actions with target scope, discovery evidence, and safety rules.
 # Per-tool quotas are deliberately not applied here; the global dynamic round capacity is enforced
@@ -3284,6 +3477,7 @@ def validate_plan(state: AgentState, proposed: Any, *, enforce_execution_limits:
         file_parameters: list[str] = []
         token_parameters: list[str] = []
         enctype = ''
+        content_type = ''
         selected: dict[str, Any] = {}
         oast_class = str(raw.get('oast_class') or '')
         scope = REGISTRY[tool][2]
@@ -3307,9 +3501,7 @@ def validate_plan(state: AgentState, proposed: Any, *, enforce_execution_limits:
             if profile not in arjun_cases_cache:
                 arjun_cases_cache[profile] = select_arjun_request_cases(found, state['target'], allow_state_changes=shared.state_changing_tests_allowed(state['target'], state.get('allow_state_changes')), agentic_catalog=True)
             cases = arjun_cases_cache[profile]
-            matching = [case for case in cases if str(case.get('url', '')) == target_url]
-            if method:
-                matching = [case for case in matching if str(case.get('method', 'GET')).upper() == method]
+            matching = [case for case in cases if _proposal_matches_discovery_case(case, raw, target_url, method)]
             if not matching:
                 continue
             selected = matching[0]
@@ -3321,9 +3513,7 @@ def validate_plan(state: AgentState, proposed: Any, *, enforce_execution_limits:
             if tool_cases_key not in tool_cases_cache:
                 tool_cases_cache[tool_cases_key] = select_tool_request_cases(found, tool, authenticated_profile=profile_has_cookie, allow_state_changes=shared.state_changing_tests_allowed(state['target'], state.get('allow_state_changes')), credential_cookies=_profile_cookie(state, profile), agentic_catalog=True)
             cases = tool_cases_cache[tool_cases_key]
-            matching = [case for case in cases if str(case.get('url', '')) == target_url]
-            if method:
-                matching = [case for case in matching if str(case.get('method', 'GET')).upper() == method]
+            matching = [case for case in cases if _proposal_matches_discovery_case(case, raw, target_url, method)]
             if not matching:
                 continue
             selected = matching[0]
@@ -3347,22 +3537,22 @@ def validate_plan(state: AgentState, proposed: Any, *, enforce_execution_limits:
             if profile not in authorization_cases_cache:
                 authorization_cases_cache[profile] = select_authorization_request_cases(found, agentic_catalog=True)
             cases = authorization_cases_cache[profile]
-            matching = [case for case in cases if str(case.get('url', '')) == target_url]
+            matching = [case for case in cases if _proposal_matches_discovery_case(case, raw, target_url, method)]
             if not matching:
                 continue
             selected = matching[0]
-            if (not shared.state_changing_tests_allowed(state['target'], state.get('allow_state_changes'))) and shared.request_case_state_change_reason(selected):
+            # Authorization differential is always read-only even when the wider assessment allows
+            # state changes. The selector already filters mutative contracts; re-check fail-closed.
+            if shared.request_case_state_change_reason(selected):
                 continue
-            method = 'GET'
-            data = ''
+            method = str(selected.get('method', 'GET')).upper()
+            data = str(selected.get('data', ''))
             parameters = [str(value) for value in selected.get('parameters', [])]
         elif scope == 'browser':
             if profile not in browser_cases_cache:
                 browser_cases_cache[profile] = select_browser_request_cases(found, agentic_catalog=True)
             cases = browser_cases_cache[profile]
-            matching = [case for case in cases if str(case.get('url', '')) == target_url]
-            if method:
-                matching = [case for case in matching if str(case.get('method', 'GET')).upper() == method]
+            matching = [case for case in cases if _proposal_matches_discovery_case(case, raw, target_url, method)]
             if not matching:
                 continue
             selected = matching[0]
@@ -3379,9 +3569,7 @@ def validate_plan(state: AgentState, proposed: Any, *, enforce_execution_limits:
             if profile not in workflow_cases_cache:
                 workflow_cases_cache[profile] = select_workflow_request_cases(found, agentic_catalog=True)
             cases = workflow_cases_cache[profile]
-            matching = [case for case in cases if str(case.get('url', '')) == target_url]
-            if method:
-                matching = [case for case in matching if str(case.get('method', 'POST')).upper() == method]
+            matching = [case for case in cases if _proposal_matches_discovery_case(case, raw, target_url, method)]
             if not matching:
                 continue
             selected = matching[0]
@@ -3409,7 +3597,10 @@ def validate_plan(state: AgentState, proposed: Any, *, enforce_execution_limits:
                 if profile not in oast_cases_cache:
                     oast_cases_cache[profile] = select_oast_request_cases(found, state['target'], allow_state_changes=shared.state_changing_tests_allowed(state['target'], state.get('allow_state_changes')), agentic_catalog=True)
                 candidates = oast_cases_cache[profile]
-                matching = [item for item in candidates if not injection or item.get('injection_url') == injection]
+                matching = [item for item in candidates if (not injection or item.get('injection_url') == injection)]
+                contract_matching = [item for item in matching if _proposal_matches_discovery_case(item, raw, str(item.get('url') or target_url), method)]
+                if contract_matching:
+                    matching = contract_matching
                 if not matching:
                     continue
                 selected = matching[0]
@@ -3418,7 +3609,11 @@ def validate_plan(state: AgentState, proposed: Any, *, enforce_execution_limits:
                 data = str(selected.get('data', ''))
                 parameters = [str(value) for value in selected.get('parameters', [])]
                 oast_class = str(selected.get('oast_class') or 'remote-fetch')
-        action = {'profile': profile, 'tool': tool, 'target_url': target_url, 'method': method or 'GET', 'data': data, 'parameters': parameters, 'source_url': source_url, 'fields': fields, 'client_sources': client_sources, 'client_sinks': client_sinks, 'file_parameters': file_parameters, 'token_parameters': token_parameters, 'enctype': enctype, 'jwt_token': token, 'injection_url': injection, 'oast_class': oast_class, 'adaptive_budget': bool(selected.get('adaptive_budget')), 'coverage_reserve': bool(selected.get('coverage_reserve') or raw.get('coverage_reserve')), 'priority_score': selected.get('priority_score'), 'sibling_broad': bool(raw.get('sibling_broad')), 'sibling_origin_score': raw.get('sibling_origin_score'), 'reason': str(raw.get('reason', ''))[:500] or 'No planner reason supplied.'}
+        if selected:
+            content_type = str(selected.get('content_type') or selected.get('enctype') or '')
+            if not enctype:
+                enctype = str(selected.get('enctype') or selected.get('content_type') or '')
+        action = {'profile': profile, 'tool': tool, 'target_url': target_url, 'method': method or 'GET', 'data': data, 'parameters': parameters, 'source_url': source_url, 'fields': fields, 'client_sources': client_sources, 'client_sinks': client_sinks, 'file_parameters': file_parameters, 'token_parameters': token_parameters, 'enctype': enctype, 'content_type': content_type, 'jwt_token': token, 'injection_url': injection, 'oast_class': oast_class, 'adaptive_budget': bool(selected.get('adaptive_budget')), 'coverage_reserve': bool(selected.get('coverage_reserve') or raw.get('coverage_reserve')), 'priority_score': selected.get('priority_score'), 'sibling_broad': bool(raw.get('sibling_broad')), 'sibling_origin_score': raw.get('sibling_origin_score'), 'reason': str(raw.get('reason', ''))[:500] or 'No planner reason supplied.'}
         identifier = action_id(action)
         # Normal Agentic execution has no Python-imposed per-tool action quota. The AI decides the
         # mix of tools and exact concrete actions; Python removes only invalid/duplicate/safety-blocked
@@ -3770,7 +3965,7 @@ async def execute_action(action: dict[str, Any], cookies: dict[str, str], discov
         oast_class = str(action.get('oast_class') or 'remote-fetch')
         oast_timeout = shared.oast_timeout_seconds(oast_class)
         request_url = _action_request_url(action, action['target_url'])
-        arguments = {'target_url': action['target_url'], 'injection_url': action['injection_url'], 'cookies': shared.scope_cookie_header(request_url, cookies.get(profile, '')), 'method': action.get('method', 'GET'), 'data': action.get('data', ''), 'parameter': (action.get('parameters') or [''])[0], 'timeout': oast_timeout, 'request_rate': shared.MAX_REQUEST_RATE, 'allow_state_changes': shared.state_changing_tests_allowed(action['target_url'], allow_state_changes), 'allow_tls_trust_retry': shared.url_in_authorized_scope(action['target_url'], request_url), 'authorized_origins': sorted(shared.AUTHORIZED_SCOPE_ORIGINS), 'allow_same_host_ports': bool(shared.ALLOW_SAME_HOST_PORTS)}
+        arguments = {'target_url': action['target_url'], 'injection_url': action['injection_url'], 'cookies': shared.scope_cookie_header(request_url, cookies.get(profile, '')), 'method': action.get('method', 'GET'), 'data': action.get('data', ''), 'content_type': action.get('content_type', ''), 'parameter': (action.get('parameters') or [''])[0], 'timeout': oast_timeout, 'request_rate': shared.MAX_REQUEST_RATE, 'allow_state_changes': shared.state_changing_tests_allowed(action['target_url'], allow_state_changes), 'allow_tls_trust_retry': shared.url_in_authorized_scope(action['target_url'], request_url), 'authorized_origins': sorted(shared.AUTHORIZED_SCOPE_ORIGINS), 'allow_same_host_ports': bool(shared.ALLOW_SAME_HOST_PORTS)}
     else:
         profile_discovery = discovery.get(profile, {})
         labels = identity_labels or {}

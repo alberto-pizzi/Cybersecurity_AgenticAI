@@ -22,7 +22,7 @@ PUBLIC_CONTENT_RE = re.compile(
     r"(?:^|/)(?:docs?|documentation|instructions?|help|about|changelog|license|copying|readme|static|assets?)(?:/|$)", re.I,
 )
 AUTHZ_PATH_RE = re.compile(
-    r"(?:^|/)(?:admin|accounts?|profiles?|users?|members?|orders?|invoices?|documents?|downloads?|reports?|records?|settings|manage(?:ment)?|roles?|permissions?|api|private|internal|dashboard|billing|payments?)(?:/|$)",
+    r"(?:^|/)(?:graphql|admin|accounts?|profiles?|users?|members?|orders?|invoices?|documents?|downloads?|reports?|records?|settings|manage(?:ment)?|roles?|permissions?|api|private|internal|dashboard|billing|payments?)(?:/|$)",
     re.I,
 )
 AUTHZ_PARAMETER_RE = re.compile(
@@ -53,8 +53,14 @@ def _authorization_relevance(target_url: str, parameters: list[str] | None) -> t
         score += 25
     return score, reasons
 
-# Issue a read-only GET for one identity while keeping the request bounded and same-origin.
-def _safe_get(url: str, cookies: str, request_budget: float, pacer: RequestRatePacer, deadline: float) -> tuple[requests.Response | None, str]:
+# Issue one read-only request contract for an identity while keeping redirects bounded and same-origin.
+def _safe_request(
+    url: str, cookies: str, method: str, data: str, content_type: str,
+    request_budget: float, pacer: RequestRatePacer, deadline: float,
+) -> tuple[requests.Response | None, str]:
+    method = str(method or "GET").upper()
+    if method not in {"GET", "POST"}:
+        return None, "unsupported_method"
     session = requests.Session()
     session.headers.update({
         "User-Agent": "SecOps-Authorization-Differential/1.0",
@@ -63,12 +69,18 @@ def _safe_get(url: str, cookies: str, request_budget: float, pacer: RequestRateP
     if cookies:
         session.headers["Cookie"] = cookies
     current, seen = url, set()
+    current_method, current_data = method, str(data or "")
+    current_content_type = str(content_type or "").strip()
     for _ in range(3):
         if remaining_budget(deadline) <= 0:
             return None, "time_limit_reached"
         if not same_origin(url, current):
             return None, "cross_origin_blocked"
-        state_reason = request_contract_state_change_reason({"url": current, "method": "GET", "data": "", "parameters": []})
+        contract = {
+            "url": current, "method": current_method, "data": current_data,
+            "parameters": [], "content_type": current_content_type,
+        }
+        state_reason = request_contract_state_change_reason(contract)
         if state_reason:
             return None, "state_change_target_blocked:" + state_reason
         try:
@@ -77,7 +89,11 @@ def _safe_get(url: str, cookies: str, request_budget: float, pacer: RequestRateP
             request_timeout = deadline_bounded_request_timeout(
                 (max(0.01, float(request_budget) * 0.25), max(0.01, float(request_budget))), deadline,
             )
-            response = session.get(current, timeout=request_timeout, allow_redirects=False)
+            headers = {"Content-Type": current_content_type} if current_method == "POST" and current_content_type else None
+            response = session.request(
+                current_method, current, data=current_data if current_method == "POST" else None,
+                headers=headers, timeout=request_timeout, allow_redirects=False,
+            )
         except requests.Timeout:
             return None, "time_limit_reached"
         except requests.RequestException as exc:
@@ -93,15 +109,21 @@ def _safe_get(url: str, cookies: str, request_budget: float, pacer: RequestRateP
         if not same_origin(url, candidate):
             response.url = current
             return response, "cross_origin_redirect_blocked"
-        state_reason = request_contract_state_change_reason({"url": candidate, "method": "GET", "data": "", "parameters": []})
-        if state_reason:
+        next_method, next_data, next_content_type = current_method, current_data, current_content_type
+        if current_method == "POST" and response.status_code in {301, 302, 303}:
+            next_method, next_data, next_content_type = "GET", "", ""
+        next_reason = request_contract_state_change_reason({
+            "url": candidate, "method": next_method, "data": next_data,
+            "parameters": [], "content_type": next_content_type,
+        })
+        if next_reason:
             response.url = current
-            return response, "state_change_redirect_blocked:" + state_reason
+            return response, "state_change_redirect_blocked:" + next_reason
         if candidate in seen:
             response.url = current
             return response, "redirect_loop"
         seen.add(current)
-        current = candidate
+        current, current_method, current_data, current_content_type = candidate, next_method, next_data, next_content_type
     response.url = current
     return response, "redirect_limit"
 
@@ -144,7 +166,7 @@ def _matching_access(
 
 # Convert scanner evidence into a normalized security finding.
 def _finding(
-    target_url: str, alternate_label: str, primary: requests.Response, alternate: requests.Response,
+    target_url: str, method: str, alternate_label: str, primary: requests.Response, alternate: requests.Response,
     similarity: float, length_ratio: float,
 ) -> dict[str, Any]:
     anonymous = alternate_label == "anonymous"
@@ -172,7 +194,7 @@ def _finding(
             else "If the requested object belongs only to the primary identity, another authenticated user may be able to access it without object-level authorization."
         ),
         "solution": "Enforce authentication and object/function-level authorization on every request, deny by default, and validate with accounts that own different objects and roles.",
-        "url": target_url, "method": "GET",
+        "url": target_url, "method": str(method or "GET").upper(),
         "evidence": (
             f"alternate={alternate_label}; primary_status={primary.status_code}; "
             f"alternate_status={alternate.status_code}; response_similarity={similarity:.4f}; "
@@ -182,21 +204,27 @@ def _finding(
         "owasp_category": "A01:2021 Broken Access Control", "cwe_id": "639" if not anonymous else "862",
     }
 
-# Compare a read-only GET under primary, secondary and anonymous identities.
+# Compare one centrally classified read-only GET/POST contract under primary, secondary and anonymous identities.
 @mcp.tool()
 def run_authorization_scan(
     target_url: str, cookies: str = "", secondary_cookies: str = "", identity_cookies: list[str] | None = None,
     identity_labels: list[str] | None = None, method: str = "GET", data: str = "", parameters: list[str] | None = None,
-    timeout: int = 30, request_rate: float | None = None,
+    content_type: str = "", timeout: int = 30, request_rate: float | None = None,
 ) -> dict:
 
     method = str(method or "GET").upper()
-    if method != "GET":
+    data = str(data or "")
+    content_type = str(content_type or "").strip()
+    if method not in {"GET", "POST"}:
         return skipped(
             "Authorization Differential Verifier", target_url,
-            "Authorization differential checks are intentionally limited to read-only GET requests.",
+            "Authorization differential checks support only read-only GET/POST request contracts.",
+            diagnosis="unsupported_method",
         )
-    state_reason = request_contract_state_change_reason({"url": target_url, "method": "GET", "data": "", "parameters": parameters or []})
+    state_reason = request_contract_state_change_reason({
+        "url": target_url, "method": method, "data": data, "parameters": parameters or [],
+        "content_type": content_type,
+    })
     if state_reason:
         return skipped(
             "Authorization Differential Verifier", target_url,
@@ -288,7 +316,10 @@ def run_authorization_scan(
     if remaining_budget(deadline) > 0:
         with ThreadPoolExecutor(max_workers=identity_workers, thread_name_prefix="secops-authz") as executor:
             futures = [
-                (label, executor.submit(_safe_get, target_url, cookie, fair_request_budget, pacer, deadline))
+                (label, executor.submit(
+                    _safe_request, target_url, cookie, method, data, content_type,
+                    fair_request_budget, pacer, deadline,
+                ))
                 for label, cookie in identity_specs
             ]
             for label, future in futures:
@@ -316,7 +347,9 @@ def run_authorization_scan(
 
     findings: list[dict[str, Any]] = []
     diagnostics: dict[str, Any] = {
-        "parameters": [str(value) for value in (parameters or [])], "primary": _summary(primary, primary_guard),
+        "parameters": [str(value) for value in (parameters or [])],
+        "request_method": method, "request_data_present": bool(data), "request_content_type": content_type,
+        "primary": _summary(primary, primary_guard),
         "anonymous": _summary(anonymous, anonymous_guard), "secondary_supplied": bool(supplied_alternates),
         "identity_comparison_count": len(supplied_alternates),
         "identity_labels": labels[:len(supplied_alternates)],
@@ -336,7 +369,7 @@ def run_authorization_scan(
         }
         if accepted and relevance_score > 0:
             findings.append(_finding(
-                target_url, "anonymous", primary, anonymous, similarity, length_ratio
+                target_url, method, "anonymous", primary, anonymous, similarity, length_ratio
             ))
     diagnostics["identity_comparisons"] = []
     alternate_timeout = False
@@ -352,7 +385,7 @@ def run_authorization_scan(
             })
             if accepted:
                 findings.append(_finding(
-                    target_url, f"authenticated_identity:{label}", primary, alternate, similarity, length_ratio,
+                    target_url, method, f"authenticated_identity:{label}", primary, alternate, similarity, length_ratio,
                 ))
         diagnostics["identity_comparisons"].append(row)
 
@@ -364,7 +397,7 @@ def run_authorization_scan(
         )
     return success(
         "Authorization Differential Verifier", target_url,
-        f"Read-only authorization differential completed. Findings: {len(findings)}.", vulnerabilities=findings,
+        f"Read-only {method} authorization differential completed. Findings: {len(findings)}.", vulnerabilities=findings,
         diagnostics=diagnostics,
     )
 
