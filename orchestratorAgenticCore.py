@@ -148,6 +148,14 @@ PLANNER_CONTEXT_SAFETY_TOKENS = 512
 # The planner needs representative outcomes and aggregate counts, not hundreds of full result rows.
 PLANNER_PREVIOUS_RESULT_ROWS_PER_PROFILE = {'test': 6, 'fast': 12, 'balanced': 20, 'deep': 28}
 PLANNER_PREVIOUS_RESULT_OUTPUT_CHARS = {'test': 120, 'fast': 160, 'balanced': 180, 'deep': 220}
+# Selection-progress metadata is advisory context, not the concrete action catalog. Keep it bounded
+# so unusually broad applications (hundreds/thousands of distinct route families) can never make a
+# later singleton candidate overflow the context window. Aggregate counts preserve the full totals;
+# only the verbose per-family breakdown is summarized.
+PLANNER_SELECTED_FAMILY_ROWS = {'test': 24, 'fast': 48, 'balanced': 96, 'deep': 160}
+PLANNER_SELECTED_FAMILY_KEY_CHARS = 240
+PLANNER_CANDIDATE_PARAMETER_CHARS = 160
+PLANNER_CANDIDATE_FAMILY_CHARS = 360
 
 # Per-batch final-analysis ceilings. These are intentionally independent from the CLI
 # --ai-timeout option, which belongs only to planner rounds. Mixing the two previously allowed a
@@ -877,6 +885,24 @@ def _parse_ai_plan_content(content: str) -> dict[str, Any]:
     return value
 
 
+def _planner_compact_label(value: Any, max_chars: int) -> str:
+    """Bound pathological labels while preserving both discriminating ends.
+
+    Prefix-only truncation can make two generated parameter/family names that differ only near the
+    end look identical to the planner. Keep the beginning and end with an explicit omitted marker;
+    this is prompt packaging only and never changes the underlying request contract.
+    """
+    text = str(value or '')
+    limit = max(16, int(max_chars))
+    if len(text) <= limit:
+        return text
+    marker = f'…<{len(text) - limit + 12} chars>…'
+    remaining = max(2, limit - len(marker))
+    head = (remaining + 1) // 2
+    tail = remaining - head
+    return text[:head] + marker + (text[-tail:] if tail else '')
+
+
 # Compact view of ONE concrete action. Python already validated the request contract; the AI decides
 # whether this exact action is useful. Values that could contain credentials remain local/redacted.
 def _planner_candidate_view(action: dict[str, Any], candidate_id: str) -> dict[str, Any]:
@@ -893,11 +919,11 @@ def _planner_candidate_view(action: dict[str, Any], candidate_id: str) -> dict[s
         'tool': str(action.get('tool') or ''),
         'method': str(action.get('method') or 'GET'),
         'url': compact_url,
-        'application_family': family_path or '/',
-        'parameters': [str(value) for value in action.get('parameters', [])][:12],
+        'application_family': _planner_compact_label(family_path or '/', PLANNER_CANDIDATE_FAMILY_CHARS),
+        'parameters': [_planner_compact_label(value, PLANNER_CANDIDATE_PARAMETER_CHARS) for value in action.get('parameters', [])][:12],
         'parameter_count': len([value for value in action.get('parameters', []) if str(value)]),
-        'file_parameters': [str(value) for value in action.get('file_parameters', [])][:4],
-        'token_parameters': [str(value) for value in action.get('token_parameters', [])][:4],
+        'file_parameters': [_planner_compact_label(value, PLANNER_CANDIDATE_PARAMETER_CHARS) for value in action.get('file_parameters', [])][:4],
+        'token_parameters': [_planner_compact_label(value, PLANNER_CANDIDATE_PARAMETER_CHARS) for value in action.get('token_parameters', [])][:4],
         'oast_class': str(action.get('oast_class') or ''),
         'adaptive_candidate': bool(action.get('adaptive_budget')),
         'coverage_reserve_hint': bool(action.get('coverage_reserve')),
@@ -1002,6 +1028,17 @@ def _fit_planner_prompt_context(
             'Split the concrete-action batch; never drop candidates silently.'
         )
     return adjusted, context, context_window, len(candidates)
+
+
+def _planner_context_overflow_error(exc: BaseException) -> bool:
+    """Return True only for provider/runtime errors that clearly indicate context overflow."""
+    text = f'{type(exc).__name__}: {exc}'.lower()
+    markers = (
+        'context length', 'context window', 'maximum context', 'max context',
+        'context size', 'too many tokens', 'token limit', 'input too long',
+        'prompt is too long', 'exceeds the context', 'exceeding bounded context',
+    )
+    return any(marker in text for marker in markers)
 
 
 def _planner_discovery_summary(discovery: dict[str, dict[str, Any]]) -> dict[str, Any]:
@@ -1631,8 +1668,18 @@ def ai_plan(state: AgentState) -> dict[str, Any]:
             selected_tool_counts[str(selected_action.get('tool') or '')] += 1
             _, selected_family = shared._application_family_key(str(selected_action.get('target_url') or ''))
             selected_family_counts[selected_family or '/'] += 1
+        family_row_cap = max(1, int(PLANNER_SELECTED_FAMILY_ROWS.get(mode, 96)))
+        family_rows = sorted(
+            selected_family_counts.items(),
+            key=lambda item: (-int(item[1]), str(item[0])),
+        )
+        visible_family_rows = family_rows[:family_row_cap]
+        selected_family_summary = {
+            str(name)[:PLANNER_SELECTED_FAMILY_KEY_CHARS]: int(count)
+            for name, count in visible_family_rows
+        }
         return {
-            'target': state['target'],
+            'target': shared.compact_log_url(str(state['target']), max_length=720),
             'round': current_round,
             'maximum_rounds': state['max_rounds'],
             'scan_mode': mode,
@@ -1649,7 +1696,9 @@ def ai_plan(state: AgentState) -> dict[str, Any]:
             'required_capacity_per_round': int(initial_budget['required_per_round']),
             'selected_so_far_count': selected_count,
             'selected_so_far_by_tool': dict(sorted(selected_tool_counts.items())),
-            'selected_so_far_by_application_family': dict(sorted(selected_family_counts.items())),
+            'selected_so_far_by_application_family': selected_family_summary,
+            'selected_so_far_application_family_count': len(selected_family_counts),
+            'selected_so_far_application_families_omitted': max(0, len(family_rows) - len(visible_family_rows)),
             'discovery_summary': _planner_discovery_summary(state['discovery']),
             'previous_results': compact_results(state['results']),
             'available_tools': registry,
@@ -1754,13 +1803,55 @@ def ai_plan(state: AgentState) -> dict[str, Any]:
     # for genuinely malformed JSON/provider replies; three retries per batch multiplied planner
     # latency on large BALANCED catalogs without improving useful coverage.
     batch_max_attempts = 2
-    for batch_number, batch in enumerate(batches, 1):
+    # The initial preflight above runs before any selections exist. Later batches include growing
+    # selected_so_far_by_tool/application_family metadata, so a batch that fit initially can become
+    # a few tokens too large at runtime. Re-check the ACTUAL prompt immediately before assigning the
+    # batch budget/provider call. If it no longer fits, split that concrete-action batch in place and
+    # re-check the first half. This changes only context packaging: candidate IDs/order are preserved,
+    # no candidate is dropped, and strict Agentic mode still requires AI judgement for every batch.
+    runtime_context_splits = 0
+    batch_index = 0
+    while batch_index < len(batches):
+        batch = batches[batch_index]
+        while True:
+            batch_number = batch_index + 1
+            runtime_preflight_prompt = build_batch_prompt(
+                batch_number, len(batches), batch, len(selected_ids),
+            )
+            try:
+                _fit_planner_prompt_context(
+                    runtime_preflight_prompt, system_message,
+                    base_context_window=base_context_window,
+                    max_context_window=max_context_window,
+                    max_predict=max_predict,
+                )
+            except RuntimeError as exc:
+                if len(batch) <= 1:
+                    raise RuntimeError(
+                        f'Planner concrete action {id_by_identity[id(batch[0])]} cannot fit the bounded '
+                        f'context window even as a singleton: {exc}'
+                    ) from exc
+                midpoint = (len(batch) + 1) // 2
+                left, right = batch[:midpoint], batch[midpoint:]
+                batches[batch_index:batch_index + 1] = [left, right]
+                runtime_context_splits += 1
+                print(
+                    f'    AI planning: runtime context grew after earlier selections; splitting '
+                    f'batch {batch_number} into {len(left)}+{len(right)} candidate(s) '
+                    f'({len(batches)} total batches now).',
+                    flush=True,
+                )
+                batch = batches[batch_index]
+                continue
+            break
+
+        batch_number = batch_index + 1
         batch_started = time.monotonic()
-        remaining_batches = max(1, len(batches) - batch_number + 1)
+        remaining_batches = max(1, len(batches) - batch_index)
         remaining_round_budget = max(0.0, round_planner_deadline - batch_started)
         if remaining_round_budget <= 0:
             planner_budget_exhausted = True
-            planner_budget_deferred_candidates += sum(len(value) for value in batches[batch_number - 1:])
+            planner_budget_deferred_candidates += sum(len(value) for value in batches[batch_index:])
             print(
                 f'[!] AI planning round budget exhausted before batch {batch_number}/{len(batches)}; '
                 f'{planner_budget_deferred_candidates} candidate(s) remain unplanned and eligible for a later round.',
@@ -1786,6 +1877,7 @@ def ai_plan(state: AgentState) -> dict[str, Any]:
             round_planner_deadline,
             batch_started + max(1.0, current_batch_budget),
         )
+        provider_context_split = False
         for attempt in range(1, batch_max_attempts + 1):
             try:
                 remaining_batch_budget = max(0.0, batch_deadline - time.monotonic())
@@ -1841,6 +1933,24 @@ def ai_plan(state: AgentState) -> dict[str, Any]:
                 break
             except Exception as exc:
                 errors.append(f'batch {batch_number} attempt {attempt}/{batch_max_attempts}: {type(exc).__name__}: {exc}')
+                # Token estimators are intentionally conservative but provider tokenizers can still
+                # disagree at the boundary. A clear provider-side context overflow is packaging, not
+                # an AI-planning failure: split the concrete batch and retry both halves. No candidate
+                # is dropped or selected by Python. This also avoids wasting the second attempt on an
+                # identically oversized request.
+                if _planner_context_overflow_error(exc) and len(batch) > 1:
+                    midpoint = (len(batch) + 1) // 2
+                    left, right = batch[:midpoint], batch[midpoint:]
+                    batches[batch_index:batch_index + 1] = [left, right]
+                    runtime_context_splits += 1
+                    provider_context_split = True
+                    print(
+                        f'    AI planning: provider rejected batch {batch_number} for context size; '
+                        f'splitting into {len(left)}+{len(right)} candidate(s) '
+                        f'({len(batches)} total batches now).',
+                        flush=True,
+                    )
+                    break
                 if attempt < batch_max_attempts and time.monotonic() < batch_deadline:
                     print(
                         f'    AI planning: batch {batch_number}/{len(batches)} returned a malformed plan '
@@ -1880,6 +1990,10 @@ def ai_plan(state: AgentState) -> dict[str, Any]:
                     f'batch (0 actions selected from it) so the rest of the assessment can continue.',
                     file=sys.stderr, flush=True,
                 )
+
+        if provider_context_split:
+            continue
+        batch_index += 1
 
     if failed_batches and len(failed_batches) == len(batches):
         # Every single batch was unsalvageable: this is not an isolated formatting slip, it means the
@@ -1938,6 +2052,7 @@ def ai_plan(state: AgentState) -> dict[str, Any]:
         'planner_batch_size': effective_batch_size,
         'planner_configured_batch_size': batch_size,
         'planner_batch_count': len(batches),
+        'planner_runtime_context_splits': runtime_context_splits,
         'planner_batches': batch_diagnostics,
         'planner_batch_failures': list(failed_batches),
         'planner_round_budget_seconds': round(float(round_planner_budget), 2),
