@@ -486,23 +486,9 @@ def _resolve_job_cookie(
     storage_state = runtime.get("storage_state") if isinstance(runtime.get("storage_state"), dict) else None
     username = str(runtime.get("username") or "")
     password = str(runtime.get("password") or "")
-    interactive = bool(getattr(sys.stdin, "isatty", lambda: False)())
-
     if manual_cookie_allowed:
         # The cookie is still the first authentication mechanism actually sent to the target.
-        # Prepare missing fallback credentials once in the runner, however, so that if the child
-        # later proves the cookie invalid it can continue with saved browser state and finally the
-        # original username/password without opening a second console prompt. Empty answers remain
-        # valid for optional credentials and simply make the final fallback unavailable.
-        if not storage_state and (not username or not password) and not bool(runtime.get("prompt_attempted")):
-            runtime["prompt_attempted"] = True
-            if not username and interactive:
-                username = input(f"[AUTH:{reference}] Target username ({username_env or 'environment variable'} not set; optional fallback after cookie/SSO): ").strip()
-            if not password and interactive:
-                password = getpass.getpass(f"[AUTH:{reference}] Target password ({password_env or 'environment variable'} not set; optional fallback after cookie/SSO): ")
-            runtime["username"] = username
-            runtime["password"] = password
-
+        # Any username/password fallback was already collected once before assessment launch.
         value = manual_cookie
         if not manual_origin:
             runtime["manual_cookie_origin"] = target_origin
@@ -520,18 +506,8 @@ def _resolve_job_cookie(
         cache[cache_key] = value
         return value
 
-    # With no saved browser session, resolve the initial username/password once before the first login.
-    # With a saved session, browser_oidc_login_session tries that state first and asks for credentials
-    # only if the IdP actually presents a login form.
-    if not storage_state and (not username or not password) and not bool(runtime.get("prompt_attempted")):
-        runtime["prompt_attempted"] = True
-        if not username and interactive:
-            username = input(f"[AUTH:{reference}] Target username ({username_env or 'environment variable'} not set): ").strip()
-        if not password and interactive:
-            password = getpass.getpass(f"[AUTH:{reference}] Target password ({password_env or 'environment variable'} not set): ")
-        runtime["username"] = username
-        runtime["password"] = password
-
+    # Username/password, when configured for this identity, were resolved once before launch.
+    # This resolver never opens an interactive prompt.
     if not storage_state and (not username or not password):
         if bool(credential.get("optional", False)):
             detail = "existing cookie is not applicable to this authorized origin/port and no reusable browser session or complete username/password is available"
@@ -561,35 +537,8 @@ def _resolve_job_cookie(
     except RuntimeError as first_exc:
         if bool(getattr(first_exc, "credential_submit_attempted", False)):
             runtime["credential_submit_used"] = True
-        # A saved SSO state may expire after the initial job. If no credentials were available yet,
-        # allow one prompt now, then retry once; never prompt again later in the assessment.
-        if storage_state and (not username or not password) and not bool(runtime.get("prompt_attempted")) and interactive:
-            runtime["prompt_attempted"] = True
-            if not username:
-                username = input(f"[AUTH:{reference}] Target username ({username_env or 'environment variable'} not set): ").strip()
-            if not password:
-                password = getpass.getpass(f"[AUTH:{reference}] Target password ({password_env or 'environment variable'} not set): ")
-            runtime["username"] = username
-            runtime["password"] = password
-            if username and password:
-                try:
-                    login_result = browser_oidc_login_session(
-                        target_url,
-                        username,
-                        password,
-                        credential,
-                        storage_state=storage_state,
-                        initial_login=not bool(runtime.get("browser_login_completed")),
-                        expected_oidc_issuer=str(runtime.get("oidc_issuer") or ""),
-                        allow_credential_submit=not bool(runtime.get("credential_submit_used")),
-                        request_rate=float((config.get("execution") or {}).get("request_rate") or 10),
-                    )
-                except RuntimeError as exc:
-                    if bool(getattr(exc, "credential_submit_attempted", False)):
-                        runtime["credential_submit_used"] = True
-                    first_exc = exc
-                else:
-                    first_exc = None
+        # No prompt is permitted here. Saved state may be repaired only with credentials that
+        # were already collected before assessment launch.
         # Do not automatically resubmit credentials after an explicit provider rejection.
         # Identity providers may deliberately return the same generic message during brute-force
         # lockout/temporary disablement, so a second automatic submission can increase lockout pressure.
@@ -635,63 +584,133 @@ def _resolve_job_cookie(
     return value
 
 
-def _runtime_auth_payload(config: dict[str, Any], job: dict[str, Any], runtime_auth_cache: dict[str, dict[str, Any]]) -> dict[str, Any]:
-    """Serialize identity-bound browser/OIDC runtime state for every resolved identity.
 
-    The child receives every resolved browser/OIDC identity so same-origin browser storage remains
-    identity-correct. Cross-origin/same-host reuse is still governed by each credential's
-    reuse_on_authorized_siblings flag. Cookie values are never written to this payload: a SHA-256
-    fingerprint links each already-resolved child Cookie header to its own browser storage state.
+def _prepare_lazy_runtime_identity(
+    config: dict[str, Any], reference: str, runtime_auth_cache: dict[str, dict[str, Any]] | None = None,
+) -> dict[str, Any] | None:
+    """Prepare lazy browser/OIDC state and collect missing credentials once before launch.
+
+    This function never authenticates to the target. It only resolves username/password/cookie into
+    the parent runtime cache. The assessment child receives those values in its protected runtime
+    payload and is non-interactive for the remainder of the run.
+    """
+    credentials = config.get("credentials") or {}
+    credential = credentials.get(reference)
+    if not isinstance(credential, dict):
+        raise ValueError(f"Unknown credential reference: {reference}")
+    kind = str(credential.get("kind") or "").strip().lower()
+    if kind not in {"browser_oidc", "snap4city_oidc"}:
+        return None
+    runtime_cache = runtime_auth_cache if runtime_auth_cache is not None else {}
+    runtime = runtime_cache.setdefault(reference, {
+        "reference": reference,
+        "kind": "browser_oidc",
+        "credential": copy.deepcopy(credential),
+        "username": "",
+        "password": "",
+        "manual_cookie": "",
+        "storage_state": None,
+        "oidc_issuer": str(credential.get("oidc_issuer") or ""),
+        "browser_login_completed": False,
+        "prompt_attempted": False,
+        "credential_submit_used": False,
+        "credential_submit_blocked": False,
+    })
+    runtime["credential"] = copy.deepcopy(credential)
+    username_env = str(credential.get("username_env") or "").strip()
+    password_env = str(credential.get("password_env") or "").strip()
+    cookie_env = str(credential.get("cookie_env") or "").strip()
+    if not runtime.get("username") and username_env:
+        runtime["username"] = os.environ.get(username_env, "").strip()
+    if not runtime.get("password") and password_env:
+        runtime["password"] = os.environ.get(password_env, "")
+
+    # Prompt at most once per configured identity, before any child assessment starts. The shared
+    # runtime cache preserves these values for every job that reuses the same identity. No network
+    # authentication happens here.
+    interactive = bool(getattr(sys.stdin, "isatty", lambda: False)())
+    if (not runtime.get("username") or not runtime.get("password")) and not bool(runtime.get("prompt_attempted")):
+        runtime["prompt_attempted"] = True
+        username = str(runtime.get("username") or "")
+        password = str(runtime.get("password") or "")
+        if not username and interactive:
+            username = input(f"[AUTH:{reference}] Target username ({username_env or 'environment variable'} not set): ").strip()
+        if not password and interactive:
+            password = getpass.getpass(f"[AUTH:{reference}] Target password ({password_env or 'environment variable'} not set): ")
+        runtime["username"] = username
+        runtime["password"] = password
+    if not runtime.get("manual_cookie") and cookie_env:
+        raw = os.environ.get(cookie_env, "").strip()
+        if raw:
+            try:
+                raw = canonical_cookie_header(raw)
+            except ValueError as exc:
+                if bool(credential.get("optional", False)):
+                    print(f"[AUTH] Optional credential {reference!r} supplied an invalid cookie in {cookie_env}: {exc}; lazy browser/username-password fallback remains available.")
+                    raw = ""
+                else:
+                    raise ValueError(f"Cookie environment variable {cookie_env!r} for credential {reference!r} is invalid: {exc}") from exc
+            required = {str(name).strip().casefold() for name in credential.get("required_cookie_names") or [] if str(name).strip()}
+            present = {name.casefold() for name in cookie_names(raw)} if raw else set()
+            if raw and required - present:
+                print(f"[AUTH] Existing cookie for credential {reference!r} is incomplete; it will not be used as the lazy session candidate.")
+                raw = ""
+            runtime["manual_cookie"] = raw
+    # The child is always non-interactive for target authentication.
+    runtime["interactive_allowed"] = False
+    return runtime
+
+def _runtime_auth_payload(config: dict[str, Any], job: dict[str, Any], runtime_auth_cache: dict[str, dict[str, Any]]) -> dict[str, Any]:
+    """Serialize configured browser/OIDC identities without forcing an early login.
+
+    A row may intentionally have no cookie fingerprint/storage state yet. The child uses the
+    credential metadata only after anonymous discovery identifies real authenticated work.
     """
     effective_refs = [str(value).strip() for value in (job.get("_effective_credential_refs") or []) if str(value).strip()]
     if not effective_refs:
-        fallback = str(job.get("credential_ref") or "").strip()
-        if fallback:
-            effective_refs = [fallback]
+        effective_refs = [str(value).strip() for value in (job.get("credential_refs") or []) if str(value).strip()]
+    if not effective_refs:
+        effective_refs = [value for value in (str(job.get("credential_ref") or "").strip(), str(job.get("secondary_credential_ref") or "").strip()) if value]
+    effective_refs = list(dict.fromkeys(effective_refs))
     identities: list[dict[str, Any]] = []
     for reference in effective_refs:
         runtime = runtime_auth_cache.get(reference)
+        if not isinstance(runtime, dict):
+            runtime = _prepare_lazy_runtime_identity(config, reference, runtime_auth_cache)
         if not isinstance(runtime, dict) or str(runtime.get("kind") or "") not in {"browser_oidc", "snap4city_oidc"}:
             continue
-        credential_options = runtime.get("credential") if isinstance(runtime.get("credential"), dict) else {}
-        username = str(runtime.get("username") or "")
-        password = str(runtime.get("password") or "")
-        storage_state = runtime.get("storage_state") if isinstance(runtime.get("storage_state"), dict) else None
-        if (not username or not password) and not storage_state:
-            continue
         resolved_cookie = str(runtime.get("resolved_cookie") or "")
-        if not resolved_cookie:
-            continue
-        try:
-            canonical = canonical_cookie_header(resolved_cookie)
-        except ValueError:
-            canonical = resolved_cookie
-        fingerprint = cookie_header_fingerprint(canonical)
+        fingerprint = ""
+        if resolved_cookie:
+            try:
+                fingerprint = cookie_header_fingerprint(canonical_cookie_header(resolved_cookie))
+            except ValueError:
+                fingerprint = cookie_header_fingerprint(resolved_cookie)
         identities.append({
             "reference": reference,
             "cookie_fingerprint": fingerprint,
-            "username": username,
-            "password": password,
-            "credential": copy.deepcopy(credential_options),
-            "storage_state": storage_state,
+            "username": str(runtime.get("username") or ""),
+            "password": str(runtime.get("password") or ""),
+            "manual_cookie": str(runtime.get("manual_cookie") or ""),
+            "interactive_allowed": False,
+            "credential": copy.deepcopy(runtime.get("credential") if isinstance(runtime.get("credential"), dict) else {}),
+            "storage_state": runtime.get("storage_state") if isinstance(runtime.get("storage_state"), dict) else None,
             "oidc_issuer": str(runtime.get("oidc_issuer") or ""),
             "credential_submit_used": bool(runtime.get("credential_submit_used", False)),
+            "credential_submit_blocked": bool(runtime.get("credential_submit_blocked", False)),
         })
     if not identities:
         return {}
     authorization = config.get("authorization") or {}
     return {
-        "schema_version": 2,
+        "schema_version": 3,
         "kind": "browser_oidc_multi",
-        # Preserve the actual CLI-primary identity even when it is a raw-cookie credential and
-        # therefore has no browser/OIDC state row in ``identities``. The child must never infer
-        # another browser identity as primary merely because it is the first serializable state.
-        "primary_reference": effective_refs[0],
+        "primary_reference": effective_refs[0] if effective_refs else "",
         "primary_origin": normalized_origin(str(job.get("target") or "")),
         "identities": identities,
         "allowed_origins": list(authorization.get("allowed_origins") or []),
+        "lazy_authentication": True,
     }
-
 
 def _runtime_auth_environment(base_env: dict[str, str], payload: dict[str, Any]) -> tuple[dict[str, str], str]:
     env = dict(base_env)
@@ -823,8 +842,19 @@ def _build_command(
         configured_refs = [value for value in (str(job.get("credential_ref") or "").strip(), str(job.get("secondary_credential_ref") or "").strip()) if value]
     configured_refs = list(dict.fromkeys(configured_refs))
     available_identities: list[tuple[str, str]] = []
+    lazy_identity_refs: list[str] = []
     seen_sessions: dict[str, str] = {}
+    credentials = config.get("credentials") or {}
     for reference in configured_refs:
+        credential = credentials.get(reference)
+        if not isinstance(credential, dict):
+            raise ValueError(f"Unknown credential reference: {reference}")
+        kind = str(credential.get("kind") or "").strip().lower()
+        if kind in {"browser_oidc", "snap4city_oidc"}:
+            if resolve_secrets:
+                _prepare_lazy_runtime_identity(config, reference, runtime_auth_cache)
+            lazy_identity_refs.append(reference)
+            continue
         value = _resolve_job_cookie(config, reference, job["target"], cache, runtime_auth_cache) if resolve_secrets else f"<credential:{reference}>"
         if not value:
             continue
@@ -843,7 +873,7 @@ def _build_command(
                 continue
             seen_sessions[fingerprint] = reference
         available_identities.append((reference, value))
-    job["_effective_credential_refs"] = [reference for reference, _ in available_identities]
+    job["_effective_credential_refs"] = list(dict.fromkeys([*lazy_identity_refs, *[reference for reference, _ in available_identities]]))
     if available_identities:
         primary_ref, primary_value = available_identities[0]
         command.extend(["--primary-identity-name", primary_ref, "--cookies", primary_value])
@@ -854,7 +884,7 @@ def _build_command(
     if force_auth_only or job.get("auth_only"):
         if not configured_refs:
             raise ValueError(f"Job {job['id']} requests auth_only but has no credential_refs/credential_ref.")
-        if resolve_secrets and not available_identities:
+        if resolve_secrets and not available_identities and not lazy_identity_refs:
             raise ValueError(f"Job {job['id']} requests auth_only but none of its configured identities is available.")
         command.append("--auth-only")
 
@@ -1546,6 +1576,26 @@ def main() -> int:
     credential_cache: dict[tuple[str, str], str] = {}
     runtime_auth_cache: dict[str, dict[str, Any]] = {}
     orchestrator_kind = str((config.get("execution") or {}).get("orchestrator") or "deterministic").lower()
+
+    # Resolve every configured browser/OIDC identity once before the first assessment job starts.
+    # This is intentionally separate from lazy network authentication: entering credentials here
+    # does not open a browser, validate a session, or contact the target.
+    if not args.dry_run:
+        credentials_cfg = config.get("credentials") or {}
+        lazy_refs: list[str] = []
+        for pending_job in jobs:
+            refs = [str(value).strip() for value in (pending_job.get("credential_refs") or []) if str(value).strip()]
+            if not refs:
+                refs = [value for value in (str(pending_job.get("credential_ref") or "").strip(), str(pending_job.get("secondary_credential_ref") or "").strip()) if value]
+            for reference in refs:
+                credential = credentials_cfg.get(reference)
+                if not isinstance(credential, dict):
+                    continue
+                if str(credential.get("kind") or "").strip().lower() in {"browser_oidc", "snap4city_oidc"} and reference not in lazy_refs:
+                    lazy_refs.append(reference)
+        for reference in lazy_refs:
+            _prepare_lazy_runtime_identity(config, reference, runtime_auth_cache)
+
     for job_index, job in enumerate(jobs, start=1):
         report_prefix = "SecOps_Agentic_Assessment" if orchestrator_kind == "agentic" else "SecOps_Assessment"
         expected_report_id = f"{report_prefix}_{stamp}_j{job_index:03d}"

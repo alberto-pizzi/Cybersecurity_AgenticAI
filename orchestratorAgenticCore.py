@@ -3175,6 +3175,7 @@ def discovery_node(state: AgentState) -> dict[str, Any]:
         flush=True,
     )
 
+    latest_service_discovery = shared_service_discovery
     service_continuation_needed = bool(
         int(shared_service_discovery.get('candidate_ports_deferred', 0) or 0) > 0
         and shared.same_host_service_remaining_time_budget_seconds() > 0
@@ -3218,6 +3219,7 @@ def discovery_node(state: AgentState) -> dict[str, Any]:
         continued_service_discovery = shared.discover_same_host_web_services(
             state['target'], time_budget_seconds=continuation_budget, resume_from=shared_service_discovery,
         )
+        latest_service_discovery = continued_service_discovery
         print(
             f"    [DISCOVERY] same-host service continuation complete: cumulative_ports="
             f"{int(continued_service_discovery.get('ports_probed', 0) or 0)}/"
@@ -3244,13 +3246,86 @@ def discovery_node(state: AgentState) -> dict[str, Any]:
                     name, found = future.result()
                     profile_results[name] = found
 
-    for profile in state['profiles']:
+    # Browser/OIDC identities supplied by assessmentRunner are intentionally absent from the initial
+    # profile list. Anonymous discovery runs first; only then do we establish a session if this origin
+    # exposed concrete authentication evidence. A successful session immediately receives a fresh
+    # authenticated discovery pass, so protected-only endpoints still enter the planner surface.
+    profiles = list(state['profiles'])
+    existing_identity_refs = {str(profile.get('identity_ref') or '') for profile in profiles if str(profile.get('identity_ref') or '')}
+    anonymous_name = next((str(profile.get('name') or '') for profile in profiles if str(profile.get('name') or '') == 'anonymous'), '')
+    anonymous_found = profile_results.get(anonymous_name, {}) if anonymous_name else {}
+    used_profile_names = {str(profile.get('name') or '') for profile in profiles}
+    for identity_ref in shared.runtime_auth_identity_references():
+        if identity_ref in existing_identity_refs:
+            continue
+        if not anonymous_found:
+            break
+        auth_result = shared.establish_lazy_authenticated_identity(
+            identity_ref, anonymous_found, state['target'], deadline=assessment_deadline,
+        )
+        if not auth_result.get('usable'):
+            status = str(auth_result.get('status') or 'not_applicable')
+            reason = str(auth_result.get('reason') or '')
+            print(f"    [AUTH LAZY] {identity_ref}: {status}; authenticated discovery not started. {reason}".rstrip(), file=sys.stderr, flush=True)
+            diagnostics.append({
+                'phase': 'lazy_authentication', 'profile': identity_ref, 'status': status,
+                'reason': reason, 'attempted': bool(auth_result.get('attempted')),
+            })
+            continue
+        cookie = str(auth_result.get('cookie_header') or '')
+        auth_origin = str(auth_result.get('authenticated_origin') or state['target'])
+        if not cookie or not auth_origin:
+            continue
+        safe_label = re.sub(r'[^a-zA-Z0-9_]+', '_', identity_ref).strip('_').lower() or 'identity'
+        profile_name = 'authenticated' if 'authenticated' not in used_profile_names else f'authenticated_{safe_label}'
+        suffix = 2
+        while profile_name in used_profile_names:
+            profile_name = f'authenticated_{safe_label}_{suffix}'
+            suffix += 1
+        used_profile_names.add(profile_name)
+        auth_profile = {
+            'name': profile_name, 'cookies': cookie, 'identity_ref': identity_ref,
+            'auth_anchor_origin': auth_origin,
+        }
+        profiles.append(auth_profile)
+        existing_identity_refs.add(identity_ref)
+        state['results'].setdefault(profile_name, {})
+        print(
+            f"    [AUTH LAZY] {identity_ref}: session established on {auth_origin} only after anonymous discovery; "
+            f"starting authenticated discovery with cookie names: {', '.join(shared.cookie_names(cookie)) or 'none'}.",
+            flush=True,
+        )
+        # Authenticated discovery starts on the origin that actually proved a usable session. Anonymous
+        # results are used only as evidence for locating other auth-capable origins; they are projected
+        # back out before this profile reaches the planner.
+        found = discover_target_sync_safe(
+            auth_origin, cookie, seeds=list(auth_result.get('auth_evidence_urls') or []),
+            forced_seeds=[], allow_state_changes=state_changes_allowed,
+            wall_clock_deadline=assessment_deadline, expand_authorized_service_hosts=False,
+            defer_same_host_service_discovery=True,
+        )
+        auth_evidence_surface = shared.merge_discovery(anonymous_found, found)
+        auth_evidence_surface = shared.authenticate_discovered_sibling_origins(
+            auth_evidence_surface, auth_origin, cookie, allow_state_changes=state_changes_allowed,
+            wall_clock_deadline=assessment_deadline,
+        )
+        found = shared.authenticated_discovery_projection(auth_evidence_surface, auth_origin, cookie)
+        profile_results[profile_name] = found
+
+    if any(str(profile.get('bootstrap_only') or '').lower() == 'true' for profile in profiles):
+        profiles = [profile for profile in profiles if str(profile.get('bootstrap_only') or '').lower() != 'true']
+    state['profiles'] = profiles
+
+    for profile in profiles:
         found = profile_results[str(profile.get('name') or '')]
         if profile.get('cookies') and found.get('authentication_effective') is not False:
+            anchor_origin = str(profile.get('auth_anchor_origin') or state['target'])
             found = shared.authenticate_discovered_sibling_origins(
-                found, state['target'], profile['cookies'], allow_state_changes=state_changes_allowed,
+                found, anchor_origin, profile['cookies'], allow_state_changes=state_changes_allowed,
                 wall_clock_deadline=assessment_deadline,
             )
+            if profile.get('identity_ref'):
+                found = shared.authenticated_discovery_projection(found, anchor_origin, profile['cookies'])
         discovery[profile['name']] = found
         diagnostics.extend(({'phase': 'discovery', 'profile': profile['name'], **item} for item in found['errors']))
         print(f"    {profile['name']}: {len(found.get('html_urls', []))} HTML pages, {len(found.get('request_cases', []))} request contracts, {len(found.get('browser_network_requests', []))} browser network requests, {len(found.get('browser_navigation_urls', []))} Chromium navigations, {len(found['jwt_tokens'])} JWTs")
@@ -3304,9 +3379,9 @@ def discovery_node(state: AgentState) -> dict[str, Any]:
             print(f"      [DISCOVERY WARNING] {error.get('type', 'error')}: {shared.compact_log_url(error.get('url', ''))} — {error.get('message', '')}")
         if found.get('authentication_effective') is False:
             print(f"    [WARNING] {profile['name']}: {found.get('authentication_note')}", file=sys.stderr)
-    broad_profile = next((str(profile.get('name') or '') for profile in state['profiles'] if str(profile.get('name') or '') == 'anonymous'), '')
+    broad_profile = next((str(profile.get('name') or '') for profile in profiles if str(profile.get('name') or '') == 'anonymous'), '')
     if not broad_profile:
-        broad_profile = next((str(profile.get('name') or '') for profile in state['profiles'] if str(profile.get('name') or '')), '')
+        broad_profile = next((str(profile.get('name') or '') for profile in profiles if str(profile.get('name') or '')), '')
     if broad_profile and broad_profile in discovery:
         sibling_selection = shared.select_sibling_broad_origins(discovery[broad_profile], state['target'])
         sibling_ranking = sibling_selection['ranking']
@@ -3316,7 +3391,7 @@ def discovery_node(state: AgentState) -> dict[str, Any]:
                 f"authorized_observed_origins={len(sibling_ranking)}; each origin is exposed as a concrete "
                 "ZAP/Nuclei/Nikto action when its profile/session is valid. Execution ceilings are applied after AI prioritization."
             )
-    return {'discovery': discovery, 'diagnostics': diagnostics}
+    return {'profiles': profiles, 'discovery': discovery, 'diagnostics': diagnostics, 'results': state['results']}
 
 
 # Returns how many concrete actions of one profile/tool have already completed. Kept for coverage

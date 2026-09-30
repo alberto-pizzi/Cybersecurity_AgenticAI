@@ -15,6 +15,7 @@ from typing import Any, TypedDict
 from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 
 import orchestratorShared as shared
+import re
 from orchestratorShared import (
     ALL_TOOLS, ARJUN_TOOL, AUTHORIZATION_TOOL, BASE_TOOLS, BROAD_SCANNER_TIMEOUTS,
     OPTIONAL_TOOLS, PARAMETER_TOOLS, PARAMETER_TOOL_TIMEOUTS, PARAMETER_TOOL_CASE_LIMITS,
@@ -145,6 +146,7 @@ async def deterministic_discovery_node(state: DeterministicState) -> dict[str, A
         flush=True,
     )
 
+    latest_service_discovery = shared_service_discovery
     service_continuation_needed = bool(
         int(shared_service_discovery.get('candidate_ports_deferred', 0) or 0) > 0
         and shared.same_host_service_remaining_time_budget_seconds() > 0
@@ -178,6 +180,7 @@ async def deterministic_discovery_node(state: DeterministicState) -> dict[str, A
             shared.discover_same_host_web_services, target,
             time_budget_seconds=continuation_budget, resume_from=shared_service_discovery,
         )
+        latest_service_discovery = continued_service_discovery
         print(
             f"    [DISCOVERY] continuazione sweep completata: porte_cumulative="
             f"{int(continued_service_discovery.get('ports_probed', 0) or 0)}/"
@@ -202,14 +205,76 @@ async def deterministic_discovery_node(state: DeterministicState) -> dict[str, A
         merged_profiles = await asyncio.gather(*(_merge_continued_service_profile(profile) for profile in profiles))
         profile_results = {name: found for name, found in merged_profiles}
 
+    # Browser/OIDC identities are activated only after anonymous discovery proves authentication is
+    # relevant. This prevents startup login/session aging and avoids authenticated scans on public-only
+    # sibling services while retaining a complete authenticated recrawl when a session is established.
+    existing_identity_refs = {str(profile.get('identity_ref') or '') for profile in profiles if str(profile.get('identity_ref') or '')}
+    anonymous_name = next((str(profile.get('name') or '') for profile in profiles if str(profile.get('name') or '') == 'anonymous'), '')
+    anonymous_found = profile_results.get(anonymous_name, {}) if anonymous_name else {}
+    used_profile_names = {str(profile.get('name') or '') for profile in profiles}
+    for identity_ref in shared.runtime_auth_identity_references():
+        if identity_ref in existing_identity_refs or not anonymous_found:
+            continue
+        auth_result = await asyncio.to_thread(
+            shared.establish_lazy_authenticated_identity, identity_ref, anonymous_found, target,
+        )
+        if not auth_result.get('usable'):
+            status = str(auth_result.get('status') or 'not_applicable')
+            reason = str(auth_result.get('reason') or '')
+            print(f"    [AUTH LAZY] {identity_ref}: {status}; discovery autenticata non avviata. {reason}".rstrip(), file=sys.stderr, flush=True)
+            diagnostics.append({'phase': 'lazy_authentication', 'profile': identity_ref, 'status': status, 'reason': reason, 'attempted': bool(auth_result.get('attempted'))})
+            continue
+        cookie = str(auth_result.get('cookie_header') or '')
+        auth_origin = str(auth_result.get('authenticated_origin') or target)
+        if not cookie or not auth_origin:
+            continue
+        safe_label = re.sub(r'[^a-zA-Z0-9_]+', '_', identity_ref).strip('_').lower() or 'identity'
+        profile_name = 'authenticated' if 'authenticated' not in used_profile_names else f'authenticated_{safe_label}'
+        suffix = 2
+        while profile_name in used_profile_names:
+            profile_name = f'authenticated_{safe_label}_{suffix}'
+            suffix += 1
+        used_profile_names.add(profile_name)
+        auth_profile = {
+            'name': profile_name, 'cookies': cookie, 'identity_ref': identity_ref,
+            'auth_anchor_origin': auth_origin,
+        }
+        profiles.append(auth_profile)
+        existing_identity_refs.add(identity_ref)
+        results.setdefault(profile_name, {})
+        print(
+            f"    [AUTH LAZY] {identity_ref}: sessione stabilita su {auth_origin} dopo discovery anonima; "
+            f"avvio discovery autenticata.",
+            flush=True,
+        )
+        found = await asyncio.to_thread(
+            discover_target, auth_origin, cookie, shared.MAX_CRAWL_PAGES, list(auth_result.get('auth_evidence_urls') or []),
+            [], allow_state_changes=workflow_state_changes,
+            expand_authorized_service_hosts=False, defer_same_host_service_discovery=True,
+        )
+        auth_evidence_surface = shared.merge_discovery(anonymous_found, found)
+        auth_evidence_surface = await asyncio.to_thread(
+            shared.authenticate_discovered_sibling_origins, auth_evidence_surface, auth_origin, cookie,
+            allow_state_changes=workflow_state_changes,
+        )
+        found = shared.authenticated_discovery_projection(auth_evidence_surface, auth_origin, cookie)
+        profile_results[profile_name] = found
+
+    if any(str(profile.get('bootstrap_only') or '').lower() == 'true' for profile in profiles):
+        profiles = [profile for profile in profiles if str(profile.get('bootstrap_only') or '').lower() != 'true']
+    state['profiles'] = profiles
+
     for profile in profiles:
         name = profile['name']
         found = profile_results[name]
         if profile.get('cookies') and found.get('authentication_effective') is not False:
+            anchor_origin = str(profile.get('auth_anchor_origin') or target)
             found = await asyncio.to_thread(
-                shared.authenticate_discovered_sibling_origins, found, target, profile['cookies'],
+                shared.authenticate_discovered_sibling_origins, found, anchor_origin, profile['cookies'],
                 allow_state_changes=workflow_state_changes,
             )
+            if profile.get('identity_ref'):
+                found = shared.authenticated_discovery_projection(found, anchor_origin, profile['cookies'])
         discovery[name] = found
         diagnostics.extend(({'phase': 'discovery', 'profile': name, **item} for item in found['errors']))
         print(f"    {name}: {len(found['html_urls'])} pagine HTML, {len(found['request_cases'])} casi GET/POST, {len(found.get('browser_navigation_urls', []))} navigazioni Chromium, {len(found['errors'])} errori")
@@ -263,7 +328,7 @@ async def deterministic_discovery_node(state: DeterministicState) -> dict[str, A
             print(f"      [CRAWL WARNING] altri {len(ordered_errors) - 5} errori sono inclusi nel report.")
         if found.get('authentication_effective') is False:
             print(f"    [WARNING] {name}: {found.get('authentication_note')}", file=sys.stderr)
-    return {'discovery': discovery, 'diagnostics': diagnostics, 'results': results, 'workflow_state_changes': workflow_state_changes}
+    return {'profiles': profiles, 'discovery': discovery, 'diagnostics': diagnostics, 'results': results, 'workflow_state_changes': workflow_state_changes}
 
 # Because FFUF and ZAP can expand discovery, broad scanning is completed before specialist selection.
 async def deterministic_broad_scan_node(state: DeterministicState) -> dict[str, Any]:

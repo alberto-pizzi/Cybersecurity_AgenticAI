@@ -69,17 +69,33 @@ C) NUOVA APPLICAZIONE - CONFIGURAZIONE
      python .\assessmentRunner.py --config .\configs\platform.example.json --orchestrator deterministic --mode balanced --dry-run --authorized
 
 D) AUTENTICAZIONE DA CONFIG
-   Una credenziale kind=browser_oidc puo' usare un cookie gia' disponibile oppure
-   username/password del target. Il runner trasforma il login riuscito in una sessione cookie
-   e passa quella sessione agli orchestrator esistenti. Con allow_same_host_ports=true, su una nuova
-   porta dello stesso hostname/schema l'ordine resta: cookie esistente -> session probe -> storage
-   browser/OIDC -> username/password gia' risolti, senza un nuovo prompt nel child. Se il cookie grezzo
-   viene rifiutato in modo conclusivo su quella porta, la coppia cookie+origin viene ricordata e non viene
-   riprovata da ogni scanner successivo; una sessione riparata/origin-specifica prende il suo posto.
+   Una credenziale kind=browser_oidc e' attivata in modo lazy. assessmentRunner legge eventuali
+   cookie/username/password dall'ambiente ma NON apre il browser e NON crea una sessione durante
+   la costruzione del job. Prima viene eseguita la discovery anonima. Solo una origin autorizzata
+   che espone evidenza reale di autenticazione (login/SSO/OIDC oppure 401/403 protetto) puo' generare
+   discovery/azioni authenticated. Una porta web pubblica senza tale evidenza resta anonima.
 
-   Se optional=true e il login non e' disponibile o fallisce, il job continua in anonimo.
-   Se usi --auth-only, invece, la sessione autenticata e' obbligatoria e il job viene bloccato
-   quando il login non riesce.
+   Quando l'auth serve davvero, l'ordine e': cookie/sessione applicabile -> validazione -> storage
+   browser/OIDC/refresh -> username/password se il vero login le richiede. Il primo login valido puo'
+   essere sulla origin primaria oppure su un'altra porta/origin gia' autorizzata che ha mostrato il login.
+   Dopo il successo viene eseguita una nuova discovery autenticata per trovare endpoint visibili solo
+   dopo il login. Se refresh/re-login produce nuovi cookie, diventano lo stato canonico usato dalle
+   azioni successive: il cookie scaduto precedente non viene riutilizzato.
+
+   Un full login riuscito puo' essere ripetuto piu' tardi se la sessione scade davvero. Un rifiuto
+   CONCLUSIVO delle credenziali/provider blocca ulteriori submit automatici della password per quella
+   identity nel run: cambiare pagina o porta non azzera la protezione. Un errore tecnico/inconclusivo
+   dopo una vera submission applica invece un cooldown identity-wide (test 1 min, fast 5 min,
+   balanced 10 min, deep 15 min), poi consente al massimo un nuovo full login; un secondo errore
+   inconclusivo blocca i tentativi successivi. Il retry state viene azzerato solo dopo che il nuovo
+   cookie/storage e' stato validato come sessione authenticated. Se la password non e' mai stata inviata
+   (per esempio no_auth_entry_observed), una pagina di login reale trovata dopo puo' ancora usarla.
+   Per OIDC il riuso resta vincolato all'issuer/realm osservato o configurato; client_id differenti
+   sullo stesso issuer non creano un nuovo budget di password.
+
+   Se optional=true e nessuna sessione autenticata puo' essere stabilita, il job continua in anonimo.
+   Con --auth-only viene comunque permessa una discovery anonima di bootstrap soltanto per trovare
+   il login; quella superficie bootstrap viene rimossa prima di planner/scanner se l'auth non riesce.
 
 E) QUALE MODALITA' CONVIENE
    fast      = smoke test o diagnostica breve
@@ -265,30 +281,21 @@ Mantieni mapping host, servizi autorizzati e riferimenti alle credenziali nel co
 nell'ambiente dell'operatore. La documentazione e il codice generico non devono incorporare host, IP,
 endpoint, porte o dataset di validazione appartenenti a un target specifico.
 
-Per una credenziale browser_oidc l'ordine di riuso e' generico:
-- un rifiuto username/password sul form della target origin o sull'issuer OIDC gia' pinnato puo' offrire un solo tentativo di correzione nel parent;
-- un rifiuto su un realm OIDC esterno non ancora pinnato NON dimostra che le credenziali locali del dashboard siano errate: viene registrata la destinazione senza query/segreti, vengono provati gli altri entry point primari e non viene richiesto di reinserire inutilmente la stessa password;
-- per applicazioni che richiedono intenzionalmente un provider OIDC esterno fisso si puo' impostare credential.oidc_issuer con l'authorization endpoint atteso; il riuso successivo resta vincolato a quell'issuer/realm.
-  1. cookie applicabile alla destinazione, se presente;
-  2. validazione con session probe;
-  3. storage state browser/OIDC gia' disponibile;
-  4. username/password originali gia' risolti dal runner, soltanto se il flusso di login li richiede.
-Un cookie_env viene prima canonicalizzato; se required_cookie_names e' configurato, il cookie manuale viene
-usato soltanto se contiene tutti i nomi richiesti. Un cookie incompleto non viene spacciato per sessione valida:
-si passa allo storage browser/SSO e poi alle username/password della STESSA identita'. Le credenziali vengono
-risolte nel parent runner una sola volta e mantenute in memoria per il job; i child non riaprono prompt.
-Il Cookie header grezzo non viene mai copiato su un hostname diverso. Per browser/OIDC la cache del Cookie
-header appiattito e' path-aware e conserva il path URL esatto: /app e /app/ sono distinti perche' routing HTTP e
-Cookie Path possono differire, mentre query e fragment non cambiano la chiave di cache. Una sessione ottenuta per
-/app-a non viene quindi riusata automaticamente per /app-b; lo storage Playwright della stessa identita' puo'
-invece essere riusato per ricavare i cookie corretti senza un nuovo login. Su un cache hit il resolved_cookie del
-runtime viene riallineato al cookie cached prima di costruire il payload parent->child, evitando fingerprint/storage
-mismatch dopo la visita di un altro path. Domain/host-only, Path, Secure e scadenza vengono rispettati; expires=0
-resta un cookie scaduto e non viene convertito in session cookie. IndexedDB viene incluso nello storage state quando
-supportato. I cookie CHIPS/partitioned restano nello storage browser e NON vengono trasformati in un Cookie header
-per scanner HTTP, perche' mancherebbe il contesto top-level della partizione.
-Una diversa porta/HTTPS-HTTP dello stesso hostname puo' essere autorizzata dalla policy multi-port, ma il riuso
-della sessione resta subordinato alla normale policy Cookie/Storage e alla validazione.
+Per una credenziale browser_oidc il login e' lazy e non viene eseguito dal parent all'avvio:
+- il runner legge soltanto metadata ed eventuali valori gia' presenti nelle env;
+- la discovery anonima individua login/SSO/OIDC o risorse 401/403 sulle origin autorizzate;
+- solo le origin con questa evidenza diventano candidate alla discovery authenticated; una porta pubblica senza login non riceve tentativi SSO speculativi;
+- quando serve davvero una sessione: cookie applicabile -> session probe -> storage browser/OIDC/refresh -> username/password se il form reale le richiede;
+- la prima sessione puo' nascere anche su una porta autorizzata diversa dalla primaria se e' li' che si trova il login;
+- un refresh/re-login riuscito sostituisce immediatamente cookie/storage vecchi per tutte le azioni successive della stessa identity;
+- un full login riuscito non impedisce un nuovo full login dopo una futura scadenza reale della sessione;
+- un rifiuto conclusivo blocca ulteriori submit automatici della password della stessa identity nel run; un errore tecnico/inconclusivo usa il cooldown 1/5/10/15 min (test/fast/balanced/deep) e consente un solo retry successivo, mentre una pagina/porta diversa non bypassa la protezione; il retry state si azzera solo dopo la validazione della nuova sessione;
+- no_auth_entry_observed non consuma il budget password perche' nessuna password e' stata inviata;
+- dopo il primo OIDC riuscito, il riuso credenziali resta legato allo stesso issuer/realm osservato/configurato; client_id diversi non sono un nuovo provider.
+Un cookie_env viene canonicalizzato e verificato rispetto a required_cookie_names, ma resta soltanto un candidato
+lazy finche' non viene validato nel momento in cui l'auth serve. Domain/host-only, Path, Secure, expiry, IndexedDB
+e CHIPS continuano a essere rispettati. Il Cookie header grezzo non viene copiato su hostname diversi; scope
+multi-port e riuso delle credenziali restano decisioni separate.
 
 Esempio generico:
   python .\assessmentRunner.py --config .\configs\<assessment>.json --orchestrator deterministic --mode balanced --dry-run --authorized
@@ -319,7 +326,7 @@ Esempio multi-identita' (vedi anche configs/platform.example.json):
   ... service ...
   "credential_refs": ["portal_user", "portal_editor", "portal_admin"]
 
-Se cookie/username/password non sono disponibili nelle rispettive variabili env, il processo padre interattivo chiede i dati separatamente per OGNI identita' con prompt [AUTH:<credential_ref>]. Le credenziali restano in memoria e non vengono ristampate nei comandi persistiti. SQLMap, Dalfox, Commix, Traversal, IDOR, Browser, Workflow e le altre fasi profile-driven usano ogni profilo separatamente; Authorization/BOLA confronta l'identita' attiva con tutte le altre identita' disponibili. Il suo deadline complessivo per azione non cresce col numero di account: il tempo di richiesta viene suddiviso in modo fair e bounded fra primaria, anonymous e identita' alternative. Lo storage browser/OIDC e il registry di sessione di una identita' non vengono mai ereditati da un'altra. La deduplica delle sessioni usa un fingerprint order-insensitive delle coppie cookie, quindi `A=1; B=2` e `B=2; A=1` rappresentano la stessa sessione e non possono produrre falsa evidenza BOLA. La validazione Authorization mantiene label e cookie come coppie anche se un'identita' opzionale e' assente. Per una stessa credenziale OIDC usata su piu' applicazioni della stessa origin, la cache del Cookie header e' distinta per path applicativo mentre lo storage browser resta riusabile. Il bootstrap dell'issuer OIDC e' disponibile una sola volta per credential_ref: dopo il primo login browser riuscito, le applicazioni successive non possono adottare un realm nuovo se il primo login era locale o un issuer diverso se era OIDC. Credential_ref distinti mantengono issuer indipendenti anche quando riusano volutamente le stesse env username/password. Per realm/provider OIDC differenti usare quindi credential_ref distinti.
+Prima di avviare il primo job dell'assessment, se username/password non sono disponibili nelle rispettive variabili env, il processo padre interattivo li chiede UNA SOLA VOLTA per ciascuna identita' configurata con prompt [AUTH:<credential_ref>]. Le credenziali restano in memoria e non vengono ristampate nei comandi persistiti. Dopo l'avvio del child non esistono altri prompt target: refresh e full re-login riusano soltanto i valori raccolti all'inizio; se non sono disponibili o vengono rifiutati, il runtime registra AUTH_FAILED secondo la policy senza attendere input umano. SQLMap, Dalfox, Commix, Traversal, IDOR, Browser, Workflow e le altre fasi profile-driven usano ogni profilo separatamente; Authorization/BOLA confronta l'identita' attiva con tutte le altre identita' disponibili. Il suo deadline complessivo per azione non cresce col numero di account: il tempo di richiesta viene suddiviso in modo fair e bounded fra primaria, anonymous e identita' alternative. Lo storage browser/OIDC e il registry di sessione di una identita' non vengono mai ereditati da un'altra. La deduplica delle sessioni usa un fingerprint order-insensitive delle coppie cookie, quindi `A=1; B=2` e `B=2; A=1` rappresentano la stessa sessione e non possono produrre falsa evidenza BOLA. La validazione Authorization mantiene label e cookie come coppie anche se un'identita' opzionale e' assente. Per una stessa credenziale OIDC usata su piu' applicazioni della stessa origin, la cache del Cookie header e' distinta per path applicativo mentre lo storage browser resta riusabile. Il bootstrap dell'issuer OIDC e' disponibile una sola volta per credential_ref: dopo il primo login browser riuscito, le applicazioni successive non possono adottare un realm nuovo se il primo login era locale o un issuer diverso se era OIDC. Credential_ref distinti mantengono issuer indipendenti anche quando riusano volutamente le stesse env username/password. Per realm/provider OIDC differenti usare quindi credential_ref distinti.
 
 Quando piu' service entry condividono la stessa origin, lo stesso path ESATTO e la stessa policy di sicurezza/autenticazione, il runner puo'
 coalescerli in un solo job logico e conservare tutti gli URL come entry point iniziali. Il trailing slash e' significativo:
@@ -451,7 +458,7 @@ Python puo' calcolare score/hint di discovery per ordinamento stabile, deduplica
 
 FFUF, ZAP, Nuclei, Session, Nikto, JWT, SQLMap, Dalfox, Commix, Traversal, IDOR, Authorization, Browser, Workflow e Interactsh vengono rappresentati come azioni concrete compatibili con la discovery. Python esegue le azioni selezionate dall'AI dopo i controlli di scope, safety e risorse. Se il planner fallisce e --require-ai NON e' attivo, viene usato il fallback deterministico di emergenza sotto le stesse policy; con --require-ai il run termina con errore. Deterministic resta un orchestratore separato con pipeline fissa e riproducibile. Le fasi post-planning di verifica/completion (conferma Chromium exact-parameter, safe-surface sweep e controlli lifecycle/sessione) operano deterministicamente per integrita' dell'evidenza e safety, dopo la selezione delle azioni di attacco.
 
-Lo scope autorizzato e lo scope delle credenziali sono separati. Un Cookie header grezzo non viene mai copiato su un hostname diverso; se authorization.allow_same_host_ports=true puo' essere provato anche su un'altra porta autorizzata dello stesso hostname/schema, perche' i cookie HTTP non sono port-scoped, ma deve superare il normale session probe. Se viene rifiutato, il sistema prova lo storage browser/OIDC e infine username/password risolti dal runner, senza prompt nel child. Se il provider rifiuta esplicitamente username/password sul target primario o su un issuer gia' pinnato, il runner NON reinvia automaticamente le credenziali: la credenziale opzionale viene esclusa (oppure quella richiesta fa fallire il job) dopo quel singolo submit. Questo evita di aumentare i contatori di brute-force/lockout quando il provider usa il generico messaggio “invalid username or password” anche durante un blocco temporaneo. Un rifiuto su un realm OIDC esterno non ancora pinnato non dimostra invece che le credenziali locali siano errate: vengono provati gli altri entry point primari senza un secondo prompt. Errori provider di lockout/policy/servizio non provocano retry automatici. Una sessione riparata specifica per la nuova origin/porta sostituisce il cookie grezzo fallito nei test successivi. Lo storage browser conserva Domain/Path/Secure e non autorizza nuove origin. Login e SSO sulla origin target restano testabili.
+Lo scope autorizzato e lo scope delle credenziali sono separati. Un Cookie header grezzo non viene mai copiato su un hostname diverso; se authorization.allow_same_host_ports=true puo' essere provato anche su un'altra porta autorizzata dello stesso hostname/schema, perche' i cookie HTTP non sono port-scoped, ma deve superare il normale session probe. Se viene rifiutato, il sistema prova lo storage browser/OIDC e infine username/password risolti una sola volta dal runner prima dell'avvio del primo job, senza alcun prompt nel child o durante l'assessment. Se il provider rifiuta esplicitamente username/password sul target primario o su un issuer gia' pinnato, il runner NON reinvia automaticamente le credenziali: la credenziale opzionale viene esclusa (oppure quella richiesta fa fallire il job) dopo quel singolo submit. Questo evita di aumentare i contatori di brute-force/lockout quando il provider usa il generico messaggio “invalid username or password” anche durante un blocco temporaneo. Un rifiuto su un realm OIDC esterno non ancora pinnato non dimostra invece che le credenziali locali siano errate: vengono provati gli altri entry point primari senza un secondo prompt. Errori provider di lockout/policy/servizio non provocano retry automatici. Una sessione riparata specifica per la nuova origin/porta sostituisce il cookie grezzo fallito nei test successivi. Lo storage browser conserva Domain/Path/Secure e non autorizza nuove origin. Login e SSO sulla origin target restano testabili.
 Le policy hard comuni a Deterministic e Agentic vengono applicate a ogni profilo: scope/cookie isolation, gestione 404/410, limiti Chromium, state-change gate, compatibilita' dei request contract, fallback active ZAP, input bounded dei wrapper e verifica XSS finale. Ranking, cap strutturali e overflow dei selector request-level appartengono alla strategia Deterministic; nell'Agentic i corrispondenti score sono hint del catalogo e non cutoff di visibilita'. Anche la verifica XSS finale Chromium usa base/max 12/20, 96/160 e 200/320 candidati PER PROFILO, quindi anonymous non puo' consumare la quota authenticated. I batch AI e le capacita' globali di ammissione restano specifici dell'Agentic: il Deterministic non ha un tetto globale del planner e percorre direttamente i casi selezionati dalla propria pipeline fissa per ciascun tool e profilo.
 JWT dispone di massimo 16/64/192 token unici scoperti per profilo in fast/balanced/deep. Il controllo e' economico e locale, per questo il pool puo' essere ampio; in Agentic ogni token valido diventa un candidato d'azione JWT indipendente che il planner AI puo' scegliere quando e' utile. Se lo stesso identico token raw compare in piu' profili/azioni, il verifier viene eseguito una sola volta e il risultato locale viene riusato mantenendo l'attribuzione per profilo. I valori raw restano input locali del verifier e non vengono mostrati in chiaro nel catalogo di azioni del planner AI.
 Gli specialisti sui parametri privilegiano API/dati, identificatori/query, POST/JSON e richieste

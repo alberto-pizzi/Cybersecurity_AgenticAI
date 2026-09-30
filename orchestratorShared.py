@@ -6,6 +6,7 @@ import contextlib
 import copy
 import asyncio
 import functools
+import getpass
 import base64
 import hashlib
 import zlib
@@ -343,6 +344,9 @@ RUNTIME_AUTH_ORIGIN_LIMITS = {'test': 2, 'fast': 12, 'balanced': 32, 'deep': 64}
 # multiply by every discovered same-host service/application. Deferred origins remain eligible in
 # later passes, so this limits wall-clock amplification without marking them permanently failed.
 RUNTIME_AUTH_PASS_TIMEOUTS = {'test': TEST_DISCOVERY_TIME_BUDGET_SECONDS, 'fast': 300, 'balanced': 1200, 'deep': 2700}
+RUNTIME_AUTH_CREDENTIAL_RETRY_COOLDOWNS = {'test': 60, 'fast': 300, 'balanced': 600, 'deep': 900}
+RUNTIME_AUTH_TERMINAL_CREDENTIAL_FAILURES = frozenset({'credentials_rejected', 'external_oidc_credentials_rejected', 'provider_authentication_error', 'additional_authentication_step_required'})
+RUNTIME_AUTH_NONCONSUMING_CREDENTIAL_FAILURES = frozenset({'credentials_unavailable', 'credential_form_fill_failed'})
 RUNTIME_AUTH_SIBLING_SSO_TIMEOUTS = {'test': 5, 'fast': 10, 'balanced': 15, 'deep': 20}
 # Candidate application entry points are bounded per origin/root, but the login helper shares one
 # total deadline across all entries. This keeps authentication bounded while avoiding an arbitrary
@@ -693,7 +697,11 @@ def scope_cookie_header(candidate: str, cookies: str, *, use_runtime_auth: bool=
             return _merge_cookie_headers(cookies, runtime_header)
         if application_header:
             return application_header
-        if registered and not same_origin(base, candidate):
+        if registered:
+            # A validated origin-specific replacement is canonical even on the primary/same origin.
+            # This is what makes a successful refresh/re-login supersede the stale profile header on
+            # every later scanner action, including flows where no Playwright storage-state cookie
+            # metadata was returned.
             return registered
         return canonical_cookie_header(cookies)
 
@@ -774,7 +782,7 @@ def configure_runtime_target_auth(primary_target: str, primary_cookie: str) -> N
             if (
                 not valid_identity_label(reference)
                 or folded_reference in seen_references
-                or not re.fullmatch(r'[0-9a-f]{64}', fingerprint)
+                or (fingerprint and not re.fullmatch(r'[0-9a-f]{64}', fingerprint))
             ):
                 print('[AUTH] Runtime target-auth state contains an invalid/duplicate identity reference or cookie fingerprint; additional-origin runtime authentication is disabled.', file=sys.stderr)
                 RUNTIME_TARGET_AUTH_STATES.clear()
@@ -787,13 +795,15 @@ def configure_runtime_target_auth(primary_target: str, primary_cookie: str) -> N
             if not isinstance(state.get('storage_state'), dict):
                 state['storage_state'] = None
             RUNTIME_TARGET_AUTH_STATES[reference] = state
-            # Register after the state exists so duplicate-session fingerprints are detected fail-closed.
-            existing = str(RUNTIME_AUTH_COOKIE_TO_REFERENCE.get(fingerprint) or '')
-            if existing and existing != reference:
-                RUNTIME_AUTH_COOKIE_TO_REFERENCE.pop(fingerprint, None)
-                RUNTIME_AUTH_AMBIGUOUS_FINGERPRINTS.add(fingerprint)
-            elif fingerprint not in RUNTIME_AUTH_AMBIGUOUS_FINGERPRINTS:
-                RUNTIME_AUTH_COOKIE_TO_REFERENCE[fingerprint] = reference
+            # Lazy identities intentionally arrive without a concrete Cookie fingerprint. Register a
+            # mapping only after a real session exists; duplicate concrete sessions still fail closed.
+            if fingerprint:
+                existing = str(RUNTIME_AUTH_COOKIE_TO_REFERENCE.get(fingerprint) or '')
+                if existing and existing != reference:
+                    RUNTIME_AUTH_COOKIE_TO_REFERENCE.pop(fingerprint, None)
+                    RUNTIME_AUTH_AMBIGUOUS_FINGERPRINTS.add(fingerprint)
+                elif fingerprint not in RUNTIME_AUTH_AMBIGUOUS_FINGERPRINTS:
+                    RUNTIME_AUTH_COOKIE_TO_REFERENCE[fingerprint] = reference
         primary_reference = str(payload.get('primary_reference') or '').strip()
         if primary_reference and not valid_identity_label(primary_reference):
             print('[AUTH] Runtime target-auth state contains an invalid primary identity reference; additional-origin runtime authentication is disabled.', file=sys.stderr)
@@ -827,21 +837,34 @@ def configure_runtime_target_auth(primary_target: str, primary_cookie: str) -> N
             register_authenticated_origin_cookie(primary_target, primary_cookie, primary_cookie)
     if RUNTIME_TARGET_AUTH_STATES:
         refs = ', '.join(RUNTIME_TARGET_AUTH_STATES)
-        print(f'[AUTH] Runtime browser/OIDC state loaded for identity-bound additional-origin authentication: {refs}; no child-console credential prompts will be used.')
+        print(f'[AUTH] Runtime browser/OIDC identity metadata loaded for lazy authentication: {refs}; target login is deferred until authenticated work is actually needed.')
 
 
 def _runtime_auth_identity_matches(cookies: str) -> bool:
     return bool(_runtime_identity_reference(cookies))
 
 
-def runtime_target_auth_available(cookies: str='', candidate: str='') -> bool:
+def runtime_auth_identity_references() -> list[str]:
+    """Configured browser/OIDC identities available to the child, including not-yet-authenticated ones."""
+    return list(RUNTIME_TARGET_AUTH_STATES)
+
+
+def runtime_auth_state_for_reference(reference: str) -> dict[str, Any]:
+    state = RUNTIME_TARGET_AUTH_STATES.get(str(reference or '').strip())
+    return state if isinstance(state, dict) else {}
+
+
+def runtime_auth_primary_reference() -> str:
+    return str(RUNTIME_TARGET_AUTH.get('reference') or '')
+
+
+def runtime_target_auth_available(cookies: str='', candidate: str='', *, identity_ref: str='') -> bool:
     """Return whether active browser/OIDC repair is allowed for this identity/destination.
 
-    Same-origin refresh is intrinsic to the configured identity and remains available even when
-    reuse_on_authorized_siblings=false. Crossing to another authorized origin/port requires that
-    explicit credential option in addition to the normal assessment scope policy.
+    Lazy authentication can select an identity directly before any Cookie fingerprint exists. Once a
+    session exists, the traditional cookie->identity mapping remains authoritative.
     """
-    state = _runtime_target_auth_for_cookie(cookies)
+    state = runtime_auth_state_for_reference(identity_ref) if identity_ref else _runtime_target_auth_for_cookie(cookies)
     credential = state.get('credential') if isinstance(state.get('credential'), dict) else {}
     if not state or str(state.get('kind') or '') not in {'browser_oidc', 'snap4city_oidc'}:
         return False
@@ -849,6 +872,7 @@ def runtime_target_auth_available(cookies: str='', candidate: str='') -> bool:
     if destination and PRIMARY_SCOPE_TARGET and same_origin(PRIMARY_SCOPE_TARGET, destination):
         return True
     return bool(credential.get('reuse_on_authorized_siblings', False))
+
 
 
 # Loads the timeouts and case limits for the selected scan profile.
@@ -3271,6 +3295,7 @@ def refresh_authenticated_session_state(
         'credential_applied': True,
         'runtime_reauthentication': runtime_reauth or {},
         'effective_cookie_names': cookie_names(effective_cookies),
+        'effective_cookie_header': effective_cookies if usable else '',
         'cache_hit': False,
     }
     # Only a conclusive usable authenticated result is safe to reuse. Negative/transient outcomes
@@ -6896,6 +6921,171 @@ def _runtime_auth_candidate_urls(discovery: dict[str, Any], origin: str, *, limi
     return [url for url, _ in sorted(scored.items(), key=lambda item: (-item[1], item[0]))[:effective_limit]]
 
 
+
+def runtime_auth_evidence_urls(
+    discovery: dict[str, Any], target: str, *, identity_ref: str='', include_configured: bool=True, limit: int | None=None,
+) -> list[str]:
+    """Return only URLs that provide concrete evidence that authentication is relevant.
+
+    Ordinary public application pages are deliberately excluded. Evidence is an observed login/SSO
+    route, an observed 401/403 request, or (for the configured primary origin only) the credential's
+    explicit login_path. This prevents multi-port discovery from launching speculative SSO attempts on
+    every web service merely because it exposed an application page.
+    """
+    origin = normalized_origin(target)
+    state = runtime_auth_state_for_reference(identity_ref) if identity_ref else RUNTIME_TARGET_AUTH
+    credential = state.get('credential') if isinstance(state.get('credential'), dict) else {}
+    scored: dict[str, int] = {}
+
+    def add(raw: Any, score: int) -> None:
+        url = str(raw or '').strip()
+        if not url or not same_origin(origin, url) or _destructive_crawl_url(url) or _browser_static_resource(url):
+            return
+        if _ephemeral_identity_flow_url(url):
+            return
+        scored[url] = max(scored.get(url, -10_000), int(score))
+
+    if include_configured:
+        login_path = str(credential.get('login_path') or '').strip()
+        if login_path:
+            try:
+                configured = urljoin(origin.rstrip('/') + '/', login_path.lstrip('/'))
+            except Exception:
+                configured = ''
+            add(configured, 1000)
+
+    for key in ('html_urls', 'browser_navigation_urls', 'urls'):
+        for value in discovery.get(key, []) or []:
+            url = str(value or '')
+            if _looks_like_application_login_entry(url) or looks_like_oidc_authentication_url(url):
+                add(url, 900 if key == 'browser_navigation_urls' else 850)
+
+    for key in ('request_cases', 'browser_network_requests'):
+        for row in discovery.get(key, []) or []:
+            if not isinstance(row, dict):
+                continue
+            url = str(row.get('url') or row.get('source_url') or '')
+            status = safe_int_value(row.get('status', row.get('response_status', row.get('status_code', 0))), 0)
+            if status in {401, 403}:
+                add(url, 950)
+            elif _looks_like_application_login_entry(url) or looks_like_oidc_authentication_url(url):
+                add(url, 900)
+
+    effective_limit = max(1, int(limit if limit is not None else RUNTIME_AUTH_ENTRY_CANDIDATE_LIMITS.get(CURRENT_SCAN_MODE, 12)))
+    return [url for url, _ in sorted(scored.items(), key=lambda item: (-item[1], item[0]))[:effective_limit]]
+
+
+def looks_like_oidc_authentication_url(url: str) -> bool:
+    try:
+        parsed = urlparse(str(url or ''))
+    except ValueError:
+        return False
+    path = str(parsed.path or '').lower()
+    query_names = {str(name).lower() for name, _ in parse_qsl(parsed.query, keep_blank_values=True)}
+    return (
+        '/realms/' in path
+        or '/protocol/openid-connect/' in path
+        or '/login-actions/' in path
+        or path.endswith(('/authorize', '/oauth2/authorize', '/oidc/authorize'))
+        or 'client_id' in query_names
+        or {'redirect_uri', 'response_type'} <= query_names
+    )
+
+
+def _lazy_runtime_prompt_credentials(runtime_state: dict[str, Any]) -> bool:
+    """Return credentials resolved before assessment start; never prompt inside the child."""
+    if runtime_state.get('credential_submit_blocked'):
+        return False
+    credential = runtime_state.get('credential') if isinstance(runtime_state.get('credential'), dict) else {}
+    username = str(runtime_state.get('username') or '')
+    password = str(runtime_state.get('password') or '')
+    username_env = str(credential.get('username_env') or '').strip()
+    password_env = str(credential.get('password_env') or '').strip()
+    if not username and username_env:
+        username = os.environ.get(username_env, '').strip()
+    if not password and password_env:
+        password = os.environ.get(password_env, '')
+    runtime_state['username'] = username
+    runtime_state['password'] = password
+    runtime_state['interactive_allowed'] = False
+    return bool(username and password)
+
+
+def runtime_auth_evidence_by_origin(
+    discovery: dict[str, Any], target: str, *, identity_ref: str='',
+) -> list[dict[str, Any]]:
+    """Rank authorized origins that actually exposed authentication evidence during anonymous discovery.
+
+    The configured primary origin is considered first. Sibling ports/origins are considered only when
+    runtime discovery observed a login/SSO route or a protected 401/403 request there. Merely exposing
+    a web application is never enough to create authenticated work.
+    """
+    primary = normalized_origin(target)
+    ordered_origins: list[str] = [primary] if primary else []
+    ordered_origins.extend(
+        origin for origin, _ in discovered_scope_origin_ranking(discovery, target)
+        if origin and origin not in ordered_origins
+    )
+    rows: list[dict[str, Any]] = []
+    for origin in ordered_origins:
+        candidates = runtime_auth_evidence_urls(
+            discovery, origin, identity_ref=identity_ref, include_configured=(origin == primary),
+        )
+        if not candidates:
+            continue
+        rows.append({'origin': origin, 'candidates': candidates, 'primary': origin == primary})
+    return rows
+
+
+def establish_lazy_authenticated_identity(
+    identity_ref: str, discovery: dict[str, Any], target: str, *, deadline: float | None=None,
+) -> dict[str, Any]:
+    """Establish the first usable session only after anonymous discovery proves auth is relevant.
+
+    The first usable session may belong to the configured primary origin or to another explicitly
+    authorized origin discovered at runtime. This avoids making primary-origin login a prerequisite
+    for authenticated coverage on a different port that exposes the actual login surface.
+    """
+    reference = str(identity_ref or '').strip()
+    if not reference or not runtime_auth_state_for_reference(reference):
+        return {'attempted': False, 'usable': False, 'status': 'identity_unavailable', 'identity_ref': reference}
+    origin_rows = runtime_auth_evidence_by_origin(discovery, target, identity_ref=reference)
+    if not origin_rows:
+        return {
+            'attempted': False, 'usable': False, 'status': 'no_auth_entry_observed', 'identity_ref': reference,
+            'reason': 'anonymous discovery found no login/SSO entry point or protected 401/403 route on any authorized origin',
+            'auth_evidence_origins': [],
+        }
+    last: dict[str, Any] = {}
+    total_candidates = sum(len(row.get('candidates') or []) for row in origin_rows)
+    for row in origin_rows:
+        origin = str(row.get('origin') or '')
+        candidates = [str(value) for value in (row.get('candidates') or []) if str(value)]
+        for candidate in candidates:
+            last = ensure_runtime_authenticated_request(candidate, '', candidate, deadline=deadline, identity_ref=reference)
+            if last.get('usable'):
+                return {
+                    **last,
+                    'authenticated_origin': origin,
+                    'candidate_count': total_candidates,
+                    'auth_evidence_urls': candidates,
+                    'auth_evidence_origins': [str(item.get('origin') or '') for item in origin_rows],
+                }
+            state = runtime_auth_state_for_reference(reference)
+            if str(last.get('auth_outcome') or '') in {'AUTH_REJECTED', 'PROVIDER_ERROR'} or state.get('credential_submit_blocked'):
+                return {
+                    **last,
+                    'authenticated_origin': origin,
+                    'candidate_count': total_candidates,
+                    'auth_evidence_urls': candidates,
+                    'auth_evidence_origins': [str(item.get('origin') or '') for item in origin_rows],
+                }
+    return {
+        **last,
+        'candidate_count': total_candidates,
+        'auth_evidence_origins': [str(item.get('origin') or '') for item in origin_rows],
+    }
+
 def _runtime_auth_probe(origin: str, cookie: str, probe_url: str, *, deadline: float | None=None) -> dict[str, Any]:
     authenticated = scanner_session_probe(probe_url, cookie, timeout=12, attempts=2, deadline=deadline, allow_tls_trust_retry=url_in_authorized_scope(PRIMARY_SCOPE_TARGET or origin, probe_url))
     if authenticated.get('conclusive') and authenticated.get('authenticated') is False:
@@ -6960,25 +7150,105 @@ def _runtime_application_scope_key(url: str) -> str:
     return origin + scope_path
 
 
-def ensure_runtime_authenticated_request(request_url: str, current_cookie: str='', probe_url: str='', timeout_seconds: int | None=None, *, deadline: float | None=None) -> dict[str, Any]:
+def _runtime_credential_submit_allowed(runtime_state: dict[str, Any]) -> tuple[bool, str]:
+    """Return whether this identity may submit username/password now.
+
+    Conclusive credential/provider failures block for the remainder of the assessment. A technical
+    failure after an actual submission gets one later retry, but never on the immediately following
+    page/origin: the identity-wide cooldown must expire first. Browser/form failures that did not
+    submit a password do not consume this guard.
+    """
+    if bool(runtime_state.get('credential_submit_blocked', False)):
+        return False, str(runtime_state.get('credential_submit_blocked_reason') or 'credential_submit_blocked')
+    retry_not_before = safe_float_value(runtime_state.get('credential_retry_not_before', 0.0), 0.0)
+    if retry_not_before > time.monotonic():
+        return False, 'credential_retry_cooldown'
+    return True, ''
+
+
+def _record_runtime_credential_failure(runtime_state: dict[str, Any], reason_code: str, *, credential_attempted: bool) -> None:
+    """Update the shared identity guard after one failed browser-auth attempt."""
+    reason = str(reason_code or 'browser_login_failed')
+    if not credential_attempted or reason in RUNTIME_AUTH_NONCONSUMING_CREDENTIAL_FAILURES:
+        return
+    runtime_state['credential_submit_used'] = True
+    if reason in RUNTIME_AUTH_TERMINAL_CREDENTIAL_FAILURES:
+        runtime_state['credential_submit_blocked'] = True
+        runtime_state['credential_submit_blocked_reason'] = reason
+        runtime_state.pop('credential_retry_not_before', None)
+        return
+    failures = max(0, safe_int_value(runtime_state.get('credential_inconclusive_failures', 0), 0)) + 1
+    runtime_state['credential_inconclusive_failures'] = failures
+    if failures >= 2:
+        runtime_state['credential_submit_blocked'] = True
+        runtime_state['credential_submit_blocked_reason'] = 'inconclusive_retry_exhausted'
+        runtime_state.pop('credential_retry_not_before', None)
+        return
+    cooldown = max(1, int(RUNTIME_AUTH_CREDENTIAL_RETRY_COOLDOWNS.get(CURRENT_SCAN_MODE, RUNTIME_AUTH_CREDENTIAL_RETRY_COOLDOWNS['balanced'])))
+    runtime_state['credential_retry_not_before'] = time.monotonic() + float(cooldown)
+    runtime_state['credential_submit_blocked_reason'] = 'credential_retry_cooldown'
+
+
+def _record_runtime_credential_success(runtime_state: dict[str, Any], *, credential_attempted: bool) -> None:
+    """A successful full login resets temporary retry state; future genuine expiry may login again."""
+    if not credential_attempted:
+        return
+    runtime_state['credential_submit_used'] = True
+    runtime_state['credential_submit_blocked'] = False
+    runtime_state.pop('credential_submit_blocked_reason', None)
+    runtime_state.pop('credential_retry_not_before', None)
+    runtime_state.pop('credential_inconclusive_failures', None)
+
+
+def ensure_runtime_authenticated_request(
+    request_url: str, current_cookie: str='', probe_url: str='', timeout_seconds: int | None=None, *,
+    deadline: float | None=None, identity_ref: str='',
+) -> dict[str, Any]:
     """Establish or refresh one authorized application session for the owning identity.
 
-    Runtime browser/OIDC state is selected from the Cookie fingerprint resolved by the parent runner.
-    Multiple identities may therefore refresh independently without sharing storage state, credentials
-    or application-attempt caches. No child-console prompt occurs.
+    The first call may be identity-reference based with no cookie at all. Later calls normally arrive
+    through the concrete Cookie fingerprint. Credential submission is never repeated after a failed
+    full login in the same assessment; after a successful login, a later genuinely expired session may
+    perform a new full login because the prior credential submission succeeded rather than failed.
     """
     url = str(request_url or '').strip()
-    runtime_state = _runtime_target_auth_for_cookie(current_cookie)
-    identity_ref = str(runtime_state.get('reference') or '') if runtime_state else ''
-    if not url or not runtime_target_auth_available(current_cookie, url) or not url_in_authorized_scope(PRIMARY_SCOPE_TARGET or url, url):
-        return {'attempted': False, 'usable': bool(scope_cookie_header(url, current_cookie)), 'cookie_header': scope_cookie_header(url, current_cookie)}
+    runtime_state = runtime_auth_state_for_reference(identity_ref) if identity_ref else _runtime_target_auth_for_cookie(current_cookie)
+    identity_ref = str(runtime_state.get('reference') or identity_ref or '') if runtime_state else str(identity_ref or '')
+    # When the caller already knows the owning identity, bind its current profile cookie before any
+    # repair. This lets a validated replacement session supersede that stale header on later calls
+    # even when the browser did not return a reusable storage_state object.
+    if current_cookie and identity_ref and runtime_state:
+        _register_runtime_cookie_alias(current_cookie, identity_ref)
+    if not url or not runtime_target_auth_available(current_cookie, url, identity_ref=identity_ref) or not url_in_authorized_scope(PRIMARY_SCOPE_TARGET or url, url):
+        return {'attempted': False, 'usable': bool(scope_cookie_header(url, current_cookie)), 'cookie_header': scope_cookie_header(url, current_cookie), 'identity_ref': identity_ref}
     if _destructive_crawl_url(url) or _browser_static_resource(url) or _ephemeral_identity_flow_url(url):
-        return {'attempted': False, 'usable': bool(scope_cookie_header(url, current_cookie)), 'cookie_header': scope_cookie_header(url, current_cookie), 'reason': 'request_not_runtime_auth_candidate'}
+        return {'attempted': False, 'usable': bool(scope_cookie_header(url, current_cookie)), 'cookie_header': scope_cookie_header(url, current_cookie), 'reason': 'request_not_runtime_auth_candidate', 'identity_ref': identity_ref}
 
     scope_key = _runtime_application_scope_key(url)
     if not scope_key:
-        return {'attempted': False, 'usable': False, 'cookie_header': '', 'reason': 'invalid_request_origin'}
+        return {'attempted': False, 'usable': False, 'cookie_header': '', 'reason': 'invalid_request_origin', 'identity_ref': identity_ref}
     attempt_key = f'{identity_ref}|{scope_key}'
+
+    # An operator-supplied cookie is only a candidate. Validate it now, at the point auth is needed,
+    # rather than launching authenticated discovery hours earlier in the parent runner.
+    manual_cookie = str(runtime_state.get('manual_cookie') or '') if isinstance(runtime_state, dict) else ''
+    if not current_cookie and manual_cookie and same_origin(PRIMARY_SCOPE_TARGET or url, url):
+        manual_probe = probe_url or url
+        manual_validation = _runtime_auth_probe(normalized_origin(url), manual_cookie, manual_probe, deadline=deadline)
+        if manual_validation.get('usable') is not False and manual_validation.get('distinguished_from_anonymous') is True:
+            _register_runtime_cookie_alias(manual_cookie, identity_ref)
+            register_authenticated_origin_cookie(normalized_origin(url), manual_cookie, manual_cookie)
+            runtime_state['resolved_cookie'] = manual_cookie
+            result = {
+                'attempted': True, 'usable': True, 'status': 'authenticated', 'auth_outcome': 'AUTH_VALID',
+                'auth_classification': 'current_identity_valid', 'identity_ref': identity_ref, 'scope_key': scope_key,
+                'request_url': url, 'probe_url': manual_probe, 'cookie_header': manual_cookie,
+                'cookie_names': cookie_names(manual_cookie), 'manual_cookie_reused': True, 'probe': manual_validation,
+                'session_fingerprint': _runtime_auth_material_fingerprint(runtime_state, manual_cookie),
+                'attempt_count': 1, 'attempted_urls': [url],
+            }
+            RUNTIME_AUTH_APPLICATION_ATTEMPTS[attempt_key] = dict(result)
+            return result
 
     session_fingerprint = _runtime_auth_material_fingerprint(runtime_state, current_cookie)
     cached = RUNTIME_AUTH_APPLICATION_ATTEMPTS.get(attempt_key)
@@ -6989,14 +7259,16 @@ def ensure_runtime_authenticated_request(request_url: str, current_cookie: str='
         return {**cached, 'attempted': False, 'reused': True, 'cookie_header': cached_cookie}
     previous_attempts = int(cached.get('attempt_count', 0) or 0) if cache_matches_session and isinstance(cached, dict) else 0
     previous_urls = {str(value) for value in (cached.get('attempted_urls') or [])} if cache_matches_session and isinstance(cached, dict) else set()
-    if cache_matches_session and isinstance(cached, dict) and cached.get('status') in {'failed', 'no_auth_entry_observed', 'session_only_credentials_required', 'credential_budget_exhausted'} and (previous_attempts >= 3 or url in previous_urls):
+    if cache_matches_session and isinstance(cached, dict) and cached.get('status') in {'failed', 'no_auth_entry_observed', 'session_only_credentials_required', 'credential_budget_exhausted'} and url in previous_urls:
         return {**cached, 'attempted': False, 'reused': True, 'cookie_header': cached_cookie}
 
     credential = dict(runtime_state.get('credential')) if isinstance(runtime_state.get('credential'), dict) else {}
-    allow_credential_submit = (
-        bool(same_origin(PRIMARY_SCOPE_TARGET or url, url))
-        and not bool(runtime_state.get('credential_submit_used', False))
-    )
+    cross_origin = bool(PRIMARY_SCOPE_TARGET and not same_origin(PRIMARY_SCOPE_TARGET, url))
+    # A different authorized origin may legitimately expose the real login for this same configured
+    # identity. Password submission is therefore governed by the identity-wide failure guard and by
+    # targetAuth's issuer/realm pinning, not by port equality. A failed full login blocks later pages
+    # and origins; a previously successful login may be repeated later when the session truly expires.
+    allow_credential_submit, credential_guard_reason = _runtime_credential_submit_allowed(runtime_state)
     login_floor = 15 if allow_credential_submit else 3
     configured_timeout = int(timeout_seconds) if timeout_seconds is not None else int(credential.get('timeout_seconds') or 60)
     if deadline is not None:
@@ -7020,135 +7292,125 @@ def ensure_runtime_authenticated_request(request_url: str, current_cookie: str='
     if probe_url and same_origin(url, probe_url) and str(probe_url) != url:
         candidate_urls.append(str(probe_url))
 
-    try:
-        login = browser_oidc_login_session(
-            normalized_origin(url),
-            username,
-            password,
-            credential,
-            storage_state=storage_state,
-            candidate_urls=candidate_urls,
-            initial_login=False,
-            include_configured_fallbacks=False,
-            expected_oidc_issuer=str(runtime_state.get('oidc_issuer') or ''),
-            # A different authorized origin/port may reuse browser/OIDC SSO state, but must never
-            # spend the real password attempt. Same-origin application repair may consume the one
-            # per-identity attempt only when the parent has not already done so.
-            allow_credential_submit=allow_credential_submit,
+    def login_once(user: str, secret: str) -> dict[str, Any]:
+        return browser_oidc_login_session(
+            normalized_origin(url), user, secret, credential, storage_state=storage_state, candidate_urls=candidate_urls,
+            initial_login=not bool(runtime_state.get('browser_login_completed', False)), include_configured_fallbacks=False,
+            expected_oidc_issuer=str(runtime_state.get('oidc_issuer') or ''), allow_credential_submit=allow_credential_submit,
             request_rate=MAX_REQUEST_RATE,
         )
+
+    try:
+        try:
+            login = login_once(username, password)
+        except BrowserLoginError as exc:
+            # Missing credentials are resolved only after the browser proved that a real login form
+            # requires them. This is the lazy equivalent of the old parent-side startup prompt.
+            if str(getattr(exc, 'reason', '') or '') == 'credentials_unavailable' and allow_credential_submit and _lazy_runtime_prompt_credentials(runtime_state):
+                username = str(runtime_state.get('username') or '')
+                password = str(runtime_state.get('password') or '')
+                login = login_once(username, password)
+            else:
+                raise
     except RuntimeError as exc:
-        if bool(getattr(exc, 'credential_submit_attempted', False)):
-            runtime_state['credential_submit_used'] = True
-        attempted_urls = (
-            list(exc.attempted_candidates)
-            if isinstance(exc, BrowserLoginError) and exc.attempted_candidates
-            else [url]
-        )
+        credential_attempted = bool(getattr(exc, 'credential_submit_attempted', False))
         reason_code = str(getattr(exc, 'reason', 'browser_login_failed') or 'browser_login_failed')
+        _record_runtime_credential_failure(runtime_state, reason_code, credential_attempted=credential_attempted)
+        attempted_urls = list(exc.attempted_candidates) if isinstance(exc, BrowserLoginError) and exc.attempted_candidates else [url]
         message = str(exc)
-        cross_origin = bool(PRIMARY_SCOPE_TARGET and not same_origin(PRIMARY_SCOPE_TARGET, url))
         if reason_code == 'credential_submit_budget_exhausted':
-            status = 'session_only_credentials_required' if cross_origin else 'credential_budget_exhausted'
+            if credential_guard_reason == 'credential_retry_cooldown':
+                status = 'credential_retry_cooldown'
+            else:
+                status = 'session_only_credentials_required' if cross_origin else 'credential_budget_exhausted'
         elif reason_code == 'browser_login_failed' and 'login form/control not found' in message.lower():
             status = 'no_auth_entry_observed'
         else:
             status = 'failed'
-        auth_classification = (
-            'different_auth' if status == 'session_only_credentials_required'
-            else 'auth_unknown' if status in {'no_auth_entry_observed', 'credential_budget_exhausted'}
-            else 'auth_unknown'
-        )
         auth_outcome = (
             'AUTH_REJECTED' if reason_code in {'credentials_rejected', 'external_oidc_credentials_rejected'}
-            else 'PROVIDER_ERROR' if reason_code == 'provider_authentication_error'
+            else 'PROVIDER_ERROR' if reason_code in {'provider_authentication_error', 'additional_authentication_step_required'}
             else 'AUTH_NOT_APPLICABLE' if status == 'session_only_credentials_required'
             else 'AUTH_FAILED'
         )
         result = {
-            'attempted': True,
-            'usable': False,
-            'status': status,
-            'auth_classification': auth_classification,
-            'auth_outcome': auth_outcome,
-            'identity_ref': identity_ref,
-            'scope_key': scope_key,
-            'request_url': url,
-            'reason': message[:1200],
-            'reason_code': reason_code,
-            'credential_submit_used': bool(runtime_state.get('credential_submit_used', False)),
-            'cookie_header': '',
-            'session_fingerprint': session_fingerprint,
-            'attempt_count': previous_attempts + 1,
+            'attempted': True, 'usable': False, 'status': status, 'auth_classification': 'different_auth' if status == 'session_only_credentials_required' else 'auth_unknown',
+            'auth_outcome': auth_outcome, 'identity_ref': identity_ref, 'scope_key': scope_key, 'request_url': url,
+            'reason': message[:1200], 'reason_code': reason_code, 'credential_submit_used': bool(runtime_state.get('credential_submit_used', False)),
+            'credential_submit_blocked': bool(runtime_state.get('credential_submit_blocked', False)), 'cookie_header': '',
+            'session_fingerprint': session_fingerprint, 'attempt_count': previous_attempts + 1,
             'attempted_urls': sorted(previous_urls | {str(value) for value in attempted_urls}),
         }
         RUNTIME_AUTH_APPLICATION_ATTEMPTS[attempt_key] = dict(result)
         return result
 
-    if bool(login.get('credential_submit_attempted', False)):
-        runtime_state['credential_submit_used'] = True
+    credential_attempted = bool(login.get('credential_submit_attempted', False))
+    runtime_state['browser_login_completed'] = True
+    if username:
+        runtime_state['username'] = username
+    if password:
+        runtime_state['password'] = password
     if isinstance(login.get('storage_state'), dict):
         runtime_state['storage_state'] = login['storage_state']
-    if login.get('oidc_issuer') and not runtime_state.get('oidc_issuer'):
-        runtime_state['oidc_issuer'] = str(login.get('oidc_issuer') or '')
+    if login.get('oidc_issuer'):
+        runtime_state['oidc_issuer'] = str(login.get('oidc_issuer') or runtime_state.get('oidc_issuer') or '')
     returned_cookie = str(login.get('cookie_header') or '')
     if returned_cookie:
         _register_runtime_cookie_alias(returned_cookie, identity_ref)
+        runtime_state['resolved_cookie'] = returned_cookie
     origin = normalized_origin(url)
-    if returned_cookie and origin and not same_origin(PRIMARY_SCOPE_TARGET or origin, origin):
-        register_authenticated_origin_cookie(origin, returned_cookie, current_cookie)
+    if returned_cookie and origin:
+        register_authenticated_origin_cookie(origin, returned_cookie, returned_cookie if not current_cookie else current_cookie)
 
-    post_session_fingerprint = _runtime_auth_material_fingerprint(runtime_state, current_cookie)
-    effective_cookie = _runtime_storage_cookie_header(url, current_cookie) or returned_cookie
+    post_session_fingerprint = _runtime_auth_material_fingerprint(runtime_state, returned_cookie or current_cookie)
+    effective_cookie = _runtime_storage_cookie_header(url, returned_cookie or current_cookie) or returned_cookie
     if not effective_cookie:
+        _record_runtime_credential_failure(
+            runtime_state, 'post_login_cookie_unusable', credential_attempted=credential_attempted,
+        )
         result = {
-            'attempted': True,
-            'usable': False,
-            'status': 'failed',
-            'identity_ref': identity_ref,
-            'scope_key': scope_key,
-            'request_url': url,
-            'reason': 'browser authentication completed without a cookie applicable to the concrete request URL',
-            'cookie_header': '',
-            'session_fingerprint': post_session_fingerprint,
-            'attempt_count': previous_attempts + 1,
-            'attempted_urls': sorted(previous_urls | {url}),
+            'attempted': True, 'usable': False, 'status': 'failed', 'identity_ref': identity_ref, 'scope_key': scope_key,
+            'request_url': url, 'reason': 'browser authentication completed without a cookie applicable to the concrete request URL',
+            'reason_code': 'post_login_cookie_unusable', 'cookie_header': '', 'session_fingerprint': post_session_fingerprint,
+            'credential_submit_used': bool(runtime_state.get('credential_submit_used', False)),
+            'credential_submit_blocked': bool(runtime_state.get('credential_submit_blocked', False)),
+            'attempt_count': previous_attempts + 1, 'attempted_urls': sorted(previous_urls | {url}),
         }
         RUNTIME_AUTH_APPLICATION_ATTEMPTS[attempt_key] = dict(result)
         return result
 
     validation_url = str(login.get('final_url') or '')
     if not validation_url or not same_origin(origin, validation_url) or _browser_static_resource(validation_url):
-        validation_url = url
+        validation_url = probe_url if probe_url and same_origin(origin, probe_url) else url
     probe = _runtime_auth_probe(origin, effective_cookie, validation_url, deadline=deadline)
     flow_observed = safe_bool_metadata(login.get('authentication_flow_observed'), False)
     usable = probe.get('usable') is not False and (probe.get('distinguished_from_anonymous') is True or flow_observed)
     result = {
-        'attempted': True,
-        'usable': bool(usable),
-        'status': 'authenticated' if usable else 'failed',
-        'auth_classification': 'current_identity_valid' if usable else 'auth_unknown',
-        'auth_outcome': 'AUTH_VALID' if usable else 'AUTH_FAILED',
-        'identity_ref': identity_ref,
-        'scope_key': scope_key,
-        'request_url': url,
-        'entry_url': str(login.get('entry_url') or ''),
-        'final_url': str(login.get('final_url') or ''),
-        'probe_url': validation_url,
-        'cookie_header': effective_cookie if usable else '',
-        'cookie_names': cookie_names(effective_cookie) if usable else [],
-        'sso_reused': safe_bool_metadata(login.get('sso_reused'), False),
-        'credentials_reused': safe_bool_metadata(login.get('used_credentials'), False),
-        'credential_submit_used': bool(runtime_state.get('credential_submit_used', False)),
-        'session_fingerprint': post_session_fingerprint,
-        'authentication_flow_observed': flow_observed,
-        'distinguished_from_anonymous': probe.get('distinguished_from_anonymous'),
-        'probe': probe,
-        'attempt_count': previous_attempts + 1,
-        'attempted_urls': sorted(previous_urls | {url}),
+        'attempted': True, 'usable': bool(usable), 'status': 'authenticated' if usable else 'failed',
+        'auth_classification': 'current_identity_valid' if usable else 'auth_unknown', 'auth_outcome': 'AUTH_VALID' if usable else 'AUTH_FAILED',
+        'identity_ref': identity_ref, 'scope_key': scope_key, 'request_url': url, 'entry_url': str(login.get('entry_url') or ''),
+        'final_url': str(login.get('final_url') or ''), 'probe_url': validation_url, 'cookie_header': effective_cookie if usable else '',
+        'cookie_names': cookie_names(effective_cookie) if usable else [], 'sso_reused': safe_bool_metadata(login.get('sso_reused'), False),
+        'credentials_reused': safe_bool_metadata(login.get('used_credentials'), False), 'credential_submit_used': bool(runtime_state.get('credential_submit_used', False)),
+        'credential_submit_blocked': bool(runtime_state.get('credential_submit_blocked', False)), 'session_fingerprint': post_session_fingerprint,
+        'authentication_flow_observed': flow_observed, 'distinguished_from_anonymous': probe.get('distinguished_from_anonymous'), 'probe': probe,
+        'attempt_count': previous_attempts + 1, 'attempted_urls': sorted(previous_urls | {url}),
     }
-    if not usable:
+    if usable:
+        # A credential submission counts as successful only after the resulting application session
+        # has been validated. Resetting the identity-wide guard earlier would allow a cookie-shaped
+        # but unauthenticated response to bypass the cooldown on the next page/origin.
+        _record_runtime_credential_success(runtime_state, credential_attempted=credential_attempted)
+        result['credential_submit_used'] = bool(runtime_state.get('credential_submit_used', False))
+        result['credential_submit_blocked'] = bool(runtime_state.get('credential_submit_blocked', False))
+    else:
+        _record_runtime_credential_failure(
+            runtime_state, 'post_login_session_validation_failed', credential_attempted=credential_attempted,
+        )
         result['reason'] = 'runtime authentication did not produce a usable application session'
+        result['reason_code'] = 'post_login_session_validation_failed'
+        result['credential_submit_used'] = bool(runtime_state.get('credential_submit_used', False))
+        result['credential_submit_blocked'] = bool(runtime_state.get('credential_submit_blocked', False))
     RUNTIME_AUTH_APPLICATION_ATTEMPTS[attempt_key] = dict(result)
     return result
 
@@ -7220,9 +7482,9 @@ def _same_origin_application_auth_candidates(discovery: dict[str, Any], target: 
 def authenticate_discovered_sibling_origins(discovery: dict[str, Any], target: str, primary_cookies: str, *, allow_state_changes: bool=False, wall_clock_deadline: float | None=None) -> dict[str, Any]:
     """Create independent sessions for authorized sibling origins observed by authenticated discovery.
 
-    This function never copies the primary Cookie header. It first imports the original browser SSO
-    storage state. If the IdP asks for credentials again, it reuses only the username/password already
-    resolved by assessmentRunner and never prompts from inside the orchestrator process.
+    This function never copies the primary Cookie header. A sibling is attempted only after discovery
+    observed real authentication evidence on that origin. Sibling origins may reuse established SSO
+    state, but they never spend another username/password submission merely because a new port exists.
     """
     if not primary_cookies or not runtime_target_auth_available(primary_cookies):
         return discovery
@@ -7238,20 +7500,14 @@ def authenticate_discovered_sibling_origins(discovery: dict[str, Any], target: s
         if not url_in_authorized_scope(target, origin):
             continue
         bucket = evidence.get(origin, {})
-        candidates = _runtime_auth_candidate_urls(discovery, origin)
+        identity_ref = _runtime_identity_reference(primary_cookies) or str(RUNTIME_TARGET_AUTH.get('reference') or '')
+        candidates = runtime_auth_evidence_urls(discovery, origin, identity_ref=identity_ref, include_configured=False)
         if not candidates:
+            # A discovered web service is not an authentication target merely because it is on an
+            # authorized sibling port. Without an observed login/SSO/401/403 signal, anonymous coverage
+            # remains authoritative and no authenticated discovery/action is created for this origin.
             continue
-        # Static-only sibling origins do not trigger a login. Any interactive evidence or an actual
-        # non-static application candidate is sufficient; this remains generic and site-independent.
         if int(bucket.get('interactive', 0) or 0) <= 0 and int(bucket.get('observations', 0) or 0) <= 1:
-            continue
-        login_signal = any(_looks_like_application_login_entry(url) for url in candidates)
-        storage_signal = any(bool(_runtime_storage_cookie_header(url, primary_cookies)) for url in candidates)
-        # Do not launch a browser-login attempt for every public sibling merely because it was linked
-        # by a large portal. High-ranked broad origins, explicit login/SSO entries and origins already
-        # touched by browser SSO state remain eligible; lower-ranked public-only origins can still use
-        # the just-in-time path if a concrete authenticated scanner later demonstrates a login gate.
-        if origin not in broad_priority_origins and not login_signal and not storage_signal:
             continue
         eligible.append((origin, score, candidates))
 
@@ -7342,6 +7598,7 @@ def authenticate_discovered_sibling_origins(discovery: dict[str, Any], target: s
         sibling_sso_cap = max(login_minimum, int(math.ceil(rate_aware_network_budget(RUNTIME_AUTH_SIBLING_SSO_TIMEOUTS.get(CURRENT_SCAN_MODE, 15), MAX_REQUEST_RATE))))
         configured_login_timeout = max(login_minimum, int(attempt_credential.get('timeout_seconds') or sibling_sso_cap))
         attempt_credential['timeout_seconds'] = max(login_minimum, min(configured_login_timeout, sibling_sso_cap, int(remaining_auth)))
+        allow_credential_submit, credential_guard_reason = _runtime_credential_submit_allowed(runtime_state)
         try:
             login = browser_oidc_login_session(
                 origin,
@@ -7353,14 +7610,19 @@ def authenticate_discovered_sibling_origins(discovery: dict[str, Any], target: s
                 initial_login=False,
                 include_configured_fallbacks=False,
                 expected_oidc_issuer=str(runtime_state.get('oidc_issuer') or ''),
-                # Sibling origins may reuse cookie/browser/OIDC SSO state only. They must never
-                # consume or repeat the real username/password attempt merely because they share
-                # the authorized hostname on another port.
-                allow_credential_submit=False,
+                # Prefer browser/OIDC SSO state. If this real auth surface still requests credentials,
+                # a full login is permitted only while the identity-wide failure guard remains clear.
+                # targetAuth additionally pins any learned/configured OIDC issuer/realm.
+                allow_credential_submit=allow_credential_submit,
                 request_rate=MAX_REQUEST_RATE,
             )
         except RuntimeError as exc:
             message = str(exc)
+            credential_attempted = bool(getattr(exc, 'credential_submit_attempted', False))
+            _record_runtime_credential_failure(
+                runtime_state, str(getattr(exc, 'reason', 'browser_login_failed') or 'browser_login_failed'),
+                credential_attempted=credential_attempted,
+            )
             # Authentication is origin/application specific. Record only entry points the browser
             # actually reached before its shared deadline; unvisited candidates remain eligible on a
             # later enrichment pass instead of being falsely exhausted.
@@ -7371,8 +7633,12 @@ def authenticate_discovered_sibling_origins(discovery: dict[str, Any], target: s
             )
             reason_code = str(getattr(exc, 'reason', 'browser_login_failed') or 'browser_login_failed')
             if reason_code == 'credential_submit_budget_exhausted':
-                status = 'session_only_credentials_required'
-                diagnostic = 'saved browser/OIDC state did not establish the sibling session; credentials were deliberately not submitted'
+                if credential_guard_reason == 'credential_retry_cooldown':
+                    status = 'credential_retry_cooldown'
+                    diagnostic = 'identity-wide credential retry cooldown is active; saved browser/OIDC state was tried without another password submission'
+                else:
+                    status = 'session_only_credentials_required'
+                    diagnostic = 'saved browser/OIDC state did not establish the sibling session; credentials were deliberately not submitted'
             elif reason_code == 'browser_login_failed' and 'login form/control not found' in message.lower():
                 status = 'no_auth_entry_observed'
                 diagnostic = 'no reusable browser/SSO session or login entry was observed on this sibling origin'
@@ -7383,9 +7649,9 @@ def authenticate_discovered_sibling_origins(discovery: dict[str, Any], target: s
             print(f'    [AUTH SSO] {origin}: {status}: {diagnostic}', file=sys.stderr, flush=True)
             continue
 
-        if bool(login.get('credential_submit_attempted', False)):
-            # Defensive invariant: allow_credential_submit=False above should make this impossible.
-            runtime_state['credential_submit_used'] = True
+        _record_runtime_credential_success(
+            runtime_state, credential_attempted=bool(login.get('credential_submit_attempted', False)),
+        )
         sibling_cookie = str(login.get('cookie_header') or '')
         if not sibling_cookie:
             runtime_rows.append({'origin': origin, 'status': 'failed', 'reason': 'browser login returned no origin cookie', 'score': score, 'attempted_candidates': [str(login.get('entry_url') or candidates[0])] if candidates else []})
@@ -7432,7 +7698,11 @@ def authenticate_discovered_sibling_origins(discovery: dict[str, Any], target: s
             'distinguished_from_anonymous': probe.get('distinguished_from_anonymous'),
             'probe': probe,
         })
-        mode = 'existing SSO state' if login.get('sso_reused') else 'the original username/password'
+        mode = (
+            'existing SSO state' if login.get('sso_reused')
+            else 'username/password' if login.get('used_credentials')
+            else 'saved browser/OIDC state'
+        )
         print(f'    [AUTH SSO] {origin}: origin session established using {mode}; cookie names: {", ".join(cookie_names(sibling_cookie)) or "none"}.', flush=True)
 
         # Revisit the sibling with its own session so protected menus/pages can contribute request
@@ -7591,6 +7861,49 @@ def discovery_for_origin(discovery: dict[str, Any], origin: str, identity_cookie
     filtered['target_preparation'] = {'performed': False, 'configured': False, 'usable': True}
     filtered['budget_diagnostics'] = dict(discovery.get('budget_diagnostics') or {})
     return filtered
+
+
+def authenticated_discovery_projection(
+    discovery: dict[str, Any], anchor_origin: str, identity_cookies: str,
+) -> dict[str, Any]:
+    """Keep authenticated-profile coverage only on origins with a validated runtime session.
+
+    Anonymous discovery may be merged temporarily as evidence so the runtime can locate login/SSO
+    surfaces on other authorized ports. Before that surface is exposed to the authenticated planner,
+    this projection removes public-only origins and retains only the anchor session plus sibling origins
+    whose runtime-authentication verdict is authenticated/reused.
+    """
+    origins: list[str] = []
+    anchor = normalized_origin(anchor_origin)
+    if anchor:
+        origins.append(anchor)
+    for row in discovery.get('runtime_sibling_authentication', []) or []:
+        if not isinstance(row, dict) or str(row.get('status') or '') not in {'authenticated', 'reused'}:
+            continue
+        origin = normalized_origin(str(row.get('origin') or ''))
+        if origin and origin not in origins:
+            origins.append(origin)
+    projected: dict[str, Any] = {}
+    for origin in origins:
+        view = discovery_for_origin(discovery, origin, identity_cookies)
+        projected = view if not projected else merge_discovery(projected, view)
+    if not projected:
+        projected = discovery_for_origin(discovery, anchor_origin, identity_cookies)
+    authenticated_origins = set(origins)
+    projected['errors'] = [
+        dict(row) for row in discovery.get('errors', []) or []
+        if isinstance(row, dict)
+        and (
+            not str(row.get('url') or '').strip()
+            or normalized_origin(str(row.get('url') or '')) in authenticated_origins
+        )
+    ]
+    for key in ('runtime_sibling_authentication', 'runtime_application_authentication'):
+        projected[key] = [dict(row) if isinstance(row, dict) else row for row in discovery.get(key, []) or []]
+    projected['authentication_effective'] = True
+    projected['authentication_note'] = 'Authenticated discovery is restricted to origins with a validated runtime session.'
+    projected['authenticated_runtime_origins'] = origins
+    return projected
 
 
 # Combines discovery results without duplicating pages or request cases.
@@ -10973,7 +11286,9 @@ def prepare_cli_context(parser: argparse.ArgumentParser, args: argparse.Namespac
         print('[*] Authenticated cookie names: ' + ', '.join(cookie_names(normalized_cookie)))
         profiles.append({'name': 'authenticated', 'cookies': normalized_cookie, 'identity_ref': str(getattr(args, 'primary_identity_name', '') or 'primary')})
     elif args.auth_only:
-        parser.error('--auth-only requires --cookies.')
+        # assessmentRunner may intentionally defer browser/OIDC login until anonymous bootstrap
+        # discovery proves that authentication is relevant. Validation occurs after runtime state loads.
+        pass
     secondary_cookie = ''
     additional_identities: list[tuple[str, str]] = []
     if args.secondary_cookies:
@@ -11031,6 +11346,10 @@ def prepare_cli_context(parser: argparse.ArgumentParser, args: argparse.Namespac
             secondary_cookie = value
         print(f"[*] Authenticated identity {label!r} cookie names: " + ', '.join(cookie_names(value)))
     configure_runtime_target_auth(target, normalized_cookie)
+    if args.auth_only and not normalized_cookie:
+        if not runtime_auth_identity_references():
+            parser.error('--auth-only requires --cookies or a configured lazy browser/OIDC identity supplied by assessmentRunner.')
+        profiles.append({'name': 'anonymous', 'cookies': '', 'bootstrap_only': 'true'})
     return (target, profiles, normalized_cookie, secondary_cookie, injection_url)
 
 # Normalizes explicit assessment entry points after the primary target and scope are configured.
