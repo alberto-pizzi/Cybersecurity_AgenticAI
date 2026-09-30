@@ -157,9 +157,9 @@ PLANNER_SELECTED_FAMILY_KEY_CHARS = 240
 PLANNER_CANDIDATE_PARAMETER_CHARS = 160
 PLANNER_CANDIDATE_FAMILY_CHARS = 360
 
-# Per-batch final-analysis ceilings. These are intentionally independent from the CLI
-# --ai-timeout option, which belongs only to planner rounds. Mixing the two previously allowed a
-# small planner timeout to silently disable otherwise well-budgeted final AI interpretation.
+# Per-batch final-analysis ceilings are intentionally independent from the CLI
+# --ai-timeout option, which belongs only to planner rounds, so final AI interpretation keeps
+# its own explicit budget.
 AI_ANALYSIS_BATCH_TIMEOUTS = {
     'test': 60,
     'fast': 480,
@@ -258,8 +258,8 @@ ROUND_EXECUTION_ACTION_ADAPTIVE_CEILINGS = {
     for mode, reference in ROUND_EXECUTION_ACTION_REFERENCE_CAPS.items()
 }
 
-# Operational pre-finalization coverage budgets. These retain the historical 1h/10h/20h/40h
-# profile envelopes and are independent from verification, AI interpretation and report rendering.
+# Operational pre-finalization coverage budgets are independent from verification, AI
+# interpretation and report rendering.
 # Lower target request rates expand only this target-traffic-dependent phase.
 AGENTIC_EXECUTION_PHASE_BUDGETS = {
     'test': 60 * 60,
@@ -401,7 +401,7 @@ def _assessment_execution_budget_exhausted(state: AgentState) -> bool:
     return time.monotonic() >= _assessment_execution_deadline(state)
 
 def _execution_overflow_cap(mode: str, round_number: int) -> int:
-    # Legacy helper retained for report compatibility. Normal Agentic planning has no Python-chosen
+    # Report-compatibility helper. Normal Agentic planning has no Python-chosen
     # overflow lane; capacity above the resolved normal capacity exists only after an explicit AI request.
     reference = int(ROUND_EXECUTION_ACTION_REFERENCE_CAPS.get(str(mode or 'balanced'), 800))
     adaptive = int(ROUND_EXECUTION_ACTION_ADAPTIVE_CEILINGS.get(str(mode or 'balanced'), reference))
@@ -1532,7 +1532,7 @@ def _planner_system_message() -> str:
     )
 
 
-# Kept as a compatibility wrapper for older callers/tests. Normal planning no longer performs a
+# Compatibility wrapper used by callers/tests. Normal planning performs no
 # tool-group breadth review because every concrete action is already evaluated by the AI.
 def _planner_review_system_message() -> str:
     return _planner_system_message()
@@ -3115,9 +3115,9 @@ def discovery_node(state: AgentState) -> dict[str, Any]:
     discovery, diagnostics = ({}, list(state['diagnostics']))
     state_changes_allowed = shared.state_changing_tests_allowed(state['target'], state.get('allow_state_changes'))
     assessment_deadline = _assessment_execution_deadline(state)
-    # Preserve the primary application frontier first. A full same-host TCP sweep used to run here
-    # synchronously and could delay web crawling/authenticated discovery by tens of minutes.
-    # Service breadth is still retained, but it runs only after every primary profile has completed.
+    # Preserve the primary application frontier first. The same-host TCP sweep runs only after every
+    # primary profile has completed, so web crawling/authenticated discovery is not delayed by the
+    # broader service-discovery phase.
     profile_results: dict[str, dict[str, Any]] = {}
     profile_workers = max(1, min(len(state['profiles']) or 1, int(shared.PARALLELISM_POLICY.get('profile_workers') or 1)))
 
@@ -4108,7 +4108,7 @@ def planner_node(state: AgentState) -> dict[str, Any]:
             for profile_data in state.get('discovery', {}).values() if isinstance(profile_data, dict)
         ),
         'round_action_normal_target_total': normal_round_base,
-        'round_action_normal_base_total': normal_round_base,  # legacy compatibility
+        'round_action_normal_base_total': normal_round_base,  # report/schema compatibility
         'round_action_resolved_base_total': resolved_round_base,
         'round_action_resolved_max_total': resolved_round_max,
         'round_action_overflow_total': round_overflow_cap,
@@ -4262,8 +4262,8 @@ async def execute_action(action: dict[str, Any], cookies: dict[str, str], discov
             result['state_refresh'] = state_refresh
         return (action, result)
 
-# Backward-compatible helper retained for older callers/checkpoint harnesses. In normal Agentic
-# execution the planner's global model-provided priority order is authoritative: Python must not
+# Compatibility helper used by direct callers/tests. In normal Agentic execution the planner's
+# global model-provided priority order is authoritative: Python must not
 # reshuffle selected actions by profile/tool class after the AI has ranked them. Scope, state-change,
 # per-tool resource and wall-clock guards still apply, but they validate/cap rather than choose order.
 def _fair_sequential_action_order(plan: list[dict[str, Any]], cookies: dict[str, str]) -> list[dict[str, Any]]:
@@ -4899,7 +4899,7 @@ def report_node(state: AgentState) -> dict[str, Any]:
             1 for profile in state['profiles']
             if bool(profile.get('cookies')) and _profile_has_effective_auth(state, str(profile.get('name') or ''))
         ),
-        # Compatibility alias for old report readers. Multi-identity reports should use authenticated_identity_count.
+        # Schema compatibility alias; multi-identity reports should use authenticated_identity_count.
         'secondary_identity_supplied': bool(state.get('secondary_cookies', '')) or sum(
             1 for profile in state['profiles']
             if bool(profile.get('cookies')) and _profile_has_effective_auth(state, str(profile.get('name') or ''))

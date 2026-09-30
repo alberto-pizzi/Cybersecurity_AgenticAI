@@ -45,7 +45,7 @@ mcp = FastMCP(
 
 # Freeze the source fingerprint when this process starts. If files are updated while an older MCP
 # process remains alive, a new orchestrator can detect that the process is stale instead of silently
-# using wrappers loaded from the previous checkout.
+# using wrappers whose source fingerprint does not match the current orchestrator.
 _SERVER_SOURCE_FINGERPRINT = secops_source_fingerprint()
 
 @mcp.tool()

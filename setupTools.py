@@ -52,7 +52,7 @@ RELEASE_TOOLS = {'nuclei': ('projectdiscovery/nuclei', 'nuclei'), 'ffuf': ('ffuf
 
 # Central CLI contracts used by both initializer validation and regression tests. Keeping these
 # option names in one place prevents wrapper changes from silently reintroducing runtime-only
-# failures such as the historical Nikto '-nocheck' incompatibility.
+# failures caused by unsupported scanner options such as Nikto '-nocheck'.
 ARJUN_REQUIRED_FLAGS = ('-u', '-m', '-w', '-t', '-T', '-c', '-q', '--include', '--headers', '--disable-redirects')
 SQLMAP_API_REQUIRED_FLAGS = ('-s', '-H', '-p', '--username', '--password')
 SQLMAP_SCAN_REQUIRED_FLAGS = (

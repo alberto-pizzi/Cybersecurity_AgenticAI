@@ -648,7 +648,7 @@ def request_body_fingerprint(method: str, data: str = "", parameters: Iterable[s
     return digest.hexdigest()[:16]
 
 # Persist text artifacts atomically on Linux, macOS and Windows. A crash can therefore leave the
-# previous complete file or the new complete file, rather than a half-written Results Data/report.
+# complete file before or after replacement, rather than a half-written Results Data/report.
 def atomic_write_text(path: str | Path, text: str, *, encoding: str = "utf-8") -> Path:
     destination = Path(path)
     destination.parent.mkdir(parents=True, exist_ok=True)
@@ -934,7 +934,7 @@ class AssessmentRateContractError(RuntimeError):
 def _rate_client_process_alive(client_key: str) -> bool:
     """Best-effort liveness check for a pacer client key.
 
-    Old state files previously retained exited assessment PIDs for the full TTL, which could keep a
+    Exited assessment PIDs are pruned promptly so they cannot keep a
     later run artificially throttled below its configured rate. Unknown/legacy keys fail open to
     TTL handling; explicit dead PIDs are removed immediately.
     """

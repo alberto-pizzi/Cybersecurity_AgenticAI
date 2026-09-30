@@ -466,7 +466,7 @@ def browser_oidc_login_session(
 ) -> dict[str, Any]:
     """Obtain one origin-scoped application session without ever prompting for credentials.
 
-    A previous Playwright storage state is imported first so an existing browser/OIDC SSO session can
+    An available Playwright storage state is imported first so an existing browser/OIDC SSO session can
     silently create an application cookie for a newly discovered sibling origin. If the identity provider
     asks for credentials again, the username/password already resolved by assessmentRunner are reused.
     """
@@ -481,7 +481,7 @@ def browser_oidc_login_session(
     if not origin:
         raise RuntimeError(f"Invalid target origin for automatic login: {target_url!r}")
 
-    # Credential-bearing logins keep the historical 15s minimum. SSO/session-only sibling probes
+    # Credential-bearing logins use a 15s minimum. SSO/session-only sibling probes
     # may use a much shorter bounded window because they are not allowed to submit credentials.
     timeout_floor = 15 if allow_credential_submit else 3
     timeout_seconds = max(timeout_floor, int(credential.get("timeout_seconds") or 60))
@@ -858,7 +858,7 @@ def browser_oidc_login_session(
                         issuer = current_issuer(auth_request_offset)
                         destination = _safe_auth_destination(current_url)
                         submission_scope = _credential_submission_scope(target_url, current_url, issuer)
-                        # Historical and multi-application deployments may use local target credentials
+                        # Multi-application deployments may use local target credentials
                         # for the primary dashboard while an authorized sibling/redirect reaches a
                         # different Keycloak/OIDC realm where those credentials are intentionally invalid.
                         # On the first primary login, an unpinned external realm rejection is therefore
@@ -921,5 +921,5 @@ def browser_oidc_login_session(
             browser.close()
 
 
-# Backward-compatible alias for older configs/imports; new code uses the provider-neutral name.
+# Configuration/import compatibility alias; runtime code uses the provider-neutral name.
 snap4city_browser_login_session = browser_oidc_login_session

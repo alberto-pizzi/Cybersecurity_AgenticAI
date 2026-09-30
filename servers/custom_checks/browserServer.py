@@ -140,7 +140,7 @@ async def _reflection_present(page: Any, marker: str) -> bool:
         return False
 
 async def _wait_for_browser_settle(page: Any, max_ms: int) -> None:
-    """Return early on a stable DOM/network state while preserving the old maximum wait."""
+    """Return early on a stable DOM/network state while respecting the configured maximum wait."""
     budget = max(1, int(max_ms))
     quantum = max(30, min(80, max(30, budget // 3)))
     waited = 0

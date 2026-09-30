@@ -1130,7 +1130,7 @@ async def deterministic_report_node(state: DeterministicState) -> dict[str, Any]
             1 for profile in profiles
             if bool(profile.get('cookies')) and discovery.get(profile['name'], {}).get('authentication_effective') is not False
         ),
-        # Compatibility alias for old report readers. Multi-identity reports should use authenticated_identity_count.
+        # Schema compatibility alias; multi-identity reports should use authenticated_identity_count.
         'secondary_identity_supplied': bool(secondary_cookies) or sum(
             1 for profile in profiles
             if bool(profile.get('cookies')) and discovery.get(profile['name'], {}).get('authentication_effective') is not False

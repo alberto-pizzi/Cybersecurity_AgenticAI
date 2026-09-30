@@ -1,5 +1,5 @@
 
-POLICY SCOPE, AUTENTICAZIONE E RATE (v31.79)
+POLICY SCOPE, AUTENTICAZIONE E RATE
 ---------------------------
 - Lo scope attivo usa origin esplicite; authorization.allow_same_host_ports (default false) puo' ammettere servizi HTTP/HTTPS su porte diverse dello stesso hostname esatto, anche con cambio HTTP<->HTTPS. Con authorization.discover_same_host_services=true la discovery puo' inoltre cercarli proattivamente con un sweep TCP generico bounded; il flag richiede allow_same_host_ports=true e non autorizza hostname sibling.
 - Un href, iframe, script, XHR/fetch o redirect verso un altro host NON estende lo scope. I suffissi DNS non autorizzano attacchi.

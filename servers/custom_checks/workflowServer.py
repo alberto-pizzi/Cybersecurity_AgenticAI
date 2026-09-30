@@ -501,7 +501,7 @@ def run_workflow_scan(
 
     # Do not discard a discovered workflow merely because its path contains reset/setup/delete-like
     # language. With state changes disabled the checks below remain structural-only; with explicit
-    # authorization the active workflow checks may run. The previous top-level regex hid useful CSRF,
+    # authorization the active workflow checks may run. The state-change classifier keeps useful CSRF,
     # CAPTCHA and authentication evidence even when no request would have been sent.
     findings: list[dict[str, Any]] = []
     diagnostics: dict[str, Any] = {

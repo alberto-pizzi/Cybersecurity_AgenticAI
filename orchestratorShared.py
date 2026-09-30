@@ -180,8 +180,8 @@ TEST_DISCOVERY_TIME_BUDGET_SECONDS = 8
 
 DISCOVERY_LIMITS = {
     # TEST remains a smoke profile. FAST/BALANCED/DEEP have larger ceilings because robots/sitemap/
-    # OpenAPI/source-map/FFUF enrichment can legitimately create far more useful surface than the
-    # previous HTML-only oriented defaults. Wall-clock budgets are scaled separately by request_rate.
+    # OpenAPI/source-map/FFUF enrichment can legitimately create a large useful surface. Wall-clock
+    # budgets are scaled separately by request_rate.
     # Service-sweep total time leaves headroom for two resolved addresses at the default 10 req/s
     # plus one bounded targeted expansion pool.  The initial slice intentionally stays much smaller
     # so application crawling/authentication still happens first; only the continuation envelope grows.
@@ -248,11 +248,9 @@ SCAN_MODES = {
     'balanced': {
         'broad': {'zap': 3000, 'nuclei': 4800, 'nikto': 300, 'ffuf': 2400, 'session': 90},
         'parameter': {'sqlmap': 180, 'dalfox': 120, 'commix': 180, 'traversal': 75, 'idor': 45, 'authorization': 70, 'browser': 120, 'workflow': 105},
-        # Raised from the previous 8-12 ceiling: each case already runs with its own independent
-        # per-case timeout (the 'parameter' timeouts above), so more selected cases means more total
-        # wall-clock time for this phase, not less time per case. The previous ceiling was small
-        # enough that, on an application with hundreds of discovered parameterized endpoints, only a
-        # small fraction of the real attack surface ever reached a specialist tool in 'balanced' mode.
+        # Each selected case runs with its own independent per-case timeout (the 'parameter'
+        # timeouts above), so larger selection limits increase total phase breadth while preserving
+        # the per-case execution budget.
         'limits': {'sqlmap': 90, 'dalfox': 120, 'commix': 84, 'traversal': 128, 'idor': 64, 'authorization': 128, 'browser': 160, 'workflow': 96},
         'arjun': 300, 'arjun_limit': 180,
     },
@@ -2684,9 +2682,8 @@ def _script_value_score(url: str) -> int:
 STATE_CHANGING_QUERY_KEYS = {'create_db', 'reset', 'delete', 'remove', 'logout', 'signout', 'logoff', 'disconnect', 'destroy', 'install', 'setup', 'password_new', 'password_conf', 'new_password', 'confirm_password'}
 
 # GET discovery safety uses the same central request-contract classifier as scanner helpers.
-# Keeping a second crawler-specific destructive-word policy previously caused coverage drift
-# (for example navigation parameters and reset-form pages could be suppressed even though the
-# concrete GET itself was read-only). Redirect destinations are evaluated independently before
+# This keeps crawler and scanner state-change semantics aligned. Redirect destinations are evaluated
+# independently before
 # they are followed, so allowing a navigation parameter does not authorize a later logout/delete hop.
 def _destructive_crawl_url(url: str) -> bool:
     return bool(request_contract_state_change_reason({
@@ -2967,9 +2964,9 @@ def _form_case(action: str, method: str, fields: list[dict[str, str]], source_ur
 class _RequestCaseAccumulator(list[dict[str, Any]]):
     """Online exact-semantic dedup for discovery request contracts.
 
-    The online accumulator deliberately uses the *same* identity as the final deduper.  Keeping two
-    independent approximations here previously allowed the early stage to erase semantically distinct
-    form encodings or internal-resource body routes before the final/specialist logic could see them.
+    The online accumulator deliberately uses the *same* identity as the final deduper so
+    semantically distinct form encodings or internal-resource body routes remain visible to the
+    final/specialist logic.
     """
     def __init__(self) -> None:
         super().__init__()
@@ -4313,10 +4310,8 @@ def _browser_network_discovery_impl(target: str, cookies: str, html_urls: list[s
             def wait_for_browser_settle(max_ms: int) -> None:
                 """Wait for delayed AJAX/menu work without restoring an unconditional fixed sleep.
 
-                A previous optimization could return after the first repeated DOM/resource sample,
-                often ~100-160 ms after navigation. That is too early for common delayed menu/XHR
-                population and can shrink the discovered application graph. We now require a minimum
-                dwell plus multiple stable samples, while still returning before max_ms on truly idle pages.
+                Require a minimum dwell plus multiple stable DOM/resource samples so delayed menu/XHR
+                population has time to appear, while still returning before max_ms on truly idle pages.
                 """
                 budget = remaining_browser_ms(max_ms)
                 if budget <= 1:
@@ -5922,7 +5917,7 @@ def discover_target(
             http_worker_local.session = worker_session
         # Copy server-issued cookies learned by any earlier worker/batch. Explicit supplied Cookie
         # headers remain origin-scoped by `_safe_crawl_get`; this synchronization only preserves
-        # ordinary Set-Cookie session continuity that the old single Session naturally provided.
+        # ordinary Set-Cookie session continuity across worker sessions.
         with http_cookie_jar_lock:
             worker_session.cookies.update(session.cookies)
         requested = str(item['requested'])
@@ -6720,7 +6715,7 @@ def select_sibling_broad_origins(
 
 
 def sibling_broad_origin_limit() -> int:
-    # Backward-compatible helper: returns the adaptive maximum, not the normal base allocation.
+    # Compatibility helper: returns the adaptive maximum, not the normal base allocation.
     return sibling_broad_origin_limits()[1]
 
 
@@ -7305,7 +7300,7 @@ def ensure_runtime_authenticated_request(
             login = login_once(username, password)
         except BrowserLoginError as exc:
             # Missing credentials are resolved only after the browser proved that a real login form
-            # requires them. This is the lazy equivalent of the old parent-side startup prompt.
+            # requires them; credentials were already resolved by the parent before child execution.
             if str(getattr(exc, 'reason', '') or '') == 'credentials_unavailable' and allow_credential_submit and _lazy_runtime_prompt_credentials(runtime_state):
                 username = str(runtime_state.get('username') or '')
                 password = str(runtime_state.get('password') or '')
@@ -9922,7 +9917,7 @@ def _workflow_case_priority(case: dict[str, Any]) -> int:
     auth_shape = _is_login_case(case) or any((token in path for token in ('login', 'signin', 'brute', 'auth')))
     captcha_shape = any(('captcha' in value for value in names)) or 'captcha' in path
     # A generic token parameter alone is not a workflow. API calls frequently contain bearer,
-    # pagination or application tokens and were previously spending workflow action slots only to
+    # pagination or application tokens do not spend workflow action slots only to
     # be SKIPPED by the verifier. Require one real CSRF/upload/auth/CAPTCHA/state-change signal.
     if not (file_parameters or state_hits or state_path or auth_shape or captcha_shape):
         return -1000
@@ -10927,7 +10922,7 @@ def log_result(profile: str, name: str, result: dict[str, Any], target: str='') 
         else:
             # An outer MCP/watchdog timeout can synthesize a PARTIAL result before the scanner
             # returns its structured metadata. Do not print missing fields as a real zero-template
-            # inventory: that previously made transport truncation look like an installation bug.
+            # inventory, so transport truncation is not misclassified as an installation bug.
             print('    [NUCLEI TEMPLATES] inventory=unknown; scanner metadata was not returned before the outer result was finalized')
         fingerprint = result.get('technology_fingerprint') if isinstance(result.get('technology_fingerprint'), dict) else {}
         direct_templates = result.get('custom_template_count') if 'custom_template_count' in result else 'unknown'
