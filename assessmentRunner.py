@@ -41,20 +41,20 @@ REPORTS_DIR = ROOT / "reports"
 # normally finalizes reports itself; this guard exists only for hangs outside the workflow guards.
 AGENTIC_PARENT_EXECUTION_BUDGET_SECONDS = {
     'test': 60 * 60,
-    'fast': 10 * 60 * 60,
-    'balanced': 20 * 60 * 60,
-    'deep': 40 * 60 * 60,
+    'fast': 14 * 60 * 60,
+    'balanced': 30 * 60 * 60,
+    'deep': 56 * 60 * 60,
 }
 AGENTIC_PARENT_FINALIZATION_BUDGET_SECONDS = {
     'test': 40 * 60,
-    'fast': 180 * 60,
-    'balanced': 330 * 60,
-    'deep': 630 * 60,
+    'fast': 240 * 60,
+    'balanced': 450 * 60,
+    'deep': 870 * 60,
 }
 # Parent-only emergency slack beyond the child's already-generous internal watchdog. This catches a
 # genuinely stuck process; it must never be the thing that decides normal scanner/AI/report coverage.
 AGENTIC_PARENT_WATCHDOG_SLACK_SECONDS = {
-    # Always wider than the child's own emergency slack (20m/2h/4h/8h respectively).
+    # Always wider than the child's own emergency slack for the same profile.
     # This is intentionally generous because the parent timeout is a process-hang kill switch,
     # not a coverage or finalization scheduler.
     'test': 50 * 60,
@@ -1362,10 +1362,8 @@ def _generate_aggregate_report(results_data: dict[str, Any], config: dict[str, A
     # PDF rendering is wrapped in its own try/except (mirroring servers/reporting/reportServer.py's
     # _generate_report) so that a PDF failure - e.g. WeasyPrint/its native Pango/Harfbuzz libraries
     # missing, or the Docker fallback being unavailable - degrades to "no PDF" instead of raising and
-    # discarding the JSON/HTML/review-snapshot artifacts that were already written above. Previously
-    # an exception here propagated out of this function entirely: the caller's except-block then
-    # logged "Aggregate report generation failed" and kept the old per-job report list, silently
-    # orphaning the aggregate HTML/JSON already on disk with no reference to them anywhere.
+    # discarding the JSON/HTML/review-snapshot artifacts that were already written above. The caller
+    # therefore keeps the aggregate JSON/HTML/review paths visible even when PDF conversion fails.
     pdf_error: str | None = None
     try:
         atomic_write_text(pdf_source_path, _render_html(payload, for_pdf=True))

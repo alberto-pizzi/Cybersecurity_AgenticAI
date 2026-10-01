@@ -410,8 +410,12 @@ def install_idor_forge() -> dict[str, Any]:
         detail = '\n'.join(filter(None, ((probe.stdout or '').strip(), (probe.stderr or '').strip())))
         raise RuntimeError('IDOR-Forge dependency preflight still fails after one clean venv rebuild.\n' + detail[-2500:])
     launcher = write_launcher('idor-forge', [str(venv_python), str(entrypoint)])
-    _IDOR_FORGE_STATE = {'repository': IDOR_FORGE_REPOSITORY, 'directory': str(IDOR_FORGE_DIR.resolve()), 'entrypoint': str(entrypoint.resolve()), 'checker': str(checker.resolve()), 'python': str(venv_python.resolve()), 'launcher': str(launcher.resolve()), 'preflight': 'ok'}
+    # Keep the virtual-environment executable path itself.  On POSIX, ``.venv/bin/python`` is
+    # commonly a symlink to the system interpreter; resolving that symlink would discard the venv
+    # context and make later preflight checks import packages from the system environment instead.
+    _IDOR_FORGE_STATE = {'repository': IDOR_FORGE_REPOSITORY, 'directory': str(IDOR_FORGE_DIR.resolve()), 'entrypoint': str(entrypoint.resolve()), 'checker': str(checker.resolve()), 'python': str(venv_python.absolute()), 'launcher': str(launcher.resolve()), 'preflight': 'ok'}
     print(f'[+] IDOR-Forge upstream runtime ready: {IDOR_FORGE_DIR}')
+    print(f'[+] IDOR-Forge isolated interpreter: {_IDOR_FORGE_STATE["python"]}')
     return dict(_IDOR_FORGE_STATE)
 
 # Configures the per-user Perl library used by CPAN on Unix-like hosts.

@@ -88,43 +88,43 @@ class AgentState(TypedDict):
 # plan (no tokens at all until prefill finishes), so these budgets stay generous by default.
 AI_PLANNER_TIMEOUTS = {
     'test': 90,
-    'fast': 900,
-    'balanced': 1800,
-    'deep': 3000,
+    'fast': 1200,
+    'balanced': 2400,
+    'deep': 3600,
 }
 # Whole-assessment control-plane guard. Per-round budgets above remain generous ceilings, but a
 # pathologically slow provider must not consume hours simply because FAST/BALANCED/DEEP allow
 # multiple planning rounds. Unused time from an early round remains available to later rounds.
 AI_PLANNER_WORKFLOW_TIMEOUTS = {
     'test': 90,
-    'fast': 1500,       # 25 minutes across at most two rounds
-    'balanced': 2700,   # 45 minutes across at most two rounds
-    'deep': 3600,       # 60 minutes across at most three rounds
+    'fast': 2100,       # 35 minutes across the assessment
+    'balanced': 4200,   # 70 minutes across the assessment
+    'deep': 6000,       # 100 minutes across the assessment
 }
 # Reserve a useful slice for each later round before allowing the current round to consume the
 # workflow-wide planner budget. If the remaining total is already below the reserve schedule, the
 # remainder is shared evenly instead of starving the current round to ~0 seconds.
 AI_PLANNER_FUTURE_ROUND_RESERVE_SECONDS = {
     'test': 0,
-    'fast': 600,
-    'balanced': 900,
-    'deep': 900,
+    'fast': 750,
+    'balanced': 1200,
+    'deep': 1500,
 }
 # Inside one planning round, protect a useful minimum for later context batches without forcing a
 # strict equal split. This lets an unusually slow early batch borrow otherwise-idle round budget
 # while still preventing it from consuming every later batch's opportunity to be evaluated.
 AI_PLANNER_FUTURE_BATCH_RESERVE_SECONDS = {
     'test': 15,
-    'fast': 90,
-    'balanced': 180,
-    'deep': 240,
+    'fast': 120,
+    'balanced': 240,
+    'deep': 360,
 }
 
 AI_PLANNER_MAX_PREDICT = {
     'test': 500,
-    'fast': 800,
-    'balanced': 1300,
-    'deep': 1800,
+    'fast': 900,
+    'balanced': 1500,
+    'deep': 2000,
 }
 
 AI_PLANNER_CONTEXT_WINDOWS = {
@@ -154,6 +154,7 @@ PLANNER_PREVIOUS_RESULT_OUTPUT_CHARS = {'test': 120, 'fast': 160, 'balanced': 18
 # only the verbose per-family breakdown is summarized.
 PLANNER_SELECTED_FAMILY_ROWS = {'test': 24, 'fast': 48, 'balanced': 96, 'deep': 160}
 PLANNER_SELECTED_FAMILY_KEY_CHARS = 240
+PLANNER_COVERAGE_DEBT_FAMILY_ROWS = {'test': 24, 'fast': 64, 'balanced': 128, 'deep': 224}
 PLANNER_CANDIDATE_PARAMETER_CHARS = 160
 PLANNER_CANDIDATE_FAMILY_CHARS = 360
 
@@ -162,9 +163,9 @@ PLANNER_CANDIDATE_FAMILY_CHARS = 360
 # its own explicit budget.
 AI_ANALYSIS_BATCH_TIMEOUTS = {
     'test': 60,
-    'fast': 480,
-    'balanced': 900,
-    'deep': 1500,
+    'fast': 600,
+    'balanced': 1200,
+    'deep': 1800,
 }
 # Aggregate ceiling for the complete post-scan AI analysis stage. The per-batch ceilings above
 # remain useful rescue bounds, but repeated finding batches must not multiply into hours after the
@@ -175,9 +176,9 @@ AI_ANALYSIS_STAGE_TIMEOUTS = {
     # subtraction from scanner coverage: the global watchdog is deliberately wider than the sum
     # of the operational execution and finalization windows.
     'test': 10 * 60,
-    'fast': 90 * 60,
-    'balanced': 180 * 60,
-    'deep': 360 * 60,
+    'fast': 120 * 60,
+    'balanced': 240 * 60,
+    'deep': 480 * 60,
 }
 AI_ANALYSIS_FUTURE_BATCH_RESERVE_SECONDS = {
     'test': 12,
@@ -234,12 +235,12 @@ WORKFLOW_COVERAGE_TOOLS = ('browser', 'workflow')
 # never cause an action to run by themselves: the AI still decides which concrete actions are useful.
 ROUND_EXECUTION_ACTION_REFERENCE_CAPS = {
     'test': 24,
-    'fast': 120,
-    'balanced': 320,
-    'deep': 480,
+    'fast': 180,
+    'balanced': 480,
+    'deep': 720,
 }
-# Compatibility alias used by older report/validation code. It now means the normal global round
-# ceiling; it is not a per-profile target and must not be interpreted as deterministic coverage.
+# Public alias consumed by report/validation code. It means the normal global round ceiling; it is
+# not a per-profile target and must not be interpreted as deterministic coverage.
 PROFILE_EXECUTION_ACTION_BUDGETS = dict(ROUND_EXECUTION_ACTION_REFERENCE_CAPS)
 PROFILE_EXECUTION_ACTION_OVERFLOW_INITIAL = {mode: 0 for mode in ROUND_EXECUTION_ACTION_REFERENCE_CAPS}
 PROFILE_EXECUTION_ACTION_OVERFLOW_STEP = {mode: 0 for mode in ROUND_EXECUTION_ACTION_REFERENCE_CAPS}
@@ -263,9 +264,9 @@ ROUND_EXECUTION_ACTION_ADAPTIVE_CEILINGS = {
 # Lower target request rates expand only this target-traffic-dependent phase.
 AGENTIC_EXECUTION_PHASE_BUDGETS = {
     'test': 60 * 60,
-    'fast': 10 * 60 * 60,
-    'balanced': 20 * 60 * 60,
-    'deep': 40 * 60 * 60,
+    'fast': 14 * 60 * 60,
+    'balanced': 30 * 60 * 60,
+    'deep': 56 * 60 * 60,
 }
 
 # Finalization phase budgets are ADDITIVE to the operational execution envelope. They do not eat
@@ -274,21 +275,21 @@ AGENTIC_EXECUTION_PHASE_BUDGETS = {
 # four stages and is only a hang/deadlock safety net.
 AGENTIC_VERIFICATION_RESERVE_SECONDS = {
     'test': 10 * 60,
-    'fast': 30 * 60,
-    'balanced': 60 * 60,
-    'deep': 120 * 60,
+    'fast': 45 * 60,
+    'balanced': 90 * 60,
+    'deep': 180 * 60,
 }
 AGENTIC_ANALYSIS_RESERVE_SECONDS = {
     'test': 10 * 60,
-    'fast': 90 * 60,
-    'balanced': 180 * 60,
-    'deep': 360 * 60,
+    'fast': 120 * 60,
+    'balanced': 240 * 60,
+    'deep': 480 * 60,
 }
 AGENTIC_REPORT_RESERVE_SECONDS = {
     'test': 20 * 60,
-    'fast': 60 * 60,
-    'balanced': 90 * 60,
-    'deep': 150 * 60,
+    'fast': 75 * 60,
+    'balanced': 120 * 60,
+    'deep': 210 * 60,
 }
 AGENTIC_FINALIZATION_RESERVE_SECONDS = {
     mode: (
@@ -304,9 +305,9 @@ AGENTIC_FINALIZATION_RESERVE_SECONDS = {
 # not killed exactly at a legitimate phase boundary.
 AGENTIC_WATCHDOG_SAFETY_MARGIN_SECONDS = {
     'test': 20 * 60,
-    'fast': 120 * 60,
-    'balanced': 240 * 60,
-    'deep': 480 * 60,
+    'fast': 180 * 60,
+    'balanced': 360 * 60,
+    'deep': 600 * 60,
 }
 
 # Compatibility/public table for the internal child hard guard at rate=10. This is intentionally
@@ -910,7 +911,7 @@ def _planner_candidate_view(action: dict[str, Any], candidate_id: str) -> dict[s
     # semantic view to decide usefulness; sending multi-kilobyte generated query strings (for
     # example DataTables requests with hundreds of columns) wastes context without adding a
     # meaningful planning signal.
-    target_url = str(action.get('target_url') or '')
+    target_url = _action_request_url(action, str(action.get('target_url') or ''))
     compact_url = shared.compact_log_url(target_url, max_length=720)
     _family_origin, family_path = shared._application_family_key(target_url)
     return {
@@ -953,7 +954,7 @@ def _fair_planner_action_order(actions: list[dict[str, Any]]) -> list[dict[str, 
         families: dict[tuple[str, str], list[dict[str, Any]]] = {}
         family_order: list[tuple[str, str]] = []
         for action in bucket:
-            family = shared._application_family_key(str(action.get('target_url') or ''))
+            family = shared._application_family_key(_action_request_url(action, str(action.get('target_url') or '')))
             if family not in families:
                 families[family] = []
                 family_order.append(family)
@@ -1426,6 +1427,46 @@ def _action_request_url(action: dict[str, Any], fallback_target: str='') -> str:
         return str(action.get('injection_url') or '').replace('FUZZ', 'secops-oast-placeholder')
     return str(action.get('target_url') or fallback_target or '')
 
+def _planner_application_family_key(action: dict[str, Any], fallback_target: str='') -> str:
+    request_url = _action_request_url(action, fallback_target)
+    origin, family = shared._application_family_key(request_url)
+    return f"{str(action.get('profile') or '')}|{origin}{family or '/'}"
+
+
+def _planner_coverage_debt_rows(
+    eligible_family_counts: Counter[str], prior_selected_family_counts: Counter[str],
+    selected_family_counts: Counter[str], row_cap: int,
+) -> list[dict[str, Any]]:
+    """Return advisory family debt after subtracting selections already made this round.
+
+    ``eligible_family_counts`` is the round-start catalogue.  Without subtracting prior-batch
+    selections, later planner batches would keep seeing already-selected work as still remaining and
+    could over-concentrate on the same application family.  This telemetry never filters or selects
+    actions; it only keeps the AI-facing debt counters internally consistent.
+    """
+    rows: list[dict[str, Any]] = []
+    for family, eligible_count in eligible_family_counts.items():
+        selected_now = max(0, int(selected_family_counts.get(family, 0) or 0))
+        prior_selected = max(0, int(prior_selected_family_counts.get(family, 0) or 0))
+        remaining = max(0, int(eligible_count or 0) - selected_now)
+        if remaining <= 0:
+            continue
+        rows.append({
+            'application_family': str(family)[:PLANNER_SELECTED_FAMILY_KEY_CHARS],
+            'remaining_eligible_actions': remaining,
+            'selected_this_round_actions': selected_now,
+            'prior_round_selected_actions': prior_selected,
+            '_sort_selected_total': prior_selected + selected_now,
+        })
+    rows.sort(key=lambda row: (
+        int(row['_sort_selected_total']),
+        -int(row['remaining_eligible_actions']),
+        str(row['application_family']),
+    ))
+    for row in rows:
+        row.pop('_sort_selected_total', None)
+    return rows[:max(1, int(row_cap or 1))]
+
 def _dedupe_no_cookie_profile_actions(state: AgentState, actions: list[dict[str, Any]]) -> list[dict[str, Any]]:
     output: list[dict[str, Any]] = []
     anonymous_equivalent: dict[str, int] = {}
@@ -1514,8 +1555,9 @@ def _planner_system_message() -> str:
         '- DEFER an action only for a concrete reason such as semantic duplication, equivalent completed work, weak applicability, incompatibility, safety constraints already described, or very low expected value.\n'
         '- Different actions from the same tool can have very different value; judge them independently. Likewise, an important action from a tool whose other actions are weak must still be selectable.\n'
         '- Broad scanners and targeted specialists are complementary; neither category replaces the other automatically.\n'
-        '- Your global numeric priority order is also the exact execution order. Do not place many slow/equivalent specialist actions ahead of distinct high-value complementary actions unless their evidence justifies it; use lower priorities for repetitive low-yield work.\n'
-        '- FFUF and Arjun are discovery producers. Rank a useful producer early when its enrichment should improve later actions. When a selected producer reaches its position in YOUR global order, Python merges its result immediately before the next action, so later same-round consumers can use the expanded graph. Python never promotes a lower-priority producer ahead of your higher-priority action and never adds an unselected producer.\n'
+        '- Your global numeric priority order is also the exact execution order. Security relevance, evidence strength, novelty/request-shape diversity and application-family coverage debt MUST dominate cost. Never lower the priority of a distinct high-value action, a new application family/shape, or materially uncovered security evidence merely because its configured timeout/cost class is higher. Use available_tools cost_class/configured_timeout_seconds ONLY as a final weak tie-breaker between actions that are otherwise equivalent on those coverage/security dimensions.\n'
+        '- coverage_debt_by_application_family is advisory remaining-surface telemetry. When several families have useful safe candidates, favor first/low-count coverage of under-tested families before spending many slow actions on a family already selected heavily in prior rounds. This is a prioritization signal, never a mandatory checklist.\n'
+        '- FFUF and Arjun are discovery producers. If you select one because its enrichment can expand a sparse/under-tested family, rank it early enough for later same-round actions to benefit. When a selected producer reaches its position in YOUR global order, Python merges its result immediately before the next action. Python never promotes a lower-priority producer ahead of your higher-priority action and never adds an unselected producer.\n'
         '- Previous findings raise follow-up priority when relevant but do not justify repeating equivalent completed work.\n'
         '- adaptive_candidate and coverage_reserve_hint are Python ranking hints only, not mandatory selections and not exclusions.\n'
         f'- FAST/BALANCED/DEEP configured reference capacities are {fast_cap}/{balanced_cap}/{deep_cap} concrete actions per round. They are not hard coverage caps: when needed, runtime admission grows to distribute the remaining eligible catalogue across the remaining rounds. Python never selects actions to fill that capacity. '
@@ -1571,6 +1613,34 @@ def _analysis_system_message() -> str:
     )
 
 
+def _planner_tool_cost_hint(tool: str) -> dict[str, Any]:
+    """Expose a weak final tie-break cost hint; Python never selects, excludes or orders by it."""
+    name = str(tool or '').lower()
+    if name == 'arjun':
+        timeout = int(shared.ARJUN_TIMEOUT)
+    elif name in shared.BROAD_SCANNER_TIMEOUTS:
+        timeout = int(shared.BROAD_SCANNER_TIMEOUTS.get(name, 0) or 0)
+    elif name in shared.PARAMETER_TOOL_TIMEOUTS:
+        timeout = int(shared.PARAMETER_TOOL_TIMEOUTS.get(name, 0) or 0)
+    elif name == 'interactsh':
+        timeout = int(shared.oast_timeout_seconds())
+    else:
+        timeout = int(shared.MCP_TOOL_TIMEOUT)
+    if timeout >= 900:
+        cost_class = 'very_high'
+    elif timeout >= 240:
+        cost_class = 'high'
+    elif timeout >= 90:
+        cost_class = 'medium'
+    else:
+        cost_class = 'low'
+    return {
+        'configured_timeout_seconds': max(0, timeout),
+        'cost_class': cost_class,
+        'discovery_producer': name in DISCOVERY_ENRICHMENT_TOOLS,
+    }
+
+
 # Asks the selected AI provider which exact concrete actions should run next. No tool/capability is
 # preselected in normal Agentic mode. Python constructs a valid deduplicated catalog, batches it for
 # context size, and applies safety/resource ceilings only after the model has prioritized actions.
@@ -1603,9 +1673,27 @@ def ai_plan(state: AgentState) -> dict[str, Any]:
 
     candidate_tools = sorted({str(action.get('tool') or '') for action in concrete_pool})
     registry = {
-        name: {'scope': REGISTRY[name][2], 'description': str(REGISTRY[name][3])[:180]}
+        name: {
+            'scope': REGISTRY[name][2],
+            'description': str(REGISTRY[name][3])[:180],
+            **_planner_tool_cost_hint(name),
+        }
         for name in candidate_tools if name in REGISTRY
     }
+    eligible_tool_counts = Counter(str(action.get('tool') or '') for action in concrete_pool)
+    eligible_family_counts: Counter[str] = Counter()
+    for action in concrete_pool:
+        family_key = _planner_application_family_key(action, str(state.get('target') or ''))
+        eligible_family_counts[family_key] += 1
+    prior_selected_family_counts: Counter[str] = Counter()
+    for audit_row in state.get('planner_audit', []) if isinstance(state.get('planner_audit'), list) else []:
+        if not isinstance(audit_row, dict):
+            continue
+        for selected in audit_row.get('selected_actions', []) if isinstance(audit_row.get('selected_actions'), list) else []:
+            if not isinstance(selected, dict):
+                continue
+            family_key = _planner_application_family_key(selected, str(state.get('target') or ''))
+            prior_selected_family_counts[family_key] += 1
     current_round = int(state.get('round', 0) or 0) + 1
     initial_budget = _round_execution_budget(state, concrete_pool, current_round)
     system_message = _planner_system_message()
@@ -1666,8 +1754,8 @@ def ai_plan(state: AgentState) -> dict[str, Any]:
             if not isinstance(selected_action, dict):
                 continue
             selected_tool_counts[str(selected_action.get('tool') or '')] += 1
-            _, selected_family = shared._application_family_key(str(selected_action.get('target_url') or ''))
-            selected_family_counts[selected_family or '/'] += 1
+            selected_family = _planner_application_family_key(selected_action, str(state.get('target') or ''))
+            selected_family_counts[selected_family] += 1
         family_row_cap = max(1, int(PLANNER_SELECTED_FAMILY_ROWS.get(mode, 96)))
         family_rows = sorted(
             selected_family_counts.items(),
@@ -1678,6 +1766,14 @@ def ai_plan(state: AgentState) -> dict[str, Any]:
             str(name)[:PLANNER_SELECTED_FAMILY_KEY_CHARS]: int(count)
             for name, count in visible_family_rows
         }
+        debt_cap = max(1, int(PLANNER_COVERAGE_DEBT_FAMILY_ROWS.get(mode, 128)))
+        coverage_debt_summary = _planner_coverage_debt_rows(
+            eligible_family_counts, prior_selected_family_counts, selected_family_counts, debt_cap,
+        )
+        remaining_debt_family_count = sum(
+            1 for family, count in eligible_family_counts.items()
+            if int(count or 0) > int(selected_family_counts.get(family, 0) or 0)
+        )
         return {
             'target': shared.compact_log_url(str(state['target']), max_length=720),
             'round': current_round,
@@ -1699,6 +1795,10 @@ def ai_plan(state: AgentState) -> dict[str, Any]:
             'selected_so_far_by_application_family': selected_family_summary,
             'selected_so_far_application_family_count': len(selected_family_counts),
             'selected_so_far_application_families_omitted': max(0, len(family_rows) - len(visible_family_rows)),
+            'remaining_eligible_by_tool': dict(sorted(eligible_tool_counts.items())),
+            'coverage_debt_by_application_family': coverage_debt_summary,
+            'coverage_debt_family_count': remaining_debt_family_count,
+            'coverage_debt_families_omitted': max(0, remaining_debt_family_count - len(coverage_debt_summary)),
             'discovery_summary': _planner_discovery_summary(state['discovery']),
             'previous_results': compact_results(state['results']),
             'available_tools': registry,
@@ -3177,7 +3277,7 @@ def discovery_node(state: AgentState) -> dict[str, Any]:
 
     latest_service_discovery = shared_service_discovery
     service_continuation_needed = bool(
-        int(shared_service_discovery.get('candidate_ports_deferred', 0) or 0) > 0
+        shared.same_host_service_discovery_needs_continuation(shared_service_discovery)
         and shared.same_host_service_remaining_time_budget_seconds() > 0
     )
 
@@ -3577,7 +3677,23 @@ def discovery_candidate_actions(state: AgentState) -> list[dict[str, Any]]:
         else:
             for case in select_oast_request_cases(state['discovery'].get(name, {}), state['target'], allow_state_changes=state_changes_allowed, agentic_catalog=True):
                 actions.append({'profile': name, 'tool': 'interactsh', 'target_url': state['target'], 'method': case.get('method', 'GET'), 'data': case.get('data', ''), 'parameters': case.get('parameters', []), 'content_type': case.get('content_type', ''), 'jwt_token': '', 'injection_url': case.get('injection_url', ''), 'oast_class': case.get('oast_class', 'remote-fetch'), 'reason': f"Discovered OAST-capable candidate parameter: {case.get('parameter', 'unknown')}."})
-    return _dedupe_no_cookie_profile_actions(state, actions)
+    deduped = _dedupe_no_cookie_profile_actions(state, actions)
+    profile_map = {str(profile.get('name') or ''): profile for profile in state.get('profiles', []) if isinstance(profile, dict)}
+    filtered: list[dict[str, Any]] = []
+    for action in deduped:
+        profile_name = str(action.get('profile') or '')
+        profile = profile_map.get(profile_name) or {}
+        raw_cookie = str(profile.get('cookies') or '')
+        if raw_cookie:
+            request_url = _action_request_url(action, str(state.get('target') or ''))
+            verdict = shared.runtime_application_auth_verdict(
+                state.get('discovery', {}).get(profile_name, {}), request_url, raw_cookie,
+                identity_ref=str(profile.get('identity_ref') or ''),
+            )
+            if verdict == 'AUTH_FAILED_CONCLUSIVE':
+                continue
+        filtered.append(action)
+    return filtered
 
 def _proposal_matches_discovery_case(case: dict[str, Any], raw: dict[str, Any], target_url: str, method: str='') -> bool:
     """Require the planner-selected local action to map back to the same discovered request contract."""
@@ -3919,7 +4035,13 @@ def _materialize_unselected_actions(state: AgentState) -> dict[str, dict[str, An
 # Planner auditing records a concise summary of each proposed action.
 def _audit_action_summary(action: dict[str, Any]) -> dict[str, Any]:
 
-    return {'planner_action_id': str(action.get('planner_action_id') or ''), 'profile': str(action.get('profile') or ''), 'tool': str(action.get('tool') or ''), 'target_url': str(action.get('target_url') or ''), 'method': str(action.get('method') or 'GET'), 'parameters': [str(value) for value in action.get('parameters', [])][:12], 'reason': str(action.get('reason') or '')[:500]}
+    summary = {'planner_action_id': str(action.get('planner_action_id') or ''), 'profile': str(action.get('profile') or ''), 'tool': str(action.get('tool') or ''), 'target_url': str(action.get('target_url') or ''), 'method': str(action.get('method') or 'GET'), 'parameters': [str(value) for value in action.get('parameters', [])][:12], 'reason': str(action.get('reason') or '')[:500]}
+    # Interactsh executes against injection_url while target_url remains the assessment root. Preserve
+    # the effective destination in the compact audit row so next-round application-family debt does
+    # not collapse all prior OAST selections back to the root family.
+    if str(action.get('tool') or '') == 'interactsh' and str(action.get('injection_url') or ''):
+        summary['injection_url'] = str(action.get('injection_url') or '')
+    return summary
 
 # At each planning round, the model proposes useful actions and validation filters unsafe or unsupported choices.
 def planner_node(state: AgentState) -> dict[str, Any]:
@@ -4120,7 +4242,7 @@ def planner_node(state: AgentState) -> dict[str, Any]:
         'round_action_adaptive_extension_ai_requested': bool(round_budget.get('adaptive_extension_ai_requested')),
         'round_action_adaptive_extension_ai_effective': bool(round_budget.get('adaptive_extension_ai_effective')),
         'round_action_adaptive_extension_deterministic_pressure': bool(round_budget.get('adaptive_extension_deterministic_pressure')),
-        # Compatibility field for older report consumers.
+        # Stable report field exposing the active round ceiling.
         'round_action_hard_cap_total': active_round_ceiling,
         'round_action_ordinary_remaining': int(round_budget['ordinary_remaining']),
         'round_action_required_per_round': int(round_budget['required_per_round']),
@@ -4148,6 +4270,7 @@ def planner_node(state: AgentState) -> dict[str, Any]:
 async def execute_action(action: dict[str, Any], cookies: dict[str, str], discovery: dict[str, dict[str, Any]], allow_state_changes: bool | None=None, secondary_cookies: str='', identity_labels: dict[str, str] | None=None, deadline: float | None=None) -> tuple[dict[str, Any], dict[str, Any]]:
     tool = action['tool']
     profile = action['profile']
+    labels = identity_labels or {}
     server, function = REGISTRY[tool][:2]
     if tool == 'jwt':
         arguments = {'jwt_token': action['jwt_token'], 'target_url': action['target_url']}
@@ -4158,7 +4281,6 @@ async def execute_action(action: dict[str, Any], cookies: dict[str, str], discov
         arguments = {'target_url': action['target_url'], 'injection_url': action['injection_url'], 'cookies': shared.scope_cookie_header(request_url, cookies.get(profile, '')), 'method': action.get('method', 'GET'), 'data': action.get('data', ''), 'content_type': action.get('content_type', ''), 'parameter': (action.get('parameters') or [''])[0], 'timeout': oast_timeout, 'request_rate': shared.MAX_REQUEST_RATE, 'allow_state_changes': shared.state_changing_tests_allowed(action['target_url'], allow_state_changes), 'allow_tls_trust_retry': shared.url_in_authorized_scope(action['target_url'], request_url), 'authorized_origins': sorted(shared.AUTHORIZED_SCOPE_ORIGINS), 'allow_same_host_ports': bool(shared.ALLOW_SAME_HOST_PORTS)}
     else:
         profile_discovery = discovery.get(profile, {})
-        labels = identity_labels or {}
         comparison_identities = [
             {'label': str(labels.get(str(name)) or name), 'cookies': str(value)}
             for name, value in cookies.items()
@@ -4187,6 +4309,17 @@ async def execute_action(action: dict[str, Any], cookies: dict[str, str], discov
                 'timed_out': True, 'time_limit_reached': True,
             })
         profile_discovery = discovery.get(profile, {})
+        application_verdict = shared.runtime_application_auth_verdict(
+            profile_discovery, request_url, raw_profile_cookie,
+            identity_ref=str(labels.get(str(profile)) or ''),
+        )
+        if application_verdict == 'AUTH_FAILED_CONCLUSIVE':
+            print(f'    [PARTIAL ] {tool}: authenticated application scope has a conclusive prior authentication failure', flush=True)
+            return (action, {
+                'tool': tool, 'status': 'partial', 'target': action['target_url'],
+                'output': 'This application scope already has a conclusive authentication failure for the selected identity; the repeated authenticated precheck was suppressed.',
+                'vulnerabilities': [], 'diagnosis': 'authentication_scope_conclusive_failure',
+            })
         source_url = str(action.get('source_url') or '')
         method = str(action.get('method') or 'GET').upper()
         probe_url = shared.select_authenticated_precheck_probe_url(

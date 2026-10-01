@@ -148,7 +148,7 @@ async def deterministic_discovery_node(state: DeterministicState) -> dict[str, A
 
     latest_service_discovery = shared_service_discovery
     service_continuation_needed = bool(
-        int(shared_service_discovery.get('candidate_ports_deferred', 0) or 0) > 0
+        shared.same_host_service_discovery_needs_continuation(shared_service_discovery)
         and shared.same_host_service_remaining_time_budget_seconds() > 0
     )
 
