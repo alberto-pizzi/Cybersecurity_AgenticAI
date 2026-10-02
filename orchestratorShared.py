@@ -188,19 +188,26 @@ DISCOVERY_LIMITS = {
     # Sibling hostnames discovered from live in-scope URLs receive a smaller priority-port pool rather
     # than a second full-range sweep.  Paths/endpoints on one hostname never duplicate the TCP sweep.
     'test': {'crawl_pages': 8, 'crawl_pages_max': 16, 'browser_pages': 4, 'browser_pages_max': 8, 'browser_per_origin_pages': 8, 'browser_menu_clicks_per_page': 2, 'browser_dom_passes': 1, 'scripts': 12, 'route_variants': 2, 'family_reserve_pages': 1, 'semantic_route_template_variants': 4, 'per_origin_pages': 10, 'same_host_service_candidates': 32, 'same_host_service_expansion_candidates': 16, 'same_host_service_time_budget_seconds': 15, 'same_host_service_initial_time_budget_seconds': 6, 'same_host_service_expansion_hosts': 2, 'same_host_service_expansion_recrawl_pages': 6},
-    'fast': {'crawl_pages': 240, 'crawl_pages_max': 700, 'browser_pages': 140, 'browser_pages_max': 420, 'browser_per_origin_pages': 360, 'browser_menu_clicks_per_page': 28, 'browser_dom_passes': 5, 'scripts': 384, 'route_variants': 14, 'family_reserve_pages': 4, 'semantic_route_template_variants': 24, 'per_origin_pages': 650, 'same_host_service_candidates': 8192, 'same_host_service_expansion_candidates': 1536, 'same_host_service_time_budget_seconds': 2400, 'same_host_service_initial_time_budget_seconds': 180, 'same_host_service_expansion_hosts': 16, 'same_host_service_expansion_recrawl_pages': 72},
-    'balanced': {'crawl_pages': 1800, 'crawl_pages_max': 5000, 'browser_pages': 1000, 'browser_pages_max': 3000, 'browser_per_origin_pages': 2600, 'browser_menu_clicks_per_page': 128, 'browser_dom_passes': 10, 'scripts': 2600, 'route_variants': 40, 'family_reserve_pages': 12, 'semantic_route_template_variants': 96, 'per_origin_pages': 4200, 'same_host_service_candidates': 65535, 'same_host_service_expansion_candidates': 6144, 'same_host_service_time_budget_seconds': 18000, 'same_host_service_initial_time_budget_seconds': 900, 'same_host_service_expansion_hosts': 64, 'same_host_service_expansion_recrawl_pages': 360},
-    'deep': {'crawl_pages': 4000, 'crawl_pages_max': 12000, 'browser_pages': 2200, 'browser_pages_max': 6500, 'browser_per_origin_pages': 5600, 'browser_menu_clicks_per_page': 240, 'browser_dom_passes': 16, 'scripts': 5200, 'route_variants': 64, 'family_reserve_pages': 24, 'semantic_route_template_variants': 192, 'per_origin_pages': 10000, 'same_host_service_candidates': 65535, 'same_host_service_expansion_candidates': 12288, 'same_host_service_time_budget_seconds': 28800, 'same_host_service_initial_time_budget_seconds': 1500, 'same_host_service_expansion_hosts': 192, 'same_host_service_expansion_recrawl_pages': 720},
+    'fast': {'crawl_pages': 360, 'crawl_pages_max': 1200, 'browser_pages': 220, 'browser_pages_max': 700, 'browser_per_origin_pages': 600, 'browser_menu_clicks_per_page': 40, 'browser_dom_passes': 6, 'scripts': 640, 'route_variants': 14, 'family_reserve_pages': 6, 'semantic_route_template_variants': 48, 'per_origin_pages': 1050, 'same_host_service_candidates': 8192, 'same_host_service_expansion_candidates': 2048, 'same_host_service_time_budget_seconds': 3000, 'same_host_service_initial_time_budget_seconds': 240, 'same_host_service_expansion_hosts': 24, 'same_host_service_expansion_recrawl_pages': 120},
+    'balanced': {'crawl_pages': 2500, 'crawl_pages_max': 8000, 'browser_pages': 1500, 'browser_pages_max': 5000, 'browser_per_origin_pages': 4200, 'browser_menu_clicks_per_page': 180, 'browser_dom_passes': 12, 'scripts': 4000, 'route_variants': 40, 'family_reserve_pages': 18, 'semantic_route_template_variants': 160, 'per_origin_pages': 6800, 'same_host_service_candidates': 65535, 'same_host_service_expansion_candidates': 8192, 'same_host_service_time_budget_seconds': 21600, 'same_host_service_initial_time_budget_seconds': 1200, 'same_host_service_expansion_hosts': 96, 'same_host_service_expansion_recrawl_pages': 600},
+    'deep': {'crawl_pages': 6000, 'crawl_pages_max': 18000, 'browser_pages': 3500, 'browser_pages_max': 10000, 'browser_per_origin_pages': 8500, 'browser_menu_clicks_per_page': 320, 'browser_dom_passes': 20, 'scripts': 8000, 'route_variants': 64, 'family_reserve_pages': 32, 'semantic_route_template_variants': 320, 'per_origin_pages': 15000, 'same_host_service_candidates': 65535, 'same_host_service_expansion_candidates': 16384, 'same_host_service_time_budget_seconds': 36000, 'same_host_service_initial_time_budget_seconds': 1800, 'same_host_service_expansion_hosts': 256, 'same_host_service_expansion_recrawl_pages': 1200},
 }
 HTTP_ATTEMPT_BUDGET_FACTORS = {'test': 1.0, 'fast': 1.75, 'balanced': 2.0, 'deep': 2.0}
 SCRIPT_ATTEMPT_BUDGET_FACTORS = {'test': 1.0, 'fast': 1.5, 'balanced': 1.75, 'deep': 1.75}
 # Chromium discovery has both a page ceiling and a wall-clock ceiling. The time budget scales with
 # the configured base navigation budget instead of being a second unrelated magic-number table.
-# Four seconds/base page is intentionally generous for normal local/intranet pages while preventing
-# pathological navigation retries or slow SPAs from turning a bounded crawl into an unbounded run.
-BROWSER_DISCOVERY_SECONDS_PER_BASE_PAGE = 4.0
+# Browser discovery is deliberately deeper than raw HTTP crawling: modern menus and SPA routes often
+# materialize only after asynchronous rendering. The assessment-wide phase deadline remains the hard
+# boundary, so increasing this allowance cannot turn Chromium into an unbounded crawl.
+BROWSER_DISCOVERY_SECONDS_PER_BASE_PAGE = 8.0
 BROWSER_DISCOVERY_MIN_SECONDS = 120.0
 BROWSER_DISCOVERY_MIN_SECONDS_BY_MODE = {'test': float(TEST_DISCOVERY_TIME_BUDGET_SECONDS)}
+BROWSER_NAVIGATION_TIMEOUTS_SECONDS = {
+    'test': (4.0, 6.0, 2.0),
+    'fast': (14.0, 22.0, 5.0),
+    'balanced': (20.0, 32.0, 8.0),
+    'deep': (30.0, 45.0, 10.0),
+}
 # Adaptive DOM settle must save idle time without declaring an AJAX-driven page complete too early.
 # Keep most of the former fixed dwell as a minimum and require repeated stable samples before exit.
 BROWSER_SETTLE_MIN_FRACTION = 0.70
@@ -341,18 +348,19 @@ RUNTIME_AUTH_ORIGIN_LIMITS = {'test': 2, 'fast': 12, 'balanced': 32, 'deep': 64}
 # One authenticated enrichment pass must be bounded globally; otherwise a 60s browser timeout can
 # multiply by every discovered same-host service/application. Deferred origins remain eligible in
 # later passes, so this limits wall-clock amplification without marking them permanently failed.
-RUNTIME_AUTH_PASS_TIMEOUTS = {'test': TEST_DISCOVERY_TIME_BUDGET_SECONDS, 'fast': 420, 'balanced': 1800, 'deep': 3600}
+RUNTIME_AUTH_PASS_TIMEOUTS = {'test': TEST_DISCOVERY_TIME_BUDGET_SECONDS, 'fast': 600, 'balanced': 2700, 'deep': 5400}
 RUNTIME_AUTH_CREDENTIAL_RETRY_COOLDOWNS = {'test': 60, 'fast': 300, 'balanced': 600, 'deep': 900}
+RUNTIME_AUTH_APPLICATION_FAILURE_COOLDOWNS = {'test': 10, 'fast': 45, 'balanced': 120, 'deep': 180}
 RUNTIME_AUTH_TERMINAL_CREDENTIAL_FAILURES = frozenset({'credentials_rejected', 'external_oidc_credentials_rejected', 'provider_authentication_error', 'additional_authentication_step_required'})
 RUNTIME_AUTH_NONCONSUMING_CREDENTIAL_FAILURES = frozenset({'credentials_unavailable', 'credential_form_fill_failed'})
-RUNTIME_AUTH_SIBLING_SSO_TIMEOUTS = {'test': 5, 'fast': 10, 'balanced': 15, 'deep': 20}
+RUNTIME_AUTH_SIBLING_SSO_TIMEOUTS = {'test': 5, 'fast': 12, 'balanced': 25, 'deep': 35}
 # Candidate application entry points are bounded per origin/root, but the login helper shares one
 # total deadline across all entries. This keeps authentication bounded while avoiding an arbitrary
 # fixed top-8 window on larger applications.
-RUNTIME_AUTH_ENTRY_CANDIDATE_LIMITS = {'test': 2, 'fast': 6, 'balanced': 12, 'deep': 16}
-RUNTIME_AUTH_RECRAWL_PAGES = {'test': 4, 'fast': 48, 'balanced': 140, 'deep': 280}
-RUNTIME_AUTH_APPLICATION_LIMITS = {'test': 2, 'fast': 10, 'balanced': 32, 'deep': 64}
-RUNTIME_AUTH_APPLICATION_RECRAWL_PAGES = {'test': 4, 'fast': 36, 'balanced': 120, 'deep': 240}
+RUNTIME_AUTH_ENTRY_CANDIDATE_LIMITS = {'test': 2, 'fast': 10, 'balanced': 20, 'deep': 28}
+RUNTIME_AUTH_RECRAWL_PAGES = {'test': 4, 'fast': 80, 'balanced': 220, 'deep': 480}
+RUNTIME_AUTH_APPLICATION_LIMITS = {'test': 2, 'fast': 16, 'balanced': 48, 'deep': 96}
+RUNTIME_AUTH_APPLICATION_RECRAWL_PAGES = {'test': 4, 'fast': 64, 'balanced': 200, 'deep': 420}
 RUNTIME_AUTH_APPLICATION_ATTEMPTS: dict[str, dict[str, Any]] = {}
 CURRENT_SCAN_MODE = 'balanced'
 REQUEST_RATE_BUDGET_SCALE = request_rate_budget_scale(MAX_REQUEST_RATE)
@@ -2091,7 +2099,7 @@ def _idor_forge_runtime_check() -> tuple[bool, str]:
     if completed.returncode != 0:
         lines = [line.strip() for line in detail.splitlines() if line.strip()]
         concise = lines[-1] if lines else f'IDOR-Forge runtime probe exit={completed.returncode}'
-        return False, concise[-1000:] + f' | runtime_python={python} | bounded native IDOR differential remains available; rerun initScript.py without --skip-scanners to restore upstream IDOR-Forge.'
+        return False, concise[-1000:] + f' | runtime_python={python} | the native IDOR differential fallback remains available within normal budgets; rerun initScript.py without --skip-scanners to restore upstream IDOR-Forge.'
     return True, detail[-1200:] or 'IDOR-Forge isolated runtime/API contract OK.'
 
 
@@ -2745,6 +2753,34 @@ def _application_root_url(url: str) -> str:
     if not segments or parsed.scheme.lower() not in {'http', 'https'} or not parsed.netloc:
         return ''
     return urlunparse((parsed.scheme, parsed.netloc, '/' + segments[0] + '/', '', '', ''))
+
+
+def _application_directory_roots(url: str, max_depth: int=3) -> list[str]:
+    """Return runtime-derived directory roots for a discovered URL.
+
+    A top-level family alone is too coarse for portals that expose multiple nested applications such
+    as ``/<family>/<management-area>/...``.  The roots returned here are derived exclusively from the
+    observed URL and stop before the apparent resource filename.  They therefore improve breadth
+    without injecting route names from external inventories or benchmarks.
+    """
+    try:
+        parsed = urlparse(str(url or ''))
+    except ValueError:
+        return []
+    if parsed.scheme.lower() not in {'http', 'https'} or not parsed.netloc:
+        return []
+    raw_segments = [segment for segment in str(parsed.path or '/').split('/') if segment]
+    if not raw_segments:
+        return []
+    # A final segment containing a filename-like suffix is a resource, not another directory root.
+    directory_segments = list(raw_segments)
+    if re.search(r'(?i)\.[a-z0-9]{1,8}$', directory_segments[-1]):
+        directory_segments.pop()
+    roots: list[str] = []
+    for depth in range(1, min(max(1, int(max_depth)), len(directory_segments)) + 1):
+        root_path = '/' + '/'.join(directory_segments[:depth]) + '/'
+        roots.append(urlunparse((parsed.scheme, parsed.netloc, root_path, '', '', '')))
+    return roots
 
 
 def _discovery_diversity_score(target: str, url: str, family_visits: Counter[tuple[str, str]]) -> int:
@@ -4147,7 +4183,9 @@ def _browser_network_discovery_impl(target: str, cookies: str, html_urls: list[s
         'external_origins_observed': [],
         'textual_responses_parsed': 0, 'textual_response_bytes_parsed': 0,
         'textual_response_navigation_candidates': 0,
-        'family_roots_promoted': 0, 'adaptive_low_value_deferred': 0,
+        'family_roots_promoted': 0, 'directory_roots_promoted': 0,
+        'http_fallback_attempts': 0, 'http_fallback_recoveries': 0,
+        'http_fallback_navigation_candidates': 0, 'adaptive_low_value_deferred': 0,
     }
     if time.monotonic() >= browser_deadline:
         budget_info['wall_clock_exhausted'] = True
@@ -4212,13 +4250,20 @@ def _browser_network_discovery_impl(target: str, cookies: str, html_urls: list[s
         queued_signatures[signature] += 1
         queue.append(candidate)
         if promote_root and len(promoted_browser_roots) < browser_family_root_limit:
-            family_root = _application_root_url(candidate)
-            if family_root and family_root != candidate and family_root not in promoted_browser_roots:
-                promoted_browser_roots.add(family_root)
+            promoted_any = False
+            for directory_root in _application_directory_roots(candidate, max_depth=3):
+                if len(promoted_browser_roots) >= browser_family_root_limit:
+                    break
+                if not directory_root or directory_root == candidate or directory_root in promoted_browser_roots:
+                    continue
+                promoted_browser_roots.add(directory_root)
                 before = len(queued)
-                enqueue_dynamic(family_root, promote_root=False)
+                enqueue_dynamic(directory_root, promote_root=False)
                 if len(queued) > before:
-                    budget_info['family_roots_promoted'] = int(budget_info.get('family_roots_promoted', 0) or 0) + 1
+                    promoted_any = True
+                    budget_info['directory_roots_promoted'] = int(budget_info.get('directory_roots_promoted', 0) or 0) + 1
+            if promoted_any:
+                budget_info['family_roots_promoted'] = int(budget_info.get('family_roots_promoted', 0) or 0) + 1
 
     enqueue_dynamic(target_url, force=True)
     for value in sorted(forced_set):
@@ -4478,10 +4523,13 @@ def _browser_network_discovery_impl(target: str, cookies: str, html_urls: list[s
                         return
 
             def navigate_with_retry(value: str) -> Any:
+                initial_seconds, retry_seconds, settle_seconds = BROWSER_NAVIGATION_TIMEOUTS_SECONDS.get(
+                    CURRENT_SCAN_MODE, BROWSER_NAVIGATION_TIMEOUTS_SECONDS['balanced']
+                )
                 try:
                     # Every authorized Chromium request (document, XHR/fetch and same-origin assets)
                     # is paced by route_guard, so page.goto must not consume a second rate token.
-                    return page.goto(value, wait_until='domcontentloaded', timeout=remaining_browser_ms(12000))
+                    return page.goto(value, wait_until='domcontentloaded', timeout=remaining_browser_ms(int(initial_seconds * 1000)))
                 except Exception as first_exc:
                     if time.monotonic() >= browser_deadline or not transient_browser_error(first_exc):
                         raise
@@ -4490,12 +4538,62 @@ def _browser_network_discovery_impl(target: str, cookies: str, html_urls: list[s
                         page.wait_for_timeout(min(250, remaining_browser_ms(250)))
                     except Exception:
                         pass
-                    response = page.goto(value, wait_until='commit', timeout=remaining_browser_ms(16000))
+                    response = page.goto(value, wait_until='commit', timeout=remaining_browser_ms(int(retry_seconds * 1000)))
                     try:
-                        page.wait_for_load_state('domcontentloaded', timeout=remaining_browser_ms(4000))
+                        page.wait_for_load_state('domcontentloaded', timeout=remaining_browser_ms(int(settle_seconds * 1000)))
                     except Exception:
                         pass
                     return response
+
+            def recover_navigation_with_http(value: str) -> int:
+                """Recover links from an in-scope page when Chromium cannot finish navigation.
+
+                This is a single bounded GET through the normal discovery request path, so it obeys
+                the shared 10 req/s pacer, redirect/scope guards and the browser phase deadline. It
+                does not mark the browser navigation itself successful; it only prevents one slow
+                rendering path from hiding the rest of that application branch.
+                """
+                if time.monotonic() >= browser_deadline:
+                    return 0
+                budget_info['http_fallback_attempts'] = int(budget_info.get('http_fallback_attempts', 0) or 0) + 1
+                fallback = requests.Session()
+                try:
+                    response, final_url, _ = _safe_crawl_get(
+                        fallback, value, target, timeout=(5, 20), max_redirects=3,
+                        cookies=cookies, deadline=browser_deadline,
+                    )
+                    if response is None or int(response.status_code or 0) >= 400:
+                        return 0
+                    content_type = str(response.headers.get('Content-Type') or '').lower()
+                    if content_type and not any(token in content_type for token in ('html', 'xhtml', 'text/plain')):
+                        return 0
+                    text = str(response.text or '')
+                    parser = LinkFormParser()
+                    try:
+                        parser.feed(text)
+                    except Exception:
+                        pass
+                    base_url = absolute_url(final_url or value, parser.base_href) if parser.base_href else (final_url or value)
+                    recovered = 0
+                    raw_links = list(parser.links)
+                    raw_links.extend(str(item.get('url') or '') for item in _literal_navigation_hints(text, base_url, target))
+                    for raw in raw_links:
+                        try:
+                            candidate = absolute_url(base_url, str(raw or '').strip())
+                        except Exception:
+                            continue
+                        before = len(queued)
+                        enqueue_dynamic(candidate)
+                        if len(queued) > before:
+                            recovered += 1
+                    if recovered:
+                        budget_info['http_fallback_recoveries'] = int(budget_info.get('http_fallback_recoveries', 0) or 0) + 1
+                        budget_info['http_fallback_navigation_candidates'] = int(
+                            budget_info.get('http_fallback_navigation_candidates', 0) or 0
+                        ) + recovered
+                    return recovered
+                finally:
+                    fallback.close()
             base_scores: list[int] = []
             adaptive_threshold: int | None = None
             while queue and len(visited) < navigation_max_budget and time.monotonic() < browser_deadline:
@@ -4711,6 +4809,10 @@ def _browser_network_discovery_impl(target: str, cookies: str, html_urls: list[s
                         except Exception:
                             continue
                 except Exception as exc:
+                    try:
+                        recover_navigation_with_http(value)
+                    except Exception as fallback_exc:
+                        errors.append({'url': value, 'type': 'BrowserDiscoveryHttpFallback', 'message': f'{type(fallback_exc).__name__}: {fallback_exc}'})
                     errors.append({'url': value, 'type': 'BrowserDiscoveryNavigation', 'message': f'{type(exc).__name__}: {exc}'})
             budget_info.update(
                 attempted=len(visited),
@@ -5646,15 +5748,15 @@ def _ffuf_application_roots(discovery: dict[str, Any], target_url: str) -> list[
     for value in values:
         if not value or normalized_origin(value) != origin:
             continue
-        # Family keys intentionally lowercase path segments for fairness accounting, but a fuzzing
-        # target must preserve the server-observed path spelling on case-sensitive deployments.
-        candidate = _application_root_url(value)
-        if not candidate or normalized_origin(candidate) != origin or candidate == root:
-            continue
-        if candidate in seen:
-            continue
-        seen.add(candidate)
-        candidates.append((_discovery_url_score(value), candidate))
+        # Preserve observed path spelling and include bounded nested directory roots. Large portals
+        # frequently mount management/API surfaces below the first path segment; fuzzing only the
+        # top-level family can therefore miss menus and wrapper pages that are discoverable from the
+        # live URL graph itself.
+        for depth, candidate in enumerate(_application_directory_roots(value, max_depth=3), start=1):
+            if not candidate or normalized_origin(candidate) != origin or candidate == root or candidate in seen:
+                continue
+            seen.add(candidate)
+            candidates.append((_discovery_url_score(value) - (depth - 1) * 2, candidate))
     ordered = [value for _, value in sorted(candidates, key=lambda item: (-item[0], item[1]))]
     return ordered[:limit]
 
@@ -6030,10 +6132,13 @@ def discover_target(
                 enqueue(variant, source_url=str(template.get('wrapper_url') or value), promote_root=False)
 
         if promote_root and len(promoted_http_roots) < http_family_root_limit:
-            family_root = _application_root_url(value)
-            if family_root and family_root != value and family_root not in promoted_http_roots:
-                promoted_http_roots.add(family_root)
-                enqueue(family_root, source_url=value, promote_root=False)
+            for directory_root in _application_directory_roots(value, max_depth=3):
+                if len(promoted_http_roots) >= http_family_root_limit:
+                    break
+                if not directory_root or directory_root == value or directory_root in promoted_http_roots:
+                    continue
+                promoted_http_roots.add(directory_root)
+                enqueue(directory_root, source_url=value, promote_root=False)
 
     for value in initial:
         enqueue(value, force=value in explicit_seed_urls)
@@ -7544,6 +7649,7 @@ def ensure_runtime_authenticated_request(
                 'session_fingerprint': _runtime_auth_material_fingerprint(runtime_state, manual_cookie),
                 'attempt_count': 1, 'attempted_urls': [url],
             }
+            result['attempt_monotonic'] = time.monotonic()
             RUNTIME_AUTH_APPLICATION_ATTEMPTS[attempt_key] = dict(result)
             return result
 
@@ -7556,8 +7662,19 @@ def ensure_runtime_authenticated_request(
         return {**cached, 'attempted': False, 'reused': True, 'cookie_header': cached_cookie}
     previous_attempts = int(cached.get('attempt_count', 0) or 0) if cache_matches_session and isinstance(cached, dict) else 0
     previous_urls = {str(value) for value in (cached.get('attempted_urls') or [])} if cache_matches_session and isinstance(cached, dict) else set()
-    if cache_matches_session and isinstance(cached, dict) and cached.get('status') in {'failed', 'no_auth_entry_observed', 'session_only_credentials_required', 'credential_budget_exhausted'} and url in previous_urls:
-        return {**cached, 'attempted': False, 'reused': True, 'cookie_header': cached_cookie}
+    cached_failure_statuses = {'failed', 'no_auth_entry_observed', 'session_only_credentials_required', 'credential_budget_exhausted', 'credential_retry_cooldown'}
+    if cache_matches_session and isinstance(cached, dict) and cached.get('status') in cached_failure_statuses:
+        cached_at = float(cached.get('attempt_monotonic') or 0.0)
+        cooldown = max(0.0, float(RUNTIME_AUTH_APPLICATION_FAILURE_COOLDOWNS.get(CURRENT_SCAN_MODE, 120)))
+        age = max(0.0, time.monotonic() - cached_at) if cached_at > 0.0 else cooldown
+        if age < cooldown:
+            return {
+                **cached, 'attempted': False, 'reused': True, 'cookie_header': cached_cookie,
+                'runtime_auth_scope_cooldown': True,
+                'cooldown_remaining_seconds': round(max(0.0, cooldown - age), 3),
+            }
+        if url in previous_urls:
+            return {**cached, 'attempted': False, 'reused': True, 'cookie_header': cached_cookie}
 
     credential = dict(runtime_state.get('credential')) if isinstance(runtime_state.get('credential'), dict) else {}
     cross_origin = bool(PRIMARY_SCOPE_TARGET and not same_origin(PRIMARY_SCOPE_TARGET, url))
@@ -7638,6 +7755,7 @@ def ensure_runtime_authenticated_request(
             'session_fingerprint': session_fingerprint, 'attempt_count': previous_attempts + 1,
             'attempted_urls': sorted(previous_urls | {str(value) for value in attempted_urls}),
         }
+        result['attempt_monotonic'] = time.monotonic()
         RUNTIME_AUTH_APPLICATION_ATTEMPTS[attempt_key] = dict(result)
         return result
 
@@ -7693,6 +7811,7 @@ def ensure_runtime_authenticated_request(
         'authentication_flow_observed': flow_observed, 'distinguished_from_anonymous': probe.get('distinguished_from_anonymous'), 'probe': probe,
         'attempt_count': previous_attempts + 1, 'attempted_urls': sorted(previous_urls | {url}),
     }
+    result['attempt_monotonic'] = time.monotonic()
     if usable:
         # A credential submission counts as successful only after the resulting application session
         # has been validated. Resetting the identity-wide guard earlier would allow a cookie-shaped
@@ -11101,6 +11220,44 @@ def enrich_discovery_with_ffuf(discovery: dict[str, Any], result: dict[str, Any]
     updated['destructive_urls_skipped'] = sorted(blocked)
     return (updated, urls)
 
+
+def enrich_discovery_with_zap(discovery: dict[str, Any], result: dict[str, Any], target: str) -> tuple[dict[str, Any], list[str]]:
+    """Merge ZAP's in-scope site tree into the request graph without issuing extra requests.
+
+    The ZAP server exports only URLs it actually observed in its exact-origin context.  This helper
+    applies the project's normal scope/destructive/static filters and materializes safe GET request
+    contracts so a later agentic round can reason about the newly observed application surface.
+    """
+    safe_urls: list[str] = []
+    seen: set[str] = set()
+    for raw in result.get('zap_discovered_urls', []) or []:
+        value = str(raw or '').strip()
+        if not value or not url_in_authorized_scope(target, value):
+            continue
+        try:
+            value = _clean_url(value)
+        except Exception:
+            continue
+        if value in seen or _destructive_crawl_url(value) or not _crawlable_url(value) or _browser_static_resource(value):
+            continue
+        seen.add(value)
+        safe_urls.append(value)
+    updated = dict(discovery)
+    updated['urls'] = sorted(set(updated.get('urls', [])) | set(safe_urls))
+    updated['html_urls'] = sorted(set(updated.get('html_urls', [])) | set(safe_urls))
+    updated['parameterized_urls'] = sorted(
+        set(updated.get('parameterized_urls', [])) | {url for url in safe_urls if urlparse(url).query}
+    )
+    zap_cases = [
+        {
+            'url': url, 'method': 'GET', 'data': '', 'parameters': _query_parameter_names(url),
+            'source_url': target, 'discovery_source': 'zap_site_tree',
+        }
+        for url in safe_urls
+    ]
+    updated['request_cases'] = _dedupe_request_cases([*updated.get('request_cases', []), *zap_cases])
+    return updated, safe_urls
+
 # Skipped runs use a common result shape with an explicit reason.
 def make_skipped_result(tool: str, target: str, reason: str) -> dict[str, Any]:
     return _result(tool, target, 'skipped', reason, 'not_applicable')
@@ -11421,19 +11578,57 @@ def recover_normal_report_artifacts(output_name: str, report: dict[str, Any]) ->
         recovered['output'] = 'Normal JSON/HTML report artifacts were recovered after the MCP/HTTP reporting failure; the PDF was not generated.' + suffix
     return recovered
 
-# Writes a small JSON report only when no normal report artifact can be recovered.
+# Writes a complete local JSON fallback only when no normal report artifact can be recovered.
+# The JSON is streamed to a temporary file and atomically promoted so an oversized normal MCP
+# payload cannot force a second full in-memory serialization. The companion HTML embeds the JSON
+# only when it is small; for large emergency datasets it stays a lightweight index pointing at
+# the complete JSON artifact instead of duplicating tens of megabytes in memory and on disk.
 def write_emergency_json_report(target: str, results: dict[str, Any], diagnostics: list[dict[str, Any]], reason: str, output_name: str='SecOps_Emergency') -> str | None:
+    temporary_path: Path | None = None
     try:
         directory = ROOT / 'reports'
         directory.mkdir(parents=True, exist_ok=True)
         stem = re.sub('[^A-Za-z0-9_.-]+', '_', output_name).strip('._')
         path = directory / f'{stem}_{datetime.now():%Y%m%d_%H%M%S}.json'
-        payload = {'generated_at': datetime.now(timezone.utc).isoformat(), 'target': target, 'reason': reason, 'diagnostics': diagnostics, 'results': results}
-        text = json.dumps(payload, indent=2, ensure_ascii=False, default=str)
-        atomic_write_text(path, text)
-        atomic_write_text(path.with_suffix('.html'), f"<!doctype html><meta charset='utf-8'><title>SecOps preview</title><style>body{{font-family:Segoe UI;margin:2rem}}pre{{white-space:pre-wrap;background:#111923;color:#e7eef7;padding:1rem}}</style><h1>SecOps emergency preview</h1><pre>{html.escape(text)}</pre>")
+        temporary_path = path.with_name(f'.{path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp')
+        payload = {
+            'generated_at': datetime.now(timezone.utc).isoformat(),
+            'target': target, 'reason': reason, 'diagnostics': diagnostics, 'results': results,
+        }
+        with temporary_path.open('w', encoding='utf-8', newline='\n') as handle:
+            json.dump(payload, handle, indent=2, ensure_ascii=False, default=str)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary_path, path)
+        temporary_path = None
+
+        json_bytes = path.stat().st_size
+        html_path = path.with_suffix('.html')
+        if json_bytes <= 2 * 1024 * 1024:
+            text = path.read_text(encoding='utf-8', errors='replace')
+            preview = (
+                "<!doctype html><meta charset='utf-8'><title>SecOps emergency preview</title>"
+                "<style>body{font-family:Segoe UI;margin:2rem}pre{white-space:pre-wrap;background:#111923;color:#e7eef7;padding:1rem}</style>"
+                f"<h1>SecOps emergency preview</h1><pre>{html.escape(text)}</pre>"
+            )
+        else:
+            leaf_count = sum(1 for _path, _result in iter_leaf_results(results))
+            preview = (
+                "<!doctype html><meta charset='utf-8'><title>SecOps emergency preview</title>"
+                "<style>body{font-family:Segoe UI;margin:2rem;max-width:70rem}code{background:#eef;padding:.15rem .3rem}</style>"
+                "<h1>SecOps emergency preview</h1>"
+                f"<p><b>Target:</b> {html.escape(str(target))}</p>"
+                f"<p><b>Reason:</b> {html.escape(str(reason))}</p>"
+                f"<p><b>Complete result rows preserved:</b> {leaf_count}</p>"
+                f"<p>The complete emergency dataset is preserved in <code>{html.escape(path.name)}</code> "
+                f"({json_bytes / (1024 * 1024):.1f} MiB). It is not duplicated into this HTML preview to keep fallback memory bounded.</p>"
+            )
+        atomic_write_text(html_path, preview)
         return str(path.resolve())
     except Exception as exc:
+        if temporary_path is not None:
+            with contextlib.suppress(OSError):
+                temporary_path.unlink()
         print(f'[REPORT FALLBACK ERROR] {exc}', file=sys.stderr)
         return None
 
@@ -11540,8 +11735,8 @@ def add_common_cli_arguments(parser: argparse.ArgumentParser, *, require_target:
     parser.add_argument('--entry-point', action='append', default=[], help='Explicit authorized HTTP/HTTPS entry point that must be included in initial discovery. Repeat as needed.')
     parser.add_argument('--discovery-seed', action='append', default=[], help='Authorized high-priority discovery seed. Unlike --entry-point it remains subject to normal route/budget limits and is not reported as a supplied entry point.')
     state_change_group = parser.add_mutually_exclusive_group()
-    state_change_group.add_argument('--allow-state-changes', dest='allow_state_changes', action='store_true', default=None, help='Explicitly enable bounded POST/upload/stored-XSS workflow probes for this run.')
-    state_change_group.add_argument('--no-allow-state-changes', dest='allow_state_changes', action='store_false', help='Explicitly disable bounded state-changing probes, including on local targets.')
+    state_change_group.add_argument('--allow-state-changes', dest='allow_state_changes', action='store_true', default=None, help='Explicitly enable POST/upload/stored-XSS workflow probes within configured safety and time limits for this run.')
+    state_change_group.add_argument('--no-allow-state-changes', dest='allow_state_changes', action='store_false', help='Explicitly disable state-changing probes, including on local targets.')
     parser.add_argument('--preflight-only', action='store_true')
     parser.add_argument('--ignore-preflight-errors', action='store_true')
     parser.add_argument('--interactsh-injection-url', default='')

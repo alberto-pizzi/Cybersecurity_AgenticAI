@@ -29,7 +29,7 @@ import orchestratorShared as shared
 from orchestratorShared import (
     BROAD_SCANNER_TIMEOUTS, PARAMETER_TOOL_TIMEOUTS,
     build_tool_arguments, call_mcp, call_mcp_with_progress, diagnose_error,
-    discover_target, discover_target_sync_safe, enrich_discovery_with_arjun, enrich_discovery_with_ffuf,
+    discover_target, discover_target_sync_safe, enrich_discovery_with_arjun, enrich_discovery_with_ffuf, enrich_discovery_with_zap,
     iter_leaf_results, log_result, log_zap_session_diagnostics, make_skipped_result,
     merge_discovery, print_security_finding_summary, select_arjun_request_cases,
     select_authorization_request_cases, select_browser_request_cases, select_logout_request_cases, select_oast_request_cases,
@@ -87,28 +87,28 @@ class AgentState(TypedDict):
 # CPU-only Ollama hosts can take far longer than 720s to prefill+decode a JSON-schema-constrained
 # plan (no tokens at all until prefill finishes), so these budgets stay generous by default.
 AI_PLANNER_TIMEOUTS = {
-    'test': 90,
-    'fast': 1200,
-    'balanced': 2400,
-    'deep': 3600,
+    'test': 120,
+    'fast': 1800,
+    'balanced': 3600,
+    'deep': 5400,
 }
 # Whole-assessment control-plane guard. Per-round budgets above remain generous ceilings, but a
 # pathologically slow provider must not consume hours simply because FAST/BALANCED/DEEP allow
 # multiple planning rounds. Unused time from an early round remains available to later rounds.
 AI_PLANNER_WORKFLOW_TIMEOUTS = {
-    'test': 90,
-    'fast': 2100,       # 35 minutes across the assessment
-    'balanced': 4200,   # 70 minutes across the assessment
-    'deep': 6000,       # 100 minutes across the assessment
+    'test': 120,
+    'fast': 3600,       # two full 30-minute planning rounds
+    'balanced': 7200,   # two full 60-minute planning rounds
+    'deep': 16200,      # three full 90-minute planning rounds
 }
 # Reserve a useful slice for each later round before allowing the current round to consume the
 # workflow-wide planner budget. If the remaining total is already below the reserve schedule, the
 # remainder is shared evenly instead of starving the current round to ~0 seconds.
 AI_PLANNER_FUTURE_ROUND_RESERVE_SECONDS = {
     'test': 0,
-    'fast': 750,
-    'balanced': 1200,
-    'deep': 1500,
+    'fast': 1800,
+    'balanced': 3600,
+    'deep': 5400,
 }
 # Inside one planning round, protect a useful minimum for later context batches without forcing a
 # strict equal split. This lets an unusually slow early batch borrow otherwise-idle round budget
@@ -177,8 +177,8 @@ AI_ANALYSIS_STAGE_TIMEOUTS = {
     # of the operational execution and finalization windows.
     'test': 10 * 60,
     'fast': 120 * 60,
-    'balanced': 240 * 60,
-    'deep': 480 * 60,
+    'balanced': 360 * 60,
+    'deep': 720 * 60,
 }
 AI_ANALYSIS_FUTURE_BATCH_RESERVE_SECONDS = {
     'test': 12,
@@ -192,6 +192,12 @@ TEST_ANALYSIS_FINDING_LIMIT = 1
 AI_ANALYSIS_MAX_PREDICT = {'test': 400, 'fast': 520, 'balanced': 850, 'deep': 1200}
 AI_ANALYSIS_RESCUE_MAX_PREDICT = {'test': 260, 'fast': 340, 'balanced': 460, 'deep': 600}
 AI_ANALYSIS_CONTEXT_WINDOWS = {'test': 4096, 'fast': 6144, 'balanced': 8192, 'deep': 12288}
+# Final-analysis prompts are split before provider invocation when the evidence batch would exceed
+# the configured context. This mirrors planner batching: coverage growth may create more batches,
+# but it must never make a large valid finding catalogue fail merely because several findings were
+# grouped into one prompt. Prompt and requested output share the same bounded model context.
+AI_ANALYSIS_CONTEXT_BYTES_PER_TOKEN_ESTIMATE = 3
+AI_ANALYSIS_CONTEXT_SAFETY_TOKENS = 384
 
 
 class AnalysisBudgetExhausted(TimeoutError):
@@ -200,6 +206,15 @@ class AnalysisBudgetExhausted(TimeoutError):
     def __init__(self, message: str, *, partial_rows: list[dict[str, Any]] | None = None) -> None:
         super().__init__(message)
         self.partial_rows = list(partial_rows or [])
+
+
+class AnalysisContextTooLarge(RuntimeError):
+    """Prompt-only context overflow for one finding after bounded compaction.
+
+    This is a coverage/representation limit, not an AI-provider failure. The original scanner
+    evidence must remain reportable even in strict Agentic mode.
+    """
+
 
 def _ai_exception_is_timeout(exc: BaseException | None) -> bool:
     """Return True only for a real timeout in an AI exception/cause chain.
@@ -221,7 +236,7 @@ BROAD_COVERAGE_TOOLS = ('ffuf', 'zap', 'nuclei', 'session', 'nikto')
 # These tools are discovery producers: when the AI selects them, their output must be merged before
 # selected consumer actions run so the same round can use the expanded request graph. This is a
 # data-dependency ordering rule, not a Python decision to select either tool.
-DISCOVERY_ENRICHMENT_TOOLS = ('ffuf', 'arjun')
+DISCOVERY_ENRICHMENT_TOOLS = ('ffuf', 'arjun', 'zap')
 PARAMETER_COVERAGE_TOOLS = ('sqlmap', 'dalfox', 'commix', 'traversal', 'idor')
 AUTHORIZATION_COVERAGE_TOOLS = ('authorization',)
 WORKFLOW_COVERAGE_TOOLS = ('browser', 'workflow')
@@ -263,10 +278,10 @@ ROUND_EXECUTION_ACTION_ADAPTIVE_CEILINGS = {
 # interpretation and report rendering.
 # Lower target request rates expand only this target-traffic-dependent phase.
 AGENTIC_EXECUTION_PHASE_BUDGETS = {
-    'test': 60 * 60,
-    'fast': 14 * 60 * 60,
-    'balanced': 30 * 60 * 60,
-    'deep': 56 * 60 * 60,
+    'test': 90 * 60,
+    'fast': 16 * 60 * 60,
+    'balanced': 48 * 60 * 60,
+    'deep': 96 * 60 * 60,
 }
 
 # Finalization phase budgets are ADDITIVE to the operational execution envelope. They do not eat
@@ -275,21 +290,21 @@ AGENTIC_EXECUTION_PHASE_BUDGETS = {
 # four stages and is only a hang/deadlock safety net.
 AGENTIC_VERIFICATION_RESERVE_SECONDS = {
     'test': 10 * 60,
-    'fast': 45 * 60,
-    'balanced': 90 * 60,
-    'deep': 180 * 60,
+    'fast': 60 * 60,
+    'balanced': 120 * 60,
+    'deep': 240 * 60,
 }
 AGENTIC_ANALYSIS_RESERVE_SECONDS = {
     'test': 10 * 60,
     'fast': 120 * 60,
-    'balanced': 240 * 60,
-    'deep': 480 * 60,
+    'balanced': 360 * 60,
+    'deep': 720 * 60,
 }
 AGENTIC_REPORT_RESERVE_SECONDS = {
     'test': 20 * 60,
-    'fast': 75 * 60,
+    'fast': 60 * 60,
     'balanced': 120 * 60,
-    'deep': 210 * 60,
+    'deep': 240 * 60,
 }
 AGENTIC_FINALIZATION_RESERVE_SECONDS = {
     mode: (
@@ -304,10 +319,10 @@ AGENTIC_FINALIZATION_RESERVE_SECONDS = {
 # never be consumed; it exists only so cleanup/emergency-artifact recovery or an unexpected hang is
 # not killed exactly at a legitimate phase boundary.
 AGENTIC_WATCHDOG_SAFETY_MARGIN_SECONDS = {
-    'test': 20 * 60,
-    'fast': 180 * 60,
-    'balanced': 360 * 60,
-    'deep': 600 * 60,
+    'test': 50 * 60,
+    'fast': 240 * 60,
+    'balanced': 480 * 60,
+    'deep': 720 * 60,
 }
 
 # Compatibility/public table for the internal child hard guard at rate=10. This is intentionally
@@ -999,6 +1014,82 @@ def _planner_action_batches(actions: list[dict[str, Any]], batch_size: int) -> l
     return [ordered[index:index + size] for index in range(0, len(ordered), size)]
 
 
+def _compact_planner_advisory_context(prompt: dict[str, Any], tier: int) -> dict[str, Any]:
+    """Shrink only advisory planner metadata; concrete candidate actions are never altered.
+
+    Later planning batches accumulate selection/family telemetry. On very broad applications that
+    metadata can make even a singleton concrete-action batch cross the provider context boundary.
+    Context packaging is not a security decision, so progressively summarize only advisory fields
+    while preserving every candidate action byte-for-byte.
+    """
+    adjusted = copy.deepcopy(prompt)
+    candidates = copy.deepcopy(list(prompt.get('candidate_actions') or []))
+    adjusted['candidate_actions'] = candidates
+
+    def first_items(value: Any, limit: int) -> dict[str, Any]:
+        if not isinstance(value, dict):
+            return {}
+        return dict(list(value.items())[:max(0, limit)])
+
+    if tier >= 1:
+        adjusted['selected_so_far_by_application_family'] = first_items(
+            adjusted.get('selected_so_far_by_application_family'), 32,
+        )
+        debt = adjusted.get('coverage_debt_by_application_family')
+        if isinstance(debt, list):
+            adjusted['coverage_debt_by_application_family'] = debt[:48]
+        tools = adjusted.get('available_tools')
+        if isinstance(tools, dict):
+            for row in tools.values():
+                if isinstance(row, dict) and row.get('description'):
+                    row['description'] = str(row['description'])[:96]
+
+    if tier >= 2:
+        adjusted['selected_so_far_by_application_family'] = first_items(
+            adjusted.get('selected_so_far_by_application_family'), 12,
+        )
+        debt = adjusted.get('coverage_debt_by_application_family')
+        if isinstance(debt, list):
+            adjusted['coverage_debt_by_application_family'] = debt[:16]
+        previous = adjusted.get('previous_results')
+        if isinstance(previous, dict):
+            for profile, row in list(previous.items()):
+                if not isinstance(row, dict):
+                    continue
+                reps = row.get('representative_results')
+                if isinstance(reps, list):
+                    row['representative_results'] = reps[:3]
+                summary = row.get('summary')
+                if isinstance(summary, dict):
+                    row['summary'] = dict(summary)
+                previous[profile] = row
+        tools = adjusted.get('available_tools')
+        if isinstance(tools, dict):
+            for row in tools.values():
+                if isinstance(row, dict):
+                    row.pop('description', None)
+
+    if tier >= 3:
+        adjusted['selected_so_far_by_application_family'] = {}
+        adjusted['coverage_debt_by_application_family'] = []
+        previous = adjusted.get('previous_results')
+        if isinstance(previous, dict):
+            adjusted['previous_results'] = {
+                profile: {'summary': dict(row.get('summary') or {})}
+                for profile, row in previous.items() if isinstance(row, dict)
+            }
+        tools = adjusted.get('available_tools')
+        if isinstance(tools, dict):
+            adjusted['available_tools'] = {
+                name: {
+                    key: row.get(key) for key in ('scope', 'cost_class', 'configured_timeout_seconds', 'discovery_producer')
+                    if key in row
+                }
+                for name, row in tools.items() if isinstance(row, dict)
+            }
+    return adjusted
+
+
 def _fit_planner_prompt_context(
     prompt: dict[str, Any],
     system_message: str,
@@ -1009,26 +1100,42 @@ def _fit_planner_prompt_context(
 ) -> tuple[dict[str, Any], str, int, int]:
     """Fit one concrete-action batch without silently hiding candidates.
 
-    Unlike the older group planner, candidate_actions is never trimmed. If a configured batch does
-    not fit even at the bounded maximum context, the caller must split it into smaller batches.
+    Multi-action batches are split by the caller when they do not fit. If a singleton becomes too
+    large only because accumulated advisory telemetry grew, this function compacts that telemetry
+    progressively while preserving the complete concrete candidate. This prevents a late-round
+    context overflow from turning successful discovery into a fatal strict-Agentic failure.
     """
-    adjusted = dict(prompt)
-    candidates = list(adjusted.get('candidate_actions') or [])
+    original_candidates = copy.deepcopy(list(prompt.get('candidate_actions') or []))
     minimum_window = max(2048, int(base_context_window))
     maximum_window = max(minimum_window, int(max_context_window))
     system_bytes = len(str(system_message or '').encode('utf-8'))
-    context = json.dumps(adjusted, ensure_ascii=False, separators=(',', ':'))
-    context_bytes = len(context.encode('utf-8'))
-    prompt_bytes = system_bytes + context_bytes
-    estimated_prompt_tokens = (prompt_bytes + PLANNER_CONTEXT_BYTES_PER_TOKEN_ESTIMATE - 1) // PLANNER_CONTEXT_BYTES_PER_TOKEN_ESTIMATE
-    needed = estimated_prompt_tokens + max(0, int(max_predict)) + PLANNER_CONTEXT_SAFETY_TOKENS
-    context_window = minimum_window if needed <= minimum_window else min(maximum_window, ((needed + 2047) // 2048) * 2048)
-    if needed > context_window:
-        raise RuntimeError(
-            f'Planner action batch requires about {needed} context tokens, exceeding bounded context window {context_window}. '
-            'Split the concrete-action batch; never drop candidates silently.'
-        )
-    return adjusted, context, context_window, len(candidates)
+
+    tiers = (0,) if len(original_candidates) > 1 else (0, 1, 2, 3)
+    last_needed = 0
+    last_window = minimum_window
+    for tier in tiers:
+        adjusted = dict(prompt) if tier == 0 else _compact_planner_advisory_context(prompt, tier)
+        # Guard the non-negotiable invariant explicitly: context compaction may never change the
+        # concrete catalog slice that the model must judge.
+        adjusted['candidate_actions'] = copy.deepcopy(original_candidates)
+        context = json.dumps(adjusted, ensure_ascii=False, separators=(',', ':'))
+        context_bytes = len(context.encode('utf-8'))
+        prompt_bytes = system_bytes + context_bytes
+        estimated_prompt_tokens = (prompt_bytes + PLANNER_CONTEXT_BYTES_PER_TOKEN_ESTIMATE - 1) // PLANNER_CONTEXT_BYTES_PER_TOKEN_ESTIMATE
+        needed = estimated_prompt_tokens + max(0, int(max_predict)) + PLANNER_CONTEXT_SAFETY_TOKENS
+        context_window = minimum_window if needed <= minimum_window else min(maximum_window, ((needed + 2047) // 2048) * 2048)
+        last_needed, last_window = needed, context_window
+        if needed <= context_window:
+            if tier:
+                adjusted['planner_advisory_context_compaction_tier'] = tier
+                context = json.dumps(adjusted, ensure_ascii=False, separators=(',', ':'))
+            return adjusted, context, context_window, len(original_candidates)
+
+    raise RuntimeError(
+        f'Planner action batch requires about {last_needed} context tokens, exceeding bounded context window {last_window}. '
+        'Split the concrete-action batch; if already a singleton, advisory context compaction was exhausted. '
+        'Concrete candidates are never dropped silently.'
+    )
 
 
 def _planner_context_overflow_error(exc: BaseException) -> bool:
@@ -2456,6 +2563,76 @@ def _analysis_related_findings(batch: list[dict[str, Any]], all_candidates: list
     ]
 
 
+def _analysis_compact_prompt_item(item: dict[str, Any], *, aggressive: bool = False) -> dict[str, Any]:
+    """Return a prompt-only compact copy while preserving the original scanner finding untouched."""
+    compact = dict(item)
+    limits = {
+        'alert': 180 if aggressive else 220,
+        'url': 360 if aggressive else 460,
+        'parameter': 120 if aggressive else 150,
+        'description': 320 if aggressive else 520,
+        'technical_details': 260 if aggressive else 420,
+        'evidence': 420 if aggressive else 760,
+        'scanner_impact': 260 if aggressive else 420,
+        'scanner_consequences': 260 if aggressive else 420,
+        'scanner_recovery': 260 if aggressive else 420,
+        'scanner_solution': 280 if aggressive else 440,
+        'attack_preconditions': 200 if aggressive else 280,
+        'owasp_category': 140 if aggressive else 170,
+    }
+    for key, limit in limits.items():
+        value = compact.get(key)
+        if isinstance(value, str) and len(value) > limit:
+            compact[key] = value[:limit] + '...'
+    return compact
+
+
+def _analysis_prompt_context(
+    state: AgentState,
+    batch: list[dict[str, Any]],
+    all_candidates: list[dict[str, Any]],
+    *,
+    compact_singleton: bool = False,
+) -> tuple[str, int, int]:
+    """Build one analysis prompt and conservatively estimate prompt+output context usage."""
+    mode = str(shared.CURRENT_SCAN_MODE or 'balanced')
+    prompt_batch = batch
+    if compact_singleton and len(batch) == 1:
+        prompt_batch = [_analysis_compact_prompt_item(batch[0], aggressive=False)]
+    related_findings = [] if mode in {'test', 'fast'} else _analysis_related_findings(prompt_batch, all_candidates)
+    payload = {
+        'target': str(state.get('target') or ''),
+        'scan_mode': mode,
+        'authenticated_profiles': [
+            profile['name'] for profile in (state.get('profiles') or [])
+            if _profile_has_effective_auth(state, str(profile.get('name') or ''))
+        ],
+        'related_findings': related_findings,
+        'findings_to_analyze': prompt_batch,
+    }
+    context = json.dumps(payload, ensure_ascii=False, separators=(',', ':'))
+    estimated_prompt_tokens = int(math.ceil(
+        (len(_analysis_system_message().encode('utf-8')) + len(context.encode('utf-8')))
+        / max(1, AI_ANALYSIS_CONTEXT_BYTES_PER_TOKEN_ESTIMATE)
+    ))
+    estimated_total_tokens = (
+        estimated_prompt_tokens
+        + int(AI_ANALYSIS_MAX_PREDICT.get(mode, 700))
+        + int(AI_ANALYSIS_CONTEXT_SAFETY_TOKENS)
+    )
+    context_window = max(1024, int(AI_ANALYSIS_CONTEXT_WINDOWS.get(mode, 6144)))
+    return context, estimated_total_tokens, context_window
+
+
+def _analysis_context_fits(
+    state: AgentState,
+    batch: list[dict[str, Any]],
+    all_candidates: list[dict[str, Any]],
+) -> tuple[bool, int, int]:
+    _, estimated_tokens, context_window = _analysis_prompt_context(state, batch, all_candidates)
+    return estimated_tokens <= context_window, estimated_tokens, context_window
+
+
 AI_ANALYSIS_MIN_WORDS = {'description': 20, 'impact': 12, 'consequences': 12, 'recovery': 12, 'solution': 15, 'rationale': 8}
 
 
@@ -2534,14 +2711,38 @@ def _analysis_quality_check(rows: list[dict[str, Any]], expected: set[str]) -> l
 def _ai_analysis_batch(state: AgentState, batch: list[dict[str, Any]], all_candidates: list[dict[str, Any]], timeout: int) -> list[dict[str, Any]]:
     system_message = _analysis_system_message()
     mode = shared.CURRENT_SCAN_MODE
-    related_findings = [] if mode in {'test', 'fast'} else _analysis_related_findings(batch, all_candidates)
-    context = json.dumps({
-        'target': state['target'],
-        'scan_mode': mode,
-        'authenticated_profiles': [profile['name'] for profile in state['profiles'] if _profile_has_effective_auth(state, str(profile.get('name') or ''))],
-        'related_findings': related_findings,
-        'findings_to_analyze': batch,
-    }, ensure_ascii=False, separators=(',', ':'))
+    context, estimated_context_tokens, context_window = _analysis_prompt_context(
+        state, batch, all_candidates, compact_singleton=False,
+    )
+    if estimated_context_tokens > context_window:
+        if len(batch) > 1:
+            raise ValueError(
+                f'AI analysis batch requires about {estimated_context_tokens} context tokens, exceeding '
+                f'bounded context window {context_window}; split the finding batch without dropping findings.'
+            )
+        # A pathological singleton is compacted only in the AI prompt. The scanner/verifier
+        # finding retained in state and emitted in the final report remains untouched.
+        context, estimated_context_tokens, context_window = _analysis_prompt_context(
+            state, batch, all_candidates, compact_singleton=True,
+        )
+        if estimated_context_tokens > context_window:
+            compacted = _analysis_compact_prompt_item(batch[0], aggressive=True)
+            mode_name = str(shared.CURRENT_SCAN_MODE or 'balanced')
+            related = [] if mode_name in {'test', 'fast'} else _analysis_related_findings([compacted], all_candidates, limit=2)
+            context = json.dumps({
+                'target': state['target'], 'scan_mode': mode_name,
+                'authenticated_profiles': [profile['name'] for profile in (state.get('profiles') or []) if _profile_has_effective_auth(state, str(profile.get('name') or ''))],
+                'related_findings': related, 'findings_to_analyze': [compacted],
+            }, ensure_ascii=False, separators=(',', ':'))
+            estimated_context_tokens = int(math.ceil(
+                (len(system_message.encode('utf-8')) + len(context.encode('utf-8')))
+                / max(1, AI_ANALYSIS_CONTEXT_BYTES_PER_TOKEN_ESTIMATE)
+            )) + int(AI_ANALYSIS_MAX_PREDICT.get(mode_name, 700)) + int(AI_ANALYSIS_CONTEXT_SAFETY_TOKENS)
+            if estimated_context_tokens > context_window:
+                raise AnalysisContextTooLarge(
+                    f'Single-finding AI analysis prompt still requires about {estimated_context_tokens} tokens after bounded '
+                    f'prompt-only compaction, exceeding context window {context_window}; scanner evidence remains intact.'
+                )
     options = {
         'temperature': 0,
         'num_predict': AI_ANALYSIS_MAX_PREDICT.get(mode, 700),
@@ -2655,6 +2856,35 @@ def _ai_analysis_batch_adaptive(
     attempt_floor = 12 if shared.CURRENT_SCAN_MODE == 'test' else 45
     if remaining < attempt_floor:
         raise AnalysisBudgetExhausted(f'{label} exhausted its shared analysis batch budget before another AI attempt could start.')
+
+    fits_context, estimated_context_tokens, context_window = _analysis_context_fits(state, batch, all_candidates)
+    if (not fits_context) and len(batch) > 1:
+        midpoint = max(1, len(batch) // 2)
+        left, right = batch[:midpoint], batch[midpoint:]
+        print(
+            f'    AI analysis: {label} requires about {estimated_context_tokens} context tokens for {len(batch)} findings '
+            f'(window={context_window}); splitting into {len(left)}+{len(right)} without dropping findings.',
+            flush=True,
+        )
+        rows: list[dict[str, Any]] = []
+        split_remaining = max(0, int(deadline - time.monotonic()))
+        left_floor = 12 if shared.CURRENT_SCAN_MODE == 'test' else 45
+        left_share = max(left_floor, int(split_remaining * (len(left) / max(1, len(batch)))))
+        left_deadline = min(deadline, time.monotonic() + left_share)
+        try:
+            rows.extend(_ai_analysis_batch_adaptive(
+                state, left, all_candidates, timeout, label=f'{label}.ctx1', deadline=left_deadline,
+            ))
+        except AnalysisBudgetExhausted as exc:
+            raise AnalysisBudgetExhausted(str(exc), partial_rows=[*rows, *exc.partial_rows]) from exc
+        try:
+            rows.extend(_ai_analysis_batch_adaptive(
+                state, right, all_candidates, timeout, label=f'{label}.ctx2', deadline=deadline,
+            ))
+        except AnalysisBudgetExhausted as exc:
+            raise AnalysisBudgetExhausted(str(exc), partial_rows=[*rows, *exc.partial_rows]) from exc
+        return rows
+
     try:
         return _ai_analysis_batch(state, batch, all_candidates, remaining)
     except Exception as exc:
@@ -2925,6 +3155,7 @@ def analysis_node(state: AgentState) -> dict[str, Any]:
     direct_representative_ids: set[str] = set()
     budget_deferred_representative_ids: set[str] = set()
     error_deferred_representative_ids: set[str] = set()
+    context_deferred_representative_ids: set[str] = set()
     incomplete_response_representative_ids: set[str] = set()
     errors: list[str] = []
     batch_count = (len(representatives) + batch_size - 1) // batch_size
@@ -3056,6 +3287,17 @@ def analysis_node(state: AgentState) -> dict[str, Any]:
                     'Continuing with later representative groups while time remains.',
                     file=sys.stderr, flush=True,
                 )
+            except AnalysisContextTooLarge as exc:
+                message = f'batch {batch_index + 1}: {type(exc).__name__}: {exc}'
+                errors.append(message)
+                context_deferred_representative_ids.update(
+                    str(item.get('id') or '') for item in batch if str(item.get('id') or '')
+                )
+                print(
+                    f'    AI analysis: {message}; this is a bounded prompt-representation limit, not an AI provider failure. '
+                    'Scanner/verifier evidence is retained and reporting continues.',
+                    file=sys.stderr, flush=True,
+                )
             except Exception as exc:
                 message = f'batch {batch_index + 1}: {type(exc).__name__}: {exc}'
                 errors.append(message)
@@ -3073,6 +3315,13 @@ def analysis_node(state: AgentState) -> dict[str, Any]:
             finding_map, members_by_representative.get(representative_id, [representative_id]),
             status='not_analyzed_budget',
             reason='Protected AI-analysis time was exhausted before this strict representative group could be post-assessed; scanner/verifier information is retained in full.',
+            provider=provider, model=model, representative_id=representative_id, overwrite=False,
+        )
+    for representative_id in context_deferred_representative_ids:
+        _set_finding_ai_analysis_status(
+            finding_map, members_by_representative.get(representative_id, [representative_id]),
+            status='not_analyzed_context',
+            reason='The finding could not fit the bounded AI context even after prompt-only compaction; original scanner/verifier evidence is retained in full and reporting continues.',
             provider=provider, model=model, representative_id=representative_id, overwrite=False,
         )
     for representative_id in error_deferred_representative_ids:
@@ -3123,6 +3372,10 @@ def analysis_node(state: AgentState) -> dict[str, Any]:
         'analysis_findings_reused_from_equivalent_group': reused_findings,
         'candidate_findings_unanalyzed': unanalyzed_findings,
         'candidate_findings_deferred_budget': budget_deferred,
+        'candidate_findings_deferred_context': sum(
+            len(members_by_representative.get(representative_id, []))
+            for representative_id in context_deferred_representative_ids
+        ),
         'candidate_findings_deferred_ai_error': sum(
             len(members_by_representative.get(representative_id, []))
             for representative_id in error_deferred_representative_ids
@@ -4529,6 +4782,13 @@ def _apply_discovery_enrichment(action: dict[str, Any], result: dict[str, Any], 
                 result['discovery_enrichment_time_limit_reached'] = True
             discovery[profile] = enriched
             return max(0, len(enriched.get('request_cases', [])) - before)
+        if tool == 'zap':
+            before = len(discovery.get(profile, {}).get('request_cases', []))
+            enriched, urls = enrich_discovery_with_zap(discovery.get(profile, {}), result, state['target'])
+            discovery[profile] = enriched
+            result['discovery_enrichment_urls'] = len(urls)
+            result['discovery_enrichment_source'] = 'zap_site_tree'
+            return max(0, len(enriched.get('request_cases', [])) - before)
         discovery[profile], generated = enrich_discovery_with_arjun(discovery.get(profile, {}), result, action['target_url'])
         return len(generated)
     except Exception as exc:
@@ -5068,7 +5328,7 @@ def report_node(state: AgentState) -> dict[str, Any]:
         if report.get('status') != 'success':
             print(f"[REPORT ERROR] {report.get('diagnosis') or 'report_failed'} — {report.get('output') or 'No report error detail returned.'}", file=sys.stderr, flush=True)
     if report.get('status') != 'success' and not any((report.get('json_filename'), report.get('html_filename'), report.get('pdf_filename'), report.get('review_snapshot_filename'))):
-        fallback = write_emergency_json_report(state['target'], state['results'], state['diagnostics'], str(report.get('output', 'Report MCP failed.')), f'{output_name}_Emergency')
+        fallback = write_emergency_json_report(state['target'], report_results, state['diagnostics'], str(report.get('output', 'Report MCP failed.')), f'{output_name}_Emergency')
         if fallback:
             report.update(json_filename=fallback, html_filename=str(Path(fallback).with_suffix('.html')), local_json_fallback=True, emergency_report=True)
     return {'report_status': report, 'results': report_results}

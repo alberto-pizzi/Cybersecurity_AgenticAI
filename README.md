@@ -1,484 +1,480 @@
-# Agentic AI Pentesting & Reporting Automation System through MCP 
+# Agentic AI Pentesting & Reporting Automation System through MCP
 
-Automated web-application security assessment platform: one unified FastMCP Streamable HTTP
-server (`servers/secopsServer.py`) imports the external-tool wrappers and project-specific checks
-and exposes their tools through a single `/mcp` endpoint. Two orchestrators drive the same tool
-catalogue against a target and produce PDF/HTML/JSON reports plus a redacted review snapshot. A platform-level
-assessment configuration can expand multiple authorized HTTP/HTTPS services into the same existing orchestrators;
-direct orchestrator commands remain supported. Full command reference: `init.txt`.
+Piattaforma per assessment web autorizzati con discovery condivisa, scanner MCP, autenticazione, orchestrazione Deterministic o Agentic e reporting JSON, HTML e PDF.
 
-## Start here: recommended workflow
+Questa guida è pensata anche per chi riceve il progetto senza conoscerne il codice. Il percorso consigliato è: inizializzare l'ambiente, copiare una configurazione di esempio, validarla con `--dry-run`, verificare l'autenticazione se presente e solo dopo avviare l'assessment.
 
-If this is the first time you open the repository, use this sequence.
+Il progetto non usa benchmark esterni come input runtime. Endpoint, parametri, servizi e request contract devono essere scoperti dal target autorizzato.
 
-1. **Initialize the environment** from the repository root.
+## Manuale operativo: avvio rapido
 
-   ```powershell
-   python .\initScript.py --with-lab
-   ```
+### 1. Preparazione
 
-   On Linux/macOS use `python3 ./initScript.py --with-lab`. The initializer verifies the project dependencies, scanners,
-   Playwright/Chromium and the selected AI backends. On Debian it also installs the native WeasyPrint host libraries
-   `libpango-1.0-0`, `libpangoft2-1.0-0` and `libharfbuzz-subset0`, so PDF rendering does not fail only because the Python
-   package is present while Pango/Harfbuzz are missing. With `--with-lab` it also prepares the local DVWA lab. At the end it
-   prints ready-to-copy commands.
+```bash
+cd ~/Cybersecurity_AgenticAI
+python initScript.py
+```
 
-   The canonical MCP registry can be inspected without a target or model startup from either orchestrator:
+Questo comando installa o verifica dipendenze, scanner, Chromium e preflight senza avviare il laboratorio di training. Per avviare anche il laboratorio locale e preparare i backend AI usare:
 
-   ```powershell
-   python .\orchestratorDeterministic.py --list-tools
-   python .\orchestratorAgentic.py --list-tools
-   ```
+```bash
+python initScript.py --with-lab
+```
 
-2. **Run Deterministic in `balanced` mode on DVWA for the first reproducible assessment.** Its execution order is fixed, so it is the
-   easiest run to inspect and reproduce. Use Agentic in `balanced` mode when you want adaptive action selection and AI evidence analysis.
+Per stampare soltanto la guida dei comandi, senza installare o avviare componenti:
 
-3. **Choose how to describe the new target.**
-   - Use `assessmentRunner.py --target <URL>` for a single starting URL when the run is anonymous or when you already have
-     a valid cookie that can be passed with `--cookies`.
-   - Use `assessmentRunner.py --config <FILE>` when you only have the target username/password and the session must be
-     created through browser/OIDC login. Direct `--target` mode does not accept target username/password and does not run
-     the provider-neutral `browser_oidc` login workflow.
-   - Also use `--config` when the authorized scope contains several hosts, ports, base paths, identities or explicit entry
-     URLs that must all be tested.
+```bash
+python initScript.py --commands-only
+```
 
-4. **Do not list every internal URL unless the scope requires specific entry URLs.** For a normal application, give the
-   root URL or the relevant base path and let discovery expand the authorized surface. Exact same-origin URLs are always
-   in scope; additional origins are followed when explicitly authorized and, when `authorization.allow_same_host_ports=true`, HTTP/HTTPS services on other ports of the same exact hostname are also admissible. With `authorization.discover_same_host_services=true`, discovery probes the initial authorized hostname and also any **new exact hostname that is both observed during discovery and already authorized by scope**. The initial host receives a deliberately short first slice so application crawling/authentication starts promptly. Additional observed authorized hostnames are then given a smaller targeted priority-port pool **before** the primary host consumes its full-range continuation; port scanning is host-level, so discovering additional paths/endpoints on one hostname never starts another TCP sweep. Candidate ordering is target-agnostic: ports already configured or observed for the authorized hostname are attempted first, then entries from runtime service databases ordered by their available service-frequency metadata, then a deterministic stratified walk across the remaining TCP range. At the default 10 req/s the complete service-discovery wall-clock budget is 2400/18000/28800 seconds (40 min / 300 min / 480 min) in fast/balanced/deep, while the initial primary-host slice remains only 180/900/1500 seconds (3 min / 15 min / 25 min). Newly observed authorized hostnames share targeted pools of 1536/6144/12288 priority candidates; unused time/candidate capacity remains available to later hosts and the primary continuation. These network-bound budgets expand automatically when `execution.request_rate` is below 10 so the configured candidate ceilings remain physically reachable instead of being silently truncated by a timeout designed for rate 10. Responsive web services are added as priority seeds and recrawled with bounded per-host page budgets. Hostnames that appear only during authenticated sibling/application recrawls are handled by one post-authentication expansion pass; those recrawls do not start their own port sweeps. TCP/service results are cached at exact-host level for the whole assessment process, so a hostname already scanned by anonymous discovery is reused by authenticated discovery instead of being swept again; the current session still receives its own bounded application recrawl. Discovery follows HTML links/forms, inline/external JavaScript literal navigation,
-   rendered DOM navigation attributes, safe menu/dropdown expansion and dynamic `document`, `xhr` and `fetch` requests observed
-   by Chromium. Values carried by routing parameters such as `redirect`, `linkUrl`, `page` or `resource` are preserved when they
-   identify different internal modules and safe nested destinations are added back to the discovery queue. Runtime-observed routing wrappers are also reused in a bounded way: when the same origin and directory expose both a wrapper such as `...?redirect=<local-route>` and another concrete sibling route, discovery may derive the corresponding wrapper variant from those two live observations. This is restricted to safe same-directory routes, excludes volatile OAuth/OIDC callbacks and never uses external endpoint inventories. Each newly observed application family receives a profile-specific early-depth reserve (1/4/12/24 useful visits in TEST/FAST/BALANCED/DEEP) before already-dense families can dominate the queue. Every newly confirmed web origin also receives its own standard metadata seeds (`robots.txt`, sitemap, OpenAPI/Swagger, manifest/service-worker) even when `/` itself returns 404. HTTP 401/403 roots remain protected-web evidence rather than being discarded as dead services. If several supplied URLs
-   must each be guaranteed as starting points, declare them as separate services in the configuration. External validation/reference
-   datasets are never runtime inputs to discovery, planning, target configuration or scanner selection; any comparison against them is a post-run evaluation step.
+Requisiti operativi: Python 3.13 nella VM Debian, accesso alla rete del target autorizzato e spazio sufficiente per scanner e report. In una installazione normale non usare `--skip-scanners`.
 
-5. **Validate a new configuration before scanning it.**
+Per preparare un solo backend AI insieme al laboratorio:
 
-   ```powershell
-   python .\assessmentRunner.py --config .\configs\platform.example.json --orchestrator deterministic --mode balanced --dry-run --authorized
-   ```
+```bash
+python initScript.py --with-lab --prepare-ai snap4city
+# oppure: llama / qwen
+```
 
-   `--dry-run` validates and expands the configuration without starting scanners. The example above adds `--authorized` only because `platform.example.json` deliberately ships with `authorization.confirmed=false`; before a real assessment, replace the placeholder authorization/reference and confirm the real scope instead of relying on the example override. Dry-run does not require the MCP/scanner runtime or a locally installed Agentic model, and it does not resolve reusable secrets; those checks are deferred to a real execution.
+Snap4City usa credenziali del provider separate dalle credenziali del target. Se serve specificare il file esplicitamente:
 
-6. **Use `balanced` unless you need a different trade-off.** `test` is the diagnostic profile: every scanner/action gets a 10-second execution budget, while local discovery/crawl expansion is kept below 10 seconds wherever that stage owns its own wall-clock budget. MCP transport keeps a separate safety margin so a scanner that uses its full 10 seconds can still return a structured partial result instead of being cut off by the transport. `fast` remains the shortest normal-coverage profile; `deep` increases discovery and scanner budgets.
+```bash
+python initScript.py --with-lab --prepare-ai snap4city \
+  --snap4city-credentials snap4city_model_credentials.json
+```
 
-   TEST is intentionally a smoke/regression profile rather than a coverage profile. Agentic TEST uses one round, at most 32 fairly interleaved planner candidates in one planner batch, a 24-action reference ceiling (27 only after an explicit bounded adaptive request), and AI analysis of at most one finding. The planner has a 90-second control-plane budget and final AI analysis has a protected ceiling of 600 seconds; these do **not** enlarge the 10-second scanner deadlines. The generic 1200-second MCP timeout is explicitly clamped in TEST: a normal 10-second scanner has an outer MCP watchdog of about 90 seconds, ZAP about 130 seconds because of its shared-daemon cleanup allowance, and auxiliary calls without a scanner deadline remain below 120 seconds. Report transport/rendering is separate: TEST uses a 60-second transfer budget, a 900-second MCP reconstruction/render ceiling and an 840-second shared PDF-conversion ceiling. Agentic TEST has a separate 20-minute report phase after its execution/verification/AI phases; the fixed 120-second emergency-artifact tail remains inside that report phase and the wider watchdog still leaves extra recovery slack. A PDF render timeout is reported as `partial/time_limit_reached` while preserving JSON/HTML/review artifacts; a real renderer/dependency failure remains an error.
+### 2. Validazione della configurazione
 
-For normal Agentic coverage profiles, **180 / 480 / 720 in fast/balanced/deep are configured reference capacities, not hard coverage caps**. At each planner round the normal admission capacity is resolved as `min(eligible, max(reference, ceil(remaining eligible / remaining rounds)))`, so Python does not discard useful AI-selected work merely because a static action count was reached. The AI still decides which concrete actions are useful and their priority; Python only enforces scope/safety, batches the full eligible catalogue for model context, and applies phase-specific budgets. Each batch also receives a bounded application-family coverage-debt summary plus per-tool timeout/cost metadata. Coverage/security value, novelty and family debt explicitly dominate cost; the cost metadata is only a final weak tie-breaker between otherwise equivalent actions. It must never demote a distinct high-value action or a new/under-covered family merely because its configured timeout is larger. Neither signal selects, requires or reorders an action in Python. If the AI selects FFUF or Arjun because a sparse family needs enrichment, the planner prompt asks it to place that producer early enough for later same-round actions to benefit, but the producer is never added or promoted unless the AI selected it. An explicit `request_adaptive_extension=true` may add up to 12.5% above the resolved normal round capacity when useful.
+```bash
+python assessmentRunner.py \
+  --config ~/Cybersecurity_AgenticAI/configs/dashboard-test.json \
+  --orchestrator agentic \
+  --mode balanced \
+  --max-rounds 2 \
+  --require-ai \
+  --dry-run \
+  --authorized
+```
 
-**Operational execution uses a dedicated TEST/FAST/BALANCED/DEEP envelope of 1 h / 14 h / 30 h / 56 h at the default 10 req/s.** Verification, AI interpretation and reporting are additive protected phases, not time removed from those scanner/planner windows. Their normal maxima are respectively **10/45/90/180 min verification**, **10/120/240/480 min AI analysis**, and **20/75/120/210 min reporting**. Therefore the complete normal phase envelope is 1h40 TEST, 18h FAST, 37h30 BALANCED and 70h30 DEEP, but every phase returns immediately when its work finishes; these are safety ceilings, not expected durations. At request rates below 10 only the target-traffic-dependent execution phase expands proportionally. AI/report budgets do not inflate merely because target traffic is slower.
+Il dry-run controlla configurazione, scope e job generati. Non avvia gli scanner.
 
-A separate internal child watchdog exists only for hangs/deadlocks and sits beyond all normal phases with additional slack. At 10 req/s its floors are **2 h TEST / 21 h FAST / 43h30 BALANCED / 80h30 DEEP**. The parent-runner process watchdog is wider again: **2h30 / 22 h / 45h30 / 86h30**. These watchdogs do not decide normal coverage, verification depth, AI coverage or report rendering; phase-specific limits do. Preflight/model readiness occurs before the graph phase clock, while the outer parent watchdog remains able to stop a truly stuck child.
+### 3. Assessment Agentic
 
-AI analysis first groups only strictly equivalent findings (same identity profile, tool/type, endpoint path, parameter/method, scanner severity and verification state), preserves each original evidence record, and reuses the representative AI narrative across equivalent instances. Unique representatives are then processed until the real AI-stage deadline; there is no static hard finding cap, so faster model throughput automatically analyzes more findings while keeping the AI-analysis stage bounded and preventing one batch from consuming the whole analysis window. **Every vulnerability/candidate remains in the report even when AI coverage is incomplete.** Each security finding carries an explicit AI coverage state (`analyzed`, `reused_equivalent`, `not_analyzed_budget`, `not_analyzed_profile_limit`, `not_analyzed_ai_error`, or `not_analyzed_ai_incomplete_response`). A finding not processed by AI keeps its scanner/verifier evidence, original description/impact/remediation fields and deterministic category/status; PDF/HTML visibly label it as not AI-analyzed and the executive/methodology sections report the incomplete AI coverage count. Human-readable PDF/HTML never drop vulnerabilities/candidates because of AI budget; repetitive informational detail remains deliberately bounded at 35 observation rows and 25 discovery rows so noisy scanners cannot make the document unbounded. Executive-summary/category/severity totals are always computed from the complete normalized set, the cap note states how many informational rows were omitted, and the complete normalized/raw result data remain in JSON. The cover also reports the measured assessment execution time up to report generation without changing the report section structure.
+```bash
+python ~/Cybersecurity_AgenticAI/assessmentRunner.py \
+  --config ~/Cybersecurity_AgenticAI/configs/dashboard-test.json \
+  --orchestrator agentic \
+  --max-rounds 2 \
+  --mode balanced \
+  --require-ai \
+  --authorized
+```
 
-`--ai-timeout` is an **aggregate planning ceiling for one Agentic round**, not a timeout restarted for every planner batch. A second whole-assessment planner guard prevents repeated rounds from turning AI waiting into multi-hour control-plane time: TEST/FAST/BALANCED/DEEP allow at most **90 / 2100 / 4200 / 6000 seconds** of planner time across the assessment. Unused time carries forward. Before the current round consumes that common remainder, useful slices are reserved for later rounds (FAST 750s, BALANCED 1200s, DEEP 1500s per future round). Inside a round, later context batches also retain protected minimum slices (15/120/240/360s in TEST/FAST/BALANCED/DEEP), while an unusually slow current batch may borrow the rest; fast batches return unused time immediately. Ollama chat and its generate fallback share the same batch deadline, so fallback cannot double the allocation. In `--require-ai` mode, exhausting the available planner budget or losing a required batch fails the required AI stage rather than silently omitting an unjudged catalogue slice. An explicit positive `--ai-timeout` is respected as the per-round ceiling when it is smaller; `0` selects the profile default, negative values are rejected, and the profile-wide cumulative safety cap still applies.
-The post-scan AI finding-analysis stage is bounded separately so many finding batches cannot multiply without control: TEST/FAST/BALANCED/DEEP allow at most **600 / 7200 / 14400 / 28800 seconds** for the complete analysis stage. Per-batch rescue/split deadlines remain inside that aggregate cap. If the phase ends before all unique representatives are analyzed, the remaining findings are retained and explicitly marked rather than being omitted or turning budget exhaustion into a fatal `--require-ai` error.
+### 4. Assessment Deterministic
 
-7. **Watch the terminal during the assessment.** Deterministic reports the fixed pipeline stages. Agentic also reports
-   planner rounds and selected actions. Execution status and coverage remain separate from security findings.
+```bash
+python ~/Cybersecurity_AgenticAI/assessmentRunner.py \
+  --config ~/Cybersecurity_AgenticAI/configs/dashboard-test.json \
+  --orchestrator deterministic \
+  --mode balanced \
+  --authorized
+```
 
-### Performance and discovery breadth
+## Architettura
 
-The current profiles intentionally spend less time on duplicate work and more on distinct surface. Request-level injection/browser actions use conservative request-family consolidation (method/origin/path/parameter/body shape), but SQLMap/Dalfox/Commix preserve observed local/internal routing values when they select different backend files/modules; Traversal, IDOR and Authorization likewise retain resource/object-sensitive variants. Nuclei DAST uses the same structural principle before expensive batches, and the final safe-surface sweep collapses only value-only duplicates that do not represent a distinct resource. Positive authenticated-session checks are reused briefly within the same identity/application family; SQLMap reuses one REST daemon with isolated tasks; Dalfox capability detection and IDOR runtime preflight are cached; Chromium reuses one process while every action receives a fresh isolated context.
+I componenti principali sono:
 
-Discovery combines HTML/form crawling, Chromium navigation and network contracts, JavaScript literals, `robots.txt`, sitemap XML/indexes, OpenAPI/Swagger documents, web manifests/service workers/config documents and JavaScript source maps. FFUF remains one planner action but can fuzz several application roots learned at runtime; its generic candidate limits are 64/600/2500/6000 in TEST/FAST/BALANCED/DEEP and its timeout is derived from roots × candidates × `request_rate` with safety margin. HTTP/JavaScript/port discovery uses bounded concurrency behind the same request-start pacer, and Chromium waits return early when DOM/network counters stabilize while retaining the configured maximum wait for slow SPAs. Current useful-page maxima are 16/700/5000/12000, Chromium maxima 8/420/3000/6500 and script maxima 12/384/2600/5200. These ceilings are intentionally larger than the base budgets so newly discovered application families can consume adaptive overflow without forcing every run to use the maximum.
-
-### Active scope and request-rate policy
-
-Active testing is based on explicit HTTP authorization, not DNS-parent relationships or textual hostname prefixes. The primary target origin is always in scope and additional exact origins can be authorized with `authorization.allowed_origins` or repeated `--authorized-origin`. An origin is scheme + hostname + effective port. `authorization.allow_same_host_ports=true` permits HTTP/HTTPS services on other ports or the other HTTP(S) scheme of an already-authorized **exact hostname**; it never authorizes a sibling/prefix/suffix hostname. `authorization.discover_same_host_services=true` enables proactive service discovery and requires the multi-port policy. The primary-host candidate ceilings are **8,192 / 65,535 / 65,535** in fast/balanced/deep, so BALANCED and DEEP can cover the complete TCP port space without increasing the request-rate peak. At the default 10 req/s the shared service-discovery wall-clock budgets are **2400 / 18000 / 28800 seconds** (40 / 300 / 480 min), while the first primary-host slice is intentionally only **180 / 900 / 1500 seconds** (3 / 15 / 25 min) so application crawling and authentication happen before a long continuation. Below 10 req/s these network-bound totals expand automatically with the configured rate. Up to **16 / 64 / 192** additional authorized observed hostnames share a smaller targeted priority-port pool (**1,536 / 6,144 / 12,288**) and are serviced before the primary host consumes its full-range continuation. The targeted pool is fairly shared across still-pending hostnames; unused time/candidate capacity remains available to later work. Partial or lower-cap rows remain resumable evidence rather than being treated as complete, and already-completed ports are not charged twice. Within one assessment, uncached sibling-host TCP sweeps are serialized: one sweep already has enough in-flight workers to saturate the shared request-start pacer, so overlapping two sweeps would add no useful throughput and would double-count the service-discovery time allowance. Application recrawls and ordinary HTTP/Chromium discovery remain concurrent behind the same rate authority. Newly confirmed HTTP/HTTPS roots are recrawled with up to **72 / 360 / 720** pages per hostname. Authenticated sibling/application recrawls explicitly skip their own per-path port sweep; one final expansion pass handles new authorized hosts revealed after login. Port discovery remains host-level: a new path on an already observed hostname never triggers another independent TCP sweep. Candidate ports start with ports configured or observed at runtime for the authorized hostname, then HTTP/web-named entries from standard runtime service databases, then the remaining TCP service-database entries ordered by available frequency, and finally a deterministic stratified walk across TCP ports 1-65535. A port is promoted to the web surface only after an HTTP response is recognized; HTTPS classification uses a bounded TLS handshake and HTTP probe. An open TCP port not confirmed as HTTP/HTTPS remains **web-unconfirmed inventory**. DNS resolution and multi-address selection are bounded by the same local service-discovery deadline, and every A/AAAA address may be tried for one candidate port without multiplying the candidate-port count. Results Data records the actual resolved-address count plus the theoretical TCP request-start floor, so multi-address budget sufficiency is auditable. The same local deadline covers pacing, TCP connect, TLS handshake and HTTP classification: once the remaining time is exhausted no new candidate or follow-up classification step is allowed to run past it. A classification interrupted by the deadline remains explicitly deferred. HTTP classification falls back from HEAD to a minimal GET when necessary. A discovered authorized hostname that fails before its first real port probe remains retryable. The candidate ceilings are maxima, not promises that every candidate will be reached; Results Data records the full TCP space, planned and unplanned candidates, `ports_probed`, `ports_probed_this_call`, deferred candidates, open-web/open-non-web counts, TCP connection attempts, resolved-address count and classification-deferred diagnostics so a profile cap cannot masquerade as complete port coverage. Candidate generation is application-agnostic and never consumes external validation/reference data. Credential propagation remains stricter than authorization: a raw Cookie header is never copied to another hostname, and origin-specific authentication is reused only where its cookie/storage policy applies and validation succeeds. For an absolute URL without an explicit port, HTTP implies 80 and HTTPS implies 443. Authorization never expands from a DNS parent/suffix relationship alone.
-
-Concrete sibling examples with `allow_same_host_ports=true`:
-
-| Discovered URL | Result | Reason |
-| --- | --- | --- |
-| `https://app.example.org:8443/app` | **Accepted** | Same exact authorized hostname; the site-level multi-port rule allows HTTP/HTTPS services on other ports. |
-| `https://api.example.org/app` | **Accepted only if explicitly authorized** | It is a sibling hostname, so the multi-port flag alone does not authorize it. An exact `allowed_origins`/service entry does. |
-| `https://api.example.org:8443/app` | **Accepted only if `api.example.org` is explicitly authorized first** | A sibling hostname is never inferred; once that exact hostname is authorized, its HTTP/HTTPS ports may be discovered under the same rule. |
-| `http://app.example.org:8080/app` | **Accepted** | Scheme and port may differ because the site-level rule is tied to the same exact hostname and HTTP/HTTPS protocols. |
-| `https://app.example.org.evil.test/app` | **Rejected** | This is a different hostname under `evil.test`, not part of `app.example.org`. |
-
-Login and SSO endpoints are not excluded by name. `/login.php`, `/ssoLogin.php`, `/auth/...` or any other authentication route remains testable when it belongs to an authorized origin. During browser authentication the page may temporarily visit a different origin; that does not authorize scanners against the external identity-provider origin. Redirects followed by sensitive Python helper/probe requests are restricted to same-origin transitions. The same guard is used by session probes, runtime target preparation, logout verification and lightweight injection pre-verifiers, so helper traffic cannot widen scope merely because an endpoint returns an external `Location`. When a session probe is stopped by that guard, or exhausts the bounded same-origin redirect limit, authentication is reported as inconclusive rather than treating the remaining 3xx response as proof of an authenticated session. Traversal/LFI pre-verification uses the same redirect guard as the other request-level verifiers. External scanner wrappers also disable autonomous redirect following where the tool exposes such a control: Arjun, Nuclei, SQLMap and Commix are invoked with redirect following disabled/ignored, ZAP direct seeding does not follow redirects, its context regex is anchored to the exact scheme/host/effective-port origin, targeted active scans use in-scope-only mode, and ZAP itself is switched to Protected mode as a second barrier; Nikto is launched without its global follow-redirects option. This does **not** discard the normal application redirect destinations found by project-controlled discovery: HTTP/Chromium discovery follows bounded redirects while every destination remains inside the configured authorization policy. Same-origin hops are followed normally; an exact additional origin is followed when it was explicitly authorized before the run; and, when `allow_same_host_ports=true`, a different port is also allowed only for the same exact authorized hostname over HTTP/HTTPS. The final in-scope URL is recorded and fed back into broad/specialist selection. Nuclei therefore receives both the original in-scope target and the bounded discovered in-scope URL set; Nikto may start directly from the final URL reached by its own project-controlled same-origin reference probe. The scanner process itself is still prevented from making an autonomous cross-origin hop. This is intentionally conservative: scanner-internal/template-specific behavior that *itself* requires following a redirect is not guaranteed to be reproduced by central discovery. Nuclei's documented `-fhr` means "follow redirects on the same host". That is not used as the authorization boundary because the flag description does not by itself guarantee the same rule as this project's allow-list: Nuclei documents protocol redirects separately, and its template variables distinguish `Host` from `Hostname` (where `Hostname` includes the port). The assessment therefore evaluates every redirect hop against the configured authorization policy (explicit origins plus the optional exact-host HTTP/HTTPS multi-port rule) instead of assuming that Nuclei's shorter "same host" wording is equivalent. The enlarged selector/discovery budgets remain bounded by profile; this residual redirect-dependent scanner behavior is reported/documented as a containment trade-off rather than claimed as zero coverage loss. FFUF is not launched with redirect-following enabled; the Dalfox wrapper does not enable its follow-redirects option. Discovery prints a single `[SCOPE]` notice when it observes out-of-scope URLs/origins, explicitly stating that they were not queued for active testing. Chromium separately reports ordinary external subresource traffic needed for rendering/authentication and the number of blocked top-level navigations toward unauthorized origins; those dependency requests are never converted into active scanner cases. The Browser XSS/workflow verifier applies the same top-level rule: third-party subresources required to render an authorized page may load, but a document/navigation redirect is followed only when its destination is admitted by the configured authorization policy (explicit origin, or another HTTP/HTTPS port of the same exact hostname when `allow_same_host_ports=true`); an unauthorized destination is aborted and recorded rather than followed as a new verification target. Service Workers are deliberately **blocked in assessment Chromium contexts** because Playwright routing does not reliably intercept requests owned by a Service Worker; leaving them enabled would create an in-scope request path that could bypass the shared request-start pacer. This can change PWA behavior and is therefore an explicit containment-versus-coverage trade-off rather than a hidden assumption. Ordinary third-party read-only subresources required for rendering may still load, but they are not assessment-target traffic and are never promoted into active scanner cases. Browser/OIDC authentication similarly paces every request to the exact target hostname (including another HTTP/HTTPS port of that hostname) while allowing an external IdP origin to complete its authentication flow without treating that provider as a scan target.
-
-Any external ground-truth or reference dataset used to evaluate discovery is kept **outside assessment runtime**. It is not injected into configuration, discovery, planning or scanner selection; post-run comparison may use it to measure what the platform discovered autonomously.
-
-The unified MCP runtime is also version-bound at runtime: `secopsServer.py` exposes a source fingerprint frozen at process startup, and the orchestrator validates it before reusing an already-listening loopback endpoint. The identity check is performed live whenever an existing listener is attached, even if the same endpoint was verified earlier in the assessment, so a process that dies and is replaced on the same port cannot inherit trust from a stale in-process cache. A stale SecOps server from another checkout/version, or an unrelated process on the configured port, is rejected with a clear preflight/runtime error instead of silently executing wrappers from a different source revision. This check is transport-level and works on Linux, macOS and Windows without relying on platform-specific PID/port ownership APIs.
-
-The containment layers are deliberately different by tool rather than blindly duplicated. The shared orchestrator gate decides which origins/request contracts are authorized before any specialist is called, including the optional same-host multi-port rule when enabled. Project discovery owns bounded authorized redirect resolution. Sensitive Python probes/custom checks use the shared same-origin redirect helper. Arjun/Nuclei/SQLMap/Commix disable autonomous redirect following, FFUF/Dalfox do not enable it, and Nikto omits global follow; they operate on URLs already admitted by discovery. `--disable-redirects` really does prevent Arjun itself from following **all** redirects, including internal ones. To preserve the ordinary GET case, the wrapper first resolves a short same-host redirect chain with auto-follow disabled, checking every hop and allowing a discovered alternate port only when the configured multi-port policy permits it. If a redirect points to a different hostname that is separately authorized, the wrapper deliberately does **not** carry the current raw cookie across that hop; central discovery handles that destination separately with the session applicable to that origin. Non-GET cases are not replayed merely to resolve redirects, avoiding duplicate stateful requests. A redirect generated only by one of Arjun's own parameter probes is still not followed inside Arjun, so this remains a documented containment-versus-coverage trade-off rather than a claim of perfectly equivalent redirect behavior. ZAP needs additional internal barriers because it maintains its own site tree and active scanner: exact-origin context, in-scope-only active scans, Protected mode and no-follow direct seeding all enforce the *same* scope policy at different ZAP layers. The Traditional ZAP Spider is retained when `allow_state_changes=true`: it runs inside the anchored exact-origin Protected-mode context with bounded thread/depth/children/duration settings, while the ZAP Network add-on installs a per-run requests/second rule derived from `execution.request_rate`. When `allow_state_changes=false`, the autonomous Spider remains disabled because an internally discovered GET cannot be passed through the project's pre-network state-change guard; SecOps' HTTP/Chromium/JS/OpenAPI/FFUF discovery supplies the safe surface and seeds it into ZAP instead. Thus the Spider is not removed merely for pacing reasons, and its extra coverage is preserved whenever the state-change policy permits autonomous crawling.
-
-`execution.request_rate` is the operator-facing traffic parameter. Commix is kept single-threaded; its native `--delay` uses fractional `1/rate` pacing only when the installed parser explicitly declares float support, otherwise the known-safe integer fallback is used. Setup records this capability so an installed scanner that does not support fractional delay is not invoked with an invalid value. If it is omitted, the runner uses **10 requests/second**. Integer values from **1 through 50 requests/second** are accepted; a value above 50, below 1, non-integer or otherwise invalid falls back to the default 10 rather than being silently clamped. The runner prints the effective policy in the console, and a fallback is recorded in Results Data and in the report Run configuration. `SECOPS_MAX_REQUEST_RATE` is the normalized child-process environment value derived from this configuration; it is not the preferred user configuration surface. Project-controlled Python HTTP/TCP helpers coordinate through a **cross-process request-start pacer**, so crawler workers, JavaScript fetchers, same-host port probes, session/authorization/workflow/traversal/IDOR probes and in-scope Chromium requests may remain concurrently in flight while their aggregate **request starts stay bounded by the active configured rate**. Concurrency is no longer a fixed 6/8-worker constant: `secops_parallelism_policy()` derives network, Browser, scanner and profile worker ceilings from the usable VM CPU set and `execution.request_rate`, reserves CPU headroom on larger VMs, and the runner prints/records those effective limits. Native child processes inherit bounded `GOMAXPROCS`/OpenMP/BLAS settings to avoid nested CPU oversubscription; the unified MCP server environment and local PDF renderer subprocesses use the same clamp even when they are started outside the normal runner path. CPU/RAM-heavy local work also shares one **cross-process heavyweight slot family**: Chromium discovery/login/verifier work, local Ollama model preparation/inference and PDF rendering all consume the same VM-level `heavy_local_workers` budget. The default derives approximately one heavyweight slot per two usable CPUs (bounded by `SECOPS_HEAVY_LOCAL_WORKERS`), so a 1–3 CPU VM runs one such workload at a time while larger VMs gain bounded parallelism. Waiting for these slots counts against each operation's existing deadline; it never enlarges scan/report budgets. I/O-bound HTTP workers are intentionally separate, so they can remain numerous enough to hide network latency while target request starts still pass through the global request-rate authority. External scanners retain their own aggregate rate/delay controls—Nuclei/FFUF/Arjun receive explicit rate caps, SQLMap/Commix use delay-aware pacing, ZAP uses the Network add-on rate rule, Nikto uses `-Pause`, and Dalfox delay is scaled by worker count—while an **exclusive cross-process target-traffic lease** surrounds native scanner traffic. `run_process()` scanners, SQLMap REST scanning, upstream IDOR-Forge, ZAP Traditional Spider and ZAP Active Scanner therefore cannot overlap another native scanner or project-controlled target request stream on the same OS-user SecOps runtime. This prevents two local assessments from multiplying the configured target request rate merely because they run in parallel. The pacer removes dead/stale clients promptly and uses only recently active clients when resolving the shared effective rate, so an exited or idle lower-rate assessment does not suppress the available rate for minutes. Browser and other Python checks still use bounded in-flight concurrency to hide response latency without creating unbounded sockets/threads. Changing the rate changes timing/concurrency, not endpoint/request-contract/template selection budgets. Two assessment processes may still run concurrently for AI, reporting and other non-target work; their **target traffic is coordinated** by the shared pacer/native lease. Before an Agentic or Deterministic target-execution window begins, SecOps also acquires a fail-closed **cross-process assessment-rate contract**. Concurrent execution windows using the same `execution.request_rate` remain allowed; a window configured with a different rate is rejected before scanner execution (exit code 5) rather than allowing a native scanner prepared at the higher rate to violate the other assessment's traffic contract. Dead process registrations are pruned automatically, while unreadable/corrupt contract state fails closed. The default long-lived ZAP daemon additionally keeps its existing per-invocation state lock because ZAP context/session/scanner configuration is process-global. This coordination is not an operating-system packet shaper: unrelated traffic or third-party processes launched outside SecOps are not controlled. The unified MCP endpoint itself remains shared safely across concurrent assessment processes through per-process lifecycle leases and source-fingerprint verification.
-
-8. **Read the final artifacts from `reports/`.** PDF and HTML are the human-readable reports. Their Discovery summary exposes the HTTP/Chromium base, adaptive overflow and maximum budgets, queued candidates, script usage, application-family breadth and aggregate runtime sibling-authentication outcomes for each profile. The report JSON contains the
-   technical report data. `.review.json` is the redacted rerender snapshot. When `assessmentRunner.py` is used,
-   `Assessment_Results_Data_<ID>.json` is the preferred redacted dataset for audit and later analysis. It embeds both per-tool coverage and the endpoint coverage matrix, together with scanner results, discovery and diagnostics. The runner prints
-   the exact paths under `Assessment final artifacts`.
-
-### Authentication: direct target or configuration?
-
-This distinction is important:
-
-- `--target` mode accepts `--cookies`. It can therefore run anonymously or reuse an authenticated session that already exists.
-- `--target` mode has no target `--username` or `--password` option. It does not create an OIDC session from account credentials.
-- If you only have the username/password of the assessed application, use a JSON configuration with a credential such as
-  `kind: "browser_oidc"`. `assessmentRunner.py` performs the browser login and passes the resulting cookies to the existing orchestrators.
-- When an OIDC credential has `optional: true`, missing credentials or a failed login fall back to the anonymous profile.
-  `--auth-only` is different: it requires a valid authenticated session, so the job is blocked if login cannot provide one.
-- Browser/OIDC authentication does not widen the attack scope. A login page or SSO wrapper on an already authorized origin remains a normal application surface and may be tested. If the browser temporarily crosses to a different origin to complete authentication, that external origin is used only for the browser login flow unless it is admitted by the configured authorization policy; the multi-port option applies only to the same exact hostname/scheme and never authorizes an external IdP hostname. A raw Cookie header is never copied to another hostname. When `authorization.allow_same_host_ports=true`, the same header is tried first on another discovered port of the exact same hostname and scheme because HTTP cookies are not port-scoped. The order is **existing cookie → validation/session probe → saved browser/OIDC state → original username/password if the login flow requests them**. A conclusively rejected speculative raw cookie is remembered per cookie+destination origin so later scanners do not keep retrying the same invalid session; a repaired browser/origin-specific session is used instead. No second child-console credential prompt is opened.
-- On the **first successful browser login of each `browser_oidc` credential reference**, if no issuer has yet been stored, the browser may bootstrap it only from a real OAuth/OIDC authorization request observed during that same login attempt. Credentials may then be filled only on the authorization endpoint itself or a provider-local login/session/authenticate route on the same provider origin. Bootstrap is consumed once per identity: later application/path logins for that same reference run with `initial_login=false` and remain pinned to the learned provider; if the first login was a local form and no issuer was learned, a later application cannot opportunistically adopt a newly observed OIDC realm. Distinct credential references keep independent issuer state even when they intentionally reuse the same username/password environment variables.
-
-### What should I normally choose?
-
-| Need | Recommended choice |
+| Componente | Funzione |
 | --- | --- |
-| First reproducible run | `assessmentRunner.py` or `orchestratorDeterministic.py`, `--mode balanced` |
-| Single target, anonymous or cookie already available | `assessmentRunner.py --target <URL>` |
-| Only target username/password available | `assessmentRunner.py --config <FILE>` with a supported login credential such as `browser_oidc` |
-| Multiple hosts / ports / base paths / identities | `assessmentRunner.py --config <FILE>` starting from `configs/platform.example.json` |
-| Several exact entry URLs that must all be covered | declare one enabled service per supplied URL in the config |
-| Check a configuration without scanning | add `--dry-run` |
-| Adaptive tool selection and AI evidence analysis | Agentic + `--model <model>`; add `--require-ai` when AI completion is mandatory |
-| Quick smoke test | `--mode fast` |
-| Normal assessment | `--mode balanced` |
-| Broader bounded assessment after validation | `--mode deep` |
-| Debug one scanner/request manually | Deterministic isolated `--tool ...` mode described in `init.txt` |
+| `assessmentRunner.py` | Espande la configurazione, prepara i job e avvia l'orchestratore. |
+| `orchestratorShared.py` | Discovery, scope, rate, request contract, sessioni e helper comuni. |
+| `orchestratorDeterministic.py` | Pipeline fissa e riproducibile. |
+| `orchestratorAgentic.py` / `orchestratorAgenticCore.py` | Planner AI, round, execution, verification e analisi finale. |
+| `servers/` | Wrapper MCP e controlli sviluppati nel progetto. |
+| `servers/reporting/` | Normalizzazione, coverage e rendering dei report. |
+| `setupTools.py` | Preparazione e preflight dei tool. |
+| `initScript.py` | Inizializzazione e guida operativa. |
 
-For non-local targets, keep state-changing checks disabled unless the authorized scope explicitly permits them. An explicit
-`allow_state_changes=false` in the configuration or `--no-allow-state-changes` on the CLI is binding. The planner cannot
-bypass this shared Python gate. The shared request-contract policy is enforced before broad ZAP/Nuclei replay and before
-request-level specialist ranking/execution: read-only GET and POST query/search/API contracts remain eligible, while destructive
-URLs, high-confidence mutating POST routes/actions, credential-changing forms and file uploads are withheld. Filtering before
-specialist ranking also means a blocked mutating request cannot consume a bounded scanner slot that a later safe contract could use. Individual
-wrappers retain their own additional safety limits, so the flag is an absolute project policy without reducing all POST
-coverage to zero.
+Deterministic e Agentic condividono discovery, sessioni, scope, scanner e reporting. La differenza principale è la strategia con cui vengono scelte le azioni.
 
-## Credential and token terminology (legend)
+## Scope e autorizzazione
 
-This document uses the word "token" for two unrelated access-credential concepts. Every later
-mention of "token" in this file is tagged with one of the two markers below, so it is always clear
-which access is meant:
+Lo scope predefinito è same-origin, quindi protocollo, hostname e porta.
 
-- **(1) AI-token** — Snap4City access/refresh tokens that authenticate to the remote LLM API (the AI
-  backend used by the Agentic planner). Managed by the Snap4City `TokenManager`, cached in
-  `token_stored.json`, and completely unrelated to any assessed target. Token acquisition/refresh POSTs use bounded timeouts and do not automatically follow HTTP redirects, so provider credentials are not forwarded to an unexpected redirect destination.
-- **(2) Target-token** — Target cookies, target JWTs and anti-CSRF tokens (for example `--cookies`,
-  `--jwt-token`, or the `dashboard_session` login) belonging to the application being assessed. Never
-  Snap4City credentials, never shared with the AI provider.
+`allow_same_host_ports=true` autorizza servizi HTTP o HTTPS su altre porte dello stesso hostname esatto.
 
-## How the core files work
+`discover_same_host_services=true` abilita la ricerca proattiva di servizi web sullo stesso hostname. Richiede l'autorizzazione multi-porta.
 
-### Initialization
+Queste opzioni non autorizzano hostname sibling.
 
-- `initScript.py`: Installs/verifies dependencies, scanners, Docker images and Playwright. On Debian the host prerequisite set includes the native WeasyPrint runtime libraries `libpango-1.0-0`, `libpangoft2-1.0-0` and `libharfbuzz-subset0`; these reporting libraries are installed even when scanner installation is skipped. Chromium is a verified default dependency: unless `--skip-browser` is explicitly used, initialization installs the Playwright Chromium build (and Linux host dependencies) and fails if a headless launch cannot be completed. With `--with-lab` it sets up
-the local training lab and ZAP and prepares the selected AI backends. If neither `--prepare-ai` nor `--agentic-model` is
-specified, it prepares all three choices: it pulls/verifies `llama3.1:8b` and `qwen2.5:7b` in the project Ollama container
-and authenticates/verifies the remote Snap4City `llama4-agentic-inference` endpoint. Snap4City is remote and therefore is
-not downloaded. `--prepare-ai snap4city|llama|qwen` prepares only one backend. If `--agentic-model` is specified without
-`--prepare-ai`, the initializer automatically prepares only that selected model. If both options are supplied, they must
-be coherent: `--prepare-ai all` accepts any Agentic model, while a single-backend `--prepare-ai` must match
-`--agentic-model`. Snap4City remains the global Agentic default. For configuration-driven assessments the generated
-commands intentionally omit `--model`: `execution.model` in that configuration wins, and if the field is absent the
-runner falls back to `snap4city`. An explicit operator `--model` remains the highest-priority one-run override. If
-initialization fails before the Snap4City verification step is reached, the initializer no longer interprets that as a
-provider failure and does not silently replace Snap4City with a local Ollama model. The initializer writes
-`.secops_runtime.json`, used by preflight checks and both orchestrators. `--commands-only` prints the `init.txt` command reference.
+I redirect vengono seguiti solo quando la destinazione rimane autorizzata. Gli scanner che potrebbero seguire redirect autonomamente vengono configurati in modo restrittivo.
 
-Nikto capability validation accepts the upstream help convention where a trailing `+` means "this option takes a value" (for example `-timeout+` or `-Plugins+`); the `+` is not treated as part of the runtime option name. This keeps the strict contract check enabled without falsely rejecting a compatible Nikto build.
+`allow_state_changes=false` blocca richieste distruttive o non necessarie. Login e SSO necessari alla sessione vengono gestiti separatamente dal traffico di attacco.
 
-- `init.txt`: Canonical operational cheat sheet stored in the repository and printed by `initScript.py --commands-only`.
-  The initializer reads the existing file and does not overwrite it during normal initialization, so documentation updates remain stable.
+## Rate e parallelismo
 
-### Orchestrators
-
-Then, there are mainly **2 orchestrators** that are responsible for directing the pipeline:
-
-- `orchestratorDeterministic.py`: Fixed, reproducible LangGraph pipeline: discovery → broad scan → parameter scan →
-authorization → browser/workflow → specialist checks → final Chromium verification → report. This path is the reproducible fixed-order engine.
-
-- `orchestratorAgentic.py`: Same discovery and safety validators as Deterministic, with **action-level AI-driven execution selection**. Python converts discovery evidence into concrete candidates such as `profile + tool + exact target/request contract`, removes only invalid/out-of-scope/unsafe/incompatible/duplicate work, and presents every remaining candidate to the model in bounded batches. The model selects exact action IDs and their priority order; Python then executes only those selected actions subject to hard scope/safety/compatibility checks, the resolved global round capacity, configured traffic policy and wall-clock safety boundaries. Agentic does not impose a post-selection per-tool quota. Python never expands a selected tool into hidden requests. Before the AI analysis, the same final deterministic Chromium verifier may retry unresolved XSS candidates when a compatible request contract is available; this is evidence verification, not planner selection. Supported aliases are `snap4city` (Snap4City `llama4-agentic-inference`),
-`llama` (Ollama `llama3.1:8b`) and `qwen` (Ollama `qwen2.5:7b`). After execution, the same selected provider/model
-performs a separate evidence-grounded risk assessment, including potential consequences and recovery/restoration guidance,
-while scanner evidence and confirmation status remain immutable.
-
-The remaining files provide shared runtime, discovery, authentication, reporting and support logic for the two orchestrators.
-
-### Platform assessment configuration
-
-- `assessmentConfig.py`: validates a platform scope containing multiple assets, credential references and web targets expressed either as an absolute per-service `url`, or as asset host/IP plus service port/protocol/base path. When only host/IP and port are supplied, port 443 infers HTTPS and other ports infer HTTP unless `protocol` is explicitly set.
-  Service discovery is web-scope driven and can be proactive when `discover_same_host_services=true` is paired with `allow_same_host_ports=true`. The initial authorized hostname receives 8,192/65,535/65,535 candidate ports in fast/balanced/deep. Exact hostnames discovered later are scanned only when they were already authorized; up to 16/64/192 such hostnames share a smaller targeted priority-port pool of 1,536/6,144/12,288 candidates, and newly confirmed web roots are recrawled with 72/360/720 pages per hostname. These targeted hostname sweeps run before the primary full-range continuation. At rate 10 the total service-discovery budgets are 2400/18000/28800 seconds (40/300/480 min), with initial primary slices of 180/900/1500 seconds; the network-bound totals expand below rate 10. Runtime-observed/configured ports are tried first, runtime service-database entries ordered by frequency second, and the stratified generic TCP-space walk uses the remaining budget. Open non-web/unclassified TCP ports remain inventory only. Every real socket attempt is paced by the assessment request-rate policy. External validation/reference datasets are not runtime inputs.
-- `assessmentRunner.py`: accepts either a platform JSON configuration or a direct `--target`/`--cookies` invocation, then delegates
-  each HTTP/HTTPS job to the existing Deterministic or Agentic orchestrator. Direct mode consumes an already available cookie session;
-  target username/password login is configuration-driven. Non-web protocols may be inventoried but are explicitly recorded as unsupported
-  by the current web-assessment orchestrators rather than being silently treated as tested.
-- `configs/dvwa.example.json`: non-secret placeholder that shows the exact DVWA configuration structure without containing a usable session.
-- `configs/dvwa.generated.json`: generated by `initScript.py --with-lab` from the fresh DVWA session and immediately usable.
-- `configs/platform.example.json`: generic multi-asset example. Each enabled HTTP/HTTPS service is an explicit target job and the example sets `allow_same_host_ports=true` to demonstrate site-level port authorization for already-authorized exact hostnames. Different hostnames are never inferred from DNS suffixes or discovered links. `browser_oidc` credentials can be attached to a service without making credentials or authorization synonymous. Three independent `browser_oidc` identities, cross-account Authorization/BOLA comparisons and aggregate reporting are also illustrated.
-### Who decides request priority
-
-There is no separate ranking service. Discovery first builds normalized `request_cases` from HTTP crawl links/forms, JavaScript endpoint extraction and Playwright network observations. Python applies hard compatibility/safety/deduplication rules and also computes **discovery ranking hints** for candidate construction: `_tool_case_priority()` handles SQLMap, Dalfox, Commix, Traversal and IDOR; `_browser_case_priority()`, `_workflow_case_priority()` and `_authorization_case_priority()` handle their dedicated classes; Arjun uses its own endpoint score. Those scores are not execution decisions in Agentic mode. Every remaining concrete candidate is presented to the AI, which assigns the **final execution priority** by selecting exact action IDs and ordering them. Deterministic, by contrast, consumes the Python ranking directly because it intentionally has a fixed non-AI pipeline.
-
-For example, SQLMap receives higher priority for SQL/data/search routes, SQL-relevant parameter names, POST/JSON contracts, live Playwright-observed requests and successful 2xx/3xx browser responses. Dalfox rewards XSS/search/comment/message inputs and live browser traffic; Commix rewards command/exec routes and `cmd`/`host`-like parameters; Traversal rewards file/download/template/path inputs; IDOR accepts safe GET/POST contracts with runtime-discovered mutable object references in query strings, path segments and policy-approved JSON/form bodies (numeric, UUID, long hex or digit-bearing opaque identifiers) while excluding navigation/OIDC controls; Browser strongly rewards client-side source/sink evidence; Workflow prioritizes upload, authentication, CAPTCHA, CSRF/token and other stateful form shapes; Authorization prioritizes read-only identity/object/resource identifiers and privileged-resource routes. Incompatible methods, logout/destructive routes, static resources, oversized generated requests and observed 404/410 cases are rejected before specialist budget selection. When state changes are disabled, `DELETE`, `PUT` and `PATCH` contracts are treated as mutating by method and POST bodies are inspected recursively so destructive actions nested inside JSON cannot bypass the central gate.
-
-Discovery breadth is adaptive before specialist selection. The HTTP crawler fills base/adaptive maxima of **240/700, 1800/5000 and 4000/12000** useful pages in fast/balanced/deep. Chromium uses **140/420, 1000/3000 and 2200/6500** navigations, expands up to **28/128/240** safe menu/dropdown controls per rendered page across **5/10/16** rescanning passes, and successfully inspects up to **384/2600/5200** JavaScript assets. Route-value retention is **14/40/64** variants per discovery shape. Queue ranking still deduplicates equivalent route shapes and penalizes static/vendor noise. Each newly observed runtime application family receives an initial bounded attempt reserve before repeated visits to already-covered families. That reserve counts real fetch attempts, including candidates already reserved in the current concurrent prefetch batch, while successful/useful pages remain a separate depth/diversity signal. A family that emits many dead/404 routes therefore cannot keep an unlimited "new family" priority and starve unrelated live families; the larger budgets go to distinct application surfaces rather than repeated or dead values. When proactive service discovery is enabled, responsive HTTP/HTTPS roots on the initial authorized hostname are priority seeds. Exact hostnames observed later and already authorized receive a fair share of one bounded expansion port budget; their confirmed web roots are recrawled within the per-host expansion page cap. Confirmed 404/410 responses remain diagnostic and do not create specialist request contracts.
-
-Discovery itself bounds value-only breadth to the configured per-route limits, so repeated ordinary values cannot flood the collected surface. From that discovered surface, Agentic catalog construction applies a conservative scanner-specific **request-family consolidation** before planning: SQLMap/Dalfox/Commix keep bounded representatives for ordinary value-only changes of the same method+origin+path+parameter/body shape, while preserving distinct observed **local/internal routing values** (query, form or JSON) when those values select different backend files/modules. Nuclei DAST/Browser/Workflow keep their structural consolidation, while Traversal, IDOR and Authorization retain substantially more concrete routing/object variants because different values can select different resources or ownership contexts. State-changing POST/body contracts remain unavailable when `allow_state_changes=false`, while read-only POST search/query/API contracts remain eligible. Absolute HTTP(S) routing destinations retain their host/path/value semantics for discovery/navigation but are not misclassified as local-file selectors. Hard exclusions remain Python-owned: incompatible methods, unsafe state changes, logout/destructive routes, static noise, invalid authorization/session scope and unsupported request shapes never become executable candidates. Authenticated eligibility is application-scope aware: `AUTH_UNKNOWN` remains eligible for the normal just-in-time session precheck, while only a terminal, conclusive failure for that exact top-level application scope suppresses repeated authenticated actions there; another application on the same origin remains independent. Session-validation cache keys preserve the exact application-scope path, including path case and `/app` versus `/app/`, so a valid session for one case-sensitive route cannot satisfy a different application accidentally. Ranking or labels such as `adaptive_candidate` and `coverage_reserve_hint` are **hints**, not mandatory selections. In normal Agentic mode the execution budget is not used to prune the resulting representative catalog before the AI: every remaining concrete action ID is batched and evaluated by the model, and the model still decides final execution priority. The bounded coverage-debt summary subtracts actions already selected in earlier batches of the same round and omits families with no remaining eligible work, preventing stale debt from repeatedly favoring a family that has already consumed its current-round share. For Interactsh/OAST actions, family accounting uses the effective `injection_url` rather than the assessment-root `target_url`, and that effective URL is retained in the compact planner audit so cross-round debt remains attributed to the real application family. Python therefore removes structural redundancy and enforces safety/resource ceilings without substituting its own attack priorities.
-
-### Completion-driven attack coverage
-
-There is deliberately **no configured coverage percentage** or external acceptance target in runtime configuration. Evaluation criteria are kept outside discovery and planning. Both orchestrators first run the broad scanners and the deeper vulnerability-class specialists. Only afterward they compute structural request contexts (`method + route/routing semantics + parameter names`) that already received completion evidence from a concrete test and run a final completion-driven **safe surface sweep** over still-untested reachable, non-destructive contexts. This prevents one POST body shape from suppressing a different POST body shape on the same URL while still collapsing harmless value-only duplicates. The sweep continues until the eligible queue is exhausted or the generic profile cap/deadline is reached; it does not stop because an arbitrary percentage was reached. Redirects are disabled inside this batch, normal scope/cookie/state-change rules are reused, and only requests that actually receive an HTTP response count as tested. Its foreign-Origin/CORS and response-classification probe improves active breadth but never substitutes for SQLMap, Dalfox, Commix, Traversal, ZAP, Nuclei, Authorization, Browser or Workflow.
-
-The report therefore exposes **two coverage numbers**: (1) contexts tested by any active check, including the safe-surface sweep, and (2) **broad/specialist tested coverage**, which excludes contexts reached only by the final safe-surface sweep. This makes it impossible to claim a high attack-coverage percentage merely by replaying many shallow requests.
-
-### Profile breadth budgets
-
-The profiles increase discovery breadth **and** deep scanner execution. All ceilings are generic and applied only after scope/safety filtering, application-family fairness and semantic/structural deduplication; none contains application names, target endpoint lists or externally supplied port data. ZAP/Nuclei work is batched inside one scanner process where possible, while request-level specialists remain sequential to preserve target safety and session integrity.
-
-| Coverage bound | test | fast | balanced | deep |
-| --- | ---: | ---: | ---: | ---: |
-| HTTP crawler pages per profile (base / adaptive max) | 8 / 16 | 180 / 500 | 1200 / 3000 | 2500 / 8000 |
-| Chromium navigations per profile (base / adaptive max) | 4 / 8 | 100 / 320 | 750 / 2200 | 1500 / 4500 |
-| Safe menu controls per rendered page / DOM passes | 2 / 1 | 20 / 4 | 96 / 8 | 180 / 12 |
-| JavaScript assets successfully inspected | 12 | 256 | 1800 | 3500 |
-| Discovery route-value variants per shape | 2 | 10 | 24 | 40 |
-| Initial authorized-host TCP candidate cap | 32 | 8192 | 65535 | 65535 |
-| Total proactive service-discovery wall-clock budget at request_rate=10 | 15 s | 1200 s | 8400 s | 16500 s |
-| Initial primary-host service slice at request_rate=10 | 6 s | 120 s | 540 s | 1080 s |
-| Additional observed-authorized hostnames per expansion pass | 2 | 12 | 48 | 160 |
-| Targeted priority-port candidate pool across additional hostnames | 16 | 1536 | 6144 | 12288 |
-| Additional-host policy | targeted priority ports before primary continuation | targeted priority ports before primary continuation | targeted priority ports before primary continuation | targeted priority ports before primary continuation |
-| Service-root recrawl pages per additional hostname | 6 | 48 | 180 | 400 |
-| ZAP ranked/proxy-verified request contracts | 20 | 80 | 320 | 640 |
-| ZAP native active request contexts | 4 | 32 | 96 | 192 |
-| ZAP passive observations retained | 40 | 180 | 800 | 1400 |
-| Nuclei focused/static targets | 32 | 128 | 1024 | 2048 |
-| Deterministic SQLMap cases (base / adaptive / generic-live reserve) | 1 / +0 / +1 | 6 / +2 / +4 | 90 / +60 / +120 | 128 / +96 / +160 |
-| Deterministic Dalfox cases (base / adaptive / generic-live reserve) | 1 / +0 / +1 | 8 / +3 / +6 | 120 / +80 / +160 | 160 / +112 / +192 |
-| Deterministic Commix cases (base / adaptive / generic-live reserve) | 1 / +0 / +1 | 6 / +2 / +2 | 84 / +64 / +80 | 112 / +96 / +96 |
-| Deterministic Traversal base / adaptive; routing-resource reserve | 2 / +0; 2 | 8 / +4; 32 | 128 / +84; 192 | 160 / +112; 320 |
-| Deterministic IDOR base / adaptive | 1 / +0 | 6 / +2 | 64 / +48 | 112 / +96 |
-| Deterministic Authorization base / adaptive | 2 / +0 | 10 / +4 | 128 / +90 | 192 / +128 |
-| Deterministic Browser verification base / adaptive | 2 / +0 | 10 / +4 | 160 / +90 | 192 / +128 |
-| Deterministic Workflow base / adaptive | 1 / +0 | 8 / +3 | 96 / +56 | 160 / +112 |
-| Deterministic Arjun endpoints base / adaptive | 2 / +0 | 12 / +4 | 120 / +80 | 160 / +112 |
-| Final Chromium XSS base / adaptive max | 2 / 3 | 12 / 20 | 96 / 160 | 200 / 320 |
-| Safe-surface sweep contexts per profile | 32 | 800 | 6000 | 15000 |
-| Broad/parameter scanner action deadline (s) | **10** | profile-specific | profile-specific | profile-specific |
-| ZAP primary tool deadline (s) | 10 | 120 | 2400 | 4800 |
-| Nuclei primary tool deadline (s) | 10 | 240 | 3600 | 7200 |
-| Agentic concrete actions per AI planner call | 32 | 64 | 96 | 128 |
-| Agentic configured reference capacity, TOTAL actions/round | **24** | **120** | **320** | **480** |
-| Agentic resolved normal/adaptive capacity | TEST stays bounded at **24** (up to **27** only on explicit bounded extension) | normal capacity grows from **120** to `min(E, max(120, ceil(E/R)))`; AI-requested extension may add up to 12.5% | normal capacity grows from **320** to `min(E, max(320, ceil(E/R)))`; AI-requested extension may add up to 12.5% | normal capacity grows from **480** to `min(E, max(480, ceil(E/R)))`; AI-requested extension may add up to 12.5% |
-
-Concrete Agentic actions use **one shared round execution ceiling across all active profiles**, rather than one execution budget per profile. The unit of decision is one exact action: `profile + tool + target/request contract`. For example, `editor + sqlmap + POST /api/orders + parameter orderId` and `editor + sqlmap + GET /search + parameter q` are two independent candidates; the AI may select one, both or neither.
-The decision granularity is the **orchestrator action**, not each raw HTTP packet generated internally by a scanner. For a targeted specialist, one action normally identifies the exact request contract/parameters. For a broad scanner such as ZAP, Nuclei or Nikto, one action is a bounded invocation against one authorized target/origin; once that action is selected, the scanner itself decides its internal probes according to its configured policy. Python does not silently select another scanner action on the model's behalf.
-
-The values **32/64/96/128** are only the maximum number of **concrete action descriptions in one model call** for TEST/FAST/BALANCED/DEEP. They bound only the number of concrete action descriptions carried by one planner request. If Balanced has 230 eligible actions, the planner normally receives three batches (96 + 96 + 38); every one of the 230 actions is presented to the AI exactly once in that planning pass. If an unusually rich batch would exceed the bounded model context, it is split again into smaller batches rather than dropping candidates. Batching/interleaving only controls prompt scheduling so one large profile/tool family does not monopolize the first call. It never authorizes an action and never removes an eligible candidate.
-
-The planner contract is also normalized at the representation boundary. A numeric AI priority outside the documented 0-100 range is clamped to that range and recorded in `contract_normalizations` in the planner diagnostics instead of aborting an otherwise valid strict Agentic run. Missing, non-numeric or non-finite priority rows are recorded as contract normalizations and are discarded without inventing a score. If the affected action ID was explicitly selected by the AI, that selection is preserved as unranked; explicitly ranked selections stay ahead of unranked selections, whose original AI/batch order is preserved. Boolean planner fields are parsed explicitly (`true/false`, `1/0`, `yes/no`) instead of through Python truthiness, duplicate selected IDs are deduplicated, identical duplicate priority rows are collapsed, and conflicting priorities for the same ID remain a contract error. Risk/confidence enum drift such as `Informational risk` or `High confidence` is normalized only when the intended enum is unambiguous.
-
-The same defensive boundary is applied to MCP/scanner results and persisted report metadata. Strings such as `"false"` no longer become true merely because they are non-empty; malformed numeric metadata falls back to bounded defaults; non-object vulnerability entries are ignored with a contract warning rather than crashing the assessment; FFUF status values and IDOR-Forge booleans are parsed defensively. SQLMap and IDOR-Forge also reserve a small TEST startup/preflight slice (3 s and 4 s respectively): exhausting that short diagnostic budget is a `partial/time_limit_reached` result, while an actual missing dependency or runtime failure remains an error.
-
-Python and AI therefore have deliberately different responsibilities. **Python decides what is allowed and representable**: scope, credential isolation, state-change policy, compatibility, duplicate suppression, request normalization and hard traffic/time/safety guards. It may attach discovery evidence or ranking hints, but these do not execute anything. **The AI decides what should run** by returning exact `Axxxx` action IDs and a 0-100 priority for every selected action. Priorities use one scale across all prompt batches; Python merges all selected actions by that AI priority (ties retain the model order) before applying the resolved round capacity, and it does not replace rejected/deferred actions with different attacks of its own choosing. The surviving AI-priority sequence is the exact execution sequence: the executor does not rebucket attacks by tool/profile, promote discovery tools, or add different attacks of its own. FFUF and Arjun are treated as discovery producers only in data flow: when a selected FFUF/Arjun action reaches its AI-chosen position, its enrichment is merged immediately before the next action executes. Therefore the planner should rank useful discovery producers early when their evidence is expected to improve later work, and same-round discovery-aware consumers such as ZAP/Nuclei can use the expanded request graph without Python moving a lower-priority producer ahead of a higher-priority action. Newly created concrete specialist actions remain visible to the following planner feedback round. TEST intentionally remains a smoke profile with a 24-action reference capacity (27 only after an explicit bounded adaptive request). FAST/BALANCED/DEEP use **120/320/480 as reference capacities, not hard coverage caps**: the normal capacity for a round grows automatically to `min(E, max(reference, ceil(E/R)))`, where `E` is the complete remaining eligible catalogue and `R` is the number of planner rounds remaining. This automatic growth creates capacity only; Python still does not choose actions to fill it. If the AI sets `request_adaptive_extension=true`, up to an additional 12.5% may be admitted above the resolved normal capacity when eligible work remains. The real hard runtime envelope is the assessment wall-clock/finalization deadline. If AI planning fails, a deterministic emergency fallback exists only when `--require-ai` is disabled; with `--require-ai`, the run fails rather than silently switching decision policy. Deterministic remains a separate fixed-pipeline orchestrator. Fixed post-planning verification/completion stages (for example exact-parameter Chromium confirmation, the safe-surface completion sweep and session-lifecycle validation) provide deterministic evidence and safety checks after planning; planner-selected attack actions remain controlled by the AI decision.
-
-Traversal keeps distinct routing/file values when they plausibly select different local resources. SQLMap/Dalfox/Commix now use the same semantic distinction for observed local/internal routing values, so one wrapper path that dispatches to different backend modules is not collapsed into an ordinary value-only variant; unrelated IDs/search terms still share the small structural variant cap. Deterministic specialist selection remains bounded by its base/adaptive/live-reserve limits; state-changing POST/body cases remain gated by `allow_state_changes`, while read-only POST contracts stay eligible. Agentic catalog construction preserves these resource-sensitive variants while keeping ordinary value repetition consolidated; IDOR and Authorization continue to retain object-sensitive variants, and Python scores remain evidence hints rather than execution decisions. IDOR accepts numeric, UUID, hexadecimal and digit-bearing opaque references discovered at runtime in query strings, path segments and policy-approved JSON/form bodies. Query GET references use upstream IDOR-Forge; path/body references use the bounded native differential and remain candidates until ownership is validated. Arjun, FFUF, Traversal and Nuclei accept the full timeout supplied by the active profile, while their internal subphases share the action deadline. The same wall-clock rule now applies to project-controlled helper traffic around the scanners: authentication/session probes, Arjun redirect/TLS preflight, FFUF/Nikto/ZAP reference probes, Authorization differential requests, IDOR baseline+mutated requests, Interactsh injection+callback waiting and SQLMap REST control calls all consume one enclosing phase/action deadline rather than receiving a fresh full timeout on every retry or helper request. Requests connect/read components are split inside the remaining deadline, so a slow connect followed by a slow read cannot approximately double the intended allowance.
-
-Nuclei and ZAP use bounded single-process breadth because one scanner invocation can cover many distinct request contexts while preserving traffic and wall-clock controls. Nuclei keeps its internal concurrency/rate controls and splits DAST into auditable batches of 48/160/240 request contracts in fast/balanced/deep under one shared action deadline; unused time flows to later batches, while an incomplete batch does not make its untouched inputs look tested. ZAP keeps a protected exact-origin context and one global deadline: 80/320/640 ranked contracts can receive proxy-assisted verification, while 32/96/192 structurally distinct contexts are reserved for the more expensive native active scanner. Native active scanning is enabled only when ZAP accepts the single-thread-per-host bound and the Network add-on rate rule derived from `execution.request_rate`; if the authoritative Network rate rule cannot be installed, native ZAP traffic that could escape the configured ceiling is disabled fail-closed while independently paced project-controlled verification may continue, and the ZAP result is reported as partial. The Traditional Spider additionally requires `allow_state_changes=true` and bounded spider controls. Native per-case time is allocated from the remaining deadline instead of as a percentage of the original timeout, so increasing the total timeout genuinely allows more cases to run rather than merely making every individual case slower. A ZAP case that merely starts but does not complete is recorded as incomplete, not `Tested`. The shared-daemon queue is an isolation requirement, not a ban on concurrent assessments: ZAP exposes process-global session, mode, Replacer and scanner configuration, so two simultaneous reconfigurations of the same daemon could contaminate each other. The wrapper therefore serializes only `run_zap_scan()` calls; after the queue lock is acquired the scan deadline is reset so queueing does not steal the new invocation's own ZAP budget. The increased target/request-contract ceilings therefore improve breadth while the existing traffic and wall-clock controls remain the safety boundary. Nuclei selection and completion are likewise reported separately: a long DAST/focused input list is not automatically counted as fully tested when the Nuclei phase times out or returns partial. Exact request contexts enter the specialist-tested numerator only when the wrapper can identify their completed execution; selected-but-incomplete inputs remain visible as audit evidence.
-
-### Discovery and scanner coverage
-
-Discovery combines an HTTP crawler, HTML/form parsing, external and inline JavaScript navigation extraction, rendered-DOM inspection and a bounded Playwright/Chromium queue. Exact same-origin URLs are always eligible; other origins require explicit authorization, while `allow_same_host_ports=true` permits HTTP/HTTPS services on other ports of the same exact hostname. With proactive service discovery enabled, the initial authorized hostname keeps the profile candidate cap (8192/65535/65535), but actual probing is additionally limited by a rate-aware wall-clock budget. At the default 10 req/s FAST/BALANCED/DEEP receive 2400/18000/28800 seconds (40/300/480 min), but only 180/900/1500 seconds are exposed to the initial primary-host slice so the application crawl is not delayed; below 10 req/s these network-bound budgets expand automatically. Exact hostnames observed later are eligible only if already authorized; up to 16/64/192 additional hosts share a smaller targeted priority-port pool (1536/6144/12288) **before** the primary full-range continuation. Candidate/time capacity not consumed by an earlier host remains available to later work, and a smaller cached sweep is resumed rather than treated as complete; a transient pre-probe failure that produced no real port probes remains eligible for one bounded continuation while a cache hit or actual probe coverage prevents duplicate sweeping; confirmed web roots receive bounded 72/360/720-page recrawl. Uncached sibling TCP sweeps themselves are single-flight at assessment-process level because parallel sweeps cannot exceed the shared request-start rate anyway; recrawls remain free to overlap as bounded application discovery. Port candidates start from ports already configured or observed at runtime for the authorized hostname, then use runtime service databases ordered by available service-frequency metadata, and finally a deterministic stratified walk across the full TCP range. No embedded application-port list, compose inventory, benchmark dataset or other target ground truth is consulted. Authenticated application/sibling recrawls explicitly skip local port enumeration, so only the final expansion pass can spend the remaining service-discovery budget. Responsive web roots are fed back as high-priority discovery seeds. TLS (Transport Layer Security) is the cryptographic protocol used by HTTPS to encrypt the connection and authenticate the server certificate. For an authorized HTTPS root, the crawler first uses normal certificate validation; only a certificate/trust-chain validation failure triggers one retry of that same authorized URL with trust verification disabled. Protocol/cipher negotiation errors do not trigger this fallback, and the fallback is recorded as discovery diagnostics rather than treated as a TLS finding. The crawler uses 240/700, 1800/5000 and 4000/12000 useful-page base/max budgets in fast/balanced/deep; Chromium uses 140/420, 1000/3000 and 2200/6500 navigations and JavaScript inspection uses 384/2600/5200 useful assets. Chromium also has a derived global wall-clock guard of `max(120 s, 4 s × effective base navigation budget)` for each discovery invocation, so a page-count-bounded crawl cannot remain indefinitely blocked by slow navigations/DOM work; the report records elapsed time, budget and whether that wall-clock guard was exhausted. Per-origin caps, route-shape deduplication, application-family fairness and 404/410 filtering prevent one noisy module from consuming the increased capacity. Safe menu expansion uses 28/128/240 controls per page across 5/10/16 DOM passes. Volatile OAuth/OIDC plumbing remains evidence but is compacted so transient values do not saturate the queue. Deterministic discovery and just-in-time authenticated-session refresh keep Playwright Sync API work off the active asyncio loop. Scope diagnostics record blocked destinations rather than relabeling their in-scope source. Query strings found in HTML/JavaScript are also normalized defensively: if an unescaped ampersand inside a human-readable value would make `urllib.parse` invent a whitespace-padded pseudo-parameter (for example `pageTitle=A & B` becoming a parameter named ` B`), the original URL remains in evidence but that fragment is not promoted to a route-shape or scanner parameter. Legitimate structured names such as `columns[0][data]`, `no_columns[]`, dotted names and colon-separated names remain valid.
-
-GET and POST are first-class request contracts. HTML forms, query strings, JavaScript `fetch`/XHR/axios hints and browser-observed requests preserve method, body, content type and nested JSON parameter paths. Discovery does not intentionally submit a state-changing action merely to enlarge coverage. Chromium applies the central state policy to every controlled request: read-only GET/POST traffic may be observed or allowed, while a mutative request is aborted when `allow_state_changes=false`. A blocked mutative contract is not discarded completely: when a safe same-origin source page exists, Chromium can still inspect that page, DOM and client-side evidence without submitting the mutation, and the observed request contract remains available for structural analysis/reporting. When `allow_state_changes=false`, replay is filtered by contract rather than by method alone: read-only POST search/query/API requests remain eligible, while high-confidence mutating POST routes/actions, credential-changing forms and file uploads are withheld from ZAP/Nuclei DAST and from request-level specialist execution. The same validation is applied again in Agentic plan validation, Deterministic specialist scheduling and isolated `--only-tool` runs. A read-only GET such as a setup/security page is not excluded merely by its path name, and benign controls such as `action=view` or `reset=false` are not treated as mutations. Destructive words inside ordinary search/filter/navigation data do not by themselves block a request (`q=delete` and a `redirect=/delete-preview` destination remain testable): value-based blocking is limited to controller/action selectors such as `action`, `operation`, `op`, `task`, `mode`, `command`, `do` and `event`, while explicit method overrides and mutating route/query-key names remain blocked directly. A form/API field named `query` is not treated as GraphQL merely because of its name; GraphQL rules are activated by the route/content type or by a value that actually looks like a GraphQL document, so ordinary read-only `POST /search`/`POST /query` contracts remain eligible. Actual GraphQL `mutation`/`subscription` documents are blocked before network transmission even when encoded in a GET `query=` parameter, while raw `application/graphql` POST bodies are classified so read-only queries remain testable. Multi-operation documents are parsed at top level and fail closed when they contain a mutation/subscription; operation names, field names, comments or string contents that merely contain those words do not create a false positive. An explicit false therefore remains binding without deleting useful GET/POST coverage from the assessment. Workflow authentication-throttling probes with deliberately invalid credentials are also suppressed when `allow_state_changes=false`, because repeated failed logins can update server-side lockout/rate counters; the form is still classified structurally. A generic `token` parameter alone is insufficient to allocate a Workflow action slot. SQLMap keeps the original discovered request for attribution/session validation, seeds only selected blank parameters with a neutral value in the scanner copy, and skips its heavy REST engine when the bounded execution-time probe returns 404/410 without candidate evidence. Credential scope remains explicit: a raw primary Cookie header is never copied to a different hostname; when `allow_same_host_ports=true` it may be tried on another authorized port of the exact same hostname/scheme because HTTP cookies are not port-scoped, but the session probe must validate it. Browser storage-state cookies continue to follow their real host-only/Domain/Path/Secure rules. Authorized sibling origins or same-origin application paths receive authenticated coverage only when a cookie is actually applicable there or runtime OIDC/SSO establishes one; no-cookie work is never relabeled as authenticated.
-
-IDOR-Forge is kept in its isolated upstream virtual environment. The initializer explicitly installs a Python-version-compatible `matplotlib` even when a particular upstream `requirements.txt` revision omits it, verifies both `matplotlib` and `IDORChecker`, and if the post-install probe still fails it rebuilds the isolated IDOR-Forge venv once and retries from a clean environment. The runtime wrapper performs only a bounded read-only preflight before an IDOR action and never installs packages during an assessment. IDOR-Forge is a degradable specialist: a stale/missing IDOR runtime is reported as a preflight warning and IDOR coverage is unavailable, but the rest of an otherwise healthy assessment continues. The API compatibility check accepts both upstream argument names used for the object-reference slot (`param` and `parameter`), while the wrapper invokes that argument positionally, so an upstream rename does not disable IDOR coverage.
-
-Observed sibling origins are not merely inventoried, but broad coverage is profile-sensitive so `balanced` does not spend most of its runtime repeating expensive general scanners on every authorized host. A shared origin-ranking function scores each observed sibling from its strongest discovered application route plus bounded evidence for forms, request contracts, browser navigation/network traffic and parameterized interactions. Full no-cookie ZAP/Nuclei/Nikto sibling coverage uses an adaptive per-mode allocation: the top 6/32/64 origins form the base set in fast/balanced/deep, with overflow up to 12/64/128 only for additional origins scoring at least 75% of the base cutoff and carrying observed interactive application evidence (forms, request contracts, browser navigation/network traffic or equivalent ranked signals). Sibling broad runs also use reduced per-run timeout factors of 55%/75%/85% of the corresponding primary broad-scanner timeout, with a 45-second floor. If both anonymous and authenticated profiles are active, this no-cookie sibling broad sweep runs only once under anonymous; the authenticated profile does not repeat the identical cookie-less work. These caps affect only the broad ZAP/Nuclei/Nikto sweep: specialist request-case selectors still accept safe URLs admitted by the configured authorization policy from every observed sibling origin, so a high-value SQLMap, Dalfox, Traversal, IDOR, Authorization, Browser or Workflow candidate is not excluded merely because its origin fell outside the broad-sibling top set. Authentication/session probes are evaluated against the concrete request URL. Raw Cookie headers are never widened to a different hostname; with `allow_same_host_ports=true` they are tried on another authorized port of the same hostname/scheme, matching the fact that HTTP cookies are not port-scoped. The probe must still validate the session. If it fails, browser-derived Domain/Path/Secure/host-only state is tried next and the already-resolved username/password are used only if the login flow requests them; a newly validated origin-specific session then replaces the speculative raw-cookie reuse for subsequent scanners. The resulting contracts are shared by both orchestrators and drive ranking instead of inventing endpoints or parameters.
-
-ZAP active mode is selected from the scan profile rather than from whether the current profile has a cookie: `fast` uses bounded targeted active scanning, `balanced` prioritized active scanning and `deep` the broader bounded mode; `diagnostic_only` remains passive. Scanner inventory is read through the Python API and retried through the raw ZAP JSON API; if metadata is unavailable, a curated set of known injection/path-traversal rule IDs is used as a compatibility fallback. Static assets are excluded from active-case selection. Parameterized request contracts remain the preferred insertion points. If semantic classification produces no compatible parameterized native plan, ZAP performs a second bounded fallback on at most 1/2/3 safe GET application pages in fast/balanced/deep, with `recurse=False` and a small curated set of installed reflected-XSS, generic-SQLi, traversal and command-injection rules. This allows active coverage on a discovered sibling origin even when its current contracts have no query/body parameters, without turning the fallback into an unbounded recursive active spider. Distinct application endpoints are retained while equivalent request shapes are deduplicated. Planned, attempted, started and completed native cases are counted separately; ZAP reports complete active coverage only when all four counts agree with the planned case count. A planned case that cannot start, remains incomplete, or is not attempted therefore makes the bounded ZAP result partial. Rule IDs are enabled one by one and the wrapper records which IDs ZAP actually accepted. `partial/no_active_scan_rules_enabled` is therefore reserved for the case where neither a compatible parameterized plan nor a safe generic GET fallback with an installed curated rule can be constructed/enabled. Passive observations are retained up to 180/800/1400 in fast/balanced/deep so a saturated observation cap is not mistaken for a complete inventory; security findings are kept separately from that observation ceiling.
-
-At Nuclei startup the wrapper revalidates the recorded official template directory against the local filesystem. If the runtime path is stale, it performs a read-only bounded rediscovery among configured/local standard template locations and uses an existing inventory without downloading or installing anything during the assessment. When the official inventory is unavailable, bundled SecOps direct-evidence templates still run when available and the result is marked `PARTIAL` with an explicit coverage gap for the missing official/DAST phases. If only the DAST subtree is missing, non-DAST direct and official phases still run. A hard failure is reserved for the case in which neither the official inventory nor the bundled direct templates are usable. Conversely, if the outer MCP watchdog finalizes a partial result before Nuclei returns its own metadata, the console reports the template inventory as **unknown** rather than inventing `total=0`/`directory=not-resolved` values. This prevents a transport timeout from being misdiagnosed as an empty template installation.
-
-The Nuclei pipeline uses explicit project HTTP templates, explicit official exposure/technology/vulnerability selections from the official HTTP template tree, and DAST request contracts derived from discovery. Nuclei's `-pt` option is only a template protocol-type filter and is **not** the project's authorization boundary. The wrapper instead performs structured template inspection before execution: HTTP routes must remain target-derived/in-scope; absolute hard-coded external destinations are rejected; DoS/brute-force classes and autonomous `headless`, `javascript`, `code`, `network`, `dns`, `file` and `workflow` protocols are excluded independently of `allow_state_changes`. When state changes are disabled, the same inspection additionally rejects mutative requests while retaining demonstrably read-only GET/POST templates. The scanner still receives only targets/contracts admitted by the project's explicit scope policy.
-
-Nuclei consumes discovered request contracts for bounded DAST checks in all three modes: the current ceilings are **96/1200/3000 request contracts** in fast/balanced/deep, while focused/static target ceilings are **128/1024/2048**; the initializer requires a DAST-capable Nuclei runtime (minimum v3.11.1), verifies the official `nuclei-templates/dast` subtree and performs a template-load DAST runtime check before assessments start. The DAST phase explicitly selects that directory. Request-shaped Proxify JSONL is attempted first; if the engine rejects it, the same GET/POST request contracts are serialized to the other officially supported Proxify YAML MultiDoc input mode; only if both request-shaped modes fail does the wrapper fall back to a plain URL list for compatible GET cases. Every attempt and stderr excerpt remains in coverage diagnostics. Fast uses `-fa low` with `fuzz-param-frequency=20`; balanced uses `-fa medium` with `fuzz-param-frequency=100`; deep uses `-fa high` with `fuzz-param-frequency=1000`. `-fm single` is retained so one parameter is mutated at a time and evidence remains attributable; it is not a low payload-count cap. SQLMap/Dalfox/other parameter scanners rank API/data-oriented contracts, meaningful identifier/query parameters, method and observed JSON/network evidence ahead of navigation-only parameters. After the scanner phases, both orchestrators perform a candidate-driven Chromium verification pass using the per-profile adaptive limits described above: 12/96/200 base candidates in `fast`/`balanced`/`deep`, expandable to 20/160/320 when the deterministic overflow conditions are met. The final action is restricted to the exact source parameter and is matched to the closest request context using the other query parameters, so two candidates on the same path/parameter but with different application context are verified separately. The source context is preserved through reconciliation and final finding deduplication, so a browser outcome cannot be reassigned to or merged with a different XSS context on the same route. The Browser server exports the parameters actually exercised so reconciliation remains deterministic even if nested diagnostics are lost in transport. Confirmed execution upgrades the source candidate and sets high verification confidence. An unexecuted browser reflection keeps the candidate's potential severity unchanged but limits confidence to medium; a successful exact-parameter bounded non-reproduction likewise preserves severity while setting confidence to low. Severity therefore expresses potential impact if the weakness is real, while confidence expresses how strongly the collected evidence supports its existence. For findings without a browser ceiling, the validated AI confidence becomes the final finding confidence. The subsequent AI analysis may enrich wording and reassess severity from impact evidence, but it cannot raise confidence above the deterministic browser ceiling (MEDIUM for reflection without execution, LOW for bounded non-reproduction). Static assets such as CSS, JavaScript, images and fonts are excluded as Browser-XSS targets. Final-XSS selection accounting records eligible, selected, deferred, base and adaptive-maximum counts before Chromium execution; Agentic carries that selection summary into report context even if the verification-stage deadline expires before execution, while Deterministic also keeps final-verification source/provenance metadata on selected cases that are safely skipped (for example after browser unavailability or failed session restoration). These audit fields describe selection/execution coverage only and never upgrade an unexecuted candidate. Deterministic skips an exact URL/method/parameter case already exercised successfully by its earlier browser/workflow phase; Agentic performs the same bounded verification before AI analysis.
-
-Nikto is reported as `partial` when its process exits successfully but neither request/host-tested metrics nor a structured report are sufficient to verify scan coverage. A positive official `host(s) tested` summary is accepted as completion evidence even when that Nikto build omits the request counter or writes no useful CSV rows. Parsed console findings are preserved, but unverified coverage is never presented as a complete successful scan. With `allow_state_changes=false`, Nikto remains enabled: its tuning is intersected with reverse tuning `x06` (all standard classes except File Upload and DoS) and autonomous `put_del_test`/`auth` plugins are excluded; the wrapper keeps a centrally controlled authenticated baseline but does not hand the autonomous Nikto engine a cookie that could make an internally generated GET such as logout mutate the authenticated session. SQLMap remains detection-only with `BEUSTQ` and does not request write/takeover functions. Commix remains active but omits only its file-based `f` technique under the no-persistent-state policy because that technique writes command output on the target filesystem.
-
-Terminal logging keeps long request URLs compact: when an URL exceeds the configured display threshold, only the endpoint plus parameter/query metadata are printed (for example parameter count and query length). The complete unmodified URL remains stored in scanner results, JSON artifacts and reports. The threshold can be adjusted with `SECOPS_TERMINAL_URL_MAX`.
-
-Agentic report wording is provider-neutral: the cover still records the concrete provider/model used for the run, while the risk-methodology and executive-summary text refer to the configured AI provider/model rather than assuming Ollama.
-
-The generated report also contains an **Endpoint coverage matrix**. It is built from the final discovery state, mode-specific action eligibility (Agentic catalog eligibility or Deterministic selector decisions) and the scanner executions, not from finding counts. Each row identifies the assessment profile, HTTP method, discovered endpoint/request context, discovery source, concrete security tools that actually ran against that context, a textual coverage status, a structured reason code and the explanatory reason when no completed test exists. Distinct POST request bodies remain separate through a short non-reversible body-context fingerprint; the body itself and submitted values are not written into the matrix. Status values are `Tested`, `Discovered only`, `Skipped`, `Execution error`, `HTTP 404` and `HTTP 410`; no icon or informal symbol is used. Common omission codes include `DEFERRED_LOW_PRIORITY`, `BUDGET_LIMIT`, `NO_COMPATIBLE_PARAMETERS`, `UNSUPPORTED_METHOD`, `STATE_CHANGE_BLOCKED`, `OUT_OF_SCOPE`, `DUPLICATE_ROUTE_VARIANT`, `HTTP_404` and `HTTP_410`; Agentic additionally uses `PLANNER_DEFERRED` when an eligible concrete action was presented to the planner but not selected for execution. A page merely visited by the crawler is therefore not labelled `Tested`. Broad-scanner evidence is attached to the exact URL when observable: Nuclei focused/DAST inputs and ZAP targeted active scans are labelled separately from request-level specialist executions, so broad coverage is not confused with a direct SQLMap/Dalfox/Commix/Traversal/Authorization-style validation. The section begins with a numeric summary that reports discovered request contexts, reachable/in-scope contexts, contexts tested by at least one concrete security-tool execution, discovery-only contexts, intentional skips, execution errors, HTTP 404/410 responses and tested coverage percentage. Anonymous and authenticated profiles are summarized independently, with an overall row when both are present. In aggregate multi-entry reports each row also retains the source job/entry point, so identical URLs reached from different configured entry points remain attributable. The complete matrix and the machine-readable `endpoint_coverage_summary` are serialized in report JSON and in the review snapshot and are embedded in `Assessment_Results_Data_<ID>.json`.
-
-- The same coverage section also exposes two bounded endpoint-only lists: **Endpoints observed / discovered** and **Endpoints security-tested at least once**. They collapse repeated tools/profiles/attempts and do not become an attack log; the full request-context coverage dataset remains in JSON.
-
-### Session-lifecycle logout verification
-
-Logout handling is profile-aware and intentionally separate from generic fuzzing. Anonymous discovery does not spend scanner budget on logout/signout/logoff endpoints because there is no authenticated session to invalidate. Authenticated discovery may retain a logout request contract, including a POST form, but does not execute it during ordinary crawling or specialist scanning. After the remaining authenticated checks and final browser verification have completed, the session verifier executes one bounded logout flow and replays the pre-logout cookie against the protected session probe. If the old cookie still provides authenticated access, the result is a deterministically confirmed session-invalidation vulnerability (CWE-613); if the old cookie is rejected, logout invalidation is verified; if the response cannot be distinguished reliably, the check remains partial rather than creating a vulnerability. Login/SSO routing is the inverse: stable application login routes remain observable/testable in the anonymous profile but are not sent to SQLMap/Dalfox/Commix/Traversal from an already authenticated profile. Volatile OAuth/OIDC protocol and application callback instances are excluded from generic injection/traversal/workflow selection in both profiles while their stable login route remains usable for authentication.
-
-## Requirements
-
-- Python 3.12+
-- Docker
-- Ollama only for local `llama`/`qwen` Agentic models. `initScript.py --with-lab` provisions both by default;
-  `--prepare-ai snap4city` does not provision or require Ollama because no local model is requested.
-- The Snap4City AI model/provider requires network access plus `snap4city_model_credentials.json` or interactive model credentials. The file may contain placeholders or references resolved from local environment variables rather than literal secrets, and it is unrelated to the account used to log in to the assessed dashboard. The provider is remote and is verified during initialization rather than downloaded. Token (1) endpoint calls use bounded HTTP timeouts; transport or JSON failures fall back through the normal cached-token/refresh/user-credential sequence (1) and cannot block indefinitely.
-- Scanner command-line contracts are checked during initialization where the tool exposes stable help output. Arjun is pinned to `2.2.7`, its known upstream status-code issue is patched when necessary, and the runtime detects whether JSON output is exposed as `-o` or `-oJ` and whether rate limiting is exposed as `--rate-limit` or `--ratelimit`. FFUF, Interactsh, Dalfox, Nuclei, SQLMap, Commix and Nikto receive option-contract checks for the flags emitted by their wrappers. Setup also validates the ZAP Python methods used by the wrapper and the IDOR-Forge constructor/check signatures, including either supported object-reference argument name (`param` or `parameter`). This turns an unsupported CLI flag or Python API mismatch into an initialization/preflight error instead of discovering it after a long assessment has reached the specialist stage. Nikto help validation remains best-effort when a distro launcher exposes reduced help, while runtime keeps the native/Docker fallback.
-
-## Detailed initialization and run options 
-
-The recommended complete local-lab initialization is:
-
-```powershell
-python .\initScript.py --with-lab
-```
-
-With neither `--prepare-ai` nor `--agentic-model`, this prepares all three supported AI choices:
-
-1. Ollama + `llama3.1:8b`;
-2. Ollama + `qwen2.5:7b`;
-3. Snap4City + `llama4-agentic-inference` (remote readiness/authentication check, no model download).
-
-If only `--agentic-model` is supplied, that model is also the only AI backend prepared. For example:
-
-```powershell
-python .\initScript.py --with-lab --agentic-model qwen
-python .\initScript.py --with-lab --agentic-model snap4city --run agentic --mode balanced
-```
-
-To prepare exactly one:
-
-```powershell
-python .\initScript.py --with-lab --prepare-ai snap4city
-python .\initScript.py --with-lab --prepare-ai llama
-python .\initScript.py --with-lab --prepare-ai qwen
-```
-
-To initialize and immediately run an orchestrator:
-
-```powershell
-python .\initScript.py --with-lab --run deterministic --mode balanced
-python .\initScript.py --with-lab --run agentic --mode balanced
-python .\initScript.py --with-lab --prepare-ai snap4city --run agentic --mode balanced
-python .\initScript.py --with-lab --prepare-ai qwen --run agentic --mode balanced
-```
-
-When all backends are prepared, the default Agentic model is Snap4City. When exactly one backend is prepared, that backend
-becomes the Agentic default. `initScript.py` has no `--model` option. `--prepare-ai` explicitly chooses what is prepared;
-`--agentic-model` chooses what Agentic uses and, when `--prepare-ai` is absent, also implicitly chooses what is prepared.
-If both are present, `--prepare-ai all --agentic-model <model>` is valid, while mismatched single-backend selections are rejected.
-
-The repository also contains `configs/dvwa.example.json`, which is only a readable placeholder and must not be used as a real authenticated session.
-After step 1 succeeds, `initScript.py` writes `configs/dvwa.generated.json` with the fresh DVWA cookie and `auth_only=false`, then prints
-ready-to-copy `assessmentRunner.py` commands for fast, balanced and deep Deterministic/Agentic runs. Those generated commands therefore
-run both anonymous and authenticated profiles by default; add `--auth-only` when only the authenticated profile is wanted. It also prints one
-direct `orchestratorAgentic.py` command so the original manual workflow remains immediately available. In addition, every non-example JSON
-under `configs/` receives exactly one Deterministic BALANCED and one Agentic BALANCED command; files whose names contain `example`, `sample`
-or `template`, and the already-covered `dvwa.generated.json`, are excluded. The additional commands use `--authorized` explicitly and the
-verified Agentic model selected by initialization when available. The same dynamic list is printed by `--commands-only`.
-
-If Snap4City authentication succeeds but its configured remote model/endpoint cannot be prepared, initialization reports the
-Snap4City error and continues. A verified local Ollama model is used as the Agentic fallback when one is already available;
-otherwise the initializer attempts to provision `llama3.1:8b`. Failure of that recovery path is reported without discarding the
-rest of the completed initialization.
-
-The complete operational reference is in `init.txt`.
-
-Before an assessment, the initializer keeps managed local repository copies of SQLMap and Commix under `~/.local/opt/` even when a same-named command already exists on `PATH`, because the wrappers require `sqlmapapi.py`/`commix.py` rather than merely a shell command. Nuclei preflight validates the complete set of CLI flags used by the wrapper (including DAST input/fuzzing/filter options) for both native and official-Docker execution. This turns version/CLI incompatibilities into setup-time errors instead of late scanner failures.
-
-## Configuration-driven assessments
-
-Validate a configuration without launching scanners:
-
-```powershell
-python .\assessmentRunner.py --config .\configs\dvwa.generated.json --orchestrator deterministic --mode balanced --dry-run
-```
-
-Configuration values for `orchestrator`, `mode` and `model` are normalized to lowercase during validation, so equivalent case variants cannot pass validation and then fail later at the orchestrator CLI. Validation also rejects non-boolean `enabled`, `auth_only`, `allow_state_changes` and `require_ai` values, invalid `max_rounds`, unresolved names in `credential_refs`, `auth_only=true` services without at least one credential reference, duplicate JSON keys, wrong explicit container types, case-insensitive credential-name collisions and duplicate `required_cookie_names`. Omitted `allow_state_changes` is normalized to the effective boolean `false`, so dry-run, command construction, coalescing and reporting all see the same fail-closed value. This keeps `--dry-run` consistent with the real execution path instead of accepting a plan that would fail only when secrets are resolved.
-
-Job coalescing uses the **exact URL path**: `/app` and `/app/` remain separate jobs because routing and Cookie `Path` semantics may differ. Query-only variants of the same exact path may share one full-pipeline job, but all concrete configured URLs are retained as forced discovery entry points.
-
-Run the generated DVWA configuration. Because the generated file contains a fresh cookie and `auth_only=false`, the default is
-anonymous + authenticated; add `--auth-only` only when the anonymous profile must be skipped:
-
-```powershell
-python .\assessmentRunner.py --config .\configs\dvwa.generated.json --orchestrator deterministic --mode balanced
-python .\assessmentRunner.py --config .\configs\dvwa.generated.json --orchestrator deterministic --mode balanced --auth-only
-python .\assessmentRunner.py --config .\configs\dvwa.generated.json --orchestrator agentic --max-rounds 2 --mode balanced --require-ai
-```
-
-The runner can also be used without a JSON file. `--config` and `--target` are alternatives. Direct-target mode accepts the same
-primary and secondary cookie headers used by the orchestrators. With a cookie and no `--auth-only`, both anonymous and authenticated
-profiles are executed. With `--auth-only`, only the authenticated profile is executed. Without a cookie, the run is anonymous only.
-Direct-target mode does **not** accept target username/password and does not execute the OIDC browser-login resolver. If account
-credentials are all you have, use a configuration with `kind: "browser_oidc"` or obtain an authorized cookie separately.
-For example:
-
-```powershell
-python .\assessmentRunner.py --target http://127.0.0.1 --cookies "PHPSESSID=<SESSION>; security=low" --orchestrator deterministic --mode balanced
-python .\assessmentRunner.py --target http://127.0.0.1 --cookies "PHPSESSID=<SESSION>; security=low" --orchestrator deterministic --mode balanced --auth-only
-python .\assessmentRunner.py --target http://127.0.0.1 --orchestrator deterministic --mode balanced
-python .\assessmentRunner.py --target http://127.0.0.1 --cookies "PHPSESSID=<SESSION>; security=low" --orchestrator agentic --model snap4city --max-rounds 2 --mode balanced --require-ai
-```
-
-`--orchestrator`, `--mode`, `--model`, `--max-rounds`, `--auth-only`, `--require-ai`/`--no-require-ai`,
-`--authorized`, `--allow-state-changes` and `--no-allow-state-changes` override only the current run and do not rewrite the source JSON. For local Ollama
-models, `assessmentRunner.py` requires the exact requested model to be already installed and passes `--no-model-pull` to the
-Agentic orchestrator; initialize the chosen model first instead of silently substituting another model. A direct
-`orchestratorAgentic.py` run may still pull a missing Ollama model unless `--no-model-pull` is supplied, but that runtime pull is
-bounded by the selected planner timeout for the current mode/override rather than inheriting the setup-only two-hour pull allowance.
-`initScript.py`/setup preparation retains the longer installation budget because model installation there is an explicit setup action,
-not assessment control-plane time.
-
-### Configuration-driven remote targets
-
-For a remote authorized application, keep host resolution, credentials and target-specific service declarations in the assessment configuration or in the operator environment; do not encode them in crawler/planner code or generic documentation. A typical validation flow is:
-
-```powershell
-python .\assessmentRunner.py --config .\configs\<assessment>.json --orchestrator deterministic --mode balanced --dry-run --authorized
-python .\assessmentRunner.py --config .\configs\<assessment>.json --orchestrator deterministic --mode balanced --authorized
-python .\assessmentRunner.py --config .\configs\<assessment>.json --orchestrator agentic --max-rounds 2 --mode balanced --require-ai --authorized
-```
-
-A service with no credential reference is anonymous-only. A service can declare **multiple** identities with `credential_refs`, bounded to **16 identities per service**; identity labels must be unique case-insensitively and duplicate concrete sessions are rejected from cross-account comparisons so BOLA evidence cannot accidentally compare one session with itself. Browser/OIDC identities are now **lazy**: before the first assessment job starts, `assessmentRunner.py` resolves each configured identity once from environment variables or, when values are missing and a console is available, asks for username/password once. Those values remain only in the protected in-memory/runtime payload for the run. The runner still does **not** open a browser, submit credentials, validate a cookie or create an authenticated profile at this stage. Anonymous discovery runs first. An authenticated profile is created only when that discovery observes concrete authentication evidence on an authorized origin (a login/SSO route, OIDC flow, or protected 401/403 request) and the session can then be established. Public-only sibling ports therefore remain anonymous and do not receive authenticated discovery/actions merely because a web service exists there. If `auth_only=false`, anonymous remains a normal profile; with `auth_only=true`, an internal anonymous bootstrap discovery may still run only to locate the real login surface, but its pages are removed before planning/scanning. After the assessment child starts, target authentication is fully non-interactive: refresh/re-login may reuse the credentials already collected at startup, but discovery, planner and scanners never ask the operator for them again. Example:
+Il rate operativo normale è 10 request start/s.
 
 ```json
 {
-  "credentials": {
-    "portal_user": {"kind":"browser_oidc", "username_env":"SECOPS_PORTAL_USER_USERNAME", "password_env":"SECOPS_PORTAL_USER_PASSWORD", "cookie_env":"SECOPS_PORTAL_USER_COOKIE", "login_path":"/app/", "validation_path":"/app/"},
-    "portal_editor": {"kind":"browser_oidc", "username_env":"SECOPS_PORTAL_EDITOR_USERNAME", "password_env":"SECOPS_PORTAL_EDITOR_PASSWORD", "cookie_env":"SECOPS_PORTAL_EDITOR_COOKIE", "login_path":"/app/", "validation_path":"/app/"},
-    "portal_admin": {"kind":"browser_oidc", "username_env":"SECOPS_PORTAL_ADMIN_USERNAME", "password_env":"SECOPS_PORTAL_ADMIN_PASSWORD", "cookie_env":"SECOPS_PORTAL_ADMIN_COOKIE", "login_path":"/app/", "validation_path":"/app/"}
-  },
-  "assets": [{"id":"frontend", "host":"portal.example.internal", "services":[{
-    "id":"https-main", "url":"https://portal.example.internal/app/",
-    "credential_refs":["portal_user","portal_editor","portal_admin"],
-    "auth_only":false, "allow_state_changes":false
-  }]}]
+  "execution": {
+    "request_rate": 10
+  }
 }
 ```
 
-`configs/tourist-dashboard.json` is **currently anonymous-only** because no target accounts are available for the present assessment, so the current file contains no target `credentials`, `credential_ref`, `credential_refs` or `secondary_credential_ref`. This is a property of the current configuration, **not a permanent architectural restriction**: if credentials become available later, the same generic cookie/browser-OIDC mechanisms documented above can be configured without changing the orchestrators. The auth/config self-test therefore validates the generic authentication contracts rather than forbidding future credentials for this named target.
+Il parallelismo serve a sfruttare l'I/O senza aumentare il picco di richieste. Le richieste controllate dal progetto condividono un pacer. Gli scanner esterni mantengono anche i propri limiti.
 
-The complete maintained example is `configs/platform.example.json`. SQLMap, Dalfox, Commix, Traversal, IDOR, Browser, Workflow, broad scanners and the other profile-driven phases run independently with every authenticated profile when applicable. The Authorization/BOLA verifier additionally compares the active identity against **all other available identities**, so horizontal and vertical role differences are not limited to one secondary account. Its existing per-action wall-clock deadline is not multiplied by the number of accounts: the verifier derives a fair bounded per-request share for primary, anonymous and every alternate identity, preserving breadth without turning additional accounts into unbounded runtime. The first available configured identity is the primary runtime identity; additional identities remain credential-isolated and never inherit its browser storage state or origin-specific cookie registry. Their own session cookies are still used normally on destinations where those cookies apply. This prevents an editor/admin comparison from silently becoming primary-vs-primary. Direct CLI runs can also supply `--secondary-cookies` as one additional read-only comparison identity; platform configs use `credential_refs` for multiple identities.
+Il pacer è condiviso anche tra processi avviati dallo stesso utente sulla VM, quindi due assessment non moltiplicano automaticamente il rate configurato. Evitare comunque run concorrenti sullo stesso target perché duplicano lavoro e possono contendere scanner stateful o risorse locali.
 
-For each browser/OIDC identity the runtime order is **anonymous discovery -> concrete auth evidence -> applicable cookie/session validation -> saved browser/OIDC storage/refresh -> username/password only when the real login flow requests them**. The first usable session may be established on the configured primary origin or on another already-authorized origin/port that actually exposed authentication evidence; primary-origin login is not a prerequisite for authenticated coverage on another authorized port. After a usable session is obtained, SecOps performs a fresh authenticated discovery on that origin, merges endpoints visible only after login, and then lets the planner/scanners operate on that authenticated surface. Anonymous results may be used temporarily to locate other auth-capable origins, but before planning the authenticated profile is projected back to origins where a runtime session was actually validated.
+## Discovery
 
-A session is validated immediately before authenticated work. If it has expired, saved browser/OIDC state is tried first; if that cannot restore the application session, a full username/password login is allowed when the identity-wide failure guard is clear. A successful refresh or re-login updates the canonical runtime storage/cookie state, so all later authenticated actions use the new cookie values rather than the stale header that triggered repair. A successful full login does not permanently consume the credential path: if that session genuinely expires later, another full login may be performed. A **conclusive** credential/provider rejection blocks further automatic password submissions for that identity during the assessment; reaching another page or another authorized port does not bypass the guard. A technical/inconclusive failure after a real submission instead starts an identity-wide cooldown (TEST 1 min, FAST 5 min, BALANCED 10 min, DEEP 15 min); after it expires, at most one additional full-login attempt is allowed, and a second inconclusive failure blocks further password submissions. The temporary retry state is cleared only after the replacement cookie/storage has been validated as a genuinely authenticated application session. A browser navigation that never submitted the password (for example `no_auth_entry_observed`) does not consume that guard, so a later real login page may still authenticate.
+La discovery usa più sorgenti:
 
-OIDC credential reuse remains tied to the real observed authorization endpoint/realm. After the first successful OIDC login, later application/origin logins may reuse the same username/password only when the observed issuer matches the learned/configured issuer; a different `client_id` alone does not create a new credential budget. If the first established identity used a local form and no OIDC issuer was learned, a newly observed unrelated OIDC realm cannot silently receive the credentials. An explicitly configured `credential.oidc_issuer` can pin the intended provider from the beginning. Raw cookies are never copied to another hostname. On an authorized additional port, Cookie/Storage applicability and session validation remain separate from scope authorization.
+- crawler HTTP
+- Chromium e Playwright
+- link, form, iframe e redirect osservati
+- risposte browser e traffico asincrono
+- JavaScript e source map quando disponibili
+- `robots.txt`, sitemap, OpenAPI, Swagger, manifest e service worker
+- FFUF
+- Arjun
+- ZAP site tree
+- service discovery same-host quando autorizzata
 
-A configured `cookie_env` is only a lazy session candidate: it is canonicalized and checked against `required_cookie_names`, then validated when authenticated work is actually needed. Browser cookie projection honors Domain/host-only, Path, Secure and expiry metadata; an explicit Unix expiry of `0` remains expired. Playwright storage retains IndexedDB when supported, and partitioned/CHIPS cookies are kept in browser storage rather than flattened into a context-free direct-scanner Cookie header. Browser/OIDC Cookie headers remain path-aware (`/app` and `/app/` are distinct). Equivalent raw Cookie headers with only pair-order differences are fingerprinted as the same concrete session. Runtime sibling/application authentication remains bounded by the profile deadlines/rate policy; origins left outside the shared deadline are deferred rather than marked failed, and only entry points actually visited before a deadline are recorded as attempted.
+Ogni richiesta utile diventa un request contract con metodo, URL, parametri, body e content type.
 
+### Fairness e anti-saturation
 
-The authentication/configuration invariants can be rechecked without a live target:
+La superficie viene divisa in famiglie applicative derivate da origin, directory e struttura osservata. Le nuove famiglie ricevono una prima opportunità prima che una famiglia molto grande consumi tutta la coda.
 
-Authentication and scanner/runtime contracts are checked by the initializer preflight and by the maintained regression suite. The normal assessment runtime does not depend on manually invoking separate `selftests/*.py` commands. The maintained checks cover multiple credential identities and session reuse as well as Python compilation/imports, scanner CLI compatibility, MCP argument/signature consistency, profile timeout ordering, defensive metadata parsing, strict JSON booleans and malformed `SECOPS_*` numeric fallbacks. Profile-aware Nuclei, Nikto and Traversal reject an unknown `scan_profile` instead of silently falling back to BALANCED.
+Le route shape già molto rappresentate perdono priorità rispetto a nuove directory, nuovi endpoint e nuovi request contract.
 
-`discover_same_host_services=true` is valid only together with `allow_same_host_ports=true`. It probes the initial authorized hostname and expands to exact hostnames observed later only when those hostnames are already authorized. Port scanning is **host-level**, not path-level: discovering ten endpoints on one hostname does not trigger ten TCP sweeps. The primary-host candidate ceilings remain 8192/65535/65535 in fast/balanced/deep. At rate 10 the total service-discovery envelopes are **2400/18000/28800 seconds** (40 min / 300 min / 480 min), while the deliberately small first primary-host slice remains **180/900/1500 seconds** so application crawling/authentication still happens first; below rate 10 these network-bound budgets expand automatically. Newly observed authorized hostnames are scanned **before** the primary host consumes its full continuation allowance and share a smaller priority-port expansion pool of **1536/6144/12288 candidates** in fast/balanced/deep rather than receiving another full-range sweep. That pool is divided across up to 16/64/192 observed authorized hostnames, with unused candidate capacity recycled; a smaller cached sweep is used as resume evidence rather than suppressing a larger fair share. Every hostname starts with ports already configured or observed at runtime for that exact authorized hostname, then runtime service-database entries ordered by available frequency metadata, then deterministic stratified sampling. No target-specific port list or endpoint name is embedded in discovery. The baseline total time budgets include headroom for the primary candidate pool plus the targeted expansion pool across two resolved A/AAAA addresses at the default 10 req/s; Results Data also records the TCP request-start floor for the actual address count so unusually large multi-address hosts remain auditable. Authenticated recrawls never launch duplicate per-path sweeps, exact-host scan results are cached across anonymous/authenticated profiles, and confirmed HTTP/HTTPS roots receive bounded recrawl. The feature never authorizes a hostname from a discovered link, DNS suffix or naming similarity and does not use target-specific reference data.
+Le pagine 404 e 410 vengono registrate ma non devono saturare il budget delle pagine utili.
 
-When several configured entry URLs normalize to the same logical service and safety/authentication policy, the runner may coalesce them into one job while preserving all supplied URLs as initial discovery entry points. Truly distinct origins/services remain distinct jobs.
+### Browser lento
 
-### Oversized report transport
-Report generation remains on the unified MCP Streamable HTTP endpoint. When the serialized report input exceeds the safe inline threshold, the orchestrator compresses it and sends bounded chunks through repeated MCP/HTTP tool calls; the report service reconstructs the payload in memory and renders it after completeness, size and SHA-256 integrity checks. Client chunk size and total chunk count are bounded consistently with the report server, and the inline threshold is never allowed to exceed the configured report payload ceiling. No local-file handoff is used for report input.
+I profili normali usano timeout browser più ampi del profilo TEST. Una navigazione lenta può ricevere un solo retry entro il budget del profilo. Se Chromium fallisce, il ramo può ancora essere esplorato tramite HTTP quando esiste una risposta utile.
 
-Reporting has its own additive phase after scanner execution, verification and AI analysis. Each chunk still has an individual HTTP timeout, while the complete transfer / MCP reconstruction+render / shared PDF ceilings for TEST/FAST/BALANCED/DEEP are respectively **60/180/300/480 s**, **900/3000/4800/8100 s**, and **840/2940/4740/8040 s**. These fit inside the explicit **20/60/90/150-minute** report phases with additional time for MCP return/serialization and the emergency-artifact tail; each PDF ceiling remains 60 seconds below its enclosing MCP render ceiling. These are maxima, not expected durations. While the final MCP rendering call is running, the orchestrator emits periodic `[REPORT WAIT]` heartbeats and, when the locally-owned server log is available, includes its latest `[REPORT SERVER]` stage. Progress therefore remains visible during long PDF conversion instead of leaving an idle SSH terminal. The complete endpoint matrix remains in HTML/JSON/review data; only the print/PDF variant caps detailed endpoint rows at 260 by default (prioritizing execution errors and untested gaps) so thousands of repetitive matrix rows cannot dominate WeasyPrint rendering. PDF rendering uses one bounded fallback chain: native WeasyPrint, then the prepared report Docker image, then Playwright Chromium. The profile PDF ceiling is a **single shared wall-clock budget for the whole fallback chain**, not a fresh allowance for every renderer; a bounded tail of that same deadline is reserved for later renderers so a hung native WeasyPrint process cannot starve Docker/Chromium. Profile-specific overrides are `SECOPS_<PROFILE>_REPORT_TRANSFER_TIMEOUT`, `SECOPS_<PROFILE>_REPORT_RENDER_TIMEOUT` and `SECOPS_<PROFILE>_REPORT_PDF_TIMEOUT` (where `<PROFILE>` is TEST, FAST, BALANCED or DEEP); the explicit report-phase deadline remains authoritative if an override is larger than the time actually left, while the wider global watchdog is reserved for emergency cleanup/hang protection. `SECOPS_MCP_REPORT_CHUNK_TIMEOUT` still controls the per-chunk ceiling. If all renderers fail or the shared budget is exhausted, the already-created JSON, HTML and review snapshot paths are returned instead of being discarded and the combined diagnostics are reported.
+### FFUF, Arjun e ZAP come strumenti che ampliano la discovery
 
-Report recovery distinguishes a normal `SecOps_*_Assessment_*` artifact from the minimal `SecOps_*_Emergency_*` last-resort artifact. If the report service has already written any normal JSON/HTML/review/PDF artifact but the final MCP/HTTP response is interrupted or reaches its outer time budget, the orchestrator recovers those deterministic paths and does not create an Emergency duplicate. An Emergency report is written only when no normal artifact can be recovered. `assessmentRunner.py` independently applies the same preference when collecting files created during a job, so one job contributes one primary human-facing report: a normal Assessment report wins over an Emergency artifact, and the terminal labels a normal HTML used because the PDF is unavailable as `HTML report (PDF fallback)` while a genuine last-resort artifact is labeled `Emergency HTML report`. Each assessment receives a collision-resistant identifier (microseconds, process id and random suffix), and each child job receives a unique report id through the runner. Artifact collection may use the expected prefix only as a filesystem lookup optimization, but every candidate report id is then required to be exactly the job report id or that job's explicit `_Emergency_` derivative; a neighboring id that merely starts with the same text is rejected. Simultaneous assessment processes therefore cannot overwrite or accidentally claim each other's reports. Results Data, report JSON/HTML/review snapshots and the final PDF publication use atomic replace semantics where applicable, so an interruption cannot normally leave a half-written persistent artifact in place of a previously complete one. The same atomic-write primitive is used for generated runtime/configuration state and cached provider-token JSON; on POSIX the token cache is additionally kept private (`0600`) when the platform supports that permission model.
+FFUF, Arjun e ZAP possono aggiungere nuova superficie al grafo delle richieste osservate.
+
+FFUF verifica nuovi URL e avvia un recrawl limitato dal budget.
+
+Arjun aggiunge parametri osservati ai request contract.
+
+ZAP può reimportare URL in-scope dal site tree.
+
+Nel percorso Agentic questi tool devono comunque essere selezionati dal modello. Python gestisce solo l’ordine tra gli strumenti che scoprono superficie e quelli che la testano.
+
+## Service discovery same-host
+
+Quando autorizzata, la service discovery cerca servizi HTTP e HTTPS su altre porte dello stesso hostname.
+
+Una porta aperta non viene automaticamente considerata superficie web. Solo i servizi confermati come HTTP o HTTPS diventano origin da esplorare.
+
+Il sweep completo viene memorizzato e non viene ripetuto nei round successivi. Il tempo successivo viene speso sul crawling dei servizi trovati.
+
+Limiti principali di discovery:
+
+| Profilo | HTTP base / max | Chromium base / max | Script | Candidate porte same-host |
+| --- | ---: | ---: | ---: | ---: |
+| TEST | 8 / 16 | 4 / 8 | 12 | 32 |
+| FAST | 360 / 1200 | 220 / 700 | 640 | 8192 |
+| BALANCED | 2500 / 8000 | 1500 / 5000 | 4000 | 65535 |
+| DEEP | 6000 / 18000 | 3500 / 10000 | 8000 | 65535 |
+
+I ceiling sono limiti massimi, non obiettivi obbligatori. Una discovery può terminare prima quando la coda non produce più nuova superficie.
+
+## Autenticazione
+
+Sono supportati profili anonymous e authenticated.
+
+Le identità possono usare cookie già disponibili oppure workflow browser/OIDC. Le sessioni sono separate per identità e application root.
+
+Prima di un'azione authenticated viene eseguito un precheck. Se la sessione è scaduta, il sistema può provare refresh, riuso dello storage o nuovo login in base alla configurazione.
+
+Fallimenti tecnici ripetuti sullo stesso application scope entrano in cooldown. Un rifiuto conclusivo delle credenziali impedisce submit ripetuti della password.
+
+Se una sessione viene recuperata, le azioni bloccate possono tornare eleggibili nei round successivi.
+
+Per controllare solo l'autenticazione:
+
+```bash
+python assessmentRunner.py \
+  --config <config.json> \
+  --orchestrator agentic \
+  --mode balanced \
+  --auth-only \
+  --authorized
+```
+
+## Deterministic
+
+Deterministic usa una pipeline stabilita dal codice. Ranking e deduplica riducono i casi equivalenti. Gli strumenti che ampliano la discovery possono essere eseguiti prima degli specialisti.
+
+Questa modalità è utile quando si vuole una baseline riproducibile.
+
+## Agentic e LangGraph
+
+Agentic costruisce azioni concrete derivate dalla discovery. Una azione identifica almeno tool, profilo, target e request context.
+
+Il planner AI decide quali ID selezionare e in quale ordine. Python controlla scope, safety, compatibilità e risorse.
+
+Il planner non deve perdere candidati per limiti di contesto. Il catalogo viene suddiviso in batch. Se un batch è troppo grande viene diviso. Se una singola azione è accompagnata da troppo contesto storico, vengono compattati solo i metadati consultivi.
+
+Con `--require-ai`, una fase AI obbligatoria che non può essere completata viene segnalata come errore. Non viene sostituita silenziosamente da una scelta deterministica.
+
+### Round e capacità
+
+| Profilo | Round predefiniti | Reference actions / round | Planner max / round | Planner cumulativo |
+| --- | ---: | ---: | ---: | ---: |
+| TEST | 1 | 24 | 120 s | 120 s |
+| FAST | 2 | 180 | 1800 s | 3600 s |
+| BALANCED | 2 | 480 | 3600 s | 7200 s |
+| DEEP | 3 | 720 | 5400 s | 16200 s |
+
+Le reference actions non sono hard cap di coverage nei profili normali. L'ammissione può crescere quando il catalogo restante e i round disponibili lo richiedono.
+
+Il secondo round riceve il delta della discovery e le famiglie ancora sottocoperte. Un'azione non eseguita nel primo round può rimanere eleggibile.
+
+## Profili e budget
+
+| Fase | TEST | FAST | BALANCED | DEEP |
+| --- | ---: | ---: | ---: | ---: |
+| Esecuzione operativa | 1,5 h | 16 h | 48 h | 96 h |
+| Verifica protetta | 10 min | 60 min | 120 min | 240 min |
+| Analisi AI protetta | 10 min | 120 min | 360 min | 720 min |
+| Reporting protetto | 20 min | 60 min | 120 min | 240 min |
+| Hard watchdog | 3 h | 24 h | 66 h | 128 h |
+
+Il watchdog è una rete di sicurezza contro hang. Non è una durata prevista.
+
+TEST è un profilo diagnostico. FAST, BALANCED e DEEP sono profili di copertura. BALANCED è il default consigliato.
+
+## Tool disponibili
+
+| Tool | Tipo | Origine e runtime | Integrazione del progetto |
+| --- | --- | --- | --- |
+| FFUF | Discovery | Open source, binario locale | `ffufServer.py` |
+| Arjun | Discovery | Open source, Python locale | `arjunServer.py` |
+| ZAP | Proxy, spider, DAST | Open source, daemon o Docker | `zapServer.py`, `zapVerification.py` |
+| Nuclei | Template scanning e DAST | Open source, binario o Docker | `nucleiServer.py` |
+| Nikto | Web server assessment | Open source, Perl o Docker | `niktoServer.py` |
+| SQLMap | SQL injection | Open source, checkout GitHub | `sqlmapServer.py` |
+| Dalfox | XSS | Open source, binario locale | `dalfoxServer.py` |
+| Commix | Command injection | Open source, checkout GitHub | `commixServer.py` |
+| Interactsh | OAST | Open source, client locale | `interactshServer.py` |
+| IDOR Forge | IDOR e BOLA | Open source, checkout GitHub | `idorForgeServer.py` con fallback nativo |
+| Traversal | Traversal e LFI | Codice del progetto | `traversalServer.py` |
+| Authorization | Access control | Codice del progetto | `authorizationServer.py` |
+| Browser | Verifica client-side | Codice del progetto con Playwright | `browserServer.py` |
+| Workflow | Flussi multi-step | Codice del progetto | `workflowServer.py` |
+| Session | Session security | Codice del progetto | `sessionServer.py` |
+| JWT | Token analysis | Codice del progetto con PyJWT | `jwtServer.py` |
+
+Docker modifica il runtime, non la provenienza del tool. I wrapper sono codice del progetto e non fork degli scanner.
+
+## Reporting
+
+Ogni assessment produce JSON, HTML e PDF quando il renderer è disponibile.
+
+Il JSON contiene il dataset completo. L'HTML è pensato per la consultazione. Il PDF è una sintesi di consegna e può ridurre righe ripetitive quando la matrice è enorme.
+
+Il report separa:
+
+1. finding di sicurezza
+2. stato dell'esecuzione dei tool
+3. coverage della superficie
+
+Un timeout non significa assenza di vulnerabilità. Nel report, `candidate` indica un problema ancora da verificare e `vulnerability` un finding confermato.
+
+### Analisi AI finale
+
+Nel percorso Agentic la fase finale può produrre descrizione, impatto e remediation per vulnerability e candidate.
+
+I batch vengono controllati contro la finestra di contesto. Un batch troppo grande viene diviso. Un singolo finding enorme viene compattato solo nella copia inviata al modello. L'evidenza originale resta intatta.
+
+### Origine dei testi nel report
+
+In Deterministic, descrizione, impatto e soluzione derivano dallo scanner o dal wrapper. Il reporting può completare campi mancanti solo per vulnerability confermate usando regole conservative.
+
+In Agentic, il nodo di analisi può produrre la narrativa finale per vulnerability e candidate. Il testo e l'evidenza originali rimangono disponibili. Observation e discovery non vengono convertite in vulnerability dall'AI.
+
+Il renderer mostra i campi finali. Non decide autonomamente il contenuto tecnico.
+
+### Report molto grandi
+
+Il payload viene compresso e trasferito in chunk di dimensione limitata. Il fallback locale usa la stessa struttura materializzata del report normale. La crescita della coverage non deve eliminare righe dalla ricostruzione finale.
+
+Se il PDF fallisce ma JSON e HTML sono validi, gli artefatti esistenti vengono conservati.
+
+## Configurazione
+
+Per una nuova applicazione conviene copiare `configs/platform.example.json` e rimuovere ciò che non serve:
+
+```bash
+cp configs/platform.example.json configs/mio-target.json
+```
+
+Il campo `authorization.confirmed` va impostato a `true` solo dopo aver verificato l'autorizzazione reale. Il parser richiede `schema_version`, `platform`, almeno un elemento in `assets`, almeno un servizio per asset e la sezione `execution`.
+
+Esempio minimo valido:
+
+```json
+{
+  "schema_version": 1,
+  "platform": {"name": "example-target"},
+  "authorization": {
+    "confirmed": true,
+    "reference": "riferimento autorizzazione",
+    "allow_same_host_ports": false,
+    "discover_same_host_services": false
+  },
+  "assets": [
+    {
+      "id": "webhost",
+      "host": "target.example",
+      "services": [
+        {
+          "id": "http-main",
+          "url": "http://target.example/",
+          "auth_only": false,
+          "allow_state_changes": false
+        }
+      ]
+    }
+  ],
+  "execution": {
+    "orchestrator": "agentic",
+    "mode": "balanced",
+    "request_rate": 10,
+    "model": "snap4city",
+    "max_rounds": 2,
+    "require_ai": true,
+    "allow_state_changes": false
+  }
+}
+```
+
+Un servizio può usare `url` oppure la combinazione `protocol`, `port` e `base_path`. `allow_same_host_ports` e `discover_same_host_services` appartengono a `authorization`, non al singolo servizio. La seconda opzione richiede la prima.
+
+Per un target autenticato aggiungere una credenziale e collegarla al servizio. Le password non vanno scritte nel JSON. Si indicano i nomi delle variabili d'ambiente:
+
+```json
+"credentials": {
+  "user": {
+    "kind": "browser_oidc",
+    "cookie_env": "SECOPS_TARGET_COOKIE",
+    "username_env": "SECOPS_TARGET_USERNAME",
+    "password_env": "SECOPS_TARGET_PASSWORD",
+    "login_path": "/",
+    "validation_path": "/",
+    "optional": true
+  }
+}
+```
+
+Nel servizio usare `"credential_ref": "user"`. Per più identità usare `credential_refs`. Se le variabili non sono disponibili, i profili browser/OIDC non opzionali possono richiedere i dati in console.
+
+Su Linux, per esempio:
+
+```bash
+export SECOPS_TARGET_USERNAME='utente'
+export SECOPS_TARGET_PASSWORD='password'
+```
+
+Per aggiungere altre origin esatte già autorizzate usare `authorization.allowed_origins` oppure ripetere `--authorized-origin` da CLI. Non usare `allowed_host_suffixes` per l'active testing.
+
+Non inserire nel config elenchi di endpoint presi da ground truth o benchmark. Le entry point devono essere reali punti iniziali autorizzati, non una lista usata per pilotare la discovery.
+
+Prima del run eseguire sempre il dry-run. Per una configurazione con login è utile anche `--auth-only`. Il file `configs/platform.example.json` mostra la forma completa con più asset, più servizi e più identità.
+
+## Opzioni principali di assessmentRunner
+
+`--config FILE` usa una configurazione multi-asset.
+
+`--target URL` esegue un target diretto. Con target diretto, `--cookies` passa la sessione primaria e `--secondary-cookies` aggiunge una seconda identità per confronti authorization/BOLA.
+
+`--orchestrator agentic|deterministic` sceglie il percorso.
+
+`--mode test|fast|balanced|deep` sceglie il profilo.
+
+`--model snap4city|llama|qwen` seleziona il backend AI Agentic.
+
+`--max-rounds 1|2|3` sovrascrive il numero di round Agentic.
+
+`--auth-only` esegue soltanto i profili autenticati.
+
+`--authorized` conferma l'autorizzazione per target non locali.
+
+`--authorized-origin URL` aggiunge una origin esatta autorizzata.
+
+`--allow-same-host-ports` e `--no-allow-same-host-ports` controllano lo scope multi-porta sullo stesso hostname.
+
+`--discover-same-host-services` e `--no-discover-same-host-services` controllano la service discovery proattiva.
+
+`--allow-state-changes` e `--no-allow-state-changes` controllano i probe che possono modificare stato, sempre entro limiti di tempo e quantità.
+
+`--require-ai` rende obbligatori planning e final analysis AI. `--no-require-ai` consente il fallback previsto dal progetto.
+
+`--dry-run` valida il piano senza avviare gli scanner.
+
+`--only ID` limita l'esecuzione a uno specifico job di servizio.
+
+`--stop-on-error` interrompe dopo il primo job bloccato. Un exit non-zero dell'orchestratore eseguibile è comunque fatale.
+
+Per la lista sempre aggiornata usare `python assessmentRunner.py --help`. Per le opzioni di installazione e preflight usare `python initScript.py --help`.
+
+## Monitoraggio
+
+```bash
+mkdir -p logs
+LOG="logs/balanced_$(date +%Y%m%d_%H%M%S).log"
+python assessmentRunner.py \
+  --config configs/dashboard-test.json \
+  --orchestrator agentic \
+  --max-rounds 2 \
+  --mode balanced \
+  --require-ai \
+  --authorized > "$LOG" 2>&1
+```
+
+```bash
+tail -n 300 -F "$LOG"
+```
+
+Per sessioni SSH lunghe usare `tmux`.
+
+## Dove sono i risultati
+
+Gli artefatti sono salvati in `reports/`.
+
+Per scaricare un file:
+
+```bash
+scp debian@<host>:/home/debian/Cybersecurity_AgenticAI/reports/<file> .
+```
+
+## Troubleshooting
+
+| Problema | Controllo |
+| --- | --- |
+| Login fallito | Verificare credenziali, redirect OIDC e log auth. |
+| Molti auth precheck falliti | Verificare la sessione sulla specifica radice applicativa. |
+| Discovery con coda residua | Controllare limiti, pagine lente e se la coda di discovery sta ancora producendo nuovi endpoint. |
+| Planner fallito | Controllare provider, budget e diagnostica dei batch. |
+| Tool partial | Leggere il codice diagnostico e il timeout. |
+| PDF mancante | Usare HTML e JSON e controllare la diagnostica del renderer. |
+| Rate sotto 10 req/s | Il rate è un massimo. Pagine lente e tool seriali possono non saturarlo. |
+
+## Sicurezza operativa
+
+Usare soltanto target propri o esplicitamente autorizzati.
+
+Il limite di traffico è coordinato cross-process. Evitare comunque assessment concorrenti sullo stesso target per non duplicare lavoro e stato degli scanner.
+
+Non abilitare state-changing probe senza una necessità esplicita.
+
+Non interpretare zero finding come prova di assenza di vulnerabilità senza controllare coverage e limitation.

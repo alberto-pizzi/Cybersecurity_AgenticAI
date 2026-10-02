@@ -82,6 +82,40 @@ def _finding_card(item: dict[str, Any], index: int, toc: list[tuple[int, str, st
             scanner_rows += _field('Scanner recommended remediation', item.get('scanner_solution'))
         scanner_block = f'<div class="scanner-original"><b class="quality-title">Original scanner assessment <span>(secondary audit)</span></b><dl>{scanner_rows}</dl></div>'
 
+    corroborating_block = ""
+    corroborating_findings = item.get("corroborating_findings") if isinstance(item.get("corroborating_findings"), list) else []
+    if corroborating_findings:
+        rendered: list[str] = []
+        for row_index, row in enumerate(corroborating_findings, start=1):
+            if not isinstance(row, dict):
+                continue
+            status = row.get("ai_analysis_status") if isinstance(row.get("ai_analysis_status"), dict) else {}
+            details = (
+                _field("Tool", row.get("tool"))
+                + _field("Profile / identity", row.get("profile"))
+                + _field("HTTP method", row.get("method"))
+                + _field("Affected URL", row.get("url"))
+                + _field("Parameter", row.get("parameter"))
+                + _field("Verification status", row.get("verification_status"))
+                + _field("Severity", str(row.get("risk") or "").upper())
+                + _field("Confidence", row.get("confidence"))
+                + _field("Description", row.get("description"))
+                + _field("Technical details", row.get("technical_details"))
+                + _field("Security impact", row.get("impact"))
+                + _field("Potential consequences", row.get("consequences"))
+                + _field("Recovery guidance", row.get("recovery"))
+                + _field("Remediation", row.get("solution"))
+                + _field("AI analysis state", status.get("status"))
+                + _field("AI analysis reason", status.get("reason"))
+                + _field("Source entry point", row.get("source_entry_point"))
+                + _field("Source job", row.get("source_job_id"))
+                + _field("Source report", row.get("source_report_id"))
+            )
+            evidence = _snippet_field(f"Corroborating evidence {row_index}", row.get("evidence"))
+            rendered.append(f'<div class="scanner-original"><b class="quality-title">Corroborating occurrence {row_index}</b><dl>{details}</dl>{evidence}</div>')
+        if rendered:
+            corroborating_block = '<div class="quality"><b class="quality-title">Corroborating evidence retained from merged occurrences</b>' + ''.join(rendered) + '</div>'
+
     ai_status_block = ""
     if ai_analysis_status:
         status = str(ai_analysis_status.get('status') or 'unknown')
@@ -89,6 +123,7 @@ def _finding_card(item: dict[str, Any], index: int, toc: list[tuple[int, str, st
             'analyzed': 'Analyzed directly by AI',
             'reused_equivalent': 'AI analysis reused from a strictly equivalent finding',
             'not_analyzed_budget': 'Not analyzed by AI — analysis time budget exhausted',
+            'not_analyzed_context': 'Not analyzed by AI — model context window limit',
             'not_analyzed_profile_limit': 'Not analyzed by AI — TEST profile analysis limit',
             'not_analyzed_ai_error': 'Not analyzed by AI — AI batch error',
             'not_analyzed_ai_incomplete_response': 'Not analyzed by AI — incomplete AI response',
@@ -149,6 +184,7 @@ def _finding_card(item: dict[str, Any], index: int, toc: list[tuple[int, str, st
 {ai_status_block}
 {ai_block}
 {scanner_block}
+{corroborating_block}
 {('<div class="quality"><b>Data-quality notes</b>' + _render_list(notes) + '</div>') if notes else ''}
 </article>"""
 

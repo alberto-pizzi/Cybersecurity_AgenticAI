@@ -40,16 +40,16 @@ REPORTS_DIR = ROOT / "reports"
 # Last-resort parent watchdog. The Agentic child has a slightly shorter internal deadline so it
 # normally finalizes reports itself; this guard exists only for hangs outside the workflow guards.
 AGENTIC_PARENT_EXECUTION_BUDGET_SECONDS = {
-    'test': 60 * 60,
-    'fast': 14 * 60 * 60,
-    'balanced': 30 * 60 * 60,
-    'deep': 56 * 60 * 60,
+    'test': 90 * 60,
+    'fast': 16 * 60 * 60,
+    'balanced': 48 * 60 * 60,
+    'deep': 96 * 60 * 60,
 }
 AGENTIC_PARENT_FINALIZATION_BUDGET_SECONDS = {
     'test': 40 * 60,
     'fast': 240 * 60,
-    'balanced': 450 * 60,
-    'deep': 870 * 60,
+    'balanced': 600 * 60,
+    'deep': 1200 * 60,
 }
 # Parent-only emergency slack beyond the child's already-generous internal watchdog. This catches a
 # genuinely stuck process; it must never be the thing that decides normal scanner/AI/report coverage.
@@ -57,9 +57,9 @@ AGENTIC_PARENT_WATCHDOG_SLACK_SECONDS = {
     # Always wider than the child's own emergency slack for the same profile.
     # This is intentionally generous because the parent timeout is a process-hang kill switch,
     # not a coverage or finalization scheduler.
-    'test': 50 * 60,
-    'fast': 240 * 60,
-    'balanced': 480 * 60,
+    'test': 55 * 60,
+    'fast': 300 * 60,
+    'balanced': 600 * 60,
     'deep': 960 * 60,
 }
 AGENTIC_JOB_WATCHDOG_SECONDS = {
@@ -1477,8 +1477,8 @@ def main() -> int:
     service_discovery_group.add_argument("--no-discover-same-host-services", dest="discover_same_host_services", action="store_false", help="Disable proactive same-host service discovery.")
     parser.add_argument("--authorized-host-suffix", action="append", default=[], help=argparse.SUPPRESS)
     state_change_group = parser.add_mutually_exclusive_group()
-    state_change_group.add_argument("--allow-state-changes", dest="allow_state_changes", action="store_true", default=None, help="Explicitly allow bounded state-changing probes for this run.")
-    state_change_group.add_argument("--no-allow-state-changes", dest="allow_state_changes", action="store_false", help="Explicitly disable bounded state-changing probes, including on local targets.")
+    state_change_group.add_argument("--allow-state-changes", dest="allow_state_changes", action="store_true", default=None, help="Explicitly allow state-changing probes within configured safety and time limits for this run.")
+    state_change_group.add_argument("--no-allow-state-changes", dest="allow_state_changes", action="store_false", help="Explicitly disable state-changing probes, including on local targets.")
     ai_group = parser.add_mutually_exclusive_group()
     ai_group.add_argument("--require-ai", dest="require_ai", action="store_true", default=None, help="Require successful Agentic planning and final AI analysis.")
     ai_group.add_argument("--no-require-ai", dest="require_ai", action="store_false", help="Allow the existing Agentic deterministic fallback when AI planning fails.")
