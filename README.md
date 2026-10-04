@@ -21,16 +21,12 @@ The system does **not** take benchmarks or endpoint lists as input: the surface 
 ```bash
 cd ~/Cybersecurity_AgenticAI
 python initScript.py              # installs/verifies dependencies, scanners, Chromium, preflight
-python initScript.py --with-lab   # adds the local lab and the AI backends
+python initScript.py --with-lab   # adds the local lab and prepares all supported AI backends
 ```
 
 Requirements: **Python 3.13** on a Debian VM, network access to the authorized target, disk space for scanners and reports.
 
-To prepare an AI backend together with the lab:
-
-```bash
-python initScript.py --with-lab --prepare-ai snap4city   # or: llama / qwen
-```
+With `--with-lab`, if neither `--prepare-ai` nor `--agentic-model` is specified, the initializer prepares **all supported AI backends** and the Agentic default is **Snap4City**. Use `--prepare-ai snap4city|llama|qwen` only when you want to restrict preparation to one backend. Snap4City is remote, so it is configured/prepared rather than downloaded locally.
 
 > Snap4City uses provider credentials **separate** from the target's.
 
@@ -64,10 +60,14 @@ python assessmentRunner.py --config configs/dashboard-test.json \
 | `assessmentRunner.py` | Expands the config, prepares the jobs, and launches the orchestrator. |
 | `orchestratorShared.py` | Discovery, scope, rate, request contract, sessions, and common helpers. |
 | `orchestratorDeterministic.py` | Fixed, reproducible pipeline. |
-| `orchestratorAgentic.py` / `orchestratorAgenticCore.py` | AI planner, rounds, execution, verification, and final analysis. |
+| `orchestratorAgentic.py` | Agentic entry point and LangGraph wiring. |
+| `orchestratorAgenticCore.py` | AI planner, rounds, execution, verification, and final analysis. |
+| `utils.py` | Shared low-level utilities, request-rate policy/pacing, process coordination, runtime helpers, and safe parsing. |
 | `servers/` | MCP wrappers and checks developed in the project. |
 | `servers/reporting/` | Normalization, coverage, and report rendering. |
-| `initScript.py` / `setupTools.py` | Initialization, operator guide, and tool preflight. |
+| `initScript.py` | Initializes the environment and generates the operator guide. |
+| `setupTools.py` | Installs/verifies scanners, dependencies, and preflight requirements. |
+| `setupLab.py` | Creates/verifies the optional local Docker lab and its session. |
 
 **Deterministic** and **Agentic** share discovery, sessions, scope, scanners, and reporting. Only **how** actions are chosen differs.
 
@@ -114,21 +114,35 @@ The first ones are **third-party open source** with MCP wrappers; the last ones 
 
 **BALANCED is the recommended default.** TEST is diagnostic only; FAST/BALANCED/DEEP are coverage profiles.
 
-The **operating rate** is **10 request starts/s** (a maximum, not a minimum). The pacer is shared cross-process: two runs by the same user do not multiply the rate. Parallelism exploits I/O without increasing the request peak.
+The default `execution.request_rate` is **10 request starts/s**, but the JSON configuration accepts any **integer from 1 to 50**. Invalid values fall back to the default 10 rather than being silently clamped. The pacer is shared cross-process, so parallel workers do not multiply the configured rate. A lower configured rate expands target-traffic-dependent time budgets so coverage is not reduced only because requests are intentionally slower. The values below are the base ceilings at the default rate of 10.
 
 ```json
 { "execution": { "request_rate": 10 } }
 ```
 
-| Phase | TEST | FAST | BALANCED | DEEP |
+| Phase / limit | TEST | FAST | BALANCED | DEEP |
 | --- | ---: | ---: | ---: | ---: |
-| Operational execution | 1.5 h | 16 h | 48 h | 96 h |
+| Planner per round | 5 min | 6 h | 30 h | 48 h |
+| Planner cumulative | 5 min | 12 h | 60 h | 144 h |
+| Operational execution | 2 h | 32 h | 96 h | 192 h |
 | Verification | 10 min | 60 min | 120 min | 240 min |
-| AI analysis | 10 min | 120 min | 360 min | 720 min |
+| Final AI analysis | 20 min | 4 h | 12 h | 24 h |
 | Reporting | 20 min | 60 min | 120 min | 240 min |
-| Hard watchdog | 3 h | 24 h | 66 h | 128 h |
+| Internal hard watchdog | 4 h | 44 h | 128 h | 256 h |
+| Parent-process watchdog | 4.5 h | 46 h | 132 h | 264 h |
 
-> The watchdog is a safety net against hangs, not an expected duration.
+The planner limits are ceilings inside the operational phase. Verification, final AI analysis, and reporting have protected windows after operational execution. The parent watchdog is the last process-hang guard, not an expected run duration.
+
+Important per-action/tool timeouts at the default rate of 10:
+
+| Tool | TEST | FAST | BALANCED | DEEP |
+| --- | ---: | ---: | ---: | ---: |
+| FFUF | 10 s | 1 h | 2 h | 4 h |
+| Commix | 10 s | 180 s | 300 s | 480 s |
+| Browser | 10 s | 120 s | 240 s | 360 s |
+| Authorization | 10 s | 90 s | 120 s | 180 s |
+
+FFUF uses its profile timeout as the global action budget. Its compact general phase may use the time still remaining after the earlier FFUF phases. Planner provider calls have a 20 s minimum useful slice. TEST analysis rescue/split calls and the Snap4City read timeout also use a 20 s floor. The remaining scanners retain their existing profile timeout settings.
 
 ---
 
@@ -210,7 +224,7 @@ Verify login and session before a long run with `--auth-only`.
 | `--config FILE` / `--target URL` | Multi-asset config or direct target. |
 | `--orchestrator agentic\|deterministic` | Chooses the path. |
 | `--mode test\|fast\|balanced\|deep` | Chooses the profile. |
-| `--model snap4city\|llama\|qwen` | AI backend (Agentic). |
+| `--model snap4city\|llama\|qwen` | AI backend (Agentic, default: Snap4City). |
 | `--max-rounds 1\|2\|3` | Number of Agentic rounds. |
 | `--require-ai` / `--no-require-ai` | Makes AI planning/analysis mandatory (or optional). |
 | `--auth-only` | Runs only the authenticated profiles. |
@@ -257,7 +271,7 @@ tail -n 300 -F "$LOG"     # on long SSH sessions use tmux
 | Planner failed | Provider, AI budget, and batch diagnostics. |
 | Tool partial | Diagnostic code and timeout before re-running. |
 | Missing PDF | Use HTML/JSON and check the renderer diagnostics. |
-| Rate below 10 req/s | Normal with slow pages or serial tools: the rate is a **maximum**. |
+| Effective rate below the configured value | Normal with slow pages or serial tools: `execution.request_rate` is a **maximum**, not a minimum. |
 
 ---
 

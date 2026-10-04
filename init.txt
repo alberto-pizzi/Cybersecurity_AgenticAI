@@ -19,12 +19,13 @@ STEP 1 - INITIALIZATION
 -----------------------
 
   python initScript.py              Installs/verifies environment, scanners, Chromium, preflight.
-  python initScript.py --with-lab   Adds the local lab and the AI backends.
+  python initScript.py --with-lab   Adds the local lab and prepares all supported AI backends.
   python initScript.py --commands-only   Prints this guide without installing anything.
 
-  AI provider (with --with-lab):
-    --prepare-ai snap4city|llama|qwen    snap4city = remote; llama/qwen = local Ollama.
-    --snap4city-credentials FILE         Provider credentials (separate from the target).
+  AI preparation with --with-lab:
+    no selector                         Prepares all supported backends. Agentic defaults to Snap4City.
+    --prepare-ai snap4city|llama|qwen   Restricts preparation to one backend. Snap4City is remote. llama/qwen use local Ollama.
+    --snap4city-credentials FILE        Provider credentials (separate from the target).
 
   Do not use --skip-scanners or --skip-browser in a normal installation.
 
@@ -60,13 +61,42 @@ CONFIGURATION
   Full example and authentication section: README.
 
 
+PROFILES, RATE, AND TIME BUDGETS
+-------------------------------
+
+  execution.request_rate defaults to 10 request starts/s and accepts JSON integers from 1 to 50.
+  Invalid values fall back to 10. The configured rate is a maximum, not a throughput target.
+  The values below are base ceilings at the default rate of 10. Lower configured rates expand
+  target-traffic-dependent budgets.
+
+  Profile                    TEST       FAST       BALANCED    DEEP
+  Planner / round            5 min      6 h        30 h        48 h
+  Planner cumulative         5 min      12 h       60 h        144 h
+  Operational execution      2 h        32 h       96 h        192 h
+  Verification               10 min     60 min     120 min     240 min
+  Final AI analysis          20 min     4 h        12 h        24 h
+  Reporting                  20 min     60 min     120 min     240 min
+  Internal watchdog          4 h        44 h       128 h       256 h
+  Parent watchdog            4.5 h      46 h       132 h       264 h
+
+  Important per-action/tool timeouts at the default rate of 10:
+  FFUF                       10 s       1 h        2 h         4 h
+  Commix                     10 s       180 s      300 s       480 s
+  Browser                    10 s       120 s      240 s       360 s
+  Authorization              10 s       90 s       120 s       180 s
+
+  FFUF uses the profile timeout as its global action budget. Its compact general phase may use the
+  time remaining after earlier FFUF phases. Planner provider calls use a 20 s minimum useful slice.
+  TEST analysis rescue/split calls and the Snap4City read timeout also have a 20 s floor. The
+  remaining scanners retain their existing profile timeout settings.
+
 initScript.py OPTIONS  (complete list)
 --------------------------------------
 
   -h, --help                              Show help and exit.
   --with-lab                              Start/verify the local lab + ZAP, prepare the AI backends, create a session.
   --run none|deterministic|agentic        Run the DVWA assessment after init (deterministic/agentic require --with-lab).
-  --prepare-ai all|snap4city|llama|qwen   AI backends prepared by --with-lab (omitted with --agentic-model = all).
+  --prepare-ai all|snap4city|llama|qwen   AI backends prepared by --with-lab. If both AI selectors are omitted, all are prepared.
   --agentic-model snap4city|llama|qwen    Model used by --run agentic and the printed commands (if --prepare-ai is omitted, prepares only this one).
   --snap4city-credentials FILE            Snap4City provider credentials JSON (not the target account).
   --mode test|fast|balanced|deep          Coverage/runtime profile (default balanced; test = short budgets).
