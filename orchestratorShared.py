@@ -247,14 +247,14 @@ SCAN_MODES = {
         'arjun': TEST_SCANNER_TIMEOUT_SECONDS, 'arjun_limit': 2,
     },
     'fast': {
-        'broad': {'zap': 180, 'nuclei': 360, 'nikto': 90, 'ffuf': 600, 'session': 40},
-        'parameter': {'sqlmap': 75, 'dalfox': 45, 'commix': 90, 'traversal': 35, 'idor': 18, 'authorization': 30, 'browser': 45, 'workflow': 40},
+        'broad': {'zap': 180, 'nuclei': 360, 'nikto': 90, 'ffuf': 3600, 'session': 40},
+        'parameter': {'sqlmap': 75, 'dalfox': 45, 'commix': 180, 'traversal': 35, 'idor': 18, 'authorization': 90, 'browser': 120, 'workflow': 40},
         'limits': {'sqlmap': 6, 'dalfox': 8, 'commix': 6, 'traversal': 8, 'idor': 6, 'authorization': 10, 'browser': 10, 'workflow': 8},
         'arjun': 90, 'arjun_limit': 24,
     },
     'balanced': {
-        'broad': {'zap': 3000, 'nuclei': 4800, 'nikto': 300, 'ffuf': 2400, 'session': 90},
-        'parameter': {'sqlmap': 180, 'dalfox': 120, 'commix': 180, 'traversal': 75, 'idor': 45, 'authorization': 70, 'browser': 120, 'workflow': 105},
+        'broad': {'zap': 3000, 'nuclei': 4800, 'nikto': 300, 'ffuf': 7200, 'session': 90},
+        'parameter': {'sqlmap': 180, 'dalfox': 120, 'commix': 300, 'traversal': 75, 'idor': 45, 'authorization': 120, 'browser': 240, 'workflow': 105},
         # Each selected case runs with its own independent per-case timeout (the 'parameter'
         # timeouts above), so larger selection limits increase total phase breadth while preserving
         # the per-case execution budget.
@@ -262,8 +262,8 @@ SCAN_MODES = {
         'arjun': 300, 'arjun_limit': 180,
     },
     'deep': {
-        'broad': {'zap': 7200, 'nuclei': 10800, 'nikto': 600, 'ffuf': 7200, 'session': 150},
-        'parameter': {'sqlmap': 300, 'dalfox': 210, 'commix': 300, 'traversal': 120, 'idor': 90, 'authorization': 120, 'browser': 210, 'workflow': 180},
+        'broad': {'zap': 7200, 'nuclei': 10800, 'nikto': 600, 'ffuf': 14400, 'session': 150},
+        'parameter': {'sqlmap': 300, 'dalfox': 210, 'commix': 480, 'traversal': 120, 'idor': 90, 'authorization': 180, 'browser': 360, 'workflow': 180},
         'limits': {'sqlmap': 128, 'dalfox': 160, 'commix': 112, 'traversal': 160, 'idor': 112, 'authorization': 192, 'browser': 192, 'workflow': 160},
         'arjun': 600, 'arjun_limit': 320,
     },

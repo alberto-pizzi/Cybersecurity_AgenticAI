@@ -40,16 +40,16 @@ REPORTS_DIR = ROOT / "reports"
 # Last-resort parent watchdog. The Agentic child has a slightly shorter internal deadline so it
 # normally finalizes reports itself; this guard exists only for hangs outside the workflow guards.
 AGENTIC_PARENT_EXECUTION_BUDGET_SECONDS = {
-    'test': 90 * 60,
-    'fast': 16 * 60 * 60,
-    'balanced': 48 * 60 * 60,
-    'deep': 96 * 60 * 60,
+    'test': 2 * 60 * 60,
+    'fast': 32 * 60 * 60,
+    'balanced': 96 * 60 * 60,
+    'deep': 192 * 60 * 60,
 }
 AGENTIC_PARENT_FINALIZATION_BUDGET_SECONDS = {
-    'test': 40 * 60,
-    'fast': 240 * 60,
-    'balanced': 600 * 60,
-    'deep': 1200 * 60,
+    'test': 50 * 60,
+    'fast': 6 * 60 * 60,
+    'balanced': 16 * 60 * 60,
+    'deep': 32 * 60 * 60,
 }
 # Parent-only emergency slack beyond the child's already-generous internal watchdog. This catches a
 # genuinely stuck process; it must never be the thing that decides normal scanner/AI/report coverage.
@@ -57,10 +57,10 @@ AGENTIC_PARENT_WATCHDOG_SLACK_SECONDS = {
     # Always wider than the child's own emergency slack for the same profile.
     # This is intentionally generous because the parent timeout is a process-hang kill switch,
     # not a coverage or finalization scheduler.
-    'test': 55 * 60,
-    'fast': 300 * 60,
-    'balanced': 600 * 60,
-    'deep': 960 * 60,
+    'test': 100 * 60,
+    'fast': 8 * 60 * 60,
+    'balanced': 20 * 60 * 60,
+    'deep': 40 * 60 * 60,
 }
 AGENTIC_JOB_WATCHDOG_SECONDS = {
     mode: (

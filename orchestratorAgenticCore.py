@@ -87,19 +87,19 @@ class AgentState(TypedDict):
 # CPU-only Ollama hosts can take far longer than 720s to prefill+decode a JSON-schema-constrained
 # plan (no tokens at all until prefill finishes), so these budgets stay generous by default.
 AI_PLANNER_TIMEOUTS = {
-    'test': 120,
-    'fast': 1800,
-    'balanced': 3600,
-    'deep': 5400,
+    'test': 5 * 60,
+    'fast': 6 * 60 * 60,
+    'balanced': 30 * 60 * 60,
+    'deep': 48 * 60 * 60,
 }
 # Whole-assessment control-plane guard. Per-round budgets above remain generous ceilings, but a
 # pathologically slow provider must not consume hours simply because FAST/BALANCED/DEEP allow
 # multiple planning rounds. Unused time from an early round remains available to later rounds.
 AI_PLANNER_WORKFLOW_TIMEOUTS = {
-    'test': 120,
-    'fast': 3600,       # two full 30-minute planning rounds
-    'balanced': 7200,   # two full 60-minute planning rounds
-    'deep': 16200,      # three full 90-minute planning rounds
+    'test': 5 * 60,
+    'fast': 12 * 60 * 60,
+    'balanced': 60 * 60 * 60,
+    'deep': 144 * 60 * 60,
 }
 # Reserve a useful slice for each later round before allowing the current round to consume the
 # workflow-wide planner budget. If the remaining total is already below the reserve schedule, the
@@ -175,10 +175,10 @@ AI_ANALYSIS_STAGE_TIMEOUTS = {
     # These ceilings match the protected analysis windows below. They are phase budgets, not a
     # subtraction from scanner coverage: the global watchdog is deliberately wider than the sum
     # of the operational execution and finalization windows.
-    'test': 10 * 60,
-    'fast': 120 * 60,
-    'balanced': 360 * 60,
-    'deep': 720 * 60,
+    'test': 20 * 60,
+    'fast': 4 * 60 * 60,
+    'balanced': 12 * 60 * 60,
+    'deep': 24 * 60 * 60,
 }
 AI_ANALYSIS_FUTURE_BATCH_RESERVE_SECONDS = {
     'test': 12,
@@ -278,10 +278,10 @@ ROUND_EXECUTION_ACTION_ADAPTIVE_CEILINGS = {
 # interpretation and report rendering.
 # Lower target request rates expand only this target-traffic-dependent phase.
 AGENTIC_EXECUTION_PHASE_BUDGETS = {
-    'test': 90 * 60,
-    'fast': 16 * 60 * 60,
-    'balanced': 48 * 60 * 60,
-    'deep': 96 * 60 * 60,
+    'test': 2 * 60 * 60,
+    'fast': 32 * 60 * 60,
+    'balanced': 96 * 60 * 60,
+    'deep': 192 * 60 * 60,
 }
 
 # Finalization phase budgets are ADDITIVE to the operational execution envelope. They do not eat
@@ -295,10 +295,10 @@ AGENTIC_VERIFICATION_RESERVE_SECONDS = {
     'deep': 240 * 60,
 }
 AGENTIC_ANALYSIS_RESERVE_SECONDS = {
-    'test': 10 * 60,
-    'fast': 120 * 60,
-    'balanced': 360 * 60,
-    'deep': 720 * 60,
+    'test': 20 * 60,
+    'fast': 4 * 60 * 60,
+    'balanced': 12 * 60 * 60,
+    'deep': 24 * 60 * 60,
 }
 AGENTIC_REPORT_RESERVE_SECONDS = {
     'test': 20 * 60,
@@ -319,10 +319,10 @@ AGENTIC_FINALIZATION_RESERVE_SECONDS = {
 # never be consumed; it exists only so cleanup/emergency-artifact recovery or an unexpected hang is
 # not killed exactly at a legitimate phase boundary.
 AGENTIC_WATCHDOG_SAFETY_MARGIN_SECONDS = {
-    'test': 50 * 60,
-    'fast': 240 * 60,
-    'balanced': 480 * 60,
-    'deep': 720 * 60,
+    'test': 70 * 60,
+    'fast': 6 * 60 * 60,
+    'balanced': 16 * 60 * 60,
+    'deep': 32 * 60 * 60,
 }
 
 # Compatibility/public table for the internal child hard guard at rate=10. This is intentionally
@@ -1415,7 +1415,7 @@ def _snap4city_chat_content(
 
     remaining = remaining_timeout()
     connect_timeout = max(0.5, min(10.0, remaining * 0.10))
-    read_timeout = max(0.5, remaining - connect_timeout)
+    read_timeout = max(20.0, remaining - connect_timeout)
     response = requests.post(
         state['snap4city_api_url'],
         json=body,
@@ -1955,7 +1955,10 @@ def ai_plan(state: AgentState) -> dict[str, Any]:
             remaining = request_deadline - time.monotonic()
             if remaining <= 0:
                 raise TimeoutError('planner batch provider-call budget exhausted')
-            return max(1, int(math.ceil(remaining)))
+            available = int(math.ceil(remaining))
+            if available < 20:
+                raise TimeoutError('planner batch provider-call budget fell below the 20-second AI-call floor')
+            return available
 
         prompt = build_batch_prompt(batch_number, len(batches), batch, len(selected_ids))
         prompt, context, context_window, candidate_count = _fit_planner_prompt_context(
@@ -2092,7 +2095,11 @@ def ai_plan(state: AgentState) -> dict[str, Any]:
                     raise TimeoutError(
                         f'planner batch fair-share budget exhausted before attempt {attempt}'
                     )
-                request_timeout = max(1, int(math.ceil(remaining_batch_budget)))
+                request_timeout = int(math.ceil(remaining_batch_budget))
+                if request_timeout < 20:
+                    raise TimeoutError(
+                        'planner batch fair-share budget fell below the 20-second AI-call floor'
+                    )
                 compact_plan, context, context_window, candidate_count, kind = run_one_batch(batch_number, batch, request_timeout)
                 endpoint_kinds.append(kind)
                 total_context_bytes += len(context.encode('utf-8'))
@@ -2763,9 +2770,9 @@ def _ai_analysis_batch(state: AgentState, batch: list[dict[str, Any]], all_candi
     if mode == 'test':
         rescue_reserve = 10
         if len(batch) == 1:
-            preferred_chat_budget = max(15, min(int(parent_timeout * 0.70), max(15, parent_timeout - rescue_reserve)))
+            preferred_chat_budget = max(20, min(int(parent_timeout * 0.70), max(20, parent_timeout - rescue_reserve)))
         else:
-            preferred_chat_budget = max(15, min(int(parent_timeout * 0.70), 30))
+            preferred_chat_budget = max(20, min(int(parent_timeout * 0.70), 30))
     elif len(batch) == 1:
         preferred_chat_budget = max(60, min(int(parent_timeout * 0.62), parent_timeout - 45))
     else:
@@ -2796,7 +2803,7 @@ def _ai_analysis_batch(state: AgentState, batch: list[dict[str, Any]], all_candi
             raise RuntimeError('; '.join(errors)) from exc
 
     remaining = max(0, int(timeout - (time.monotonic() - started)))
-    rescue_minimum = 8 if mode == 'test' else 40
+    rescue_minimum = 20 if mode == 'test' else 40
     if remaining < rescue_minimum:
         message = '; '.join(errors + ['single-finding rescue skipped: analysis budget exhausted'])
         if _ai_exception_is_timeout(first_error):
@@ -2853,7 +2860,7 @@ def _ai_analysis_batch_adaptive(
     if deadline is None:
         deadline = time.monotonic() + max(1, int(timeout))
     remaining = max(0, int(deadline - time.monotonic()))
-    attempt_floor = 12 if shared.CURRENT_SCAN_MODE == 'test' else 45
+    attempt_floor = 20 if shared.CURRENT_SCAN_MODE == 'test' else 45
     if remaining < attempt_floor:
         raise AnalysisBudgetExhausted(f'{label} exhausted its shared analysis batch budget before another AI attempt could start.')
 
@@ -2868,7 +2875,7 @@ def _ai_analysis_batch_adaptive(
         )
         rows: list[dict[str, Any]] = []
         split_remaining = max(0, int(deadline - time.monotonic()))
-        left_floor = 12 if shared.CURRENT_SCAN_MODE == 'test' else 45
+        left_floor = 20 if shared.CURRENT_SCAN_MODE == 'test' else 45
         left_share = max(left_floor, int(split_remaining * (len(left) / max(1, len(batch)))))
         left_deadline = min(deadline, time.monotonic() + left_share)
         try:
@@ -2925,7 +2932,7 @@ def _ai_analysis_batch_adaptive(
         # the second child receives whatever remains under the same parent deadline. If one child
         # later exhausts the shared deadline, preserve rows already completed by the sibling instead
         # of throwing away valid AI work for the whole parent batch.
-        left_floor = 12 if shared.CURRENT_SCAN_MODE == 'test' else 45
+        left_floor = 20 if shared.CURRENT_SCAN_MODE == 'test' else 45
         left_share = max(left_floor, int(remaining * (len(left) / max(1, len(batch)))))
         left_deadline = min(deadline, time.monotonic() + left_share)
         try:
