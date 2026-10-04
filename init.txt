@@ -1,409 +1,125 @@
-SECOPS INITIALIZER - GUIDA OPERATIVA
-===================================
+SECOPS INITIALIZER - TECHNICAL GUIDE
+====================================
 
-MANUALE OPERATIVO
------------------
+Schematic reference of all commands and options of initScript.py and assessmentRunner.py.
+Architecture, tool table, profiles/budgets, scope, and troubleshooting: see README.
+Always aligned with the code: python <script> --help.
 
-Questa guida contiene i comandi principali per installare, verificare e usare il progetto. I dettagli architetturali completi sono nel README e nella relazione.
+THERE ARE ONLY TWO CORE STEPS:
+  1) initScript.py        -> prepares the environment (one time only).
+  2) assessmentRunner.py  -> runs the assessment in the chosen mode (agentic or deterministic)
+                             with the desired --config. This is the only step that repeats.
+--dry-run and --auth-only are NOT steps of their own: only optional checks before step 2.
 
-1. PREPARAZIONE
----------------
+Requirements: Python 3.13 on a Debian VM, network to the authorized target, disk space.
+Use only your own targets or ones you are explicitly authorized to test.
 
-Dalla root del progetto, per installare o verificare ambiente, scanner, Chromium e preflight:
 
-  python initScript.py
-
-Per aggiungere anche il laboratorio locale e la preparazione dei backend AI:
-
-  python initScript.py --with-lab
-
-Per stampare i comandi senza installare o avviare componenti:
-
-  python initScript.py --commands-only
-
-Per preparare un solo provider AI insieme al laboratorio:
-
-  python initScript.py --with-lab --prepare-ai snap4city
-  python initScript.py --with-lab --prepare-ai llama
-  python initScript.py --with-lab --prepare-ai qwen
-
-Snap4City è il provider remoto previsto dal progetto. Llama e Qwen usano Ollama locale.
-
-Se Snap4City non ha ancora credenziali o token utilizzabili:
-
-  python initScript.py --with-lab --prepare-ai snap4city \
-    --snap4city-credentials snap4city_model_credentials.json
-
-Le credenziali del provider AI sono separate da username, password e cookie del target.
-
-2. PREFLIGHT
-------------
-
-Il preflight controlla runtime, server MCP, binari e dipendenze richieste dai wrapper.
-
-Non usare --skip-scanners in un'installazione normale. Questa opzione serve solo quando si vuole inizializzare il progetto senza installare gli scanner.
-
-Il browser è richiesto per le verifiche Chromium. --skip-browser lo rende opzionale e i controlli browser-only verranno saltati.
-
-3. DRY-RUN
-----------
-
-Prima di un assessment lungo:
-
-  python assessmentRunner.py \
-    --config configs/dashboard-test.json \
-    --orchestrator agentic \
-    --mode balanced \
-    --max-rounds 2 \
-    --require-ai \
-    --dry-run \
-    --authorized
-
-Il dry-run valida configurazione, scope e job. Non esegue scanner.
-
-4. ASSESSMENT
--------------
-
-Agentic BALANCED:
-
-  python assessmentRunner.py \
-    --config configs/dashboard-test.json \
-    --orchestrator agentic \
-    --max-rounds 2 \
-    --mode balanced \
-    --require-ai \
-    --authorized
-
-Deterministic BALANCED:
-
-  python assessmentRunner.py \
-    --config configs/dashboard-test.json \
-    --orchestrator deterministic \
-    --mode balanced \
-    --authorized
-
-Target diretto:
-
-  python assessmentRunner.py \
-    --target http://target \
-    --orchestrator agentic \
-    --mode balanced \
-    --authorized
-
-5. NUOVA APPLICAZIONE E CONFIGURAZIONE
------------------------------------
-
-Copiare configs/platform.example.json e modificare la copia:
-
-  cp configs/platform.example.json configs/mio-target.json
-
-Non creare il JSON da memoria. Impostare authorization.confirmed=true solo dopo aver verificato l'autorizzazione reale.
-
-Campi minimi obbligatori:
-  schema_version = 1
-  platform.name
-  assets[] con id e almeno un servizio
-  ogni servizio con id e url, oppure protocol + port + base_path
-  execution
-
-Esempio minimo valido:
-
-  {
-    "schema_version": 1,
-    "platform": {"name": "example-target"},
-    "authorization": {
-      "confirmed": true,
-      "reference": "riferimento autorizzazione",
-      "allow_same_host_ports": false,
-      "discover_same_host_services": false
-    },
-    "assets": [{
-      "id": "webhost",
-      "host": "target.example",
-      "services": [{
-        "id": "http-main",
-        "url": "http://target.example/",
-        "auth_only": false,
-        "allow_state_changes": false
-      }]
-    }],
-    "execution": {
-      "orchestrator": "agentic",
-      "mode": "balanced",
-      "request_rate": 10,
-      "model": "snap4city",
-      "max_rounds": 2,
-      "require_ai": true,
-      "allow_state_changes": false
-    }
-  }
-
-Per login browser/OIDC aggiungere credentials e collegare il nome al servizio con credential_ref o credential_refs. Usare cookie_env, username_env e password_env invece di scrivere segreti nel JSON.
-
-Esempio:
-  "credentials": {
-    "user": {
-      "kind": "browser_oidc",
-      "cookie_env": "SECOPS_TARGET_COOKIE",
-      "username_env": "SECOPS_TARGET_USERNAME",
-      "password_env": "SECOPS_TARGET_PASSWORD",
-      "login_path": "/",
-      "validation_path": "/",
-      "optional": true
-    }
-  }
-
-Poi nel servizio:
-  "credential_ref": "user"
-
-Prima di eseguire usare --dry-run. Per controllare soltanto login e sessione usare --auth-only.
-
-6. SCOPE
---------
-
-Default: same-origin.
-
---authorized-origin URL
-  Aggiunge una origin HTTP o HTTPS esatta.
-
---allow-same-host-ports
-  Autorizza HTTP o HTTPS su altre porte dello stesso hostname esatto.
-
---discover-same-host-services
-  Cerca servizi web sullo stesso hostname. Richiede l'autorizzazione multi-porta.
-
-Queste opzioni non autorizzano host sibling.
-
-7. RATE E STATE CHANGES
+STEP 1 - INITIALIZATION
 -----------------------
 
-Il rate operativo normale è 10 request start/s.
+  python initScript.py              Installs/verifies environment, scanners, Chromium, preflight.
+  python initScript.py --with-lab   Adds the local lab and the AI backends.
+  python initScript.py --commands-only   Prints this guide without installing anything.
 
-Il parallelismo non deve aumentare il picco di traffico. Il pacer è condiviso anche tra processi dello stesso utente sulla VM. Run concorrenti sullo stesso target restano sconsigliati perché duplicano lavoro e possono contendere scanner stateful.
+  AI provider (with --with-lab):
+    --prepare-ai snap4city|llama|qwen    snap4city = remote; llama/qwen = local Ollama.
+    --snap4city-credentials FILE         Provider credentials (separate from the target).
 
---no-allow-state-changes
-  Mantiene bloccati probe distruttivi o non necessari.
+  Do not use --skip-scanners or --skip-browser in a normal installation.
 
---allow-state-changes
-  Abilita probe state-changing limitati da budget e policy per un run esplicitamente autorizzato.
 
-8. AUTENTICAZIONE
------------------
-
-Sono supportati anonymous, cookie e browser/OIDC.
-
-Con --target diretto, --cookies passa la sessione primaria e --secondary-cookies aggiunge una seconda identità. Con --config è preferibile usare credentials e credential_ref/credential_refs.
-
-Le sessioni sono separate per identità e radice applicativa.
-
-Per controllare solo l'autenticazione:
-
-  python assessmentRunner.py \
-    --config <config.json> \
-    --orchestrator agentic \
-    --mode balanced \
-    --auth-only \
-    --authorized
-
-Un rifiuto conclusivo delle credenziali blocca submit ripetuti. Errori tecnici possono essere ritentati dopo cooldown.
-
-9. DISCOVERY
-------------
-
-La discovery usa crawler HTTP, Chromium, JavaScript, request contract, FFUF, Arjun, ZAP e service discovery quando autorizzata.
-
-La superficie viene divisa in famiglie. Le nuove famiglie ricevono priorità iniziale per evitare che una sola area molto grande saturi la coda.
-
-FFUF, Arjun e ZAP possono ampliare il grafo delle richieste osservate. Nel percorso Agentic devono essere selezionati dal modello. Nel percorso Deterministic possono essere previsti dalla pipeline.
-
-Limiti principali:
-
-  TEST      HTTP 8/16        Browser 4/8         Script 12
-  FAST      HTTP 360/1200    Browser 220/700     Script 640
-  BALANCED  HTTP 2500/8000   Browser 1500/5000   Script 4000
-  DEEP      HTTP 6000/18000  Browser 3500/10000  Script 8000
-
-I valori base/max sono ceiling. La discovery può terminare prima quando non produce nuova superficie.
-
-10. AGENTIC E LANGGRAPH
-----------------------
-
-L'Agentic costruisce azioni concrete dalla discovery. Il modello decide quali azioni eseguire e la loro priorità.
-
-Python applica scope, safety, compatibilità, rate e budget.
-
-Il planner divide i cataloghi grandi in batch. Un batch troppo grande viene spezzato senza perdere candidati. Metadati storici possono essere compattati, ma non l'azione concreta.
-
-Con --require-ai, un planning obbligatorio non riuscito viene segnalato come errore.
-
-Round e budget planner:
-
-  TEST      1 round   24 reference actions    120 s/round     120 s cumulativi
-  FAST      2 round   180 reference actions   1800 s/round    3600 s cumulativi
-  BALANCED  2 round   480 reference actions   3600 s/round    7200 s cumulativi
-  DEEP      3 round   720 reference actions   5400 s/round    16200 s cumulativi
-
-Le reference actions non sono hard cap di coverage nei profili normali.
-
-11. PROFILI E BUDGET
---------------------
-
-  TEST      execution 1,5 h   verification 10 min   analysis 10 min   report 20 min   watchdog 3 h
-  FAST      execution 16 h    verification 60 min   analysis 120 min  report 60 min   watchdog 24 h
-  BALANCED  execution 48 h    verification 120 min  analysis 360 min  report 120 min  watchdog 66 h
-  DEEP      execution 96 h    verification 240 min  analysis 720 min  report 240 min  watchdog 128 h
-
-TEST è diagnostico. BALANCED è il profilo consigliato per assessment normali.
-
-12. TOOL E ORIGINE
-------------------
-
-  FFUF          open source, binario locale              wrapper ffufServer.py
-  Arjun         open source, Python locale               wrapper arjunServer.py
-  ZAP           open source, daemon o Docker             wrapper zapServer.py
-  Nuclei        open source, binario o Docker            wrapper nucleiServer.py
-  Nikto         open source, Perl o Docker               wrapper niktoServer.py
-  SQLMap        open source, checkout GitHub             wrapper sqlmapServer.py
-  Dalfox        open source, binario locale              wrapper dalfoxServer.py
-  Commix        open source, checkout GitHub             wrapper commixServer.py
-  Interactsh    open source, client locale               wrapper interactshServer.py
-  IDOR Forge    open source, checkout GitHub             wrapper idorForgeServer.py
-  Traversal     codice del progetto                      traversalServer.py
-  Authorization codice del progetto                      authorizationServer.py
-  Browser       codice del progetto + Playwright         browserServer.py
-  Workflow      codice del progetto                      workflowServer.py
-  Session       codice del progetto                      sessionServer.py
-  JWT           codice del progetto + PyJWT              jwtServer.py
-
-Docker modifica il runtime, non l'origine del tool. I wrapper sono codice del progetto.
-
-13. REPORTING
--------------
-
-Il report produce JSON, HTML e PDF.
-
-JSON contiene il dataset completo.
-HTML è pensato per la consultazione.
-PDF è una sintesi di consegna.
-
-Il report separa finding, stato di esecuzione e coverage.
-
-Nel Deterministic il testo dei finding deriva dal tool o dal wrapper. Il reporting può completare campi mancanti solo per vulnerability confermate con regole conservative.
-
-Nell'Agentic la final analysis può produrre descrizione, impatto e remediation per vulnerability e candidate. L'evidenza originale resta invariata.
-
-I batch dell'analisi AI vengono divisi se superano la finestra di contesto. Un finding molto grande viene compattato solo nella copia inviata al modello.
-
-Payload di report molto grandi vengono compressi e trasferiti a chunk. Se il trasporto normale fallisce, il fallback locale usa la stessa struttura materializzata. La coverage non viene ridotta per rendere il report più piccolo.
-
-14. LOG
--------
-
-  mkdir -p logs
-  LOG="logs/balanced_$(date +%Y%m%d_%H%M%S).log"
-
-  python assessmentRunner.py \
-    --config configs/dashboard-test.json \
-    --orchestrator agentic \
-    --max-rounds 2 \
-    --mode balanced \
-    --require-ai \
-    --authorized > "$LOG" 2>&1
-
-  tail -n 300 -F "$LOG"
-
-Usare tmux per sessioni SSH lunghe.
-
-15. RISULTATI
--------------
-
-Gli artefatti sono nella directory reports/.
-
-Download di un file:
-
-  scp debian@<host>:/home/debian/Cybersecurity_AgenticAI/reports/<file> .
-
-16. TROUBLESHOOTING
+STEP 2 - ASSESSMENT
 -------------------
 
-Login fallito
-  Verificare configurazione, credenziali e redirect OIDC.
+  This is the only step that repeats: run assessmentRunner.py choosing mode and config.
 
-Molti auth precheck falliti
-  Verificare la sessione sulla specifica radice applicativa.
+  Agentic:        --orchestrator agentic --mode balanced --max-rounds 2 --require-ai --authorized
+  Deterministic:  --orchestrator deterministic --mode balanced --authorized
+  Direct target:  --target http://target --orchestrator agentic --mode balanced --authorized
 
-Discovery con coda residua
-  Controllare limiti, pagine lente e se la coda di discovery sta ancora producendo nuovi endpoint.
+  Optional check before the run (NOT a step of its own):
+    --dry-run    validates config, scope, and jobs without launching scanners
+    --auth-only  tests only login and session
+    python assessmentRunner.py --config configs/dashboard-test.json \
+      --orchestrator agentic --mode balanced --max-rounds 2 --require-ai --dry-run --authorized
 
-Planner fallito
-  Controllare provider, budget e diagnostica dei batch.
 
-Tool partial
-  Leggere il codice diagnostico e il timeout.
+=== REFERENCE (details of the two steps) ===
 
-PDF mancante
-  Usare JSON e HTML già prodotti e controllare il renderer.
 
-Rate sotto 10 req/s
-  Il valore è un massimo. Pagine lente o tool seriali possono non saturarlo.
+CONFIGURATION
+-------------
 
-17. OPZIONI initScript
-----------------------
+  cp configs/platform.example.json configs/my-target.json
 
---with-lab
-  Avvia o verifica il laboratorio locale e abilita la preparazione dei backend AI.
+  - Set authorization.confirmed=true only after real authorization.
+  - Minimal fields: schema_version, platform.name, assets[] (id + service), execution.
+  - Secrets via env (cookie_env/username_env/password_env), never in the JSON; link with credential_ref.
 
---prepare-ai all|snap4city|llama|qwen
-  Sceglie quali backend preparare insieme a --with-lab.
+  Full example and authentication section: README.
 
---agentic-model snap4city|llama|qwen
-  Sceglie il modello usato dall'esempio Agentic e, se --prepare-ai è omesso, il backend da preparare.
 
---snap4city-credentials FILE
-  Indica il file credenziali del provider Snap4City. Non sono credenziali del target.
+initScript.py OPTIONS  (complete list)
+--------------------------------------
 
---mode test|fast|balanced|deep
-  Sceglie il profilo usato dagli esempi e dall'eventuale --run.
+  -h, --help                              Show help and exit.
+  --with-lab                              Start/verify the local lab + ZAP, prepare the AI backends, create a session.
+  --run none|deterministic|agentic        Run the DVWA assessment after init (deterministic/agentic require --with-lab).
+  --prepare-ai all|snap4city|llama|qwen   AI backends prepared by --with-lab (omitted with --agentic-model = all).
+  --agentic-model snap4city|llama|qwen    Model used by --run agentic and the printed commands (if --prepare-ai is omitted, prepares only this one).
+  --snap4city-credentials FILE            Snap4City provider credentials JSON (not the target account).
+  --mode test|fast|balanced|deep          Coverage/runtime profile (default balanced; test = short budgets).
+  --skip-preflight                        Skip the MCP/dependency preflight.
+  --skip-scanners                         Skip scanner installation and do not require all of them.
+  --skip-browser                          Do not install/verify Chromium; browser-only checks are skipped.
+  --require-browser                       Compat: Chromium is already required by default (unless --skip-browser).
+  --commands-only                         Print this guide, write init.txt, and exit.
 
---run none|deterministic|agentic
-  Esegue il DVWA del laboratorio dopo l'inizializzazione. Richiede --with-lab per deterministic o agentic.
 
---skip-preflight
---skip-scanners
---skip-browser
---require-browser
-  Opzioni di installazione e diagnostica. Non usare gli skip in una installazione normale.
+assessmentRunner.py OPTIONS  (complete list)
+--------------------------------------------
 
---commands-only
-  Stampa la guida senza installare o avviare componenti.
+  Source (required, exactly one):
+  --config FILE                           Multi-asset assessment from JSON.
+  --target URL                            Direct HTTP/HTTPS target (alternative to --config).
 
-18. OPZIONI assessmentRunner
-----------------------------
+  Identity (only with --target):
+  --cookies HEADER                        Cookie header of the primary session.
+  --secondary-cookies HEADER              Second authenticated identity (authorization/BOLA comparisons).
 
---config FILE
---target URL
---cookies COOKIE_HEADER
---secondary-cookies COOKIE_HEADER
---orchestrator agentic|deterministic
---mode test|fast|balanced|deep
---model snap4city|llama|qwen
---max-rounds 1|2|3
---auth-only
---authorized
---authorized-origin URL
---allow-same-host-ports
---no-allow-same-host-ports
---discover-same-host-services
---no-discover-same-host-services
---allow-state-changes
---no-allow-state-changes
---require-ai
---no-require-ai
---dry-run
---only JOB_ID
---stop-on-error
+  Execution:
+  --orchestrator agentic|deterministic    Chooses the path (overrides the config).
+  --mode test|fast|balanced|deep          Coverage/runtime profile (overrides the config).
+  --model snap4city|llama|qwen            Agentic AI backend (overrides the config).
+  --max-rounds 1|2|3                      Maximum number of Agentic rounds.
+  --require-ai                            Makes planning and final AI analysis mandatory.
+  --no-require-ai                         Allows the deterministic fallback if AI planning fails.
+  --auth-only                             Runs only the authenticated profile.
+  --dry-run                               Validates and saves the plan without executing scanners.
+  --only JOB_ID                           Limit to a single service job (e.g. web01/https-main).
+  --stop-on-error                         Stop after the first blocked job (a non-zero orchestrator exit is always fatal).
 
-Per l'elenco aggiornato: python assessmentRunner.py --help
-Per installazione e preflight: python initScript.py --help
+  Scope and authorization:
+  --authorized                            Confirms authorization for non-local targets.
+  --authorized-origin URL                 Adds an exact HTTP/HTTPS origin (repeatable).
+  --allow-same-host-ports                 Authorizes HTTP/HTTPS on other ports of the exact same hostname.
+  --no-allow-same-host-ports              Keeps exact-origin only (default when the config field is absent).
+  --discover-same-host-services           Proactive same-host service discovery (requires --allow-same-host-ports).
+  --no-discover-same-host-services        Disables same-host service discovery.
+  --allow-state-changes                   Enables state-changing probes within safety and time limits.
+  --no-allow-state-changes                Disables state-changing probes (including on local targets).
 
-Usare soltanto target propri o esplicitamente autorizzati.
+
+LOGS AND RESULTS
+----------------
+
+  Artifacts in reports/  (JSON = complete dataset, HTML = consultation, PDF = delivery summary).
+
+  Logging a long run (use tmux on SSH):
+    LOG="logs/balanced_$(date +%Y%m%d_%H%M%S).log"
+    python assessmentRunner.py --config configs/dashboard-test.json \
+      --orchestrator agentic --mode balanced --max-rounds 2 --require-ai --authorized > "$LOG" 2>&1
+    tail -n 300 -F "$LOG"
+
+  Download: scp debian@<host>:/home/debian/Cybersecurity_AgenticAI/reports/<file> .
