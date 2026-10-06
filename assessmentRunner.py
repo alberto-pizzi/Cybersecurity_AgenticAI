@@ -37,8 +37,9 @@ from targetAuth import BrowserLoginError, browser_oidc_login_session
 ROOT = Path(__file__).resolve().parent
 REPORTS_DIR = ROOT / "reports"
 
-# Last-resort parent watchdog. The Agentic child has a slightly shorter internal deadline so it
-# normally finalizes reports itself; this guard exists only for hangs outside the workflow guards.
+# Legacy/reference parent watchdog sizing. Normal Agentic execution no longer applies a fixed parent
+# wall-clock cutoff because a healthy model may legitimately require many individually bounded calls.
+# Per-tool/provider timeouts and the child's target-work/finalization guards remain active.
 AGENTIC_PARENT_EXECUTION_BUDGET_SECONDS = {
     'test': 2 * 60 * 60,
     'fast': 32 * 60 * 60,
@@ -72,11 +73,14 @@ AGENTIC_JOB_WATCHDOG_SECONDS = {
 }
 
 
-def _agentic_parent_watchdog_seconds(mode: str, request_rate: float) -> float:
+def _agentic_parent_watchdog_seconds(mode: str, request_rate: float, max_rounds: int | None = None) -> float:
     mode = str(mode or 'balanced').lower()
-    scale = max(1.0, 10.0 / max(1.0, float(request_rate or 10.0)))
-    execution = float(AGENTIC_PARENT_EXECUTION_BUDGET_SECONDS.get(mode, AGENTIC_PARENT_EXECUTION_BUDGET_SECONDS['balanced'])) * scale
-    finalization = float(AGENTIC_PARENT_FINALIZATION_BUDGET_SECONDS.get(mode, AGENTIC_PARENT_FINALIZATION_BUDGET_SECONDS['balanced']))
+    rate_scale = max(1.0, 10.0 / max(1.0, float(request_rate or 10.0)))
+    baseline_rounds = max(1, int(default_max_rounds(mode)))
+    rounds = max(1, int(max_rounds or baseline_rounds))
+    round_scale = max(1.0, float(rounds) / float(baseline_rounds))
+    execution = float(AGENTIC_PARENT_EXECUTION_BUDGET_SECONDS.get(mode, AGENTIC_PARENT_EXECUTION_BUDGET_SECONDS['balanced'])) * rate_scale * round_scale
+    finalization = float(AGENTIC_PARENT_FINALIZATION_BUDGET_SECONDS.get(mode, AGENTIC_PARENT_FINALIZATION_BUDGET_SECONDS['balanced'])) * round_scale
     slack = float(AGENTIC_PARENT_WATCHDOG_SLACK_SECONDS.get(mode, AGENTIC_PARENT_WATCHDOG_SLACK_SECONDS['balanced']))
     return execution + finalization + slack
 
@@ -1480,7 +1484,7 @@ def main() -> int:
     state_change_group.add_argument("--allow-state-changes", dest="allow_state_changes", action="store_true", default=None, help="Explicitly allow state-changing probes within configured safety and time limits for this run.")
     state_change_group.add_argument("--no-allow-state-changes", dest="allow_state_changes", action="store_false", help="Explicitly disable state-changing probes, including on local targets.")
     ai_group = parser.add_mutually_exclusive_group()
-    ai_group.add_argument("--require-ai", dest="require_ai", action="store_true", default=None, help="Require successful Agentic planning and final AI analysis.")
+    ai_group.add_argument("--require-ai", dest="require_ai", action="store_true", default=None, help="Require AI-controlled attack selection with no deterministic fallback. Isolated AI/control-plane failures are reported as incomplete coverage while collected evidence is still finalized.")
     ai_group.add_argument("--no-require-ai", dest="require_ai", action="store_false", help="Allow the existing Agentic deterministic fallback when AI planning fails.")
     parser.add_argument("--dry-run", action="store_true", help="Validate and persist the job plan without executing scanners.")
     parser.add_argument("--only", default="", help="Optional exact service job id, for example web01/https-main.")
@@ -1665,8 +1669,12 @@ def main() -> int:
             completed_returncode = 1
             child_watchdog_seconds: float | None = None
             if str((config.get('execution') or {}).get('orchestrator') or '').lower() == 'agentic':
-                mode = str((config.get('execution') or {}).get('mode') or 'balanced').lower()
-                child_watchdog_seconds = _agentic_parent_watchdog_seconds(mode, effective_rate)
+                # Agentic AI phases are completion-driven and every external/provider operation has
+                # its own bounded timeout. Do not impose a second fixed parent wall-clock ceiling:
+                # on very broad targets it could terminate a healthy child solely because many AI
+                # batches legitimately completed slowly. Fatal provider/tool failures still surface
+                # from the child with a non-zero return code.
+                child_watchdog_seconds = None
             try:
                 completed_returncode, watchdog_expired = _run_orchestrator_child(
                     command, cwd=ROOT, env=child_env, timeout_seconds=child_watchdog_seconds

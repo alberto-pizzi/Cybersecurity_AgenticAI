@@ -87,10 +87,8 @@ def _first_visible_locator(page: Any, selectors: Iterable[str]) -> Any | None:
 
 
 def _login_diagnostic(page: Any) -> str:
-    # Do not treat every provider alert as a bad password. Account lockout, temporary provider
-    # failures, policy denial or CAPTCHA messages must not trigger an automatic credential retry.
-    # Only generic, explicit credential-rejection wording is eligible for the one parent-side
-    # correction attempt.
+    # Do not treat every provider alert as a bad password.
+    # Some applications display a generic "authentication error" message for other reasons, such as an expired session or a missing required cookie.
     rejection_patterns = (
         r"\binvalid (?:user(?:name)? )?(?:credentials|password)\b",
         r"\binvalid username or password\b",

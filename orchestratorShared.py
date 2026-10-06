@@ -2353,7 +2353,7 @@ def _crawlable_url(url: str) -> bool:
     # destinations and generate large 404 waves that displace real application discovery. Apply
     # this only to the path: bracketed query parameter names remain fully supported.
     decoded_path = unquote(raw_path)
-    if any(token in decoded_path for token in ('*', '${', '{{', '}}', '`', '\\', '(', ')', '[', ']', '<', '>')):
+    if any(token in decoded_path for token in ('*', '${', '{', '}', '`', '\\', '(', ')', '[', ']', '<', '>')):
         return False
     if any(ord(char) < 32 or ord(char) == 127 for char in decoded_path):
         return False
@@ -3432,8 +3432,12 @@ def refresh_authenticated_session_state(
         if runtime_reauth.get('usable') and repaired_cookie:
             effective_cookies = repaired_cookie
             selected_probe = str(runtime_reauth.get('probe_url') or target)
-            probe_cookies = scope_cookie_header(selected_probe, cookies) or effective_cookies
-            preparation_cookies = scope_cookie_header(preparation_target, cookies) or effective_cookies
+            # Revalidation must use the repaired session, not prefer the stale cookie header that
+            # triggered reauthentication in the first place. Scope the repaired header to each
+            # destination and fall back to that same repaired header only when no narrower mapping
+            # exists. Using `cookies` here could immediately invalidate a successful repair.
+            probe_cookies = scope_cookie_header(selected_probe, effective_cookies) or effective_cookies
+            preparation_cookies = scope_cookie_header(preparation_target, effective_cookies) or effective_cookies
             preparation = apply_runtime_target_preparation(preparation_target, preparation_cookies, allow_state_changes=allow_state_changes, deadline=deadline)
             probe = scanner_session_probe(selected_probe, probe_cookies, timeout=10, attempts=3, deadline=deadline, allow_tls_trust_retry=url_in_authorized_scope(PRIMARY_SCOPE_TARGET or target, selected_probe))
             probe_invalid = probe.get('conclusive') is True and probe.get('authenticated') is False
@@ -12016,6 +12020,11 @@ def build_tool_arguments(tool: str, target_url: str, cookies: str, discovery: di
             arguments['content_type'] = str(case.get('content_type') or case.get('enctype') or '')
         elif tool == 'idor':
             arguments['content_type'] = str(case.get('content_type') or case.get('enctype') or '')
+            # Fail closed if scope was not configured. Using target_url as its own fallback base
+            # would make any direct/internal IDOR action appear authorized for a TLS trust bypass.
+            arguments['allow_tls_trust_retry'] = bool(
+                PRIMARY_SCOPE_TARGET and url_in_authorized_scope(PRIMARY_SCOPE_TARGET, target_url)
+            )
     elif tool == 'authorization':
         comparison_rows: list[dict[str, str]] = []
         seen_cookies: set[str] = set()

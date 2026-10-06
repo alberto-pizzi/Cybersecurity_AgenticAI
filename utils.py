@@ -238,6 +238,8 @@ def request_contract_state_change_reason(case: dict[str, Any]) -> str:
         "upload", "register", "signup", "create", "update", "save", "modify", "change",
         "truncate", "purge", "wipe", "logout", "signout", "logoff", "commit", "approve",
         "reject", "enable", "disable", "activate", "deactivate", "publish", "unpublish",
+        "rename", "move", "swap", "reload", "restart", "restore", "migrate", "replace",
+        "revoke", "grant", "assign", "attach", "detach", "start", "stop", "reindex",
     }
     destructive_get_tokens = {
         "delete", "remove", "destroy", "reinstall", "uninstall", "truncate", "purge",
@@ -442,7 +444,9 @@ def request_contract_state_change_reason(case: dict[str, Any]) -> str:
         "delete", "remove", "destroy", "reset", "upload", "register", "signup", "create",
         "update", "save", "modify", "change", "truncate", "purge", "wipe", "logout",
         "signout", "logoff", "commit", "approve", "reject", "enable", "disable", "activate",
-        "deactivate", "publish", "unpublish",
+        "deactivate", "publish", "unpublish", "rename", "move", "swap", "reload",
+        "restart", "restore", "migrate", "replace", "revoke", "grant", "assign",
+        "attach", "detach", "start", "stop", "reindex",
     }
     for name, value in query_pairs:
         leaf_name = re.split(r"[.\[]", name)[-1].rstrip("]")

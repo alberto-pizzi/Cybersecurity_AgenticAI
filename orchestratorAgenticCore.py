@@ -25,6 +25,7 @@ from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 warnings.filterwarnings("ignore", message=r".*authlib\.jose.*deprecated.*")
 import requests
 from utils import heavy_compute_workload_lease
+from assessmentConfig import default_max_rounds
 import orchestratorShared as shared
 from orchestratorShared import (
     BROAD_SCANNER_TIMEOUTS, PARAMETER_TOOL_TIMEOUTS,
@@ -73,7 +74,7 @@ class AgentState(TypedDict):
     report_status: dict[str, Any]
     require_ai: bool
     planner_source: str
-    ai_timeout: int
+    planner_timeout: int
     allow_state_changes: bool | None
     secondary_cookies: str
     planner_audit: list[dict[str, Any]]
@@ -84,6 +85,8 @@ class AgentState(TypedDict):
     started_monotonic: float
     wall_clock_budget_seconds: int
     execution_budget_seconds: int
+    planner_control_plane_seconds: float
+    analysis_control_plane_seconds: float
 # CPU-only Ollama hosts can take far longer than 720s to prefill+decode a JSON-schema-constrained
 # plan (no tokens at all until prefill finishes), so these budgets stay generous by default.
 AI_PLANNER_TIMEOUTS = {
@@ -92,32 +95,62 @@ AI_PLANNER_TIMEOUTS = {
     'balanced': 30 * 60 * 60,
     'deep': 48 * 60 * 60,
 }
-# Whole-assessment control-plane guard. Per-round budgets above remain generous ceilings, but a
-# pathologically slow provider must not consume hours simply because FAST/BALANCED/DEEP allow
-# multiple planning rounds. Unused time from an early round remains available to later rounds.
+# Nominal whole-assessment planner accounting for the configured number of rounds. These totals
+# are diagnostics/capacity references only; normal runtime is completion-driven and does not stop
+# merely because the nominal total is crossed.
 AI_PLANNER_WORKFLOW_TIMEOUTS = {
     'test': 5 * 60,
     'fast': 12 * 60 * 60,
     'balanced': 60 * 60 * 60,
     'deep': 144 * 60 * 60,
 }
-# Reserve a useful slice for each later round before allowing the current round to consume the
-# workflow-wide planner budget. If the remaining total is already below the reserve schedule, the
-# remainder is shared evenly instead of starving the current round to ~0 seconds.
-AI_PLANNER_FUTURE_ROUND_RESERVE_SECONDS = {
-    'test': 0,
-    'fast': 1800,
-    'balanced': 3600,
-    'deep': 5400,
+
+
+def _round_count_scale(mode: str, max_rounds: int | None) -> float:
+    """Scale work-dependent budgets only when rounds exceed the profile default."""
+    mode = str(mode or 'balanced').lower()
+    baseline_rounds = max(1, int(default_max_rounds(mode)))
+    try:
+        requested_rounds = int(max_rounds or baseline_rounds)
+    except (TypeError, ValueError):
+        requested_rounds = baseline_rounds
+    requested_rounds = max(1, requested_rounds)
+    return max(1.0, float(requested_rounds) / float(baseline_rounds))
+
+
+def planner_workflow_budget_seconds(
+    mode: str, max_rounds: int | None, per_round_budget_seconds: int | float | None = None,
+) -> int:
+    """Return nominal cumulative planner capacity for diagnostics.
+
+    Runtime planning is completion-driven and does not stop merely because this nominal total is
+    crossed. The value is retained for capacity reporting and outer-envelope sizing only.
+    """
+    mode = str(mode or 'balanced').lower()
+    per_round = max(1, int(per_round_budget_seconds or AI_PLANNER_TIMEOUTS.get(mode, AI_PLANNER_TIMEOUTS['balanced'])))
+    rounds = max(1, int(max_rounds or default_max_rounds(mode)))
+    return per_round * rounds
+# Nominal cumulative planner capacity scales with max_rounds for diagnostics and containing-envelope
+# reporting. It is not an aggregate admission deadline. Per-provider-call timing is independent: a
+# call is never started below the hard 20-second transport floor, and every real call receives the
+# profile's full preferred watchdog. The number of remaining batches never divides that watchdog.
+PLANNER_PROVIDER_CALL_FLOOR_SECONDS = 20
+PLANNER_BATCH_SCHEDULING_HEADROOM_SECONDS = 5
+PLANNER_BATCH_CAPACITY_TOLERANCE_SECONDS = 1.0
+AI_PLANNER_MIN_BATCH_ALLOCATION_SECONDS = {
+    'test': 20,
+    'fast': 30,
+    'balanced': 30,
+    'deep': 30,
 }
-# Inside one planning round, protect a useful minimum for later context batches without forcing a
-# strict equal split. This lets an unusually slow early batch borrow otherwise-idle round budget
-# while still preventing it from consuming every later batch's opportunity to be evaluated.
-AI_PLANNER_FUTURE_BATCH_RESERVE_SECONDS = {
-    'test': 15,
-    'fast': 120,
-    'balanced': 240,
-    'deep': 360,
+AI_PLANNER_PREFERRED_BATCH_ALLOCATION_SECONDS = {
+    # These are provider-call watchdogs, not target runtimes. A fast model returns immediately;
+    # the generous ceiling exists only so a legitimately slow inference is not misclassified as a
+    # scheduling failure. BALANCED therefore allows a full 30 minutes per started planner batch.
+    'test': 120,
+    'fast': 900,
+    'balanced': 1800,
+    'deep': 2700,
 }
 
 AI_PLANNER_MAX_PREDICT = {
@@ -158,23 +191,20 @@ PLANNER_COVERAGE_DEBT_FAMILY_ROWS = {'test': 24, 'fast': 64, 'balanced': 128, 'd
 PLANNER_CANDIDATE_PARAMETER_CHARS = 160
 PLANNER_CANDIDATE_FAMILY_CHARS = 360
 
-# Per-batch final-analysis ceilings are intentionally independent from the CLI
-# --ai-timeout option, which belongs only to planner rounds, so final AI interpretation keeps
-# its own explicit budget.
+# Per-batch final-analysis watchdogs are independent from planner nominal-capacity accounting.
 AI_ANALYSIS_BATCH_TIMEOUTS = {
-    'test': 60,
-    'fast': 600,
-    'balanced': 1200,
-    'deep': 1800,
+    # Per-provider-call watchdogs. They do not accumulate into a hard stage ceiling: each real
+    # analysis batch (including a context-split child) receives its complete allowance.
+    'test': 120,
+    'fast': 900,
+    'balanced': 1800,
+    'deep': 2700,
 }
-# Aggregate ceiling for the complete post-scan AI analysis stage. The per-batch ceilings above
-# remain useful rescue bounds, but repeated finding batches must not multiply into hours after the
-# scanners have already finished. The assessment/report deadlines still provide the outer guard.
+# Nominal sizing/reserve values for the complete post-scan AI analysis stage. They are retained for
+# diagnostics and report metadata, but they are NOT aggregate admission cutoffs in normal runtime.
+# Every actual analysis batch/context child receives the complete per-call watchdog above.
 AI_ANALYSIS_STAGE_TIMEOUTS = {
     # Final AI interpretation is a first-class assessment phase, not spare-time cleanup.
-    # These ceilings match the protected analysis windows below. They are phase budgets, not a
-    # subtraction from scanner coverage: the global watchdog is deliberately wider than the sum
-    # of the operational execution and finalization windows.
     'test': 20 * 60,
     'fast': 4 * 60 * 60,
     'balanced': 12 * 60 * 60,
@@ -216,11 +246,19 @@ class AnalysisContextTooLarge(RuntimeError):
     """
 
 
+class AnalysisPartialFailure(RuntimeError):
+    """Non-timeout AI-analysis child failure with already completed sibling rows attached."""
+
+    def __init__(self, message: str, *, partial_rows: list[dict[str, Any]] | None = None) -> None:
+        super().__init__(message)
+        self.partial_rows = list(partial_rows or [])
+
+
 def _ai_exception_is_timeout(exc: BaseException | None) -> bool:
     """Return True only for a real timeout in an AI exception/cause chain.
 
-    A provider HTTP/contract failure that merely happens near the batch deadline must not be
-    downgraded to a benign budget exhaustion under --require-ai.
+    A provider HTTP/contract failure must not be mislabeled as a timeout merely because it occurs
+    late in a call; only an actual timeout exception is classified as provider/model timeout.
     """
     seen: set[int] = set()
     current = exc
@@ -338,19 +376,45 @@ AGENTIC_WALL_CLOCK_BUDGETS = {
 SAFE_SURFACE_FINALIZATION_SHARE = 0.35
 
 
-def assessment_execution_budget_seconds(mode: str) -> int:
+def assessment_execution_budget_seconds(
+    mode: str, max_rounds: int | None = None, planner_per_round_budget_seconds: int | float | None = None,
+) -> int:
     mode = str(mode or 'balanced').lower()
     base = int(AGENTIC_EXECUTION_PHASE_BUDGETS.get(mode, AGENTIC_EXECUTION_PHASE_BUDGETS['balanced']))
-    # Only the target-traffic-dependent operational phase expands at lower configured request rates.
-    # Final AI/report work is independent from the target request-rate contract and therefore keeps
-    # stable, explicit phase budgets.
-    return int(math.ceil(base * shared.request_rate_budget_scale(shared.MAX_REQUEST_RATE)))
+    round_scale = _round_count_scale(mode, max_rounds)
+    rate_scale = shared.request_rate_budget_scale(shared.MAX_REQUEST_RATE)
+    scaled_base = float(base) * round_scale * rate_scale
+
+    # Keep the optional sizing parameter for internal/programmatic compatibility. Normal CLI runs
+    # always use the profile value, so this normally contributes zero extra time. If a caller uses a
+    # larger internal sizing value, the containing execution envelope remains consistent.
+    rounds = max(1, int(max_rounds or default_max_rounds(mode)))
+    default_per_round = int(AI_PLANNER_TIMEOUTS.get(mode, AI_PLANNER_TIMEOUTS['balanced']))
+    requested_per_round = max(1, int(planner_per_round_budget_seconds or default_per_round))
+    default_planner_total = default_per_round * rounds
+    requested_planner_total = requested_per_round * rounds
+    planner_extra = max(0, requested_planner_total - default_planner_total)
+    return int(math.ceil(scaled_base + planner_extra))
 
 
-def assessment_wall_clock_budget_seconds(mode: str) -> int:
+def _scaled_finalization_budget_seconds(mode: str, max_rounds: int | None) -> int:
     mode = str(mode or 'balanced').lower()
-    execution = assessment_execution_budget_seconds(mode)
-    finalization = int(AGENTIC_FINALIZATION_RESERVE_SECONDS.get(mode, AGENTIC_FINALIZATION_RESERVE_SECONDS['balanced']))
+    base = int(AGENTIC_FINALIZATION_RESERVE_SECONDS.get(mode, AGENTIC_FINALIZATION_RESERVE_SECONDS['balanced']))
+    return int(math.ceil(base * _round_count_scale(mode, max_rounds)))
+
+
+def analysis_stage_budget_seconds(mode: str, max_rounds: int | None) -> int:
+    mode = str(mode or 'balanced').lower()
+    base = int(AI_ANALYSIS_STAGE_TIMEOUTS.get(mode, AI_ANALYSIS_STAGE_TIMEOUTS['balanced']))
+    return int(math.ceil(base * _round_count_scale(mode, max_rounds)))
+
+
+def assessment_wall_clock_budget_seconds(
+    mode: str, max_rounds: int | None = None, planner_per_round_budget_seconds: int | float | None = None,
+) -> int:
+    mode = str(mode or 'balanced').lower()
+    execution = assessment_execution_budget_seconds(mode, max_rounds, planner_per_round_budget_seconds)
+    finalization = _scaled_finalization_budget_seconds(mode, max_rounds)
     watchdog_slack = int(AGENTIC_WATCHDOG_SAFETY_MARGIN_SECONDS.get(mode, AGENTIC_WATCHDOG_SAFETY_MARGIN_SECONDS['balanced']))
     return execution + finalization + watchdog_slack
 
@@ -360,10 +424,12 @@ def _assessment_started(state: AgentState) -> float:
 
 
 def _assessment_deadline(state: AgentState) -> float:
-    # Last-resort internal safety boundary. Normal stages use the forward phase deadlines below and
-    # should never need this slack.
-    budget = int(state.get('wall_clock_budget_seconds') or assessment_wall_clock_budget_seconds(shared.CURRENT_SCAN_MODE))
-    return _assessment_started(state) + max(60, budget)
+    # Last-resort internal safety boundary for target work/finalization. AI control-plane time is
+    # deliberately excluded from this fixed envelope and added back from measured elapsed time: a
+    # slow but healthy model must never consume scanner/report time merely by thinking longer.
+    budget = int(state.get('wall_clock_budget_seconds') or assessment_wall_clock_budget_seconds(shared.CURRENT_SCAN_MODE, state.get('max_rounds'), state.get('planner_timeout')))
+    ai_elapsed = max(0.0, float(state.get('planner_control_plane_seconds') or 0.0)) + max(0.0, float(state.get('analysis_control_plane_seconds') or 0.0))
+    return _assessment_started(state) + max(60, budget) + ai_elapsed
 
 
 def _assessment_remaining_seconds(state: AgentState) -> float:
@@ -374,31 +440,36 @@ def _assessment_execution_budget_seconds(state: AgentState) -> int:
     explicit = int(state.get('execution_budget_seconds') or 0)
     if explicit > 0:
         return explicit
-    return assessment_execution_budget_seconds(shared.CURRENT_SCAN_MODE)
+    return assessment_execution_budget_seconds(shared.CURRENT_SCAN_MODE, state.get('max_rounds'), state.get('planner_timeout'))
 
 
 def _assessment_finalization_reserve_seconds(state: AgentState) -> int:
     mode = str(shared.CURRENT_SCAN_MODE or 'balanced')
-    return int(AGENTIC_FINALIZATION_RESERVE_SECONDS.get(mode, AGENTIC_FINALIZATION_RESERVE_SECONDS['balanced']))
+    return _scaled_finalization_budget_seconds(mode, state.get('max_rounds'))
 
 
 def _assessment_verification_reserve_seconds(state: AgentState) -> float:
     mode = str(shared.CURRENT_SCAN_MODE or 'balanced')
-    return float(AGENTIC_VERIFICATION_RESERVE_SECONDS.get(mode, AGENTIC_VERIFICATION_RESERVE_SECONDS['balanced']))
+    base = float(AGENTIC_VERIFICATION_RESERVE_SECONDS.get(mode, AGENTIC_VERIFICATION_RESERVE_SECONDS['balanced']))
+    return base * _round_count_scale(mode, state.get('max_rounds'))
 
 
 def _assessment_report_reserve_seconds(state: AgentState) -> float:
     mode = str(shared.CURRENT_SCAN_MODE or 'balanced')
-    return float(AGENTIC_REPORT_RESERVE_SECONDS.get(mode, AGENTIC_REPORT_RESERVE_SECONDS['balanced']))
+    base = float(AGENTIC_REPORT_RESERVE_SECONDS.get(mode, AGENTIC_REPORT_RESERVE_SECONDS['balanced']))
+    return base * _round_count_scale(mode, state.get('max_rounds'))
 
 
 def _assessment_analysis_reserve_seconds(state: AgentState) -> float:
     mode = str(shared.CURRENT_SCAN_MODE or 'balanced')
-    return float(AGENTIC_ANALYSIS_RESERVE_SECONDS.get(mode, AGENTIC_ANALYSIS_RESERVE_SECONDS['balanced']))
+    return float(analysis_stage_budget_seconds(mode, state.get('max_rounds')))
 
 
 def _assessment_execution_deadline(state: AgentState) -> float:
-    return _assessment_started(state) + float(_assessment_execution_budget_seconds(state))
+    # Planner inference is control-plane work, not target execution. Preserve the complete target
+    # execution allowance by shifting this deadline forward by the planner time already consumed.
+    planner_elapsed = max(0.0, float(state.get('planner_control_plane_seconds') or 0.0))
+    return _assessment_started(state) + float(_assessment_execution_budget_seconds(state)) + planner_elapsed
 
 
 def _assessment_verification_deadline(state: AgentState) -> float:
@@ -410,7 +481,13 @@ def _assessment_analysis_deadline(state: AgentState) -> float:
 
 
 def _assessment_report_deadline(state: AgentState) -> float:
-    return _assessment_analysis_deadline(state) + _assessment_report_reserve_seconds(state)
+    # Final analysis is completion-driven. If healthy provider calls legitimately take longer than
+    # the nominal analysis reserve, only the excess must shift the report boundary forward; otherwise
+    # the report could be forced into emergency recovery immediately after a successful long analysis.
+    nominal_analysis = _assessment_analysis_reserve_seconds(state)
+    actual_analysis = max(0.0, float(state.get('analysis_control_plane_seconds') or 0.0))
+    analysis_overrun = max(0.0, actual_analysis - nominal_analysis)
+    return _assessment_analysis_deadline(state) + analysis_overrun + _assessment_report_reserve_seconds(state)
 
 
 def _assessment_execution_budget_exhausted(state: AgentState) -> bool:
@@ -1110,7 +1187,11 @@ def _fit_planner_prompt_context(
     maximum_window = max(minimum_window, int(max_context_window))
     system_bytes = len(str(system_message or '').encode('utf-8'))
 
-    tiers = (0,) if len(original_candidates) > 1 else (0, 1, 2, 3)
+    # Advisory telemetry is compactable for every batch size. Candidate actions themselves are
+    # immutable below, so trying compact advisory representations before splitting cannot hide or
+    # preselect any action. This prevents accumulated prior-round/result metadata from needlessly
+    # turning one otherwise valid multi-action batch into many tiny batches.
+    tiers = (0, 1, 2, 3)
     last_needed = 0
     last_window = minimum_window
     for tier in tiers:
@@ -1230,25 +1311,20 @@ def _ollama_stream_content(url: str, payload: dict[str, Any], *, response_kind: 
             raise ValueError('Ollama completed without returning response content.')
         return content
 
-    # Ollama's model runner can crash under memory pressure mid-batch (HTTP 500
-    # "model runner has unexpectedly stopped"); it typically reloads the model on
-    # the next request, so one short-delayed retry recovers without failing the
-    # whole batch outright.
-    outer_started = time.monotonic()
-    provider_deadline = outer_started + max(1.0, float(total_timeout))
-    with _ollama_resource_lease(url, deadline=provider_deadline) as resource_slot:
+    # Waiting for the shared local-compute slot is scheduler time, not model-inference time. Give
+    # that bounded wait its own allowance; once the slot is acquired every actual HTTP inference
+    # attempt receives the complete provider watchdog. Likewise, the one bounded retry after an
+    # Ollama runner crash is a new provider request and must not inherit the failed attempt's tail.
+    lease_deadline = time.monotonic() + max(1.0, float(total_timeout))
+    with _ollama_resource_lease(url, deadline=lease_deadline) as resource_slot:
         if resource_slot is None:
-            raise TimeoutError(f'Ollama request exceeded the {total_timeout}-second provider-call budget while waiting for the shared local-AI slot.')
+            raise TimeoutError(f'Ollama local-AI resource slot was not acquired within {total_timeout} seconds.')
         retries_left = 1
         while True:
-            remaining = total_timeout - (time.monotonic() - outer_started)
-            if remaining <= 0:
-                raise TimeoutError(f'Ollama request exceeded the {total_timeout}-second provider-call budget.')
             try:
-                return _attempt(max(1, int(math.ceil(remaining))))
+                return _attempt(max(1, int(total_timeout)))
             except RuntimeError as exc:
-                remaining = total_timeout - (time.monotonic() - outer_started)
-                if retries_left > 0 and _OLLAMA_RUNNER_CRASH_MARKER in str(exc) and remaining > 30:
+                if retries_left > 0 and _OLLAMA_RUNNER_CRASH_MARKER in str(exc):
                     retries_left -= 1
                     time.sleep(3)
                     continue
@@ -1375,6 +1451,22 @@ def _snap4city_chat_content(
     total_timeout: int,
     temperature: float=0.0,
 ) -> str:
+    # Authentication/token refresh is control-plane preparation, not model inference. Keep it
+    # bounded, but do not let a slow refresh shave seconds or minutes off the model's own watchdog.
+    auth_deadline = time.monotonic() + max(1.0, float(total_timeout))
+
+    def auth_remaining_timeout() -> float:
+        remaining = auth_deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError(f'Snap4City token acquisition exceeded the {total_timeout}-second bounded preparation allowance.')
+        return remaining
+
+    manager = _snap4city_token_manager(
+        state['snap4city_credentials'], timeout_seconds=auth_remaining_timeout(),
+    )
+    access_token = manager.get_token(timeout_seconds=auth_remaining_timeout())
+
+    # Start the actual inference watchdog only after a usable access token exists.
     provider_started = time.monotonic()
     provider_deadline = provider_started + max(1.0, float(total_timeout))
 
@@ -1383,11 +1475,6 @@ def _snap4city_chat_content(
         if remaining <= 0:
             raise TimeoutError(f'Snap4City provider call exceeded the {total_timeout}-second budget.')
         return remaining
-
-    manager = _snap4city_token_manager(
-        state['snap4city_credentials'], timeout_seconds=remaining_timeout(),
-    )
-    access_token = manager.get_token(timeout_seconds=remaining_timeout())
     body = {
         'access_token': access_token,
         'endpoint': state['model'],
@@ -1754,9 +1841,7 @@ def _planner_tool_cost_hint(tool: str) -> dict[str, Any]:
 def ai_plan(state: AgentState) -> dict[str, Any]:
     """Ask the AI to decide concrete actions, not tools/groups.
 
-    Large catalogs are split into fair concrete-action batches. Every eligible action is presented to
-    the AI exactly once in the planning pass. Python never expands a selected tool into hidden
-    requests.
+    Large catalogs are packed into concrete-action batches bounded by the planner output/context contract. Batches are split further only when their actual prompt/provider context is too large. Every eligible action is presented to the AI exactly once without an aggregate planner wall-clock cutoff. Python never expands a selected tool into hidden requests.
     """
     full_concrete_pool = _eligible_action_catalog(state)
     if not full_concrete_pool:
@@ -1766,7 +1851,7 @@ def ai_plan(state: AgentState) -> dict[str, Any]:
     eligible_candidate_count = len(full_concrete_pool)
     if mode == 'test' and eligible_candidate_count > TEST_PLANNER_CANDIDATE_LIMIT:
         # TEST is a plumbing/smoke profile, not a coverage profile. Keep one fair interleaved
-        # sample across profile/tool buckets so large applications cannot multiply the AI timeout
+        # sample across profile/tool buckets so large applications cannot multiply AI request load
         # into dozens of planner batches. FAST/BALANCED/DEEP still present every eligible action.
         concrete_pool = _fair_planner_action_order(full_concrete_pool)[:TEST_PLANNER_CANDIDATE_LIMIT]
     else:
@@ -1806,14 +1891,12 @@ def ai_plan(state: AgentState) -> dict[str, Any]:
     system_message = _planner_system_message()
     provider = str(state.get('ai_provider') or 'ollama').lower()
     base = state['ollama_url'].rstrip('/')
-    # --ai-timeout is a PER-ROUND planner control-plane budget, not a per-batch multiplier.
-    # Respect an explicit positive operator override exactly: the CLI already supplies the generous
-    # mode default when the user passes 0. Silently raising e.g. --ai-timeout 30 to 120 seconds would
-    # contradict the printed/configured budget and could push work past an operator-selected bound.
-    # Direct/programmatic callers still get the mode default when the state omits the value.
-    configured_planner_budget = int(state.get('ai_timeout') or AI_PLANNER_TIMEOUTS.get(mode, 480))
+    # Profile planner totals are nominal capacity/accounting values only. They never divide or cap
+    # a real provider call. Direct/programmatic callers use the profile default when the state omits
+    # the value.
+    configured_planner_budget = int(state.get('planner_timeout') or AI_PLANNER_TIMEOUTS.get(mode, 480))
     configured_planner_budget = max(1, configured_planner_budget)
-    workflow_planner_budget = max(1, int(AI_PLANNER_WORKFLOW_TIMEOUTS.get(mode, configured_planner_budget)))
+    workflow_planner_budget = planner_workflow_budget_seconds(mode, state.get('max_rounds'), configured_planner_budget)
     prior_planner_seconds = sum(
         max(0.0, float(row.get('planner_seconds') or 0.0))
         for row in state.get('planner_audit', [])
@@ -1821,13 +1904,11 @@ def ai_plan(state: AgentState) -> dict[str, Any]:
     )
     remaining_workflow_planner_budget = max(0.0, float(workflow_planner_budget) - prior_planner_seconds)
     future_rounds = max(0, int(state.get('max_rounds') or current_round) - current_round)
-    future_round_reserve = max(0, int(AI_PLANNER_FUTURE_ROUND_RESERVE_SECONDS.get(mode, 0)))
-    reserved_for_future_rounds = float(future_rounds * future_round_reserve)
-    if remaining_workflow_planner_budget > reserved_for_future_rounds:
-        workflow_cap_for_round = remaining_workflow_planner_budget - reserved_for_future_rounds
-    else:
-        workflow_cap_for_round = remaining_workflow_planner_budget / max(1, future_rounds + 1)
-    round_planner_budget = max(1.0, min(float(configured_planner_budget), workflow_cap_for_round))
+    # Profile values are diagnostics/capacity guidance only. There is intentionally no aggregate
+    # planner wall-clock stop: every concrete batch may take its full provider-call allowance and
+    # fast calls simply return early. This removes the failure mode where a very broad application
+    # exhausts an arbitrary cumulative timer despite a healthy provider.
+    round_planner_budget = float(configured_planner_budget)
     max_predict = AI_PLANNER_MAX_PREDICT.get(mode, 800)
     base_context_window = AI_PLANNER_CONTEXT_WINDOWS.get(mode, 6144)
     max_context_window = AI_PLANNER_CONTEXT_WINDOWS_MAX.get(mode, base_context_window)
@@ -1842,16 +1923,18 @@ def ai_plan(state: AgentState) -> dict[str, Any]:
     endpoint_kinds: list[str] = []
     errors: list[str] = []
     failed_batches: list[int] = []
+    successful_ai_batches = 0
+    context_deferred_candidate_ids: list[str] = []
     batch_diagnostics: list[dict[str, Any]] = []
     total_context_bytes = 0
     max_context_used = 0
     planning_started = time.monotonic()
-    round_planner_deadline = min(
-        planning_started + float(round_planner_budget),
-        _assessment_execution_deadline(state),
-    )
-    planner_budget_exhausted = False
-    planner_budget_deferred_candidates = 0
+    # Batch count never divides the timeout and timing pressure never causes context splitting.
+    # There is no aggregate planner deadline; the profile per-round value is retained only for
+    # diagnostics/capacity reporting.
+    planner_provider_timeout_observed = False
+    planner_ai_error_deferred_candidates = 0
+    planner_budget_auto_extension_seconds = 0.0
 
     def build_batch_prompt(batch_number: int, batch_count: int, batch: list[dict[str, Any]], selected_count: int) -> dict[str, Any]:
         selected_tool_counts: Counter[str] = Counter()
@@ -1931,9 +2014,18 @@ def ai_plan(state: AgentState) -> dict[str, Any]:
                     max_context_window=max_context_window,
                     max_predict=max_predict,
                 )
-            except RuntimeError:
+            except RuntimeError as exc:
                 if len(batch) <= 1:
-                    raise
+                    candidate_id = id_by_identity[id(batch[0])]
+                    context_deferred_candidate_ids.append(candidate_id)
+                    errors.append(f'preflight singleton {candidate_id}: {type(exc).__name__}: {exc}')
+                    print(
+                        f'[!] AI planning: concrete action {candidate_id} cannot fit the model context even '
+                        f'after advisory-context compaction; deferring only that candidate instead of '
+                        f'aborting the assessment.',
+                        file=sys.stderr, flush=True,
+                    )
+                    continue
                 midpoint = (len(batch) + 1) // 2
                 rebuilt.extend((batch[:midpoint], batch[midpoint:]))
                 split_happened = True
@@ -1944,21 +2036,20 @@ def ai_plan(state: AgentState) -> dict[str, Any]:
             break
 
     effective_batch_size = max((len(batch) for batch in batches), default=0)
+    minimum_batch_allocation = max(
+        float(PLANNER_PROVIDER_CALL_FLOOR_SECONDS),
+        float(AI_PLANNER_MIN_BATCH_ALLOCATION_SECONDS.get(mode, 30)),
+    )
+    preferred_batch_allocation = max(
+        minimum_batch_allocation,
+        float(AI_PLANNER_PREFERRED_BATCH_ALLOCATION_SECONDS.get(mode, 120)),
+    )
 
     def run_one_batch(batch_number: int, batch: list[dict[str, Any]], request_timeout: int) -> tuple[dict[str, Any], str, int, int, str]:
-        # Chat -> generate is a fallback path for ONE planner batch. Both provider calls must share
-        # the same batch fair-share deadline; otherwise a failed chat could consume `request_timeout`
-        # and the generate fallback could consume it again, silently doubling this batch's budget.
-        request_deadline = time.monotonic() + max(1.0, float(request_timeout))
-
-        def remaining_request_timeout() -> int:
-            remaining = request_deadline - time.monotonic()
-            if remaining <= 0:
-                raise TimeoutError('planner batch provider-call budget exhausted')
-            available = int(math.ceil(remaining))
-            if available < 20:
-                raise TimeoutError('planner batch provider-call budget fell below the 20-second AI-call floor')
-            return available
+        # `request_timeout` starts at the actual provider invocation, not while Python is building or
+        # fitting the prompt. Every real provider call therefore receives the complete watchdog. An
+        # Ollama chat -> generate fallback is a NEW provider call and receives a fresh full watchdog.
+        provider_timeout = max(PLANNER_PROVIDER_CALL_FLOOR_SECONDS, int(request_timeout))
 
         prompt = build_batch_prompt(batch_number, len(batches), batch, len(selected_ids))
         prompt, context, context_window, candidate_count = _fit_planner_prompt_context(
@@ -1970,7 +2061,7 @@ def ai_plan(state: AgentState) -> dict[str, Any]:
         common_options = {'temperature': 0, 'num_predict': max_predict, 'num_ctx': context_window, 'top_p': 0.9}
         if provider == 'snap4city':
             content = _snap4city_chat_content(
-                state, system_message, context, total_timeout=remaining_request_timeout(), temperature=0.0,
+                state, system_message, context, total_timeout=provider_timeout, temperature=0.0,
             )
             kind = 'snap4city'
         else:
@@ -1986,7 +2077,7 @@ def ai_plan(state: AgentState) -> dict[str, Any]:
             }
             try:
                 content = _ollama_stream_content(
-                    f'{base}/api/chat', chat_payload, response_kind='chat', total_timeout=remaining_request_timeout(), early_json=True,
+                    f'{base}/api/chat', chat_payload, response_kind='chat', total_timeout=provider_timeout, early_json=True,
                 )
                 kind = 'chat'
             except Exception as chat_exc:
@@ -1998,8 +2089,9 @@ def ai_plan(state: AgentState) -> dict[str, Any]:
                     'options': common_options,
                     'keep_alive': '30m',
                 }
+                generate_timeout = provider_timeout
                 content = _ollama_stream_content(
-                    f'{base}/api/generate', generate_payload, response_kind='generate', total_timeout=remaining_request_timeout(), early_json=True,
+                    f'{base}/api/generate', generate_payload, response_kind='generate', total_timeout=generate_timeout, early_json=True,
                 )
                 kind = 'generate'
         plan = _parse_ai_plan_content(content)
@@ -2016,9 +2108,9 @@ def ai_plan(state: AgentState) -> dict[str, Any]:
     # The initial preflight above runs before any selections exist. Later batches include growing
     # selected_so_far_by_tool/application_family metadata, so a batch that fit initially can become
     # a few tokens too large at runtime. Re-check the ACTUAL prompt immediately before assigning the
-    # batch budget/provider call. If it no longer fits, split that concrete-action batch in place and
-    # re-check the first half. This changes only context packaging: candidate IDs/order are preserved,
-    # no candidate is dropped, and strict Agentic mode still requires AI judgement for every batch.
+    # provider call. If it no longer fits, split that concrete-action batch in place and re-check
+    # the first half. This changes only context packaging: candidate IDs/order are preserved and no
+    # candidate is dropped.
     runtime_context_splits = 0
     batch_index = 0
     while batch_index < len(batches):
@@ -2037,16 +2129,24 @@ def ai_plan(state: AgentState) -> dict[str, Any]:
                 )
             except RuntimeError as exc:
                 if len(batch) <= 1:
-                    raise RuntimeError(
-                        f'Planner concrete action {id_by_identity[id(batch[0])]} cannot fit the bounded '
-                        f'context window even as a singleton: {exc}'
-                    ) from exc
+                    candidate_id = id_by_identity[id(batch[0])]
+                    context_deferred_candidate_ids.append(candidate_id)
+                    errors.append(f'runtime singleton {candidate_id}: {type(exc).__name__}: {exc}')
+                    batches.pop(batch_index)
+                    print(
+                        f'[!] AI planning: concrete action {candidate_id} no longer fits the model context '
+                        f'even after advisory-context compaction; deferring only that candidate instead of '
+                        f'aborting the assessment.',
+                        file=sys.stderr, flush=True,
+                    )
+                    batch = []
+                    break
                 midpoint = (len(batch) + 1) // 2
                 left, right = batch[:midpoint], batch[midpoint:]
                 batches[batch_index:batch_index + 1] = [left, right]
                 runtime_context_splits += 1
                 print(
-                    f'    AI planning: runtime context grew after earlier selections; splitting '
+                    f'    AI planning: actual planner prompt exceeds the context window; splitting '
                     f'batch {batch_number} into {len(left)}+{len(right)} candidate(s) '
                     f'({len(batches)} total batches now).',
                     flush=True,
@@ -2055,50 +2155,32 @@ def ai_plan(state: AgentState) -> dict[str, Any]:
                 continue
             break
 
+        if not batch:
+            continue
+
         batch_number = batch_index + 1
         batch_started = time.monotonic()
-        remaining_batches = max(1, len(batches) - batch_index)
-        remaining_round_budget = max(0.0, round_planner_deadline - batch_started)
-        if remaining_round_budget <= 0:
-            planner_budget_exhausted = True
-            planner_budget_deferred_candidates += sum(len(value) for value in batches[batch_index:])
-            print(
-                f'[!] AI planning round budget exhausted before batch {batch_number}/{len(batches)}; '
-                f'{planner_budget_deferred_candidates} candidate(s) remain unplanned and eligible for a later round.',
-                file=sys.stderr, flush=True,
-            )
-            if state.get('require_ai'):
-                raise RuntimeError(
-                    f'Strict agentic mode requires the full AI planning stage, but the per-round planner budget '
-                    f'({round_planner_budget}s) expired before batch {batch_number}/{len(batches)}.'
-                )
-            break
-        # Reserve a useful minimum for every later batch, then let the current batch borrow the
-        # remaining round slack. If the round is already too tight to honor those reserves, fall back
-        # to an equal share of what remains. Fast batches still return all unused time to later ones.
-        future_batch_count = max(0, remaining_batches - 1)
-        configured_future_batch_reserve = max(0.0, float(AI_PLANNER_FUTURE_BATCH_RESERVE_SECONDS.get(mode, 120)))
-        reserved_for_future_batches = configured_future_batch_reserve * future_batch_count
-        if remaining_round_budget > reserved_for_future_batches:
-            current_batch_budget = remaining_round_budget - reserved_for_future_batches
-        else:
-            current_batch_budget = remaining_round_budget / remaining_batches
-        batch_deadline = min(
-            round_planner_deadline,
-            batch_started + max(1.0, current_batch_budget),
-        )
+        # Timing pressure never splits or suppresses a planner batch. The total batch count never
+        # divides the timeout: every batch that starts gets the full preferred per-call watchdog.
+        reserved_for_future_batches = 0.0
+        current_batch_budget = preferred_batch_allocation
+        batch_deadline = batch_started + current_batch_budget
         provider_context_split = False
         for attempt in range(1, batch_max_attempts + 1):
+            # Every new AI attempt is a new real provider call and therefore receives a fresh full
+            # per-call watchdog. A malformed-but-returned first response must not leave the retry
+            # with only a small tail of the first call's allocation.
+            batch_deadline = time.monotonic() + current_batch_budget
             try:
                 remaining_batch_budget = max(0.0, batch_deadline - time.monotonic())
                 if remaining_batch_budget <= 0:
                     raise TimeoutError(
-                        f'planner batch fair-share budget exhausted before attempt {attempt}'
+                        f'planner batch allocated budget exhausted before attempt {attempt}'
                     )
                 request_timeout = int(math.ceil(remaining_batch_budget))
-                if request_timeout < 20:
+                if request_timeout < PLANNER_PROVIDER_CALL_FLOOR_SECONDS:
                     raise TimeoutError(
-                        'planner batch fair-share budget fell below the 20-second AI-call floor'
+                        f'planner batch allocation fell below the {PLANNER_PROVIDER_CALL_FLOOR_SECONDS}-second AI-call floor'
                     )
                 compact_plan, context, context_window, candidate_count, kind = run_one_batch(batch_number, batch, request_timeout)
                 endpoint_kinds.append(kind)
@@ -2129,6 +2211,7 @@ def ai_plan(state: AgentState) -> dict[str, Any]:
                 reasoning = _humanize_planner_reasoning(compact_plan.get('reasoning_summary'))[:400]
                 if reasoning:
                     reasoning_parts.append(f'Batch {batch_number}/{len(batches)}: {reasoning}')
+                successful_ai_batches += 1
                 batch_diagnostics.append({
                     'batch': batch_number,
                     'candidate_count': candidate_count,
@@ -2138,8 +2221,8 @@ def ai_plan(state: AgentState) -> dict[str, Any]:
                     'context_bytes': len(context.encode('utf-8')),
                     'context_window': context_window,
                     'seconds': round(time.monotonic() - batch_started, 2),
-                    'allocated_budget_seconds': round(max(0.0, batch_deadline - batch_started), 2),
-                    'future_batch_reserve_seconds': round(configured_future_batch_reserve, 2),
+                    'allocated_budget_seconds': round(current_batch_budget, 2),
+                    'minimum_future_batch_allocation_seconds': round(minimum_batch_allocation, 2),
                     'reserved_for_future_batches_seconds': round(reserved_for_future_batches, 2),
                     'request_timeout_seconds': request_timeout,
                     'contract_normalizations': list(compact_plan.get('_contract_normalizations') or []),
@@ -2165,25 +2248,23 @@ def ai_plan(state: AgentState) -> dict[str, Any]:
                         flush=True,
                     )
                     break
-                if attempt < batch_max_attempts and time.monotonic() < batch_deadline:
+                if attempt < batch_max_attempts:
+                    retry_policy = f'a fresh full {preferred_batch_allocation:.0f}s provider-call allocation'
                     print(
                         f'    AI planning: batch {batch_number}/{len(batches)} returned a malformed plan '
-                        f'({type(exc).__name__}: {exc}); asking the AI again within the remaining per-round fair-share budget.',
+                        f"({type(exc).__name__}: {exc}); asking the AI again with {retry_policy}.",
                         flush=True,
                     )
                     continue
-                # Every attempt for this batch failed. Strict Agentic mode must fail rather than
-                # silently omit AI judgement for part of the catalog. Only non-strict mode may defer the
-                # failed batch; its candidates remain eligible in a later round and Python never invents
-                # substitute attacks for them.
-                if isinstance(exc, TimeoutError) or time.monotonic() >= batch_deadline:
-                    planner_budget_exhausted = True
-                    planner_budget_deferred_candidates += len(batch)
-                if state.get('require_ai'):
-                    raise RuntimeError(
-                        f'Strict agentic mode requires every planner batch to complete; batch '
-                        f'{batch_number}/{len(batches)} failed after {attempt} attempt(s): {type(exc).__name__}: {exc}'
-                    ) from exc
+                # Every attempt for this batch failed. An isolated provider/format/timeout problem
+                # must not discard hours of successful discovery and scanner evidence. Defer this
+                # concrete slice explicitly and continue with later batches. Strict Agentic semantics
+                # are preserved because Python never invents substitute attacks: only actions actually
+                # selected by successful AI batches may execute. A globally unusable provider is still
+                # detected after the loop when no batch succeeds at all.
+                if _ai_exception_is_timeout(exc):
+                    planner_provider_timeout_observed = True
+                planner_ai_error_deferred_candidates += len(batch)
                 failed_batches.append(batch_number)
                 batch_diagnostics.append({
                     'batch': batch_number,
@@ -2192,8 +2273,8 @@ def ai_plan(state: AgentState) -> dict[str, Any]:
                     'selected_action_ids': [],
                     'endpoint': 'failed',
                     'seconds': round(time.monotonic() - batch_started, 2),
-                    'allocated_budget_seconds': round(max(0.0, batch_deadline - batch_started), 2),
-                    'future_batch_reserve_seconds': round(configured_future_batch_reserve, 2),
+                    'allocated_budget_seconds': round(current_batch_budget, 2),
+                    'minimum_future_batch_allocation_seconds': round(minimum_batch_allocation, 2),
                     'reserved_for_future_batches_seconds': round(reserved_for_future_batches, 2),
                     'error': f'{type(exc).__name__}: {exc}',
                     'skipped_after_exhausted_retries': True,
@@ -2209,11 +2290,14 @@ def ai_plan(state: AgentState) -> dict[str, Any]:
             continue
         batch_index += 1
 
-    if failed_batches and len(failed_batches) == len(batches):
-        # Every single batch was unsalvageable: this is not an isolated formatting slip, it means the
-        # AI provider itself is not usable right now. Strict Agentic mode still fails loudly here
-        # rather than silently proceeding with zero AI-vetted actions for the whole round.
-        raise RuntimeError('; '.join(errors))
+    if state.get('require_ai') and successful_ai_batches == 0 and (failed_batches or context_deferred_candidate_ids):
+        # Strict mode requires at least one real successful AI planning call whenever a concrete
+        # catalogue exists. If every provider call failed, or every candidate was context-deferred
+        # before a provider call could be made, do not misreport that state as a valid AI decision
+        # to select zero actions. Finalize explicitly as incomplete AI/control-plane coverage while
+        # preserving discovery/scanner evidence and without inventing a deterministic plan.
+        detail = '; '.join(errors) or 'No concrete planner batch could be represented inside the configured model context.'
+        raise RuntimeError(detail)
 
     # Every batch uses the same AI priority scale. Merge the batch-local selections globally using
     # only priorities returned by the model; technical batch order is a tie-breaker only when the AI
@@ -2227,6 +2311,9 @@ def ai_plan(state: AgentState) -> dict[str, Any]:
         )
     )
     selected_actions = [dict(candidate_map[candidate_id]) for candidate_id in selected_ids]
+
+    planner_elapsed_seconds = max(0.0, time.monotonic() - planning_started)
+    planner_budget_auto_extension_seconds = max(0.0, planner_elapsed_seconds - float(round_planner_budget))
 
     round_budget = _round_execution_budget(
         state, concrete_pool, current_round, ai_extension_requested=adaptive_requested,
@@ -2267,18 +2354,36 @@ def ai_plan(state: AgentState) -> dict[str, Any]:
         'planner_configured_batch_size': batch_size,
         'planner_batch_count': len(batches),
         'planner_runtime_context_splits': runtime_context_splits,
+        'planner_successful_ai_batch_count': int(successful_ai_batches),
+        'planner_context_deferred_candidate_ids': list(context_deferred_candidate_ids),
+        'planner_context_deferred_candidate_count': len(context_deferred_candidate_ids),
         'planner_batches': batch_diagnostics,
         'planner_batch_failures': list(failed_batches),
         'planner_round_budget_seconds': round(float(round_planner_budget), 2),
+        'planner_round_nominal_budget_seconds': int(configured_planner_budget),
         'planner_round_budget_configured_seconds': int(configured_planner_budget),
-        'planner_round_budget_effective_seconds': round(max(0.0, round_planner_deadline - planning_started), 2),
+        'planner_round_budget_effective_seconds': 0.0,
         'planner_workflow_budget_seconds': int(workflow_planner_budget),
         'planner_workflow_used_before_round_seconds': round(prior_planner_seconds, 2),
         'planner_workflow_remaining_before_round_seconds': round(remaining_workflow_planner_budget, 2),
-        'planner_future_round_reserve_seconds': int(future_round_reserve),
+        'planner_future_round_reserve_seconds': 0,
+        'planner_cumulative_remaining_available_to_round_seconds': 0.0,
+        'planner_aggregate_hard_cap_enabled': False,
         'planner_future_rounds_after_current': int(future_rounds),
-        'planner_budget_exhausted': bool(planner_budget_exhausted),
-        'planner_budget_deferred_candidate_count': int(planner_budget_deferred_candidates),
+        'planner_minimum_batch_allocation_seconds': round(minimum_batch_allocation, 2),
+        'planner_preferred_batch_allocation_seconds': round(preferred_batch_allocation, 2),
+        'planner_batch_scheduling_headroom_seconds': int(PLANNER_BATCH_SCHEDULING_HEADROOM_SECONDS),
+        'planner_batch_capacity_tolerance_seconds': float(PLANNER_BATCH_CAPACITY_TOLERANCE_SECONDS),
+        'planner_budget_auto_extension_seconds': round(planner_budget_auto_extension_seconds, 2),
+        'planner_round_budget_borrow_allowed': True,
+        # Compatibility fields stay present but remain false/zero because aggregate planner
+        # budget exhaustion no longer exists in completion-driven mode. Provider/model failures are
+        # reported separately below.
+        'planner_budget_floor_shortfall': False,
+        'planner_budget_exhausted': False,
+        'planner_budget_deferred_candidate_count': 0,
+        'planner_provider_timeout_observed': bool(planner_provider_timeout_observed),
+        'planner_ai_error_deferred_candidate_count': int(planner_ai_error_deferred_candidates),
         'selected_action_ids': selected_ids_admitted,
         'ai_selected_action_ids_before_cap': selected_ids,
         'ai_selected_action_priorities': {candidate_id: selected_priority_by_id[candidate_id] for candidate_id in selected_ids},
@@ -2303,7 +2408,7 @@ def ai_plan(state: AgentState) -> dict[str, Any]:
         'review_seconds': 0.0,
         'review_error': '',
         'review_reasoning': '',
-        'seconds': round(time.monotonic() - planning_started, 2),
+        'seconds': round(planner_elapsed_seconds, 2),
         'attempt_errors': list(errors),
     })
     return {
@@ -2484,10 +2589,9 @@ def _expand_equivalent_analysis_rows(
 
 
 def _analysis_budget_estimated_batch_capacity(mode: str, stage_budget_seconds: float) -> int:
-    """Conservative planning estimate only; actual admission is elapsed-time adaptive."""
-    minimum_batch_seconds = 45.0
-    reserve = max(minimum_batch_seconds, float(AI_ANALYSIS_FUTURE_BATCH_RESERVE_SECONDS.get(mode, 90)))
-    return max(0, int(float(stage_budget_seconds) // reserve))
+    """Conservative capacity if every started batch consumed its complete normal timeout."""
+    full_batch_seconds = max(45.0, float(AI_ANALYSIS_BATCH_TIMEOUTS.get(mode, 240)))
+    return max(0, int(float(stage_budget_seconds) // full_batch_seconds))
 
 
 # Parses one structured batch returned by the AI analysis stage.
@@ -2713,8 +2817,7 @@ def _analysis_quality_check(rows: list[dict[str, Any]], expected: set[str]) -> l
 
 
 # Runs one evidence-grounded analysis batch with the selected AI provider. Multi-finding failures are split
-# immediately; a single finding gets one smaller rescue attempt instead of
-# spending the entire batch budget on a second long generation.
+# immediately; a singleton rescue is a separate provider call and receives a fresh full watchdog.
 def _ai_analysis_batch(state: AgentState, batch: list[dict[str, Any]], all_candidates: list[dict[str, Any]], timeout: int) -> list[dict[str, Any]]:
     system_message = _analysis_system_message()
     mode = shared.CURRENT_SCAN_MODE
@@ -2759,25 +2862,13 @@ def _ai_analysis_batch(state: AgentState, batch: list[dict[str, Any]], all_candi
     provider = str(state.get('ai_provider') or 'ollama').lower()
     base = state['ollama_url'].rstrip('/')
     expected = {str(item['id']) for item in batch}
-    started = time.monotonic()
     errors: list[str] = []
     first_error: BaseException | None = None
-
-    # For a one-finding request, reserve time for a compact rescue when the parent slice is large
-    # enough. Preferred floors must never enlarge the timeout supplied by the adaptive parent: near
-    # a stage deadline a short final slice may legitimately run without enough time for a rescue.
+    # Every actual provider call gets the complete watchdog. If a singleton needs the
+    # alternate generate/rescue path, that is a new provider call and receives a fresh complete
+    # allocation too. There is no aggregate analysis-stage deadline in normal mode.
     parent_timeout = max(1, int(timeout))
-    if mode == 'test':
-        rescue_reserve = 10
-        if len(batch) == 1:
-            preferred_chat_budget = max(20, min(int(parent_timeout * 0.70), max(20, parent_timeout - rescue_reserve)))
-        else:
-            preferred_chat_budget = max(20, min(int(parent_timeout * 0.70), 30))
-    elif len(batch) == 1:
-        preferred_chat_budget = max(60, min(int(parent_timeout * 0.62), parent_timeout - 45))
-    else:
-        preferred_chat_budget = max(55, min(int(parent_timeout * 0.70), 105))
-    chat_budget = max(1, min(parent_timeout, int(preferred_chat_budget)))
+    chat_budget = parent_timeout
 
     try:
         if provider == 'snap4city':
@@ -2802,13 +2893,10 @@ def _ai_analysis_batch(state: AgentState, batch: list[dict[str, Any]], all_candi
         if len(batch) > 1:
             raise RuntimeError('; '.join(errors)) from exc
 
-    remaining = max(0, int(timeout - (time.monotonic() - started)))
-    rescue_minimum = 20 if mode == 'test' else 40
-    if remaining < rescue_minimum:
-        message = '; '.join(errors + ['single-finding rescue skipped: analysis budget exhausted'])
-        if _ai_exception_is_timeout(first_error):
-            raise AnalysisBudgetExhausted(message) from first_error
-        raise RuntimeError(message) from first_error
+    # The rescue is a separate provider call, so it must not inherit a shrinking remainder from
+    # the failed/malformed chat call. This prevents a healthy rescue from failing merely because
+    # the first call was slow.
+    rescue_timeout = parent_timeout
 
     rescue_system = (
         system_message
@@ -2824,7 +2912,7 @@ def _ai_analysis_batch(state: AgentState, batch: list[dict[str, Any]], all_candi
         if provider == 'snap4city':
             content = _snap4city_chat_content(
                 state, rescue_system, context,
-                total_timeout=remaining, temperature=0.0,
+                total_timeout=rescue_timeout, temperature=0.0,
             )
         else:
             generate_payload = {
@@ -2834,7 +2922,7 @@ def _ai_analysis_batch(state: AgentState, batch: list[dict[str, Any]], all_candi
             }
             content = _ollama_stream_content(
                 f'{base}/api/generate', generate_payload, response_kind='generate',
-                total_timeout=remaining, early_json=True,
+                total_timeout=rescue_timeout, early_json=True,
             )
         return _analysis_quality_check(_parse_analysis_content(content), expected)
     except Exception as exc:
@@ -2853,100 +2941,94 @@ def _ai_analysis_batch_adaptive(
     label: str,
     deadline: float | None = None,
 ) -> list[dict[str, Any]]:
-    # Every retry/split belongs to one original batch budget. Older code restarted the full
-    # timeout for each child batch, so a malformed four-finding response could multiply a
-    # 900-second Balanced budget across several retries. A shared deadline keeps the whole
-    # adaptive tree bounded while still allowing smaller rescue batches.
-    if deadline is None:
-        deadline = time.monotonic() + max(1, int(timeout))
-    remaining = max(0, int(deadline - time.monotonic()))
-    attempt_floor = 20 if shared.CURRENT_SCAN_MODE == 'test' else 45
-    if remaining < attempt_floor:
-        raise AnalysisBudgetExhausted(f'{label} exhausted its shared analysis batch budget before another AI attempt could start.')
+    """Analyze one logical batch without shrinking child calls because of parent timing.
 
+    `timeout` is a per-provider-call watchdog. Context splits and malformed-response recovery create
+    new real AI calls, so each child receives the same complete watchdog. A timeout therefore means
+    the provider/model failed to finish one generous call, not that Python divided an aggregate
+    stage budget too tightly. `deadline` remains accepted for compatibility but is intentionally not
+    inherited by split children.
+    """
+    full_timeout = max(1, int(timeout))
     fits_context, estimated_context_tokens, context_window = _analysis_context_fits(state, batch, all_candidates)
     if (not fits_context) and len(batch) > 1:
         midpoint = max(1, len(batch) // 2)
         left, right = batch[:midpoint], batch[midpoint:]
         print(
             f'    AI analysis: {label} requires about {estimated_context_tokens} context tokens for {len(batch)} findings '
-            f'(window={context_window}); splitting into {len(left)}+{len(right)} without dropping findings.',
+            f'(window={context_window}); splitting into {len(left)}+{len(right)} without dropping findings; '
+            f'each child keeps the full {full_timeout}s provider allowance.',
             flush=True,
         )
         rows: list[dict[str, Any]] = []
-        split_remaining = max(0, int(deadline - time.monotonic()))
-        left_floor = 20 if shared.CURRENT_SCAN_MODE == 'test' else 45
-        left_share = max(left_floor, int(split_remaining * (len(left) / max(1, len(batch)))))
-        left_deadline = min(deadline, time.monotonic() + left_share)
         try:
             rows.extend(_ai_analysis_batch_adaptive(
-                state, left, all_candidates, timeout, label=f'{label}.ctx1', deadline=left_deadline,
+                state, left, all_candidates, full_timeout, label=f'{label}.ctx1', deadline=None,
             ))
-        except AnalysisBudgetExhausted as exc:
-            raise AnalysisBudgetExhausted(str(exc), partial_rows=[*rows, *exc.partial_rows]) from exc
+        except AnalysisBudgetExhausted as child_exc:
+            raise AnalysisBudgetExhausted(str(child_exc), partial_rows=[*rows, *child_exc.partial_rows]) from child_exc
+        except AnalysisPartialFailure as child_exc:
+            raise AnalysisPartialFailure(str(child_exc), partial_rows=[*rows, *child_exc.partial_rows]) from child_exc
+        except Exception as child_exc:
+            if rows:
+                raise AnalysisPartialFailure(str(child_exc), partial_rows=rows) from child_exc
+            raise
         try:
             rows.extend(_ai_analysis_batch_adaptive(
-                state, right, all_candidates, timeout, label=f'{label}.ctx2', deadline=deadline,
+                state, right, all_candidates, full_timeout, label=f'{label}.ctx2', deadline=None,
             ))
-        except AnalysisBudgetExhausted as exc:
-            raise AnalysisBudgetExhausted(str(exc), partial_rows=[*rows, *exc.partial_rows]) from exc
+        except AnalysisBudgetExhausted as child_exc:
+            raise AnalysisBudgetExhausted(str(child_exc), partial_rows=[*rows, *child_exc.partial_rows]) from child_exc
+        except AnalysisPartialFailure as child_exc:
+            raise AnalysisPartialFailure(str(child_exc), partial_rows=[*rows, *child_exc.partial_rows]) from child_exc
+        except Exception as child_exc:
+            if rows:
+                raise AnalysisPartialFailure(str(child_exc), partial_rows=rows) from child_exc
+            raise
         return rows
 
     try:
-        return _ai_analysis_batch(state, batch, all_candidates, remaining)
+        return _ai_analysis_batch(state, batch, all_candidates, full_timeout)
     except Exception as exc:
-        # If the model/transport consumed the shared batch deadline, this is phase-budget
-        # exhaustion rather than a provider-contract failure. Preserve scanner evidence and let
-        # analysis_node continue with later groups even under --require-ai. An immediate provider
-        # error while substantial batch time remains is still propagated and remains fatal in
-        # strict mode.
-        remaining_after_error = max(0, int(deadline - time.monotonic()))
-        if remaining_after_error < attempt_floor:
-            if _ai_exception_is_timeout(exc):
-                raise AnalysisBudgetExhausted(
-                    f'{label} exhausted its shared analysis batch budget while waiting for AI output.'
-                ) from exc
-            # A real provider/contract failure does not become benign merely because it arrived
-            # near the deadline. Let strict mode treat it as the AI failure it actually is.
-            raise
         if len(batch) <= 1:
-            raise
-        midpoint = max(1, len(batch) // 2)
-        left = batch[:midpoint]
-        right = batch[midpoint:]
-        remaining = max(0, int(deadline - time.monotonic()))
-        split_floor = 24 if shared.CURRENT_SCAN_MODE == 'test' else 90
-        if remaining < split_floor:
             if _ai_exception_is_timeout(exc):
                 raise AnalysisBudgetExhausted(
-                    f'{label} exhausted its shared analysis batch budget before split retries could complete.'
+                    f'{label} provider/model did not complete within the full {full_timeout}s call watchdog.'
                 ) from exc
             raise
+
+        midpoint = max(1, len(batch) // 2)
+        left, right = batch[:midpoint], batch[midpoint:]
         print(
-            f'    AI analysis: {label} did not complete cleanly; retrying as smaller AI batches '
-            f'({len(left)} + {len(right)} findings) within the same {timeout}s batch deadline.',
+            f'    AI analysis: {label} did not complete cleanly ({type(exc).__name__}: {exc}); '
+            f'retrying as {len(left)}+{len(right)} smaller AI batches, each with the full {full_timeout}s allowance.',
             flush=True,
         )
         rows: list[dict[str, Any]] = []
-        # Allocate the first child only its proportional share of the remaining wall-clock time;
-        # the second child receives whatever remains under the same parent deadline. If one child
-        # later exhausts the shared deadline, preserve rows already completed by the sibling instead
-        # of throwing away valid AI work for the whole parent batch.
-        left_floor = 20 if shared.CURRENT_SCAN_MODE == 'test' else 45
-        left_share = max(left_floor, int(remaining * (len(left) / max(1, len(batch)))))
-        left_deadline = min(deadline, time.monotonic() + left_share)
         try:
             rows.extend(_ai_analysis_batch_adaptive(
-                state, left, all_candidates, timeout, label=f'{label}.1', deadline=left_deadline,
+                state, left, all_candidates, full_timeout, label=f'{label}.1', deadline=None,
             ))
-        except AnalysisBudgetExhausted as exc:
-            raise AnalysisBudgetExhausted(str(exc), partial_rows=[*rows, *exc.partial_rows]) from exc
+        except AnalysisBudgetExhausted as child_exc:
+            raise AnalysisBudgetExhausted(str(child_exc), partial_rows=[*rows, *child_exc.partial_rows]) from child_exc
+        except AnalysisPartialFailure as child_exc:
+            raise AnalysisPartialFailure(str(child_exc), partial_rows=[*rows, *child_exc.partial_rows]) from child_exc
+        except Exception as child_exc:
+            if rows:
+                raise AnalysisPartialFailure(str(child_exc), partial_rows=rows) from child_exc
+            raise
         try:
             rows.extend(_ai_analysis_batch_adaptive(
-                state, right, all_candidates, timeout, label=f'{label}.2', deadline=deadline,
+                state, right, all_candidates, full_timeout, label=f'{label}.2', deadline=None,
             ))
-        except AnalysisBudgetExhausted as exc:
-            raise AnalysisBudgetExhausted(str(exc), partial_rows=[*rows, *exc.partial_rows]) from exc
+        except AnalysisBudgetExhausted as child_exc:
+            raise AnalysisBudgetExhausted(str(child_exc), partial_rows=[*rows, *child_exc.partial_rows]) from child_exc
+        except AnalysisPartialFailure as child_exc:
+            raise AnalysisPartialFailure(str(child_exc), partial_rows=[*rows, *child_exc.partial_rows]) from child_exc
+        except Exception as child_exc:
+            if rows:
+                raise AnalysisPartialFailure(str(child_exc), partial_rows=rows) from child_exc
+            raise
         return rows
 
 
@@ -3090,7 +3172,10 @@ def analysis_node(state: AgentState) -> dict[str, Any]:
     if not candidates:
         analysis = {'status': 'skipped', 'provider': str(state.get('ai_provider') or 'ollama'), 'model': state['model'], 'analyzed_findings': 0, 'severity_changes': 0, 'errors': [], 'seconds': 0.0}
         print('AI analysis: no confirmed/candidate findings to analyze.', flush=True)
-        return {'results': results, 'analysis': analysis}
+        return {
+            'results': results, 'analysis': analysis,
+            'analysis_control_plane_seconds': max(0.0, float(state.get('analysis_control_plane_seconds') or 0.0)),
+        }
 
     started = time.monotonic()
     mode = shared.CURRENT_SCAN_MODE
@@ -3124,38 +3209,13 @@ def analysis_node(state: AgentState) -> dict[str, Any]:
             )
         representatives = kept
 
-    default_batch_budget = AI_ANALYSIS_BATCH_TIMEOUTS.get(mode, 240)
-    remaining_for_analysis = max(0, int(_assessment_analysis_deadline(state) - time.monotonic()))
-    configured_stage_budget = max(1, int(AI_ANALYSIS_STAGE_TIMEOUTS.get(mode, default_batch_budget)))
-    stage_budget = min(configured_stage_budget, remaining_for_analysis)
-    analysis_stage_deadline = min(started + float(stage_budget), _assessment_analysis_deadline(state))
-
-    if remaining_for_analysis < 45:
-        pending_ids = [
-            finding_id for finding_id, finding in finding_map.items()
-            if isinstance(finding, dict)
-            and str((finding.get('ai_analysis_status') or {}).get('status') or '') == 'pending'
-        ]
-        _set_finding_ai_analysis_status(
-            finding_map, pending_ids,
-            status='not_analyzed_budget',
-            reason='The protected AI-analysis phase had less than the minimum safe batch window remaining; scanner/verifier information is fully retained.',
-            provider=provider, model=model,
-        )
-        analysis = {
-            'status': 'partial', 'provider': provider, 'model': model,
-            'candidate_findings': len(representatives), 'candidate_findings_total': total_candidate_findings,
-            'analysis_representative_findings_total': representative_total,
-            'equivalent_findings_collapsed': equivalent_findings_collapsed,
-            'analyzed_findings': 0, 'severity_changes': 0,
-            'candidate_findings_unanalyzed': total_candidate_findings,
-            'errors': ['protected AI-analysis phase had insufficient remaining time for a safe model call; scanner/verifier evidence retained'],
-            'seconds': round(time.monotonic() - started, 2), 'diagnosis': 'assessment_time_budget_exhausted',
-        }
-        print('AI analysis: protected analysis phase had insufficient time for a safe model call; scanner evidence is retained.', flush=True)
-        return {'results': results, 'analysis': analysis}
-
-    batch_budget = min(default_batch_budget, remaining_for_analysis)
+    default_batch_budget = int(AI_ANALYSIS_BATCH_TIMEOUTS.get(mode, 1800))
+    configured_stage_budget = max(1, int(analysis_stage_budget_seconds(mode, state.get('max_rounds'))))
+    # The aggregate stage value is now a nominal sizing/reporting reserve, not an admission cap.
+    # Real batches are completion-driven and each receives the complete per-call watchdog.
+    stage_budget = configured_stage_budget
+    analysis_stage_deadline = math.inf
+    batch_budget = default_batch_budget
     batch_size = AI_ANALYSIS_BATCH_SIZES.get(mode, 8)
     estimated_batch_capacity = _analysis_budget_estimated_batch_capacity(mode, stage_budget)
     analyzed = changed = direct_representatives_analyzed = 0
@@ -3174,146 +3234,142 @@ def analysis_node(state: AgentState) -> dict[str, Any]:
             flush=True,
         )
 
-    if batch_budget < 45:
-        message = f'analysis batch time budget is too small: {batch_budget}s; minimum is 45s; scanner evidence retained'
-        errors.append(message)
-        budget_deferred_representative_ids.update(str(item.get('id') or '') for item in representatives)
-    else:
-        for batch_index in range(batch_count):
-            batch = representatives[batch_index * batch_size:(batch_index + 1) * batch_size]
-            try:
-                now = time.monotonic()
-                remaining_hard = max(0.0, _assessment_analysis_deadline(state) - now)
-                remaining_stage = max(0.0, analysis_stage_deadline - now)
-                if remaining_hard < 45:
-                    errors.append('assessment wall-clock budget reached during AI analysis; remaining findings retained without AI rewrite')
-                    budget_deferred_representative_ids.update(
-                        str(item.get('id') or '') for item in representatives[batch_index * batch_size:]
-                    )
-                    break
-                if remaining_stage < 45:
-                    errors.append('aggregate AI analysis stage budget reached; remaining findings retain scanner/verifier evidence without AI rewrite')
-                    budget_deferred_representative_ids.update(
-                        str(item.get('id') or '') for item in representatives[batch_index * batch_size:]
-                    )
-                    break
-
-                # Do not pre-reserve time for the entire remaining catalog: that was the starvation
-                # bug. Protect only a few future batches while allowing fast successful generations
-                # to continue until the real stage deadline. This makes coverage depend on measured
-                # AI throughput rather than a pessimistic static finding cap.
-                remaining_batches = max(1, batch_count - batch_index)
-                future_batch_count = max(0, remaining_batches - 1)
-                protected_future_batches = min(future_batch_count, {'test': 0, 'fast': 2, 'balanced': 3, 'deep': 4}.get(mode, 3))
-                future_batch_reserve = max(45.0, float(AI_ANALYSIS_FUTURE_BATCH_RESERVE_SECONDS.get(mode, 90)))
-                max_protected_seconds = max(0.0, remaining_stage - 45.0)
-                protected_seconds = min(max_protected_seconds, future_batch_reserve * protected_future_batches)
-                stage_slice = max(45.0, remaining_stage - protected_seconds)
-                effective_batch_budget = min(float(batch_budget), float(remaining_hard), float(stage_slice))
-                if effective_batch_budget < 45:
-                    errors.append(
-                        f'analysis stage cannot allocate the 45s minimum to batch {batch_index + 1}/{batch_count} '
-                        f'within the remaining aggregate budget; scanner evidence retained'
-                    )
-                    budget_deferred_representative_ids.update(
-                        str(item.get('id') or '') for item in representatives[batch_index * batch_size:]
-                    )
-                    break
-
-                effective_batch_budget_int = max(45, int(math.ceil(effective_batch_budget)))
-                batch_deadline = min(analysis_stage_deadline, time.monotonic() + effective_batch_budget)
-                rows = _ai_analysis_batch_adaptive(
-                    state, batch, representatives, effective_batch_budget_int,
-                    label=f'batch {batch_index + 1}/{batch_count}', deadline=batch_deadline,
+    for batch_index in range(batch_count):
+        batch = representatives[batch_index * batch_size:(batch_index + 1) * batch_size]
+        try:
+            # Completion-driven final analysis: batch count never divides time and there is no
+            # aggregate stage deadline. Each started batch gets the full provider watchdog; a fast
+            # response returns immediately, while a timeout now indicates a genuinely stalled/slow
+            # provider call rather than an undersized Python phase budget.
+            effective_batch_budget_int = int(default_batch_budget)
+            rows = _ai_analysis_batch_adaptive(
+                state, batch, representatives, effective_batch_budget_int,
+                label=f'batch {batch_index + 1}/{batch_count}', deadline=None,
+            )
+            direct_ids = {str(row.get('id') or '') for row in rows if str(row.get('id') or '')}
+            expected_ids = {str(item.get('id') or '') for item in batch if str(item.get('id') or '')}
+            missing_ids = expected_ids - direct_ids
+            if missing_ids:
+                incomplete_response_representative_ids.update(missing_ids)
+                errors.append(
+                    f'batch {batch_index + 1}/{batch_count}: AI response omitted {len(missing_ids)} representative finding(s); '
+                    'their scanner/verifier data were retained without AI rewrite'
                 )
-                direct_ids = {str(row.get('id') or '') for row in rows if str(row.get('id') or '')}
-                expected_ids = {str(item.get('id') or '') for item in batch if str(item.get('id') or '')}
-                missing_ids = expected_ids - direct_ids
-                if missing_ids:
-                    incomplete_response_representative_ids.update(missing_ids)
-                    errors.append(
-                        f'batch {batch_index + 1}/{batch_count}: AI response omitted {len(missing_ids)} representative finding(s); '
-                        'their scanner/verifier data were retained without AI rewrite'
-                    )
-                expanded_rows = _expand_equivalent_analysis_rows(rows, members_by_representative)
-                batch_analyzed, batch_changed = _apply_analysis(
+            expanded_rows = _expand_equivalent_analysis_rows(rows, members_by_representative)
+            batch_analyzed, batch_changed = _apply_analysis(
+                expanded_rows, finding_map, state['model'], str(state.get('ai_provider') or 'ollama')
+            )
+            # A syntactically present row can still be rejected by _apply_analysis (for example
+            # an invalid risk/confidence enum). Count a representative as directly analyzed only
+            # when its original finding actually carries an analyzed/reused status afterwards.
+            successfully_applied_ids = {
+                representative_id for representative_id in direct_ids
+                if str((finding_map.get(representative_id, {}).get('ai_analysis_status') or {}).get('status') or '')
+                in {'analyzed', 'reused_equivalent'}
+            }
+            invalid_applied_ids = direct_ids - successfully_applied_ids
+            if invalid_applied_ids:
+                incomplete_response_representative_ids.update(invalid_applied_ids)
+                errors.append(
+                    f'batch {batch_index + 1}/{batch_count}: {len(invalid_applied_ids)} returned representative row(s) '
+                    'failed AI analysis validation; scanner/verifier data were retained without AI rewrite'
+                )
+            direct_representative_ids.update(successfully_applied_ids)
+            direct_representatives_analyzed += len(successfully_applied_ids)
+            analyzed += batch_analyzed
+            changed += batch_changed
+            print(
+                f'    AI analysis: batch {batch_index + 1}/{batch_count}: representatives={len(direct_ids)}; '
+                f'findings covered={batch_analyzed}; severity changes={batch_changed}', flush=True,
+            )
+        except AnalysisBudgetExhausted as exc:
+            message = f'batch {batch_index + 1}: {type(exc).__name__}: {exc}'
+            errors.append(message)
+            expected_ids = {str(item.get('id') or '') for item in batch if str(item.get('id') or '')}
+            partial_rows = [row for row in getattr(exc, 'partial_rows', []) if isinstance(row, dict)]
+            direct_ids = {str(row.get('id') or '') for row in partial_rows if str(row.get('id') or '')}
+            successfully_applied_ids: set[str] = set()
+            partial_analyzed = partial_changed = 0
+            if partial_rows:
+                expanded_rows = _expand_equivalent_analysis_rows(partial_rows, members_by_representative)
+                partial_analyzed, partial_changed = _apply_analysis(
                     expanded_rows, finding_map, state['model'], str(state.get('ai_provider') or 'ollama')
                 )
-                # A syntactically present row can still be rejected by _apply_analysis (for example
-                # an invalid risk/confidence enum). Count a representative as directly analyzed only
-                # when its original finding actually carries an analyzed/reused status afterwards.
                 successfully_applied_ids = {
                     representative_id for representative_id in direct_ids
                     if str((finding_map.get(representative_id, {}).get('ai_analysis_status') or {}).get('status') or '')
                     in {'analyzed', 'reused_equivalent'}
                 }
-                invalid_applied_ids = direct_ids - successfully_applied_ids
-                if invalid_applied_ids:
-                    incomplete_response_representative_ids.update(invalid_applied_ids)
-                    errors.append(
-                        f'batch {batch_index + 1}/{batch_count}: {len(invalid_applied_ids)} returned representative row(s) '
-                        'failed AI analysis validation; scanner/verifier data were retained without AI rewrite'
-                    )
+                invalid_partial_ids = direct_ids - successfully_applied_ids
+                if invalid_partial_ids:
+                    incomplete_response_representative_ids.update(invalid_partial_ids)
                 direct_representative_ids.update(successfully_applied_ids)
                 direct_representatives_analyzed += len(successfully_applied_ids)
-                analyzed += batch_analyzed
-                changed += batch_changed
-                print(
-                    f'    AI analysis: batch {batch_index + 1}/{batch_count}: representatives={len(direct_ids)}; '
-                    f'findings covered={batch_analyzed}; severity changes={batch_changed}', flush=True,
+                analyzed += partial_analyzed
+                changed += partial_changed
+            error_deferred_representative_ids.update(expected_ids - direct_ids)
+            print(
+                f'    AI analysis: {message}; the full per-call watchdog was available, so this is treated as an AI/provider timeout rather than a local phase-budget shortage. '
+                f'Preserved {len(successfully_applied_ids)} completed representative row(s); remaining scanner/verifier data retained. '
+                'Continuing with later representative groups.',
+                file=sys.stderr, flush=True,
+            )
+        except AnalysisPartialFailure as exc:
+            message = f'batch {batch_index + 1}: {type(exc).__name__}: {exc}'
+            errors.append(message)
+            expected_ids = {str(item.get('id') or '') for item in batch if str(item.get('id') or '')}
+            partial_rows = [row for row in getattr(exc, 'partial_rows', []) if isinstance(row, dict)]
+            direct_ids = {str(row.get('id') or '') for row in partial_rows if str(row.get('id') or '')}
+            successfully_applied_ids: set[str] = set()
+            partial_analyzed = partial_changed = 0
+            if partial_rows:
+                expanded_rows = _expand_equivalent_analysis_rows(partial_rows, members_by_representative)
+                partial_analyzed, partial_changed = _apply_analysis(
+                    expanded_rows, finding_map, state['model'], str(state.get('ai_provider') or 'ollama')
                 )
-            except AnalysisBudgetExhausted as exc:
-                message = f'batch {batch_index + 1}: {type(exc).__name__}: {exc}'
-                errors.append(message)
-                expected_ids = {str(item.get('id') or '') for item in batch if str(item.get('id') or '')}
-                partial_rows = [row for row in getattr(exc, 'partial_rows', []) if isinstance(row, dict)]
-                direct_ids = {str(row.get('id') or '') for row in partial_rows if str(row.get('id') or '')}
-                successfully_applied_ids: set[str] = set()
-                partial_analyzed = partial_changed = 0
-                if partial_rows:
-                    expanded_rows = _expand_equivalent_analysis_rows(partial_rows, members_by_representative)
-                    partial_analyzed, partial_changed = _apply_analysis(
-                        expanded_rows, finding_map, state['model'], str(state.get('ai_provider') or 'ollama')
-                    )
-                    successfully_applied_ids = {
-                        representative_id for representative_id in direct_ids
-                        if str((finding_map.get(representative_id, {}).get('ai_analysis_status') or {}).get('status') or '')
-                        in {'analyzed', 'reused_equivalent'}
-                    }
-                    invalid_partial_ids = direct_ids - successfully_applied_ids
-                    if invalid_partial_ids:
-                        incomplete_response_representative_ids.update(invalid_partial_ids)
-                    direct_representative_ids.update(successfully_applied_ids)
-                    direct_representatives_analyzed += len(successfully_applied_ids)
-                    analyzed += partial_analyzed
-                    changed += partial_changed
-                budget_deferred_representative_ids.update(expected_ids - direct_ids)
-                print(
-                    f'    AI analysis: {message}; this is bounded phase-budget exhaustion, not an AI provider failure. '
-                    f'Preserved {len(successfully_applied_ids)} completed representative row(s); remaining scanner/verifier data retained. '
-                    'Continuing with later representative groups while time remains.',
-                    file=sys.stderr, flush=True,
-                )
-            except AnalysisContextTooLarge as exc:
-                message = f'batch {batch_index + 1}: {type(exc).__name__}: {exc}'
-                errors.append(message)
-                context_deferred_representative_ids.update(
-                    str(item.get('id') or '') for item in batch if str(item.get('id') or '')
-                )
-                print(
-                    f'    AI analysis: {message}; this is a bounded prompt-representation limit, not an AI provider failure. '
-                    'Scanner/verifier evidence is retained and reporting continues.',
-                    file=sys.stderr, flush=True,
-                )
-            except Exception as exc:
-                message = f'batch {batch_index + 1}: {type(exc).__name__}: {exc}'
-                errors.append(message)
-                if state.get('require_ai'):
-                    raise RuntimeError(f'Strict agentic mode requires AI analysis: {message}') from exc
-                error_deferred_representative_ids.update(
-                    str(item.get('id') or '') for item in batch if str(item.get('id') or '')
-                )
-                print(f'    AI analysis: {message}; scanner data retained for this batch.', file=sys.stderr, flush=True)
+                successfully_applied_ids = {
+                    representative_id for representative_id in direct_ids
+                    if str((finding_map.get(representative_id, {}).get('ai_analysis_status') or {}).get('status') or '')
+                    in {'analyzed', 'reused_equivalent'}
+                }
+                invalid_partial_ids = direct_ids - successfully_applied_ids
+                if invalid_partial_ids:
+                    incomplete_response_representative_ids.update(invalid_partial_ids)
+                direct_representative_ids.update(successfully_applied_ids)
+                direct_representatives_analyzed += len(successfully_applied_ids)
+                analyzed += partial_analyzed
+                changed += partial_changed
+            error_deferred_representative_ids.update(expected_ids - direct_ids)
+            print(
+                f'    AI analysis: {message}; preserved {len(successfully_applied_ids)} completed representative row(s) from earlier split children. '
+                'Remaining scanner/verifier data retained and reporting continues.',
+                file=sys.stderr, flush=True,
+            )
+        except AnalysisContextTooLarge as exc:
+            message = f'batch {batch_index + 1}: {type(exc).__name__}: {exc}'
+            errors.append(message)
+            context_deferred_representative_ids.update(
+                str(item.get('id') or '') for item in batch if str(item.get('id') or '')
+            )
+            print(
+                f'    AI analysis: {message}; this is a bounded prompt-representation limit, not an AI provider failure. '
+                'Scanner/verifier evidence is retained and reporting continues.',
+                file=sys.stderr, flush=True,
+            )
+        except Exception as exc:
+            message = f'batch {batch_index + 1}: {type(exc).__name__}: {exc}'
+            errors.append(message)
+            # Final AI interpretation is enrichment, never the owner of scanner/verifier truth.
+            # Even in --require-ai, one provider/contract failure must not destroy a completed
+            # assessment. Keep the original evidence, mark this group explicitly incomplete, and
+            # continue so reporting can always materialize the work already performed.
+            error_deferred_representative_ids.update(
+                str(item.get('id') or '') for item in batch if str(item.get('id') or '')
+            )
+            print(
+                f'    AI analysis: {message}; scanner/verifier data retained and reporting will continue.',
+                file=sys.stderr, flush=True,
+            )
 
     # Make AI coverage explicit on every original security finding. No vulnerability/candidate is
     # removed merely because AI coverage ended: each retains scanner/verifier evidence and a reason.
@@ -3335,7 +3391,7 @@ def analysis_node(state: AgentState) -> dict[str, Any]:
         _set_finding_ai_analysis_status(
             finding_map, members_by_representative.get(representative_id, [representative_id]),
             status='not_analyzed_ai_error',
-            reason='AI analysis for this batch failed while strict AI was disabled; scanner/verifier information is retained in full.',
+            reason='AI analysis for this batch failed; scanner/verifier information is retained in full and reporting continued.',
             provider=provider, model=model, representative_id=representative_id, overwrite=False,
         )
     for representative_id in incomplete_response_representative_ids:
@@ -3354,8 +3410,8 @@ def analysis_node(state: AgentState) -> dict[str, Any]:
     if still_pending:
         _set_finding_ai_analysis_status(
             finding_map, still_pending,
-            status='not_analyzed_budget',
-            reason='AI analysis ended before this finding received a model assessment; scanner/verifier information is retained in full.',
+            status='not_analyzed_ai_incomplete_response',
+            reason='AI analysis ended without a valid model assessment for this finding; scanner/verifier information is retained in full.',
             provider=provider, model=model, overwrite=False,
         )
 
@@ -3393,7 +3449,7 @@ def analysis_node(state: AgentState) -> dict[str, Any]:
         ),
         # Compatibility key: now a conservative throughput estimate, not a hard admission cap.
         'analysis_budget_batch_limit': estimated_batch_capacity,
-        'analysis_budget_policy': 'elapsed-time adaptive over strict equivalent-finding representatives; no static hard finding cap',
+        'analysis_budget_policy': 'completion-driven over strict equivalent-finding representatives; no aggregate stage wall-clock cap; every real AI batch/context child receives the full per-call watchdog',
         'test_finding_limit': TEST_ANALYSIS_FINDING_LIMIT if mode == 'test' else 0,
         'test_representatives_deferred': test_representatives_deferred if mode == 'test' else 0,
         'test_findings_deferred': test_findings_deferred if mode == 'test' else 0,
@@ -3404,7 +3460,8 @@ def analysis_node(state: AgentState) -> dict[str, Any]:
         'batch_timeout_seconds': batch_budget,
         'stage_timeout_seconds': configured_stage_budget,
         'stage_budget_effective_seconds': stage_budget,
-        'future_batch_reserve_seconds': int(AI_ANALYSIS_FUTURE_BATCH_RESERVE_SECONDS.get(mode, 90)),
+        'stage_budget_is_hard_cap': False,
+        'full_batch_allocation_seconds': int(default_batch_budget),
         'policy': 'AI supplies the final severity and professional description/impact/consequence/recovery/remediation wording; strictly equivalent findings may reuse one AI assessment while retaining individual scanner evidence; browser verification constrains confidence independently from severity, while original scanner narrative, category, verification status and evidence remain preserved and scanner/verifier-controlled where applicable.',
     }
     print(
@@ -3412,7 +3469,11 @@ def analysis_node(state: AgentState) -> dict[str, Any]:
         f"reused={reused_findings}; severity changes={changed}; {analysis['seconds']:.1f}s",
         flush=True,
     )
-    return {'results': results, 'analysis': analysis}
+    analysis_control_plane_seconds = max(0.0, float(state.get('analysis_control_plane_seconds') or 0.0)) + max(0.0, float(analysis.get('seconds') or 0.0))
+    return {
+        'results': results, 'analysis': analysis,
+        'analysis_control_plane_seconds': analysis_control_plane_seconds,
+    }
 
 # Keeps a bounded result summary that is safe to send back to the planner.
 def compact_results(results: dict[str, dict[str, Any]]) -> dict[str, Any]:
@@ -4369,6 +4430,13 @@ def planner_node(state: AgentState) -> dict[str, Any]:
     validated_concrete_action_count = 0
     review_selected_ids: list[str] = []
     review_reasoning = ''
+    review_seconds = 0.0
+    review_error = ''
+    selected_ids: list[str] = []
+    ai_selected_ids: list[str] = []
+    candidate_count = 0
+    detailed_candidate_count = 0
+    candidate_pool_count = len(eligible)
     fallback_reason = ''
     # Measure the AI attempt independently from success-only ai_plan diagnostics. This prevents a
     # failed non-strict attempt from being recorded as zero seconds and then receiving the same
@@ -4452,14 +4520,26 @@ def planner_node(state: AgentState) -> dict[str, Any]:
         planner_seconds = max(0.0, time.monotonic() - planner_attempt_started)
         endpoint = str(LAST_AI_PLAN_DIAGNOSTICS.get('endpoint', 'unavailable'))
         context_bytes = int(LAST_AI_PLAN_DIAGNOSTICS.get('context_bytes', 0) or 0)
-        if state.get('require_ai'):
-            raise RuntimeError(f'Strict agentic mode requires a successful AI plan: {type(exc).__name__}: {exc}') from exc
-        plan = _fallback_plan(state, eligible, resolved_round_max)
-        finished = not plan
         fallback_reason = f'{type(exc).__name__}: {exc}'
-        message = 'AI concrete-action planning failed; because --require-ai is disabled, the emergency deterministic fallback was used under the same global round cap: ' + fallback_reason
+        if state.get('require_ai'):
+            # Strict Agentic mode must never invent a deterministic attack plan when AI planning is
+            # unavailable. It also must not throw away hours of discovery/scanning just because the
+            # control plane hit a genuine provider/model/contract error. Finalize honestly with no new actions,
+            # preserve all evidence, and make the incomplete AI-planning coverage explicit.
+            plan = []
+            finished = True
+            planner_source = 'ai_failed_finalize'
+            message = (
+                'Strict AI concrete-action planning could not complete; no deterministic fallback '
+                'was used. Preserving all collected evidence and proceeding to verification, AI '
+                'analysis where available, and reporting: ' + fallback_reason
+            )
+        else:
+            plan = _fallback_plan(state, eligible, resolved_round_max)
+            finished = not plan
+            planner_source = 'fallback'
+            message = 'AI concrete-action planning failed; because --require-ai is disabled, the emergency deterministic fallback was used under the same global round cap: ' + fallback_reason
         notes.append(message)
-        planner_source = 'fallback'
         summary = message[:1000]
         print(f'\n[!] {message}', file=sys.stderr, flush=True)
     plan_before_final_cap = len(plan)
@@ -4474,16 +4554,16 @@ def planner_node(state: AgentState) -> dict[str, Any]:
         'planner_source': planner_source,
         'planner_endpoint': endpoint,
         'context_bytes': context_bytes,
-        'context_window': int(LAST_AI_PLAN_DIAGNOSTICS.get('context_window', 0) or 0) if planner_source == 'ai' else 0,
+        'context_window': int(LAST_AI_PLAN_DIAGNOSTICS.get('context_window', 0) or 0) if planner_source in {'ai', 'ai_failed_finalize'} else 0,
         'eligible_action_count': len(eligible),
-        'planner_candidate_pool_count': int(LAST_AI_PLAN_DIAGNOSTICS.get('candidate_pool_count', len(eligible)) or len(eligible)) if planner_source == 'ai' else len(eligible),
-        'planner_candidate_count': int(LAST_AI_PLAN_DIAGNOSTICS.get('candidate_count', len(eligible)) or len(eligible)) if planner_source == 'ai' else len(eligible),
-        'planner_detailed_candidate_count': int(LAST_AI_PLAN_DIAGNOSTICS.get('detailed_candidate_count', 0) or 0) if planner_source == 'ai' else 0,
-        'concrete_action_pool_count': int(LAST_AI_PLAN_DIAGNOSTICS.get('concrete_action_pool_count', len(eligible)) or len(eligible)) if planner_source == 'ai' else len(eligible),
-        'planner_batch_size': int(LAST_AI_PLAN_DIAGNOSTICS.get('planner_batch_size', 0) or 0) if planner_source == 'ai' else 0,
-        'planner_batch_count': int(LAST_AI_PLAN_DIAGNOSTICS.get('planner_batch_count', 0) or 0) if planner_source == 'ai' else 0,
-        'available_actions_per_profile': dict(LAST_AI_PLAN_DIAGNOSTICS.get('available_actions_per_profile', {})) if planner_source == 'ai' and isinstance(LAST_AI_PLAN_DIAGNOSTICS.get('available_actions_per_profile', {}), dict) else {},
-        'admitted_actions_per_profile': dict(LAST_AI_PLAN_DIAGNOSTICS.get('admitted_actions_per_profile', {})) if planner_source == 'ai' and isinstance(LAST_AI_PLAN_DIAGNOSTICS.get('admitted_actions_per_profile', {}), dict) else {},
+        'planner_candidate_pool_count': int(LAST_AI_PLAN_DIAGNOSTICS.get('candidate_pool_count', len(eligible)) or len(eligible)) if planner_source in {'ai', 'ai_failed_finalize'} else len(eligible),
+        'planner_candidate_count': int(LAST_AI_PLAN_DIAGNOSTICS.get('candidate_count', len(eligible)) or len(eligible)) if planner_source in {'ai', 'ai_failed_finalize'} else len(eligible),
+        'planner_detailed_candidate_count': int(LAST_AI_PLAN_DIAGNOSTICS.get('detailed_candidate_count', 0) or 0) if planner_source in {'ai', 'ai_failed_finalize'} else 0,
+        'concrete_action_pool_count': int(LAST_AI_PLAN_DIAGNOSTICS.get('concrete_action_pool_count', len(eligible)) or len(eligible)) if planner_source in {'ai', 'ai_failed_finalize'} else len(eligible),
+        'planner_batch_size': int(LAST_AI_PLAN_DIAGNOSTICS.get('planner_batch_size', 0) or 0) if planner_source in {'ai', 'ai_failed_finalize'} else 0,
+        'planner_batch_count': int(LAST_AI_PLAN_DIAGNOSTICS.get('planner_batch_count', 0) or 0) if planner_source in {'ai', 'ai_failed_finalize'} else 0,
+        'available_actions_per_profile': dict(LAST_AI_PLAN_DIAGNOSTICS.get('available_actions_per_profile', {})) if planner_source in {'ai', 'ai_failed_finalize'} and isinstance(LAST_AI_PLAN_DIAGNOSTICS.get('available_actions_per_profile', {}), dict) else {},
+        'admitted_actions_per_profile': dict(LAST_AI_PLAN_DIAGNOSTICS.get('admitted_actions_per_profile', {})) if planner_source in {'ai', 'ai_failed_finalize'} and isinstance(LAST_AI_PLAN_DIAGNOSTICS.get('admitted_actions_per_profile', {}), dict) else {},
         'eligible_tools': sorted({str(action.get('tool') or '') for action in eligible}),
         'request_case_duplicates_consolidated': sum(
             int(((profile_data.get('budget_diagnostics') or {}).get('request_case_duplicates_consolidated_online', 0)) or 0)
@@ -4508,23 +4588,28 @@ def planner_node(state: AgentState) -> dict[str, Any]:
         'round_action_required_per_round': int(round_budget['required_per_round']),
         'round_action_remaining_rounds': int(round_budget['remaining_rounds']),
         'round_action_count_before_final_cap': plan_before_final_cap,
-        'execution_budget_diagnostics_per_profile': dict(LAST_AI_PLAN_DIAGNOSTICS.get('execution_budget_diagnostics_per_profile', {})) if planner_source == 'ai' and isinstance(LAST_AI_PLAN_DIAGNOSTICS.get('execution_budget_diagnostics_per_profile', {}), dict) else {},
-        'ai_selected_action_count_before_cap': len(ai_selected_ids) if planner_source == 'ai' else 0,
+        'execution_budget_diagnostics_per_profile': dict(LAST_AI_PLAN_DIAGNOSTICS.get('execution_budget_diagnostics_per_profile', {})) if planner_source in {'ai', 'ai_failed_finalize'} and isinstance(LAST_AI_PLAN_DIAGNOSTICS.get('execution_budget_diagnostics_per_profile', {}), dict) else {},
+        'ai_selected_action_count_before_cap': len(ai_selected_ids) if planner_source in {'ai', 'ai_failed_finalize'} else 0,
         'validated_concrete_action_count': validated_concrete_action_count,
         'review_reasoning': review_reasoning if planner_source == 'ai' else '',
         'fallback_reason': fallback_reason,
         'selected_action_count': len(plan),
         'selected_actions': [_audit_action_summary(action) for action in plan],
         'planner_seconds': round(float(planner_seconds), 2),
-        'planner_round_budget_seconds': float(LAST_AI_PLAN_DIAGNOSTICS.get('planner_round_budget_seconds', 0) or 0) if planner_source == 'ai' else 0.0,
-        'planner_round_budget_configured_seconds': int(LAST_AI_PLAN_DIAGNOSTICS.get('planner_round_budget_configured_seconds', 0) or 0) if planner_source == 'ai' else 0,
-        'planner_workflow_budget_seconds': int(LAST_AI_PLAN_DIAGNOSTICS.get('planner_workflow_budget_seconds', 0) or 0) if planner_source == 'ai' else 0,
-        'planner_workflow_used_before_round_seconds': float(LAST_AI_PLAN_DIAGNOSTICS.get('planner_workflow_used_before_round_seconds', 0) or 0) if planner_source == 'ai' else 0.0,
+        'planner_round_budget_seconds': float(LAST_AI_PLAN_DIAGNOSTICS.get('planner_round_budget_seconds', 0) or 0) if planner_source in {'ai', 'ai_failed_finalize'} else 0.0,
+        'planner_round_budget_configured_seconds': int(LAST_AI_PLAN_DIAGNOSTICS.get('planner_round_budget_configured_seconds', 0) or 0) if planner_source in {'ai', 'ai_failed_finalize'} else 0,
+        'planner_workflow_budget_seconds': int(LAST_AI_PLAN_DIAGNOSTICS.get('planner_workflow_budget_seconds', 0) or 0) if planner_source in {'ai', 'ai_failed_finalize'} else 0,
+        'planner_workflow_used_before_round_seconds': float(LAST_AI_PLAN_DIAGNOSTICS.get('planner_workflow_used_before_round_seconds', 0) or 0) if planner_source in {'ai', 'ai_failed_finalize'} else 0.0,
         'reasoning_summary': summary[:1500]})
     print(f'[*] Validated actions: {len(plan)}', flush=True)
     for action in plan:
         print(f"    {action['profile']:13} {action['tool']:10} {shared.compact_log_url(action['target_url'])} — {action['reason']}", flush=True)
-    return {'plan': plan, 'round': round_number, 'notes': notes, 'finished': finished, 'planner_source': planner_source, 'planner_audit': audit}
+    planner_control_plane_seconds = max(0.0, float(state.get('planner_control_plane_seconds') or 0.0)) + max(0.0, float(planner_seconds))
+    return {
+        'plan': plan, 'round': round_number, 'notes': notes, 'finished': finished,
+        'planner_source': planner_source, 'planner_audit': audit,
+        'planner_control_plane_seconds': planner_control_plane_seconds,
+    }
 
 # Action execution invokes one validated tool and stores the normalized result in planner state.
 async def execute_action(action: dict[str, Any], cookies: dict[str, str], discovery: dict[str, dict[str, Any]], allow_state_changes: bool | None=None, secondary_cookies: str='', identity_labels: dict[str, str] | None=None, deadline: float | None=None) -> tuple[dict[str, Any], dict[str, Any]]:
@@ -5287,8 +5372,8 @@ def report_node(state: AgentState) -> dict[str, Any]:
             'verification_budget_seconds': _assessment_verification_reserve_seconds(state),
             'ai_analysis_budget_seconds': _assessment_analysis_reserve_seconds(state),
             'report_budget_seconds': _assessment_report_reserve_seconds(state),
-            'internal_watchdog_seconds': int(state.get('wall_clock_budget_seconds') or assessment_wall_clock_budget_seconds(shared.CURRENT_SCAN_MODE)),
-            'watchdog_policy': 'last-resort hang/deadlock guard; normal scheduling is controlled by explicit phase budgets',
+            'internal_watchdog_seconds': int(state.get('wall_clock_budget_seconds') or assessment_wall_clock_budget_seconds(shared.CURRENT_SCAN_MODE, state.get('max_rounds'), state.get('planner_timeout'))),
+            'watchdog_policy': 'internal target-work/finalization guard excludes measured AI control-plane time; the assessment runner does not impose a second fixed Agentic parent wall-clock cutoff',
         },
         'python_executable': sys.executable,
         'mcp_server_python': shared._server_python(),

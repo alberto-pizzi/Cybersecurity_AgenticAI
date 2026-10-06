@@ -14,7 +14,7 @@ import orchestratorShared as shared
 from assessmentConfig import default_max_rounds
 from utils import AssessmentRateContractError, assessment_rate_contract
 from orchestratorAgenticCore import (
-    AgentState, AI_PLANNER_TIMEOUTS, AI_PLANNER_WORKFLOW_TIMEOUTS, AI_ANALYSIS_STAGE_TIMEOUTS, SNAP4CITY_DEFAULT_API_URL, resolve_ai_model, assessment_execution_budget_seconds, assessment_wall_clock_budget_seconds,
+    AgentState, AI_PLANNER_TIMEOUTS, SNAP4CITY_DEFAULT_API_URL, resolve_ai_model, planner_workflow_budget_seconds, analysis_stage_budget_seconds, assessment_execution_budget_seconds, assessment_wall_clock_budget_seconds,
     ensure_ollama_model, warm_ollama_model, ensure_snap4city_model,
     discovery_node, planner_node, executor_node, verification_node, analysis_node, report_node, route_after_execution,
     execute_action, execute_plan, validate_plan,
@@ -97,7 +97,7 @@ def main() -> int:
     parser.add_argument(
         "--require-ai",
         action="store_true",
-        help="Fail if a required AI planning or analysis stage cannot complete.",
+        help="Require AI-controlled attack selection: never substitute a deterministic attack plan. AI/control-plane failures are reported as incomplete coverage and already collected evidence is still finalized.",
     )
     parser.add_argument("--max-rounds", type=int, default=0, choices=(0, 1, 2, 3), help="Maximum planning rounds; 0 selects the scan-profile default (TEST=1, FAST=2, BALANCED=2, DEEP=3).")
     parser.add_argument(
@@ -106,16 +106,7 @@ def main() -> int:
         choices=("", *sorted(REGISTRY)),
         help="Debug filter: expose only this scanner/tool to the AI planner. Empty keeps the normal autonomous candidate set.",
     )
-    parser.add_argument(
-        "--ai-timeout",
-        type=int,
-        default=0,
-        help="AI planning budget per round only; final finding analysis has independent mode-specific phase and per-batch budgets. 0 selects planner defaults.",
-    )
     args = parser.parse_args()
-
-    if args.ai_timeout < 0:
-        parser.error('--ai-timeout must be 0 (mode default) or a positive number of seconds.')
 
     if not args.max_rounds:
         args.max_rounds = default_max_rounds(args.mode)
@@ -139,8 +130,9 @@ def main() -> int:
     globals()["CURRENT_SCAN_MODE"] = deterministic_core.CURRENT_SCAN_MODE
     globals()["ARJUN_TIMEOUT"] = deterministic_core.ARJUN_TIMEOUT
 
-    wall_clock_budget_seconds = assessment_wall_clock_budget_seconds(args.mode)
-    execution_budget_seconds = assessment_execution_budget_seconds(args.mode)
+    planner_timeout = AI_PLANNER_TIMEOUTS[args.mode]
+    wall_clock_budget_seconds = assessment_wall_clock_budget_seconds(args.mode, args.max_rounds, planner_timeout)
+    execution_budget_seconds = assessment_execution_budget_seconds(args.mode, args.max_rounds, planner_timeout)
 
     checks = run_preflight_checks(include_live=True)
     errors = print_preflight_report(checks, show_ok=args.preflight_only)
@@ -167,15 +159,16 @@ def main() -> int:
         print(f"[*] Explicit entry points: {len(entry_points)} URL(s) will be forced into initial discovery.")
     if discovery_seeds:
         print(f"[*] Priority discovery seeds: {len(discovery_seeds)} URL(s) will be explored under normal discovery limits.")
-    planner_timeout = args.ai_timeout or AI_PLANNER_TIMEOUTS[args.mode]
-    planner_workflow_timeout = AI_PLANNER_WORKFLOW_TIMEOUTS[args.mode]
+    planner_workflow_timeout = planner_workflow_budget_seconds(args.mode, args.max_rounds, planner_timeout)
     print(
-        f"[*] AI planner control-plane limits: <= {planner_timeout}s per round; "
-        f"<= {planner_workflow_timeout}s cumulative across this assessment profile."
+        f"[*] AI planner timing: nominal profile allowance {planner_timeout}s per round for diagnostics; "
+        f"nominal workflow capacity {planner_workflow_timeout}s for max_rounds={args.max_rounds}. "
+        "Planning is completion-driven with no aggregate planner wall-clock cutoff. "
+        "Each real provider call receives the full profile watchdog and fast calls return immediately."
     )
     print(
-        f"[*] AI final-analysis control-plane limit: <= {AI_ANALYSIS_STAGE_TIMEOUTS[args.mode]}s "
-        f"aggregate for the complete post-scan analysis stage."
+        f"[*] AI final-analysis nominal reserve: {analysis_stage_budget_seconds(args.mode, args.max_rounds)}s; "
+        "this is not an aggregate hard stop. Every started analysis/context-split batch receives its full provider-call watchdog."
     )
     selected_provider, requested_model, selection_diagnostics = resolve_ai_model(args.model)
     print(
@@ -192,7 +185,7 @@ def main() -> int:
             )
             print(
                 f"[*] Snap4City ready: model={selected_model}; "
-                f"warm-up={ai_diagnostics.get('warmup_seconds')}s; planner budget={planner_timeout}s per round"
+                f"warm-up={ai_diagnostics.get('warmup_seconds')}s; nominal planner budget={planner_timeout}s per round"
             )
         else:
             selected_model, ai_diagnostics = ensure_ollama_model(
@@ -218,7 +211,7 @@ def main() -> int:
                 ai_diagnostics["warmup"] = warmup
                 print(
                     f"[*] Ollama model warm: {warmup.get('seconds')}s; "
-                    f"planner budget={planner_timeout}s per round"
+                    f"nominal planner budget={planner_timeout}s per round"
                 )
             except Exception as warm_exc:
                 ai_diagnostics["warmup_error"] = (
@@ -278,7 +271,7 @@ def main() -> int:
         "report_status": {},
         "require_ai": args.require_ai,
         "planner_source": "pending",
-        "ai_timeout": planner_timeout,
+        "planner_timeout": planner_timeout,
         "allow_state_changes": args.allow_state_changes,
         "secondary_cookies": secondary_cookie,
         "planner_audit": [],
@@ -289,6 +282,8 @@ def main() -> int:
         "started_monotonic": workflow_started_monotonic,
         "wall_clock_budget_seconds": wall_clock_budget_seconds,
         "execution_budget_seconds": execution_budget_seconds,
+        "planner_control_plane_seconds": 0.0,
+        "analysis_control_plane_seconds": 0.0,
     }
     started = time.time()
     try:

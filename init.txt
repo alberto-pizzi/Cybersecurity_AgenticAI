@@ -70,14 +70,14 @@ PROFILES, RATE, AND TIME BUDGETS
   target-traffic-dependent budgets.
 
   Profile                    TEST       FAST       BALANCED    DEEP
-  Planner / round            5 min      6 h        30 h        48 h
-  Planner cumulative         5 min      12 h       60 h        144 h
+  Planner nominal / round    5 min      6 h        30 h        48 h
+  Planner nominal cumulative 5 min      12 h       60 h        144 h
   Operational execution      2 h        32 h       96 h        192 h
   Verification               10 min     60 min     120 min     240 min
-  Final AI analysis          20 min     4 h        12 h        24 h
+  Final AI nominal reserve   20 min     4 h        12 h        24 h
   Reporting                  20 min     60 min     120 min     240 min
-  Internal watchdog          4 h        44 h       128 h       256 h
-  Parent watchdog            4.5 h      46 h       132 h       264 h
+  Internal target/final guard 4 h       44 h       128 h       256 h
+  Fixed parent cutoff        disabled   disabled   disabled    disabled
 
   Important per-action/tool timeouts at the default rate of 10:
   FFUF                       10 s       1 h        2 h         4 h
@@ -85,10 +85,21 @@ PROFILES, RATE, AND TIME BUDGETS
   Browser                    10 s       120 s      240 s       360 s
   Authorization              10 s       90 s       120 s       180 s
 
+  These figures use the default round counts: TEST=1, FAST=2, BALANCED=2, DEEP=3. Planner
+  cumulative and final-analysis values are nominal sizing/accounting values in normal mode, not
+  aggregate wall-clock stop conditions. Measured planner/final-analysis control-plane time is
+  excluded from the fixed target-work/finalization guard, and the assessment runner imposes no
+  second fixed Agentic parent
+  cutoff. Tool/provider calls remain individually bounded.
+
   FFUF uses the profile timeout as its global action budget. Its compact general phase may use the
-  time remaining after earlier FFUF phases. Planner provider calls use a 20 s minimum useful slice.
-  TEST analysis rescue/split calls and the Snap4City read timeout also have a 20 s floor. The
-  remaining scanners retain their existing profile timeout settings.
+  time remaining after earlier FFUF phases. Planner provider calls have a 20 s transport floor and
+  BALANCED gives every started planner batch a full 1800 s (30 min) watchdog. Batch count never
+  divides this timeout and normal mode has no aggregate planner wall-clock cutoff; splitting occurs
+  only for real context overflow. Final AI analysis is also completion-driven: every BALANCED batch
+  gets 1800 s, and every context/recovery split child gets a fresh full 1800 s allowance rather than
+  sharing a shrinking parent deadline. A full-call timeout is therefore an AI/provider timeout, not
+  a local stage-budget shortage. Scanner/verifier evidence is preserved if such a real AI error occurs.
 
 initScript.py OPTIONS  (complete list)
 --------------------------------------
@@ -122,9 +133,10 @@ assessmentRunner.py OPTIONS  (complete list)
   --orchestrator agentic|deterministic    Chooses the path (overrides the config).
   --mode test|fast|balanced|deep          Coverage/runtime profile (overrides the config).
   --model snap4city|llama|qwen            Agentic AI backend (overrides the config).
-  --max-rounds 1|2|3                      Maximum number of Agentic rounds.
-  --require-ai                            Makes planning and final AI analysis mandatory.
-  --no-require-ai                         Allows the deterministic fallback if AI planning fails.
+  --max-rounds 1|2|3                      Maximum Agentic rounds. Extra rounds expand round-dependent budgets/watchdogs.
+  --require-ai                            AI controls attack selection; no deterministic planner fallback is allowed.
+                                           If AI control-plane work cannot complete, evidence is finalized with an explicit limitation instead of being discarded.
+  --no-require-ai                         Allows the deterministic planner fallback if AI planning fails.
   --auth-only                             Runs only the authenticated profile.
   --dry-run                               Validates and saves the plan without executing scanners.
   --only JOB_ID                           Limit to a single service job (e.g. web01/https-main).

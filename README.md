@@ -122,16 +122,16 @@ The default `execution.request_rate` is **10 request starts/s**, but the JSON co
 
 | Phase / limit | TEST | FAST | BALANCED | DEEP |
 | --- | ---: | ---: | ---: | ---: |
-| Planner per round | 5 min | 6 h | 30 h | 48 h |
-| Planner cumulative | 5 min | 12 h | 60 h | 144 h |
+| Planner nominal per round | 5 min | 6 h | 30 h | 48 h |
+| Planner nominal cumulative accounting | 5 min | 12 h | 60 h | 144 h |
 | Operational execution | 2 h | 32 h | 96 h | 192 h |
 | Verification | 10 min | 60 min | 120 min | 240 min |
-| Final AI analysis | 20 min | 4 h | 12 h | 24 h |
+| Final AI analysis nominal reserve | 20 min | 4 h | 12 h | 24 h |
 | Reporting | 20 min | 60 min | 120 min | 240 min |
-| Internal hard watchdog | 4 h | 44 h | 128 h | 256 h |
-| Parent-process watchdog | 4.5 h | 46 h | 132 h | 264 h |
+| Internal target/finalization guard | 4 h | 44 h | 128 h | 256 h |
+| Fixed parent-process cutoff | disabled | disabled | disabled | disabled |
 
-The planner limits are ceilings inside the operational phase. Verification, final AI analysis, and reporting have protected windows after operational execution. The parent watchdog is the last process-hang guard, not an expected run duration.
+The table uses each profile's default round count (TEST 1, FAST 2, BALANCED 2, DEEP 3). Planner and final-AI values are **nominal sizing/accounting values in normal profile mode, not aggregate wall-clock stop conditions**. Every started planner or analysis batch gets its complete provider-call watchdog, and fast responses return immediately. Measured planner/analysis control-plane time is excluded from the fixed target-execution/finalization guard, so a healthy but slow model does not consume scanner or report time. The assessment runner also no longer imposes a second fixed Agentic parent timeout; provider/tool calls retain their own bounded timeouts. `--max-rounds` still scales target-work/finalization reserves as before.
 
 Important per-action/tool timeouts at the default rate of 10:
 
@@ -142,7 +142,7 @@ Important per-action/tool timeouts at the default rate of 10:
 | Browser | 10 s | 120 s | 240 s | 360 s |
 | Authorization | 10 s | 90 s | 120 s | 180 s |
 
-FFUF uses its profile timeout as the global action budget. Its compact general phase may use the time still remaining after the earlier FFUF phases. Planner provider calls have a 20 s minimum useful slice. TEST analysis rescue/split calls and the Snap4City read timeout also use a 20 s floor. The remaining scanners retain their existing profile timeout settings.
+FFUF uses its profile timeout as the global action budget. Its compact general phase may use the time still remaining after the earlier FFUF phases. Planner provider calls have a 20 s transport floor and a generous per-call watchdog (BALANCED: **1800 s / 30 min**). A malformed-plan retry is a new provider call and receives a fresh full 1800 s allocation. The total number of batches never divides that timeout; in normal mode there is no aggregate planner wall-clock cutoff, so 6536 batches are not rejected merely because their worst-case sum exceeds a nominal cumulative number. Batches split only when the actual prompt exceeds model context or the provider explicitly reports context overflow. Final AI analysis is also completion-driven: every BALANCED provider call gets **1800 s**; context-split children, malformed-response recovery children and singleton rescue calls each get a fresh full 1800 s provider allowance rather than sharing a shrinking parent deadline. There is no aggregate final-analysis wall-clock admission cap. If a full 1800 s call itself times out, that is recorded as an AI/provider timeout; scanner/verifier evidence is still retained and reporting continues. The remaining scanners retain their existing profile timeout settings.
 
 ---
 
@@ -225,8 +225,8 @@ Verify login and session before a long run with `--auth-only`.
 | `--orchestrator agentic\|deterministic` | Chooses the path. |
 | `--mode test\|fast\|balanced\|deep` | Chooses the profile. |
 | `--model snap4city\|llama\|qwen` | AI backend (Agentic, default: Snap4City). |
-| `--max-rounds 1\|2\|3` | Number of Agentic rounds. |
-| `--require-ai` / `--no-require-ai` | Makes AI planning/analysis mandatory (or optional). |
+| `--max-rounds 1\|2\|3` | Maximum Agentic rounds. Increasing it also expands the round-dependent budget/watchdog envelopes. |
+| `--require-ai` / `--no-require-ai` | With `--require-ai`, attack selection never falls back to a deterministic plan. If AI control-plane work cannot complete, collected evidence is finalized and the incomplete AI coverage is reported instead of discarding the run. |
 | `--auth-only` | Runs only the authenticated profiles. |
 | `--authorized` | Confirms authorization for non-local targets. |
 | `--dry-run` | Validates the plan without launching scanners. |
@@ -268,7 +268,7 @@ tail -n 300 -F "$LOG"     # on long SSH sessions use tmux
 | Login failed | Credentials, OIDC redirects, and auth logs. |
 | Many failed auth prechecks | Session valid for the specific application root. |
 | Discovery with residual queue | Limits, slow pages, queue still producing new endpoints. |
-| Planner failed | Provider, AI budget, and batch diagnostics. |
+| Planner incomplete | Provider/contract errors, per-call watchdogs, and context diagnostics. Normal profile mode has no aggregate planner time cutoff; collected evidence still reaches final reporting. |
 | Tool partial | Diagnostic code and timeout before re-running. |
 | Missing PDF | Use HTML/JSON and check the renderer diagnostics. |
 | Effective rate below the configured value | Normal with slow pages or serial tools: `execution.request_rate` is a **maximum**, not a minimum. |
