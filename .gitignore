@@ -8,3 +8,4 @@ token_stored.json
 reports/
 __pycache__/
 *.pyc
+/.secops_tmp/mcp-http/
