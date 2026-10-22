@@ -19,6 +19,9 @@ from reporting.coverage import _executive_text, build_coverage, build_endpoint_c
 from reporting.findings import _finding_groups, _human_readable_findings, flatten_findings
 from reporting.html_report import _render_html
 from reporting.pdf_maker import html2pdf
+from reporting import report_filters as report_filters_config
+from reporting.reduced_report import render_reduced_html
+from reporting.summary_report import render_summary_html
 from reporting.revision_snapshot import build_review_snapshot
 from reporting.text_utils import _as_dict, _redact_value, _safe_name
 
@@ -164,6 +167,43 @@ def discard_report_upload(upload_id: str) -> dict:
     return {"status": "success", "upload_id": str(upload_id or ""), "discarded": existed}
 
 
+def _render_companion_reports(payload: dict, base: str, pdf_timeout: int | float) -> dict:
+    """Render the condensed companion reports (reduced + summary) configured in
+    ``report_filters``.
+
+    Each report is written as ``<base>.<suffix>.html`` and ``<base>.<suffix>.pdf``.
+    This runs only after the full report's PDF has succeeded and is best-effort:
+    a failure in a companion report is logged and skipped, never propagated, so
+    it can never break the primary report deliverables.
+    """
+    produced: dict = {}
+    jobs = []
+    if getattr(report_filters_config, "GENERATE_REDUCED_REPORT", True):
+        jobs.append(("reduced", report_filters_config.REDUCED_REPORT_SUFFIX, render_reduced_html))
+    if getattr(report_filters_config, "GENERATE_SUMMARY_REPORT", True):
+        jobs.append(("summary", report_filters_config.SUMMARY_REPORT_SUFFIX, render_summary_html))
+
+    for kind, suffix, builder in jobs:
+        safe_suffix = str(suffix or kind).strip().strip(".") or kind
+        html_path = Path(REPORTS_DIR) / f"{base}.{safe_suffix}.html"
+        pdf_path = Path(REPORTS_DIR) / f"{base}.{safe_suffix}.pdf"
+        try:
+            print(f"[REPORT SERVER] report {base}: building {kind} companion report HTML.", flush=True)
+            atomic_write_text(html_path, builder(payload))
+            print(f"[REPORT SERVER] report {base}: rendering {kind} companion PDF.", flush=True)
+            html2pdf(html_path, pdf_path, timeout_seconds=pdf_timeout)
+            print(f"[REPORT SERVER] report {base}: {kind} companion report completed; file={pdf_path}.", flush=True)
+            produced[f"{kind}_html_filename"] = str(html_path.resolve())
+            if pdf_path.is_file():
+                produced[f"{kind}_pdf_filename"] = str(pdf_path.resolve())
+        except Exception as exc:
+            # Companion reports are supplementary; never fail the primary report because of one.
+            print(f"[REPORT SERVER] report {base}: {kind} companion report skipped: {type(exc).__name__}: {exc}", flush=True)
+            if html_path.is_file():
+                produced[f"{kind}_html_filename"] = str(html_path.resolve())
+    return produced
+
+
 def _generate_report(
     findings_summary: dict | str,
     target_url: str,
@@ -284,6 +324,10 @@ def _generate_report(
     finally:
         pdf_source_path.unlink(missing_ok=True)
 
+    # The full PDF rendered successfully; now produce the condensed companion
+    # reports (reduced + summary) alongside it, governed by report_filters.
+    companion_reports = _render_companion_reports(payload, base, pdf_timeout)
+
     pwndoc_url = os.getenv("PWNDOC_URL", "").rstrip("/")
     pwndoc_status = "not_configured"
     if pwndoc_url:
@@ -305,6 +349,9 @@ def _generate_report(
         html_filename=str(html_path.resolve()),
         json_filename=str(json_path.resolve()),
         review_snapshot_filename=str(review_snapshot_path.resolve()),
+        **companion_reports,
+        local_reduced_report_generated="reduced_pdf_filename" in companion_reports,
+        local_summary_report_generated="summary_pdf_filename" in companion_reports,
         local_pdf_generated=True,
         local_html_generated=True,
         local_json_generated=True,
