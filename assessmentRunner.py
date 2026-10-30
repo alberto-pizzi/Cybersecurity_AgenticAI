@@ -1457,13 +1457,174 @@ def _select_primary_job_report_artifact(artifacts: list[dict[str, Any]]) -> tupl
     return primary, suppressed
 
 
+# ---------------------------------------------------------------------------
+# Report-only path: regenerate HTML/PDF deliverables from an existing JSON
+# ---------------------------------------------------------------------------
+# This lets an operator rebuild the full report plus the condensed companion
+# "list" reports (reduced + summary) from a JSON that a previous run already
+# produced, WITHOUT launching any scanner against the target. It accepts the
+# three JSON artifacts the pipeline writes:
+#   * the technical report JSON   (<report_id>.json)
+#   * the review snapshot         (<report_id>.review.json)
+#   * the results-data dataset    (Assessment_Results_Data_*.json)
+# The default assessment flow is unchanged; this path runs only when
+# --report-from-json is supplied, so no pentest is performed in that case.
+def _report_inputs_from_external_json(path: str) -> dict[str, Any]:
+    source_path = Path(path).expanduser().resolve()
+    try:
+        document = json.loads(source_path.read_text(encoding="utf-8"))
+    except OSError as exc:
+        raise ValueError(f"Cannot read report source JSON {source_path}: {exc}") from exc
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"Report source is not valid JSON: {source_path}: {exc}") from exc
+    if not isinstance(document, dict):
+        raise ValueError("Report source JSON must be a JSON object.")
+
+    cover = {
+        "client_name": "", "assessor": "", "assessment_type": "",
+        "assessment_start": "", "assessment_end": "", "report_version": "",
+    }
+
+    def _cover_from(mapping: dict[str, Any]) -> None:
+        if not isinstance(mapping, dict):
+            return
+        for key in cover:
+            value = mapping.get(key)
+            if isinstance(value, str) and value.strip():
+                cover[key] = value
+
+    snapshot_type = str(document.get("snapshot_type") or "")
+    dataset_type = str(document.get("dataset_type") or "")
+
+    if snapshot_type == "secops-review-snapshot":
+        results = document.get("results")
+        target = str(document.get("target") or "")
+        context = document.get("assessment_context") if isinstance(document.get("assessment_context"), dict) else {}
+        suggested = str(document.get("source_report_id") or source_path.stem) or "SecOps_Assessment"
+        kind = "review snapshot"
+    elif dataset_type == "secops-assessment-results-data":
+        reports = [row for row in (document.get("reports_data") or []) if isinstance(row, dict)]
+        reference = str(document.get("report_id") or document.get("reference_id") or "")
+        chosen = next((row for row in reports if reference and str(row.get("report_id") or "") == reference), None)
+        if chosen is None and reports:
+            chosen = reports[0]
+        source = chosen if isinstance(chosen, dict) else document
+        assessment_results = source.get("assessment_results") if isinstance(source.get("assessment_results"), dict) else {}
+        results = assessment_results.get("scanner_results")
+        target = str(source.get("target") or document.get("target") or "")
+        context = source.get("assessment_context") if isinstance(source.get("assessment_context"), dict) else {}
+        _cover_from(source.get("report_metadata") if isinstance(source.get("report_metadata"), dict) else {})
+        suggested = reference or source_path.stem or "SecOps_Assessment"
+        kind = "results-data dataset"
+    elif isinstance(document.get("results"), dict):
+        results = document.get("results")
+        target = str(document.get("target") or "")
+        context = document.get("assessment_context") if isinstance(document.get("assessment_context"), dict) else {}
+        _cover_from(document)
+        suggested = str(document.get("report_id") or source_path.stem) or "SecOps_Assessment"
+        kind = "technical report JSON"
+    else:
+        raise ValueError(
+            "Unrecognized report source JSON. Expected a technical report JSON (<report_id>.json), "
+            "a review snapshot (<report_id>.review.json) or a results-data dataset (Assessment_Results_Data_*.json)."
+        )
+
+    if not isinstance(results, dict) or not results:
+        raise ValueError(f"The {kind} does not contain the scanner results required to regenerate a report.")
+    if not target:
+        raise ValueError(f"The {kind} does not record the assessed target required to regenerate a report.")
+
+    return {
+        "findings_summary": results,
+        "target_url": target,
+        "assessment_context": context if isinstance(context, dict) else {},
+        "cover": cover,
+        "suggested_output_name": suggested,
+        "source_kind": kind,
+        "source_path": str(source_path),
+    }
+
+
+def _generate_reports_from_external_json(args: argparse.Namespace) -> int:
+    try:
+        inputs = _report_inputs_from_external_json(args.report_from_json)
+    except ValueError as exc:
+        print(f"[ERROR] {exc}", file=sys.stderr)
+        return 2
+
+    servers_dir = str((ROOT / "servers").resolve())
+    if servers_dir not in sys.path:
+        sys.path.insert(0, servers_dir)
+    try:
+        from reporting.reportServer import _generate_report
+    except Exception as exc:
+        print(f"[ERROR] The report generator is unavailable: {type(exc).__name__}: {exc}", file=sys.stderr)
+        return 1
+
+    cover = inputs["cover"]
+    output_name = (args.output_name or "").strip() or f"{inputs['suggested_output_name']}_from_json"
+
+    print(f"[REPORT-FROM-JSON] Source: {inputs['source_path']} ({inputs['source_kind']}).")
+    print(f"[REPORT-FROM-JSON] Target: {inputs['target_url']}; output base name: {output_name}.")
+    print("[REPORT-FROM-JSON] No scanner is launched; the HTML/PDF report and the companion list reports are rebuilt from the JSON.", flush=True)
+
+    result = _generate_report(
+        findings_summary=inputs["findings_summary"],
+        target_url=inputs["target_url"],
+        output_name=output_name,
+        assessment_context=inputs["assessment_context"],
+        client_name=(args.client_name or cover["client_name"]),
+        assessor=(args.assessor or cover["assessor"]),
+        assessment_type=(args.assessment_type or cover["assessment_type"]),
+        assessment_start=cover["assessment_start"],
+        assessment_end=cover["assessment_end"],
+        report_version=(args.report_version or cover["report_version"] or "1.0"),
+    )
+
+    status = str(result.get("status") or "")
+    print("\n=== Report-from-JSON artifacts ===")
+    any_artifact = False
+    for label, key in (
+        ("PDF report", "pdf_filename"),
+        ("HTML report", "html_filename"),
+        ("JSON report", "json_filename"),
+        ("Review snapshot", "review_snapshot_filename"),
+        ("Reduced report (HTML)", "reduced_html_filename"),
+        ("Reduced report (PDF)", "reduced_pdf_filename"),
+        ("Summary list (HTML)", "summary_html_filename"),
+        ("Summary list (PDF)", "summary_pdf_filename"),
+    ):
+        value = result.get(key)
+        if value:
+            any_artifact = True
+            print(f"[+] {label}: {value}")
+    if not any_artifact:
+        print("[+] No artifact was produced.")
+
+    if status != "success":
+        detail = result.get("message") or result.get("error") or "see diagnosis"
+        print(f"[!] Report generation status: {status or 'unknown'} ({detail}).", file=sys.stderr)
+    return 0 if status == "success" else 1
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="Run one direct target or expand a multi-asset assessment JSON file through the existing deterministic or agentic orchestrators."
+        description="Run one direct target or expand a multi-asset assessment JSON file through the existing deterministic or agentic orchestrators. With --report-from-json, instead rebuild the HTML/PDF report and companion list reports from an existing assessment JSON without running the pentest."
     )
     source_group = parser.add_mutually_exclusive_group(required=True)
     source_group.add_argument("--config", help="Platform assessment JSON file.")
     source_group.add_argument("--target", help="Direct HTTP/HTTPS target; alternative to --config.")
+    source_group.add_argument(
+        "--report-from-json", dest="report_from_json", default="",
+        help="Regenerate the HTML/PDF report and the companion list reports from an existing discovery/assessment JSON "
+             "(a technical report <id>.json, a <id>.review.json snapshot, or an Assessment_Results_Data_*.json dataset) "
+             "WITHOUT running the pentest. The default assessment flow is unchanged when this is not supplied.",
+    )
+    parser.add_argument("--output-name", dest="output_name", default="", help="Report-from-JSON mode: base file name for the regenerated artifacts. Defaults to the source report id with a '_from_json' suffix.")
+    parser.add_argument("--client-name", dest="client_name", default="", help="Report-from-JSON mode: override the cover-page client name.")
+    parser.add_argument("--assessor", dest="assessor", default="", help="Report-from-JSON mode: override the cover-page assessor name.")
+    parser.add_argument("--assessment-type", dest="assessment_type", default="", help="Report-from-JSON mode: override the cover-page assessment type.")
+    parser.add_argument("--report-version", dest="report_version", default="", help="Report-from-JSON mode: override the cover-page report version (default 1.0).")
     parser.add_argument("--cookies", default="", help="Primary cookie header for direct --target mode. Without --auth-only, both anonymous and authenticated profiles are run.")
     parser.add_argument("--secondary-cookies", default="", help="Optional second authenticated identity for direct --target authorization/BOLA comparison.")
     parser.add_argument("--orchestrator", choices=tuple(sorted(SUPPORTED_ORCHESTRATORS)), default="", help="Override execution.orchestrator from the configuration.")
@@ -1493,6 +1654,10 @@ def main() -> int:
         help="Stop after the first blocked job as well; a non-zero executable orchestrator exit is always treated as fatal and stops automatically.",
     )
     args = parser.parse_args()
+
+    # Report-only mode: rebuild deliverables from an existing JSON and skip the pentest entirely.
+    if getattr(args, "report_from_json", ""):
+        return _generate_reports_from_external_json(args)
 
     try:
         if args.config:

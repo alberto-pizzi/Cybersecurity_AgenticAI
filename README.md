@@ -249,6 +249,27 @@ Artifacts are saved in `reports/`. To download them:
 scp debian@<host>:/home/debian/Cybersecurity_AgenticAI/reports/<file> .
 ```
 
+### 🔁 Regenerate reports from an existing JSON (no pentest)
+
+By **default** nothing changes: `assessmentRunner.py` runs the pentest and then builds the report from the evidence it just collected. As an **optional** alternative, `--report-from-json` rebuilds the **HTML and PDF** deliverables (full **report** + the companion **list** reports — *reduced* and *summary*) from a JSON **already produced** by a previous run, **without launching any scanner against the target**.
+
+Accepted inputs:
+
+- the **technical report JSON** (`<report_id>.json`),
+- the **review snapshot** (`<report_id>.review.json`),
+- the **results-data dataset** (`Assessment_Results_Data_*.json`).
+
+```bash
+# Rebuild report + list (HTML/PDF) from an external JSON, no pentest
+python assessmentRunner.py --report-from-json reports/SecOps_Assessment_XXXX.json
+
+# Optional cover-page overrides and a custom output base name
+python assessmentRunner.py --report-from-json reports/SecOps_Assessment_XXXX.json \
+  --output-name MyClient_rev2 --client-name "ACME" --assessor "Team" --assessment-type "Web app" --report-version 1.1
+```
+
+> `--report-from-json` is mutually exclusive with `--config`/`--target`, and `--authorized` is **not** required because no target traffic is generated. Scanner results in these JSON files are already redacted, so the regenerated report carries no secrets.
+
 Monitoring a long run:
 
 ```bash
