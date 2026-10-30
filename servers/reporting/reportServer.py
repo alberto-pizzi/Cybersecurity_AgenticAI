@@ -171,7 +171,7 @@ def _render_companion_reports(payload: dict, base: str, pdf_timeout: int | float
     """Render the condensed companion reports (reduced + summary) configured in
     ``report_filters``.
 
-    Each report is written as ``<base>.<suffix>.html`` and ``<base>.<suffix>.pdf``.
+    Each report is written as ``<base>_<suffix>.html`` and ``<base>_<suffix>.pdf``.
     This runs only after the full report's PDF has succeeded and is best-effort:
     a failure in a companion report is logged and skipped, never propagated, so
     it can never break the primary report deliverables.
@@ -185,8 +185,8 @@ def _render_companion_reports(payload: dict, base: str, pdf_timeout: int | float
 
     for kind, suffix, builder in jobs:
         safe_suffix = str(suffix or kind).strip().strip(".") or kind
-        html_path = Path(REPORTS_DIR) / f"{base}.{safe_suffix}.html"
-        pdf_path = Path(REPORTS_DIR) / f"{base}.{safe_suffix}.pdf"
+        html_path = Path(REPORTS_DIR) / f"{base}_{safe_suffix}.html"
+        pdf_path = Path(REPORTS_DIR) / f"{base}_{safe_suffix}.pdf"
         try:
             print(f"[REPORT SERVER] report {base}: building {kind} companion report HTML.", flush=True)
             atomic_write_text(html_path, builder(payload))

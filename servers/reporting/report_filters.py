@@ -3,10 +3,10 @@ full report.
 
 Besides the complete report (``<base>.pdf``) the pipeline now also renders:
 
-  1. A **reduced report** (``<base>.reduced.pdf`` / ``.html``) — every finding
+  1. A **reduced report** (``<base>_reduced.pdf`` / ``.html``) — every finding
      is still present, but the amount of detail per finding is trimmed by
      severity so the document is far smaller than the full report.
-  2. A **summary report** (``<base>.summary.pdf`` / ``.html``) — a compact list
+  2. A **summary report** (``<base>_summary.pdf`` / ``.html``) — a compact list
      of every test/attack that was executed together with the critical issues
      that were detected.
 
@@ -34,7 +34,7 @@ from __future__ import annotations
 GENERATE_REDUCED_REPORT = True
 GENERATE_SUMMARY_REPORT = True
 
-# File-name suffixes: <base>.<suffix>.pdf / <base>.<suffix>.html
+# File-name suffixes: <base>_<suffix>.pdf / <base>_<suffix>.html
 REDUCED_REPORT_SUFFIX = "reduced"
 SUMMARY_REPORT_SUFFIX = "summary"
 
