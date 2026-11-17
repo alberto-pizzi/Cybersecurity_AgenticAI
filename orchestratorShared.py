@@ -1,3 +1,4 @@
+# SECOps_MANUAL_SCOPE_RESUME_V4
 from __future__ import annotations
 import argparse
 import atexit
@@ -85,7 +86,7 @@ REPORT_RENDER_TIMEOUT_SECONDS = {
 # the requested MCP wait; scanner cleanup/serialization grace is added separately below.
 TEST_MCP_AUX_REQUEST_TIMEOUT_SECONDS = max(30.0, safe_float_value(os.getenv('SECOPS_TEST_MCP_AUX_REQUEST_TIMEOUT', '60'), 60.0))
 MCP_ZAP_SHARED_WAIT_MULTIPLIER = max(0.0, safe_float_value(os.getenv('SECOPS_ZAP_SHARED_WAIT_MULTIPLIER', '1.0'), 1.0))
-MAX_PARAMETER_ENDPOINTS = max(1, safe_int_value(os.getenv('SECOPS_MAX_PARAMETER_ENDPOINTS', '5'), 5))
+MAX_PARAMETER_ENDPOINTS = max(1, safe_int_value(os.getenv('SECOPS_MAX_PARAMETER_ENDPOINTS', '128'), 128))
 TERMINAL_URL_MAX = max(120, safe_int_value(os.getenv('SECOPS_TERMINAL_URL_MAX', '240'), 240))
 
 MAX_REQUEST_RATE = scanner_request_rate()
@@ -4077,7 +4078,7 @@ def _browser_request_state_reason(request: Any, allow_state_changes: bool=False)
 
 
 # Uses Chromium as a bounded dynamic discovery queue so rendered navigation and XHR/fetch contracts become scanner inputs.
-def _browser_network_discovery(target: str, cookies: str, html_urls: list[str], forced_urls: list[str] | None=None, priority_urls: list[str] | None=None, allow_state_changes: bool=False, wall_clock_deadline: float | None=None) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[str], list[dict[str, Any]], dict[str, Any]]:
+def _browser_network_discovery(target: str, cookies: str, html_urls: list[str], forced_urls: list[str] | None=None, priority_urls: list[str] | None=None, allow_state_changes: bool=False, wall_clock_deadline: float | None=None, resume_browser_seen_urls: list[str] | None=None) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[str], list[dict[str, Any]], dict[str, Any]]:
     """Run Chromium discovery behind a CPU-aware profile slot.
 
     Profile-level HTTP/JS discovery may overlap, but Chromium/DOM work is materially heavier than
@@ -4132,6 +4133,7 @@ def _browser_network_discovery(target: str, cookies: str, html_urls: list[str], 
             request_cases, observed, navigated, errors, budget_info = _browser_network_discovery_impl(
                 target, cookies, html_urls, forced_urls=forced_urls, priority_urls=priority_urls,
                 allow_state_changes=allow_state_changes, wall_clock_deadline=wall_clock_deadline,
+                resume_browser_seen_urls=resume_browser_seen_urls,
             )
             budget_info = dict(budget_info or {})
             budget_info['browser_slot_wait_seconds'] = round(waited, 3)
@@ -4143,10 +4145,14 @@ def _browser_network_discovery(target: str, cookies: str, html_urls: list[str], 
         _BROWSER_DISCOVERY_SEMAPHORE.release()
 
 
-def _browser_network_discovery_impl(target: str, cookies: str, html_urls: list[str], forced_urls: list[str] | None=None, priority_urls: list[str] | None=None, allow_state_changes: bool=False, wall_clock_deadline: float | None=None) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[str], list[dict[str, Any]], dict[str, Any]]:
+def _browser_network_discovery_impl(target: str, cookies: str, html_urls: list[str], forced_urls: list[str] | None=None, priority_urls: list[str] | None=None, allow_state_changes: bool=False, wall_clock_deadline: float | None=None, resume_browser_seen_urls: list[str] | None=None) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[str], list[dict[str, Any]], dict[str, Any]]:
 
     limits = DISCOVERY_LIMITS.get(CURRENT_SCAN_MODE, DISCOVERY_LIMITS['balanced'])
-    forced_set = { _clean_url(value) for value in forced_urls or [] if value and url_in_authorized_scope(target, value) }
+    previous_browser = {
+        _clean_url(value) for value in resume_browser_seen_urls or []
+        if isinstance(value, str) and value and url_in_authorized_scope(target, value)
+    }
+    forced_set = { _clean_url(value) for value in forced_urls or [] if value and url_in_authorized_scope(target, value) } - previous_browser
     priority_set = forced_set | { _clean_url(value) for value in priority_urls or [] if value and url_in_authorized_scope(target, value) }
     navigation_budget = max(int(limits['browser_pages']), len(forced_set))
     navigation_max_budget = max(navigation_budget, int(limits.get('browser_pages_max', navigation_budget)), len(forced_set))
@@ -4207,6 +4213,7 @@ def _browser_network_discovery_impl(target: str, cookies: str, html_urls: list[s
         ranked_pages.remove(target_url)
     queue: list[str] = []
     queued: set[str] = set()
+    deferred_browser_urls: set[str] = set()
     queued_signatures: Counter[tuple[str, str, tuple[str, ...]]] = Counter()
     visited_signatures: Counter[tuple[str, str, tuple[str, ...]]] = Counter()
     origin_visits: Counter[str] = Counter()
@@ -4239,7 +4246,7 @@ def _browser_network_discovery_impl(target: str, cookies: str, html_urls: list[s
                 candidate = _normalize_redundant_base_path_link(target, _clean_url(raw_url))
         except Exception:
             return
-        if not candidate or candidate in queued or candidate in visited:
+        if not candidate or candidate in queued or candidate in visited or candidate in previous_browser:
             return
         if not url_in_authorized_scope(target, candidate) or not _crawlable_url(candidate) or _destructive_crawl_url(candidate):
             return
@@ -4247,8 +4254,10 @@ def _browser_network_discovery_impl(target: str, cookies: str, html_urls: list[s
         origin = normalized_origin(candidate)
         variant_limit = _discovery_variant_limit(candidate, route_variant_limit)
         if not force and queued_signatures[signature] >= variant_limit:
+            deferred_browser_urls.add(candidate)
             return
         if origin_visits[origin] >= per_origin_limit:
+            deferred_browser_urls.add(candidate)
             return
         queued.add(candidate)
         queued_signatures[signature] += 1
@@ -4318,7 +4327,7 @@ def _browser_network_discovery_impl(target: str, cookies: str, html_urls: list[s
                 if route.request.is_navigation_request() and not in_scope:
                     budget_info['external_navigation_requests_blocked'] = int(budget_info.get('external_navigation_requests_blocked', 0) or 0) + 1
                     route.abort()
-                elif not in_scope and request_method not in {'GET', 'HEAD', 'OPTIONS'}:
+                elif not in_scope:
                     budget_info['external_navigation_requests_blocked'] = int(budget_info.get('external_navigation_requests_blocked', 0) or 0) + 1
                     route.abort()
                 elif in_scope and _browser_request_state_reason(route.request, allow_state_changes):
@@ -4606,7 +4615,7 @@ def _browser_network_discovery_impl(target: str, cookies: str, html_urls: list[s
                     f'profile={"authenticated" if cookies else "anonymous"} navigated={len(visited)}/{navigation_max_budget} queued={len(queue)}',
                 )
                 best_index = min(
-                    range(len(queue)),
+                    range(min(len(queue), 128)),
                     key=lambda index: _discovery_family_fairness_key(target, queue[index], family_visits, queue[index] in priority_set),
                 )
                 value = queue[best_index]
@@ -4616,7 +4625,9 @@ def _browser_network_discovery_impl(target: str, cookies: str, html_urls: list[s
                         cutoff_score = min(base_scores) if base_scores else value_score
                         adaptive_threshold = max(1, int(cutoff_score * 0.75))
                     if value_score < adaptive_threshold and family_visits.get(_application_family_key(value), 0) > 0:
-                        queue.pop(best_index)
+                        # R1321: this URL is not navigated. Keep it in the resumable
+                        # deferred frontier rather than silently losing it.
+                        deferred_browser_urls.add(queue.pop(best_index))
                         budget_info['adaptive_low_value_deferred'] = int(budget_info.get('adaptive_low_value_deferred', 0) or 0) + 1
                         continue
                 value = queue.pop(best_index)
@@ -4858,6 +4869,8 @@ def _browser_network_discovery_impl(target: str, cookies: str, html_urls: list[s
         runtime_script_endpoint_hints=len(runtime_script_endpoint_hints),
     )
     # Transient transfer to discover_target(): removed before diagnostics are exposed to reports.
+    budget_info['_pending_browser_urls'] = list(dict.fromkeys(queue))
+    budget_info['_deferred_browser_urls'] = sorted(deferred_browser_urls)
     budget_info['_runtime_script_endpoint_hints'] = runtime_script_endpoint_hints
     return (_dedupe_request_cases(cases), unique_observed, list(dict.fromkeys(navigated)), errors, budget_info)
 
@@ -5916,6 +5929,8 @@ def discover_target(
     wall_clock_deadline: float | None=None,
     precomputed_same_host_service_discovery: dict[str, Any] | None=None,
     defer_same_host_service_discovery: bool=False,
+    resume_seen_urls: list[str] | None=None,
+    resume_browser_seen_urls: list[str] | None=None,
 ) -> dict[str, Any]:
 
     session = requests.Session()
@@ -6003,6 +6018,15 @@ def discover_target(
                 metadata_seed_urls.add(_clean_url(value))
     priority_seed_urls = ordinary_seed_urls | explicit_seed_urls | discovered_service_roots | metadata_seed_urls
     initial = list(dict.fromkeys([_clean_url(target), *sorted(priority_seed_urls)]))
+    # SECOps_MANUAL_RESUME_V3: process-scoped resume from audited checkpoints.
+    previous_http = {
+        _clean_url(value) for value in resume_seen_urls or []
+        if isinstance(value, str) and value and url_in_authorized_scope(target, value)
+    }
+    previous_browser = {
+        _clean_url(value) for value in resume_browser_seen_urls or []
+        if isinstance(value, str) and value and url_in_authorized_scope(target, value)
+    }
     explicit_seed_count = len(explicit_seed_urls)
     page_budget = max(min(max(1, int(max_pages)), int(limits['crawl_pages'])), min(256, explicit_seed_count))
     page_max_budget = max(
@@ -6039,6 +6063,9 @@ def discover_target(
     per_origin_attempt_limit = max(per_origin_limit, int(math.ceil(per_origin_limit * attempt_factor)))
     promoted_http_roots: set[str] = set()
     http_family_root_limit = max(4, min(256, max(1, page_max_budget // 4)))
+    # R1321: a resume must be capable of discovering new live routing templates.
+    # enqueue() already excludes previous_http and queued URLs, and per-template
+    # generation remains bounded by semantic_template_limit.
     semantic_template_limit = max(0, int(limits.get('semantic_route_template_variants', 0) or 0))
     semantic_route_templates: dict[tuple[str, str, str, int], dict[str, Any]] = {}
     semantic_route_candidates: dict[tuple[str, str], dict[str, str]] = defaultdict(dict)
@@ -6077,7 +6104,7 @@ def discover_target(
             value = _normalize_redundant_base_path_link(target, _clean_url(raw_url))
         except Exception:
             return
-        if not value or value in queued:
+        if not value or value in queued or value in previous_http:
             return
         if not url_in_authorized_scope(target, value):
             skipped_out_of_scope += 1
@@ -6123,7 +6150,7 @@ def discover_target(
             (key, template) for key, template in semantic_route_templates.items()
             if (str(template.get('origin') or ''), str(template.get('directory') or '/')) == route_bucket
         ]
-        for template_key, template in candidate_templates:
+        for template_key, template in (candidate_templates if semantic_template_limit else []):
             for candidate_url in list(semantic_route_candidates.get(route_bucket, {})):
                 variant = _semantic_route_template_variant(template, candidate_url)
                 if not variant or variant == str(template.get('wrapper_url') or '') or variant in semantic_route_generated:
@@ -6184,7 +6211,7 @@ def discover_target(
         nonlocal skipped_route_variants, skipped_origin_budget, http_attempts, http_adaptive_threshold, http_adaptive_stopped
         while queue and pages_processed + sum(batch_origin_reservations.values()) < page_max_budget and http_attempts < attempt_budget and http_discovery_time_left():
             best_index = min(
-                range(len(queue)),
+                range(min(len(queue), 128)),
                 key=lambda index: _discovery_family_fairness_key(
                     target, queue[index], family_useful_visits, queue[index] in priority_seed_urls,
                     batch_family_reservations, family_attempt_visits,
@@ -6704,10 +6731,13 @@ def discover_target(
                         if case['method'] == 'GET':
                             parameterized.add(case['url'])
 
+    fresh_browser_forced = sorted(explicit_seed_urls - previous_browser)
+    fresh_browser_priority = sorted(priority_seed_urls - previous_browser)
     browser_cases, browser_network_requests, browser_navigation_urls, browser_errors, browser_budget_info = _browser_network_discovery(
-        target, cookies, sorted(html_urls), sorted(explicit_seed_urls), sorted(priority_seed_urls),
+        target, cookies, sorted(html_urls - previous_browser), fresh_browser_forced, fresh_browser_priority,
         allow_state_changes=allow_state_changes, wall_clock_deadline=external_discovery_deadline,
-    ) if html_urls or priority_seed_urls else ([], [], [], [], {'base_budget': int(limits['browser_pages']), 'max_budget': int(limits.get('browser_pages_max', limits['browser_pages'])), 'attempted': 0, 'adaptive_overflow_used': 0, 'remaining_candidates': 0, 'adaptive_threshold': None, 'max_saturated': False, 'wall_clock_budget_seconds': 0.0, 'wall_clock_elapsed_seconds': 0.0, 'wall_clock_exhausted': bool(external_discovery_deadline is not None and time.monotonic() >= external_discovery_deadline)})
+        resume_browser_seen_urls=sorted(previous_browser),
+    ) if html_urls - previous_browser or fresh_browser_priority or fresh_browser_forced else ([], [], [], [], {'base_budget': int(limits['browser_pages']), 'max_budget': int(limits.get('browser_pages_max', limits['browser_pages'])), 'attempted': 0, 'adaptive_overflow_used': 0, 'remaining_candidates': 0, 'adaptive_threshold': None, 'max_saturated': False, 'wall_clock_budget_seconds': 0.0, 'wall_clock_elapsed_seconds': 0.0, 'wall_clock_exhausted': bool(external_discovery_deadline is not None and time.monotonic() >= external_discovery_deadline)})
     request_cases.extend(browser_cases)
     html_urls.update(browser_navigation_urls)
     visited.update(browser_navigation_urls)
@@ -6767,6 +6797,11 @@ def discover_target(
             sources.append(str(case.get('discovery_source')))
         for source in set(str(value) for value in sources if str(value)):
             case_source_counts[source] += 1
+    # Residual URLs belong to the active HTTP/browser queues, not a cumulative sum.
+    pending_http_urls = list(dict.fromkeys(queue))
+    pending_browser_urls = list(dict.fromkeys(browser_budget_info.pop('_pending_browser_urls', [])))
+    deferred_browser_urls = list(dict.fromkeys(browser_budget_info.pop('_deferred_browser_urls', [])))
+    pending_script_urls = sorted(deferred_script_urls)
     rate_stats = _DISCOVERY_REQUEST_PACER.stats()
     budget_diagnostics = {
         'mode': CURRENT_SCAN_MODE,
@@ -6807,6 +6842,7 @@ def discover_target(
         'browser_textual_response_bytes_parsed': int(browser_budget_info.get('textual_response_bytes_parsed', 0) or 0),
         'browser_textual_response_navigation_candidates': int(browser_budget_info.get('textual_response_navigation_candidates', 0) or 0),
         'browser_adaptive_low_value_deferred': int(browser_budget_info.get('adaptive_low_value_deferred', 0) or 0),
+        'browser_deferred_candidates': len(deferred_browser_urls),
         'browser_adaptive_threshold': browser_budget_info.get('adaptive_threshold'),
         'browser_max_budget_saturated': bool(browser_budget_info.get('max_saturated', False)),
         'browser_wall_clock_budget_seconds': float(browser_budget_info.get('wall_clock_budget_seconds', 0.0) or 0.0),
@@ -6901,7 +6937,7 @@ def discover_target(
             f'{browser_blocked_navigations}. Origins: {preview}{suffix}'
         )
 
-    result = {'urls': sorted(visited), 'html_urls': sorted(html_urls), 'form_urls': sorted(form_urls), 'parameterized_urls': sorted(parameterized), 'request_cases': _dedupe_request_cases(request_cases), 'script_urls': sorted(script_urls), 'script_endpoint_hints': script_endpoint_hints, 'browser_network_requests': browser_network_requests, 'browser_navigation_urls': browser_navigation_urls, 'client_side_candidates': client_side_candidates, 'jwt_tokens': sorted(tokens), 'errors': errors, 'authentication_effective': auth_effective, 'authentication_note': auth_note, 'authentication_probe': auth_probe, 'target_preparation': target_preparation, 'destructive_urls_skipped': sorted(destructive_skipped), 'destructive_request_cases': _dedupe_request_cases(destructive_request_cases), 'coverage_skipped_cases': coverage_skipped_cases, 'budget_diagnostics': budget_diagnostics, 'same_host_service_discovery': same_host_service_discovery, 'same_host_service_discoveries': [same_host_service_discovery] if same_host_service_discovery.get('enabled') else [], 'explicit_entry_points': sorted(explicit_seed_urls), 'priority_discovery_seeds': sorted(ordinary_seed_urls), 'proactive_service_roots': sorted(discovered_service_roots), 'metadata_discovery_seeds': sorted(metadata_seed_urls)}
+    result = {'pending_http_urls': pending_http_urls, 'pending_browser_urls': pending_browser_urls, 'deferred_browser_urls': deferred_browser_urls, 'pending_script_urls': pending_script_urls, 'urls': sorted(visited), 'html_urls': sorted(html_urls), 'form_urls': sorted(form_urls), 'parameterized_urls': sorted(parameterized), 'request_cases': _dedupe_request_cases(request_cases), 'script_urls': sorted(script_urls), 'script_endpoint_hints': script_endpoint_hints, 'browser_network_requests': browser_network_requests, 'browser_navigation_urls': browser_navigation_urls, 'client_side_candidates': client_side_candidates, 'jwt_tokens': sorted(tokens), 'errors': errors, 'authentication_effective': auth_effective, 'authentication_note': auth_note, 'authentication_probe': auth_probe, 'target_preparation': target_preparation, 'destructive_urls_skipped': sorted(destructive_skipped), 'destructive_request_cases': _dedupe_request_cases(destructive_request_cases), 'coverage_skipped_cases': coverage_skipped_cases, 'budget_diagnostics': budget_diagnostics, 'same_host_service_discovery': same_host_service_discovery, 'same_host_service_discoveries': [same_host_service_discovery] if same_host_service_discovery.get('enabled') else [], 'explicit_entry_points': sorted(explicit_seed_urls), 'priority_discovery_seeds': sorted(ordinary_seed_urls), 'proactive_service_roots': sorted(discovered_service_roots), 'metadata_discovery_seeds': sorted(metadata_seed_urls)}
     if expand_authorized_service_hosts:
         result = expand_discovered_authorized_host_services(
             result, target, cookies, max_pages=max_pages, allow_state_changes=allow_state_changes,
@@ -6951,6 +6987,8 @@ def discover_target_sync_safe(
     wall_clock_deadline: float | None=None,
     precomputed_same_host_service_discovery: dict[str, Any] | None=None,
     defer_same_host_service_discovery: bool=False,
+    resume_seen_urls: list[str] | None=None,
+    resume_browser_seen_urls: list[str] | None=None,
 ) -> dict[str, Any]:
     try:
         asyncio.get_running_loop()
@@ -6962,6 +7000,7 @@ def discover_target_sync_safe(
             allow_state_changes=allow_state_changes, wall_clock_deadline=wall_clock_deadline,
             precomputed_same_host_service_discovery=precomputed_same_host_service_discovery,
             defer_same_host_service_discovery=defer_same_host_service_discovery,
+            resume_seen_urls=resume_seen_urls, resume_browser_seen_urls=resume_browser_seen_urls,
         )
     with ThreadPoolExecutor(max_workers=1, thread_name_prefix='secops-discovery') as executor:
         return executor.submit(
@@ -6971,6 +7010,7 @@ def discover_target_sync_safe(
             allow_state_changes=allow_state_changes, wall_clock_deadline=wall_clock_deadline,
             precomputed_same_host_service_discovery=precomputed_same_host_service_discovery,
             defer_same_host_service_discovery=defer_same_host_service_discovery,
+            resume_seen_urls=resume_seen_urls, resume_browser_seen_urls=resume_browser_seen_urls,
         ).result()
 
 def _discovered_scope_origin_evidence(discovery: dict[str, Any], target: str) -> dict[str, dict[str, int]]:
@@ -10480,8 +10520,7 @@ def select_arjun_candidates(discovery: dict[str, Any], target: str, limit: int=M
             score -= 8
         if score <= 0 and (has_form or has_existing_parameters):
             score = 1
-        if score > 0:
-            ranked.append((score, _clean_url(url)))
+        ranked.append((score, _clean_url(url)))
     best: dict[str, int] = {}
     for score, url in ranked:
         best[url] = max(score, best.get(url, score))
@@ -10508,7 +10547,7 @@ def _authorization_case_priority(case: dict[str, Any]) -> int:
         return -1000
     parsed = urlparse(url)
     path_tokens = {token for token in re.split('[^a-z0-9_-]+', parsed.path.lower()) if token}
-    if path_tokens & AUTHORIZATION_EXCLUDED_PATH_HINTS:
+    if path_tokens & {'login','signin','sign-in','logout','signout','logoff','csrf','captcha','setup','install','reset','delete','remove','drop','truncate','purge','wipe'}:
         return -1000
     pairs = [(name.lower(), value) for name, value in parse_qsl(parsed.query, keep_blank_values=True)]
     names = {str(value).lower() for value in case.get('parameters', []) if str(value)}
@@ -10779,7 +10818,7 @@ def select_arjun_request_cases(discovery: dict[str, Any], target: str, limit: in
             # is still unknown; blanket exclusion was an unnecessary coverage loss.
             if fully_modelled_form:
                 score -= 6
-        if score < 12:
+        if score < 12 and method != 'GET':
             continue
         ranked.append((score, {'url': url, 'method': method, 'data': str(case.get('data') or ''), 'parameters': parameters, 'content_type': str(case.get('content_type') or case.get('enctype') or ''), 'enctype': str(case.get('enctype') or case.get('content_type') or '')}))
     for url in select_arjun_candidates(discovery, target, limit=max(effective_limit * 3, 6)):
@@ -10788,8 +10827,6 @@ def select_arjun_request_cases(discovery: dict[str, Any], target: str, limit: in
         if path in represented_paths or parsed.query or _destructive_crawl_url(url):
             continue
         score = _risk_terms(path) + (18 if any((token in path for token in ('/api/', 'callback', 'webhook', 'debug', 'admin'))) else 0)
-        if score < 12:
-            continue
         ranked.append((score, {'url': url, 'method': 'GET', 'data': '', 'parameters': []}))
     if CURRENT_SCAN_MODE in {'balanced', 'deep'} and (not ranked or CURRENT_SCAN_MODE == 'deep'):
         relaxed: list[tuple[int, dict[str, Any]]] = []
