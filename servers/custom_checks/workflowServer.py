@@ -10,7 +10,7 @@ from urllib.parse import parse_qsl, urljoin, urlparse
 
 import requests
 
-from utils import RequestRatePacer, partial, request_same_origin_redirects, secops_parallelism_policy, skipped, success
+from utils import RequestRatePacer, partial, request_contract_state_change_reason, request_same_origin_redirects, secops_parallelism_policy, skipped, success
 
 from utils import same_origin
 
@@ -541,7 +541,31 @@ def run_workflow_scan(
 
     applicable = any(bool(value.get("applicable")) for value in (csrf_diag, upload_diag, auth_diag, captcha_diag))
     if not applicable:
-        return skipped("Web Workflow Verifier", target_url, "The discovered form did not match CSRF, upload, authentication or CAPTCHA workflow classes.")
+        if method != "GET":
+            return skipped("Web Workflow Verifier", target_url, "The discovered form did not match CSRF, upload, authentication or CAPTCHA workflow classes.")
+        # Do not report a single GET as a completed multi-step workflow.
+        # Keep a read-only baseline only when the CP11 state guard approves it.
+        if request_contract_state_change_reason({'url':target_url,'method':'GET','data':'','parameters':list(parameters or [])}):
+            return skipped('Web Workflow Verifier',target_url,'GET baseline rejected by state-change policy.',diagnosis='state_change_policy_blocked')
+        try:
+            if not pacer.wait(action_deadline):
+                return partial('Web Workflow Verifier',target_url,'GET baseline rate slot unavailable before deadline.',diagnosis='time_limit_reached',timed_out=True,vulnerabilities=[],diagnostics=diagnostics)
+            session=_session(cookies)
+            try:
+                response=session.get(target_url,timeout=(3,max(5,min(30,int(remaining_budget(action_deadline))))),allow_redirects=False)
+            finally:
+                session.close()
+            diagnostics['readonly_get_baseline']={'status':response.status_code,
+                'redirect':response.status_code in (301,302,303,307,308),
+                'has_form':'<form' in response.text[:50000].lower(),
+                'note':'single GET observation only, NOT a verified workflow'}
+            return partial('Web Workflow Verifier',target_url,
+                'Read-only GET baseline collected; no verified CSRF/upload/authentication/CAPTCHA workflow.',
+                diagnosis='baseline_only',vulnerabilities=[],diagnostics=diagnostics)
+        except requests.Timeout:
+            return partial('Web Workflow Verifier',target_url,'GET baseline timed out.',diagnosis='time_limit_reached',timed_out=True,vulnerabilities=[],diagnostics=diagnostics)
+        except requests.RequestException as exc:
+            return partial('Web Workflow Verifier',target_url,'GET baseline transport unavailable: '+type(exc).__name__,diagnosis='baseline_transport_unavailable',vulnerabilities=[],diagnostics=diagnostics)
     if remaining_budget(action_deadline) <= 0:
         return partial(
             "Web Workflow Verifier", target_url,
