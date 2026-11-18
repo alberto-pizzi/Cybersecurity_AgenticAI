@@ -9,6 +9,8 @@ import sys
 import uuid
 import time
 import traceback
+from collections import Counter
+from hashlib import sha256
 from datetime import datetime
 from pathlib import Path
 from typing import Any, TypedDict
@@ -98,6 +100,8 @@ class DeterministicState(TypedDict, total=False):
     assessment_context: dict[str, Any]
     report_status: dict[str, Any]
     assessment_started_monotonic: float
+    cross_discovery_audit: dict[str, Any]
+    incremental_coverage_audit: dict[str, Any]
 
 # Discovers pages, forms, and request cases separately for every active profile.
 async def deterministic_discovery_node(state: DeterministicState) -> dict[str, Any]:
@@ -343,6 +347,331 @@ async def deterministic_discovery_node(state: DeterministicState) -> dict[str, A
             print(f"    [WARNING] {name}: {found.get('authentication_note')}", file=sys.stderr)
     return {'profiles': profiles, 'discovery': discovery, 'diagnostics': diagnostics, 'results': results, 'workflow_state_changes': workflow_state_changes}
 
+# The ordinary crawler/Chromium and sibling-service discovery run before this stage.
+# The following caps are for FFUF + Arjun + recrawl COMBINED across every profile.
+_CROSS_SECONDS = {'test': 25, 'fast': 180, 'balanced': 480, 'deep': 900}
+_CROSS_ARJUN_LIMIT = {'test': 2, 'fast': 10, 'balanced': 32, 'deep': 64}
+
+
+def _safe_discovery_case(target: str, case: dict[str, Any]) -> bool:
+    url = str(case.get('url') or '')
+    return bool(url and str(case.get('method') or 'GET').upper() in {'GET', 'POST'}
+                and shared.url_in_authorized_scope(target, url)
+                and not shared._destructive_crawl_url(url)
+                and not shared._ephemeral_identity_flow_url(url)
+                and not shared.request_case_state_change_reason(case))
+
+
+def _case_identity(tool: str, case: dict[str, Any]) -> tuple[Any, ...]:
+    method = str(case.get('method') or 'GET').upper()
+    # Legacy selection summaries did not preserve form-field metadata. For
+    # ordinary GETs a conservative request identity prevents unsafe replay.
+    if method == 'GET' and not case.get('data'):
+        return (tool, method, shared.semantic_request_identity_url(str(case.get('url') or '')),
+                tuple(sorted(str(p).lower() for p in case.get('parameters', []) if str(p))))
+    return (tool, _no_cookie_request_execution_key(tool, case))
+
+
+async def deterministic_cross_discovery_node(state: DeterministicState) -> dict[str, Any]:
+    """FFUF -> scoped recrawl -> Arjun, with bounded novel-root feedback.
+
+    Discovery budget is shared, split between profiles, and does not come from
+    crawler/Chromium, Browser, ZAP, or specialist scanner allowances.
+    """
+    target = state['target']
+    profiles = sorted(state['profiles'], key=lambda p: bool(p.get('cookies')))
+    discovery = state['discovery']
+    results = state['results']
+    diagnostics = list(state.get('diagnostics') or [])
+    mode = str(shared.CURRENT_SCAN_MODE or 'balanced').lower()
+    per_profile = float(_CROSS_SECONDS.get(mode, 480)) / max(1, len(profiles))
+    ffuf_spec = next(spec for spec in BASE_TOOLS if spec.name == 'ffuf')
+    audit = {'budget_seconds': per_profile * len(profiles), 'profile_seconds': per_profile,
+             'profiles': {}, 'policy': 'crawler-first; bounded FFUF-Arjun'}
+    anonymous_urls: list[str] = []
+
+    for profile in profiles:
+        name, cookies = profile['name'], str(profile.get('cookies') or '')
+        found = discovery[name]
+        started = time.monotonic()
+        deadline = started + per_profile * 0.90  # remaining 10% reserved for ZAP additions
+        limits = {'ffuf': per_profile * .32, 'arjun': per_profile * .43,
+                  'recrawl': per_profile * .15}
+        runs: dict[str, list[dict[str, Any]]] = {'ffuf': [], 'arjun': []}
+        seen_roots: set[str] = set()
+        seen_cases: set[tuple[Any, ...]] = set()
+        ffuf_observed: set[str] = set()
+        info = {'ffuf_calls': 0, 'arjun_calls': 0, 'recrawls': 0, 'deferred': 0}
+        effective_cookie = cookies
+        stop = False
+
+        async def crawl(urls: list[str]) -> None:
+            nonlocal found
+            available = min(limits['recrawl'], deadline - time.monotonic())
+            seeds = list(dict.fromkeys(u for u in urls if _safe_discovery_case(target, {'url': u, 'method': 'GET'})))[:64]
+            if not seeds or available < 2:
+                info['deferred'] += len(seeds)
+                return
+            t0 = time.monotonic()
+            try:
+                extra = await asyncio.to_thread(
+                    shared.discover_target_sync_safe, target, effective_cookie,
+                    seeds=seeds, allow_state_changes=False, max_pages=min(shared.MAX_CRAWL_PAGES, 64),
+                    expand_authorized_service_hosts=False,
+                    defer_same_host_service_discovery=True,
+                    wall_clock_deadline=t0 + available)
+                found = merge_discovery(found, extra)
+                diagnostics.extend({'phase': 'cross_recrawl', 'profile': name, **error}
+                                   for error in extra.get('errors', []))
+                info['recrawls'] += 1
+            except Exception as exc:
+                diagnostics.append({'phase': 'cross_recrawl', 'profile': name, 'error': type(exc).__name__})
+            finally:
+                limits['recrawl'] = max(0., limits['recrawl'] - (time.monotonic() - t0))
+
+        # Keep B recrawl independent of A and bounded by B's own allowance.
+        if cookies and anonymous_urls:
+            available = min(limits['recrawl'], deadline - time.monotonic())
+            if available >= 2 and not _application_auth_rejected(profile, found, target):
+                t0 = time.monotonic()
+                try:
+                    refreshed = await asyncio.to_thread(refresh_authenticated_session_state,
+                        target, cookies, select_session_probe_url(found, target),
+                        allow_state_changes=False, deadline=t0 + available)
+                    remaining = min(limits['recrawl'] - (time.monotonic() - t0), deadline - time.monotonic())
+                    if refreshed.get('usable') and refreshed.get('credential_applied') and remaining >= 2:
+                        effective_cookie = str(refreshed.get('effective_cookie_header') or '') or cookies
+                        extra = await asyncio.to_thread(shared.discover_target_sync_safe,
+                            target, effective_cookie, seeds=anonymous_urls[:64],
+                            allow_state_changes=False, max_pages=min(shared.MAX_CRAWL_PAGES, 64),
+                            expand_authorized_service_hosts=False,
+                            defer_same_host_service_discovery=True, wall_clock_deadline=t0 + available)
+                        found = merge_discovery(found, extra)
+                        diagnostics.extend({'phase': 'anonymous_ffuf_authenticated_recrawl',
+                            'profile': name, **error} for error in extra.get('errors', []))
+                        info['recrawls'] += 1
+                except Exception as exc:
+                    diagnostics.append({'phase': 'anonymous_ffuf_authenticated_recrawl',
+                                        'profile': name, 'error': type(exc).__name__})
+                finally:
+                    limits['recrawl'] = max(0., limits['recrawl'] - (time.monotonic() - t0))
+
+        for index in range(2):
+            if stop:
+                break
+            remaining = min(limits['ffuf'], deadline - time.monotonic())
+            try:
+                args = build_tool_arguments('ffuf', target, effective_cookie, found,
+                                            allow_state_changes=False, timeout_override=max(1, int(remaining) - 1))
+                roots = [u for u in args.get('roots', []) if shared.url_in_authorized_scope(target, str(u))
+                         and u not in seen_roots]
+            except Exception as exc:
+                diagnostics.append({'phase': 'cross_ffuf_catalog', 'profile': name,
+                                    'error': type(exc).__name__})
+                break  # No remote action was submitted; specialist stages remain eligible.
+            # Preserve the original single-target FFUF coverage when discovery
+            # cannot derive any explicit roots; do not lose the baseline scan.
+            if index == 0 and not roots and shared.url_in_authorized_scope(target, target):
+                roots = [target]
+            if index == 0:
+                remaining = min(remaining, per_profile * .32 * .75)
+            if roots and remaining >= 3 and not _application_auth_rejected(profile, found, target):
+                started_call = time.monotonic()
+                invoked = False
+                try:
+                    refresh = (await asyncio.to_thread(refresh_authenticated_session_state,
+                        target, cookies, select_session_probe_url(found, target),
+                        allow_state_changes=False, deadline=deadline)) if cookies else {'usable': True, 'credential_applied': False}
+                    remaining = min(limits['ffuf'] - (time.monotonic() - started_call),
+                                    deadline - time.monotonic())
+                    if refresh.get('usable') is False or (cookies and not refresh.get('credential_applied')) or remaining < 2:
+                        result = make_skipped_result('ffuf', target, 'Session or cross-discovery budget unavailable.')
+                    else:
+                        effective_cookie = str(refresh.get('effective_cookie_header') or '') or cookies
+                        args['cookies'] = shared.scope_cookie_header(target, effective_cookie)
+                        args['roots'] = roots
+                        args['timeout'] = max(1, int(remaining) - 1)
+                        invoked = True
+                        result = await call_mcp_with_progress(ffuf_spec, args,
+                            timeout_seconds=remaining, hard_timeout_seconds=remaining)
+                    result['session_state_refresh'] = refresh
+                except Exception as exc:
+                    result = {'tool': 'ffuf', 'target': target, 'status': 'error',
+                              'vulnerabilities': [], 'output': type(exc).__name__,
+                              'remote_action_state_uncertain': invoked}
+                    diagnostics.append({'phase': 'cross_ffuf', 'profile': name, 'error': type(exc).__name__})
+                finally:
+                    limits['ffuf'] = max(0., limits['ffuf'] - (time.monotonic() - started_call))
+                    seen_roots.update(roots)  # uncertain remote actions cannot be replayed
+                _tag_coverage_action(result, 'ffuf', target_url=target)
+                runs['ffuf'].append(result)
+                log_result(name, 'ffuf', result, target)
+                info['ffuf_calls'] += int(invoked)
+                if result.get('status') in {'success', 'partial'}:
+                    found, urls = enrich_discovery_with_ffuf(found, result, target)
+                    if name == 'anonymous':
+                        anonymous_urls.extend(urls)
+                    ffuf_observed.update(shared.semantic_request_identity_url(u) for u in urls)
+                    # The FFUF observation remains visible to specialist selectors
+                    # even when the bounded recrawl cannot fetch the page again.
+                    rows = []
+                    for observed in urls[:min(shared.MAX_CRAWL_PAGES, 256)]:
+                        parsed = urlparse(observed)
+                        case = {'url': observed, 'method': 'GET', 'data': '',
+                                'parameters': [k for k, _ in parse_qsl(parsed.query, keep_blank_values=True)],
+                                'source_url': target, 'discovery_source': 'ffuf_observed'}
+                        if _safe_discovery_case(target, case) and not shared._browser_static_resource(observed):
+                            rows.append(case)
+                    found['request_cases'] = shared._dedupe_request_cases([*found.get('request_cases', []), *rows])
+                    await crawl(urls)
+                stop = bool(result.get('remote_action_state_uncertain') or result.get('remote_scan_unconfirmed_active'))
+            # Arjun on crawler endpoints even when FFUF has no roots or no result.
+            if stop:
+                break
+            try:
+                cases = select_arjun_request_cases(found, target,
+                    limit=min(shared.ARJUN_ENDPOINT_LIMIT, _CROSS_ARJUN_LIMIT.get(mode, 32)),
+                    allow_state_changes=False, agentic_catalog=True)
+            except Exception as exc:
+                diagnostics.append({'phase': 'cross_arjun_catalog', 'profile': name,
+                                    'error': type(exc).__name__})
+                break  # Preserve FFUF evidence and allow normal broad/specialist stages.
+            # Reserve half of the Arjun slots for newly discovered FFUF routes,
+            # and the other half for crawler candidates; neither can starve the other.
+            cap = _CROSS_ARJUN_LIMIT.get(mode, 32)
+            unseen = [c for c in cases if _case_identity('arjun', c) not in seen_cases]
+            ffuf_cases = [c for c in unseen if shared.semantic_request_identity_url(str(c.get('url') or '')) in ffuf_observed]
+            crawler_cases = [c for c in unseen if c not in ffuf_cases]
+            selected = (ffuf_cases[:cap // 2] + crawler_cases[:max(0, cap - min(cap // 2, len(ffuf_cases)))]
+                        + ffuf_cases[cap // 2:] + crawler_cases[max(0, cap - min(cap // 2, len(ffuf_cases))):])[:cap]
+            for case in selected:
+                url = str(case.get('url') or '')
+                key = _case_identity('arjun', case)
+                if key in seen_cases or not _safe_discovery_case(target, case) or _application_auth_rejected(profile, found, url):
+                    continue
+                remaining = min(limits['arjun'], deadline - time.monotonic())
+                if remaining < 3:
+                    info['deferred'] += 1
+                    break
+                seen_cases.add(key)
+                started_call = time.monotonic()
+                invoked = False
+                try:
+                    refresh = (await asyncio.to_thread(refresh_authenticated_session_state,
+                        url, cookies, shared.select_application_session_probe_url(found, url, str(case.get('source_url') or '')),
+                        allow_state_changes=False, deadline=deadline)) if cookies else {'usable': True, 'credential_applied': False}
+                    remaining = min(limits['arjun'] - (time.monotonic() - started_call), deadline - time.monotonic())
+                    if refresh.get('usable') is False or (cookies and not refresh.get('credential_applied')) or remaining < 2:
+                        result = make_skipped_result('arjun', url, 'Session or cross-discovery budget unavailable.')
+                    else:
+                        refreshed = str(refresh.get('effective_cookie_header') or '') or effective_cookie
+                        args = build_tool_arguments('arjun', url, refreshed, found, case=case,
+                            allow_state_changes=False, timeout_override=max(1, int(remaining) - 1))
+                        invoked = True
+                        result = await call_mcp_with_progress(ARJUN_TOOL, args,
+                            timeout_seconds=remaining, hard_timeout_seconds=remaining)
+                    result['session_state_refresh'] = refresh
+                except Exception as exc:
+                    result = {'tool': 'arjun', 'target': url, 'status': 'error',
+                              'vulnerabilities': [], 'output': type(exc).__name__,
+                              'remote_action_state_uncertain': invoked}
+                    diagnostics.append({'phase': 'cross_arjun', 'profile': name, 'error': type(exc).__name__})
+                finally:
+                    limits['arjun'] = max(0., limits['arjun'] - (time.monotonic() - started_call))
+                _tag_coverage_action(result, 'arjun', target_url=url, method=case.get('method','GET'),
+                    parameters=list(case.get('parameters', [])), source_url=str(case.get('source_url') or ''),
+                    data=str(case.get('data') or ''))
+                runs['arjun'].append(result)
+                log_result(name, 'arjun', result, url)
+                info['arjun_calls'] += int(invoked)
+                if result.get('status') in {'success', 'partial'}:
+                    found, _ = enrich_discovery_with_arjun(found, result, url)
+                if result.get('remote_action_state_uncertain') or result.get('remote_scan_unconfirmed_active'):
+                    stop = True
+                    break
+            # Second FFUF pass only if Arjun revealed genuinely new FFUF roots.
+            if index == 0:
+                try:
+                    next_args = build_tool_arguments('ffuf', target, effective_cookie, found, allow_state_changes=False)
+                except Exception as exc:
+                    diagnostics.append({'phase': 'cross_ffuf_feedback_catalog', 'profile': name,
+                                        'error': type(exc).__name__})
+                    break
+                if not any(u not in seen_roots for u in next_args.get('roots', [])):
+                    break
+        discovery[name] = found
+        for tool in ('ffuf', 'arjun'):
+            results[name][tool] = (aggregate_runs(tool, target, runs[tool]) if runs[tool]
+                else make_skipped_result(tool, target, 'No eligible read-only target or discovery budget.'))
+        info['elapsed_seconds'] = round(time.monotonic() - started, 3)
+        audit['profiles'][name] = info
+    return {'discovery': discovery, 'results': results, 'diagnostics': diagnostics,
+            'cross_discovery_audit': audit}
+
+
+async def _zap_arjun_new_urls(
+    state: DeterministicState, profile: dict[str, Any], found: dict[str, Any],
+    prior: dict[str, Any], target: str, urls: list[str], diagnostics: list[dict[str, Any]],
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    seconds = _CROSS_SECONDS.get(str(shared.CURRENT_SCAN_MODE).lower(), 480) * .10 / max(1, len(state['profiles']))
+    deadline = time.monotonic() + seconds
+    name, cookies = profile['name'], str(profile.get('cookies') or '')
+    eligible = {(urlparse(u).scheme, urlparse(u).netloc, urlparse(u).path) for u in urls
+                if _safe_discovery_case(target, {'url': u, 'method': 'GET'})}
+    if not eligible:
+        return found, []
+    # Only genuinely NEW observed routes; old Arjun actions are never repeated.
+    old = {str(row.get('coverage_action', {}).get('target_url') or '')
+           for _, row in iter_leaf_results(prior.get('arjun', {})) if isinstance(row, dict)}
+    try:
+        cases = select_arjun_request_cases(found, target, limit=shared.ARJUN_ENDPOINT_LIMIT,
+                                           allow_state_changes=False, agentic_catalog=True)
+    except Exception as exc:
+        diagnostics.append({'phase': 'zap_arjun_catalog', 'profile': name,
+                            'error': type(exc).__name__})
+        return found, []
+    fresh: list[dict[str, Any]] = []
+    for case in cases:
+        url = str(case.get('url') or '')
+        parsed = urlparse(url)
+        if len(fresh) >= 5 or deadline - time.monotonic() < 3:
+            break
+        if (parsed.scheme, parsed.netloc, parsed.path) not in eligible or url in old:
+            continue
+        if not _safe_discovery_case(target, case) or _application_auth_rejected(profile, found, url):
+            continue
+        old.add(url)
+        invoked = False
+        try:
+            refresh = (await asyncio.to_thread(refresh_authenticated_session_state,
+                url, cookies, shared.select_application_session_probe_url(found, url, str(case.get('source_url') or '')),
+                allow_state_changes=False, deadline=deadline)) if cookies else {'usable': True, 'credential_applied': False}
+            remaining = deadline - time.monotonic()
+            if refresh.get('usable') is False or (cookies and not refresh.get('credential_applied')) or remaining < 2:
+                result = make_skipped_result('arjun', url, 'ZAP followup session or reserved budget unavailable.')
+            else:
+                args = build_tool_arguments('arjun', url,
+                    str(refresh.get('effective_cookie_header') or '') or cookies, found, case=case,
+                    allow_state_changes=False, timeout_override=max(1, int(remaining) - 1))
+                invoked = True
+                result = await call_mcp_with_progress(ARJUN_TOOL, args,
+                    timeout_seconds=remaining, hard_timeout_seconds=remaining)
+            result['session_state_refresh'] = refresh
+        except Exception as exc:
+            diagnostics.append({'phase': 'zap_arjun', 'profile': name, 'error': type(exc).__name__})
+            result = {'tool': 'arjun', 'status': 'error', 'target': url, 'vulnerabilities': [],
+                      'remote_action_state_uncertain': invoked}
+        _tag_coverage_action(result, 'arjun', target_url=url, method=str(case.get('method','GET')),
+            parameters=list(case.get('parameters', [])), data=str(case.get('data') or ''))
+        fresh.append(result)
+        log_result(name, 'arjun', result, url)
+        if result.get('status') in {'success', 'partial'}:
+            found, _ = enrich_discovery_with_arjun(found, result, url)
+        if result.get('remote_action_state_uncertain') or result.get('remote_scan_unconfirmed_active'):
+            break
+    return found, fresh
+
+
 # Because FFUF and ZAP can expand discovery, broad scanning is completed before specialist selection.
 async def deterministic_broad_scan_node(state: DeterministicState) -> dict[str, Any]:
     target = state['target']
@@ -359,17 +688,11 @@ async def deterministic_broad_scan_node(state: DeterministicState) -> dict[str, 
         print(f'\n[*] Scanner generali - profilo: {name}')
         sibling_origins: list[str] = []
         sibling_selection_logged = False
-        if cookies and 'anonymous' in results:
-            anonymous_ffuf = results.get('anonymous', {}).get('ffuf', {})
-            if isinstance(anonymous_ffuf, dict):
-                _, anonymous_urls = enrich_discovery_with_ffuf(discovery[name], anonymous_ffuf, target)
-                if anonymous_urls:
-                    recrawl = await asyncio.to_thread(shared.discover_target_sync_safe, target, cookies, seeds=anonymous_urls, allow_state_changes=shared.state_changing_tests_allowed(target, state.get('allow_state_changes')))
-                    discovery[name] = merge_discovery(discovery[name], recrawl)
-                    diagnostics.extend(({'phase': 'anonymous_ffuf_authenticated_recrawl', 'profile': name, **item} for item in recrawl['errors']))
         session_valid = discovery[name].get('authentication_effective') is not False
         probe_url = select_session_probe_url(discovery[name], target)
         for scanner_name in broad_tool_order(bool(cookies)):
+            if scanner_name == 'ffuf':  # completed by bounded cross-discovery
+                continue
             spec = broad_specs[scanner_name]
             # FFUF executes first and may expand discovery. Freeze the sibling broad set only after
             # that enrichment, immediately before ZAP/Nuclei/Nikto consume it.
@@ -477,11 +800,13 @@ async def deterministic_broad_scan_node(state: DeterministicState) -> dict[str, 
             # static-resource and destructive-route guards before becoming a GET case.
             if spec.name == 'zap':
                 observed_total = 0
+                observed_zap_urls: list[str] = []
                 for observed_target, observed_result in [(target, result), *zip(sibling_origins, sibling_runs)]:
                     if observed_result.get('status') not in {'success', 'partial'}:
                         continue
                     discovery[name], extra = enrich_discovery_with_zap(discovery[name], observed_result, observed_target)
                     observed_total += len(extra)
+                    observed_zap_urls.extend(extra)
                 if observed_total:
                     print(f'    [DISCOVERY] ZAP site-tree: {observed_total} scoped URL observations merged into Deterministic discovery.')
             results[name][spec.name] = aggregate_runs(spec.name, target, [result, *sibling_runs]) if sibling_runs else result
@@ -502,42 +827,14 @@ async def deterministic_broad_scan_node(state: DeterministicState) -> dict[str, 
                         print('    [AUTH SESSION ROOT CAUSE] Direct recovery probe conclusively reached the login page after ZAP.', file=sys.stderr)
                     elif recovery.get('conclusive') is False:
                         print('    [WARNING] Target recovery remained temporarily inconclusive; downstream scanners will still run because no logout was proven.', file=sys.stderr)
-            if spec.name == 'ffuf' and result.get('status') in {'success', 'partial'}:
-                discovery[name], discovered_urls = enrich_discovery_with_ffuf(discovery[name], result, target)
-                if discovered_urls:
-                    recrawl = await asyncio.to_thread(shared.discover_target_sync_safe, target, cookies, seeds=discovered_urls, allow_state_changes=shared.state_changing_tests_allowed(target, state.get('allow_state_changes')))
-                    discovery[name] = merge_discovery(discovery[name], recrawl)
-                    if cookies and discovery[name].get('authentication_effective') is not False:
-                        discovery[name] = await asyncio.to_thread(shared.authenticate_discovered_sibling_origins, discovery[name], target, cookies, allow_state_changes=shared.state_changing_tests_allowed(target, state.get('allow_state_changes')))
-                    diagnostics.extend(({'phase': 'ffuf_recrawl', 'profile': name, **item} for item in recrawl['errors']))
-                    print(f"    [INFO   ] FFUF re-crawl: {len(discovery[name]['html_urls'])} HTML pages, {len(discovery[name]['request_cases'])} GET/POST cases")
-                    if cookies and recrawl.get('authentication_effective') is False:
-                        session_valid = False
-                        print('    [AUTH SESSION ROOT CAUSE] The authenticated session became invalid after FFUF. Remaining authenticated scanners will be skipped.', file=sys.stderr)
-                if cookies and result.get('diagnosis') == 'authentication_lost_during_ffuf':
-                    session_valid = False
-        arjun_runs: list[dict[str, Any]] = []
-        arjun_cases = select_arjun_request_cases(discovery[name], target, limit=shared.ARJUN_ENDPOINT_LIMIT, allow_state_changes=shared.state_changing_tests_allowed(target, state.get('allow_state_changes')))
-        if arjun_cases:
-            arjun_budget = shared.specialist_budget_diagnostics('arjun', arjun_cases)
-            print(f"    [INFO   ] Arjun request cases selected: {len(arjun_cases)}; base={arjun_budget['base']}; adaptive={arjun_budget['adaptive_used']}; adaptive max={arjun_budget['adaptive_max']}")
-            for case in arjun_cases:
-                endpoint = str(case.get('url') or target)
-                endpoint_probe = shared.select_application_session_probe_url(discovery[name], endpoint, str(case.get('source_url') or ''))
-                refresh = (await asyncio.to_thread(refresh_authenticated_session_state, endpoint, cookies, endpoint_probe, allow_state_changes=shared.state_changing_tests_allowed(target, state.get('allow_state_changes')))) if cookies else {'performed': False, 'usable': True, 'credential_applied': False}
-                if refresh.get('usable') is False or (cookies and not refresh.get('credential_applied')):
-                    result = make_skipped_result('arjun', endpoint, 'The authenticated application session could not be restored before hidden-parameter discovery.') | {'session_state_refresh': refresh}
-                else:
-                    arguments = build_tool_arguments('arjun', endpoint, cookies, discovery[name], case=case, allow_state_changes=state.get('allow_state_changes'))
-                    result = await call_mcp_with_progress(ARJUN_TOOL, arguments)
-                    result['session_state_refresh'] = refresh
-                if result.get('status') in {'success', 'partial'}:
-                    discovery[name], _ = enrich_discovery_with_arjun(discovery[name], result, endpoint)
-                _tag_coverage_action(result, 'arjun', target_url=endpoint, method=str(case.get('method', 'GET')), parameters=list(case.get('parameters', [])), source_url=str(case.get('source_url', '')), data=str(case.get('data') or ''))
-                arjun_runs.append(result)
-                log_result(name, 'arjun', result, endpoint)
+                if observed_total and not result.get('remote_action_state_uncertain'):
+                    # Always after the existing post-ZAP session recovery.
+                    discovery[name], new_arjun = await _zap_arjun_new_urls(
+                        state, profile, discovery[name], results[name], target,
+                        observed_zap_urls, diagnostics)
+                    if new_arjun:
+                        results[name]['arjun_zap_followup'] = aggregate_runs('arjun', target, new_arjun)
         profile_session_state[name] = session_valid
-        results[name]['arjun'] = aggregate_runs('arjun', target, arjun_runs) if arjun_runs else make_skipped_result('arjun', target, 'No suitable HTML/form endpoint was available for hidden-parameter discovery.')
     return {'discovery': discovery, 'diagnostics': diagnostics, 'results': results, 'has_authenticated_profile': has_authenticated_profile, 'profile_session_state': profile_session_state}
 
 # For parameter testing, each specialist receives only the request cases relevant to its vulnerability class.
@@ -574,7 +871,10 @@ async def deterministic_parameter_scan_node(state: DeterministicState) -> dict[s
         if refresh.get('usable') is False or (cookies and not refresh.get('credential_applied')):
             skipped = make_skipped_result(spec.name, url, 'The authenticated application session could not be restored before this scanner.') | {'session_state_refresh': refresh}
             return _tag_coverage_action(skipped, spec.name, target_url=url, method=str(case.get('method', 'GET')), parameters=list(case.get('parameters', [])), source_url=str(case.get('source_url', '')), data=str(case.get('data') or ''))
-        arguments = build_tool_arguments(spec.name, url, cookies, {}, case=case, allow_state_changes=allow_state_changes, timeout_override=timeout)
+        effective = str(refresh.get('effective_cookie_header') or '') or cookies
+        arguments = build_tool_arguments(spec.name, url, effective, {}, case=case, allow_state_changes=allow_state_changes, timeout_override=timeout)
+        if cookies and refresh.get('usable') and refresh.get('credential_applied') and spec.name in {'sqlmap', 'dalfox', 'commix', 'traversal'}:
+            arguments['session_prevalidated'] = True
         result = await call_mcp_with_progress(spec, arguments, timeout_seconds=timeout + 35)
         result['session_state_refresh'] = refresh
         return _tag_coverage_action(result, spec.name, target_url=url, method=str(case.get('method', 'GET')), parameters=list(case.get('parameters', [])), source_url=str(case.get('source_url', '')), data=str(case.get('data') or ''))
@@ -596,7 +896,7 @@ async def deterministic_parameter_scan_node(state: DeterministicState) -> dict[s
             cases = select_tool_request_cases(
                 discovery[name], spec.name, authenticated_profile=bool(cookies),
                 allow_state_changes=shared.state_changing_tests_allowed(target, state.get('allow_state_changes')),
-                credential_cookies=cookies,
+                credential_cookies=cookies, agentic_catalog=True,
             )
             deduped_cases: list[dict[str, Any]] = []
             for case in cases:
@@ -620,7 +920,7 @@ async def deterministic_parameter_scan_node(state: DeterministicState) -> dict[s
                 deduped_cases.append(case)
             cases = deduped_cases
             get_count = sum((str(case.get('method', 'GET')).upper() == 'GET' for case in cases))
-            selection_summary[name][spec.name] = [{'method': str(case.get('method', 'GET')).upper(), 'url': str(case.get('url', '')), 'parameters': list(case.get('parameters', [])), 'priority_score': case.get('priority_score'), 'adaptive_budget': bool(case.get('adaptive_budget')), 'adaptive_budget_evidence': list(case.get('adaptive_budget_evidence', []))} for case in cases]
+            selection_summary[name][spec.name] = [{'method': str(case.get('method', 'GET')).upper(), 'url': str(case.get('url', '')), 'parameters': list(case.get('parameters', [])), 'data': str(case.get('data') or ''), 'priority_score': case.get('priority_score'), 'adaptive_budget': bool(case.get('adaptive_budget')), 'adaptive_budget_evidence': list(case.get('adaptive_budget_evidence', []))} for case in cases]
             budget = shared.specialist_budget_diagnostics(spec.name, cases)
             budget_detail = f"base={budget['base']}; adaptive={budget['adaptive_used']}; adaptive max={budget['adaptive_max']}"
             if spec.name == 'traversal':
@@ -1016,6 +1316,132 @@ def _reconcile_deterministic_browser_result(results: dict[str, dict[str, Any]], 
             finding.update(verification_status='browser-not-reproduced-bounded', confidence='low', browser_final_verification='not_reproduced', browser_confidence_ceiling='low', browser_verification_evidence=f"Chromium completed an exact-parameter bounded check for {parameter or 'the source parameter'} without marker execution or reflection.")
 
 # Rechecks unresolved scanner-produced XSS candidates with Chromium before deterministic reporting.
+# One bounded late pass handles NEW browser/workflow-discovered contracts.
+# It does not re-run the original parameter stage or send unsafe actions.
+async def deterministic_incremental_node(state: DeterministicState) -> dict[str, Any]:
+    target = state['target']
+    mode = str(shared.CURRENT_SCAN_MODE or 'balanced').lower()
+    allowance = {'test': 0, 'fast': 90, 'balanced': 300, 'deep': 600}.get(mode, 300)
+    limit = {'test': 0, 'fast': 16, 'balanced': 48, 'deep': 80}.get(mode, 48)
+    audit = {'budget_seconds': allowance, 'selected': 0, 'attempted': 0,
+             'deferred': 0, 'success': 0, 'partial': 0, 'skipped': 0, 'error': 0, 'actions': []}
+    if not allowance:
+        return {'incremental_coverage_audit': audit}
+    deadline = time.monotonic() + allowance
+    results = state['results']
+    summary = state.get('parameter_selection_summary') or {}
+    seen: dict[str, set[tuple[Any, ...]]] = {}
+    queue: list[tuple[str, ToolSpec, dict[str, Any], dict[str, Any]]] = []
+    for profile in state['profiles']:
+        name, cookies = profile['name'], str(profile.get('cookies') or '')
+        prior = set()
+        for spec in PARAMETER_TOOLS:
+            for case in summary.get(name, {}).get(spec.name, []):
+                prior.add(_case_identity(spec.name, case))
+        for _, row in iter_leaf_results(results.get(name, {})):
+            action = row.get('coverage_action') if isinstance(row, dict) else None
+            if isinstance(action, dict) and action.get('tool'):
+                prior.add(_case_identity(str(action['tool']), {**action, 'url': action.get('target_url', '')}))
+        seen[name] = prior
+        found = state['discovery'][name]
+        for spec in PARAMETER_TOOLS:
+            try:
+                cases = select_tool_request_cases(found, spec.name,
+                    authenticated_profile=bool(cookies), allow_state_changes=False,
+                    credential_cookies=cookies, agentic_catalog=True)
+            except Exception as exc:
+                state.setdefault('diagnostics', []).append({'phase': 'incremental_catalog',
+                    'profile': name, 'tool': spec.name, 'error': type(exc).__name__})
+                continue
+            for case in cases:
+                key = _case_identity(spec.name, case)
+                if (key in prior or not _safe_discovery_case(target, case)
+                        or shared.tool_case_hard_skip_reason(spec.name, case)
+                        or _application_auth_rejected(profile, found, str(case.get('url') or ''))):
+                    continue
+                # A POST with unproven read-only behavior never enters an extra pass.
+                if str(case.get('method') or 'GET').upper() != 'GET':
+                    continue
+                prior.add(key)
+                queue.append((name, spec, case, profile))
+    # Least-covered family first; alternating profiles and tools avoids monopolies.
+    families: Counter[str] = Counter()
+    for name, tool_runs in results.items():
+        for _, row in iter_leaf_results(tool_runs):
+            if not isinstance(row, dict) or row.get('status') != 'success':
+                continue
+            action = row.get('coverage_action')
+            if isinstance(action, dict) and action.get('target_url'):
+                u = urlparse(str(action['target_url']))
+                families[f'{u.netloc}/{(u.path.strip("/").split("/") or [""])[0]}'] += 1
+    def family(row: tuple[str, ToolSpec, dict[str, Any], dict[str, Any]]) -> str:
+        u = urlparse(str(row[2].get('url') or ''))
+        return f'{u.netloc}/{(u.path.strip("/").split("/") or [""])[0]}'
+    # Hard cap by group, then prefer least-covered families and least-used
+    # scanners/profiles as the queue evolves. No fixed round count is needed.
+    quota: Counter[tuple[str, str]] = Counter()
+    queued = len(queue)
+    group_cap = max(1, limit // max(1, len(state['profiles']) * len(PARAMETER_TOOLS)))
+    while queue and audit['attempted'] < limit and deadline - time.monotonic() >= 3:
+        candidates = [row for row in queue if quota[(row[0], row[1].name)] < group_cap]
+        if not candidates:
+            break
+        name, spec, case, profile = min(candidates, key=lambda row: (
+            quota[(row[0], row[1].name)], families[family(row)], row[0], row[1].name,
+            str(row[2].get('url') or '')))
+        queue.remove((name, spec, case, profile))
+        group = (name, spec.name)
+        url = str(case.get('url') or '')
+        t0 = time.monotonic()
+        invoked = False
+        cookies = str(profile.get('cookies') or '')
+        try:
+            refresh = (await asyncio.to_thread(refresh_authenticated_session_state,
+                url, cookies, shared.select_application_session_probe_url(state['discovery'][name], url,
+                str(case.get('source_url') or '')), allow_state_changes=False, deadline=deadline)) if cookies else {'usable': True, 'credential_applied': False}
+            remaining = min(PARAMETER_TOOL_TIMEOUTS.get(spec.name, 120), deadline - time.monotonic())
+            if refresh.get('usable') is False or (cookies and not refresh.get('credential_applied')) or remaining < 2:
+                result = make_skipped_result(spec.name, url, 'Residual budget or authenticated session unavailable.')
+            else:
+                effective = str(refresh.get('effective_cookie_header') or '') or cookies
+                arguments = build_tool_arguments(spec.name, url, effective, state['discovery'][name],
+                    case=case, allow_state_changes=False, timeout_override=max(1, int(remaining) - 1))
+                if cookies and spec.name in {'sqlmap','dalfox','commix','traversal'}:
+                    arguments['session_prevalidated'] = True
+                invoked = True
+                result = await call_mcp_with_progress(spec, arguments,
+                    timeout_seconds=remaining, hard_timeout_seconds=remaining)
+            result['session_state_refresh'] = refresh
+        except Exception as exc:
+            result = {'tool': spec.name, 'target': url, 'status': 'error',
+                      'vulnerabilities': [], 'remote_action_state_uncertain': invoked}
+            state.setdefault('diagnostics', []).append({'phase': 'incremental', 'profile': name,
+                'error': type(exc).__name__})
+        _tag_coverage_action(result, spec.name, target_url=url, method=case.get('method','GET'),
+            parameters=list(case.get('parameters', [])), source_url=str(case.get('source_url') or ''),
+            data=str(case.get('data') or ''))
+        index = f'{spec.name}_incremental'
+        prior_result = results[name].get(index)
+        results[name][index] = aggregate_runs(spec.name, target,
+            ([prior_result] if prior_result else []) + [result])
+        log_result(name, spec.name, result, url)
+        audit['attempted'] += int(invoked)
+        audit[result.get('status') if result.get('status') in {'success', 'partial', 'skipped', 'error'} else 'error'] += 1
+        audit['actions'].append({'profile': name, 'tool': spec.name,
+            'status': result.get('status'), 'method': case.get('method', 'GET'),
+            'identity': sha256(repr(_case_identity(spec.name, case)).encode('utf-8')).hexdigest()})
+        quota[group] = quota.get(group, 0) + 1
+        if result.get('status') == 'success':
+            families[family((name, spec, case, profile))] += 1
+        if result.get('remote_action_state_uncertain') or result.get('remote_scan_unconfirmed_active'):
+            audit['remote_uncertain_stop'] = True
+            break
+    audit['selected'] = queued
+    audit['deferred'] = max(0, queued - sum(quota.values()))
+    return {'results': results, 'diagnostics': state.get('diagnostics', []),
+            'incremental_coverage_audit': audit}
+
+
 async def deterministic_verification_node(state: DeterministicState) -> dict[str, Any]:
     target = state['target']
     rows = _final_browser_verification_cases(state)
@@ -1203,6 +1629,8 @@ async def deterministic_report_node(state: DeterministicState) -> dict[str, Any]
         'parameter_tool_timeouts': PARAMETER_TOOL_TIMEOUTS,
         'broad_scanner_timeouts': BROAD_SCANNER_TIMEOUTS,
         'scan_mode': shared.CURRENT_SCAN_MODE,
+        'deterministic_cross_discovery': state.get('cross_discovery_audit', {}),
+        'deterministic_incremental_coverage': state.get('incremental_coverage_audit', {}),
         'request_rate_policy': shared.runtime_request_rate_policy(),
         'allow_same_host_ports': shared.ALLOW_SAME_HOST_PORTS,
         'discover_same_host_services': shared.DISCOVER_SAME_HOST_SERVICES,
@@ -1210,7 +1638,7 @@ async def deterministic_report_node(state: DeterministicState) -> dict[str, Any]
         'redirect_scope_policy': ('active scanners use explicit-origin authorization; same-host multi-port expansion is ' + ('enabled (exact hostname, HTTP/HTTPS services across authorized ports)' if shared.ALLOW_SAME_HOST_PORTS else 'disabled') + '; sensitive HTTP helpers stay same-origin, while project discovery follows bounded redirects only across destinations authorized before the run; external scanner processes do not autonomously follow redirects, so tool-internal redirect-dependent behavior is intentionally conservative; ZAP adds an exact-origin context plus in-scope-only active scans and Protected mode; browser authentication may traverse an external IdP without authorizing it for active testing'),
         'damage_recovery_policy': 'Confirmed findings retain scanner evidence and receive conservative consequence and recovery/restoration guidance when the originating tool does not provide it. Potential damage is never reported as observed damage without supporting evidence.',
         'assessment_execution_seconds': round(max(0.0, time.monotonic() - float(state.get('assessment_started_monotonic') or time.monotonic())), 3)}
-    context['orchestration'] = {'engine': 'langgraph', 'mode': 'deterministic', 'nodes': ['discovery', 'broad_scan', 'parameter_scan', 'authorization', 'browser_workflow', 'special_checks', 'verification', 'report']}
+    context['orchestration'] = {'engine': 'langgraph', 'mode': 'deterministic', 'nodes': ['discovery', 'cross_discovery', 'broad_scan', 'parameter_scan', 'authorization', 'browser_workflow', 'special_checks', 'incremental_coverage', 'verification', 'report']}
     print('\n[*] Generazione report...')
     output_name = str(os.environ.get('SECOPS_REPORT_RUN_ID') or f'SecOps_Assessment_{datetime.now():%Y%m%d_%H%M%S_%f}_{os.getpid()}_{uuid.uuid4().hex[:8]}')
     report = await call_mcp('reporting/reportServer.py', 'generate_report', {'findings_summary': results, 'target_url': target, 'output_name': output_name, 'assessment_context': context})
@@ -1345,20 +1773,24 @@ def build_deterministic_graph() -> Any:
     from langgraph.graph import END, START, StateGraph
     graph = StateGraph(DeterministicState)
     graph.add_node("discovery", deterministic_discovery_node)
+    graph.add_node("cross_discovery", deterministic_cross_discovery_node)
     graph.add_node("broad_scan", deterministic_broad_scan_node)
     graph.add_node("parameter_scan", deterministic_parameter_scan_node)
     graph.add_node("authorization", deterministic_authorization_node)
     graph.add_node("browser_workflow", deterministic_browser_workflow_node)
     graph.add_node("special_checks", deterministic_special_checks_node)
+    graph.add_node("incremental_coverage", deterministic_incremental_node)
     graph.add_node("verification", deterministic_verification_node)
     graph.add_node("report", deterministic_report_node)
     graph.add_edge(START, "discovery")
-    graph.add_edge("discovery", "broad_scan")
+    graph.add_edge("discovery", "cross_discovery")
+    graph.add_edge("cross_discovery", "broad_scan")
     graph.add_edge("broad_scan", "parameter_scan")
     graph.add_edge("parameter_scan", "authorization")
     graph.add_edge("authorization", "browser_workflow")
     graph.add_edge("browser_workflow", "special_checks")
-    graph.add_edge("special_checks", "verification")
+    graph.add_edge("special_checks", "incremental_coverage")
+    graph.add_edge("incremental_coverage", "verification")
     graph.add_edge("verification", "report")
     graph.add_edge("report", END)
     return graph.compile()

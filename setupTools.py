@@ -58,7 +58,7 @@ SQLMAP_API_REQUIRED_FLAGS = ('-s', '-H', '-p', '--username', '--password')
 SQLMAP_SCAN_REQUIRED_FLAGS = (
     '--url', '--batch', '--level', '--risk', '--technique', '--time-sec', '--timeout', '--retries',
     '--threads', '--delay', '--flush-session', '--skip-waf', '--drop-set-cookie', '--time-limit',
-    '--ignore-redirects', '--method', '--data', '--cookie', '-p',
+    '--ignore-redirects', '-X', '--data', '--cookie', '-p',
 )
 COMMIX_REQUIRED_FLAGS = ('--url', '--batch', '--ignore-session', '--disable-coloring', '--ignore-redirects', '--level', '--timeout', '--retries', '--drop-set-cookie', '--time-limit', '--delay', '--threads', '--technique', '--data', '-p', '--cookie')
 FFUF_REQUIRED_FLAGS = ('-u', '-w', '-of', '-o', '-ac', '-t', '-rate', '-timeout', '-maxtime', '-noninteractive', '-b')
@@ -1109,7 +1109,7 @@ def _commix_delay_contract(commix_script: Path) -> dict[str, Any]:
 
 def _validate_cli_contract(name: str, command: list[str], required_flags: tuple[str, ...], *, accepted_codes: tuple[int, ...]=(0, 1, 2)) -> dict[str, Any]:
     result = run(command, required=False, capture=True, show_output=False, timeout=90)
-    help_text = _process_output(result, 20000)
+    help_text = _process_output(result)
     missing = [flag for flag in required_flags if not _help_has_flag(help_text, flag)]
     if result.returncode not in accepted_codes or missing:
         raise RuntimeError(
@@ -1133,13 +1133,13 @@ def validate_scanner_cli_contracts() -> dict[str, Any]:
         # initialization catches stale/incompatible managed checkouts before an assessment can
         # spend hours only to fail on an unknown option/REST field.
         results['sqlmap-scan'] = _validate_cli_contract(
-            'SQLMap scanner', [sys.executable, str(sqlmap_scan), '-hh'],
+            'SQLMap scanner', [sys.executable, str(sqlmap_scan), '-hh', '--non-interactive'],
             SQLMAP_SCAN_REQUIRED_FLAGS, accepted_codes=(0,),
         )
     commix_script = LOCAL_OPT / 'commix' / 'commix.py'
     if commix_script.is_file():
         results['commix'] = _validate_cli_contract(
-            'Commix', [sys.executable, str(commix_script), '--help'],
+            'Commix', [sys.executable, str(commix_script), '-hh'],
             COMMIX_REQUIRED_FLAGS,
             accepted_codes=(0,),
         )
