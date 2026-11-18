@@ -43,7 +43,7 @@ FASTMCP_VERSION = '3.4.5'
 FASTMCP_REQUIREMENT = f'fastmcp=={FASTMCP_VERSION}'
 LANGGRAPH_REQUIREMENT = 'langgraph==1.2.10'
 COMPATIBILITY_REQUIREMENTS = ('websockets>=15.0.1,<16', 'jsonschema-path>=0.4.5,<0.5.0')
-PYTHON_PACKAGES = (FASTMCP_REQUIREMENT, LANGGRAPH_REQUIREMENT, *COMPATIBILITY_REQUIREMENTS, 'requests>=2.32,<3', 'packaging>=24,<27', 'beautifulsoup4>=4.13,<5', 'zaproxy>=0.5,<0.6', 'PyJWT>=2.10,<3', 'arjun==2.2.7', 'playwright>=1.54,<2')
+PYTHON_PACKAGES = (FASTMCP_REQUIREMENT, LANGGRAPH_REQUIREMENT, *COMPATIBILITY_REQUIREMENTS, 'requests>=2.32,<3', 'beautifulsoup4>=4.13,<5', 'zaproxy>=0.5,<0.6', 'PyJWT>=2.10,<3', 'arjun==2.2.7', 'playwright>=1.54,<2')
 SCANNERS = ('nuclei', 'nikto', 'ffuf', 'dalfox', 'commix', 'sqlmap', 'arjun', 'idor-forge', 'interactsh-client')
 REPOSITORY_TOOLS = {'sqlmap': ('https://github.com/sqlmapproject/sqlmap.git', 'sqlmap.py'), 'commix': ('https://github.com/commixproject/commix.git', 'commix.py')}
 IDOR_FORGE_REPOSITORY = 'https://github.com/errorfiathck/IDOR-Forge.git'
@@ -58,7 +58,7 @@ SQLMAP_API_REQUIRED_FLAGS = ('-s', '-H', '-p', '--username', '--password')
 SQLMAP_SCAN_REQUIRED_FLAGS = (
     '--url', '--batch', '--level', '--risk', '--technique', '--time-sec', '--timeout', '--retries',
     '--threads', '--delay', '--flush-session', '--skip-waf', '--drop-set-cookie', '--time-limit',
-    '--ignore-redirects', '-X', '--data', '--cookie', '-p',
+    '--ignore-redirects', '--method', '--data', '--cookie', '-p',
 )
 COMMIX_REQUIRED_FLAGS = ('--url', '--batch', '--ignore-session', '--disable-coloring', '--ignore-redirects', '--level', '--timeout', '--retries', '--drop-set-cookie', '--time-limit', '--delay', '--threads', '--technique', '--data', '-p', '--cookie')
 FFUF_REQUIRED_FLAGS = ('-u', '-w', '-of', '-o', '-ac', '-t', '-rate', '-timeout', '-maxtime', '-noninteractive', '-b')
