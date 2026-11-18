@@ -43,7 +43,7 @@ FASTMCP_VERSION = '3.4.5'
 FASTMCP_REQUIREMENT = f'fastmcp=={FASTMCP_VERSION}'
 LANGGRAPH_REQUIREMENT = 'langgraph==1.2.10'
 COMPATIBILITY_REQUIREMENTS = ('websockets>=15.0.1,<16', 'jsonschema-path>=0.4.5,<0.5.0')
-PYTHON_PACKAGES = (FASTMCP_REQUIREMENT, LANGGRAPH_REQUIREMENT, *COMPATIBILITY_REQUIREMENTS, 'requests>=2.32,<3', 'beautifulsoup4>=4.13,<5', 'zaproxy>=0.5,<0.6', 'PyJWT>=2.10,<3', 'arjun==2.2.7', 'playwright>=1.54,<2')
+PYTHON_PACKAGES = (FASTMCP_REQUIREMENT, LANGGRAPH_REQUIREMENT, *COMPATIBILITY_REQUIREMENTS, 'requests>=2.32,<3', 'packaging>=24,<27', 'beautifulsoup4>=4.13,<5', 'zaproxy>=0.5,<0.6', 'PyJWT>=2.10,<3', 'arjun==2.2.7', 'playwright>=1.54,<2')
 SCANNERS = ('nuclei', 'nikto', 'ffuf', 'dalfox', 'commix', 'sqlmap', 'arjun', 'idor-forge', 'interactsh-client')
 REPOSITORY_TOOLS = {'sqlmap': ('https://github.com/sqlmapproject/sqlmap.git', 'sqlmap.py'), 'commix': ('https://github.com/commixproject/commix.git', 'commix.py')}
 IDOR_FORGE_REPOSITORY = 'https://github.com/errorfiathck/IDOR-Forge.git'
@@ -287,46 +287,44 @@ def install_playwright_browser(*, required: bool=False) -> bool:
 
 # Clones a Git repository or updates an existing local copy.
 def clone_or_update(url: str, destination: Path) -> None:
-    if not shutil.which('git'):
-        raise RuntimeError('Git is required to install repository-based tools.')
-    if (destination / '.git').is_dir():
-        fetch = run(['git', '-C', str(destination), 'fetch', '--depth', '1', 'origin', 'HEAD'], required=False, capture=True, timeout=600)
-        if fetch.returncode:
-            print(f'[!] Keeping the existing {destination.name} checkout.')
-            return
-        run(['git', '-C', str(destination), 'reset', '--hard', 'FETCH_HEAD'], timeout=120)
+    """Clone when absent; keep installed scanner checkouts immutable during init.
+
+    The previous git reset --hard erased upstream local changes at every startup.
+    An incomplete existing directory is never deleted automatically.
+    """
+    if destination.exists() or destination.is_symlink():
+        if not destination.is_dir() or destination.is_symlink():
+            raise RuntimeError(f'Existing scanner path is not a regular directory: {destination}')
+        print(f'[+] Existing upstream directory retained without git reset: {destination}')
         return
-    shutil.rmtree(destination, ignore_errors=True)
+    if not shutil.which('git'):
+        raise RuntimeError('Git is required to clone a missing repository-based scanner.')
     destination.parent.mkdir(parents=True, exist_ok=True)
-    run(['git', 'clone', '--depth', '1', url, str(destination)], timeout=1200)
+    result = run(['git', 'clone', '--depth', '1', url, str(destination)],
+                 required=False, capture=True, timeout=1200)
+    if result.returncode:
+        raise RuntimeError(
+            f'Clone failed for {destination}; an incomplete checkout may remain and will not be deleted automatically. '
+            + _process_output(result, 1400)
+        )
 
 # Installs a scanner directly from its upstream Git repository.
 def install_repository_tool(name: str, repository: str, script_name: str) -> None:
     destination = LOCAL_OPT / name
     script = destination / script_name
-    external = command_path(name)
-    # SQLMap needs sqlmapapi.py and Commix uses the repository entry script directly. A PATH-only
-    # install is therefore not sufficient proof that the runtime wrapper can find what it needs.
-    # Keep one initializer-managed checkout on every OS and make the launcher point to that checkout.
     if script.is_file():
-        # Managed repository tools are expected to be refreshed when initScript verifies scanners.
-        # The old early-return left SQLMap/Commix indefinitely stale, so a wrapper could correctly
-        # validate a newer option contract in source while the VM kept an older checkout forever.
-        # clone_or_update is fail-safe: a fetch failure keeps the existing checkout, after which the
-        # explicit CLI/API contract validation below decides whether that checkout is usable.
-        if (destination / '.git').is_dir():
-            clone_or_update(repository, destination)
-        else:
-            print(f'[+] {name} managed script exists without Git metadata; validating existing runtime: {script}')
+        print(f'[+] {name} installed checkout retained; no automatic upstream reset: {script}')
+    else:
+        if destination.exists():
+            raise RuntimeError(
+                f'{name} managed checkout is incomplete at {destination}; preserving files. '
+                'Repair this repository explicitly rather than silently deleting it.'
+            )
+        if command_path(name):
+            print(f'[+] {name} exists on PATH, but the MCP wrapper requires its managed script; cloning it.')
+        clone_or_update(repository, destination)
         if not script.is_file():
-            raise RuntimeError(f'Missing {script_name} after refreshing {name}.')
-        write_launcher(name, [sys.executable, str(script)])
-        return
-    if external:
-        print(f'[+] {name} exists on PATH at {external}, but the SecOps wrapper requires its managed repository script; installing {destination}.')
-    clone_or_update(repository, destination)
-    if not script.is_file():
-        raise RuntimeError(f'Missing {script_name} after cloning {name}.')
+            raise RuntimeError(f'Missing {script_name} after cloning {name}.')
     write_launcher(name, [sys.executable, str(script)])
 
 # Reads the Python requirements needed by the upstream IDOR-Forge project.
@@ -364,6 +362,37 @@ def _idor_forge_runtime_requirements(requirements: Path) -> list[str]:
         packages.append('matplotlib>=3.10,<4' if sys.version_info >= (3, 13) else 'matplotlib>=3.8,<4')
     return packages
 
+# Probe installed distributions inside the isolated IDOR-Forge interpreter without
+# importing or altering its packages. Only missing/incompatible requirements are installed.
+def _idor_forge_missing_requirements(venv_python: Path, requirements: list[str]) -> list[str]:
+    names = list(dict.fromkeys(Requirement(raw).name for raw in requirements))
+    script = (
+        'import importlib.metadata as m, json, sys; '
+        'names=json.loads(sys.argv[1]); '
+        'available={str(d.metadata.get("Name") or "").lower().replace("_", "-"): d.version for d in m.distributions()}; '
+        'print(json.dumps({name: available.get(name.lower().replace("_", "-")) for name in names}))'
+    )
+    result = run([str(venv_python), '-c', script, json.dumps(names)],
+                 required=False, capture=True, show_output=False, timeout=120)
+    if result.returncode:
+        raise RuntimeError(
+            'IDOR-Forge venv dependency metadata check failed (venv preserved): '
+            + _process_output(result, 1600)
+        )
+    try:
+        installed = json.loads((result.stdout or '').strip())
+    except (ValueError, TypeError) as exc:
+        raise RuntimeError('IDOR-Forge venv returned invalid dependency metadata.') from exc
+    missing = []
+    for raw in requirements:
+        req = Requirement(raw)
+        if req.marker is not None and not req.marker.evaluate():
+            continue
+        version = installed.get(req.name)
+        if not version or (req.specifier and version not in req.specifier):
+            missing.append(raw)
+    return missing
+
 # Runs the IDOR-Forge API/dependency contract inside its isolated interpreter.
 def _probe_idor_forge_runtime(venv_python: Path) -> subprocess.CompletedProcess[str]:
     return run(
@@ -376,44 +405,55 @@ def _probe_idor_forge_runtime(venv_python: Path) -> subprocess.CompletedProcess[
 # Installs the upstream IDOR-Forge project and creates its launcher. A stale/corrupted isolated
 # environment is rebuilt once during setup; assessments themselves never mutate scanner runtimes.
 def install_idor_forge() -> dict[str, Any]:
+    """Use IDOR-Forge's own Python; repair only missing deps, preserve failed venv."""
     global _IDOR_FORGE_STATE
-    clone_or_update(IDOR_FORGE_REPOSITORY, IDOR_FORGE_DIR)
     entrypoint = IDOR_FORGE_DIR / 'IDOR-Forge.py'
     checker = IDOR_FORGE_DIR / 'core' / 'IDORChecker.py'
     requirements = IDOR_FORGE_DIR / 'requirements.txt'
-    if not entrypoint.is_file() or not checker.is_file() or (not requirements.is_file()):
-        raise RuntimeError('The IDOR-Forge checkout is incomplete.')
+    if not (entrypoint.is_file() and checker.is_file() and requirements.is_file()):
+        if IDOR_FORGE_DIR.exists():
+            raise RuntimeError(
+                'Existing IDOR-Forge checkout is incomplete; files preserved at ' + str(IDOR_FORGE_DIR)
+            )
+        clone_or_update(IDOR_FORGE_REPOSITORY, IDOR_FORGE_DIR)
+        if not (entrypoint.is_file() and checker.is_file() and requirements.is_file()):
+            raise RuntimeError('New IDOR-Forge checkout is incomplete; manual diagnosis required.')
+    else:
+        print('[+] IDOR-Forge repository retained; no automatic git reset.')
     venv_dir = IDOR_FORGE_DIR / '.venv'
     venv_python = venv_dir / ('Scripts/python.exe' if os.name == 'nt' else 'bin/python')
+    if not (venv_dir / 'pyvenv.cfg').is_file() and venv_dir.exists():
+        raise RuntimeError('IDOR-Forge venv directory is missing pyvenv.cfg; refusing to use a system Python disguised as a venv.')
+    if not venv_python.is_file():
+        if venv_dir.exists():
+            raise RuntimeError(
+                'IDOR-Forge venv exists but its Python executable is missing; refusing to overwrite: '
+                + str(venv_dir)
+            )
+        run([sys.executable, '-m', 'venv', str(venv_dir)], timeout=1200)
+    if not (venv_dir / 'pyvenv.cfg').is_file():
+        raise RuntimeError('IDOR-Forge virtual environment could not be created (missing pyvenv.cfg).')
     runtime_requirements = _idor_forge_runtime_requirements(requirements)
-
-    def install_runtime() -> None:
-        if not venv_python.is_file():
-            run([sys.executable, '-m', 'venv', str(venv_dir)], timeout=1200)
-        print('[*] IDOR-Forge runtime dependencies: ' + ', '.join(runtime_requirements))
-        # Upgrade pip in the isolated environment first so Python 3.13 wheels are resolved reliably.
-        run([str(venv_python), '-m', 'pip', 'install', '--disable-pip-version-check', '--upgrade', 'pip'], timeout=1200, cwd=IDOR_FORGE_DIR)
-        run([str(venv_python), '-m', 'pip', 'install', '--disable-pip-version-check', '--upgrade', *runtime_requirements], timeout=3600, cwd=IDOR_FORGE_DIR)
-
-    install_runtime()
+    missing = _idor_forge_missing_requirements(venv_python, runtime_requirements)
+    if missing:
+        print('[*] Installing only missing/incompatible IDOR-Forge venv dependencies: ' + ', '.join(missing))
+        run([str(venv_python), '-m', 'pip', 'install', '--disable-pip-version-check',
+             *missing], timeout=3600, cwd=IDOR_FORGE_DIR)
+    else:
+        print('[+] IDOR-Forge venv requirements satisfied; no pip update.')
     probe = _probe_idor_forge_runtime(venv_python)
     if probe.returncode:
-        detail = '\n'.join(filter(None, ((probe.stdout or '').strip(), (probe.stderr or '').strip())))
-        print('[!] IDOR-Forge isolated runtime failed its post-install probe; rebuilding the venv once.\n' + detail[-1800:])
-        try:
-            shutil.rmtree(venv_dir)
-        except OSError as exc:
-            raise RuntimeError(f'Unable to rebuild stale IDOR-Forge environment {venv_dir}: {exc}') from exc
-        install_runtime()
-        probe = _probe_idor_forge_runtime(venv_python)
-    if probe.returncode:
-        detail = '\n'.join(filter(None, ((probe.stdout or '').strip(), (probe.stderr or '').strip())))
-        raise RuntimeError('IDOR-Forge dependency preflight still fails after one clean venv rebuild.\n' + detail[-2500:])
+        raise RuntimeError(
+            'IDOR-Forge API/runtime check failed. Original repository and venv retained for diagnosis.\n'
+            + _process_output(probe, 2500)
+        )
     launcher = write_launcher('idor-forge', [str(venv_python), str(entrypoint)])
-    # Keep the virtual-environment executable path itself.  On POSIX, ``.venv/bin/python`` is
-    # commonly a symlink to the system interpreter; resolving that symlink would discard the venv
-    # context and make later preflight checks import packages from the system environment instead.
-    _IDOR_FORGE_STATE = {'repository': IDOR_FORGE_REPOSITORY, 'directory': str(IDOR_FORGE_DIR.resolve()), 'entrypoint': str(entrypoint.resolve()), 'checker': str(checker.resolve()), 'python': str(venv_python.absolute()), 'launcher': str(launcher.resolve()), 'preflight': 'ok'}
+    _IDOR_FORGE_STATE = {
+        'repository': IDOR_FORGE_REPOSITORY, 'directory': str(IDOR_FORGE_DIR.resolve()),
+        'entrypoint': str(entrypoint.resolve()), 'checker': str(checker.resolve()),
+        'python': str(venv_python.absolute()), 'launcher': str(launcher.resolve()),
+        'preflight': 'ok',
+    }
     print(f'[+] IDOR-Forge upstream runtime ready: {IDOR_FORGE_DIR}')
     print(f'[+] IDOR-Forge isolated interpreter: {_IDOR_FORGE_STATE["python"]}')
     return dict(_IDOR_FORGE_STATE)
@@ -936,6 +976,17 @@ def ensure_nuclei_engine_current() -> dict[str, Any]:
         try:
             before = run([executable, '-version'], required=False, capture=True, show_output=False, timeout=60)
             if before.returncode == 0:
+                if (_nuclei_version_supported(_process_output(before, 1000))
+                        and os.environ.get('SECOPS_REFRESH_SCANNERS', '').strip() != '1'):
+                    _NUCLEI_ENGINE_STATE = {
+                        'execution_mode': 'native', 'executable': executable,
+                        'launcher': executable, 'docker_image': '', 'update_returncode': 0,
+                        'version_before': _process_output(before, 1000),
+                        'version_after': _process_output(before, 1000),
+                        'update_output_excerpt': 'Compatible native engine already installed; update skipped.',
+                    }
+                    print('[+] Nuclei native engine already compatible; no self-update.')
+                    return dict(_NUCLEI_ENGINE_STATE)
                 update = run([executable, '-update'], required=False, capture=True, timeout=NUCLEI_TEMPLATE_UPDATE_TIMEOUT)
                 after = run([executable, '-version'], required=False, capture=True, show_output=False, timeout=60)
                 if after.returncode == 0 and _nuclei_version_supported(_process_output(after, 1000)):
@@ -975,6 +1026,21 @@ def ensure_nuclei_templates() -> dict[str, Any]:
     update_returncode = 0
     combined = ''
     fallback_used = False
+    current_best = _best_nuclei_template_directory()
+    current_dast = _nuclei_dast_template_count(current_best)
+    if (filesystem_before >= NUCLEI_TEMPLATE_MINIMUM and current_dast > 0
+            and os.environ.get('SECOPS_REFRESH_SCANNERS', '').strip() != '1'):
+        print(f'[+] Nuclei template inventory sufficient: {filesystem_before}; DAST={current_dast}; refresh skipped.')
+        _NUCLEI_TEMPLATE_STATE = {
+            'count': filesystem_before, 'dast_count': current_dast,
+            'count_before_update': filesystem_before, 'minimum_expected': NUCLEI_TEMPLATE_MINIMUM,
+            'sufficient': True, 'update_returncode': 0,
+            'update_output_excerpt': 'Existing template inventory verified; update skipped.',
+            'fallback_used': False, 'inventory_source': 'filesystem',
+            'directory': current_best, 'directories': directories_before,
+            'filesystem_candidates': _filesystem_nuclei_template_inventory(),
+        }
+        return dict(_NUCLEI_TEMPLATE_STATE)
     if mode == 'native':
         if not executable:
             raise RuntimeError('Nuclei native executable is unavailable; templates cannot be updated.')
@@ -1168,7 +1234,7 @@ def validate_scanner_cli_contracts() -> dict[str, Any]:
         dalfox_version = _dalfox_version_tuple(_process_output(version_probe, 1000))
         scan = run([dalfox, 'scan', '--help'], required=False, capture=True, show_output=False, timeout=90)
         legacy = run([dalfox, 'url', '--help'], required=False, capture=True, show_output=False, timeout=90)
-        scan_help, legacy_help = _process_output(scan, 16000), _process_output(legacy, 16000)
+        scan_help, legacy_help = _process_output(scan), _process_output(legacy)
         v3_required = DALFOX_V3_REQUIRED_FLAGS
         v3_worker_ok = _help_has_flag(scan_help, '--workers') or _help_has_flag(scan_help, '--worker')
         v3_rate_flag = next((flag for flag in ('--rate-limit', '--rl', '-r') if _help_has_flag(scan_help, flag)), '')
@@ -1389,11 +1455,29 @@ def write_runtime_config(status: dict[str, str | None]) -> None:
             status_directories.append(str(path.parent))
     directories = configure_path() + status_directories
     payload = {'schema_version': 4, 'generated_at': datetime.now(timezone.utc).isoformat(), 'project_root': str(ROOT), 'python_executable': sys.executable, 'platform': platform.platform(), 'machine': platform.machine(), 'tool_directories': list(dict.fromkeys(directories)), 'executables': status, 'idor_forge': dict(_IDOR_FORGE_STATE) if _IDOR_FORGE_STATE else {'repository': IDOR_FORGE_REPOSITORY, 'directory': str(IDOR_FORGE_DIR), 'python': str(IDOR_FORGE_DIR / '.venv' / ('Scripts/python.exe' if os.name == 'nt' else 'bin/python'))}, 'mcp_transport': 'streamable_http', 'mcp_http': {'host': '127.0.0.1', 'path': '/mcp', 'services': {name: mcp_http_url(name) for name in MCP_SERVER_PORTS}}, 'playwright_chromium': {'ready': _playwright_chromium_ready()[0], 'interpreter': sys.executable}, 'nikto_perl': str(Path(find_perl()).resolve()) if find_perl() else '', 'nikto_script': str((LOCAL_OPT / 'nikto' / 'program' / 'nikto.pl').resolve()), 'nikto_image': NIKTO_DOCKER_IMAGE, 'nikto_execution_mode': 'docker_official_image' if _docker_image_ready(NIKTO_DOCKER_IMAGE) else 'native_perl', 'nuclei_image': NUCLEI_DOCKER_IMAGE if _NUCLEI_ENGINE_STATE.get('execution_mode') == 'docker_official_image' else '', 'nuclei_execution_mode': str(_NUCLEI_ENGINE_STATE.get('execution_mode') or 'native'), 'nuclei_engine': dict(_NUCLEI_ENGINE_STATE), 'report_docker_image': REPORT_DOCKER_IMAGE if _docker_image_ready(REPORT_DOCKER_IMAGE) else '', 'report_docker_source_image': REPORT_DOCKER_SOURCE_IMAGE, 'report_execution_mode': 'docker_registry_alias' if _docker_image_ready(REPORT_DOCKER_IMAGE) else 'native_weasyprint', 'nuclei_templates': dict(_NUCLEI_TEMPLATE_STATE) if _NUCLEI_TEMPLATE_STATE else {'count': _filesystem_nuclei_template_count()[0], 'directory': _best_nuclei_template_directory(), 'directories': _filesystem_nuclei_template_count()[1], 'filesystem_candidates': _filesystem_nuclei_template_inventory(), 'minimum_expected': NUCLEI_TEMPLATE_MINIMUM}}
+    # A scanner-only initialization must not discard a previously validated lab
+    # cookie or per-origin target metadata. --with-lab refreshes these afterward.
+    if RUNTIME_FILE.is_file():
+        try:
+            previous = json.loads(RUNTIME_FILE.read_text(encoding='utf-8'))
+        except (OSError, ValueError):
+            previous = {}
+        if isinstance(previous, dict):
+            for auth_key in ('last_auth_target', 'last_auth_cookie',
+                             'last_auth_generated_at', 'target_profiles'):
+                if auth_key in previous:
+                    payload[auth_key] = previous[auth_key]
     atomic_write_text(RUNTIME_FILE, json.dumps(payload, indent=2, ensure_ascii=False))
     print(f'[+] Runtime scanner configuration written: {RUNTIME_FILE}')
 
 # FFUF setup writes the bundled fallback wordlist only when no project copy exists.
 def create_wordlist() -> None:
     WORDLISTS_DIR.mkdir(parents=True, exist_ok=True)
+    destination = WORDLISTS_DIR / 'common.txt'
+    if destination.is_file():
+        print(f'[+] Existing SecOps wordlist preserved: {destination}')
+        return
+    if destination.exists() or destination.is_symlink():
+        raise RuntimeError('Cannot create fallback wordlist over a non-file/symlink: ' + str(destination))
     words = 'admin api assets backup config debug docs images index.php js login.php robots.txt server-status uploads vulnerabilities .env .git'.split()
-    (WORDLISTS_DIR / 'common.txt').write_text('\n'.join(words) + '\n', encoding='utf-8')
+    destination.write_text('\n'.join(words) + '\n', encoding='utf-8')

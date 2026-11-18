@@ -9,6 +9,59 @@ import subprocess
 import sys
 from pathlib import Path
 
+# Minimal setup bootstrap. setupLab/setupTools import requests and packaging BEFORE
+# install_python_packages() is called, so resolve only these two dependencies first.
+# Do not install packages into the system interpreter or change a working venv.
+def _bootstrap_import_dependencies() -> None:
+    import importlib
+    import importlib.metadata
+    import re
+
+    required = (
+        ('requests', 'requests>=2.32,<3', (2, 32), (3,)),
+        ('packaging', 'packaging>=24,<27', (24,), (27,)),
+    )
+    missing = []
+    for module, requirement, minimum, exclusive_maximum in required:
+        try:
+            installed = importlib.metadata.version(module)
+            match = re.match(r'^(\d+(?:\.\d+)*)', installed)
+            if not match:
+                missing.append(requirement)
+                continue
+            version = tuple(int(piece) for piece in match.group(1).split('.'))
+            if version < minimum or version >= exclusive_maximum:
+                missing.append(requirement)
+                continue
+            importlib.import_module(module)
+        except (importlib.metadata.PackageNotFoundError, ImportError):
+            missing.append(requirement)
+    if not missing:
+        return
+    if sys.prefix == getattr(sys, 'base_prefix', sys.prefix):
+        raise RuntimeError(
+            'Bootstrap dependencies missing/incompatible: ' + ', '.join(missing)
+            + '. Run initScript.py with the project .venv Python; refusing system pip.'
+        )
+    command = [sys.executable, '-m', 'pip', 'install', '--disable-pip-version-check', *missing]
+    print('[*] Installing missing bootstrap dependencies only: ' + ', '.join(missing))
+    try:
+        result = subprocess.run(command, check=False, text=True, capture_output=True, timeout=900)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise RuntimeError(f'Bootstrap pip did not complete: {exc}') from exc
+    if result.returncode:
+        raise RuntimeError('Bootstrap pip failed: ' + (result.stderr or result.stdout or '')[-2500:])
+    # Check in a clean interpreter: in-process packages may have been loaded by
+    # third-party tooling before a repair, and should not be trusted after upgrade.
+    validation = subprocess.run(
+        [sys.executable, '-c', 'import requests, packaging; from packaging.requirements import Requirement; print("Bootstrap OK")'],
+        capture_output=True, text=True, check=False, timeout=60,
+    )
+    if validation.returncode:
+        raise RuntimeError('Bootstrap verification failed: ' + (validation.stderr or '')[-1800:])
+
+_bootstrap_import_dependencies()
+
 from setupLab import setup_local_lab, update_runtime_auth
 from assessmentConfig import default_max_rounds
 from setupTools import (
@@ -19,7 +72,7 @@ from setupTools import (
 from utils import atomic_write_text, setup_path
 
 UNIFIED_MCP_SERVER = ROOT / "servers" / "secopsServer.py"
-LINUX_BASE_PACKAGES = ("perl", "cpanminus", "build-essential")
+LINUX_BASE_PACKAGES = ("perl", "cpanminus", "build-essential", "python3-venv")
 LINUX_REPORT_PACKAGES = ("libpango-1.0-0", "libpangoft2-1.0-0", "libharfbuzz-subset0")
 DEFAULT_AGENTIC_MODEL = "snap4city"
 LOCAL_AI_MODELS = {"llama": "llama3.1:8b", "qwen": "qwen2.5:7b"}
@@ -89,6 +142,7 @@ def _refresh_docker_path() -> str | None:
         program_files = Path(os.environ.get("ProgramFiles", r"C:\Program Files"))
         candidates.extend((
             program_files / "Docker" / "Docker" / "resources" / "bin",
+            Path(os.environ.get("LOCALAPPDATA", str(Path.home() / "AppData" / "Local"))) / "Programs" / "DockerDesktop" / "resources" / "bin",
             program_files / "Docker" / "Docker" / "resources",
         ))
     elif sys.platform == "darwin":
@@ -206,6 +260,52 @@ def ensure_docker_installed() -> str:
     print(f"[+] Docker installed: {docker}")
     return docker
 
+
+# A Docker CLI on PATH does not prove that Docker Desktop's Linux Engine is running.
+# This check is invoked only for the bundled lab, before any scanner modifies state.
+def ensure_docker_engine_ready() -> None:
+    def probe() -> tuple[bool, str]:
+        try:
+            result = subprocess.run(
+                ['docker', 'info', '--format', '{{.ServerVersion}}'],
+                capture_output=True, text=True, timeout=20, check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            return False, str(exc)
+        return (result.returncode == 0 and bool(result.stdout.strip()),
+                (result.stderr or result.stdout or '').strip()[-1400:])
+
+    ready, diagnostic = probe()
+    if ready:
+        print('[+] Docker Engine ready.')
+        return
+    if os.name == 'nt':
+        candidates = (
+            Path(os.environ.get('LOCALAPPDATA', str(Path.home() / 'AppData' / 'Local'))) / 'Programs' / 'DockerDesktop' / 'Docker Desktop.exe',
+            Path(os.environ.get('ProgramFiles', r'C:\Program Files')) / 'Docker' / 'Docker' / 'Docker Desktop.exe',
+        )
+        desktop = next((candidate for candidate in candidates if candidate.is_file()), None)
+        if desktop:
+            print('[*] Docker Desktop is installed but its Linux Engine is offline; launching existing Desktop.')
+            try:
+                subprocess.Popen([str(desktop)], stdin=subprocess.DEVNULL,
+                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                 creationflags=getattr(subprocess, 'CREATE_NEW_PROCESS_GROUP', 0))
+            except OSError as exc:
+                diagnostic = f'Docker Desktop launch failed: {exc}; {diagnostic}'
+            else:
+                import time
+                for _ in range(30):
+                    ready, diagnostic = probe()
+                    if ready:
+                        print('[+] Docker Engine ready after Docker Desktop startup.')
+                        return
+                    time.sleep(2)
+    raise RuntimeError(
+        'Docker CLI found, but Docker Engine is unavailable; DVWA/ZAP cannot start. '
+        'Start Docker Desktop (Linux containers/WSL2), then retry --with-lab. '
+        + diagnostic[-1400:]
+    )
 
 # Fail early when the project source tree is incomplete for the unified MCP architecture.
 def verify_unified_mcp_source() -> None:
@@ -591,6 +691,8 @@ def main() -> int:
         if sys.platform.startswith("linux"):
             ensure_linux_host_prerequisites(include_scanner_packages=not args.skip_scanners)
         ensure_docker_installed()
+        if args.with_lab:
+            ensure_docker_engine_ready()
         print("\n=== SecOps FastMCP initialization ===")
         install_python_packages()
         if not args.skip_browser:
