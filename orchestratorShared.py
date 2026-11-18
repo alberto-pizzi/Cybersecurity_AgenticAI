@@ -122,7 +122,7 @@ def _discovery_progress(phase: str, detail: str = '') -> None:
     utilization = max(0.0, min(999.0, (recent_rate / effective_rate) * 100.0))
     print(
         f"[DISCOVERY PROGRESS] {phase}: aggregate target starts≈{recent_rate:.2f} req/s "
-        f"(configured={MAX_REQUEST_RATE:g}, effective_shared={effective_rate:g}, utilization≈{utilization:.0f}%); "
+        f"(configured={MAX_REQUEST_RATE:g}, effective_shared={effective_rate:g}, utilization~{utilization:.0f}%); "
         f"starts={starts}; throttle_wait={float(stats.get('throttle_sleep_seconds', 0.0) or 0.0):.1f}s{suffix}",
         flush=True,
     )
