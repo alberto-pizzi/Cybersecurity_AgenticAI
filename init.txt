@@ -45,6 +45,10 @@ STEP 2 - ASSESSMENT
     python assessmentRunner.py --config configs/dashboard-test.json \
       --orchestrator agentic --mode balanced --max-rounds 2 --require-ai --dry-run --authorized
 
+  Optional alternative (NO pentest, NOT a step of its own):
+    --report-from-json FILE   rebuilds report + list (HTML/PDF) from an existing JSON
+    python assessmentRunner.py --report-from-json reports/SecOps_Assessment_XXXX.json
+
 
 === REFERENCE (details of the two steps) ===
 
@@ -124,6 +128,15 @@ assessmentRunner.py OPTIONS  (complete list)
   Source (required, exactly one):
   --config FILE                           Multi-asset assessment from JSON.
   --target URL                            Direct HTTP/HTTPS target (alternative to --config).
+  --report-from-json FILE                 Rebuild HTML/PDF report + list reports from an existing JSON, without pentest.
+                                           Accepts <report_id>.json, <report_id>.review.json or Assessment_Results_Data_*.json.
+
+  Report-from-JSON (only with --report-from-json):
+  --output-name NAME                      Base name of the regenerated files (default: <report_id>_from_json).
+  --client-name NAME                      Override the cover-page client name.
+  --assessor NAME                         Override the cover-page assessor name.
+  --assessment-type TYPE                  Override the cover-page assessment type.
+  --report-version VERSION                Override the cover-page report version (default 1.0).
 
   Identity (only with --target):
   --cookies HEADER                        Cookie header of the primary session.
@@ -163,5 +176,13 @@ LOGS AND RESULTS
     python assessmentRunner.py --config configs/dashboard-test.json \
       --orchestrator agentic --mode balanced --max-rounds 2 --require-ai --authorized > "$LOG" 2>&1
     tail -n 300 -F "$LOG"
+
+  Regenerate reports from an existing JSON (no pentest, no target traffic):
+    python assessmentRunner.py --report-from-json reports/SecOps_Assessment_XXXX.json
+    python assessmentRunner.py --report-from-json reports/SecOps_Assessment_XXXX.json \
+      --output-name MyClient_rev2 --client-name "ACME" --assessor "Team" --assessment-type "Web app" --report-version 1.1
+    - Default flow unchanged: without this option the runner runs the pentest and builds the report.
+    - Mutually exclusive with --config/--target; --authorized is NOT required.
+    - Scanner results in these JSON files are already redacted: the regenerated report carries no secrets.
 
   Download: scp debian@<host>:/home/debian/Cybersecurity_AgenticAI/reports/<file> .
