@@ -60,7 +60,28 @@ def _bootstrap_import_dependencies() -> None:
     if validation.returncode:
         raise RuntimeError('Bootstrap verification failed: ' + (validation.stderr or '')[-1800:])
 
-_bootstrap_import_dependencies()
+def _prefer_project_venv_when_launched_directly() -> None:
+    # A bare `python initScript.py` can resolve to WindowsApps' system Python,
+    # which has different Playwright/Arjun/FastMCP versions from the project venv.
+    # Hand control to the existing project interpreter before importing tooling.
+    if __name__ != '__main__' or sys.prefix != getattr(sys, 'base_prefix', sys.prefix):
+        return
+    project = Path(__file__).resolve().parent
+    candidate = project / '.venv' / ('Scripts/python.exe' if os.name == 'nt' else 'bin/python')
+    if not candidate.is_file():
+        return
+    try:
+        if os.path.samefile(sys.executable, candidate):
+            return
+    except OSError:
+        pass
+    print('[*] Using existing SecOps project venv instead of global Python: ' + str(candidate), flush=True)
+    completed = subprocess.run([str(candidate), str(Path(__file__).resolve()), *sys.argv[1:]], check=False)
+    raise SystemExit(completed.returncode)
+
+if __name__ == '__main__':
+    _prefer_project_venv_when_launched_directly()
+    _bootstrap_import_dependencies()
 
 from setupLab import setup_local_lab, update_runtime_auth
 from assessmentConfig import default_max_rounds

@@ -43,7 +43,7 @@ FASTMCP_VERSION = '3.4.5'
 FASTMCP_REQUIREMENT = f'fastmcp=={FASTMCP_VERSION}'
 LANGGRAPH_REQUIREMENT = 'langgraph==1.2.10'
 COMPATIBILITY_REQUIREMENTS = ('websockets>=15.0.1,<16', 'jsonschema-path>=0.4.5,<0.5.0')
-PYTHON_PACKAGES = (FASTMCP_REQUIREMENT, LANGGRAPH_REQUIREMENT, *COMPATIBILITY_REQUIREMENTS, 'requests>=2.32,<3', 'beautifulsoup4>=4.13,<5', 'zaproxy>=0.5,<0.6', 'PyJWT>=2.10,<3', 'arjun==2.2.7', 'playwright>=1.54,<2')
+PYTHON_PACKAGES = (FASTMCP_REQUIREMENT, LANGGRAPH_REQUIREMENT, *COMPATIBILITY_REQUIREMENTS, 'requests>=2.32,<3', 'packaging>=24,<27', 'beautifulsoup4>=4.13,<5', 'zaproxy>=0.5,<0.6', 'PyJWT>=2.10,<3', 'arjun==2.2.7', 'playwright>=1.54,<2')
 SCANNERS = ('nuclei', 'nikto', 'ffuf', 'dalfox', 'commix', 'sqlmap', 'arjun', 'idor-forge', 'interactsh-client')
 REPOSITORY_TOOLS = {'sqlmap': ('https://github.com/sqlmapproject/sqlmap.git', 'sqlmap.py'), 'commix': ('https://github.com/commixproject/commix.git', 'commix.py')}
 IDOR_FORGE_REPOSITORY = 'https://github.com/errorfiathck/IDOR-Forge.git'
@@ -58,7 +58,7 @@ SQLMAP_API_REQUIRED_FLAGS = ('-s', '-H', '-p', '--username', '--password')
 SQLMAP_SCAN_REQUIRED_FLAGS = (
     '--url', '--batch', '--level', '--risk', '--technique', '--time-sec', '--timeout', '--retries',
     '--threads', '--delay', '--flush-session', '--skip-waf', '--drop-set-cookie', '--time-limit',
-    '--ignore-redirects', '--method', '--data', '--cookie', '-p',
+    '--ignore-redirects', '-X', '--data', '--cookie', '-p',
 )
 COMMIX_REQUIRED_FLAGS = ('--url', '--batch', '--ignore-session', '--disable-coloring', '--ignore-redirects', '--level', '--timeout', '--retries', '--drop-set-cookie', '--time-limit', '--delay', '--threads', '--technique', '--data', '-p', '--cookie')
 FFUF_REQUIRED_FLAGS = ('-u', '-w', '-of', '-o', '-ac', '-t', '-rate', '-timeout', '-maxtime', '-noninteractive', '-b')
@@ -66,7 +66,7 @@ INTERACTSH_REQUIRED_FLAGS = ('-n', '-pi', '-json', '-v', '-duc', '-ps', '-psf', 
 DALFOX_V3_REQUIRED_FLAGS = ('--format', '--output', '--param', '--cookies', '--no-color', '--silence', '--method', '--data')
 DALFOX_V2_REQUIRED_FLAGS = ('--method', '--data')
 NUCLEI_REQUIRED_FLAGS = ('-l', '-jsonl', '-silent', '-nc', '-o', '-duc', '-no-stdin', '-c', '-bs', '-pc', '-rl', '-timeout', '-retries', '-dr', '-H', '-dast', '-im', '-fm', '-fa', '-fuzz-param-frequency', '-t', '-severity', '-ni', '-tags', '-etags', '-tl')
-NIKTO_REQUIRED_FLAGS = ('-host', '-nointeractive', '-ask', '-timeout', '-maxtime', '-Pause', '-Format', '-output', '-Tuning', '-Plugins', '-Display', '-Cgidirs', '-Option', '-nocookies')
+NIKTO_REQUIRED_FLAGS = ('-host', '-nointeractive', '-ask', '-timeout', '-maxtime', '-Pause', '-Format', '-output', '-Tuning', '-Plugins', '-Display', '-Cgidirs', '-Option')
 
 # Setup commands use one wrapper so timeouts and process failures produce consistent errors.
 def run(command: list[str], *, required: bool=True, capture: bool=False, show_output: bool=True, timeout: int=3600, cwd: Path | None=None, env_overrides: dict[str, str] | None=None) -> subprocess.CompletedProcess[str]:
@@ -1182,7 +1182,20 @@ def _validate_cli_contract(name: str, command: list[str], required_flags: tuple[
             f"{name} CLI contract validation failed; missing flags: {', '.join(missing) if missing else 'none'}\n"
             + help_text[-3000:]
         )
-    return {'name': name, 'command': command, 'required_flags': list(required_flags), 'returncode': result.returncode}
+    metadata = {'name': name, 'command': command, 'required_flags': list(required_flags), 'returncode': result.returncode}
+    if name.lower().startswith('nikto'):
+        # Nikto releases vary: legacy -nocookies disables automatic jar reuse; newer
+        # -usecookies enables it, so the absence of that opt-in means no reuse.
+        # Requiring both is invalid. Reject variants that expose neither control.
+        explicit_disable = _help_has_flag(help_text, '-nocookies')
+        opt_in = _help_has_flag(help_text, '-usecookies')
+        if not (explicit_disable or opt_in):
+            raise RuntimeError(
+                f'{name} cookie-isolation CLI contract unknown: no -nocookies or -usecookies. '
+                'Refusing to assume anonymous cookie isolation.'
+            )
+        metadata['cookie_strategy'] = 'explicit_disable' if explicit_disable else 'opt_in'
+    return metadata
 
 def validate_scanner_cli_contracts() -> dict[str, Any]:
     results: dict[str, Any] = {}
@@ -1444,6 +1457,28 @@ def verify_scanners(required: bool=True) -> dict[str, str | None]:
         raise RuntimeError('Missing or unusable scanners: ' + ', '.join(missing))
     return status
 
+# Prove the policy from the *selected* Nikto engine (not a different executable).
+# No target HTTP is sent; only the local CLI help is invoked.
+def _nikto_cookie_policy_for_runtime(status: dict[str, str | None]) -> str:
+    if not status.get('nikto'):
+        return 'unavailable'
+    if _docker_image_ready(NIKTO_DOCKER_IMAGE):
+        docker = command_path('docker')
+        if not docker:
+            raise RuntimeError('Nikto Docker image selected but Docker CLI is unavailable.')
+        command = [docker, 'run', '--rm', NIKTO_DOCKER_IMAGE, '-Help']
+    else:
+        perl_value = find_perl()
+        script = LOCAL_OPT / 'nikto' / 'program' / 'nikto.pl'
+        if perl_value and script.is_file():
+            command = [perl_value, str(script), '-Help']
+        else:
+            command = [str(status['nikto']), '-Help']
+    validated = _validate_cli_contract('Nikto selected engine', command, NIKTO_REQUIRED_FLAGS)
+    strategy = str(validated['cookie_strategy'])
+    print(f'[+] Nikto cookie control verified: {strategy}; only selected engine will be used.')
+    return strategy
+
 # Writes local runtime paths, the unified MCP endpoint, tool modes, and template metadata.
 def write_runtime_config(status: dict[str, str | None]) -> None:
     status_directories = []
@@ -1455,6 +1490,9 @@ def write_runtime_config(status: dict[str, str | None]) -> None:
             status_directories.append(str(path.parent))
     directories = configure_path() + status_directories
     payload = {'schema_version': 4, 'generated_at': datetime.now(timezone.utc).isoformat(), 'project_root': str(ROOT), 'python_executable': sys.executable, 'platform': platform.platform(), 'machine': platform.machine(), 'tool_directories': list(dict.fromkeys(directories)), 'executables': status, 'idor_forge': dict(_IDOR_FORGE_STATE) if _IDOR_FORGE_STATE else {'repository': IDOR_FORGE_REPOSITORY, 'directory': str(IDOR_FORGE_DIR), 'python': str(IDOR_FORGE_DIR / '.venv' / ('Scripts/python.exe' if os.name == 'nt' else 'bin/python'))}, 'mcp_transport': 'streamable_http', 'mcp_http': {'host': '127.0.0.1', 'path': '/mcp', 'services': {name: mcp_http_url(name) for name in MCP_SERVER_PORTS}}, 'playwright_chromium': {'ready': _playwright_chromium_ready()[0], 'interpreter': sys.executable}, 'nikto_perl': str(Path(find_perl()).resolve()) if find_perl() else '', 'nikto_script': str((LOCAL_OPT / 'nikto' / 'program' / 'nikto.pl').resolve()), 'nikto_image': NIKTO_DOCKER_IMAGE, 'nikto_execution_mode': 'docker_official_image' if _docker_image_ready(NIKTO_DOCKER_IMAGE) else 'native_perl', 'nuclei_image': NUCLEI_DOCKER_IMAGE if _NUCLEI_ENGINE_STATE.get('execution_mode') == 'docker_official_image' else '', 'nuclei_execution_mode': str(_NUCLEI_ENGINE_STATE.get('execution_mode') or 'native'), 'nuclei_engine': dict(_NUCLEI_ENGINE_STATE), 'report_docker_image': REPORT_DOCKER_IMAGE if _docker_image_ready(REPORT_DOCKER_IMAGE) else '', 'report_docker_source_image': REPORT_DOCKER_SOURCE_IMAGE, 'report_execution_mode': 'docker_registry_alias' if _docker_image_ready(REPORT_DOCKER_IMAGE) else 'native_weasyprint', 'nuclei_templates': dict(_NUCLEI_TEMPLATE_STATE) if _NUCLEI_TEMPLATE_STATE else {'count': _filesystem_nuclei_template_count()[0], 'directory': _best_nuclei_template_directory(), 'directories': _filesystem_nuclei_template_count()[1], 'filesystem_candidates': _filesystem_nuclei_template_inventory(), 'minimum_expected': NUCLEI_TEMPLATE_MINIMUM}}
+    # This result corresponds exactly to the image/native executable chosen above.
+    # Never reuse a cookie contract previously proved for a different scanner build.
+    payload['nikto_cookie_strategy'] = _nikto_cookie_policy_for_runtime(status)
     # A scanner-only initialization must not discard a previously validated lab
     # cookie or per-origin target metadata. --with-lab refreshes these afterward.
     if RUNTIME_FILE.is_file():
