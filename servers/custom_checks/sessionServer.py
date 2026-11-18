@@ -121,8 +121,7 @@ def _cookie_attribute_findings(url: str, rows: list[dict[str, Any]], https: bool
     return findings
 
 # Analyze cookie flags, bounded anonymous session uniqueness and fixation indicators.
-@mcp.tool()
-def run_session_scan(
+def _run_session_scan_single(
     target_url: str, cookies: str = "", probe_url: str = "", timeout: int = 30, sample_count: int = 5,
     request_rate: float | None = None, allow_state_changes: bool = False,
 ) -> dict:
@@ -187,6 +186,12 @@ def run_session_scan(
             except requests.RequestException as exc:
                 diagnostics["authenticated_probe_error"] = f"{type(exc).__name__}: {exc}"
     diagnostics["initial_probe_workers"] = initial_workers
+    # Batch completeness requires an actual successful baseline HTTP response;
+    # presence of a supplied cookie alone is not proof that a request ran.
+    diagnostics["anonymous_initial_probe_received"] = baseline is not None
+    diagnostics["anonymous_initial_probe_status"] = baseline.status_code if baseline is not None else None
+    diagnostics["authenticated_initial_probe_received"] = authenticated is not None if cookies else None
+    diagnostics["authenticated_initial_probe_status"] = authenticated.status_code if authenticated is not None else None
 
     set_cookie_rows: list[dict[str, Any]] = []
     if baseline is not None:
@@ -317,6 +322,90 @@ def run_session_scan(
         "Session Security Analyzer", target_url,
         f"Session analysis completed. Findings: {len(findings)}.", vulnerabilities=findings, diagnostics=diagnostics,
     )
+
+
+@mcp.tool()
+def run_session_scan(
+    target_url: str, cookies: str = "", probe_url: str = "", timeout: int = 30, sample_count: int = 5,
+    request_rate: float | None = None, allow_state_changes: bool = False,
+    probe_urls: list[str] | None = None, authorized_probe_urls: list[str] | None = None,
+) -> dict:
+    """One exact probe (legacy) or explicitly reviewed multi-context GET probes.
+
+    The batch is only enabled when the caller supplies the EXACT list of
+    approved request URLs. An origin grant alone never enables arbitrary paths.
+    Every context has its own result and the shared deadline is enforced.
+    """
+    if probe_urls is None:
+        return _run_session_scan_single(target_url, cookies, probe_url,
+                                        timeout, sample_count, request_rate, allow_state_changes)
+    if allow_state_changes:
+        return skipped("Session Security Analyzer", target_url,
+            "R1317 batch supports only read-only GET session probes.",
+            diagnosis="batch_state_changes_disallowed")
+    if not isinstance(probe_urls, list) or not isinstance(authorized_probe_urls, list):
+        return skipped("Session Security Analyzer", target_url,
+            "R1317 batch needs individually reviewed authorized_probe_urls.",
+            diagnosis="session_exact_target_grants_missing")
+    if any(not isinstance(u, str) for u in probe_urls + authorized_probe_urls):
+        return skipped("Session Security Analyzer", target_url,
+            "R1317 batch grant/URL lists contain non-string values.",
+            diagnosis="session_invalid_probe_list")
+    urls = list(dict.fromkeys(probe_urls))
+    allowed = set(authorized_probe_urls)
+    if not urls or any(not same_origin(target_url,url)
+                       or url not in allowed or request_contract_state_change_reason({
+                           "url":url, "method":"GET", "data":"", "parameters":[]})
+                       for url in urls):
+        return skipped("Session Security Analyzer", target_url,
+            "R1317 batch contains an unreviewed, out-of-origin, or state-changing URL.",
+            diagnosis="session_probe_scope_or_grant_mismatch")
+    deadline = time.monotonic() + max(5,int(timeout))
+    completed = []
+    findings = []
+    for url in urls:
+        remaining = int(deadline - time.monotonic())
+        if remaining < 5:
+            break
+        result = _run_session_scan_single(
+            target_url, cookies, url, remaining, sample_count,
+            request_rate, False,
+        )
+        if not isinstance(result,dict):
+            result = {"status":"error", "diagnosis":"malformed_session_result", "vulnerabilities":[]}
+        state = str(result.get("status") or "error").lower()
+        diagnosis = result.get("diagnosis")
+        detail = result.get("diagnostics") or {}
+        if state == "success" and (not isinstance(detail, dict)
+                or detail.get("anonymous_initial_probe_received") is not True
+                or (detail.get("anonymous_initial_probe_status") is not None
+                    and int(detail["anonymous_initial_probe_status"]) >= 400)
+                or (cookies and (detail.get("authenticated_initial_probe_received") is not True
+                    or (detail.get("authenticated_initial_probe_status") is not None
+                        and int(detail["authenticated_initial_probe_status"]) >= 400)
+                    or bool((detail.get("authenticated_probe") or {}).get("login_detected"))))):
+            # A cookie supplied by the caller is not a network response.
+            state = "partial"
+            diagnosis = "session_initial_http_probe_unverified"
+        completed.append({"probe_url":url, "status":state,
+                          "diagnosis":diagnosis,
+                          "findings_count":len(result.get("vulnerabilities") or [])})
+        findings.extend(result.get("vulnerabilities") or [])
+        if state != "success":
+            # Do not silently replay the uncertain remote action or pretend
+            # later contexts were tested.
+            break
+    common = {"vulnerabilities":findings, "probe_contexts_planned":len(urls),
+              "probe_contexts_attempted":len(completed), "probe_context_results":completed,
+              "probe_contexts_unattempted":urls[len(completed):],
+              "per_context_complete":len(completed)==len(urls) and all(
+                  row["status"] == "success" for row in completed)}
+    if not common["per_context_complete"]:
+        return partial("Session Security Analyzer", target_url,
+            f"Session contexts not fully verified ({len(completed)}/{len(urls)}).",
+            diagnosis="session_batch_incomplete", timed_out=time.monotonic() >= deadline, **common)
+    return success("Session Security Analyzer", target_url,
+        f"All {len(urls)} authorized session contexts checked.", **common)
 
 
 # Verifies that an authenticated logout endpoint invalidates the old session identifier.

@@ -287,12 +287,6 @@ def run_authorization_scan(
         )
     labels = [label for label, _ in alternate_pairs]
     supplied_alternates = [value for _, value in alternate_pairs]
-    if relevance_score <= 0 and not supplied_alternates:
-        return skipped(
-            "Authorization Differential Verifier", target_url,
-            "The request resembles public/static documentation and has no object or identity reference suitable for an authorization differential.",
-            diagnosis="authorization_candidate_not_relevant", relevance_score=relevance_score, relevance_reasons=relevance_reasons,
-        )
     planned_identity_requests = max(2, 2 + len(supplied_alternates))
     parallelism = secops_parallelism_policy(request_rate)
     identity_workers = max(1, min(planned_identity_requests, int(parallelism.get("network_workers") or 1)))
@@ -367,7 +361,7 @@ def run_authorization_scan(
         diagnostics["anonymous_comparison"] = {
             "accepted_equivalent": accepted, "similarity": round(similarity, 4), "length_ratio": round(length_ratio, 4),
         }
-        if accepted and relevance_score > 0:
+        if accepted:
             findings.append(_finding(
                 target_url, method, "anonymous", primary, anonymous, similarity, length_ratio
             ))

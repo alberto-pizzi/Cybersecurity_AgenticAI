@@ -185,8 +185,10 @@ async def _query_checks(
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     findings: list[dict[str, Any]] = []
     attempts: list[dict[str, Any]] = []
-    candidates = [value for value in parameters if value and XSS_NAME_RE.search(value)] or list(parameters)
-    candidates = list(dict.fromkeys(candidates))[:5]
+    # Rank high-signal inputs first but never drop other approved parameters.
+    ordered = list(dict.fromkeys(str(p) for p in parameters if p))
+    matching = [p for p in ordered if XSS_NAME_RE.search(p)]
+    candidates = matching + [p for p in ordered if p not in matching]
     for parameter in candidates:
         marker = _short_marker("Q")
         variants = _query_payload_candidates(marker)

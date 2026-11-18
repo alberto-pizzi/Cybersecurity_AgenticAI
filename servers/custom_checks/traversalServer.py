@@ -172,16 +172,32 @@ def run_traversal_scan(
     except requests.RequestException as exc:
         baseline_error = f"{type(exc).__name__}: {exc}"
 
+    # Without any baseline response a differential marker comparison is unsound.
+    # An HTTP 404/400 baseline is different: a mutation may turn the response into
+    # HTTP 200 and reveal a real issue. Keep the probes, but report partial coverage.
+    if baseline is None:
+        return partial(
+            "Path Traversal/LFI", target_url,
+            "Traversal not started: original read-only baseline did not return an HTTP response.",
+            diagnosis="baseline_unavailable", timed_out=False,
+            vulnerabilities=[], applicable=True, attempts=[],
+            candidate_parameters=candidates, fully_tested_parameters=[],
+            unattempted_parameters=candidates, full_parameter_coverage=False,
+            baseline_available=False, baseline_http_status=None, baseline_error=baseline_error,
+        )
+
     attempts: list[dict[str, Any]] = []
     findings: list[dict[str, Any]] = []
     parallelism = secops_parallelism_policy(request_rate)
     # Confirm only known file markers that are absent from the benign response. Independent
     # read-only payloads for one parameter run concurrently behind the shared request pacer.
     budget_exhausted = False
-    for parameter in candidates[:parameter_limit]:
+    selected_parameters: list[str] = []
+    for parameter in candidates:
         if remaining_budget(deadline) <= 0:
             budget_exhausted = True
             break
+        selected_parameters.append(parameter)
         def run_probe(spec: tuple[str, re.Pattern[str], str]):
             payload, marker, label = spec
             probe_url, probe_data, mutated, mutation_mode = mutate_observed_parameter(
@@ -259,21 +275,36 @@ def run_traversal_scan(
         if budget_exhausted:
             break
 
+    # A selected parameter is not necessarily a tested parameter: a failed
+    # mutation, timeout or network error provides no negative LFI evidence.
+    fully_tested_parameters = [parameter for parameter in candidates
+        if len([a for a in attempts if a.get("parameter") == parameter and "status" in a]) >= len(PROBES)]
+    untested_parameters = [p for p in candidates if p not in fully_tested_parameters]
     common = {
         "vulnerabilities": findings, "attempts": attempts, "applicable": True,
         "authenticated": bool(cookies), "session_probe": session_probe,
         "execution_mode": "bounded_known_file_markers", "per_request_budget_seconds": request_budget,
         "tool_timeout_seconds": timeout, "phase_ratio_policy": {"session": TRAVERSAL_SESSION_RATIO, "request": TRAVERSAL_REQUEST_RATIO},
         "parallelism_policy": parallelism,
-        "scan_profile": profile, "parameter_limit": parameter_limit,
+        "scan_profile": profile, "profile_suggested_parameter_batch": parameter_limit,
+        "candidate_parameters": candidates, "selected_parameters": selected_parameters,
+        "attempted_parameters": sorted({str(a.get("parameter")) for a in attempts if "status" in a}),
+        "fully_tested_parameters": fully_tested_parameters,
+        "unattempted_parameters": untested_parameters,
+        "full_parameter_coverage": not untested_parameters and not budget_exhausted and baseline is not None,
         "baseline_available": baseline is not None, "baseline_error": baseline_error,
+        "baseline_http_status": baseline.status_code if baseline is not None else None,
+        "baseline_is_success_response": bool(baseline is not None and baseline.status_code < 400),
         "content_type": str(content_type or ''),
     }
-    if budget_exhausted:
+    if budget_exhausted or untested_parameters or baseline is None or baseline.status_code >= 400:
+        diagnosis = ("time_limit_reached" if budget_exhausted else
+                     "baseline_http_error" if baseline is not None and baseline.status_code >= 400 else
+                     "baseline_unavailable" if baseline is None else "parameters_not_fully_tested")
         return partial(
             "Path Traversal/LFI", target_url,
-            f"Traversal verification reached its shared action time budget. Confirmed findings preserved: {len(findings)}.",
-            diagnosis="time_limit_reached", timed_out=True, time_limit_reached=True, **common,
+            f"Traversal verification incomplete ({len(fully_tested_parameters)}/{len(candidates)} fully tested parameters); findings preserved: {len(findings)}.",
+            diagnosis=diagnosis, timed_out=bool(budget_exhausted), time_limit_reached=bool(budget_exhausted), **common,
         )
     return success(
         "Path Traversal/LFI", target_url, f"Bounded traversal verification completed. Confirmed findings: {len(findings)}.",

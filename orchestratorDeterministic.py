@@ -22,7 +22,7 @@ from orchestratorShared import (
     SCANNER_PROGRESS_INTERVAL, SINGLE_TOOL_CHOICES, TIME_LIMIT_DIAGNOSES, ToolSpec, WORKFLOW_TOOLS,
     add_common_cli_arguments, agentic_registry, aggregate_runs, broad_tool_order,
     build_tool_arguments, call_mcp, call_mcp_with_progress, configure_scan_mode,
-    diagnose_error, discover_target, enrich_discovery_with_arjun, enrich_discovery_with_ffuf,
+    diagnose_error, discover_target, enrich_discovery_with_arjun, enrich_discovery_with_ffuf, enrich_discovery_with_zap,
     iter_leaf_results, log_result, log_zap_session_diagnostics, make_skipped_result,
     merge_discovery, prepare_cli_context, prepare_cli_entry_points, prepare_cli_discovery_seeds, print_preflight_report, print_security_finding_summary,
     refresh_authenticated_session_state, run_preflight_checks, select_arjun_request_cases,
@@ -60,6 +60,19 @@ def _tag_coverage_action(result: dict[str, Any], tool: str, *, target_url: str, 
         'source_url': str(source_url or ''),
     }
     return result
+
+
+# R1324: align the deterministic dispatch with Agentic's application-specific
+# authentication verdict. A failed /appA must not quarantine /appB, even when
+# they share an origin. Unknown/transient outcomes still require a live precheck.
+def _application_auth_rejected(profile: dict[str, Any], discovery: dict[str, Any], request_url: str) -> bool:
+    cookie = str(profile.get('cookies') or '')
+    if not cookie:
+        return False
+    return shared.runtime_application_auth_verdict(
+        discovery, request_url, cookie,
+        identity_ref=str(profile.get('identity_ref') or ''),
+    ) == 'AUTH_FAILED_CONCLUSIVE'
 
 
 # Stores the state exchanged between the deterministic workflow steps.
@@ -111,7 +124,7 @@ async def deterministic_discovery_node(state: DeterministicState) -> dict[str, A
                 flush=True,
             )
             found = await asyncio.to_thread(
-                discover_target, target, profile.get('cookies', ''), shared.MAX_CRAWL_PAGES,
+                shared.discover_target_sync_safe, target, profile.get('cookies', ''), shared.MAX_CRAWL_PAGES,
                 list(state.get('discovery_seeds') or []), list(state.get('entry_points') or []),
                 allow_state_changes=workflow_state_changes,
                 expand_authorized_service_hosts=False,
@@ -248,7 +261,7 @@ async def deterministic_discovery_node(state: DeterministicState) -> dict[str, A
             flush=True,
         )
         found = await asyncio.to_thread(
-            discover_target, auth_origin, cookie, shared.MAX_CRAWL_PAGES, list(auth_result.get('auth_evidence_urls') or []),
+            shared.discover_target_sync_safe, auth_origin, cookie, shared.MAX_CRAWL_PAGES, list(auth_result.get('auth_evidence_urls') or []),
             [], allow_state_changes=workflow_state_changes,
             expand_authorized_service_hosts=False, defer_same_host_service_discovery=True,
         )
@@ -351,7 +364,7 @@ async def deterministic_broad_scan_node(state: DeterministicState) -> dict[str, 
             if isinstance(anonymous_ffuf, dict):
                 _, anonymous_urls = enrich_discovery_with_ffuf(discovery[name], anonymous_ffuf, target)
                 if anonymous_urls:
-                    recrawl = await asyncio.to_thread(discover_target, target, cookies, seeds=anonymous_urls, allow_state_changes=shared.state_changing_tests_allowed(target, state.get('allow_state_changes')))
+                    recrawl = await asyncio.to_thread(shared.discover_target_sync_safe, target, cookies, seeds=anonymous_urls, allow_state_changes=shared.state_changing_tests_allowed(target, state.get('allow_state_changes')))
                     discovery[name] = merge_discovery(discovery[name], recrawl)
                     diagnostics.extend(({'phase': 'anonymous_ffuf_authenticated_recrawl', 'profile': name, **item} for item in recrawl['errors']))
         session_valid = discovery[name].get('authentication_effective') is not False
@@ -400,17 +413,39 @@ async def deterministic_broad_scan_node(state: DeterministicState) -> dict[str, 
             scanner_timeout = BROAD_SCANNER_TIMEOUTS.get(spec.name, 180)
             if cookies and spec.name == 'ffuf' and (shared.CURRENT_SCAN_MODE == 'balanced'):
                 scanner_timeout = min(scanner_timeout, 35)
-            if cookies and (not session_valid):
-                result = make_skipped_result(spec.name, target, 'Authenticated session is no longer valid; this run was skipped to avoid reporting anonymous coverage as authenticated.')
+            if _application_auth_rejected(profile, discovery[name], target):
+                result = make_skipped_result(spec.name, target, 'Primary application conclusively rejected authentication; other applications remain independently eligible.')
             else:
-                arguments = build_tool_arguments(spec.name, target, cookies, discovery[name], allow_state_changes=state.get('allow_state_changes'), timeout_override=scanner_timeout)
-                result = await call_mcp_with_progress(spec, arguments)
+                # Exact app-level precheck prevents an expired B cookie from being
+                # misreported as authenticated coverage; a transient discovery
+                # failure alone does not preclude a successful recovery.
+                refresh = None
+                if cookies:
+                    refresh = await asyncio.to_thread(
+                        refresh_authenticated_session_state, target, cookies, probe_url,
+                        allow_state_changes=shared.state_changing_tests_allowed(target, state.get('allow_state_changes')),
+                    )
+                if refresh is not None and (refresh.get('usable') is False or not refresh.get('credential_applied')):
+                    result = make_skipped_result(spec.name, target, 'Primary application authentication could not be proved after a bounded precheck.')
+                    result['session_state_refresh'] = refresh
+                else:
+                    arguments = build_tool_arguments(spec.name, target, cookies, discovery[name], allow_state_changes=state.get('allow_state_changes'), timeout_override=scanner_timeout)
+                    result = await call_mcp_with_progress(spec, arguments)
+                    if refresh is not None:
+                        result['session_state_refresh'] = refresh
             _tag_coverage_action(result, spec.name, target_url=target)
             log_result(name, spec.name, result, target)
             sibling_runs: list[dict[str, Any]] = []
-            if result.get('status') != 'skipped' and spec.name in {'zap', 'nuclei', 'nikto'}:
+            if spec.name in {'zap', 'nuclei', 'nikto'}:
                 for sibling_origin in sibling_origins:
                     sibling_discovery = shared.discovery_for_origin(discovery[name], sibling_origin, cookies)
+                    if _application_auth_rejected(profile, sibling_discovery, sibling_origin):
+                        sibling_result = make_skipped_result(spec.name, sibling_origin,
+                            'Sibling application conclusively rejected authentication; other origins remain eligible.')
+                        _tag_coverage_action(sibling_result, spec.name, target_url=sibling_origin)
+                        sibling_runs.append(sibling_result)
+                        log_result(name, spec.name, sibling_result, sibling_origin)
+                        continue
                     sibling_timeout = shared.sibling_broad_timeout(spec.name, scanner_timeout)
                     sibling_refresh: dict[str, Any] | None = None
                     if cookies:
@@ -436,6 +471,19 @@ async def deterministic_broad_scan_node(state: DeterministicState) -> dict[str, 
                     _tag_coverage_action(sibling_result, spec.name, target_url=sibling_origin)
                     sibling_runs.append(sibling_result)
                     log_result(name, spec.name, sibling_result, sibling_origin)
+            # R1321 parity: the Agentic executor merges ZAP's observed site-tree
+            # back into discovery; Deterministic previously discarded that surface.
+            # No new HTTP requests here. Every new URL passes the shared scope,
+            # static-resource and destructive-route guards before becoming a GET case.
+            if spec.name == 'zap':
+                observed_total = 0
+                for observed_target, observed_result in [(target, result), *zip(sibling_origins, sibling_runs)]:
+                    if observed_result.get('status') not in {'success', 'partial'}:
+                        continue
+                    discovery[name], extra = enrich_discovery_with_zap(discovery[name], observed_result, observed_target)
+                    observed_total += len(extra)
+                if observed_total:
+                    print(f'    [DISCOVERY] ZAP site-tree: {observed_total} scoped URL observations merged into Deterministic discovery.')
             results[name][spec.name] = aggregate_runs(spec.name, target, [result, *sibling_runs]) if sibling_runs else result
             if result.get('status') == 'skipped':
                 continue
@@ -457,7 +505,7 @@ async def deterministic_broad_scan_node(state: DeterministicState) -> dict[str, 
             if spec.name == 'ffuf' and result.get('status') in {'success', 'partial'}:
                 discovery[name], discovered_urls = enrich_discovery_with_ffuf(discovery[name], result, target)
                 if discovered_urls:
-                    recrawl = await asyncio.to_thread(discover_target, target, cookies, seeds=discovered_urls, allow_state_changes=shared.state_changing_tests_allowed(target, state.get('allow_state_changes')))
+                    recrawl = await asyncio.to_thread(shared.discover_target_sync_safe, target, cookies, seeds=discovered_urls, allow_state_changes=shared.state_changing_tests_allowed(target, state.get('allow_state_changes')))
                     discovery[name] = merge_discovery(discovery[name], recrawl)
                     if cookies and discovery[name].get('authentication_effective') is not False:
                         discovery[name] = await asyncio.to_thread(shared.authenticate_discovered_sibling_origins, discovery[name], target, cookies, allow_state_changes=shared.state_changing_tests_allowed(target, state.get('allow_state_changes')))
@@ -513,6 +561,10 @@ async def deterministic_parameter_scan_node(state: DeterministicState) -> dict[s
         skip_reason = _tool_case_skip_reason(spec.name, case, authenticated_profile=bool(effective_cookies or cookies))
         if skip_reason:
             return _tag_coverage_action(make_skipped_result(spec.name, url, skip_reason), spec.name, target_url=url, method=str(case.get('method', 'GET')), parameters=list(case.get('parameters', [])), source_url=str(case.get('source_url', '')), data=str(case.get('data') or ''))
+        if _application_auth_rejected(profile, profile_discovery, url):
+            return _tag_coverage_action(make_skipped_result(
+                spec.name, url, 'Conclusive authentication rejection for this application; other applications remain eligible.'
+            ), spec.name, target_url=url, method=str(case.get('method', 'GET')), parameters=list(case.get('parameters', [])), source_url=str(case.get('source_url', '')), data=str(case.get('data') or ''))
         timeout = PARAMETER_TOOL_TIMEOUTS.get(spec.name, 120)
         method = str(case.get('method', 'GET')).upper()
         case_probe = shared.select_authenticated_precheck_probe_url(
@@ -531,8 +583,8 @@ async def deterministic_parameter_scan_node(state: DeterministicState) -> dict[s
         print(f'\n[*] Scanner su parametri - profilo: {name}')
         selection_summary[name] = {}
         skip_reason = ''
-        if cookies and (not session_state.get(name, True)):
-            skip_reason = 'Authenticated session became invalid before parameter testing.'
+        # A profile-wide discovery failure is not a conclusive failure for every
+        # application on the same origin; each case has its own verdict and precheck.
         if skip_reason:
             for spec in PARAMETER_TOOLS:
                 results[name][spec.name] = make_skipped_result(spec.name, target, skip_reason)
@@ -548,10 +600,15 @@ async def deterministic_parameter_scan_node(state: DeterministicState) -> dict[s
             )
             deduped_cases: list[dict[str, Any]] = []
             for case in cases:
+                # Agentic uses the same hard compatibility exclusions before dispatch.
+                if shared.tool_case_hard_skip_reason(spec.name,case):
+                    continue
                 case_url = str(case.get('url') or '')
                 no_cookie_key = (spec.name, str(case.get('method', 'GET')).upper(), case_url, tuple(sorted(str(value).lower() for value in case.get('parameters', []) if str(value))))
                 applicable_cookie = shared.scope_cookie_header(case_url, cookies)
                 can_refresh_identity = bool(cookies and shared.runtime_target_auth_available(cookies, case_url))
+                if _application_auth_rejected(profile, discovery[name], case_url):
+                    continue
                 if cookies and not applicable_cookie and not can_refresh_identity:
                     # Do not spend a specialist slot on a request that this authenticated identity
                     # can never credential. Anonymous, when enabled, owns the no-cookie equivalent.
@@ -595,15 +652,12 @@ async def deterministic_authorization_node(state: DeterministicState) -> dict[st
             results[name]['authorization'] = result
             log_result(name, 'authorization', result, target)
             continue
-        if not profile_session_state.get(name, True):
-            result = make_skipped_result('authorization', target, 'Authenticated session became invalid before authorization comparison.')
-            results[name]['authorization'] = result
-            log_result(name, 'authorization', result, target)
-            continue
+        # No profile-wide skip: an exact app-specific proof is required below.
         state_changes_allowed = bool(state.get('workflow_state_changes', False))
         cases = [
             case for case in select_authorization_request_cases(discovery[name])
             if (shared.scope_cookie_header(str(case.get('url') or ''), cookies) or shared.runtime_target_auth_available(cookies, str(case.get('url') or '')))
+            and not _application_auth_rejected(profile, discovery[name], str(case.get('url') or ''))
             and (state_changes_allowed or not shared.request_case_state_change_reason(case))
         ]
         authorization_selection_summary[name] = [{
@@ -683,6 +737,10 @@ async def deterministic_browser_workflow_node(state: DeterministicState) -> dict
     async def run_case(tool: str, case: dict[str, Any], cookies: str, profile_discovery: dict[str, Any], probe_url: str) -> dict[str, Any]:
         url = str(case.get('url', target))
         method = str(case.get('method', 'GET')).upper()
+        if _application_auth_rejected(profile, profile_discovery, url):
+            return _tag_coverage_action(make_skipped_result(
+                tool, url, 'Conclusive authentication rejection for this application; other applications remain eligible.'
+            ), tool, target_url=url, method=method, parameters=list(case.get('parameters', [])), source_url=str(case.get('source_url', '')), data=str(case.get('data') or ''))
         case_probe = shared.select_authenticated_precheck_probe_url(
             profile_discovery, url, str(case.get('source_url') or ''), method,
         )
@@ -697,8 +755,7 @@ async def deterministic_browser_workflow_node(state: DeterministicState) -> dict
         name, cookies = (profile['name'], profile['cookies'])
         selection_summary[name] = {'browser': [], 'workflow': []}
         skip_reason = ''
-        if cookies and (not session_state.get(name, True)):
-            skip_reason = 'Authenticated session became invalid before browser/workflow verification.'
+        # Preserve healthy sibling applications even if another app failed auth.
         if skip_reason:
             for spec in WORKFLOW_TOOLS:
                 results[name][spec.name] = make_skipped_result(spec.name, target, skip_reason)
@@ -718,6 +775,8 @@ async def deterministic_browser_workflow_node(state: DeterministicState) -> dict
                 key = _no_cookie_request_execution_key(tool, case)
                 applicable_cookie = shared.scope_cookie_header(case_url, cookies)
                 can_refresh_identity = bool(cookies and shared.runtime_target_auth_available(cookies, case_url))
+                if _application_auth_rejected(profile, profile_discovery, case_url):
+                    continue
                 if cookies and not applicable_cookie and not can_refresh_identity:
                     continue
                 if not cookies and not applicable_cookie:
@@ -728,6 +787,10 @@ async def deterministic_browser_workflow_node(state: DeterministicState) -> dict
             return selected
         browser_cases = dedupe_no_cookie_cases('browser', browser_cases)
         workflow_cases = dedupe_no_cookie_cases('workflow', workflow_cases)
+        # Preserve the same hard rejection policy as Agentic, without
+        # imposing the Agentic planner's heuristic ranking/budget choices.
+        browser_cases = [case for case in browser_cases if not shared.tool_case_hard_skip_reason('browser',case)]
+        workflow_cases = [case for case in workflow_cases if not shared.tool_case_hard_skip_reason('workflow',case)]
         selection_summary[name]['browser'] = [{'method': str(case.get('method', 'GET')).upper(), 'url': str(case.get('url', '')), 'parameters': list(case.get('parameters', [])), 'fields': list(case.get('fields', [])), 'source_url': str(case.get('source_url', '')), 'client_sources': list(case.get('client_sources', [])), 'client_sinks': list(case.get('client_sinks', [])), 'priority_score': case.get('priority_score'), 'adaptive_budget': bool(case.get('adaptive_budget')), 'adaptive_budget_evidence': list(case.get('adaptive_budget_evidence', []))} for case in browser_cases]
         selection_summary[name]['workflow'] = [{'method': str(case.get('method', 'POST')).upper(), 'url': str(case.get('url', '')), 'parameters': list(case.get('parameters', [])), 'file_parameters': list(case.get('file_parameters', [])), 'token_parameters': list(case.get('token_parameters', [])), 'source_url': str(case.get('source_url', '')), 'priority_score': case.get('priority_score'), 'adaptive_budget': bool(case.get('adaptive_budget')), 'adaptive_budget_evidence': list(case.get('adaptive_budget_evidence', []))} for case in workflow_cases]
         print(f'\n[*] Browser/workflow - profilo: {name}')
@@ -1006,6 +1069,8 @@ async def deterministic_verification_node(state: DeterministicState) -> dict[str
             selection_summary.setdefault(profile_name, []).append(selection_row)
             if browser_unavailable:
                 result = make_skipped_result('browser', url, 'Playwright was unavailable in the first final-verification run; remaining Chromium cases were not repeated.')
+            elif _application_auth_rejected(profile, profile_discovery, url):
+                result = make_skipped_result('browser', url, 'This application conclusively rejected authentication; no final browser request sent.')
             else:
                 method = str(case.get('method', 'GET')).upper()
                 case_probe = shared.select_authenticated_precheck_probe_url(
@@ -1181,7 +1246,10 @@ def _single_tool_case(discovery: dict[str, Any], tool: str, target: str, explici
         if not effective_parameters:
             source = urlparse(url).query if method == 'GET' else data
             effective_parameters = [name for name, _ in parse_qsl(source, keep_blank_values=True)]
-        return {'url': url, 'method': method, 'data': data, 'parameters': effective_parameters, 'source_url': url}
+        explicit_case={'url': url, 'method': method, 'data': data, 'parameters': effective_parameters, 'source_url': url}
+        if shared.tool_case_hard_skip_reason(tool,explicit_case):
+            raise ValueError('Requested tool case violates the shared hard scanner compatibility policy')
+        return explicit_case
     if tool == 'arjun':
         cases = select_arjun_request_cases(discovery, target, limit=1, allow_state_changes=allow_state_changes)
         return cases[0] if cases else None
@@ -1195,7 +1263,7 @@ def _single_tool_case(discovery: dict[str, Any], tool: str, target: str, explici
         cases = select_workflow_request_cases(discovery, limit=1)
         return cases[0] if cases else None
     cases = select_tool_request_cases(discovery, tool, limit=1, authenticated_profile=authenticated_profile, allow_state_changes=allow_state_changes, credential_cookies=credential_cookies)
-    return cases[0] if cases else None
+    return next((case for case in cases if not shared.tool_case_hard_skip_reason(tool,case)),None)
 
 # Tool-specific preflight filtering keeps only errors relevant to the requested isolated run.
 def _single_tool_preflight_errors(checks: list[dict[str, str]], tool: str) -> list[dict[str, str]]:
@@ -1214,7 +1282,7 @@ async def run_single_tool_debug(*, tool: str, target: str, cookies: str, mode: s
     if timeout_override < 0:
         raise ValueError('--tool-timeout cannot be negative.')
     state_changes = state_changing_tests_allowed(target, allow_state_changes)
-    discovery = await asyncio.to_thread(discover_target, target, cookies, allow_state_changes=state_changes)
+    discovery = await asyncio.to_thread(shared.discover_target_sync_safe, target, cookies, allow_state_changes=state_changes)
     spec = next((item for item in ALL_TOOLS if item.name == tool))
     selected_target = target
     if tool in {'ffuf', 'zap', 'nuclei', 'session', 'nikto'}:
