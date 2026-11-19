@@ -9,6 +9,29 @@ import subprocess
 import sys
 from pathlib import Path
 
+# When invoked as a script, prefer the interpreter bound to this repository's
+# virtual environment before importing third-party modules or running pip.
+# Importing initScript from another module must never spawn a child interpreter.
+def _use_project_venv_for_cli() -> None:
+    if __name__ != '__main__':
+        return
+    project = Path(__file__).absolute().parent
+    venv = project / '.venv'
+    target = venv / ('Scripts/python.exe' if os.name == 'nt' else 'bin/python')
+    if not target.is_file():
+        return  # A new/explicit environment may legitimately lack a project .venv.
+    current_prefix = Path(sys.prefix).absolute()
+    if os.path.normcase(str(current_prefix)) == os.path.normcase(str(venv.absolute())):
+        return
+    print(f'[*] Using the existing SecOps project Python: {target}', flush=True)
+    try:
+        result = subprocess.run([str(target), str(Path(__file__).absolute()), *sys.argv[1:]], check=False)
+    except OSError as exc:
+        raise RuntimeError(f'Unable to launch project virtual environment {target}: {exc}') from exc
+    raise SystemExit(result.returncode)
+
+_use_project_venv_for_cli()
+
 # Minimal setup bootstrap. setupLab/setupTools import requests and packaging BEFORE
 # install_python_packages() is called, so resolve only these two dependencies first.
 # Do not install packages into the system interpreter or change a working venv.
@@ -60,28 +83,7 @@ def _bootstrap_import_dependencies() -> None:
     if validation.returncode:
         raise RuntimeError('Bootstrap verification failed: ' + (validation.stderr or '')[-1800:])
 
-def _prefer_project_venv_when_launched_directly() -> None:
-    # A bare `python initScript.py` can resolve to WindowsApps' system Python,
-    # which has different Playwright/Arjun/FastMCP versions from the project venv.
-    # Hand control to the existing project interpreter before importing tooling.
-    if __name__ != '__main__' or sys.prefix != getattr(sys, 'base_prefix', sys.prefix):
-        return
-    project = Path(__file__).resolve().parent
-    candidate = project / '.venv' / ('Scripts/python.exe' if os.name == 'nt' else 'bin/python')
-    if not candidate.is_file():
-        return
-    try:
-        if os.path.samefile(sys.executable, candidate):
-            return
-    except OSError:
-        pass
-    print('[*] Using existing SecOps project venv instead of global Python: ' + str(candidate), flush=True)
-    completed = subprocess.run([str(candidate), str(Path(__file__).resolve()), *sys.argv[1:]], check=False)
-    raise SystemExit(completed.returncode)
-
-if __name__ == '__main__':
-    _prefer_project_venv_when_launched_directly()
-    _bootstrap_import_dependencies()
+_bootstrap_import_dependencies()
 
 from setupLab import setup_local_lab, update_runtime_auth
 from assessmentConfig import default_max_rounds
@@ -327,6 +329,216 @@ def ensure_docker_engine_ready() -> None:
         'Start Docker Desktop (Linux containers/WSL2), then retry --with-lab. '
         + diagnostic[-1400:]
     )
+
+
+# Scanner processes run inside the MCP server, not inside this initializer.  Check the
+# Docker access of the actual server user rather than interpreting `docker image inspect`
+# as proof that a container can be started by Nikto or Nuclei.
+def _docker_socket_identity() -> tuple[int, str] | None:
+    if not sys.platform.startswith('linux'):
+        return None
+    import grp
+    import stat
+    try:
+        info = Path('/var/run/docker.sock').stat()
+        if not stat.S_ISSOCK(info.st_mode):
+            return None
+        return info.st_gid, grp.getgrgid(info.st_gid).gr_name
+    except (OSError, KeyError):
+        return None
+
+
+def _docker_grant_service_group(user: str, group_id: int, group_name: str) -> bool:
+    import pwd
+    account = pwd.getpwnam(user)
+    if group_id in os.getgrouplist(user, account.pw_gid):
+        return False
+    print(f'[DOCKER] Permanent privilege change: adding {user} to {group_name}. '
+          'Docker socket access grants root-equivalent privileges.', flush=True)
+    run([*_linux_sudo_prefix(), 'usermod', '-aG', group_name, user], timeout=120)
+    if group_id not in os.getgrouplist(user, account.pw_gid):
+        raise RuntimeError(f'User {user} still lacks Docker group {group_name} after usermod.')
+    return True
+
+
+def _docker_initializer_access() -> None:
+    if not shutil.which('docker'):
+        raise RuntimeError('Docker is not installed or not on PATH.')
+    probe = subprocess.run(['docker', 'info', '--format', '{{.ServerVersion}}'],
+                           capture_output=True, text=True, timeout=25, check=False)
+    if probe.returncode == 0:
+        print('[+] Docker CLI and daemon usable by initializer.', flush=True)
+        return
+    diagnostic = (probe.stderr or probe.stdout or '').strip()[-1200:]
+    socket = _docker_socket_identity()
+    if socket and 'permission denied' in diagnostic.lower():
+        import pwd
+        user = pwd.getpwuid(os.geteuid()).pw_name
+        _docker_grant_service_group(user, *socket)
+        raise RuntimeError(
+            f'Docker group membership for {user} is configured, but this already-running '
+            'shell/tmux process cannot acquire new supplementary groups. Reconnect SSH, '
+            'create a new tmux session and rerun initScript.py. ' + diagnostic
+        )
+    raise RuntimeError('Docker is unavailable to initializer: ' + diagnostic)
+
+
+def _mcp_listener_pids(port: int) -> list[int]:
+    if sys.platform.startswith('linux'):
+        import re
+        ss = shutil.which('ss')
+        if not ss:
+            raise RuntimeError('Linux iproute2/ss is needed to inspect the MCP listener.')
+        command = [ss, '-H', '-ltnp', f'( sport = :{port} )']
+        proc = subprocess.run(command, capture_output=True, text=True, timeout=15)
+        pids = {int(n) for n in re.findall(r'pid=(\d+)', proc.stdout)}
+        if proc.stdout.strip() and not pids:
+            sudo = _linux_sudo_prefix()
+            proc = subprocess.run([*sudo, *command], capture_output=True, text=True, timeout=30)
+            pids = {int(n) for n in re.findall(r'pid=(\d+)', proc.stdout)}
+        if proc.returncode or (proc.stdout.strip() and not pids):
+            raise RuntimeError('MCP listener owner cannot be identified safely: ' + (proc.stderr or proc.stdout)[-500:])
+        return sorted(pids)
+    if os.name == 'nt':
+        import re
+        powershell = shutil.which('powershell.exe') or shutil.which('powershell')
+        if not powershell:
+            raise RuntimeError('PowerShell is required to identify the Windows MCP listener.')
+        command = f'Get-NetTCPConnection -State Listen -LocalPort {int(port)} -ErrorAction SilentlyContinue | Select-Object -ExpandProperty OwningProcess -Unique'
+        result = subprocess.run([powershell, '-NoProfile', '-NonInteractive', '-Command', command],
+                                capture_output=True, text=True, timeout=25)
+        if result.returncode:
+            raise RuntimeError('Cannot identify Windows MCP listener: ' + result.stderr[-600:])
+        return sorted({int(v) for v in re.findall(r'^\s*(\d+)\s*$', result.stdout, re.M)})
+    raise RuntimeError(f'Automatic MCP process identification not supported on {sys.platform}.')
+
+
+def _mcp_verified_pid(pid: int) -> tuple[str, set[int]]:
+    """Only the existing project's exact secopsServer.py process may be restarted."""
+    if pid <= 0 or pid == os.getpid():
+        raise RuntimeError(f'Refusing unsafe MCP PID {pid}.')
+    expected_script = str(UNIFIED_MCP_SERVER.resolve())
+    if sys.platform.startswith('linux'):
+        import pwd
+        proc = Path('/proc') / str(pid)
+        cmd = (proc / 'cmdline').read_bytes().replace(b'\0', b' ').decode('utf-8', errors='replace')
+        cwd = str((proc / 'cwd').resolve())
+        if expected_script not in cmd and not ('secopsServer.py' in cmd and cwd == str(ROOT)):
+            raise RuntimeError(f'PID {pid} on MCP port is not verified as {expected_script}.')
+        groups: set[int] = set()
+        for line in (proc / 'status').read_text(encoding='utf-8').splitlines():
+            if line.startswith('Groups:'):
+                groups.update(map(int, line.split(':', 1)[1].split()))
+            if line.startswith('Gid:'):
+                fields = line.split(':', 1)[1].split()
+                if len(fields) > 1:
+                    groups.add(int(fields[1]))
+        return pwd.getpwuid(proc.stat().st_uid).pw_name, groups
+    if os.name == 'nt':
+        ps = shutil.which('powershell.exe') or shutil.which('powershell')
+        command = f'(Get-CimInstance Win32_Process -Filter "ProcessId={pid}" -ErrorAction Stop).CommandLine'
+        result = subprocess.run([ps, '-NoProfile', '-NonInteractive', '-Command', command],
+                                capture_output=True, text=True, timeout=25)
+        text = (result.stdout or '').lower().replace('/', '\\')
+        if result.returncode or expected_script.lower() not in text:
+            raise RuntimeError(f'PID {pid} is not the expected original MCP server; not terminating it.')
+        return '', set()
+    raise RuntimeError('Cannot verify MCP server PID on this platform.')
+
+
+def _mcp_systemd_unit_for_pid(pid: int) -> str:
+    """Find the actual systemd service owning a verified original MCP process."""
+    if not sys.platform.startswith('linux') or not shutil.which('systemctl'):
+        return ''
+    import re
+    try:
+        cgroups = (Path('/proc') / str(pid) / 'cgroup').read_text(encoding='utf-8')
+    except OSError:
+        return ''
+    units = sorted(set(re.findall(r'(?:^|/)([a-zA-Z0-9_.@\x2d]+\.service)(?:/|$)', cgroups)))
+    for unit in units:
+        try:
+            result = subprocess.run(['systemctl', 'show', unit, '--property=MainPID', '--value'],
+                                    capture_output=True, text=True, timeout=10, check=False)
+            if result.returncode == 0 and result.stdout.strip() == str(pid):
+                return unit
+        except (OSError, subprocess.TimeoutExpired):
+            continue
+    return ''
+
+
+def _reconcile_existing_mcp_before_preflight() -> None:
+    """Refresh a stale or existing original MCP before an assessment can reuse it.
+
+    No unrelated service is stopped, no active assessment lease is bypassed, and
+    the source fingerprint check remains authoritative in the final preflight.
+    """
+    import signal
+    import time
+    import orchestratorShared as shared
+    from utils import MCP_UNIFIED_SERVICE, mcp_http_port
+
+    port = int(mcp_http_port(MCP_UNIFIED_SERVICE))
+    if not shared._port_open('127.0.0.1', port):
+        print('[+] No existing MCP listener; preflight will start the current version.', flush=True)
+        return
+    # Keep lock only for the lease/ownership check. A systemd service may take the
+    # same lock during shutdown/startup; restarting it while holding the lock deadlocks.
+    with shared._mcp_lifecycle_guard():
+        live_leases = shared._prune_mcp_leases_locked()
+        if live_leases:
+            raise RuntimeError(f'MCP port {port} is in use by active assessment lease(s): '
+                               f'{live_leases}. Cannot restart while jobs may be executing.')
+        pids = _mcp_listener_pids(port)
+        if len(pids) != 1:
+            raise RuntimeError(f'MCP port {port} is occupied but has {len(pids)} verified owner candidates: {pids}.')
+        pid = pids[0]
+        username, live_groups = _mcp_verified_pid(pid)
+        unit = _mcp_systemd_unit_for_pid(pid)
+        if sys.platform.startswith('linux'):
+            socket = _docker_socket_identity()
+            if socket and username:
+                import pwd
+                uid = pwd.getpwnam(username).pw_uid
+                if uid != 0 and socket[0] not in live_groups:
+                    _docker_grant_service_group(username, *socket)
+                    if not unit:
+                        current_user = pwd.getpwuid(os.geteuid()).pw_name
+                        if username != current_user or socket[0] not in os.getgroups():
+                            raise RuntimeError(
+                                f'MCP PID {pid} lacks effective Docker access. The persistent '
+                                'group is now set, but the installer cannot relaunch this '
+                                'different-user process with verified fresh groups. No scanner '
+                                'has been declared ready.'
+                            )
+                        # A same-user MCP process started outside systemd can be
+                        # replaced: preflight starts it with our currently valid groups.
+    print(f'[MCP] Restarting verified original MCP PID={pid}' + (f' via {unit}' if unit else '') + '.', flush=True)
+    if unit:
+        run([*_linux_sudo_prefix(), 'systemctl', 'restart', unit], timeout=90)
+    elif os.name == 'nt':
+        completed = subprocess.run(['taskkill', '/PID', str(pid)], capture_output=True, text=True, timeout=20)
+        if completed.returncode:
+            raise RuntimeError(f'Cannot stop verified MCP PID {pid}: {completed.stderr[-700:]}')
+    else:
+        os.kill(pid, signal.SIGTERM)
+    deadline = time.monotonic() + 45.0
+    while time.monotonic() < deadline:
+        # With systemd Restart=always the socket may never be free for very long;
+        # verify process replacement rather than relying on an observed gap.
+        if not shared._port_open('127.0.0.1', port):
+            if not unit:
+                return  # preflight may start an owned non-systemd singleton
+            time.sleep(0.3)  # systemd may still be in its start phase
+            continue
+        new_pids = _mcp_listener_pids(port)
+        if new_pids and pid not in new_pids:
+            for new_pid in new_pids:
+                _mcp_verified_pid(new_pid)
+            print('[+] MCP listener replaced with a new process; live preflight will verify fingerprint.', flush=True)
+            return
+        time.sleep(0.3)
+    raise RuntimeError(f'Original MCP PID {pid} did not restart within its bounded stop window.')
 
 # Fail early when the project source tree is incomplete for the unified MCP architecture.
 def verify_unified_mcp_source() -> None:
@@ -712,8 +924,15 @@ def main() -> int:
         if sys.platform.startswith("linux"):
             ensure_linux_host_prerequisites(include_scanner_packages=not args.skip_scanners)
         ensure_docker_installed()
+        # Linux permission repair must precede the generic Engine readiness check:
+        # otherwise a permission-denied socket would abort before usermod can fix it.
+        if sys.platform.startswith('linux') and (args.with_lab or not args.skip_scanners):
+            _docker_initializer_access()
         if args.with_lab:
             ensure_docker_engine_ready()
+        # Windows Docker Desktop may have needed startup before a real docker-info check.
+        if not sys.platform.startswith('linux') and (args.with_lab or not args.skip_scanners):
+            _docker_initializer_access()
         print("\n=== SecOps FastMCP initialization ===")
         install_python_packages()
         if not args.skip_browser:
@@ -778,6 +997,9 @@ def main() -> int:
             assessment_config = _write_dvwa_assessment_config(cookie, config_model, args.mode)
             print(f"[+] DVWA assessment configuration: {assessment_config}")
 
+        # Always reconcile an already-running ORIGINAL MCP with the current sources
+        # and runtime configuration before the first scanner preflight/assessment.
+        _reconcile_existing_mcp_before_preflight()
         if not args.skip_preflight:
             run_preflight()
 
