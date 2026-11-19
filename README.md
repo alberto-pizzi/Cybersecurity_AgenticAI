@@ -14,7 +14,7 @@ The system does **not** take benchmarks or endpoint lists as input: the surface 
 > 1. **`initScript.py`** → prepares the environment (one time only).
 > 2. **`assessmentRunner.py`** → runs the assessment in the chosen mode (**agentic** or **deterministic**) with the desired `--config`.
 >
-> `--dry-run` and `--auth-only` are **not** steps of their own: they are only optional checks to run before step 2.
+> `--dry-run` and `--auth-only` are **not** separate steps: the former validates the plan, while the latter runs the assessment on authenticated profiles only.
 
 ### Step 1 — Preparation (`initScript.py`)
 
@@ -34,7 +34,7 @@ With `--with-lab`, if neither `--prepare-ai` nor `--agentic-model` is specified,
 
 This is the only step that repeats: run `assessmentRunner.py` choosing the **mode** and **config**.
 
-> 💡 *Optional check (recommended before long runs):* add `--dry-run` to validate config, scope, and jobs **without** launching scanners, or `--auth-only` to test only login and session.
+> 💡 *Optional execution flags:* use `--dry-run` to validate config, scope, and jobs **without** launching scanners (recommended before long runs), or `--auth-only` to assess **authenticated profiles only** (scanners still run).
 >
 > ```bash
 > python assessmentRunner.py --config configs/dashboard-test.json \
@@ -64,12 +64,13 @@ python assessmentRunner.py --config configs/dashboard-test.json \
 | `orchestratorAgenticCore.py` | AI planner, rounds, execution, verification, and final analysis. |
 | `utils.py` | Shared low-level utilities, request-rate policy/pacing, process coordination, runtime helpers, and safe parsing. |
 | `servers/` | MCP wrappers and checks developed in the project. |
+| `servers/secopsServer.py` | Unified MCP listener, source fingerprint and Docker runtime self-test. |
 | `servers/reporting/` | Normalization, coverage, and report rendering. |
 | `initScript.py` | Initializes the environment and generates the operator guide. |
 | `setupTools.py` | Installs/verifies scanners, dependencies, and preflight requirements. |
 | `setupLab.py` | Creates/verifies the optional local Docker lab and its session. |
 
-**Deterministic** and **Agentic** share discovery, sessions, scope, scanners, and reporting. Only **how** actions are chosen differs.
+**Deterministic** and **Agentic** share discovery, sessions, scope, scanners, and reporting. Deterministic uses a fixed 10-node pipeline (including FFUF/Arjun cross-discovery and a bounded incremental GET pass); Agentic uses a 6-node graph with AI-selected concrete actions, feedback rounds, and a final AI analysis. Scope and safety remain enforced by Python.
 
 ---
 
@@ -131,7 +132,7 @@ The default `execution.request_rate` is **10 request starts/s**, but the JSON co
 | Internal target/finalization guard | 4 h | 44 h | 128 h | 256 h |
 | Fixed parent-process cutoff | disabled | disabled | disabled | disabled |
 
-The table uses each profile's default round count (TEST 1, FAST 2, BALANCED 2, DEEP 3). Planner and final-AI values are **nominal sizing/accounting values in normal profile mode, not aggregate wall-clock stop conditions**. Every started planner or analysis batch gets its complete provider-call watchdog, and fast responses return immediately. Measured planner/analysis control-plane time is excluded from the fixed target-execution/finalization guard, so a healthy but slow model does not consume scanner or report time. The assessment runner also no longer imposes a second fixed Agentic parent timeout; provider/tool calls retain their own bounded timeouts. `--max-rounds` still scales target-work/finalization reserves as before.
+The table uses each profile's default round count (TEST 1, FAST 2, BALANCED 2, DEEP 3). Planner and final-AI values are **nominal sizing/accounting values in normal profile mode, not aggregate wall-clock stop conditions**. Every started planner or analysis batch gets its complete provider-call watchdog, and fast responses return immediately. Measured planner/analysis control-plane time is excluded from the fixed target-execution/finalization guard, so a healthy but slow model does not consume scanner or report time. The assessment runner does not impose an additional fixed Agentic parent-process timeout; provider/tool calls retain their own bounded timeouts. `--max-rounds` still scales target-work/finalization reserves as before.
 
 Important per-action/tool timeouts at the default rate of 10:
 
@@ -142,7 +143,11 @@ Important per-action/tool timeouts at the default rate of 10:
 | Browser | 10 s | 120 s | 240 s | 360 s |
 | Authorization | 10 s | 90 s | 120 s | 180 s |
 
-FFUF uses its profile timeout as the global action budget. Its compact general phase may use the time still remaining after the earlier FFUF phases. Planner provider calls have a 20 s transport floor and a generous per-call watchdog (BALANCED: **1800 s / 30 min**). A malformed-plan retry is a new provider call and receives a fresh full 1800 s allocation. The total number of batches never divides that timeout; in normal mode there is no aggregate planner wall-clock cutoff, so 6536 batches are not rejected merely because their worst-case sum exceeds a nominal cumulative number. Batches split only when the actual prompt exceeds model context or the provider explicitly reports context overflow. Final AI analysis is also completion-driven: every BALANCED provider call gets **1800 s**; context-split children, malformed-response recovery children and singleton rescue calls each get a fresh full 1800 s provider allowance rather than sharing a shrinking parent deadline. There is no aggregate final-analysis wall-clock admission cap. If a full 1800 s call itself times out, that is recorded as an AI/provider timeout; scanner/verifier evidence is still retained and reporting continues. The remaining scanners retain their existing profile timeout settings.
+In Deterministic, the combined **FFUF + Arjun + recrawl** discovery window is **25 s / 180 s / 480 s / 900 s** (TEST / FAST / BALANCED / DEEP), shared across active profiles. Per profile, 32% is allocated to FFUF, 43% to Arjun, 15% to recrawl and 10% is reserved for Arjun follow-up on newly observed ZAP routes. The shared deadline may shorten an individual allocation; unrun cases are recorded as skipped. Specialist case quotas use bounded adaptive overflow and a reserved allowance for routing/traversal cases.
+
+Agentic reference action capacities per round are **24 / 180 / 480 / 720**. In FAST/BALANCED/DEEP the admission capacity can grow with remaining eligible work; the AI still selects actions, with an optional AI-requested extension up to 12.5%. The global round cap is shared fairly across active profiles and tools.
+
+For standalone FFUF actions, the profile timeout is the global action budget. Its compact general phase may use the time still remaining after the earlier FFUF phases. Planner provider calls have a 20 s transport floor and a generous per-call watchdog (BALANCED: **1800 s / 30 min**). A malformed-plan retry is a new provider call and receives a fresh full 1800 s allocation. The total number of batches never divides that timeout; in normal mode there is no aggregate planner wall-clock cutoff, so batches are not rejected merely because their worst-case sum exceeds a nominal cumulative value. Batches split only when the actual prompt exceeds model context or the provider explicitly reports context overflow. Final AI analysis is also completion-driven: every BALANCED provider call gets **1800 s**; context-split children, malformed-response recovery children and singleton rescue calls each get a fresh full 1800 s provider allowance rather than sharing a shrinking parent deadline. There is no aggregate final-analysis wall-clock admission cap. If a full 1800 s call itself times out, that is recorded as an AI/provider timeout; scanner/verifier evidence is still retained and reporting continues. The remaining scanners retain their existing profile timeout settings.
 
 ---
 
@@ -213,7 +218,7 @@ export SECOPS_TARGET_USERNAME='user'
 export SECOPS_TARGET_PASSWORD='password'
 ```
 
-Verify login and session before a long run with `--auth-only`.
+With `--auth-only`, the **full assessment** runs on authenticated profiles only; it is not a login-only diagnostic. A stale cookie is revalidated and, when permitted and configured credentials are available, the session can be restored through the existing browser/OIDC flow. Conclusive credential rejection is scoped to the identity, application root and origin/port; other authorized applications and anonymous work remain eligible. Verified replacement cookies are persisted to a source JSON only for explicitly managed credentials.
 
 ---
 
@@ -251,7 +256,7 @@ scp debian@<host>:/home/debian/Cybersecurity_AgenticAI/reports/<file> .
 
 ### 🔁 Regenerate reports from an existing JSON (no pentest)
 
-By **default** nothing changes: `assessmentRunner.py` runs the pentest and then builds the report from the evidence it just collected. As an **optional** alternative, `--report-from-json` rebuilds the **HTML and PDF** deliverables (full **report** + the companion **list** reports — *reduced* and *summary*) from a JSON **already produced** by a previous run, **without launching any scanner against the target**.
+Without `--report-from-json`, `assessmentRunner.py` runs the pentest and builds the report from the evidence it collects. As an **optional** alternative, `--report-from-json` rebuilds the **HTML and PDF** deliverables (full **report** + the companion **list** reports — *reduced* and *summary*) from a JSON **already produced** by a previous run, **without launching any scanner against the target**.
 
 Accepted inputs:
 
@@ -287,6 +292,7 @@ tail -n 300 -F "$LOG"     # on long SSH sessions use tmux
 | Problem | Check |
 | --- | --- |
 | Login failed | Credentials, OIDC redirects, and auth logs. |
+| Nikto/Docker access denied | Check Docker from the **MCP process**, not only from the SSH shell; verify its runtime identity and service isolation. `initScript.py` checks Docker through the live MCP and does not restart unrelated services. |
 | Many failed auth prechecks | Session valid for the specific application root. |
 | Discovery with residual queue | Limits, slow pages, queue still producing new endpoints. |
 | Planner incomplete | Provider/contract errors, per-call watchdogs, and context diagnostics. Normal profile mode has no aggregate planner time cutoff; collected evidence still reaches final reporting. |
