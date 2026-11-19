@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import sys
 from pathlib import Path
+from typing import Any
 
 # Allow direct execution (python servers/secopsServer.py) as well as orchestrator-managed startup.
 SERVERS_DIR = Path(__file__).resolve().parent
@@ -49,13 +50,50 @@ mcp = FastMCP(
 _SERVER_SOURCE_FINGERPRINT = secops_source_fingerprint()
 
 @mcp.tool()
-def secops_runtime_identity() -> dict[str, str | int]:
-    return {
+def secops_runtime_identity(check_docker: bool = False) -> dict[str, Any]:
+    result: dict[str, Any] = {
         "source_fingerprint": _SERVER_SOURCE_FINGERPRINT,
         "root": str(ROOT_DIR.resolve()),
         "python": sys.executable,
         "pid": os.getpid(),
     }
+    if check_docker:
+        # Run an innocuous Docker API check inside the actual MCP service context.
+        # A successful `docker info` in the installer's shell is not sufficient
+        # when a systemd service has different sandboxing or environment.
+        import shutil
+        import subprocess
+        diagnostic: dict[str, Any] = {
+            "uid": os.geteuid() if hasattr(os, "geteuid") else None,
+            "groups": list(os.getgroups()) if hasattr(os, "getgroups") else [],
+            "socket_gid": None,
+            "ok": False,
+            "returncode": None,
+            "detail": "",
+        }
+        if sys.platform.startswith("linux"):
+            try:
+                diagnostic["socket_gid"] = Path("/var/run/docker.sock").stat().st_gid
+            except OSError as exc:
+                diagnostic["detail"] = f"Docker socket inspection: {type(exc).__name__}: {exc}"
+        if shutil.which("docker"):
+            try:
+                probe = subprocess.run(
+                    ["docker", "info", "--format", "{{.ServerVersion}}"],
+                    capture_output=True, text=True, timeout=15, check=False,
+                )
+                diagnostic["returncode"] = probe.returncode
+                diagnostic["ok"] = probe.returncode == 0 and bool(probe.stdout.strip())
+                if diagnostic["ok"]:
+                    diagnostic["version"] = probe.stdout.strip()
+                else:
+                    diagnostic["detail"] = (probe.stderr or probe.stdout or "Docker info failed").strip()[-1200:]
+            except (OSError, subprocess.TimeoutExpired) as exc:
+                diagnostic["detail"] = f"{type(exc).__name__}: {exc}"[-1200:]
+        else:
+            diagnostic["detail"] = "docker executable not found in MCP PATH"
+        result["docker"] = diagnostic
+    return result
 
 # Child modules remain independently maintainable, but only this parent owns an HTTP listener.
 for child in (

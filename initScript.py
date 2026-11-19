@@ -8,6 +8,7 @@ import shutil
 import subprocess
 import sys
 from pathlib import Path
+from typing import Any
 
 # When invoked as a script, prefer the interpreter bound to this repository's
 # virtual environment before importing third-party modules or running pip.
@@ -495,6 +496,21 @@ def _reconcile_existing_mcp_before_preflight() -> None:
         pid = pids[0]
         username, live_groups = _mcp_verified_pid(pid)
         unit = _mcp_systemd_unit_for_pid(pid)
+        # A matching Python command line does not establish service ownership. The manual
+        # CP18 service can intentionally start the same source file from this checkout;
+        # restarting that systemd unit here would interfere with independent pentests.
+        # Only a unit explicitly designated for the ORIGINAL project may be managed.
+        if unit:
+            permitted_unit = os.environ.get('SECOPS_ORIGINAL_MCP_SYSTEMD_UNIT', '').strip()
+            if unit != permitted_unit:
+                raise RuntimeError(
+                    f'MCP port {port} belongs to systemd unit {unit!r} (PID {pid}), '
+                    'not an explicitly designated original MCP service. '
+                    'The initializer will not restart or reuse a possibly manual service. '
+                    'Isolate the manual MCP on a separate port/service, or set '
+                    'SECOPS_ORIGINAL_MCP_SYSTEMD_UNIT to the exact unit name only after '
+                    'confirming that it is exclusively owned by the original project.'
+                )
         if sys.platform.startswith('linux'):
             socket = _docker_socket_identity()
             if socket and username:
@@ -539,6 +555,52 @@ def _reconcile_existing_mcp_before_preflight() -> None:
             return
         time.sleep(0.3)
     raise RuntimeError(f'Original MCP PID {pid} did not restart within its bounded stop window.')
+
+# Confirm Docker from the actual, currently running MCP process, not only from
+# the initializer's shell. Systemd sandboxing and namespaces can make these differ.
+def _verify_mcp_docker_access() -> None:
+    import asyncio
+    from fastmcp import Client
+    import orchestratorShared as shared
+    from utils import MCP_UNIFIED_SERVICE, mcp_http_url, secops_source_fingerprint
+
+    url = mcp_http_url(MCP_UNIFIED_SERVICE)
+    expected = secops_source_fingerprint()
+
+    async def inspect() -> dict[str, Any]:
+        async with Client(url) as client:
+            response = await asyncio.wait_for(
+                client.call_tool('secops_runtime_identity', {'check_docker': True}),
+                timeout=30,
+            )
+        data, is_error, message = shared._extract_response(response)
+        if is_error or not isinstance(data, dict):
+            raise RuntimeError('MCP Docker verification returned an invalid payload: '
+                               + str(message or data)[:900])
+        return data
+
+    # Uses the ordinary verified launcher; never contacts a third-party listener.
+    shared._ensure_http_server()
+    response = asyncio.run(inspect())
+    if response.get('source_fingerprint') != expected:
+        raise RuntimeError('MCP source fingerprint changed during Docker verification; '
+                           'refusing to use a stale service.')
+    docker = response.get('docker')
+    if not isinstance(docker, dict):
+        raise RuntimeError('MCP does not support the runtime Docker self-test. '
+                           'Update the existing servers/secopsServer.py as well.')
+    if docker.get('ok') is not True:
+        raise RuntimeError(
+            'Docker is NOT usable from inside the MCP process. '
+            f"PID={response.get('pid')}; uid={docker.get('uid')}; "
+            f"groups={docker.get('groups')}; socket_gid={docker.get('socket_gid')}; "
+            f"returncode={docker.get('returncode')}; detail={str(docker.get('detail') or '')[-1200:]}. "
+            'Review the actual service sandbox/namespace and Docker environment. '
+            'The initializer will not incorrectly declare Nikto ready.'
+        )
+    print(f"[+] Docker verified inside MCP PID={response.get('pid')}; "
+          f"Docker version={docker.get('version')}", flush=True)
+
 
 # Fail early when the project source tree is incomplete for the unified MCP architecture.
 def verify_unified_mcp_source() -> None:
@@ -1000,6 +1062,8 @@ def main() -> int:
         # Always reconcile an already-running ORIGINAL MCP with the current sources
         # and runtime configuration before the first scanner preflight/assessment.
         _reconcile_existing_mcp_before_preflight()
+        if not args.skip_scanners:
+            _verify_mcp_docker_access()
         if not args.skip_preflight:
             run_preflight()
 
