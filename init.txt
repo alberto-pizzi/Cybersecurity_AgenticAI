@@ -9,7 +9,7 @@ THERE ARE ONLY TWO CORE STEPS:
   1) initScript.py        -> prepares the environment (one time only).
   2) assessmentRunner.py  -> runs the assessment in the chosen mode (agentic or deterministic)
                              with the desired --config. This is the only step that repeats.
---dry-run and --auth-only are NOT steps of their own: only optional checks before step 2.
+--dry-run and --auth-only are NOT separate steps: dry-run checks the plan; auth-only runs authenticated scanning.
 
 Requirements: Python 3.13 on a Debian VM, network to the authorized target, disk space.
 Use only your own targets or ones you are explicitly authorized to test.
@@ -27,6 +27,7 @@ STEP 1 - INITIALIZATION
     --prepare-ai snap4city|llama|qwen   Restricts preparation to one backend. Snap4City is remote. llama/qwen use local Ollama.
     --snap4city-credentials FILE        Provider credentials (separate from the target).
 
+  The initializer checks Docker from the live unified MCP process and avoids restarting unrelated services.
   Do not use --skip-scanners or --skip-browser in a normal installation.
 
 
@@ -39,9 +40,9 @@ STEP 2 - ASSESSMENT
   Deterministic:  --orchestrator deterministic --mode balanced --authorized
   Direct target:  --target http://target --orchestrator agentic --mode balanced --authorized
 
-  Optional check before the run (NOT a step of its own):
+  Optional execution flags (NOT separate steps):
     --dry-run    validates config, scope, and jobs without launching scanners
-    --auth-only  tests only login and session
+    --auth-only  runs the full scanner workflow only for authenticated profiles
     python assessmentRunner.py --config configs/dashboard-test.json \
       --orchestrator agentic --mode balanced --max-rounds 2 --require-ai --dry-run --authorized
 
@@ -61,6 +62,10 @@ CONFIGURATION
   - Set authorization.confirmed=true only after real authorization.
   - Minimal fields: schema_version, platform.name, assets[] (id + service), execution.
   - Secrets via env (cookie_env/username_env/password_env), never in the JSON; link with credential_ref.
+
+  A stale cookie may be renewed with configured browser/OIDC credentials; a conclusive login rejection
+  blocks only that identity + application + origin/port, not unrelated applications or anonymous scans.
+  Verified cookies persist to JSON only for explicitly managed credential references.
 
   Full example and authentication section: README.
 
@@ -89,14 +94,21 @@ PROFILES, RATE, AND TIME BUDGETS
   Browser                    10 s       120 s      240 s       360 s
   Authorization              10 s       90 s       120 s       180 s
 
+  Deterministic FFUF + Arjun + recrawl, shared across profiles: 25 s / 180 s / 480 s / 900 s.
+  Per-profile time split: FFUF 32%, Arjun 43%, recrawl 15%, ZAP-new-route Arjun reserve 10%.
+  Remaining shared time may limit a scanner, unrun cases are recorded as skipped.
+  Adaptive specialist quotas preserve capacity for high-value/routing request contracts.
+  Agentic reference actions/round: TEST 24, FAST 180, BALANCED 480, DEEP 720.
+  Normal-mode admission adapts to remaining work; AI may request up to +12.5% capacity.
+  The global action limit is balanced across profiles and tools; Python does not select attacks.
+
   These figures use the default round counts: TEST=1, FAST=2, BALANCED=2, DEEP=3. Planner
   cumulative and final-analysis values are nominal sizing/accounting values in normal mode, not
   aggregate wall-clock stop conditions. Measured planner/final-analysis control-plane time is
-  excluded from the fixed target-work/finalization guard, and the assessment runner imposes no
-  second fixed Agentic parent
-  cutoff. Tool/provider calls remain individually bounded.
+  excluded from the fixed target-work/finalization guard; the assessment runner imposes no
+  additional fixed Agentic parent cutoff. Tool/provider calls remain individually bounded.
 
-  FFUF uses the profile timeout as its global action budget. Its compact general phase may use the
+  For standalone FFUF actions, the profile timeout is the global action budget. Its compact general phase may use the
   time remaining after earlier FFUF phases. Planner provider calls have a 20 s transport floor and
   BALANCED gives every started planner batch a full 1800 s (30 min) watchdog. Batch count never
   divides this timeout and normal mode has no aggregate planner wall-clock cutoff; splitting occurs
@@ -119,7 +131,7 @@ initScript.py OPTIONS  (complete list)
   --skip-scanners                         Skip scanner installation and do not require all of them.
   --skip-browser                          Do not install/verify Chromium; browser-only checks are skipped.
   --require-browser                       Compat: Chromium is already required by default (unless --skip-browser).
-  --commands-only                         Print this guide, write init.txt, and exit.
+  --commands-only                         Print this guide, create init.txt if absent, and exit.
 
 
 assessmentRunner.py OPTIONS  (complete list)
@@ -181,7 +193,7 @@ LOGS AND RESULTS
     python assessmentRunner.py --report-from-json reports/SecOps_Assessment_XXXX.json
     python assessmentRunner.py --report-from-json reports/SecOps_Assessment_XXXX.json \
       --output-name MyClient_rev2 --client-name "ACME" --assessor "Team" --assessment-type "Web app" --report-version 1.1
-    - Default flow unchanged: without this option the runner runs the pentest and builds the report.
+    - Without this option, the runner runs the pentest and builds the report.
     - Mutually exclusive with --config/--target; --authorized is NOT required.
     - Scanner results in these JSON files are already redacted: the regenerated report carries no secrets.
 
