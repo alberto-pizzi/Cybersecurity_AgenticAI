@@ -51,6 +51,8 @@ python assessmentRunner.py --config configs/dashboard-test.json \
   --orchestrator deterministic --mode balanced --authorized
 ```
 
+📄 **`init.txt`** is the operator's technical guide: a quick reference of every command and option for `initScript.py` and `assessmentRunner.py`.
+
 ---
 
 ## 🧩 Architecture
