@@ -256,6 +256,40 @@ Artifacts are saved in `reports/`. To download them:
 scp debian@<host>:/home/debian/Cybersecurity_AgenticAI/reports/<file> .
 ```
 
+### 📁 Output files and naming
+
+All files are written to `reports/`. Every job report shares one **base name**:
+
+```text
+SecOps_Assessment_<stamp>_j<NNN>           # Deterministic orchestrator
+SecOps_Agentic_Assessment_<stamp>_j<NNN>   # Agentic orchestrator
+```
+
+- `<stamp>` = `YYYYMMDD_HHMMSS_<microseconds>_<pid>_<8 hex chars>` (UTC), shared by all jobs of the same assessment.
+- `j<NNN>` = job index (`j001`, `j002`, …).
+- `<platform>` = `platform.name` from the config, with non-alphanumeric characters replaced by `_`.
+
+| File | What it is |
+|---|---|
+| `<base>.json` | Technical report data: all normalized findings, coverage and redacted scanner results. |
+| `<base>.review.json` | Review snapshot, used to rebuild the report without a new scan. |
+| `<base>.html` / `<base>.pdf` | **Full** report: complete technical report (interactive HTML / PDF deliverable). |
+| `<base>_reduced.html` / `.pdf` | **Reduced** report: every finding, with detail trimmed by severity. |
+| `<base>_summary.html` / `.pdf` | **Summary** report: tests performed plus critical/high issues only. |
+| `Assessment_Results_Data_<ref>.json` | Dataset of the whole assessment: redacted config, rate policy, outcome of every job and report data. |
+| `<platform>_<stamp>_aggregate.json` / `.review.json` / `.html` / `.pdf` | Single report merging all jobs (only with `reporting.aggregate_report=true` and at least 2 jobs). |
+| `supporting/<platform>_<stamp>/` | Job JSON, snapshot, HTML and PDF moved here when `reporting.keep_job_reports=false`. |
+| `<base>_Emergency_<YYYYMMDD>_<HHMMSS>.json` / `.html` | Raw emergency dump, only if the report server failed with nothing recoverable. |
+| `<report_id>_from_json.*` | Reports rebuilt with `--report-from-json` (same files as a job). |
+| `<report_id>_revision.*` | Reports rebuilt with `rerenderReport.py`. |
+
+Notes:
+
+- `<ref>` is the report base name when the assessment produced a single report, the aggregate report name when the aggregate report is enabled, and `<platform>_<stamp>` otherwise.
+- A successful job produces **8 files** (`.json`, `.review.json`, full/reduced/summary in HTML and PDF), plus one `Assessment_Results_Data_*.json` per assessment.
+- If the full PDF fails, only `.json`, `.review.json` and `.html` remain, and no reduced/summary report is produced.
+
+
 ### 🔁 Regenerate reports from an existing JSON (no pentest)
 
 Without `--report-from-json`, `assessmentRunner.py` runs the pentest and builds the report from the evidence it collects. As an **optional** alternative, `--report-from-json` rebuilds the **HTML and PDF** deliverables (full **report** + the companion **list** reports — *reduced* and *summary*) from a JSON **already produced** by a previous run, **without launching any scanner against the target**.
